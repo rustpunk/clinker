@@ -213,8 +213,250 @@ pub fn bind_schema(
 
     validate_state_writers(nodes, diags);
     validate_init_phase_terminals(nodes, diags);
+    validate_read_after_write(nodes, &artifacts, diags);
 
     artifacts
+}
+
+/// Compile-time check: every `$pipeline.<key>` / `$source.<key>` /
+/// `$record.<key>` read whose `(scope, key)` pair is written by some
+/// `state` node must originate at a node whose DAG ancestor set
+/// includes that writer. A reader on a sibling branch (no path from
+/// writer to reader) would observe the variable's default value, not
+/// the written value — exactly the "hidden DAG edge" anti-pattern
+/// Airflow Variables and Talend `globalMap` are infamous for.
+///
+/// Self-reads (a state node referencing the same variable it writes)
+/// are allowed: the read evaluates BEFORE the write within a single
+/// record's processing, observing the previous value.
+///
+/// Reads of `(scope, key)` pairs declared in `vars:` but never written
+/// by any state node are NOT flagged here — those are valid reads of
+/// the declaration default. Reads that aren't declared at all are
+/// already rejected by the resolver in Phase B / C-1.
+///
+/// Emits E171 with primary span on the offending CXL reference and a
+/// secondary span on the writer state node.
+fn validate_read_after_write(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::config::VarScope;
+
+    // Build (scope, var) → writer-node-name map.
+    let mut writers: std::collections::HashMap<(VarScope, String), String> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        if let PipelineNode::State { header, config } = &spanned.value {
+            for assignment in &config.set {
+                writers
+                    .entry((config.scope, assignment.var.clone()))
+                    .or_insert_with(|| header.name.clone());
+            }
+        }
+    }
+    if writers.is_empty() {
+        return;
+    }
+
+    // Build transitive ancestor map keyed by node name. Iterates
+    // `nodes` in declaration order, which is topologically sound per
+    // Stage-3 validation, so each node's ancestor set can be assembled
+    // from already-processed predecessors.
+    let mut ancestors: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        let name = spanned.value.name().to_string();
+        let mut anc: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let direct: Vec<String> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
+            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+        };
+        for parent in direct {
+            anc.insert(parent.clone());
+            if let Some(parent_anc) = ancestors.get(&parent) {
+                anc.extend(parent_anc.iter().cloned());
+            }
+        }
+        ancestors.insert(name, anc);
+    }
+
+    // Walk every CXL-bearing node's typed program(s); for each scope
+    // read whose key has a known writer, check the writer is in the
+    // reader's ancestor set.
+    for spanned in nodes {
+        let reader_name = spanned.value.name().to_string();
+        let mut typed_keys: Vec<String> = Vec::new();
+        match &spanned.value {
+            PipelineNode::Transform { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. } => {
+                if artifacts.typed.contains_key(&reader_name) {
+                    typed_keys.push(reader_name.clone());
+                }
+            }
+            PipelineNode::State { config, .. } => {
+                for assignment in &config.set {
+                    typed_keys.push(format!("{reader_name}::{}", assignment.var));
+                }
+            }
+            _ => {}
+        }
+        let span = span_for_node(spanned);
+        for key in typed_keys {
+            let Some(typed) = artifacts.typed.get(&key) else {
+                continue;
+            };
+            let mut reads: Vec<(VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            for (scope, var) in reads {
+                let Some(writer_name) = writers.get(&(scope, var.clone())) else {
+                    continue;
+                };
+                // Self-read inside the writing state node is fine.
+                if writer_name == &reader_name {
+                    continue;
+                }
+                let reader_anc = ancestors.get(&reader_name);
+                let is_descendant = reader_anc
+                    .map(|set| set.contains(writer_name))
+                    .unwrap_or(false);
+                if !is_descendant {
+                    let scope_str = match scope {
+                        VarScope::Pipeline => "$pipeline",
+                        VarScope::Source => "$source",
+                        VarScope::Record => "$record",
+                    };
+                    let writer_span = nodes
+                        .iter()
+                        .find(|n| n.value.name() == writer_name.as_str())
+                        .map(span_for_node)
+                        .unwrap_or(Span::SYNTHETIC);
+                    diags.push(
+                        Diagnostic::error(
+                            "E171",
+                            format!(
+                                "node {reader_name:?} reads {scope_str}.{var} but is not a DAG \
+                                 descendant of writer state node {writer_name:?} — the read \
+                                 would observe the declaration default, not the written value \
+                                 (move the reader downstream of the writer or remove the read)"
+                            ),
+                            LabeledSpan::primary(span, "non-descendant reader".to_string()),
+                        )
+                        .with_secondary(LabeledSpan::new(
+                            writer_span,
+                            Some("writer state node".to_string()),
+                        )),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn span_for_node(spanned: &Spanned<PipelineNode>) -> Span {
+    let line = spanned.referenced.line() as u32;
+    if line > 0 {
+        Span::line_only(line)
+    } else {
+        Span::SYNTHETIC
+    }
+}
+
+fn collect_scope_reads_in_statement(
+    stmt: &Statement,
+    out: &mut Vec<(crate::config::VarScope, String)>,
+) {
+    match stmt {
+        Statement::Emit { expr, .. }
+        | Statement::Let { expr, .. }
+        | Statement::ExprStmt { expr, .. } => collect_scope_reads_in_expr(expr, out),
+        Statement::Filter { predicate, .. } => collect_scope_reads_in_expr(predicate, out),
+        Statement::Trace { guard, message, .. } => {
+            if let Some(g) = guard {
+                collect_scope_reads_in_expr(g, out);
+            }
+            collect_scope_reads_in_expr(message, out);
+        }
+        Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+    }
+}
+
+fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarScope, String)>) {
+    use crate::config::VarScope;
+    match expr {
+        Expr::PipelineAccess { field, .. } => out.push((VarScope::Pipeline, field.to_string())),
+        Expr::SourceAccess { field, .. } => out.push((VarScope::Source, field.to_string())),
+        Expr::RecordAccess { field, .. } => out.push((VarScope::Record, field.to_string())),
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            collect_scope_reads_in_expr(lhs, out);
+            collect_scope_reads_in_expr(rhs, out);
+        }
+        Expr::Unary { operand, .. } => collect_scope_reads_in_expr(operand, out),
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_scope_reads_in_expr(condition, out);
+            collect_scope_reads_in_expr(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_scope_reads_in_expr(eb, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject {
+                collect_scope_reads_in_expr(s, out);
+            }
+            for arm in arms {
+                collect_scope_reads_in_expr(&arm.pattern, out);
+                collect_scope_reads_in_expr(&arm.body, out);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_scope_reads_in_expr(receiver, out);
+            for a in args {
+                collect_scope_reads_in_expr(a, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                collect_scope_reads_in_expr(a, out);
+            }
+        }
+        Expr::Literal { .. }
+        | Expr::FieldRef { .. }
+        | Expr::QualifiedFieldRef { .. }
+        | Expr::MetaAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
+    }
 }
 
 /// Compile-time check: an init-phase state node must be terminal in

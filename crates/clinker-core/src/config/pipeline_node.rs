@@ -1905,6 +1905,110 @@ nodes:
     }
 
     #[test]
+    fn test_state_node_non_descendant_reader_emits_e171() {
+        // Phase F-2a: Transform on a sibling branch reads
+        // $pipeline.cutoff that's only written further down the
+        // OTHER branch. Without DAG ancestry from writer to reader,
+        // the read silently observes the declaration default — the
+        // canonical "hidden DAG edge" anti-pattern. E171 makes it
+        // explicit at compile time.
+        let yaml = r#"
+pipeline:
+  name: state_non_descendant_read
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: reader_branch
+    input: src
+    config:
+      cxl: |
+        emit observed = $pipeline.cutoff
+  - type: state
+    name: writer_branch
+    input: src
+    config:
+      scope: pipeline
+      set:
+        - var: cutoff
+          cxl: "amount"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("non-descendant reader should reject at compile");
+        let e171 = err_diags
+            .iter()
+            .find(|d| d.code == "E171")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected E171, got: {:?}",
+                    err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            e171.message.contains("reader_branch"),
+            "diagnostic should name the non-descendant reader: {}",
+            e171.message
+        );
+        assert!(
+            e171.message.contains("writer_branch"),
+            "diagnostic should name the writer state node: {}",
+            e171.message
+        );
+    }
+
+    #[test]
+    fn test_state_node_descendant_reader_ok() {
+        // Phase F-2a sanity: a Transform downstream of the writer
+        // state node IS a transitive descendant, so the read is
+        // legal — the executor sees the written value.
+        let yaml = r#"
+pipeline:
+  name: state_descendant_read_ok
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: writer
+    input: src
+    config:
+      scope: pipeline
+      set:
+        - var: cutoff
+          cxl: "amount"
+  - type: transform
+    name: reader
+    input: writer
+    config:
+      cxl: |
+        emit observed = $pipeline.cutoff
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let _plan = cfg.compile(&ctx).expect("descendant reader should compile");
+    }
+
+    #[test]
     fn test_state_node_init_phase_with_runtime_descendant_emits_e164() {
         // Phase E v1: init state nodes must be terminal — a
         // downstream node consuming from them is rejected with E164
