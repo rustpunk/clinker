@@ -1168,10 +1168,16 @@ fn bind_composition(
             .unwrap_or(Path::new(""))
             .to_path_buf(),
     );
-    // Composition bodies are sealed from parent scoped vars: parent
-    // `$pipeline.<key>` / `$source.<key>` declarations are not visible inside
-    // the body. Phase G will allow opting into specific names via
-    // `CompositionSignature.scoped_vars_schema`.
+    // Composition bodies are sealed from parent scoped vars (Phase F-2c):
+    // parent `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
+    // declarations are not visible inside the body. The seal is structural
+    // — the body's `bind_schema_inner` recursion sees an empty
+    // `ScopedVarsRegistry`, so the resolver rejects any user-declared
+    // scoped reference with the standard "unknown member" diagnostic.
+    // Phase G adds `CompositionSignature.scoped_vars_schema` to allow
+    // opting specific names back in, plus a composition-aware diagnostic
+    // that distinguishes "parent var not declared in signature" from
+    // "no such var anywhere."
     let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
     // The new enclosing_scope is the parent's node names (for E108).
     bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
