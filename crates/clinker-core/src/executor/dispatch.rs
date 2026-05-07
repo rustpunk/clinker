@@ -3132,7 +3132,7 @@ pub(crate) fn dispatch_plan_node(
             let payload = resolved
                 .as_deref()
                 .expect("PlanNode::State.resolved populated by lowering");
-            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+            let mut input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
                 own_buf
             } else {
                 let predecessors: Vec<NodeIndex> = current_dag
@@ -3159,19 +3159,18 @@ pub(crate) fn dispatch_plan_node(
             for assignment in &payload.assignments {
                 let mut evaluator =
                     cxl::eval::ProgramEvaluator::new(assignment.typed.clone(), false);
-                for (record, rn) in &input_records {
+                for (record, rn) in input_records.iter_mut() {
                     let file_idx = (rn.saturating_sub(1)) as usize;
+                    let source_file_arc = ctx
+                        .source_file_arcs
+                        .get(file_idx)
+                        .unwrap_or(&ctx.source_file_arcs[0])
+                        .clone();
                     let eval_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx
-                            .source_file_arcs
-                            .get(file_idx)
-                            .unwrap_or(&ctx.source_file_arcs[0]),
+                        source_file: &source_file_arc,
                         source_row: *rn,
-                        source_path: ctx
-                            .source_file_arcs
-                            .get(file_idx)
-                            .unwrap_or(&ctx.source_file_arcs[0]),
+                        source_path: &source_file_arc,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -3190,16 +3189,31 @@ pub(crate) fn dispatch_plan_node(
                                     }
                                     crate::config::VarScope::Source => {
                                         ctx.stable.set_source_var(
-                                            eval_ctx.source_file,
+                                            &source_file_arc,
                                             &assignment.var,
                                             value,
                                         );
                                     }
                                     crate::config::VarScope::Record => {
-                                        // Phase D-3 — rejected at lowering with E162.
-                                        unreachable!(
-                                            "record-scope state nodes rejected before lowering"
+                                        // Store under the reserved
+                                        // RECORD_VAR_META_PREFIX so
+                                        // `Record::resolve("$record.<key>")`
+                                        // strips the prefix and finds it
+                                        // via `get_meta`.
+                                        let key = format!(
+                                            "{}{}",
+                                            clinker_record::RECORD_VAR_META_PREFIX,
+                                            assignment.var
                                         );
+                                        if let Err(cap_err) = record.set_meta(&key, value) {
+                                            return Err(crate::error::PipelineError::Compilation {
+                                                transform_name: format!("state:{name}"),
+                                                messages: vec![format!(
+                                                    "record-scope state assignment {:?}: {cap_err}",
+                                                    assignment.var
+                                                )],
+                                            });
+                                        }
                                     }
                                 }
                             }

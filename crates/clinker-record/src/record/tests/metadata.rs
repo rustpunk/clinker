@@ -135,3 +135,26 @@ fn test_record_metadata_cap_allows_overwrite() {
     record.set_meta("key_0", Value::Integer(999)).unwrap();
     assert_eq!(record.get_meta("key_0"), Some(&Value::Integer(999)));
 }
+
+#[test]
+fn test_record_var_resolves_via_field_resolver() {
+    // Phase D-3: record-scope state-node writes go to the metadata
+    // channel under `RECORD_VAR_META_PREFIX`. The Record's
+    // `FieldResolver::resolve("$record.<key>")` impl strips the
+    // namespace prefix and looks up the prefixed metadata key.
+    let mut record = test_record();
+    let key = format!("{}{}", RECORD_VAR_META_PREFIX, "fuzzy_score");
+    record.set_meta(&key, Value::Float(0.85)).unwrap();
+    assert_eq!(
+        record.resolve("$record.fuzzy_score"),
+        Some(&Value::Float(0.85)),
+        "$record.<key> should resolve via the reserved metadata prefix"
+    );
+    // Sanity: a $meta.* read for the same suffix does NOT pick up the
+    // record-var entry (the metadata key is the prefixed form, not
+    // the bare suffix).
+    assert!(
+        record.resolve("$meta.fuzzy_score").is_none(),
+        "$meta.<suffix> must not silently match record-var storage"
+    );
+}

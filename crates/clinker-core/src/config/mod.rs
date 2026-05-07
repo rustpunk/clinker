@@ -3172,22 +3172,9 @@ pub(crate) fn lower_node_to_plan_node(
             output_schema: schema_from_bound(name),
         }),
         PipelineNode::State { config, .. } => {
-            // Phase D / D-2: pipeline-scope and source-scope runtime
-            // writes are wired. Record-scope writes still need a
-            // per-record state-threading channel that Phase D-3 will
-            // add; reject them with E162 until then.
-            use crate::config::{Phase as ConfPhase, VarScope};
-            if config.scope == VarScope::Record {
-                diags.push(crate::error::Diagnostic::error(
-                    "E162",
-                    format!(
-                        "state node {name:?}: scope `record` not yet wired into the executor \
-                         (Phase D-3 will thread per-record state alongside the record buffers)"
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                ));
-                return None;
-            }
+            // Phases D / D-2 / D-3 wire all three runtime scope tiers.
+            // Init-phase orchestration is still gated by E163 (Phase E).
+            use crate::config::Phase as ConfPhase;
             if config.phase == ConfPhase::Init {
                 diags.push(crate::error::Diagnostic::error(
                     "E163",

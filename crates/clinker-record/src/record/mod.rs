@@ -8,6 +8,16 @@ use std::sync::Arc;
 /// Maximum number of metadata keys per record.
 const MAX_METADATA_KEYS: usize = 64;
 
+/// Reserved prefix for record-scope user-declared variable storage in
+/// the metadata channel. The state node arm (Phase D-3) writes
+/// `$record.<key>` values under `__rv_<key>` so they share the
+/// existing 64-key metadata cap with `$meta.*` but stay distinguishable
+/// at the read site (where `Record::resolve` strips the `$record.`
+/// prefix and dispatches via this constant). Distinct from `$meta.*`
+/// keys (which the user authors freely) — `$record.<key>` keys are
+/// declared at the pipeline top with a type, single-writer enforced.
+pub const RECORD_VAR_META_PREFIX: &str = "__rv_";
+
 /// Schema-indexed row record.
 ///
 /// Values live in a positional `Vec<Value>` whose length equals
@@ -246,6 +256,15 @@ impl FieldResolver for Record {
         // Handle $meta.* namespace: resolve from per-record metadata map.
         if let Some(meta_key) = name.strip_prefix("$meta.") {
             return self.get_meta(meta_key);
+        }
+        // Handle $record.<key>: resolve from the metadata map under
+        // the reserved RECORD_VAR_META_PREFIX so user-declared
+        // `vars.record` slots share storage with `$meta.*` without
+        // colliding (state node Phase D-3 writes use the prefix).
+        if let Some(record_var) = name.strip_prefix("$record.") {
+            // Stack-allocated for short keys; Box for the rare long key.
+            // 56 bytes covers prefix + 51-char var names without heap.
+            return self.get_meta(&format!("{RECORD_VAR_META_PREFIX}{record_var}"));
         }
         self.get(name)
     }

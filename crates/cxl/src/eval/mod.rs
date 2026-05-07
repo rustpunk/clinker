@@ -443,13 +443,16 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 .unwrap_or(Value::Null))
         }
 
-        Expr::RecordAccess { .. } => {
-            // `$record.<key>` reads land here once the State node (Phase D)
-            // populates the per-record scope on EvalContext. Until then,
-            // the record-scope slot is empty and reads return Null —
-            // matching how `$pipeline.<key>` behaves when no default was
-            // declared.
-            Ok(Value::Null)
+        Expr::RecordAccess { field, .. } => {
+            // `$record.<key>` reads delegate to the resolver, which
+            // (for `Record`) strips the `$record.` prefix and looks
+            // up the value under the reserved
+            // `RECORD_VAR_META_PREFIX` in the per-record metadata
+            // channel. Phase D-3's state-node arm writes there.
+            Ok(resolver
+                .resolve(&format!("$record.{field}"))
+                .cloned()
+                .unwrap_or(Value::Null))
         }
 
         Expr::Now { .. } => Ok(Value::DateTime(ctx.stable.clock.now())),

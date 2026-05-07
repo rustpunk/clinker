@@ -1857,12 +1857,15 @@ nodes:
     }
 
     #[test]
-    fn test_state_node_record_scope_emits_e162() {
-        // Phase D-3 (record scope) is not wired; the lowering pass
-        // surfaces E162 so a pipeline using it fails compile loudly.
+    fn test_state_node_record_scope_lowers_to_plan_node() {
+        // Phase D-3: a runtime-phase record-scope state node compiles
+        // end-to-end and lowers to `PlanNode::State`. The executor's
+        // State arm writes per-record values into the record's
+        // metadata channel under `RECORD_VAR_META_PREFIX`; downstream
+        // `$record.<key>` reads recover them via `Record::resolve`.
         let yaml = r#"
 pipeline:
-  name: state_record_scope_unsupported
+  name: state_record_scope_smoke
   vars:
     record:
       score: { type: float }
@@ -1886,13 +1889,16 @@ nodes:
 "#;
         let cfg = crate::config::parse_config(yaml).expect("config parses");
         let ctx = crate::config::CompileContext::default();
-        let err_diags = cfg
+        let plan = cfg
             .compile(&ctx)
-            .expect_err("record-scope state should reject at compile");
+            .expect("record-scope state should compile");
+        let dag = plan.dag();
         assert!(
-            err_diags.iter().any(|d| d.code == "E162"),
-            "expected E162 diagnostic, got: {:?}",
-            err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+            dag.graph.node_indices().any(|idx| matches!(
+                &dag.graph[idx],
+                crate::plan::execution::PlanNode::State { .. }
+            )),
+            "expected PlanNode::State in lowered DAG"
         );
     }
 
