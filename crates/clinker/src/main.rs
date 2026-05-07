@@ -445,7 +445,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut source_name_by_node: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for src in pipeline_config.source_configs() {
-        if let Some(stem) = std::path::Path::new(&src.path)
+        if let Some(stem) = std::path::Path::new(src.path_str())
             .file_stem()
             .and_then(|s| s.to_str())
         {
@@ -456,7 +456,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .source_configs()
         .next()
         .and_then(|s| {
-            std::path::Path::new(&s.path)
+            std::path::Path::new(s.path_str())
                 .file_stem()
                 .map(|st| st.to_owned())
         })
@@ -564,12 +564,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .source_configs()
         .next()
         .expect("pipeline has at least one source");
-    let input_path = first_source.path.clone();
+    let input_path = first_source.path_str().to_string();
 
     let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
         std::collections::HashMap::new();
     for source in pipeline_config.source_configs() {
-        let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&source.path)?);
+        let reader: Box<dyn std::io::Read + Send> =
+            Box::new(std::fs::File::open(source.path_str())?);
         readers.insert(source.name.clone(), reader);
     }
 
@@ -861,7 +862,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             thread_count: num_threads(args),
             input_files: pipeline_config
                 .source_configs()
-                .map(|i| i.path.clone())
+                .map(|i| i.path_str().to_string())
                 .collect(),
             output_files: pipeline_config
                 .output_configs()

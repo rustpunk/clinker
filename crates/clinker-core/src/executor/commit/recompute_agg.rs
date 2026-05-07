@@ -142,6 +142,10 @@ pub(crate) fn emit_post_recompute(
         stable: ctx.stable,
         source_file: ctx.source_file_arc,
         source_row: 0,
+        source_path: ctx.source_path_arc,
+        source_count: ctx.source_count,
+        source_batch: ctx.source_batch_arc,
+        ingestion_timestamp: ctx.source_ingestion_timestamp,
     };
     let emits_synthetic = retained.aggregator.emits_synthetic_ck();
     retained

@@ -429,6 +429,8 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(ctx.resolve_pipeline(field).unwrap_or(Value::Null))
         }
 
+        Expr::SourceAccess { field, .. } => Ok(ctx.resolve_source(field).unwrap_or(Value::Null)),
+
         Expr::MetaAccess { field, .. } => {
             // Check locally-emitted metadata first (same transform), then resolver
             if let Some(val) = meta_state.get(&**field) {

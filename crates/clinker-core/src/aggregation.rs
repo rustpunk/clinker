@@ -281,9 +281,9 @@ pub fn eval_expr_in_agg_scope(
         Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } => {
             Err(AggregateEvalError::UnsupportedResidual { what: "field-ref" })
         }
-        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } => {
+        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } | Expr::SourceAccess { .. } => {
             Err(AggregateEvalError::UnsupportedResidual {
-                what: "$meta/$pipeline access",
+                what: "$meta/$pipeline/$source access",
             })
         }
         Expr::MethodCall { .. } => Err(AggregateEvalError::UnsupportedResidual {
@@ -3647,11 +3647,7 @@ mod spill_trigger_tests {
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
-        EvalContext {
-            stable,
-            source_file: file,
-            source_row: row,
-        }
+        EvalContext::test_with_file(stable, file, row)
     }
 
     // ------------------------------------------------------------------

@@ -906,6 +906,10 @@ pub(crate) fn execute_combine_grace_hash(
             stable: ctx.stable,
             source_file: ctx.source_file,
             source_row: rn,
+            source_path: ctx.source_path,
+            source_count: ctx.source_count,
+            source_batch: ctx.source_batch,
+            ingestion_timestamp: ctx.ingestion_timestamp,
         };
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
         probe_keys_buf.clear();
@@ -1342,6 +1346,10 @@ fn process_spilled_partition(
                 stable: ctx.stable,
                 source_file: ctx.source_file,
                 source_row: row_seq,
+                source_path: ctx.source_path,
+                source_count: ctx.source_count,
+                source_batch: ctx.source_batch,
+                ingestion_timestamp: ctx.ingestion_timestamp,
             };
             let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
             probe_keys_buf.clear();
@@ -1547,6 +1555,10 @@ fn bnl_fallback(
                     stable: rc.ctx.stable,
                     source_file: rc.ctx.source_file,
                     source_row: row_seq,
+                    source_path: rc.ctx.source_path,
+                    source_count: rc.ctx.source_count,
+                    source_batch: rc.ctx.source_batch,
+                    ingestion_timestamp: rc.ctx.ingestion_timestamp,
                 };
                 let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
                 probe_keys_buf.clear();
@@ -2220,11 +2232,7 @@ mod tests {
 
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &source_file,
-            source_row: 0,
-        };
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut budget = MemoryBudget::new(u64::MAX, 0.80);
 
         // Drive everything through grace hash. body_program=None so
@@ -2408,11 +2416,7 @@ mod tests {
 
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &source_file,
-            source_row: 0,
-        };
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
 
         // Big hard limit so should_abort never fires; tiny spill
         // threshold so should_spill fires immediately (process RSS
@@ -2590,11 +2594,7 @@ mod tests {
 
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &source_file,
-            source_row: 0,
-        };
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
 
         // Memory hard limit huge so should_abort never fires; spill
         // threshold tiny so spills happen; disk quota tight so the
@@ -2886,11 +2886,7 @@ mod tests {
             build_qualifier: &h.emit.build_qualifier,
             propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
         };
-        let eval_ctx = EvalContext {
-            stable: &h.stable,
-            source_file: &h.source_file,
-            source_row: 0,
-        };
+        let eval_ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
         let rc = ReloadContext {
             name: &h.emit.name,
             build_extractor: &h.build_extractor,
@@ -2922,11 +2918,7 @@ mod tests {
             // Feed the HLL via the build-side hash of the join key.
             let stable = cxl::eval::StableEvalContext::test_default();
             let source_file: Arc<str> = Arc::from("test.csv");
-            let ctx = EvalContext {
-                stable: &stable,
-                source_file: &source_file,
-                source_row: 0,
-            };
+            let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
             let keys = h.build_extractor.extract(&ctx, r).unwrap();
             sketch.add(hash_composite_key(&keys, &h.hash_state));
         }
@@ -2996,11 +2988,7 @@ mod tests {
         let parent_id = sp.partition_id as u64;
         let stable = cxl::eval::StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &source_file,
-            source_row: 0,
-        };
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut a = 0usize;
         let mut b = 0usize;
         for r in &builds {

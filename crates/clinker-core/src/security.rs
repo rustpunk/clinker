@@ -196,10 +196,9 @@ pub fn validate_all_config_paths(
             Span::SYNTHETIC
         };
         let (raw, _name): (Option<&str>, &str) = match &spanned.value {
-            PipelineNode::Source { config, .. } => (
-                Some(config.source.path.as_str()),
-                config.source.name.as_str(),
-            ),
+            PipelineNode::Source { config, .. } => {
+                (Some(config.source.path_str()), config.source.name.as_str())
+            }
             PipelineNode::Output { config, .. } => (
                 Some(config.output.path.as_str()),
                 config.output.name.as_str(),

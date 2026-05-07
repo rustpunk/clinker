@@ -1277,10 +1277,20 @@ impl PipelineExecutor {
             &params.batch_id,
             &params.pipeline_vars,
         );
-        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
+        let source_file_arc: Arc<str> = Arc::from(input.path_str());
+        // `$source.path` carries the full canonical path; equal to
+        // `$source.file` today. Distinct identity will land alongside the
+        // shortest-unique-suffix `$source.file_label` in §5.
+        let source_path_arc: Arc<str> = Arc::clone(&source_file_arc);
+        // `$source.batch` is per-source-run. Default to a fresh UUID v7
+        // that's distinct from `pipeline.batch_id` (per-pipeline-run).
+        let source_batch_arc: Arc<str> = Arc::from(uuid::Uuid::now_v7().to_string());
+        let source_ingestion_timestamp = pipeline_start_time;
 
         let strategy = config.error_handling.strategy;
         let total_records = all_records.len() as u64;
+        // `$source.count` — total records ingested from this source.
+        let source_count: u64 = total_records;
 
         // Name → index map for looking up `CompiledTransform` by node
         // name. Borrowed by the dispatcher's Transform / Aggregation
@@ -1347,6 +1357,10 @@ impl PipelineExecutor {
             transform_by_name,
             stable: &stable,
             source_file_arc: &source_file_arc,
+            source_path_arc: &source_path_arc,
+            source_batch_arc: &source_batch_arc,
+            source_count,
+            source_ingestion_timestamp,
             strategy,
 
             node_buffers: HashMap::new(),

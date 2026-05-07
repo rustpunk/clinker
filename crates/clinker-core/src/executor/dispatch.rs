@@ -183,6 +183,20 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) transform_by_name: HashMap<&'a str, usize>,
     pub(crate) stable: &'a StableEvalContext,
     pub(crate) source_file_arc: &'a Arc<str>,
+    /// Backing storage for `$source.path` — full canonical path. Equal to
+    /// `source_file_arc` today (different label only after §5 introduces
+    /// the shortest-unique-suffix `$source.file_label` for path templates).
+    pub(crate) source_path_arc: &'a Arc<str>,
+    /// Backing storage for `$source.batch` — per-source-run UUID v7,
+    /// shared across all records ingested from this source. Distinct from
+    /// `pipeline.batch_id` which is single-valued per pipeline run.
+    pub(crate) source_batch_arc: &'a Arc<str>,
+    /// Backing storage for `$source.count` — the total record count
+    /// ingested from this source. Set after Phase-1 arena fill.
+    pub(crate) source_count: u64,
+    /// Backing storage for `$source.ingestion_timestamp` — wall-clock
+    /// time when ingestion of this source began.
+    pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
     pub(crate) strategy: ErrorStrategy,
 
     // Owned mutable per-walk state.
@@ -922,6 +936,10 @@ pub(crate) fn dispatch_plan_node(
                     stable: ctx.stable,
                     source_file: ctx.source_file_arc,
                     source_row: rn,
+                    source_path: ctx.source_path_arc,
+                    source_count: ctx.source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
                 };
 
                 let target_schema = output_schema
@@ -1193,6 +1211,10 @@ pub(crate) fn dispatch_plan_node(
                         stable: ctx.stable,
                         source_file: ctx.source_file_arc,
                         source_row: rn,
+                        source_path: ctx.source_path_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
                     };
 
                     let route_result = {
@@ -1594,6 +1616,10 @@ pub(crate) fn dispatch_plan_node(
                     stable: ctx.stable,
                     source_file: ctx.source_file_arc,
                     source_row: *row_num,
+                    source_path: ctx.source_path_arc,
+                    source_count: ctx.source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
                 };
                 if let Err(e) = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows) {
                     match ctx.config.error_handling.strategy {
@@ -1644,6 +1670,10 @@ pub(crate) fn dispatch_plan_node(
                 stable: ctx.stable,
                 source_file: ctx.source_file_arc,
                 source_row: 0,
+                source_path: ctx.source_path_arc,
+                source_count: ctx.source_count,
+                source_batch: ctx.source_batch_arc,
+                ingestion_timestamp: ctx.source_ingestion_timestamp,
             };
             let out_rows: Vec<AggSortRow> = if is_relaxed {
                 let mut hash_box = match stream.into_retained_hash() {
@@ -2379,6 +2409,10 @@ pub(crate) fn dispatch_plan_node(
                         stable: ctx.stable,
                         source_file: ctx.source_file_arc,
                         source_row: 0,
+                        source_path: ctx.source_path_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
                     };
                     let output_records = execute_combine_iejoin(IEJoinExec {
                         name,
@@ -2428,6 +2462,10 @@ pub(crate) fn dispatch_plan_node(
                         stable: ctx.stable,
                         source_file: ctx.source_file_arc,
                         source_row: 0,
+                        source_path: ctx.source_path_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
                     };
                     let output_records = execute_combine_grace_hash(GraceHashExec {
                         name,
@@ -2485,6 +2523,10 @@ pub(crate) fn dispatch_plan_node(
                         stable: ctx.stable,
                         source_file: ctx.source_file_arc,
                         source_row: 0,
+                        source_path: ctx.source_path_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
                     };
                     let output_records = execute_combine_sort_merge(SortMergeExec {
                         name,
@@ -2528,6 +2570,10 @@ pub(crate) fn dispatch_plan_node(
                 stable: ctx.stable,
                 source_file: ctx.source_file_arc,
                 source_row: 0,
+                source_path: ctx.source_path_arc,
+                source_count: ctx.source_count,
+                source_batch: ctx.source_batch_arc,
+                ingestion_timestamp: ctx.source_ingestion_timestamp,
             };
             let build_timer =
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
@@ -2576,6 +2622,10 @@ pub(crate) fn dispatch_plan_node(
                     stable: ctx.stable,
                     source_file: ctx.source_file_arc,
                     source_row: rn,
+                    source_path: ctx.source_path_arc,
+                    source_count: ctx.source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
                 };
 
                 // Probe-side key extraction routes through the

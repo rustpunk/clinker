@@ -322,7 +322,7 @@ fn source_ancestors_of(
         };
         match node {
             PipelineNode::Source { config: src, .. } => {
-                let stem = std::path::Path::new(&src.source.path)
+                let stem = std::path::Path::new(src.source.path_str())
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")

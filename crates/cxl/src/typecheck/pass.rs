@@ -384,9 +384,21 @@ impl<'a> TypeChecker<'a> {
             Expr::PipelineAccess { node_id, field, .. } => {
                 let ty = match &**field {
                     "start_time" => Type::DateTime,
-                    "name" | "execution_id" | "source_file" => Type::String,
-                    "total_count" | "ok_count" | "dlq_count" | "source_row" => Type::Int,
+                    "name" | "execution_id" | "batch_id" => Type::String,
+                    "total_count" | "ok_count" | "dlq_count" | "filtered_count"
+                    | "distinct_count" => Type::Int,
                     _ => Type::Any, // User-defined pipeline.vars.*
+                };
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+
+            Expr::SourceAccess { node_id, field, .. } => {
+                let ty = match &**field {
+                    "file" | "path" | "batch" => Type::String,
+                    "row" | "count" => Type::Int,
+                    "ingestion_timestamp" => Type::DateTime,
+                    _ => Type::Any,
                 };
                 self.set_type(*node_id, ty.clone());
                 ty
@@ -883,25 +895,23 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // Per-record provenance fields (`pipeline.source_row` /
-            // `pipeline.source_file`) cannot appear outside an aggregate
-            // function inside an aggregate transform —
-            // the residual evaluator at finalize() does not have a current
-            // record. Universal SQL practice (Postgres SQLSTATE 42803,
-            // DuckDB binder, Trino `$row_id` scan-only, Spark functional-
-            // dependency rule, DataFusion #20135).
-            Expr::PipelineAccess { field, span, .. }
+            // Per-record provenance fields (`source.row` / `source.file`)
+            // cannot appear outside an aggregate function inside an
+            // aggregate transform — the residual evaluator at finalize()
+            // does not have a current record. Universal SQL practice
+            // (Postgres SQLSTATE 42803, DuckDB binder, Trino `$row_id`
+            // scan-only, Spark functional-dependency rule, DataFusion #20135).
+            Expr::SourceAccess { field, span, .. }
                 if matches!(self.aggregate_mode, AggregateMode::GroupBy { .. })
-                    && self.agg_function_depth == 0
-                    && (field.as_ref() == "source_row" || field.as_ref() == "source_file") =>
+                    && self.agg_function_depth == 0 =>
             {
                 self.error(
                     *span,
                     format!(
-                        "`pipeline.{field}` is per-record provenance and cannot appear in an aggregate residual expression"
+                        "`source.{field}` is per-record provenance and cannot appear in an aggregate residual expression"
                     ),
                     Some(format!(
-                        "Wrap in an aggregate function (e.g., `first(pipeline.{field})`, `min(pipeline.{field})`, `max(pipeline.{field})`)"
+                        "Wrap in an aggregate function (e.g., `first($source.{field})`, `min($source.{field})`, `max($source.{field})`)"
                     )),
                 );
             }
@@ -952,6 +962,7 @@ impl<'a> TypeChecker<'a> {
             Expr::Literal { .. }
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
+            | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
@@ -1719,11 +1730,11 @@ mod tests {
     // Per-record provenance fields cannot appear bare in an aggregate
     // residual; must be wrapped in an aggregate.
     #[test]
-    fn test_typecheck_rejects_pipeline_source_row_in_agg_residual() {
-        let errs = agg_err("emit row = $pipeline.source_row", &["dept"], &["dept"]);
+    fn test_typecheck_rejects_source_row_in_agg_residual() {
+        let errs = agg_err("emit row = $source.row", &["dept"], &["dept"]);
         assert!(
             errs.iter()
-                .any(|d| d.message.contains("source_row")
+                .any(|d| d.message.contains("source.row")
                     && d.message.contains("per-record provenance")),
             "expected provenance rejection, got: {:?}",
             errs.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -1731,8 +1742,8 @@ mod tests {
     }
 
     #[test]
-    fn test_typecheck_allows_first_pipeline_source_row_in_agg() {
-        let _ = agg_ok("emit row = min($pipeline.source_row)", &["dept"], &["dept"]);
+    fn test_typecheck_allows_first_source_row_in_agg() {
+        let _ = agg_ok("emit row = min($source.row)", &["dept"], &["dept"]);
     }
 
     #[test]

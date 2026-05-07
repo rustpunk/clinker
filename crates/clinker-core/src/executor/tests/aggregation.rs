@@ -103,11 +103,7 @@ mod dispatch {
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
-        EvalContext {
-            stable,
-            source_file: file,
-            source_row: row,
-        }
+        EvalContext::test_with_file(stable, file, row)
     }
 
     fn group_state_for_key<'a>(
@@ -1488,11 +1484,7 @@ mod two_phase_bytes_spill {
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
-        EvalContext {
-            stable,
-            source_file: file,
-            source_row: row,
-        }
+        EvalContext::test_with_file(stable, file, row)
     }
 
     fn dataset() -> Vec<&'static str> {
