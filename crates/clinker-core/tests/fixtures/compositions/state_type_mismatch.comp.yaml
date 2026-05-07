@@ -1,0 +1,25 @@
+# Phase H integration fixture (Item 7c, E174): composition declares
+# `cutoff: { type: string }` while the parent declares it as `int`.
+# Compile must reject with E174 — types must match between parent
+# and composition opt-in.
+_compose:
+  name: state_type_mismatch
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: int }
+  outputs:
+    out: tap
+  config_schema: {}
+  scoped_vars:
+    pipeline:
+      cutoff:
+        type: string
+
+nodes:
+  - type: transform
+    name: tap
+    input: inp
+    config:
+      cxl: |
+        emit id = id

@@ -1,0 +1,5 @@
+---
+source: crates/clinker-core/tests/state_node_diagnostics.rs
+expression: render_diags(&diags)
+---
+E164: init-phase state node "init_writer" has runtime descendant "runtime_reader": init state nodes can feed other init-phase state nodes but must not be consumed by runtime-phase nodes (their record output is not visible in the runtime walk). Either change the consumer to `phase: init` or detach it from this init state node.

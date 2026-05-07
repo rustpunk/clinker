@@ -1,0 +1,27 @@
+# Phase H integration fixture (Item 7): composition body that opts
+# in to a parent `$pipeline.<custom>` variable via
+# `_compose.scoped_vars.pipeline`. The body's transform reads the
+# declared parent var and emits it; the integration test asserts the
+# parent's value is visible to the body.
+_compose:
+  name: state_uses_declared
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: int }
+  outputs:
+    out: tap
+  config_schema: {}
+  scoped_vars:
+    pipeline:
+      cutoff:
+        type: int
+
+nodes:
+  - type: transform
+    name: tap
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit cutoff_seen = $pipeline.cutoff
