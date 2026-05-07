@@ -1857,6 +1857,103 @@ nodes:
     }
 
     #[test]
+    fn test_state_node_init_phase_lowers_to_plan_node() {
+        // Phase E v1: `phase: init` is no longer rejected with E163
+        // — it lowers to `PlanNode::State` like a runtime-phase state
+        // node. The executor visits init-phase state nodes at their
+        // topological position; for single-source pipelines the
+        // natural ordering writes init values before runtime
+        // descendants read them.
+        let yaml = r#"
+pipeline:
+  name: state_init_phase_smoke
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: cfg
+    config:
+      name: cfg
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: precompute
+    input: cfg
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: cutoff
+          cxl: "amount"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let plan = cfg
+            .compile(&ctx)
+            .expect("init-phase state should now lower (Phase E v1)");
+        let dag = plan.dag();
+        assert!(
+            dag.graph.node_indices().any(|idx| matches!(
+                &dag.graph[idx],
+                crate::plan::execution::PlanNode::State { .. }
+            )),
+            "expected PlanNode::State for init-phase state node"
+        );
+    }
+
+    #[test]
+    fn test_state_node_init_phase_with_runtime_descendant_emits_e164() {
+        // Phase E v1: init state nodes must be terminal — a
+        // downstream node consuming from them is rejected with E164
+        // until Phase E-2's source-replay orchestration lands.
+        let yaml = r#"
+pipeline:
+  name: state_init_with_consumer
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: cfg
+    config:
+      name: cfg
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: precompute
+    input: cfg
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: cutoff
+          cxl: "amount"
+  - type: output
+    name: sink
+    input: precompute
+    config:
+      name: sink
+      type: csv
+      path: out.csv
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("init state node with runtime descendant should reject");
+        assert!(
+            err_diags.iter().any(|d| d.code == "E164"),
+            "expected E164, got: {:?}",
+            err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_state_node_record_scope_lowers_to_plan_node() {
         // Phase D-3: a runtime-phase record-scope state node compiles
         // end-to-end and lowers to `PlanNode::State`. The executor's

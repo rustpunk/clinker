@@ -212,8 +212,99 @@ pub fn bind_schema(
     );
 
     validate_state_writers(nodes, diags);
+    validate_init_phase_terminals(nodes, diags);
 
     artifacts
+}
+
+/// Compile-time check: an init-phase state node must be terminal in
+/// the DAG — no other node may consume from it. Without source-replay
+/// infrastructure, the executor cannot deliver init-phase records to
+/// runtime-phase descendants, and silent record-loss would be a
+/// debugging nightmare. Phase E v1 enforces the structural invariant
+/// up front; Phase E-2 will lift the restriction once two-pass
+/// orchestration with source replay lands.
+///
+/// Walks each `phase: init` state node and checks whether any other
+/// node in the topology references it as input. Emits E164 with the
+/// state node's span and the offending downstream node's name.
+fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
+    let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
+        let line = spanned.referenced.line() as u32;
+        if line > 0 {
+            Span::line_only(line)
+        } else {
+            Span::SYNTHETIC
+        }
+    };
+    let init_state_names: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|spanned| match &spanned.value {
+            PipelineNode::State { header, config }
+                if config.phase == crate::config::Phase::Init =>
+            {
+                Some(header.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if init_state_names.is_empty() {
+        return;
+    }
+    for spanned in nodes {
+        // For every node, check its inputs against the init-state-name
+        // set. Each input declared on a node implies a downstream
+        // dependency on that input, so an init state node showing up
+        // as an input means it has a non-init descendant.
+        let inputs: Vec<&str> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
+            | PipelineNode::Composition { header, .. } => {
+                vec![upstream_target_name(&header.input.value).unwrap_or("")]
+            }
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .collect(),
+        };
+        let consumer_name = spanned.value.name();
+        let consumer_span = span_for(spanned);
+        for input_name in inputs {
+            if init_state_names.contains(input_name) {
+                let init_state_span = nodes
+                    .iter()
+                    .find(|n| n.value.name() == input_name)
+                    .map(span_for)
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E164",
+                        format!(
+                            "init-phase state node {input_name:?} has runtime descendant \
+                             {consumer_name:?}: init state nodes must be terminal in the DAG \
+                             (Phase E-2 will lift this restriction once two-pass orchestration \
+                             with source replay lands)"
+                        ),
+                        LabeledSpan::primary(init_state_span, "init state node".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        consumer_span,
+                        Some("downstream consumer".to_string()),
+                    )),
+                );
+            }
+        }
+    }
 }
 
 /// Compile-time check: at most one state node writes any given

@@ -3173,19 +3173,17 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::State { config, .. } => {
             // Phases D / D-2 / D-3 wire all three runtime scope tiers.
-            // Init-phase orchestration is still gated by E163 (Phase E).
-            use crate::config::Phase as ConfPhase;
-            if config.phase == ConfPhase::Init {
-                diags.push(crate::error::Diagnostic::error(
-                    "E163",
-                    format!(
-                        "state node {name:?}: `phase: init` not yet wired (Phase E will run \
-                         the init sub-DAG to completion before runtime)"
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                ));
-                return None;
-            }
+            // Phase E v1 lowers `phase: init` identically to runtime —
+            // both produce `PlanNode::State` and the executor visits
+            // them at their topological position. For pipelines whose
+            // init data flows through a single primary chain, the
+            // topological order naturally runs init writes before any
+            // runtime descendant reads them. Strict
+            // init-before-runtime ordering across disjoint sub-DAGs
+            // (separate sources for init vs runtime) requires a
+            // two-pass walk with source-replay infrastructure that is
+            // a future Phase E-2 follow-up.
+            //
             // Pull each assignment's typed program out of
             // `artifacts.typed`. `bind_schema` populates these under
             // synthetic per-assignment keys; if any are missing, a
