@@ -34,11 +34,14 @@ fn run_with_output(
         .compile(&CompileContext::default())
         .expect("fixture must compile cleanly");
 
-    let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
+    let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
     for (name, data) in inputs {
         readers.insert(
             (*name).to_string(),
-            Box::new(std::io::Cursor::new(data.as_bytes().to_vec())) as Box<dyn Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(data.as_bytes().to_vec())),
+            ),
         );
     }
 

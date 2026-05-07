@@ -66,8 +66,16 @@ const PIPELINE_MEMBERS: &[&str] = &[
     "total_count",
     "ok_count",
     "dlq_count",
-    "source_file",
-    "source_row",
+];
+
+/// The known source.* member names — per-record / per-source provenance.
+const SOURCE_MEMBERS: &[&str] = &[
+    "file",
+    "row",
+    "path",
+    "count",
+    "batch",
+    "ingestion_timestamp",
 ];
 
 /// Run Phase B: resolve all identifiers in the program.
@@ -249,6 +257,22 @@ impl<'a> Resolver<'a> {
                     // For now, accept anything under pipeline.* and let runtime resolve
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
                     let _ = span;
+                }
+            }
+            Expr::SourceAccess {
+                node_id,
+                field,
+                span,
+            } => {
+                if SOURCE_MEMBERS.contains(&&**field) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown source member '$source.{field}'"),
+                        help: best_match(field, SOURCE_MEMBERS, 3)
+                            .map(|s| format!("did you mean '$source.{s}'?")),
+                    });
                 }
             }
             Expr::MetaAccess { node_id, .. } => {
@@ -518,6 +542,25 @@ mod tests {
         assert!(
             has_pipeline,
             "Expected PipelineMember binding for pipeline.start_time"
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_member() {
+        let resolved = resolve_ok("emit f = $source.file", &[]);
+        let has_binding = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(has_binding, "Expected binding for $source.file");
+    }
+
+    #[test]
+    fn test_resolve_unknown_source_member() {
+        let diags = resolve_err("emit f = $source.unknown", &[]);
+        assert!(
+            diags.iter().any(|d| d.message.contains("$source.unknown")),
+            "expected diagnostic for unknown $source member: {diags:?}"
         );
     }
 

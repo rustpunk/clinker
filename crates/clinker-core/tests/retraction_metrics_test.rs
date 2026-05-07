@@ -32,10 +32,12 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
         shutdown_token: None,
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers = HashMap::from([(
         primary,
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(

@@ -134,7 +134,7 @@ where
     }
 
     // Open reader for this source
-    let mut reader = open_reader(&input.path)?;
+    let mut reader = open_reader(input.path_str())?;
 
     // Build Arena. The standalone path holds a fresh `MemoryBudget`
     // — multi-source ingestion runs before the executor's ctx-owned

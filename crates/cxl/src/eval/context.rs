@@ -32,8 +32,8 @@ pub const MAX_STRING_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Pipeline-stable evaluation context — built once per pipeline run, shared
 /// (via `Arc`) across every record-level dispatch site. All `pipeline.*`
-/// members EXCEPT per-record provenance (`source_file`, `source_row`)
-/// resolve against this struct.
+/// members resolve against this struct; per-record provenance lives under
+/// `$source.*` on the borrowed `EvalContext<'_>` view.
 ///
 /// Mirrors DataFusion `Arc<TaskContext>`, Apache Beam `FinishBundleContext`,
 /// Flink `RuntimeContext`. Replaces an earlier per-record `String::clone` +
@@ -56,9 +56,9 @@ pub struct StableEvalContext {
 }
 
 impl StableEvalContext {
-    /// Resolve a stable `pipeline.*` member by name (everything except
-    /// per-record provenance). Per-record `source_file` / `source_row`
-    /// resolution lives on the borrowed `EvalContext<'_>` view.
+    /// Resolve a stable `pipeline.*` member by name. Per-record provenance
+    /// (`$source.file`, `$source.row`) resolves through the borrowed
+    /// `EvalContext<'_>` view, not this struct.
     pub fn resolve_pipeline_stable(&self, member: &str) -> Option<Value> {
         match member {
             "start_time" => Some(Value::DateTime(self.pipeline_start_time)),
@@ -97,24 +97,47 @@ impl StableEvalContext {
 }
 
 /// Per-record evaluation context view — borrows from a `StableEvalContext`
-/// and adds the only fields that change per row (`source_file`, `source_row`).
-/// Constructed inline at every dispatch site; zero allocation.
+/// and adds the per-record / per-source provenance fields. Constructed
+/// inline at every dispatch site; zero allocation.
 pub struct EvalContext<'a> {
     pub stable: &'a StableEvalContext,
-    /// pipeline.source_file — from record provenance, set per record.
+    /// `$source.file` — record's originating file path.
     pub source_file: &'a Arc<str>,
-    /// pipeline.source_row — from record provenance, set per record.
+    /// `$source.row` — record's row number within its source file
+    /// (0-indexed in the input stream).
     pub source_row: u64,
+    /// `$source.path` — full canonical path of the record's source file.
+    /// Equal to `source_file` today; distinct from a future
+    /// `$source.file_label` (shortest-unique-suffix display label).
+    pub source_path: &'a Arc<str>,
+    /// `$source.count` — total records ingested from this source. Stable
+    /// across all records from the same source within a run.
+    pub source_count: u64,
+    /// `$source.batch` — per-source-run identifier (UUID v7 by default).
+    /// Distinct from `pipeline.batch_id` which is per-pipeline-run.
+    pub source_batch: &'a Arc<str>,
+    /// `$source.ingestion_timestamp` — wall-clock time when ingestion of
+    /// this source began.
+    pub ingestion_timestamp: NaiveDateTime,
 }
 
 impl<'a> EvalContext<'a> {
-    /// Resolve a `pipeline.*` member by name. Per-record provenance is
-    /// served by the view; everything else delegates to the stable context.
+    /// Resolve a `pipeline.*` member by name — pipeline-stable values only.
+    /// Per-record provenance lives under `$source.*`; see `resolve_source`.
     pub fn resolve_pipeline(&self, member: &str) -> Option<Value> {
+        self.stable.resolve_pipeline_stable(member)
+    }
+
+    /// Resolve a `$source.*` member — per-record / per-source provenance.
+    pub fn resolve_source(&self, member: &str) -> Option<Value> {
         match member {
-            "source_file" => Some(Value::String(self.source_file.to_string().into())),
-            "source_row" => Some(Value::Integer(self.source_row as i64)),
-            other => self.stable.resolve_pipeline_stable(other),
+            "file" => Some(Value::String(self.source_file.to_string().into())),
+            "row" => Some(Value::Integer(self.source_row as i64)),
+            "path" => Some(Value::String(self.source_path.to_string().into())),
+            "count" => Some(Value::Integer(self.source_count as i64)),
+            "batch" => Some(Value::String(self.source_batch.to_string().into())),
+            "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
+            _ => None,
         }
     }
 
@@ -129,6 +152,37 @@ impl<'a> EvalContext<'a> {
             stable,
             source_file: test_default_source_file(),
             source_row: 1,
+            source_path: test_default_source_file(),
+            source_count: 0,
+            source_batch: test_default_source_batch(),
+            ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        }
+    }
+
+    /// Test helper: borrow a stable context plus an explicit source-file
+    /// `Arc<str>` and row number, defaulting the rest of `$source.*` to
+    /// the same placeholder values as `test_default_borrowed`. Used by
+    /// the workspace test helpers that previously constructed
+    /// `EvalContext` literally with three fields.
+    pub fn test_with_file(
+        stable: &'a StableEvalContext,
+        source_file: &'a Arc<str>,
+        source_row: u64,
+    ) -> Self {
+        Self {
+            stable,
+            source_file,
+            source_row,
+            source_path: source_file,
+            source_count: 0,
+            source_batch: test_default_source_batch(),
+            ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
         }
     }
 }
@@ -140,6 +194,13 @@ fn test_default_source_file() -> &'static Arc<str> {
     use std::sync::OnceLock;
     static FILE: OnceLock<Arc<str>> = OnceLock::new();
     FILE.get_or_init(|| Arc::from("test.csv"))
+}
+
+/// Like `test_default_source_file` but for `$source.batch`.
+fn test_default_source_batch() -> &'static Arc<str> {
+    use std::sync::OnceLock;
+    static BATCH: OnceLock<Arc<str>> = OnceLock::new();
+    BATCH.get_or_init(|| Arc::from("test-batch-000"))
 }
 
 #[cfg(test)]
@@ -248,31 +309,77 @@ mod tests {
         assert!(ctx.resolve_pipeline("nonexistent").is_none());
     }
 
+    fn make_ctx<'a>(
+        stable: &'a StableEvalContext,
+        file: &'a Arc<str>,
+        batch: &'a Arc<str>,
+        row: u64,
+    ) -> EvalContext<'a> {
+        EvalContext {
+            stable,
+            source_file: file,
+            source_row: row,
+            source_path: file,
+            source_count: 100,
+            source_batch: batch,
+            ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        }
+    }
+
     #[test]
-    fn test_pipeline_source_provenance_per_record() {
+    fn test_source_provenance_per_record() {
         let stable = StableEvalContext::test_default();
         let file_a: Arc<str> = Arc::from("file_a.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &file_a,
-            source_row: 10,
-        };
-        match ctx.resolve_pipeline("source_file").unwrap() {
+        let batch: Arc<str> = Arc::from("batch-000");
+        let ctx = make_ctx(&stable, &file_a, &batch, 10);
+        match ctx.resolve_source("file").unwrap() {
             Value::String(s) => assert_eq!(&*s, "file_a.csv"),
             other => panic!("expected String, got {:?}", other),
         }
-        assert_eq!(ctx.resolve_pipeline("source_row"), Some(Value::Integer(10)));
+        assert_eq!(ctx.resolve_source("row"), Some(Value::Integer(10)));
 
         let file_b: Arc<str> = Arc::from("file_b.csv");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &file_b,
-            source_row: 20,
-        };
-        match ctx.resolve_pipeline("source_file").unwrap() {
+        let ctx = make_ctx(&stable, &file_b, &batch, 20);
+        match ctx.resolve_source("file").unwrap() {
             Value::String(s) => assert_eq!(&*s, "file_b.csv"),
             other => panic!("expected String, got {:?}", other),
         }
-        assert_eq!(ctx.resolve_pipeline("source_row"), Some(Value::Integer(20)));
+        assert_eq!(ctx.resolve_source("row"), Some(Value::Integer(20)));
+    }
+
+    #[test]
+    fn test_source_full_member_set() {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("data/orders.csv");
+        let batch: Arc<str> = Arc::from("RUN-2026-001");
+        let ctx = make_ctx(&stable, &file, &batch, 42);
+        match ctx.resolve_source("path").unwrap() {
+            Value::String(s) => assert_eq!(&*s, "data/orders.csv"),
+            other => panic!("expected String, got {:?}", other),
+        }
+        assert_eq!(ctx.resolve_source("count"), Some(Value::Integer(100)));
+        match ctx.resolve_source("batch").unwrap() {
+            Value::String(s) => assert_eq!(&*s, "RUN-2026-001"),
+            other => panic!("expected String, got {:?}", other),
+        }
+        assert!(matches!(
+            ctx.resolve_source("ingestion_timestamp"),
+            Some(Value::DateTime(_))
+        ));
+        assert!(ctx.resolve_source("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_pipeline_no_longer_has_source_fields() {
+        let stable = StableEvalContext::test_default();
+        let file_a: Arc<str> = Arc::from("file_a.csv");
+        let batch: Arc<str> = Arc::from("b");
+        let ctx = make_ctx(&stable, &file_a, &batch, 10);
+        // After §0 split, source_file/source_row are NOT under $pipeline.*.
+        assert!(ctx.resolve_pipeline("source_file").is_none());
+        assert!(ctx.resolve_pipeline("source_row").is_none());
     }
 }

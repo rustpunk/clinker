@@ -141,6 +141,15 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// Per-record source provenance: `$source.file`, `$source.row`.
+    /// Distinct namespace from `$pipeline.*` (pipeline-stable per-run state)
+    /// because per-record values cannot be pipeline-scope when one Source
+    /// matches multiple files or multiple Sources feed a join.
+    SourceAccess {
+        node_id: NodeId,
+        field: Box<str>,
+        span: Span,
+    },
     MetaAccess {
         node_id: NodeId,
         field: Box<str>,
@@ -201,6 +210,7 @@ impl Expr {
             | Expr::Coalesce { span, .. }
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
+            | Expr::SourceAccess { span, .. }
             | Expr::MetaAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
@@ -224,6 +234,7 @@ impl Expr {
             | Expr::Coalesce { node_id, .. }
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
+            | Expr::SourceAccess { node_id, .. }
             | Expr::MetaAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
@@ -302,6 +313,7 @@ impl Expr {
                 }
             }
             Expr::PipelineAccess { .. }
+            | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
@@ -313,7 +325,10 @@ impl Expr {
 }
 
 fn is_system_namespace(name: &str) -> bool {
-    name.starts_with("$pipeline") || name.starts_with("$meta") || name.starts_with("$ck")
+    name.starts_with("$pipeline")
+        || name.starts_with("$source")
+        || name.starts_with("$meta")
+        || name.starts_with("$ck")
 }
 
 #[derive(Debug, Clone)]

@@ -267,15 +267,16 @@ fn generate_input_doc(
     let schema = build_input_schema(input);
     let field_count = schema.as_ref().map(|s| s.fields.len()).unwrap_or(0);
 
+    let target = input.display_target();
     let summary = if field_count > 0 {
         format!(
             "Ingests {} from `{}` with {} schema-defined field(s).",
-            format_name, input.path, field_count,
+            format_name, target, field_count,
         )
     } else {
         format!(
             "Ingests {} from `{}` with inferred schema.",
-            format_name, input.path,
+            format_name, target,
         )
     };
 
@@ -289,7 +290,7 @@ fn generate_input_doc(
     entries.push(ConfigEntry {
         category: ConfigCategory::Format,
         key: "PATH".to_string(),
-        value: input.path.clone(),
+        value: target,
     });
 
     // Format-specific options

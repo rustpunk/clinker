@@ -28,6 +28,15 @@
 //! | `E112`      | error    | Runtime composition recursion depth exceeded |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
+//! | `E210`      | error    | Source declares more than one of `{path,glob,regex,paths}` |
+//! | `E211`      | error    | Source declares none of `{path,glob,regex,paths}`    |
+//! | `E212`      | error    | Invalid glob pattern in source matcher               |
+//! | `E213`      | error    | Invalid regex pattern in source matcher              |
+//! | `E214`      | error    | Invalid duration string for `modified_after`/`_before` |
+//! | `E215`      | error    | Invalid byte size for `min_size`/`max_size`          |
+//! | `E216`      | error    | Source matched zero files (with `on_no_match: error`) |
+//! | `E217`      | error    | Schema mismatch across multi-file source's files     |
+//! | `E218`      | error    | `files.take_first` and `files.take_last` both set    |
 //! | `E15Y`      | error    | Aggregate with streaming strategy over relaxed-CK group_by |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |

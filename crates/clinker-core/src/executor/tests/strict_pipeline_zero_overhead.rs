@@ -79,9 +79,12 @@ o2,HR,20
 o3,ENG,100
 ";
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -95,9 +98,14 @@ o3,ENG,100
         shutdown_token: None,
     };
     let config = crate::config::parse_config(STRICT_PIPELINE).expect("parse");
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("strict pipeline must run on the FastPath without error");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("strict pipeline must run on the FastPath without error");
 
     // Strict pipelines emit every record through the strict commit
     // body — no deferred-Output speculation, no cascading-retraction

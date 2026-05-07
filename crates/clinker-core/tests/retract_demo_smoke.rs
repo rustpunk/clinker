@@ -116,14 +116,20 @@ fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Strin
         .name
         .clone();
 
-    let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
+    let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
     readers.insert(
         "orders".to_string(),
-        Box::new(Cursor::new(orders_csv.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(orders_csv.as_bytes().to_vec())),
+        ),
     );
     readers.insert(
         "audit_events".to_string(),
-        Box::new(Cursor::new(audit_events_csv.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(audit_events_csv.as_bytes().to_vec())),
+        ),
     );
     assert_eq!(primary, "orders", "demo's primary driving source is orders");
 

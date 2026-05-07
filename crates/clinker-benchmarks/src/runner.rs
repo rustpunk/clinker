@@ -51,7 +51,7 @@ impl BenchPipelineRunner {
             .count();
 
         // Build a reader for each source node.
-        let mut readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::new();
+        let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
 
         for spanned in &config.nodes {
             if let PipelineNode::Source {
@@ -85,7 +85,10 @@ impl BenchPipelineRunner {
                 let file = std::fs::File::open(&data_path).expect("cached data file must exist");
                 readers.insert(
                     body.source.name.clone(),
-                    Box::new(BufReader::new(file)) as _,
+                    clinker_core::executor::single_file_reader(
+                        data_path.clone(),
+                        Box::new(BufReader::new(file)),
+                    ),
                 );
             }
         }

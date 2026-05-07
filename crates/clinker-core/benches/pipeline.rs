@@ -89,9 +89,12 @@ nodes:
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
-                let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+                let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
-                    Box::new(Cursor::new(csv_bytes.clone())) as Box<dyn std::io::Read + Send>,
+                    clinker_core::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(csv_bytes.clone())),
+                    ),
                 )]);
                 let buf = BenchBuffer::new();
                 let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
@@ -175,9 +178,12 @@ nodes:
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
-                let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+                let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
-                    Box::new(Cursor::new(csv_bytes.clone())) as Box<dyn std::io::Read + Send>,
+                    clinker_core::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(csv_bytes.clone())),
+                    ),
                 )]);
                 let buf = BenchBuffer::new();
                 let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
@@ -275,9 +281,12 @@ nodes:
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
-                let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+                let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
-                    Box::new(Cursor::new(csv_bytes.clone())) as Box<dyn std::io::Read + Send>,
+                    clinker_core::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(csv_bytes.clone())),
+                    ),
                 )]);
                 let high_buf = BenchBuffer::new();
                 let medium_buf = BenchBuffer::new();
@@ -372,9 +381,12 @@ nodes:
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
-                let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+                let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
-                    Box::new(Cursor::new(csv_bytes.clone())) as Box<dyn std::io::Read + Send>,
+                    clinker_core::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(csv_bytes.clone())),
+                    ),
                 )]);
                 let buf = BenchBuffer::new();
                 let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(

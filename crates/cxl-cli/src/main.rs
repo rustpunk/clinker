@@ -284,10 +284,17 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
+    // REPL has no real batch context — use the same placeholder as the
+    // stable execution_id so `$source.batch` is at least non-empty.
+    let source_batch_arc: std::sync::Arc<str> = std::sync::Arc::clone(&stable.pipeline_batch_id);
     let ctx = EvalContext {
         stable: &stable,
         source_file: &source_file_arc,
         source_row: 1,
+        source_path: &source_file_arc,
+        source_count: 1,
+        source_batch: &source_batch_arc,
+        ingestion_timestamp: stable.pipeline_start_time,
     };
 
     let resolver = HashMapResolver::new(record_map);
@@ -535,6 +542,7 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
+        cxl::ast::Expr::SourceAccess { field, .. } => format!("$source.{}", field),
         cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
@@ -685,10 +693,16 @@ mod tests {
             pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let source_batch_arc: std::sync::Arc<str> =
+            std::sync::Arc::clone(&stable.pipeline_batch_id);
         let ctx = EvalContext {
             stable: &stable,
             source_file: &source_file_arc,
             source_row: 1,
+            source_path: &source_file_arc,
+            source_count: 1,
+            source_batch: &source_batch_arc,
+            ingestion_timestamp: stable.pipeline_start_time,
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
@@ -727,10 +741,16 @@ mod tests {
             pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let source_batch_arc: std::sync::Arc<str> =
+            std::sync::Arc::clone(&stable.pipeline_batch_id);
         let ctx = EvalContext {
             stable: &stable,
             source_file: &source_file_arc,
             source_row: 1,
+            source_path: &source_file_arc,
+            source_count: 1,
+            source_batch: &source_batch_arc,
+            ingestion_timestamp: stable.pipeline_start_time,
         };
 
         let resolver = HashMapResolver::new(fields);

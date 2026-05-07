@@ -75,11 +75,14 @@ fn run_pipeline_multi_source(
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let plan = config.compile(&ctx).expect("compile pipeline");
 
-    let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
+    let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
     for (name, data) in inputs {
         readers.insert(
             (*name).to_string(),
-            Box::new(Cursor::new(data.as_bytes().to_vec())) as Box<dyn Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(data.as_bytes().to_vec())),
+            ),
         );
     }
 

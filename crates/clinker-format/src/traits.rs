@@ -12,6 +12,18 @@ use crate::error::FormatError;
 pub trait FormatReader: Send {
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError>;
     fn next_record(&mut self) -> Result<Option<Record>, FormatError>;
+
+    /// Borrow the path of the file that produced the most-recently-
+    /// emitted record. Returns `None` for single-file readers (the
+    /// caller falls back to the source's static path); multi-file
+    /// readers override this to expose the per-file `Arc<str>` that
+    /// changes as the wrapper advances across file boundaries.
+    ///
+    /// Wrappers (e.g. `CoercingReader`) that hold an inner reader
+    /// must delegate to it.
+    fn current_source_file(&self) -> Option<&Arc<str>> {
+        None
+    }
 }
 
 /// Streaming record writer. Consumes records one at a time.

@@ -1499,11 +1499,7 @@ mod tests {
         );
         let stable = cxl::eval::StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("");
-        let ctx = EvalContext {
-            stable: &stable,
-            source_file: &source_file,
-            source_row: 0,
-        };
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut budget = match rk.budget_bytes {
             Some(b) => MemoryBudget::new(b, 0.80),
             None => MemoryBudget::from_config(None),

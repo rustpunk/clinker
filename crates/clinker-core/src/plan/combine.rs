@@ -407,6 +407,7 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }

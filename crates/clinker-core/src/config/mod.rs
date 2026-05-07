@@ -110,7 +110,49 @@ pub struct ConcurrencyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
-    pub path: String,
+    /// Literal file path (the simple case). Mutually exclusive with
+    /// `glob`/`regex`/`paths`; exactly one of the four must be set.
+    /// Validated post-deserialize via `SourceConfig::validate_matching`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Glob pattern matching one or more files (POSIX/gitignore semantics
+    /// via the `glob` crate). Mutually exclusive with `path`/`regex`/`paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    /// Regex pattern matched against full paths under the workspace root.
+    /// Mutually exclusive with `path`/`glob`/`paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// Explicit list of files. Mutually exclusive with `path`/`glob`/`regex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+
+    /// Glob patterns to remove from the discovered file set (gitignore
+    /// semantics). Applied after primary discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    /// Skip files modified before this point. Accepts a duration relative
+    /// to "now" (`"5m"`, `"2h"`, `"3d"`) or an RFC3339 timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_after: Option<TimeBound>,
+    /// Skip files modified after this point. Accepts the same forms as
+    /// `modified_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_before: Option<TimeBound>,
+    /// Skip files smaller than this size. Accepts `"1KB"`, `"10MB"`, etc.
+    /// (decimal, 1KB = 1000 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_size: Option<ByteSize>,
+    /// Skip files larger than this size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<ByteSize>,
+
+    /// File-listing controls (sort order, take N, recursion, no-match
+    /// policy). Nested to keep the file-level `sort_order` separate from
+    /// the existing record-level `sort_order` field below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<FileListingControls>,
+
     /// Format-layer schema pointer (e.g. fixed-width field layouts).
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk
@@ -122,6 +164,9 @@ pub struct SourceConfig {
     pub schema_overrides: Option<Vec<FieldDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_paths: Option<Vec<ArrayPathConfig>>,
+    /// Record-level sortedness inside the file (used by combine/aggregate
+    /// planning to enable streaming strategies). Distinct from
+    /// `files.sort_order` which orders the file set itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(flatten)]
@@ -129,6 +174,186 @@ pub struct SourceConfig {
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// File-listing controls — file-set ordering, take-N, recursion,
+/// no-match policy. Nested under `files:` to avoid colliding with the
+/// record-level `sort_order:` field at the SourceConfig top level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FileListingControls {
+    /// Sort key for the file set. Default `Name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<FileSortKey>,
+    /// Sort direction. Default `Asc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<SortDir>,
+    /// Take only the first N files after sort. Mutually exclusive with
+    /// `take_last`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take_first: Option<usize>,
+    /// Take only the last N files after sort. Mutually exclusive with
+    /// `take_first`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take_last: Option<usize>,
+    /// Walk directories recursively. Default: true if the glob contains
+    /// `**`, false otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+    /// Behavior when no files match. Default `Error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_no_match: Option<NoMatchPolicy>,
+}
+
+/// Sort key for ordering the discovered file set.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSortKey {
+    /// Lexicographic sort on the full path.
+    #[default]
+    Name,
+    /// Sort by file creation time (`birthtime` on supporting filesystems;
+    /// falls back to mtime where unavailable).
+    Created,
+    /// Sort by last-modified time.
+    Modified,
+}
+
+/// Sort direction for the file set ordering.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// Behavior when discovery matches zero files.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoMatchPolicy {
+    /// Fail the run with E216.
+    #[default]
+    Error,
+    /// Log a warning and continue with an empty record stream.
+    Warn,
+    /// Silently produce an empty record stream.
+    Skip,
+}
+
+/// Time bound for `modified_after` / `modified_before`. Resolves to a
+/// concrete `SystemTime` at parse time. Two YAML forms:
+///
+/// - **Relative duration**: `"5m"`, `"2h"`, `"3d"`, `"30s"` — interpreted
+///   relative to the time of deserialization (effectively "now").
+/// - **Absolute timestamp**: any RFC3339 string (`"2026-05-01T00:00:00Z"`).
+#[derive(Debug, Clone, Copy)]
+pub struct TimeBound(pub std::time::SystemTime);
+
+impl TimeBound {
+    /// Parse `"<n><unit>"` with unit ∈ {s, m, h, d}. Returns `None` if the
+    /// string is not in this form.
+    fn parse_duration(s: &str) -> Option<std::time::Duration> {
+        let (num_str, unit) = s.split_at(s.len().checked_sub(1)?);
+        let n: u64 = num_str.parse().ok()?;
+        let secs = match unit {
+            "s" => n,
+            "m" => n.checked_mul(60)?,
+            "h" => n.checked_mul(60 * 60)?,
+            "d" => n.checked_mul(60 * 60 * 24)?,
+            _ => return None,
+        };
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+impl Serialize for TimeBound {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Round-trip as RFC3339 — the relative form is parse-time only.
+        let dt: chrono::DateTime<chrono::Utc> = self.0.into();
+        s.serialize_str(&dt.to_rfc3339())
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeBound {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        if let Some(dur) = Self::parse_duration(&raw) {
+            // Relative-to-now: clip rather than panic if the duration
+            // somehow underflows (it won't for any reasonable value).
+            let when = std::time::SystemTime::now()
+                .checked_sub(dur)
+                .unwrap_or(std::time::UNIX_EPOCH);
+            return Ok(TimeBound(when));
+        }
+        let dt = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|e| {
+            de::Error::custom(format!(
+                "expected duration like \"5m\"/\"2h\"/\"3d\" or RFC3339 timestamp; \
+                 got {raw:?}: {e}"
+            ))
+        })?;
+        Ok(TimeBound(dt.with_timezone(&chrono::Utc).into()))
+    }
+}
+
+/// Byte size for `min_size` / `max_size`. Decimal units (1KB = 1000 bytes,
+/// 1MB = 1_000_000) — matches the convention used by `du`, `df`, AWS CLI,
+/// and most file-tooling. Plain `"1024"` (no unit) is interpreted as bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSize(pub u64);
+
+impl ByteSize {
+    fn parse(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let (num_part, mult) = if let Some(rest) = s.strip_suffix("GB") {
+            (rest, 1_000_000_000)
+        } else if let Some(rest) = s.strip_suffix("MB") {
+            (rest, 1_000_000)
+        } else if let Some(rest) = s.strip_suffix("KB") {
+            (rest, 1_000)
+        } else if let Some(rest) = s.strip_suffix('B') {
+            (rest, 1)
+        } else {
+            (s, 1)
+        };
+        let n: u64 = num_part.trim().parse().ok()?;
+        n.checked_mul(mult)
+    }
+}
+
+impl Serialize for ByteSize {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{}B", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Accept either an integer (bytes) or a string with a unit suffix.
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = ByteSize;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte size as integer or string like \"1KB\"/\"100MB\"")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ByteSize, E> {
+                Ok(ByteSize(v))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ByteSize, E> {
+                u64::try_from(v)
+                    .map(ByteSize)
+                    .map_err(|_| de::Error::custom("byte size cannot be negative"))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ByteSize, E> {
+                ByteSize::parse(v).map(ByteSize).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "expected byte size like \"100\"/\"1KB\"/\"5MB\"/\"2GB\"; got {v:?}"
+                    ))
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// Adjacently tagged format enum for inputs.
@@ -254,6 +479,35 @@ impl SourceConfig {
         match &self.format {
             InputFormat::Csv(opts) => opts.as_ref(),
             _ => None,
+        }
+    }
+
+    /// Borrow the literal `path:` for the simple-case source. Returns `""`
+    /// for sources using `glob`/`regex`/`paths` matchers — the latter
+    /// resolve to a `Vec<PathBuf>` at discovery time and don't have a
+    /// single literal path to display.
+    ///
+    /// Use this only on call sites that genuinely want the literal path
+    /// (display, security checks of one path, schema-stem extraction for
+    /// the simple case). For runtime file enumeration use the discovery
+    /// module instead.
+    pub fn path_str(&self) -> &str {
+        self.path.as_deref().unwrap_or("")
+    }
+
+    /// Human-readable target description for diagnostics and Kiln display.
+    /// Reflects the active matcher (`path` / `glob` / `regex` / `paths`).
+    pub fn display_target(&self) -> String {
+        if let Some(p) = self.path.as_deref() {
+            p.to_string()
+        } else if let Some(g) = self.glob.as_deref() {
+            format!("glob: {g}")
+        } else if let Some(r) = self.regex.as_deref() {
+            format!("regex: {r}")
+        } else if let Some(ps) = self.paths.as_deref() {
+            format!("paths: [{}]", ps.join(", "))
+        } else {
+            String::new()
         }
     }
 }
@@ -2790,6 +3044,7 @@ pub(crate) fn lower_node_to_plan_node(
             resolved: Some(Box::new(PlanOutputPayload {
                 output: config.output.clone(),
                 validated_path: None,
+                fan_out_per_source_file: false,
             })),
         }),
         PipelineNode::Route { config, .. } => Some(PlanNode::Route {

@@ -76,9 +76,12 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
     let plan = config.compile(&ctx).expect("compile pipeline");
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+    let readers = HashMap::from([(
         primary,
-        Box::new(Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
 
     let buf = SharedBuffer::new();

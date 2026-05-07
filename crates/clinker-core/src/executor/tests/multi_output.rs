@@ -51,11 +51,11 @@ fn test_eval_context() -> cxl::eval::EvalContext<'static> {
     use std::sync::{Arc, OnceLock};
     static STABLE: OnceLock<cxl::eval::StableEvalContext> = OnceLock::new();
     static SOURCE_FILE: OnceLock<Arc<str>> = OnceLock::new();
-    cxl::eval::EvalContext {
-        stable: STABLE.get_or_init(cxl::eval::StableEvalContext::test_default),
-        source_file: SOURCE_FILE.get_or_init(|| Arc::from("test.csv")),
-        source_row: 1,
-    }
+    cxl::eval::EvalContext::test_with_file(
+        STABLE.get_or_init(cxl::eval::StableEvalContext::test_default),
+        SOURCE_FILE.get_or_init(|| Arc::from("test.csv")),
+        1,
+    )
 }
 
 /// Helper: assemble a Record from an `(emitted, metadata)` field pair
@@ -331,10 +331,12 @@ fn run_multi_output(
     let params = test_params(&config);
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
         .iter()
@@ -346,8 +348,13 @@ fn run_multi_output(
         })
         .collect();
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -706,9 +713,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let good_buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
@@ -723,8 +733,13 @@ nodes:
         ),
     ]);
 
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        "src",
+        readers,
+        writers.into(),
+        &params,
+    );
     assert!(result.is_err(), "should propagate writer error");
 }
 
@@ -997,9 +1012,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
         (
@@ -1016,7 +1034,7 @@ nodes:
 
     // Panic should be caught and propagated, not hang or abort
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params)
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers.into(), &params)
     }));
 
     // The panic is re-raised via resume_unwind, so catch_unwind catches it
@@ -1169,9 +1187,12 @@ nodes:
 
     // Enough records that "b" gets traffic and will error
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
         (
@@ -1188,8 +1209,13 @@ nodes:
     ]);
 
     // Should not deadlock — producer handles SendError::Disconnected
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        "src",
+        readers,
+        writers.into(),
+        &params,
+    );
     // Either error (from the dying writer) or success if the writer survived long enough
     // The key assertion: no deadlock, no hang — the test completes
     let _ = result;
@@ -1261,9 +1287,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     // Both writers will fail on flush → PipelineError::Multiple
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
@@ -1277,8 +1306,13 @@ nodes:
         ),
     ]);
 
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        "src",
+        readers,
+        writers.into(),
+        &params,
+    );
     // The DAG-walk Output arm collects every Output's write/flush
     // failure across the topo walk before aggregating into
     // PipelineError::Multiple. With both writers failing on flush, the
@@ -1679,9 +1713,12 @@ nodes:
     let params = test_params(&config);
     let input_csv = "id,name\n1,Alice\n2,Bob\n";
 
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+    let readers: crate::executor::SourceReaders = [(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(input_csv.to_string())),
+        ),
     )]
     .into_iter()
     .collect();
@@ -1696,8 +1733,13 @@ nodes:
         })
         .collect();
 
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        "src",
+        readers,
+        writers.into(),
+        &params,
+    );
     assert!(
         result.is_ok(),
         "single-writer HashMap should work: {result:?}"
@@ -1743,9 +1785,12 @@ nodes:
     let params = test_params(&config);
     let input_csv = "x\n42\n";
 
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+    let readers: crate::executor::SourceReaders = [(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(input_csv.to_string())),
+        ),
     )]
     .into_iter()
     .collect();
@@ -1760,8 +1805,13 @@ nodes:
         })
         .collect();
 
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        "src",
+        readers,
+        writers.into(),
+        &params,
+    );
     assert!(
         result.is_ok(),
         "single-reader HashMap should work: {result:?}"

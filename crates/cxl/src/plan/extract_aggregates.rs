@@ -192,6 +192,7 @@ fn extract_aggs_from_expr(
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -332,6 +333,7 @@ fn rewrite_group_key_refs(
         | Expr::QualifiedFieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -414,6 +416,7 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -460,6 +463,7 @@ fn contains_agg_call(expr: &Expr) -> bool {
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -522,6 +526,9 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
         Expr::Now { .. } => buf.push_str("now"),
         Expr::PipelineAccess { field, .. } => {
             let _ = write!(buf, "p:{field}");
+        }
+        Expr::SourceAccess { field, .. } => {
+            let _ = write!(buf, "s:{field}");
         }
         Expr::MetaAccess { field, .. } => {
             let _ = write!(buf, "m:{field}");

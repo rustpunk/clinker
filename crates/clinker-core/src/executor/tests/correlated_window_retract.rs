@@ -64,10 +64,12 @@ fn run_pipeline(
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
 
     let buf = SharedBuffer::new();
@@ -76,8 +78,13 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 

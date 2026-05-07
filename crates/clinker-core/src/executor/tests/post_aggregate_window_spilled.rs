@@ -82,16 +82,19 @@ nodes:
         shutdown_token: None,
     };
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.into_bytes())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
+    PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers.into(), &params)
         .expect("pipeline must run under memory pressure");
     let output = buf.as_string();
 

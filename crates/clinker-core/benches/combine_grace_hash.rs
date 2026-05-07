@@ -236,14 +236,20 @@ fn run_grace(
     probe_csv: &[u8],
     params: &PipelineRunParams,
 ) -> Vec<u8> {
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "build".to_string(),
-            Box::new(Cursor::new(build_csv.to_vec())) as Box<dyn std::io::Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(build_csv.to_vec())),
+            ),
         ),
         (
             "probe".to_string(),
-            Box::new(Cursor::new(probe_csv.to_vec())) as Box<dyn std::io::Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(probe_csv.to_vec())),
+            ),
         ),
     ]);
     let out_buf = BenchBuffer::new();

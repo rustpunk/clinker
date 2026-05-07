@@ -106,16 +106,20 @@ ENG,5000
         .compile(&crate::config::CompileContext::default())
         .expect("compile");
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
+            ),
         ),
         (
             "depts".to_string(),
-            Box::new(std::io::Cursor::new(depts.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(depts.as_bytes().to_vec())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -228,16 +232,20 @@ ENG,5000
         .compile(&crate::config::CompileContext::default())
         .expect("compile");
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
+            ),
         ),
         (
             "depts".to_string(),
-            Box::new(std::io::Cursor::new(depts.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(depts.as_bytes().to_vec())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();

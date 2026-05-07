@@ -180,6 +180,56 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
     out
 }
 
+/// Map from source-node name to the ordered list of files feeding that
+/// source. Each entry pairs the originating filesystem path (used to
+/// stamp `$source.file` per record) with an open `Read` handle.
+///
+/// For literal-`path:` sources the vec holds a single element. For
+/// `glob`/`regex`/`paths` sources the discovery layer produces one
+/// entry per matched file; the executor concatenates them into a single
+/// stream via [`crate::source::multi_file::MultiFileFormatReader`] and
+/// stamps each record with the file it came from.
+pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot>>;
+
+/// Output writer registry. Holds two parallel maps:
+///
+/// - `single`: one writer per output name (the legacy shape; matches
+///   one-Output-to-one-file pipelines).
+/// - `fan_out`: per-source-file writers for outputs flagged
+///   `fan_out_per_source_file` in the plan. Outer key is the output
+///   name; inner key is the source-file `Arc<str>` (matching the
+///   per-record Arcs in `ExecutorContext.source_file_arcs`).
+///
+/// Auto-converts from `HashMap<String, Box<dyn Write + Send>>` so
+/// existing callers that don't need fan-out keep the simpler shape.
+#[derive(Default)]
+pub struct WriterRegistry {
+    pub single: HashMap<String, Box<dyn Write + Send>>,
+    pub fan_out: HashMap<String, HashMap<std::sync::Arc<str>, Box<dyn Write + Send>>>,
+}
+
+impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
+    fn from(single: HashMap<String, Box<dyn Write + Send>>) -> Self {
+        Self {
+            single,
+            fan_out: HashMap::new(),
+        }
+    }
+}
+
+/// Helper for callers (mostly tests and benchmarks) that have a single
+/// in-memory reader per source: wraps it in the one-element
+/// `Vec<FileSlot>` shape that the executor's reader registry expects.
+pub fn single_file_reader(
+    path: impl Into<std::path::PathBuf>,
+    reader: Box<dyn Read + Send>,
+) -> Vec<crate::source::multi_file::FileSlot> {
+    vec![crate::source::multi_file::FileSlot {
+        path: path.into(),
+        reader,
+    }]
+}
+
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
 pub struct PipelineRunParams {
     /// UUID v7 execution ID, unique per run.
@@ -429,10 +479,10 @@ impl PipelineExecutor {
     ///     );
     /// }
     /// ```
-    pub fn run_plan_with_readers_writers(
+    pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
-        readers: HashMap<String, Box<dyn Read + Send>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        readers: SourceReaders,
+        writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let config = plan.config();
@@ -446,7 +496,7 @@ impl PipelineExecutor {
                         .to_string(),
                 ))
             })?;
-        Self::run_with_readers_writers(config, &primary_name, readers, writers, params)
+        Self::run_with_readers_writers(config, &primary_name, readers, writers.into(), params)
     }
 
     /// Same as [`Self::run_plan_with_readers_writers`] but with an
@@ -459,14 +509,14 @@ impl PipelineExecutor {
     /// declared in the pipeline config, and a reader for that name
     /// must be present in `readers`. Violations surface as
     /// `PipelineError::Config(ConfigError::Validation(..))`.
-    pub fn run_plan_with_readers_writers_with_primary(
+    pub fn run_plan_with_readers_writers_with_primary<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         primary: &str,
-        readers: HashMap<String, Box<dyn Read + Send>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        readers: SourceReaders,
+        writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), primary, readers, writers, params)
+        Self::run_with_readers_writers(plan.config(), primary, readers, writers.into(), params)
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
@@ -500,8 +550,8 @@ impl PipelineExecutor {
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         primary: &str,
-        readers: HashMap<String, Box<dyn Read + Send>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        readers: SourceReaders,
+        writers: WriterRegistry,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         Self::run_with_readers_writers_in_context(
@@ -523,8 +573,8 @@ impl PipelineExecutor {
     pub(crate) fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
         primary: &str,
-        mut readers: HashMap<String, Box<dyn Read + Send>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        mut readers: SourceReaders,
+        writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: crate::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
@@ -544,15 +594,23 @@ impl PipelineExecutor {
                 )))
             })?;
         let input = &source_configs[primary_idx];
-        let reader = readers.remove(&input.name).ok_or_else(|| {
+        let files = readers.remove(&input.name).ok_or_else(|| {
             PipelineError::Config(crate::config::ConfigError::Validation(format!(
                 "no reader registered for input '{}'",
                 input.name
             )))
         })?;
+        if files.is_empty() {
+            return Err(PipelineError::Config(
+                crate::config::ConfigError::Validation(format!(
+                    "source '{}' has empty file list",
+                    input.name
+                )),
+            ));
+        }
         let mut collector = stage_metrics::StageCollector::default();
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
-        let raw_reader = build_format_reader(input, reader)?;
+        let raw_reader = build_multi_file_reader(input, files)?;
         // Wrap with schema-based type coercion if the source declares typed columns.
         let mut format_reader = wrap_with_schema_coercion(raw_reader, config, &input.name)?;
         let schema = format_reader.schema()?;
@@ -751,8 +809,12 @@ impl PipelineExecutor {
         let required_arena = plan.required_arena();
 
         // Validate that all configured outputs have registered writers.
+        // Either the single-writer slot or the fan-out slot must contain
+        // the output's name; the dispatcher consults whichever applies.
         for output in &output_configs {
-            if !writers.contains_key(&output.name) {
+            let registered = writers.single.contains_key(&output.name)
+                || writers.fan_out.contains_key(&output.name);
+            if !registered {
                 return Err(PipelineError::Config(
                     crate::config::ConfigError::Validation(format!(
                         "no writer registered for output '{}'",
@@ -813,9 +875,9 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         input: &crate::config::SourceConfig,
         mut format_reader: Box<dyn FormatReader>,
-        readers: &mut HashMap<String, Box<dyn Read + Send>>,
+        readers: &mut SourceReaders,
         source_configs: &[crate::config::SourceConfig],
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         compiled_routes_by_name: HashMap<String, CompiledRoute>,
@@ -846,13 +908,33 @@ impl PipelineExecutor {
         // `MetadataCapExceeded` is recoverable per-record (DLQ);
         // every other reader error short-circuits.
         let mut all_records: Vec<(Record, u64)> = Vec::new();
+        // Parallel vector of per-record source-file Arcs. Index by
+        // `row_num - 1` to recover the file each record came from. For
+        // single-file sources every entry is the same Arc; for
+        // multi-file sources entries vary across file boundaries set
+        // by `MultiFileFormatReader::current_source_file()`.
+        let mut per_record_source_files: Vec<Arc<str>> = Vec::new();
+        // Fallback when the format-reader chain doesn't expose a
+        // current-file (e.g. literal `path:` sources don't go through
+        // the multi-file wrapper). Falls back to the static config
+        // path; empty for matchers that don't carry one.
+        let static_source_file: Arc<str> = if input.path_str().is_empty() {
+            Arc::from("<source>")
+        } else {
+            Arc::from(input.path_str())
+        };
         let mut row_num: u64 = 0;
         loop {
             match format_reader.next_record() {
                 Ok(Some(record)) => {
                     row_num += 1;
                     counters.total_count += 1;
+                    let file_arc = format_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
                     all_records.push((record, row_num));
+                    per_record_source_files.push(file_arc);
                 }
                 Ok(None) => break,
                 Err(clinker_format::error::FormatError::MetadataCapExceeded {
@@ -1162,11 +1244,14 @@ impl PipelineExecutor {
                 if combine_source_records.contains_key(upstream) {
                     continue;
                 }
-                let Some(reader) = readers.remove(upstream) else {
+                let Some(files) = readers.remove(upstream) else {
                     // Another combine already drained the reader (safe —
                     // the map is shared across all combine inputs).
                     continue;
                 };
+                if files.is_empty() {
+                    continue;
+                }
                 let src_cfg = source_configs
                     .iter()
                     .find(|s| s.name == upstream)
@@ -1175,7 +1260,7 @@ impl PipelineExecutor {
                             "combine build-side source '{upstream}' not declared in the pipeline",
                         )))
                     })?;
-                let raw_reader = build_format_reader(src_cfg, reader)?;
+                let raw_reader = build_multi_file_reader(src_cfg, files)?;
                 let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
                 let mut recs: Vec<(Record, u64)> = Vec::new();
                 let mut rn: u64 = 0;
@@ -1218,6 +1303,7 @@ impl PipelineExecutor {
             config,
             input,
             all_records,
+            per_record_source_files,
             combine_source_records,
             writers,
             transforms,
@@ -1251,8 +1337,9 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
+        per_record_source_files: Vec<Arc<str>>,
         combine_source_records: HashMap<String, Vec<(Record, u64)>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         compiled_routes_by_name: HashMap<String, CompiledRoute>,
@@ -1277,10 +1364,26 @@ impl PipelineExecutor {
             &params.batch_id,
             &params.pipeline_vars,
         );
-        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
+        // Synthetic source-file placeholder used by dispatch sites that
+        // have no live record (combine/finalize/post-aggregate emits
+        // with `source_row: 0`). For multi-file sources `input.path` is
+        // empty; the placeholder string is distinguishable from a real
+        // file path so users see it clearly in `$source.file` if it
+        // ever leaks past a merge boundary.
+        let source_file_arc: Arc<str> = if input.path_str().is_empty() {
+            Arc::from("<source>")
+        } else {
+            Arc::from(input.path_str())
+        };
+        // `$source.batch` is per-source-run. Default to a fresh UUID v7
+        // that's distinct from `pipeline.batch_id` (per-pipeline-run).
+        let source_batch_arc: Arc<str> = Arc::from(uuid::Uuid::now_v7().to_string());
+        let source_ingestion_timestamp = pipeline_start_time;
 
         let strategy = config.error_handling.strategy;
         let total_records = all_records.len() as u64;
+        // `$source.count` — total records ingested from this source.
+        let source_count: u64 = total_records;
 
         // Name → index map for looking up `CompiledTransform` by node
         // name. Borrowed by the dispatcher's Transform / Aggregation
@@ -1346,13 +1449,18 @@ impl PipelineExecutor {
             compiled_transforms: transforms,
             transform_by_name,
             stable: &stable,
-            source_file_arc: &source_file_arc,
+            source_file_arcs: &per_record_source_files,
+            synthetic_source_file: &source_file_arc,
+            source_batch_arc: &source_batch_arc,
+            source_count,
+            source_ingestion_timestamp,
             strategy,
 
             node_buffers: HashMap::new(),
             combine_source_records,
             all_records,
-            writers,
+            writers: writers.single,
+            fan_out_writers: writers.fan_out,
             compiled_route,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -1587,6 +1695,36 @@ fn build_format_reader(
             Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
         }
     }
+}
+
+/// Build a [`MultiFileFormatReader`] wrapping every file the discovery
+/// layer returned for this source. Single-file sources go through the
+/// same path with a one-element slot list — the wrapper short-circuits
+/// transparently.
+fn build_multi_file_reader(
+    input: &crate::config::SourceConfig,
+    files: Vec<crate::source::multi_file::FileSlot>,
+) -> Result<Box<dyn FormatReader>, PipelineError> {
+    use crate::source::multi_file::{FactoryFn, MultiFileFormatReader};
+
+    // The factory closure captures the source config by clone so each
+    // file gets a fresh format reader configured identically. Format
+    // construction errors map to the wrapper's `Schema` variant via
+    // `clinker_format::FormatError` so they bubble through the trait
+    // boundary intact.
+    let owned_config = input.clone();
+    let factory: Box<FactoryFn> = Box::new(
+        move |reader: Box<dyn Read + Send>,
+              _idx: usize|
+              -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
+            build_format_reader(&owned_config, reader).map_err(|e| {
+                clinker_format::FormatError::SchemaInference(format!(
+                    "format reader construction failed: {e}"
+                ))
+            })
+        },
+    );
+    Ok(Box::new(MultiFileFormatReader::new(files, factory)))
 }
 
 /// Wrap a format reader with schema-based type coercion if the source
@@ -2433,9 +2571,12 @@ mod tests {
         let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
         let primary = config.source_configs().next().unwrap().name.clone();
-        let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+        let readers: crate::executor::SourceReaders = HashMap::from([(
             primary.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+            ),
         )]);
         let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
             config.output_configs().next().unwrap().name.clone(),
@@ -2456,7 +2597,11 @@ mod tests {
         };
 
         let report = PipelineExecutor::run_with_readers_writers(
-            &config, &primary, readers, writers, &params,
+            &config,
+            &primary,
+            readers,
+            writers.into(),
+            &params,
         )?;
 
         let output = output_buf.as_string();

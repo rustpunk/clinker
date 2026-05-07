@@ -281,9 +281,9 @@ pub fn eval_expr_in_agg_scope(
         Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } => {
             Err(AggregateEvalError::UnsupportedResidual { what: "field-ref" })
         }
-        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } => {
+        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } | Expr::SourceAccess { .. } => {
             Err(AggregateEvalError::UnsupportedResidual {
-                what: "$meta/$pipeline access",
+                what: "$meta/$pipeline/$source access",
             })
         }
         Expr::MethodCall { .. } => Err(AggregateEvalError::UnsupportedResidual {
@@ -3165,6 +3165,17 @@ pub fn qualifies_for_streaming(
                 ),
             };
         }
+        PartitioningKind::FilePartitioned { .. } => {
+            // FilePartitioned: records are file-sequential at ingest, so
+            // each file's records arrive contiguously. Streaming
+            // aggregation is eligible *if* the user's group_by is also
+            // covered by the parent's `sort_order` — the per-file
+            // contiguity gives an implicit `$source.file` prefix that
+            // never disagrees, and the user-typed sort_order takes care
+            // of the rest. The runtime per-row `$source.file` Arc
+            // (§6) becomes part of the aggregate group key without the
+            // user having to type it.
+        }
     }
 
     // (b) Ordering check.
@@ -3647,11 +3658,7 @@ mod spill_trigger_tests {
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
-        EvalContext {
-            stable,
-            source_file: file,
-            source_row: row,
-        }
+        EvalContext::test_with_file(stable, file, row)
     }
 
     // ------------------------------------------------------------------

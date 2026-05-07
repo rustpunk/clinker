@@ -369,7 +369,11 @@ pub fn structural_search(
         // Check inputs
         for input in config.source_configs() {
             if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {
-                let detail = format!("type: {}, path: {}", input.format.format_name(), input.path);
+                let detail = format!(
+                    "type: {}, path: {}",
+                    input.format.format_name(),
+                    input.display_target()
+                );
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
                     stage_name: input.name.clone(),
@@ -459,7 +463,7 @@ fn content_for_input(input: &clinker_core::config::SourceConfig) -> String {
         "{} {} {}",
         input.name,
         input.format.format_name(),
-        input.path
+        input.display_target()
     );
     if let Some(ref schema) = input.schema {
         content.push_str(&format!(" schema:{schema:?}"));

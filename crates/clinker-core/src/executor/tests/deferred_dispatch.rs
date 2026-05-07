@@ -186,9 +186,12 @@ o1,HR,10
 o2,HR,20
 o3,ENG,100
 ";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -201,9 +204,14 @@ o3,ENG,100
         pipeline_vars: Default::default(),
         shutdown_token: None,
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("pipeline must run without error");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("pipeline must run without error");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -305,9 +313,12 @@ nodes:
     let csv = format!("order_id,department,payload\no1,HR,{big}\no2,ENG,{big}\n");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.into_bytes())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -326,8 +337,13 @@ nodes:
     // build (E310 from the source-rooted Phase-0 arena). Either path
     // surfaces the E310 admission failure shape; assert the err string
     // carries that signature.
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    );
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
@@ -428,9 +444,12 @@ o2,HR,20
 o3,HR,30
 ";
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -446,7 +465,11 @@ o3,HR,30
     let config = crate::config::parse_config(yaml).expect("parse");
     with_test_loop_cap(0, || {
         let _ = PipelineExecutor::run_with_readers_writers(
-            &config, &primary, readers, writers, &params,
+            &config,
+            &primary,
+            readers,
+            writers.into(),
+            &params,
         );
     });
 }
@@ -569,16 +592,20 @@ ENG,500
 
     let config = crate::config::parse_config(yaml).expect("parse");
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "dept_lookup".to_string(),
-            Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -592,9 +619,14 @@ ENG,500
         pipeline_vars: Default::default(),
         shutdown_token: None,
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("combine-in-region pipeline must converge");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("combine-in-region pipeline must converge");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -761,9 +793,12 @@ o6,ENG,300
     );
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -786,7 +821,12 @@ o6,ENG,300
     // time, which is not safe under cargo's default parallel test
     // runner.
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("composition pipeline must run without error");
 
@@ -997,9 +1037,12 @@ o6,ENG,300
     );
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1013,7 +1056,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("recursive composition pipeline must run without error");
 
@@ -1219,9 +1267,12 @@ o6,ENG,300
         .expect("nested composition + parent continuation must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1235,7 +1286,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("nested composition + parent continuation must run without error");
 
@@ -1414,9 +1470,12 @@ o6,ENG,300
         .expect("nested composition + cascading-retract pipeline must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1430,7 +1489,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("nested composition + cascading retract must run without error");
 
@@ -1591,9 +1655,12 @@ o6,ENG,300
         .expect("bare-Aggregate body + parent continuation must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1607,7 +1674,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("bare-Aggregate body + parent continuation must run without error");
 
@@ -1733,9 +1805,12 @@ o5,ENG,200
 o6,ENG,300
 ";
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let big_buf = SharedBuffer::new();
     let small_buf = SharedBuffer::new();
@@ -1756,9 +1831,14 @@ o6,ENG,300
         shutdown_token: None,
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("fan-out pipeline must converge");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("fan-out pipeline must converge");
 
     let big_out = big_buf.as_string();
     let small_out = small_buf.as_string();
@@ -1914,16 +1994,20 @@ nodes:
     }
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.into_bytes()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.into_bytes())),
+            ),
         ),
         (
             "dept_lookup".to_string(),
-            Box::new(std::io::Cursor::new(lookup_csv.into_bytes()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.into_bytes())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -1938,8 +2022,13 @@ nodes:
         shutdown_token: None,
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    );
 
     // The pipeline either errors at the build-side cross-region tee
     // (`tee_emit_to_region_input_buffers` raising E310 from

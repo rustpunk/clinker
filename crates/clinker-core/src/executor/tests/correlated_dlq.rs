@@ -28,10 +28,12 @@ fn run_correlated_pipeline(
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
 
     let buf = SharedBuffer::new();
@@ -40,8 +42,13 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -384,9 +391,12 @@ nodes:
         shutdown_token: None,
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf_a = SharedBuffer::new();
     let buf_b = SharedBuffer::new();
@@ -400,9 +410,14 @@ nodes:
             Box::new(buf_b.clone()) as Box<dyn std::io::Write + Send>,
         ),
     ]);
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
 
     let out_a = buf_a.as_string();
     let out_b = buf_b.as_string();
@@ -884,16 +899,20 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "departments".to_string(),
-            Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 
@@ -903,9 +922,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     // Group A driver records: A,1 (clean) and A,3 (clean) survive
@@ -1061,21 +1085,27 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "products".to_string(),
-            Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "categories".to_string(),
-            Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 
@@ -1085,9 +1115,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     // Department A: O1 and O3 succeed validate; O2 fails (trigger).
@@ -1281,16 +1316,20 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "sessions".to_string(),
-            Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 
@@ -1300,9 +1339,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     assert_eq!(

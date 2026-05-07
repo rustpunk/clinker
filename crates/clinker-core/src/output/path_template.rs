@@ -181,6 +181,17 @@ impl PathTemplate {
             .iter()
             .any(|s| matches!(s, Segment::Token(t) if t.name == "source_name" && t.arg.is_none()))
     }
+
+    /// Whether the template references any per-record token
+    /// (`{source_file}` / `{source_path}`). When true AND the Output's
+    /// parent partitioning is `FilePartitioned`, the planner marks the
+    /// Output for fan-out routing — one writer per source file rather
+    /// than one global writer.
+    pub fn has_per_record_tokens(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, Segment::Token(t) if PER_RECORD_TOKENS.contains(&t.name.as_str())))
+    }
 }
 
 /// Render every Output node's `path:` template in place, with `n` set
@@ -322,7 +333,7 @@ fn source_ancestors_of(
         };
         match node {
             PipelineNode::Source { config: src, .. } => {
-                let stem = std::path::Path::new(&src.source.path)
+                let stem = std::path::Path::new(src.source.path_str())
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
@@ -362,7 +373,21 @@ const KNOWN_TOKENS: &[&str] = &[
     "execution_id",
     "batch_id",
     "n",
+    // Per-record tokens — resolved per record at runtime when the
+    // Output's parent has live `FilePartitioned` lineage. At
+    // single-render time they substitute to placeholder text (the
+    // first matched file's path/label) which is overwritten by the
+    // dispatcher once per-record fan-out lands.
+    "source_file",
+    "source_path",
 ];
+
+/// Per-record tokens that flag an Output for fan-out routing. Used by
+/// the planner to detect when a path template depends on a record's
+/// originating file: an Output whose template contains any of these AND
+/// whose parent partitioning is `FilePartitioned` should produce one
+/// writer per source file rather than one global writer.
+pub const PER_RECORD_TOKENS: &[&str] = &["source_file", "source_path"];
 
 fn parse_token_body(body: &str, full: &str) -> Result<TokenSpec, ConfigError> {
     let parts: Vec<&str> = body.split(':').collect();
@@ -396,7 +421,12 @@ fn parse_token_body(body: &str, full: &str) -> Result<TokenSpec, ConfigError> {
             KNOWN_TOKENS.join(", ")
         )));
     }
-    if arg.is_some() && !matches!(name.as_str(), "source_name" | "pipeline_hash") {
+    if arg.is_some()
+        && !matches!(
+            name.as_str(),
+            "source_name" | "pipeline_hash" | "source_file" | "source_path"
+        )
+    {
         return Err(ConfigError::Validation(format!(
             "token {{{name}}} does not accept an argument (got `:{}`) in {full:?}",
             arg.as_deref().unwrap_or("")
@@ -434,6 +464,12 @@ fn resolve_token(spec: &TokenSpec, ctx: &TemplateContext<'_>) -> Result<String, 
                 .unwrap_or_default()),
             None => Ok(ctx.source_name_default.unwrap_or("").to_string()),
         },
+        // Per-record tokens render to a placeholder at single-render
+        // time. The dispatcher's fan-out path overrides this when the
+        // Output's input has live `FilePartitioned` lineage; without
+        // fan-out (or with it consumed via Merge/Combine), this
+        // placeholder is what users see.
+        "source_file" | "source_path" => Ok("<merged>".to_string()),
         "channel" => Ok(ctx.channel.unwrap_or("").to_string()),
         "pipeline_hash" => {
             let hex = hex_lower(&ctx.pipeline_hash);

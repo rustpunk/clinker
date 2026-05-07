@@ -302,12 +302,13 @@ nodes:
             &row_count,
             |b, _| {
                 b.iter(|| {
-                    let readers: HashMap<String, Box<dyn std::io::Read + Send>> =
-                        HashMap::from([(
-                            "src".to_string(),
-                            Box::new(Cursor::new(csv_bytes.clone()))
-                                as Box<dyn std::io::Read + Send>,
-                        )]);
+                    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+                        "src".to_string(),
+                        clinker_core::executor::single_file_reader(
+                            "test.csv",
+                            Box::new(Cursor::new(csv_bytes.clone())),
+                        ),
+                    )]);
                     let buf = BenchBuffer::new();
                     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
                         "out".to_string(),
@@ -422,16 +423,20 @@ nodes:
             &row_count,
             |b, _| {
                 b.iter(|| {
-                    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+                    let readers: clinker_core::executor::SourceReaders = HashMap::from([
                         (
                             "orders".to_string(),
-                            Box::new(Cursor::new(orders_bytes.clone()))
-                                as Box<dyn std::io::Read + Send>,
+                            clinker_core::executor::single_file_reader(
+                                "test.csv",
+                                Box::new(Cursor::new(orders_bytes.clone())),
+                            ),
                         ),
                         (
                             "depts".to_string(),
-                            Box::new(Cursor::new(depts_csv.clone()))
-                                as Box<dyn std::io::Read + Send>,
+                            clinker_core::executor::single_file_reader(
+                                "test.csv",
+                                Box::new(Cursor::new(depts_csv.clone())),
+                            ),
                         ),
                     ]);
                     let buf = BenchBuffer::new();
