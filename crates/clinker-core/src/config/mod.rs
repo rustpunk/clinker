@@ -3681,6 +3681,14 @@ const RESERVED_SOURCE_NAMES: &[&str] = &[
     "ingestion_timestamp",
 ];
 
+/// Reserved `$record.*` member names. Empty today — issue #44 will add
+/// `index` (record's positional index in its source) and `source` (a
+/// back-reference to the originating source-node name) as builtin
+/// members. The empty stub is wired now so the validation pipeline
+/// rejects `vars.record.<reserved>` collisions automatically once #44
+/// fills in the names.
+const RESERVED_RECORD_NAMES: &[&str] = &[];
+
 /// Post-deserialization validation.
 fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     for input in config.source_configs() {
@@ -3740,7 +3748,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
 fn validate_scoped_vars(vars: &ScopedVarsDecl) -> Result<(), ConfigError> {
     validate_scope("pipeline", &vars.pipeline, RESERVED_PIPELINE_NAMES)?;
     validate_scope("source", &vars.source, RESERVED_SOURCE_NAMES)?;
-    validate_scope("record", &vars.record, &[])?;
+    validate_scope("record", &vars.record, RESERVED_RECORD_NAMES)?;
     Ok(())
 }
 

@@ -158,8 +158,11 @@ use crate::projection::project_output_from_record;
 ///
 /// Owned (mutated across the walk):
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
-/// * `combine_source_records` — pre-loaded build-side source streams the
-///   Source arm consults before falling back to `all_records`.
+/// * `preloaded_source_records` — pre-loaded non-primary source streams
+///   the Source arm consults before falling back to `all_records`. Holds
+///   both combine build-side inputs (Phase Combine) and init-phase
+///   ancestor Sources (Phase E-2). Renamed from `combine_source_records`
+///   when Phase E-2 broadened the role.
 /// * `all_records` — primary driving stream materialized before the walk.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
@@ -209,7 +212,7 @@ pub(crate) struct ExecutorContext<'a> {
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
-    pub(crate) combine_source_records: HashMap<String, Vec<(Record, u64)>>,
+    pub(crate) preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
     pub(crate) all_records: Vec<(Record, u64)>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     /// Per-source-file writers for outputs marked `fan_out_per_source_file`
@@ -835,7 +838,7 @@ pub(crate) fn dispatch_plan_node(
             // ports surface as synthetic Source nodes in the body
             // graph, owning the records the parent scope harvested
             // for that port; (2) combine build-side sources whose
-            // records were pre-loaded into `combine_source_records`
+            // records were pre-loaded into `preloaded_source_records`
             // before the DAG walk; (3) fall back to the primary
             // driving reader's stream via `all_records`. Records are
             // canonicalized onto the Source's plan-time `Arc<Schema>`
@@ -934,7 +937,7 @@ pub(crate) fn dispatch_plan_node(
                     .into_iter()
                     .map(|(r, rn)| (canonicalize(&r), rn))
                     .collect()
-            } else if let Some(src_recs) = ctx.combine_source_records.get(name.as_str()) {
+            } else if let Some(src_recs) = ctx.preloaded_source_records.get(name.as_str()) {
                 src_recs
                     .iter()
                     .map(|(r, rn)| (canonicalize(r), *rn))
@@ -3708,12 +3711,12 @@ fn execute_composition_body(
     let output_idx = bound_body.output_port_to_node_idx.values().next().copied();
 
     // Swap node_buffers to a body-local namespace so body NodeIndices
-    // don't collide with the parent's. `combine_source_records` is
+    // don't collide with the parent's. `preloaded_source_records` is
     // also swapped to an empty map: the body's Source arms (if any
     // — body-scope sources are unusual but legal) fall back to
     // `all_records`, not parent-scope combine sources.
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_combine = std::mem::take(&mut ctx.combine_source_records);
+    let saved_combine = std::mem::take(&mut ctx.preloaded_source_records);
     // Install the body's `input:` reference table so the Route arm
     // can resolve `<route>.<branch>` references against body
     // siblings. Restored on exit.
@@ -3785,7 +3788,7 @@ fn execute_composition_body(
     // sync by hand on every exit path through this function.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
     ctx.node_buffers = saved_buffers;
-    ctx.combine_source_records = saved_combine;
+    ctx.preloaded_source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
     // Pop the window-runtime overlay so subsequent windows in the
     // parent scope route through `top` again. Removing the body's

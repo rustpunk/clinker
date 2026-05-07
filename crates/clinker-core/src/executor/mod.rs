@@ -1232,7 +1232,7 @@ impl PipelineExecutor {
             }
         };
 
-        let mut combine_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        let mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
         for (combine_name, combine_inputs) in &artifacts.combine_inputs {
             let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
             for combine_input in combine_inputs.values() {
@@ -1247,7 +1247,7 @@ impl PipelineExecutor {
                     // `all_records`.
                     continue;
                 }
-                if combine_source_records.contains_key(upstream) {
+                if preloaded_source_records.contains_key(upstream) {
                     continue;
                 }
                 let Some(files) = readers.remove(upstream) else {
@@ -1301,7 +1301,7 @@ impl PipelineExecutor {
                         Err(other) => return Err(other.into()),
                     }
                 }
-                combine_source_records.insert(upstream.to_string(), recs);
+                preloaded_source_records.insert(upstream.to_string(), recs);
             }
         }
 
@@ -1309,7 +1309,7 @@ impl PipelineExecutor {
         // Init-phase state nodes' ancestors include Sources. Those
         // Sources need their records materialized before the
         // two-pass walk runs, because the Source dispatcher arm
-        // reads from `combine_source_records` (or `all_records` for
+        // reads from `preloaded_source_records` (or `all_records` for
         // the primary). A standalone init Source isn't a combine
         // input and isn't the primary, so without this pre-load it
         // would have nothing to feed the init-phase Aggregate / Map
@@ -1337,7 +1337,7 @@ impl PipelineExecutor {
                 // Records already in `all_records`.
                 continue;
             }
-            if combine_source_records.contains_key(upstream) {
+            if preloaded_source_records.contains_key(upstream) {
                 continue;
             }
             let Some(files) = readers.remove(upstream.as_str()) else {
@@ -1368,7 +1368,7 @@ impl PipelineExecutor {
                     Err(other) => return Err(other.into()),
                 }
             }
-            combine_source_records.insert(upstream.clone(), recs);
+            preloaded_source_records.insert(upstream.clone(), recs);
         }
 
         Self::execute_dag_branching(
@@ -1376,7 +1376,7 @@ impl PipelineExecutor {
             input,
             all_records,
             per_record_source_files,
-            combine_source_records,
+            preloaded_source_records,
             writers,
             transforms,
             compiled_route,
@@ -1410,7 +1410,7 @@ impl PipelineExecutor {
         input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
         per_record_source_files: Vec<Arc<str>>,
-        combine_source_records: HashMap<String, Vec<(Record, u64)>>,
+        preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -1529,7 +1529,7 @@ impl PipelineExecutor {
             strategy,
 
             node_buffers: HashMap::new(),
-            combine_source_records,
+            preloaded_source_records,
             all_records,
             writers: writers.single,
             fan_out_writers: writers.fan_out,

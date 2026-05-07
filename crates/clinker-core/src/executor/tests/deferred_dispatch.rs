@@ -495,7 +495,7 @@ o3,HR,30
 ///
 /// Build-side rows that hit DLQ during the forward pass require
 /// either a Transform-mediated build chain (which breaks
-/// `combine_source_records` lookup since Combine's build input must
+/// `preloaded_source_records` lookup since Combine's build input must
 /// resolve to a Source directly) or source-level validation (not yet
 /// available on `Source` nodes). The contract that an at-commit
 /// Combine rebuild reads from the cross-region buffer rather than
