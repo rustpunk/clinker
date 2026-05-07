@@ -443,6 +443,15 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 .unwrap_or(Value::Null))
         }
 
+        Expr::RecordAccess { .. } => {
+            // `$record.<key>` reads land here once the State node (Phase D)
+            // populates the per-record scope on EvalContext. Until then,
+            // the record-scope slot is empty and reads return Null —
+            // matching how `$pipeline.<key>` behaves when no default was
+            // declared.
+            Ok(Value::Null)
+        }
+
         Expr::Now { .. } => Ok(Value::DateTime(ctx.stable.clock.now())),
 
         Expr::Wildcard { .. } => Ok(Value::Bool(true)), // Wildcard in match = always matches

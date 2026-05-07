@@ -168,6 +168,7 @@ mod tests {
             &ctx,
             &symbol_table,
             std::path::Path::new(""),
+            Default::default(),
         );
         (artifacts, diags)
     }

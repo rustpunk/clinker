@@ -159,6 +159,12 @@ pub(crate) struct BindContext<'a> {
     /// pipeline this is typically `"pipelines/"` or similar; for nested
     /// compositions it's the directory of the `.comp.yaml` file.
     pub origin_dir: PathBuf,
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$row.<key>`
+    /// registry. Built once from `PipelineConfig.pipeline.vars` at the
+    /// `bind_schema` entry and threaded into every CXL resolve / typecheck
+    /// call site. Empty for compositions that don't propagate scoped vars
+    /// (Phase G will revisit composition propagation).
+    pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -184,6 +190,7 @@ pub fn bind_schema(
     ctx: &CompileContext,
     symbol_table: &CompositionSymbolTable,
     pipeline_dir: &Path,
+    scoped_vars: cxl::resolve::ScopedVarsRegistry,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -194,6 +201,7 @@ pub fn bind_schema(
         depth: 0,
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
+        scoped_vars,
     };
     bind_schema_inner(
         nodes,
@@ -299,6 +307,7 @@ fn bind_schema_inner(
                     &upstream,
                     AggregateMode::Row,
                     span,
+                    &bind_ctx.scoped_vars,
                 ) {
                     Ok(mut typed) => {
                         let out = propagate_row(&upstream, &typed);
@@ -341,7 +350,14 @@ fn bind_schema_inner(
                 let agg_mode = AggregateMode::GroupBy {
                     group_by_fields: config.group_by.iter().cloned().collect(),
                 };
-                match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
+                match typecheck_cxl(
+                    &name,
+                    &config.cxl.source,
+                    &upstream,
+                    agg_mode,
+                    span,
+                    &bind_ctx.scoped_vars,
+                ) {
                     Ok(mut typed) => {
                         let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
@@ -354,9 +370,14 @@ fn bind_schema_inner(
             PipelineNode::Route { header, config: _ } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
-                    if let Ok(mut empty) =
-                        typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span)
-                    {
+                    if let Ok(mut empty) = typecheck_cxl(
+                        &name,
+                        "",
+                        &cloned,
+                        AggregateMode::Row,
+                        span,
+                        &bind_ctx.scoped_vars,
+                    ) {
                         empty.output_row = cloned.clone();
                         artifacts.typed.insert(name.clone(), Arc::new(empty));
                     }
@@ -400,6 +421,7 @@ fn bind_schema_inner(
                     diags,
                     artifacts,
                     schema_by_name,
+                    &bind_ctx.scoped_vars,
                 );
             }
             PipelineNode::Composition {
@@ -564,6 +586,11 @@ fn bind_composition(
             .unwrap_or(Path::new(""))
             .to_path_buf(),
     );
+    // Composition bodies are sealed from parent scoped vars: parent
+    // `$pipeline.<key>` / `$source.<key>` declarations are not visible inside
+    // the body. Phase G will allow opting into specific names via
+    // `CompositionSignature.scoped_vars_schema`.
+    let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
     // The new enclosing_scope is the parent's node names (for E108).
     bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
     // Also include the enclosing scope's names so nested compositions
@@ -594,6 +621,7 @@ fn bind_composition(
     bind_ctx.depth -= 1;
     bind_ctx.use_path_stack.pop();
     bind_ctx.enclosing_scope_names = saved_enclosing;
+    bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
 
     // 9. Compute output rows from signature.outputs → body schemas.
@@ -1551,6 +1579,7 @@ fn typecheck_cxl(
     schema: &Row,
     mode: AggregateMode,
     span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
     let parse_result = cxl::parser::Parser::parse(source);
     if !parse_result.errors.is_empty() {
@@ -1572,43 +1601,49 @@ fn typecheck_cxl(
     // qualified fields via `Expr::QualifiedFieldRef` (handled in
     // typecheck/pass.rs, not resolve).
     let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
-    let resolved =
-        cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
-            .map_err(|diags| {
-                Diagnostic::error(
-                    "E200",
-                    format!(
-                        "CXL name resolution failed in {node_name:?}: {}",
-                        diags
-                            .into_iter()
-                            .map(|d| d.message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                )
-            })?;
-    cxl::typecheck::type_check_with_mode(resolved, schema, mode).map_err(|diags| {
-        let errors: Vec<String> = diags
-            .iter()
-            .filter(|d| !d.is_warning)
-            .map(|d| d.message.clone())
-            .collect();
-        let joined = if errors.is_empty() {
-            diags
-                .into_iter()
-                .map(|d| d.message)
-                .collect::<Vec<_>>()
-                .join("; ")
-        } else {
-            errors.join("; ")
-        };
+    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
+        parse_result.ast,
+        &field_refs,
+        parse_result.node_count,
+        &std::collections::HashMap::new(),
+        scoped_vars,
+    )
+    .map_err(|diags| {
         Diagnostic::error(
             "E200",
-            format!("CXL type error in {node_name:?}: {joined}"),
+            format!(
+                "CXL name resolution failed in {node_name:?}: {}",
+                diags
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             LabeledSpan::primary(span, String::new()),
         )
-    })
+    })?;
+    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
+        .map_err(|diags| {
+            let errors: Vec<String> = diags
+                .iter()
+                .filter(|d| !d.is_warning)
+                .map(|d| d.message.clone())
+                .collect();
+            let joined = if errors.is_empty() {
+                diags
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                errors.join("; ")
+            };
+            Diagnostic::error(
+                "E200",
+                format!("CXL type error in {node_name:?}: {joined}"),
+                LabeledSpan::primary(span, String::new()),
+            )
+        })
 }
 
 /// Propagate an upstream row through a Transform node: start with all
@@ -1751,6 +1786,7 @@ fn bind_combine(
     diags: &mut Vec<Diagnostic>,
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) {
     // E300: combine requires at least 2 inputs.
     if header.input.len() < 2 {
@@ -1835,14 +1871,19 @@ fn bind_combine(
     let merged_row = Row::closed(merged_declared, cxl_span);
 
     // ── Where-clause typecheck ─────────────────────────────────────
-    let typed_where =
-        match typecheck_combine_where(name, config.where_expr.as_ref(), &merged_row, span) {
-            Ok(t) => Arc::new(t),
-            Err(mut new_diags) => {
-                diags.append(&mut new_diags);
-                return;
-            }
-        };
+    let typed_where = match typecheck_combine_where(
+        name,
+        config.where_expr.as_ref(),
+        &merged_row,
+        span,
+        scoped_vars,
+    ) {
+        Ok(t) => Arc::new(t),
+        Err(mut new_diags) => {
+            diags.append(&mut new_diags);
+            return;
+        }
+    };
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
     let e304_before = diags.iter().filter(|d| d.code == "E304").count();
@@ -1864,7 +1905,7 @@ fn bind_combine(
     // typed program needed by `cxl::eval::eval_expr` at runtime — no
     // re-typecheck per side, since equality sub-`Expr`s preserve their
     // NodeIds and the where-program's regex cache covers them.
-    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span) {
+    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span, scoped_vars) {
         Ok(d) => d,
         Err(type_diags) => {
             for td in type_diags {
@@ -2019,6 +2060,7 @@ fn bind_combine(
         &merged_row,
         AggregateMode::Row,
         span,
+        scoped_vars,
     ) {
         Ok(t) => t,
         Err(d) => {
@@ -2240,6 +2282,7 @@ fn typecheck_combine_where(
     where_src: &str,
     merged_row: &Row,
     span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Vec<Diagnostic>> {
     let wrapped = format!("filter {where_src}");
     let parse_result = cxl::parser::Parser::parse(&wrapped);
@@ -2261,25 +2304,34 @@ fn typecheck_combine_where(
         .field_names()
         .map(|qf| qf.name.as_ref())
         .collect();
-    let resolved =
-        match cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
-        {
-            Ok(r) => r,
-            Err(rd) => {
-                let msg = rd
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(vec![Diagnostic::error(
-                    "E200",
-                    format!("combine {combine_name:?} where-clause name resolution: {msg}"),
-                    LabeledSpan::primary(span, String::new()),
-                )]);
-            }
-        };
+    let resolved = match cxl::resolve::resolve_program_with_modules_and_vars(
+        parse_result.ast,
+        &field_refs,
+        parse_result.node_count,
+        &std::collections::HashMap::new(),
+        scoped_vars,
+    ) {
+        Ok(r) => r,
+        Err(rd) => {
+            let msg = rd
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(vec![Diagnostic::error(
+                "E200",
+                format!("combine {combine_name:?} where-clause name resolution: {msg}"),
+                LabeledSpan::primary(span, String::new()),
+            )]);
+        }
+    };
 
-    match cxl::typecheck::type_check(resolved, merged_row) {
+    match cxl::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        merged_row,
+        cxl::typecheck::pass::AggregateMode::Row,
+        scoped_vars,
+    ) {
         Ok(typed) => Ok(typed),
         Err(type_diags) => {
             let mut out = Vec::new();
@@ -2537,6 +2589,7 @@ fn walk_for_unknown_refs(
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }

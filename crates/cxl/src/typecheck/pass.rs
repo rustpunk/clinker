@@ -9,6 +9,7 @@ use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp}
 use crate::builtins::BuiltinRegistry;
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
+use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
 
 /// Return type inference for aggregate function calls.
 ///
@@ -126,6 +127,26 @@ pub fn type_check_with_mode(
     schema: &Row,
     aggregate_mode: AggregateMode,
 ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+    type_check_with_mode_and_vars(
+        resolved,
+        schema,
+        aggregate_mode,
+        &ScopedVarsRegistry::default(),
+    )
+}
+
+/// Run Phase C with explicit aggregate-mode and scoped-vars registry.
+///
+/// Reads of declared `$pipeline.<key>` / `$source.<key>` resolve to the
+/// declared type (mapped via [`scoped_var_type_to_type`]); undeclared keys
+/// would have been rejected at resolve time and never reach the
+/// typechecker, so this lookup is total for any resolver-accepted access.
+pub fn type_check_with_mode_and_vars(
+    resolved: ResolvedProgram,
+    schema: &Row,
+    aggregate_mode: AggregateMode,
+    scoped_vars: &ScopedVarsRegistry,
+) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
     let registry = BuiltinRegistry::new();
     let node_count = resolved.node_count;
 
@@ -140,6 +161,7 @@ pub fn type_check_with_mode(
         bindings: &bindings,
         schema,
         registry: &registry,
+        scoped_vars,
         types: vec![None; node_count as usize],
         regexes: vec![None; node_count as usize],
         field_constraints: HashMap::new(),
@@ -187,6 +209,10 @@ struct TypeChecker<'a> {
     bindings: &'a [Option<ResolvedBinding>],
     schema: &'a Row,
     registry: &'a BuiltinRegistry,
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
+    /// types; consulted on every PipelineAccess / SourceAccess after the
+    /// builtin-member shortcut misses.
+    scoped_vars: &'a ScopedVarsRegistry,
     types: Vec<Option<Type>>,
     regexes: Vec<Option<Regex>>,
     field_constraints: HashMap<String, Vec<FieldConstraint>>,
@@ -198,6 +224,20 @@ struct TypeChecker<'a> {
     /// inside the arguments of an AggCall; bare FieldRefs are exempted from
     /// the "must appear in group_by" check.
     agg_function_depth: u32,
+}
+
+/// Convert a [`ScopedVarType`] (the config-mirroring tag) to the CXL
+/// [`Type`]. `Date`/`DateTime` map to their distinct CXL types — strict
+/// mode coerces only at the eval boundary, not at typecheck.
+fn scoped_var_type_to_type(t: ScopedVarType) -> Type {
+    match t {
+        ScopedVarType::String => Type::String,
+        ScopedVarType::Int => Type::Int,
+        ScopedVarType::Float => Type::Float,
+        ScopedVarType::Bool => Type::Bool,
+        ScopedVarType::Date => Type::Date,
+        ScopedVarType::DateTime => Type::DateTime,
+    }
 }
 
 impl<'a> TypeChecker<'a> {
@@ -387,7 +427,13 @@ impl<'a> TypeChecker<'a> {
                     "name" | "execution_id" | "batch_id" => Type::String,
                     "total_count" | "ok_count" | "dlq_count" | "filtered_count"
                     | "distinct_count" => Type::Int,
-                    _ => Type::Any, // User-defined pipeline.vars.*
+                    other => self
+                        .scoped_vars
+                        .pipeline
+                        .get(other)
+                        .copied()
+                        .map(scoped_var_type_to_type)
+                        .unwrap_or(Type::Any),
                 };
                 self.set_type(*node_id, ty.clone());
                 ty
@@ -398,7 +444,13 @@ impl<'a> TypeChecker<'a> {
                     "file" | "path" | "batch" => Type::String,
                     "row" | "count" => Type::Int,
                     "ingestion_timestamp" => Type::DateTime,
-                    _ => Type::Any,
+                    other => self
+                        .scoped_vars
+                        .source
+                        .get(other)
+                        .copied()
+                        .map(scoped_var_type_to_type)
+                        .unwrap_or(Type::Any),
                 };
                 self.set_type(*node_id, ty.clone());
                 ty
@@ -407,6 +459,22 @@ impl<'a> TypeChecker<'a> {
             Expr::MetaAccess { node_id, .. } => {
                 self.set_type(*node_id, Type::Any);
                 Type::Any
+            }
+
+            Expr::RecordAccess { node_id, field, .. } => {
+                // `$record.<key>` reads against the declared registry —
+                // the resolver already rejected undeclared keys, so a miss
+                // here implies an internal bug. Fall through to Any rather
+                // than re-emitting a diagnostic.
+                let ty = self
+                    .scoped_vars
+                    .record
+                    .get(&**field)
+                    .copied()
+                    .map(scoped_var_type_to_type)
+                    .unwrap_or(Type::Any);
+                self.set_type(*node_id, ty.clone());
+                ty
             }
 
             Expr::Now { node_id, .. } => {
@@ -964,6 +1032,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::PipelineAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
+            | Expr::RecordAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::AggSlot { .. }

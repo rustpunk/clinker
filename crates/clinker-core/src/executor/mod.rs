@@ -642,6 +642,12 @@ impl PipelineExecutor {
                 })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
+        let scoped_vars: cxl::resolve::ScopedVarsRegistry = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(crate::config::scoped_vars_registry)
+            .unwrap_or_default();
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
@@ -736,7 +742,7 @@ impl PipelineExecutor {
                             }
                         }
                     }
-                    Some(Self::compile_route(rc, &emitted_fields)?)
+                    Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
                 }
                 None => None,
             }
@@ -797,7 +803,7 @@ impl PipelineExecutor {
                         }
                     }
                 }
-                let cr = Self::compile_route(&route_config, &emitted_fields)?;
+                let cr = Self::compile_route(&route_config, &emitted_fields, &scoped_vars)?;
                 compiled_routes_by_name.insert(route_name.clone(), cr);
             }
         }
@@ -1570,6 +1576,7 @@ impl PipelineExecutor {
     fn compile_route(
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
+        scoped_vars: &cxl::resolve::ScopedVarsRegistry,
     ) -> Result<CompiledRoute, PipelineError> {
         let type_cols: IndexMap<cxl::typecheck::QualifiedField, Type> = emitted_fields
             .iter()
@@ -1596,17 +1603,25 @@ impl PipelineExecutor {
                 });
             }
 
-            let resolved = cxl::resolve::resolve_program(
+            let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
                 parse_result.ast,
                 &field_refs,
                 parse_result.node_count,
+                &std::collections::HashMap::new(),
+                scoped_vars,
             )
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: format!("route:{}", branch.name),
                 messages: diags.into_iter().map(|d| d.message).collect(),
             })?;
 
-            let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
+            let typed = cxl::typecheck::pass::type_check_with_mode_and_vars(
+                resolved,
+                &type_schema,
+                cxl::typecheck::pass::AggregateMode::Row,
+                scoped_vars,
+            )
+            .map_err(|diags| {
                 let errors: Vec<String> = diags
                     .iter()
                     .filter(|d| !d.is_warning)

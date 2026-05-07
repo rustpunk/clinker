@@ -281,11 +281,12 @@ pub fn eval_expr_in_agg_scope(
         Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } => {
             Err(AggregateEvalError::UnsupportedResidual { what: "field-ref" })
         }
-        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } | Expr::SourceAccess { .. } => {
-            Err(AggregateEvalError::UnsupportedResidual {
-                what: "$meta/$pipeline/$source access",
-            })
-        }
+        Expr::MetaAccess { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::RecordAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
+            what: "$meta/$pipeline/$source/$record access",
+        }),
         Expr::MethodCall { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "method call",
         }),
