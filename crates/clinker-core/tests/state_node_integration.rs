@@ -126,14 +126,16 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: amount, type: int }
-  - type: state
+  - type: transform
     name: capture
     input: src
     config:
-      scope: pipeline
-      set:
-        - var: last_amount
-          cxl: "amount"
+      declares:
+        - { name: last_amount, scope: pipeline, type: int }
+      cxl: |
+        emit id = id
+        emit amount = amount
+        emit $pipeline.last_amount = amount
   - type: transform
     name: read_back
     input: capture
@@ -189,14 +191,16 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: label, type: string }
-  - type: state
+  - type: transform
     name: capture
     input: src
     config:
-      scope: source
-      set:
-        - var: batch_label
-          cxl: "label"
+      declares:
+        - { name: batch_label, scope: source, type: string }
+      cxl: |
+        emit id = id
+        emit label = label
+        emit $source.batch_label = label
   - type: transform
     name: read_back
     input: capture

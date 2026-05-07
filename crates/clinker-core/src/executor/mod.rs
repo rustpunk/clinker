@@ -2505,7 +2505,7 @@ pub(crate) fn evaluate_single_transform(
             for (key, value) in &metadata {
                 let _ = out.set_meta(key, value.clone());
             }
-            for (key, value) in record_vars {
+            for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))
@@ -2594,7 +2594,7 @@ pub(crate) fn evaluate_single_transform_windowed(
             for (key, value) in &metadata {
                 let _ = out.set_meta(key, value.clone());
             }
-            for (key, value) in record_vars {
+            for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))

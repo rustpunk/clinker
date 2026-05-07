@@ -1773,7 +1773,7 @@ fn emit_for_probe<'a>(
                                 for (k, v) in metadata {
                                     let _ = rec.set_meta(&k, v);
                                 }
-                                for (k, v) in record_vars {
+                                for (k, v) in *record_vars {
                                     let _ = rec.set_record_var(&k, v);
                                 }
                                 output.push((rec, rn));
@@ -1803,7 +1803,7 @@ fn emit_for_probe<'a>(
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
                             }
-                            for (k, v) in record_vars {
+                            for (k, v) in *record_vars {
                                 let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(&mut rec, m, propagate_ck);

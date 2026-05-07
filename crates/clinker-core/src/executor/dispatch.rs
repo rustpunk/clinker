@@ -2957,7 +2957,7 @@ pub(crate) fn dispatch_plan_node(
                                             for (k, v) in metadata {
                                                 let _ = rec.set_meta(&k, v);
                                             }
-                                            for (k, v) in record_vars {
+                                            for (k, v) in *record_vars {
                                                 let _ = rec.set_record_var(&k, v);
                                             }
                                             output_records.push((rec, rn));
@@ -3000,7 +3000,7 @@ pub(crate) fn dispatch_plan_node(
                                         for (k, v) in metadata {
                                             let _ = rec.set_meta(&k, v);
                                         }
-                                        for (k, v) in record_vars {
+                                        for (k, v) in *record_vars {
                                             let _ = rec.set_record_var(&k, v);
                                         }
                                         // Build-side `$ck.<field>` propagation

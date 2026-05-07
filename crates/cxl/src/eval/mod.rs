@@ -30,10 +30,14 @@ pub enum EvalResult {
     /// the caller applies to the record's record_vars channel
     /// (`$pipeline.*` and `$source.*` writes go directly through
     /// `StableEvalContext` during eval and are not surfaced here).
+    /// `record_vars` is boxed to keep the enum's stack footprint
+    /// under clippy's `large_enum_variant` threshold; the typical
+    /// record path with no `$record.<key>` writes still produces an
+    /// empty boxed map.
     Emit {
         fields: indexmap::IndexMap<String, Value>,
         metadata: indexmap::IndexMap<String, Value>,
-        record_vars: indexmap::IndexMap<String, Value>,
+        record_vars: Box<indexmap::IndexMap<String, Value>>,
     },
     /// Record should be excluded from output.
     Skip(SkipReason),
@@ -255,7 +259,7 @@ impl ProgramEvaluator {
         Ok(EvalResult::Emit {
             fields: output,
             metadata: meta_output,
-            record_vars: record_var_writes,
+            record_vars: Box::new(record_var_writes),
         })
     }
 

@@ -2564,7 +2564,7 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
             // to the output row — skip them so the row/schema view
             // downstream operators see only reflects user-visible data
             // fields.
-            if matches!(target, cxl::ast::EmitTarget::Meta) {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
@@ -2612,7 +2612,7 @@ fn propagate_aggregate(
             ..
         } = stmt
         {
-            if matches!(target, cxl::ast::EmitTarget::Meta) {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
@@ -3611,7 +3611,7 @@ fn combine_output_row(
             ..
         } = stmt
         {
-            if matches!(target, cxl::ast::EmitTarget::Meta) {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
