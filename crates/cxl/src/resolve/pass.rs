@@ -107,9 +107,9 @@ pub fn resolve_program_with_modules(
 /// Run Phase B with module + scoped-vars awareness.
 ///
 /// `scoped_vars` carries the pipeline's declared `$pipeline.<key>` /
-/// `$source.<key>` / `$row.<key>` registry. Empty registry preserves the
-/// pre-Phase-B behavior — only builtin members of each namespace resolve.
-/// Production call sites build the registry from
+/// `$source.<key>` / `$record.<key>` registry. Empty registry preserves
+/// the pre-Phase-B behavior — only builtin members of each namespace
+/// resolve. Production call sites build the registry from
 /// `clinker_core::config::ScopedVarsDecl`.
 pub fn resolve_program_with_modules_and_vars(
     program: Program,
@@ -154,7 +154,7 @@ struct Resolver<'a> {
     module_aliases: HashMap<String, String>,
     /// Available module exports, keyed by module path
     module_exports: &'a HashMap<String, ModuleExports>,
-    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$row.<key>`
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
     /// registry consulted alongside the builtin member sets.
     scoped_vars: &'a ScopedVarsRegistry,
 }

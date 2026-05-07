@@ -61,9 +61,9 @@ pub struct PipelineMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
     /// User-defined variable declarations grouped by scope (pipeline, source,
-    /// row). Pipeline-scope defaults seed the runtime registry at init;
-    /// source- and row-scope entries are placeholders for runtime writes by
-    /// `state` nodes (no readers yet).
+    /// record). Pipeline-scope defaults seed the runtime registry at init;
+    /// source- and record-scope entries are placeholders for runtime writes
+    /// by `state` nodes (no readers yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vars: Option<ScopedVarsDecl>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,15 +113,18 @@ pub struct ConcurrencyConfig {
 /// User-defined variable declarations partitioned by scope.
 ///
 /// Three scopes mirror the CXL read namespaces: `$pipeline.<key>` is
-/// init-bound and broadcast to every record; `$source.<key>` is per-source
-/// with a fresh slot per ingestion stream; `$row.<key>` is per-record
-/// scratch state distinct from `$meta.*` (writable by `state` nodes only,
-/// declared with type for compile-time checking).
+/// init-bound and broadcast to every record; `$source.<key>` is
+/// per-source with a fresh slot per ingestion stream; `$record.<key>` is
+/// per-record scratch state distinct from `$meta.*` (writable by `state`
+/// nodes only, declared with type for compile-time checking). The
+/// `record` name (rather than `row`) reflects Clinker's multi-format
+/// scope — CSV rows, JSON objects, XML elements, and fixed-width records
+/// all flow through the same `Record` type.
 ///
 /// Pipeline-scope defaults flow into [`StableEvalContext.pipeline_vars`]
-/// at init via [`convert_pipeline_vars`]. Source- and row-scope readers
-/// arrive in a follow-up commit; their declarations parse and validate
-/// today so the YAML surface is stable across the sprint.
+/// at init via [`convert_pipeline_vars`]. Source- and record-scope
+/// readers arrive in a follow-up commit; their declarations parse and
+/// validate today so the YAML surface is stable across the sprint.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScopedVarsDecl {
@@ -130,14 +133,14 @@ pub struct ScopedVarsDecl {
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub source: IndexMap<String, ScopedVarDecl>,
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub row: IndexMap<String, ScopedVarDecl>,
+    pub record: IndexMap<String, ScopedVarDecl>,
 }
 
 /// One scoped variable's declared type and optional default value.
 ///
 /// `default` must match `var_type` — enforced by [`validate_scoped_vars`].
-/// Source- and row-scope variables typically omit the default (their value
-/// arrives at runtime from a `state` node write).
+/// Source- and record-scope variables typically omit the default (their
+/// value arrives at runtime from a `state` node write).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedVarDecl {
@@ -150,8 +153,8 @@ pub struct ScopedVarDecl {
 /// Scoped-variable primitive type set.
 ///
 /// Mirrors the CXL primitive types the typecheck pass uses to validate
-/// `$pipeline.<key>` / `$source.<key>` / `$row.<key>` reads. `Date` and
-/// `DateTime` accept ISO-8601 string defaults (parsed at the eval
+/// `$pipeline.<key>` / `$source.<key>` / `$record.<key>` reads. `Date`
+/// and `DateTime` accept ISO-8601 string defaults (parsed at the eval
 /// boundary, not at YAML load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -192,8 +195,8 @@ pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRe
             .iter()
             .map(|(k, d)| (k.clone(), d.var_type.into()))
             .collect(),
-        row: decl
-            .row
+        record: decl
+            .record
             .iter()
             .map(|(k, d)| (k.clone(), d.var_type.into()))
             .collect(),
@@ -3690,7 +3693,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
 fn validate_scoped_vars(vars: &ScopedVarsDecl) -> Result<(), ConfigError> {
     validate_scope("pipeline", &vars.pipeline, RESERVED_PIPELINE_NAMES)?;
     validate_scope("source", &vars.source, RESERVED_SOURCE_NAMES)?;
-    validate_scope("row", &vars.row, &[])?;
+    validate_scope("record", &vars.record, &[])?;
     Ok(())
 }
 

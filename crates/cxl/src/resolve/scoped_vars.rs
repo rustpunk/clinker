@@ -13,7 +13,12 @@
 //! - [`ScopedVarsRegistry::source`] — read via `$source.<key>`, alongside
 //!   builtin provenance (`file`, `row`, `path`, `count`, `batch`,
 //!   `ingestion_timestamp`).
-//! - [`ScopedVarsRegistry::row`] — read via `$row.<key>`. No builtins.
+//! - [`ScopedVarsRegistry::record`] — read via `$record.<key>`. No
+//!   builtins. Per-record scratch state distinct from `$meta.*` (which
+//!   is single-writer-within-a-CXL-program); `$record.*` is multi-writer
+//!   across nodes within a record's lifetime. Naming follows the
+//!   workspace's `Record` type — applies uniformly to CSV rows, JSON
+//!   objects, XML elements, and fixed-width records.
 
 use indexmap::IndexMap;
 
@@ -41,12 +46,12 @@ pub enum ScopedVarType {
 pub struct ScopedVarsRegistry {
     pub pipeline: IndexMap<String, ScopedVarType>,
     pub source: IndexMap<String, ScopedVarType>,
-    pub row: IndexMap<String, ScopedVarType>,
+    pub record: IndexMap<String, ScopedVarType>,
 }
 
 impl ScopedVarsRegistry {
     /// True if the registry declares no variables in any scope.
     pub fn is_empty(&self) -> bool {
-        self.pipeline.is_empty() && self.source.is_empty() && self.row.is_empty()
+        self.pipeline.is_empty() && self.source.is_empty() && self.record.is_empty()
     }
 }

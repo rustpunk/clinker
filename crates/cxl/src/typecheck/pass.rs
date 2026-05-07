@@ -209,7 +209,7 @@ struct TypeChecker<'a> {
     bindings: &'a [Option<ResolvedBinding>],
     schema: &'a Row,
     registry: &'a BuiltinRegistry,
-    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$row.<key>`
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
     /// types; consulted on every PipelineAccess / SourceAccess after the
     /// builtin-member shortcut misses.
     scoped_vars: &'a ScopedVarsRegistry,
