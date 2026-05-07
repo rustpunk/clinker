@@ -521,6 +521,99 @@ fn validate_read_after_write(
     }
 }
 
+/// Phase G: build a composition body's scoped-vars registry from the
+/// intersection of the body's `_compose.scoped_vars` schema and the
+/// parent's actual declarations.
+///
+/// For each `(scope, key)` declared in the schema:
+/// - If the parent has the same `(scope, key)` with the same type,
+///   include it in the body's registry.
+/// - If the parent doesn't declare it (or declares it with a different
+///   type), emit E174 and skip the entry. The body's CXL referencing
+///   that name then falls back to the resolver's "unknown member"
+///   diagnostic — which is the right outcome because the schema's
+///   contract was unfulfillable.
+///
+/// Returns the body-visible registry. An empty schema produces an
+/// empty registry, preserving the Phase F-2c seal as the default.
+fn build_body_scoped_vars(
+    schema: &crate::config::ScopedVarsSchema,
+    parent: &cxl::resolve::ScopedVarsRegistry,
+    composition_name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> cxl::resolve::ScopedVarsRegistry {
+    use cxl::resolve::ScopedVarsRegistry;
+
+    if schema.is_empty() {
+        return ScopedVarsRegistry::default();
+    }
+
+    let mut registry = ScopedVarsRegistry::default();
+
+    let check = |scope_str: &str,
+                 schema_map: &indexmap::IndexMap<String, crate::config::ScopedVarType>,
+                 parent_map: &indexmap::IndexMap<String, cxl::resolve::ScopedVarType>,
+                 out_map: &mut indexmap::IndexMap<String, cxl::resolve::ScopedVarType>,
+                 diags: &mut Vec<Diagnostic>| {
+        for (key, schema_ty) in schema_map {
+            let cxl_schema_ty: cxl::resolve::ScopedVarType = (*schema_ty).into();
+            match parent_map.get(key) {
+                Some(parent_ty) if *parent_ty == cxl_schema_ty => {
+                    out_map.insert(key.clone(), cxl_schema_ty);
+                }
+                Some(parent_ty) => {
+                    diags.push(Diagnostic::error(
+                        "E174",
+                        format!(
+                            "composition {composition_name:?}: scoped_vars schema declares \
+                                 ${scope_str}.{key} as {cxl_schema_ty:?}, but the parent \
+                                 pipeline declares it as {parent_ty:?} — types must match"
+                        ),
+                        LabeledSpan::primary(span, "composition call site".to_string()),
+                    ));
+                }
+                None => {
+                    diags.push(Diagnostic::error(
+                        "E174",
+                        format!(
+                            "composition {composition_name:?}: scoped_vars schema declares \
+                                 ${scope_str}.{key} but the parent pipeline does not declare \
+                                 a matching variable — add it to the parent's `vars.{scope_str}` \
+                                 block or remove it from the composition's scoped_vars schema"
+                        ),
+                        LabeledSpan::primary(span, "composition call site".to_string()),
+                    ));
+                }
+            }
+        }
+    };
+
+    check(
+        "pipeline",
+        &schema.pipeline,
+        &parent.pipeline,
+        &mut registry.pipeline,
+        diags,
+    );
+    check(
+        "source",
+        &schema.source,
+        &parent.source,
+        &mut registry.source,
+        diags,
+    );
+    check(
+        "record",
+        &schema.record,
+        &parent.record,
+        &mut registry.record,
+        diags,
+    );
+
+    registry
+}
+
 fn span_for_node(spanned: &Spanned<PipelineNode>) -> Span {
     let line = spanned.referenced.line() as u32;
     if line > 0 {
@@ -1168,17 +1261,26 @@ fn bind_composition(
             .unwrap_or(Path::new(""))
             .to_path_buf(),
     );
-    // Composition bodies are sealed from parent scoped vars (Phase F-2c):
-    // parent `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
-    // declarations are not visible inside the body. The seal is structural
-    // — the body's `bind_schema_inner` recursion sees an empty
-    // `ScopedVarsRegistry`, so the resolver rejects any user-declared
-    // scoped reference with the standard "unknown member" diagnostic.
-    // Phase G adds `CompositionSignature.scoped_vars_schema` to allow
-    // opting specific names back in, plus a composition-aware diagnostic
-    // that distinguishes "parent var not declared in signature" from
-    // "no such var anywhere."
+    // Composition bodies are sealed from parent scoped vars by default
+    // (Phase F-2c) — the body sees an empty `ScopedVarsRegistry` and the
+    // resolver rejects every `$pipeline.<custom>` / `$source.<custom>` /
+    // `$record.<custom>` read with the standard "unknown member"
+    // diagnostic.
+    //
+    // Phase G adds opt-in inheritance via the composition's
+    // `_compose.scoped_vars` schema. For each `(scope, key)` declared
+    // in `signature.scoped_vars_schema`, if the parent has a matching
+    // declaration with the same type, the body's registry includes it.
+    // Mismatches (parent missing the var, or type doesn't match) emit
+    // E174.
     let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
+    bind_ctx.scoped_vars = build_body_scoped_vars(
+        &signature.scoped_vars_schema,
+        &saved_scoped_vars,
+        &signature.name,
+        span,
+        diags,
+    );
     // The new enclosing_scope is the parent's node names (for E108).
     bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
     // Also include the enclosing scope's names so nested compositions

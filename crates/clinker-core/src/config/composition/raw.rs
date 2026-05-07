@@ -41,6 +41,33 @@ pub(super) struct RawCompositionSignature {
     pub config_schema: IndexMap<String, RawParamDecl>,
     #[serde(default)]
     pub resources_schema: IndexMap<String, RawResourceDecl>,
+    /// Phase G: opt-in declarations of which parent scoped vars
+    /// the composition body may read. Mirrors
+    /// `clinker_core::config::ScopedVarsDecl` shape, but the inner
+    /// entry is just a typed declaration (no defaults — those live
+    /// on the parent's declarations). YAML form:
+    ///     scoped_vars:
+    ///       pipeline:
+    ///         cutoff_date: { type: date }
+    ///       source:
+    ///         label: { type: string }
+    #[serde(default)]
+    pub scoped_vars: RawScopedVarsSchema,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(super) struct RawScopedVarsSchema {
+    pub pipeline: IndexMap<String, RawScopedVarTypeDecl>,
+    pub source: IndexMap<String, RawScopedVarTypeDecl>,
+    pub record: IndexMap<String, RawScopedVarTypeDecl>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawScopedVarTypeDecl {
+    #[serde(rename = "type")]
+    pub var_type: crate::config::ScopedVarType,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,12 +245,34 @@ impl RawCompositionSignature {
             })
             .collect();
 
+        let scoped_vars_schema = super::ScopedVarsSchema {
+            pipeline: self
+                .scoped_vars
+                .pipeline
+                .into_iter()
+                .map(|(k, v)| (k, v.var_type))
+                .collect(),
+            source: self
+                .scoped_vars
+                .source
+                .into_iter()
+                .map(|(k, v)| (k, v.var_type))
+                .collect(),
+            record: self
+                .scoped_vars
+                .record
+                .into_iter()
+                .map(|(k, v)| (k, v.var_type))
+                .collect(),
+        };
+
         CompositionSignature {
             name: self.name,
             inputs,
             outputs,
             config_schema,
             resources_schema,
+            scoped_vars_schema,
             source_path,
             source_spans,
         }
