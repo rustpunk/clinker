@@ -1305,6 +1305,72 @@ impl PipelineExecutor {
             }
         }
 
+        // ── Pre-load init-phase Sources (Phase E-2) ─────────────
+        // Init-phase state nodes' ancestors include Sources. Those
+        // Sources need their records materialized before the
+        // two-pass walk runs, because the Source dispatcher arm
+        // reads from `combine_source_records` (or `all_records` for
+        // the primary). A standalone init Source isn't a combine
+        // input and isn't the primary, so without this pre-load it
+        // would have nothing to feed the init-phase Aggregate / Map
+        // / state node downstream.
+        //
+        // The map is reused (not renamed) for now — the loaded
+        // records share the same per-name keying and the same
+        // dispatcher consumption path that combine inputs use.
+        // Eventually this map should rename to
+        // `preloaded_source_records` to reflect its broader role,
+        // but the rename touches every dispatcher site and is held
+        // for a follow-up cleanup commit.
+        let init_source_names: Vec<String> = {
+            let init_set = crate::executor::compute_init_phase_node_set(plan);
+            init_set
+                .into_iter()
+                .filter_map(|idx| match &plan.graph[idx] {
+                    crate::plan::execution::PlanNode::Source { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for upstream in &init_source_names {
+            if upstream.as_str() == input.name {
+                // Records already in `all_records`.
+                continue;
+            }
+            if combine_source_records.contains_key(upstream) {
+                continue;
+            }
+            let Some(files) = readers.remove(upstream.as_str()) else {
+                continue;
+            };
+            if files.is_empty() {
+                continue;
+            }
+            let src_cfg = source_configs
+                .iter()
+                .find(|s| s.name == *upstream)
+                .ok_or_else(|| {
+                    PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                        "init-phase source '{upstream}' not declared in the pipeline",
+                    )))
+                })?;
+            let raw_reader = build_multi_file_reader(src_cfg, files)?;
+            let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
+            let mut recs: Vec<(Record, u64)> = Vec::new();
+            let mut rn: u64 = 0;
+            loop {
+                match src_reader.next_record() {
+                    Ok(Some(record)) => {
+                        rn += 1;
+                        recs.push((record, rn));
+                    }
+                    Ok(None) => break,
+                    Err(other) => return Err(other.into()),
+                }
+            }
+            combine_source_records.insert(upstream.clone(), recs);
+        }
+
         Self::execute_dag_branching(
             config,
             input,
