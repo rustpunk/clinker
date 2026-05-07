@@ -1,0 +1,22 @@
+# Phase F-2c / Item 4 fixture: composition body that reads a parent
+# `$pipeline.<custom>` variable WITHOUT declaring it in
+# `_compose.scoped_vars`. The body's CXL resolver should reject the
+# read with E173 (composition-aware "you tried to read a parent var
+# hidden from your body — declare in `_compose.scoped_vars` to opt in")
+# rather than the generic "unknown member" diagnostic.
+_compose:
+  name: state_uses_undeclared
+  inputs:
+    data:
+      schema:
+        - { name: id, type: string }
+  outputs:
+    data: read_var.out
+
+nodes:
+  - type: transform
+    name: read_var
+    input: data
+    config:
+      cxl: |
+        emit observed = $pipeline.cutoff

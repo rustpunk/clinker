@@ -42,16 +42,47 @@ pub enum ScopedVarType {
 /// registry pass `&ScopedVarsRegistry::default()` and observe the
 /// pre-Phase-B behavior (only builtin members of `$pipeline.*` /
 /// `$source.*` resolve).
+///
+/// The `hidden_*` tiers carry parent-scope vars that the body is NOT
+/// permitted to read, but their existence informs a more useful
+/// diagnostic: composition bodies use this to surface the
+/// schema-aware E173 ("you tried to read a parent var that's hidden
+/// from your body — declare it in `_compose.scoped_vars` to opt in")
+/// rather than the generic "unknown member" error. Empty for
+/// non-composition contexts.
 #[derive(Debug, Clone, Default)]
 pub struct ScopedVarsRegistry {
     pub pipeline: IndexMap<String, ScopedVarType>,
     pub source: IndexMap<String, ScopedVarType>,
     pub record: IndexMap<String, ScopedVarType>,
+    pub hidden_pipeline: IndexMap<String, ScopedVarType>,
+    pub hidden_source: IndexMap<String, ScopedVarType>,
+    pub hidden_record: IndexMap<String, ScopedVarType>,
+}
+
+/// Per-scope tag for `ScopedVarsRegistry::hidden_lookup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTag {
+    Pipeline,
+    Source,
+    Record,
 }
 
 impl ScopedVarsRegistry {
-    /// True if the registry declares no variables in any scope.
+    /// True if the registry declares no variables in any visible scope.
     pub fn is_empty(&self) -> bool {
         self.pipeline.is_empty() && self.source.is_empty() && self.record.is_empty()
+    }
+
+    /// Look up `key` in the hidden tier of `scope`. Returns `Some` when
+    /// the parent declared the var but the composition's signature
+    /// didn't opt it in — the resolver uses this to produce the
+    /// composition-aware E173 diagnostic.
+    pub fn hidden_lookup(&self, scope: ScopeTag, key: &str) -> Option<ScopedVarType> {
+        match scope {
+            ScopeTag::Pipeline => self.hidden_pipeline.get(key).copied(),
+            ScopeTag::Source => self.hidden_source.get(key).copied(),
+            ScopeTag::Record => self.hidden_record.get(key).copied(),
+        }
     }
 }

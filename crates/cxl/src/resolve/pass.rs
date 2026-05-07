@@ -282,6 +282,28 @@ impl<'a> Resolver<'a> {
                 let is_declared = self.scoped_vars.pipeline.contains_key(&**field);
                 if is_builtin || is_declared {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Pipeline, field)
+                    .is_some()
+                {
+                    // Phase F-2c / Item 4 — composition body referenced a
+                    // parent-declared var that's NOT in the body's
+                    // `_compose.scoped_vars` opt-in schema. E173 makes the
+                    // sealing explicit instead of falling through to a
+                    // generic "unknown member" diagnostic.
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$pipeline.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.pipeline` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.pipeline` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
                 } else {
                     let declared: Vec<&str> = self
                         .scoped_vars
@@ -314,6 +336,23 @@ impl<'a> Resolver<'a> {
                 let is_declared = self.scoped_vars.source.contains_key(&**field);
                 if is_builtin || is_declared {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Source, field)
+                    .is_some()
+                {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$source.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.source` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.source` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
                 } else {
                     let declared: Vec<&str> =
                         self.scoped_vars.source.keys().map(|s| s.as_str()).collect();
@@ -346,6 +385,23 @@ impl<'a> Resolver<'a> {
                 // tracked in #44). Only declared user-scope vars resolve.
                 if self.scoped_vars.record.contains_key(&**field) {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Record, field)
+                    .is_some()
+                {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$record.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.record` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.record` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
                 } else {
                     let declared: Vec<&str> =
                         self.scoped_vars.record.keys().map(|s| s.as_str()).collect();

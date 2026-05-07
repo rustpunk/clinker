@@ -200,6 +200,12 @@ pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRe
             .iter()
             .map(|(k, d)| (k.clone(), d.var_type.into()))
             .collect(),
+        // Top-level pipelines never have hidden vars — those are
+        // populated only when entering a composition body via
+        // `build_body_scoped_vars` to support the E173 diagnostic.
+        hidden_pipeline: indexmap::IndexMap::new(),
+        hidden_source: indexmap::IndexMap::new(),
+        hidden_record: indexmap::IndexMap::new(),
     }
 }
 

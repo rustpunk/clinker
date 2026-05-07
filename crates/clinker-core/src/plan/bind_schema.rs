@@ -677,10 +677,6 @@ fn build_body_scoped_vars(
 ) -> cxl::resolve::ScopedVarsRegistry {
     use cxl::resolve::ScopedVarsRegistry;
 
-    if schema.is_empty() {
-        return ScopedVarsRegistry::default();
-    }
-
     let mut registry = ScopedVarsRegistry::default();
 
     let check = |scope_str: &str,
@@ -742,6 +738,28 @@ fn build_body_scoped_vars(
         &mut registry.record,
         diags,
     );
+
+    // Phase F-2c / Item 4 — populate the hidden tier with parent vars
+    // that are NOT opted into the schema. The composition body's
+    // resolver consults `hidden_*` on miss to emit E173 (composition-
+    // aware "this is a parent var hidden from your body — declare in
+    // _compose.scoped_vars to opt in") rather than the generic
+    // "unknown member" diagnostic.
+    for (key, ty) in &parent.pipeline {
+        if !schema.pipeline.contains_key(key) {
+            registry.hidden_pipeline.insert(key.clone(), *ty);
+        }
+    }
+    for (key, ty) in &parent.source {
+        if !schema.source.contains_key(key) {
+            registry.hidden_source.insert(key.clone(), *ty);
+        }
+    }
+    for (key, ty) in &parent.record {
+        if !schema.record.contains_key(key) {
+            registry.hidden_record.insert(key.clone(), *ty);
+        }
+    }
 
     registry
 }

@@ -2112,6 +2112,57 @@ nodes:
     }
 
     #[test]
+    fn test_composition_body_undeclared_parent_var_emits_e173() {
+        // Phase F-2c / Item 4: parent declares `$pipeline.cutoff`,
+        // composition body's CXL reads it but the composition's
+        // `_compose.scoped_vars` schema is empty. The body's resolver
+        // sees the parent var in the `hidden_pipeline` tier and
+        // emits E173 instead of the generic "unknown member" error.
+        let yaml = r#"
+pipeline:
+  name: state_composition_body_unscoped
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 5 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - { name: id, type: string }
+  - type: composition
+    name: caller
+    input: src
+    use: compositions/state_uses_undeclared.comp.yaml
+    inputs:
+      data: src
+    outputs:
+      data: out
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.join("tests").join("fixtures");
+        let ctx = crate::config::CompileContext::with_pipeline_dir(
+            &workspace_root,
+            std::path::PathBuf::new(),
+        );
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("composition body reading undeclared parent var should reject");
+        assert!(
+            err_diags
+                .iter()
+                .any(|d| d.message.contains("E173")
+                    || d.message.contains("composition body references")),
+            "expected E173 composition-aware diagnostic, got: {:?}",
+            err_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_init_phase_reads_runtime_var_emits_e175() {
         // Phase F-2 / Item 3: an init-phase state node reads a
         // variable that's only written by a runtime-phase state node.
