@@ -60,8 +60,12 @@ pub struct PipelineMeta {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
+    /// User-defined variable declarations grouped by scope (pipeline, source,
+    /// row). Pipeline-scope defaults seed the runtime registry at init;
+    /// source- and row-scope entries are placeholders for runtime writes by
+    /// `state` nodes (no readers yet).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vars: Option<IndexMap<String, serde_json::Value>>,
+    pub vars: Option<ScopedVarsDecl>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_formats: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +108,60 @@ pub struct ConcurrencyConfig {
     pub threads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<usize>,
+}
+
+/// User-defined variable declarations partitioned by scope.
+///
+/// Three scopes mirror the CXL read namespaces: `$pipeline.<key>` is
+/// init-bound and broadcast to every record; `$source.<key>` is per-source
+/// with a fresh slot per ingestion stream; `$row.<key>` is per-record
+/// scratch state distinct from `$meta.*` (writable by `state` nodes only,
+/// declared with type for compile-time checking).
+///
+/// Pipeline-scope defaults flow into [`StableEvalContext.pipeline_vars`]
+/// at init via [`convert_pipeline_vars`]. Source- and row-scope readers
+/// arrive in a follow-up commit; their declarations parse and validate
+/// today so the YAML surface is stable across the sprint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScopedVarsDecl {
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub pipeline: IndexMap<String, ScopedVarDecl>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub source: IndexMap<String, ScopedVarDecl>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub row: IndexMap<String, ScopedVarDecl>,
+}
+
+/// One scoped variable's declared type and optional default value.
+///
+/// `default` must match `var_type` — enforced by [`validate_scoped_vars`].
+/// Source- and row-scope variables typically omit the default (their value
+/// arrives at runtime from a `state` node write).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedVarDecl {
+    #[serde(rename = "type")]
+    pub var_type: ScopedVarType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// Scoped-variable primitive type set.
+///
+/// Mirrors the CXL primitive types the typecheck pass will use to validate
+/// `$pipeline.<key>` / `$source.<key>` / `$row.<key>` reads in the
+/// follow-up Phase B commit. `Date` and `DateTime` accept ISO-8601 string
+/// defaults (parsed at the eval boundary, not at YAML load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopedVarType {
+    String,
+    Int,
+    Float,
+    Bool,
+    Date,
+    DateTime,
 }
 
 /// Input source configuration.
@@ -3505,7 +3563,8 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     Ok(config)
 }
 
-/// Reserved pipeline member names that cannot be used as user variable names.
+/// Reserved `$pipeline.*` member names that cannot be used as user variable
+/// names. Mirrors `crates/cxl/src/resolve/pass.rs::PIPELINE_MEMBERS`.
 const RESERVED_PIPELINE_NAMES: &[&str] = &[
     "start_time",
     "name",
@@ -3514,8 +3573,19 @@ const RESERVED_PIPELINE_NAMES: &[&str] = &[
     "total_count",
     "ok_count",
     "dlq_count",
-    "source_file",
-    "source_row",
+    "filtered_count",
+    "distinct_count",
+];
+
+/// Reserved `$source.*` member names. Mirrors
+/// `crates/cxl/src/resolve/pass.rs::SOURCE_MEMBERS`.
+const RESERVED_SOURCE_NAMES: &[&str] = &[
+    "file",
+    "row",
+    "path",
+    "count",
+    "batch",
+    "ingestion_timestamp",
 ];
 
 /// Post-deserialization validation.
@@ -3534,9 +3604,9 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Validate pipeline.vars
+    // Validate pipeline.vars (typed, scope-partitioned)
     if let Some(ref vars) = config.pipeline.vars {
-        validate_pipeline_vars(vars)?;
+        validate_scoped_vars(vars)?;
     }
 
     // Validate log directives on Transform nodes.
@@ -3571,68 +3641,94 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate pipeline.vars: no reserved name collisions, no nested objects/arrays/null.
-fn validate_pipeline_vars(vars: &IndexMap<String, serde_json::Value>) -> Result<(), ConfigError> {
-    for (name, value) in vars {
-        // Check reserved name collision
-        if RESERVED_PIPELINE_NAMES.contains(&name.as_str()) {
+/// Validate the scope-partitioned `vars:` block: each scope's keys cannot
+/// collide with that scope's reserved member names, and any declared
+/// default must match its declared type.
+fn validate_scoped_vars(vars: &ScopedVarsDecl) -> Result<(), ConfigError> {
+    validate_scope("pipeline", &vars.pipeline, RESERVED_PIPELINE_NAMES)?;
+    validate_scope("source", &vars.source, RESERVED_SOURCE_NAMES)?;
+    validate_scope("row", &vars.row, &[])?;
+    Ok(())
+}
+
+fn validate_scope(
+    scope: &str,
+    decls: &IndexMap<String, ScopedVarDecl>,
+    reserved: &[&str],
+) -> Result<(), ConfigError> {
+    for (name, decl) in decls {
+        if reserved.contains(&name.as_str()) {
             return Err(ConfigError::Validation(format!(
-                "pipeline.vars: '{}' is a reserved pipeline member name and cannot be used as a variable",
-                name
+                "vars.{scope}: '{name}' is a reserved {scope} member name and cannot be used as a variable",
             )));
         }
-
-        // Check value type — only scalars allowed
-        match value {
-            serde_json::Value::Object(_) => {
-                return Err(ConfigError::Validation(format!(
-                    "pipeline.vars.{}: nested objects are not supported — only scalar values (string, number, bool)",
-                    name
-                )));
-            }
-            serde_json::Value::Array(_) => {
-                return Err(ConfigError::Validation(format!(
-                    "pipeline.vars.{}: arrays are not supported — only scalar values (string, number, bool)",
-                    name
-                )));
-            }
-            serde_json::Value::Null => {
-                return Err(ConfigError::Validation(format!(
-                    "pipeline.vars.{}: null values are not supported — provide a scalar value",
-                    name
-                )));
-            }
-            _ => {} // String, Number, Bool — all ok
+        if let Some(default) = &decl.default {
+            check_default_type(scope, name, decl.var_type, default)?;
         }
     }
     Ok(())
 }
 
-/// Convert validated pipeline vars from serde_json to clinker_record::Value.
-/// Only call after `validate_pipeline_vars` has passed (no null/object/array).
-pub fn convert_pipeline_vars(
-    vars: &IndexMap<String, serde_json::Value>,
-) -> IndexMap<String, clinker_record::Value> {
-    vars.iter()
-        .map(|(k, v)| {
-            let val = match v {
-                serde_json::Value::Bool(b) => clinker_record::Value::Bool(*b),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        clinker_record::Value::Integer(i)
-                    } else {
-                        clinker_record::Value::Float(n.as_f64().unwrap_or(0.0))
-                    }
-                }
-                serde_json::Value::String(s) => {
-                    clinker_record::Value::String(s.clone().into_boxed_str())
-                }
-                // Null/Object/Array rejected by validate_pipeline_vars
-                _ => unreachable!("validate_pipeline_vars should reject non-scalar values"),
-            };
-            (k.clone(), val)
+fn check_default_type(
+    scope: &str,
+    name: &str,
+    var_type: ScopedVarType,
+    default: &serde_json::Value,
+) -> Result<(), ConfigError> {
+    let mismatch = || {
+        ConfigError::Validation(format!(
+            "vars.{scope}.{name}: default value does not match declared type {var_type:?}",
+        ))
+    };
+    match (var_type, default) {
+        (_, serde_json::Value::Null) => Err(ConfigError::Validation(format!(
+            "vars.{scope}.{name}: default value cannot be null",
+        ))),
+        (
+            ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
+            serde_json::Value::String(_),
+        ) => Ok(()),
+        (ScopedVarType::Int, serde_json::Value::Number(n)) if n.is_i64() => Ok(()),
+        (ScopedVarType::Float, serde_json::Value::Number(_)) => Ok(()),
+        (ScopedVarType::Bool, serde_json::Value::Bool(_)) => Ok(()),
+        _ => Err(mismatch()),
+    }
+}
+
+/// Convert pipeline-scope variable defaults into the runtime
+/// `IndexMap<String, Value>` consumed by [`StableEvalContext::pipeline_vars`].
+///
+/// Source- and row-scope declarations are intentionally not threaded here —
+/// their values are produced at runtime by `state` nodes (Phase D), not
+/// from YAML defaults. Only call after [`validate_scoped_vars`] has passed.
+pub fn convert_pipeline_vars(vars: &ScopedVarsDecl) -> IndexMap<String, clinker_record::Value> {
+    vars.pipeline
+        .iter()
+        .filter_map(|(name, decl)| {
+            decl.default
+                .as_ref()
+                .map(|default| (name.clone(), default_to_value(decl.var_type, default)))
         })
         .collect()
+}
+
+fn default_to_value(var_type: ScopedVarType, default: &serde_json::Value) -> clinker_record::Value {
+    use clinker_record::Value;
+    match (var_type, default) {
+        (ScopedVarType::Bool, serde_json::Value::Bool(b)) => Value::Bool(*b),
+        (ScopedVarType::Int, serde_json::Value::Number(n)) => {
+            Value::Integer(n.as_i64().unwrap_or(0))
+        }
+        (ScopedVarType::Float, serde_json::Value::Number(n)) => {
+            Value::Float(n.as_f64().unwrap_or(0.0))
+        }
+        (
+            ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
+            serde_json::Value::String(s),
+        ) => Value::String(s.clone().into_boxed_str()),
+        // validate_scoped_vars rejects every other (type, default) combo.
+        _ => unreachable!("validate_scoped_vars should reject mismatched defaults"),
+    }
 }
 
 /// Load and parse a pipeline config from a YAML file path with extra variables.
