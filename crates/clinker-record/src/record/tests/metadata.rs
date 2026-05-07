@@ -138,23 +138,45 @@ fn test_record_metadata_cap_allows_overwrite() {
 
 #[test]
 fn test_record_var_resolves_via_field_resolver() {
-    // Phase D-3: record-scope state-node writes go to the metadata
-    // channel under `RECORD_VAR_META_PREFIX`. The Record's
-    // `FieldResolver::resolve("$record.<key>")` impl strips the
-    // namespace prefix and looks up the prefixed metadata key.
+    // Phase D-3 / Item 5: record-scope state-node writes go to the
+    // dedicated `record_vars` channel (independent of `$meta.*`).
+    // `FieldResolver::resolve("$record.<key>")` strips the namespace
+    // prefix and looks up via `get_record_var`.
     let mut record = test_record();
-    let key = format!("{}{}", RECORD_VAR_META_PREFIX, "fuzzy_score");
-    record.set_meta(&key, Value::Float(0.85)).unwrap();
+    record
+        .set_record_var("fuzzy_score", Value::Float(0.85))
+        .unwrap();
     assert_eq!(
         record.resolve("$record.fuzzy_score"),
         Some(&Value::Float(0.85)),
-        "$record.<key> should resolve via the reserved metadata prefix"
+        "$record.<key> should resolve via the dedicated record_vars channel"
     );
-    // Sanity: a $meta.* read for the same suffix does NOT pick up the
-    // record-var entry (the metadata key is the prefixed form, not
-    // the bare suffix).
+    // Sanity: $meta.* and $record.<key> live in independent maps.
     assert!(
         record.resolve("$meta.fuzzy_score").is_none(),
         "$meta.<suffix> must not silently match record-var storage"
     );
+}
+
+#[test]
+fn test_record_var_independent_64_key_budget() {
+    // Item 5: `$meta.*` and `$record.<key>` have INDEPENDENT 64-key
+    // budgets. Filling one to capacity must not affect the other.
+    let mut record = test_record();
+    for i in 0..64 {
+        record
+            .set_meta(&format!("meta_{i}"), Value::Integer(i as i64))
+            .unwrap();
+    }
+    // 64 record-vars must still succeed even though metadata is full.
+    for i in 0..64 {
+        record
+            .set_record_var(&format!("rv_{i}"), Value::Integer(i as i64))
+            .unwrap();
+    }
+    // 65th of either kind exceeds its own cap.
+    let meta_overflow = record.set_meta("meta_64", Value::Integer(64));
+    assert!(meta_overflow.is_err(), "65th $meta.* should error");
+    let rv_overflow = record.set_record_var("rv_64", Value::Integer(64));
+    assert!(rv_overflow.is_err(), "65th $record.<key> should error");
 }

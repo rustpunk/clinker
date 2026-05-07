@@ -8,15 +8,12 @@ use std::sync::Arc;
 /// Maximum number of metadata keys per record.
 const MAX_METADATA_KEYS: usize = 64;
 
-/// Reserved prefix for record-scope user-declared variable storage in
-/// the metadata channel. The state node arm (Phase D-3) writes
-/// `$record.<key>` values under `__rv_<key>` so they share the
-/// existing 64-key metadata cap with `$meta.*` but stay distinguishable
-/// at the read site (where `Record::resolve` strips the `$record.`
-/// prefix and dispatches via this constant). Distinct from `$meta.*`
-/// keys (which the user authors freely) — `$record.<key>` keys are
-/// declared at the pipeline top with a type, single-writer enforced.
-pub const RECORD_VAR_META_PREFIX: &str = "__rv_";
+/// Maximum number of `$record.<key>` user-declared scoped variables
+/// per record. Independent of the `$meta.*` cap so heavy `$meta.*`
+/// use does not starve `$record.<key>` writes (Item 5 of the
+/// sprint-close remediation; the prior `__rv_` prefix shared the
+/// metadata cap).
+const MAX_RECORD_VARS: usize = 64;
 
 /// Schema-indexed row record.
 ///
@@ -36,6 +33,11 @@ pub struct Record {
     /// Per-record metadata. Stripped from output unless `include_metadata` is set.
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
+    /// Per-record user-declared `$record.<key>` scoped variables
+    /// (Item 5 — independent 64-key budget, distinct from `metadata`).
+    /// Written by Phase D-3 state nodes with `scope: record`. Lazy-
+    /// initialized on first `set_record_var()` call.
+    record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
 }
 
 /// Wire payload for a [`Record`] in binary spill streams.
@@ -45,13 +47,23 @@ pub struct Record {
 /// optional per-record metadata. Callers reconstruct a full `Record` via
 /// [`RecordPayload::into_record`].
 ///
-/// Wire format (postcard): `(Vec<Value>, Option<Vec<(Box<str>, Value)>>)`.
+/// Wire format (postcard):
+/// `(Vec<Value>, Option<Vec<(Box<str>, Value)>>, Option<Vec<(Box<str>, Value)>>)`.
+/// The `record_vars` slot was added in Item 5 to give `$record.<key>`
+/// its own 64-key budget separate from `$meta.*`. `serde(default)` on
+/// the new field keeps wire-format backward compatibility — older
+/// spill streams without the trailing field deserialize as
+/// `record_vars: None`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecordPayload {
     /// Positional field values in schema column order.
     pub values: Vec<Value>,
     /// Per-record metadata entries, or `None` if the record has no metadata.
     pub metadata: Option<Vec<(Box<str>, Value)>>,
+    /// Per-record `$record.<key>` user-declared scoped variables
+    /// (Item 5), or `None` if the record has none.
+    #[serde(default)]
+    pub record_vars: Option<Vec<(Box<str>, Value)>>,
 }
 
 impl RecordPayload {
@@ -65,21 +77,28 @@ impl RecordPayload {
                 let _ = record.set_meta(&k, v);
             }
         }
+        if let Some(rv_pairs) = self.record_vars {
+            for (k, v) in rv_pairs {
+                let _ = record.set_record_var(&k, v);
+            }
+        }
         record
     }
 }
 
 impl Serialize for Record {
-    /// Serializes this record as a [`RecordPayload`] (values + metadata).
+    /// Serializes this record as a [`RecordPayload`] (values + metadata + record_vars).
     ///
     /// The schema is not included in the wire output. Callers that need
     /// schema information must write it separately (e.g., as a header line)
     /// and supply it on deserialization via [`RecordPayload::into_record`].
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let meta = self.metadata_pairs();
+        let rv = self.record_var_pairs();
         RecordPayload {
             values: self.values.clone(),
             metadata: if meta.is_empty() { None } else { Some(meta) },
+            record_vars: if rv.is_empty() { None } else { Some(rv) },
         }
         .serialize(serializer)
     }
@@ -105,6 +124,7 @@ impl Record {
             schema,
             values,
             metadata: None,
+            record_vars: None,
         }
     }
 
@@ -186,6 +206,52 @@ impl Record {
         }
     }
 
+    // ── Record-scope variables (`$record.<key>`) ────────────────────
+
+    /// Read a `$record.<key>` user-declared scoped variable by key.
+    ///
+    /// Distinct from `get_meta`: `$record.<key>` keys live in their
+    /// own 64-key budget (independent of `$meta.*`) and are written
+    /// only by Phase D-3 state nodes with `scope: record`.
+    pub fn get_record_var(&self, key: &str) -> Option<&Value> {
+        self.record_vars.as_ref().and_then(|m| m.get(key))
+    }
+
+    /// Write a `$record.<key>` user-declared scoped variable.
+    /// Lazy-inits the map on first call. Returns `Err` if the
+    /// per-record record-vars cap (64 keys) would be exceeded.
+    pub fn set_record_var(&mut self, key: &str, value: Value) -> Result<(), &'static str> {
+        let map = self
+            .record_vars
+            .get_or_insert_with(|| Box::new(IndexMap::new()));
+        if !map.contains_key(key) && map.len() >= MAX_RECORD_VARS {
+            return Err("per-record `$record.<key>` cap exceeded (64 keys)");
+        }
+        map.insert(key.into(), value);
+        Ok(())
+    }
+
+    /// Whether this record has any `$record.<key>` scoped-var entries.
+    pub fn has_record_vars(&self) -> bool {
+        self.record_vars.as_ref().is_some_and(|m| !m.is_empty())
+    }
+
+    /// Iterator over all `$record.<key>` scoped-var key-value pairs.
+    pub fn iter_record_vars(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.record_vars
+            .iter()
+            .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
+    }
+
+    /// Collect all `$record.<key>` entries as owned pairs (for binary
+    /// spill encoding via [`RecordPayload::record_vars`]).
+    pub fn record_var_pairs(&self) -> Vec<(Box<str>, Value)> {
+        match &self.record_vars {
+            None => Vec::new(),
+            Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
     // ── Fields ─────────────────────────────────────────────────────
 
     /// Iterator over every schema field in schema order. Metadata is
@@ -247,7 +313,8 @@ impl Record {
             map_backing + keys_heap + values_heap
         };
         let metadata_size = self.metadata.as_ref().map_or(0, |m| indexmap_heap(m));
-        values_backing + values_heap + metadata_size
+        let record_vars_size = self.record_vars.as_ref().map_or(0, |m| indexmap_heap(m));
+        values_backing + values_heap + metadata_size + record_vars_size
     }
 }
 
@@ -257,14 +324,12 @@ impl FieldResolver for Record {
         if let Some(meta_key) = name.strip_prefix("$meta.") {
             return self.get_meta(meta_key);
         }
-        // Handle $record.<key>: resolve from the metadata map under
-        // the reserved RECORD_VAR_META_PREFIX so user-declared
-        // `vars.record` slots share storage with `$meta.*` without
-        // colliding (state node Phase D-3 writes use the prefix).
+        // Handle $record.<key>: resolve from the dedicated record-vars
+        // channel (Item 5 — independent 64-key budget, distinct from
+        // `$meta.*`). Phase D-3 state nodes with `scope: record` write
+        // here.
         if let Some(record_var) = name.strip_prefix("$record.") {
-            // Stack-allocated for short keys; Box for the rare long key.
-            // 56 bytes covers prefix + 51-char var names without heap.
-            return self.get_meta(&format!("{RECORD_VAR_META_PREFIX}{record_var}"));
+            return self.get_record_var(record_var);
         }
         self.get(name)
     }

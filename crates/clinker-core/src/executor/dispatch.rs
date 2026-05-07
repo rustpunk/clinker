@@ -3198,17 +3198,15 @@ pub(crate) fn dispatch_plan_node(
                                         );
                                     }
                                     crate::config::VarScope::Record => {
-                                        // Store under the reserved
-                                        // RECORD_VAR_META_PREFIX so
-                                        // `Record::resolve("$record.<key>")`
-                                        // strips the prefix and finds it
-                                        // via `get_meta`.
-                                        let key = format!(
-                                            "{}{}",
-                                            clinker_record::RECORD_VAR_META_PREFIX,
-                                            assignment.var
-                                        );
-                                        if let Err(cap_err) = record.set_meta(&key, value) {
+                                        // Item 5 — write to the dedicated
+                                        // `record_vars` channel on Record;
+                                        // independent 64-key budget from
+                                        // `$meta.*`. `Record::resolve`
+                                        // routes `$record.<key>` reads
+                                        // there directly.
+                                        if let Err(cap_err) =
+                                            record.set_record_var(&assignment.var, value)
+                                        {
                                             return Err(crate::error::PipelineError::Compilation {
                                                 transform_name: format!("state:{name}"),
                                                 messages: vec![format!(
