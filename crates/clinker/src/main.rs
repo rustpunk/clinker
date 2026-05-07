@@ -575,12 +575,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Outputs are written atomically: each output writes to a sibling
     // tempfile, then renames into place after the pipeline completes
-    // successfully. On crash or pipeline error, the tempfile is left in
-    // place (and its path logged) so an operator can inspect partial
-    // output without the final path showing a truncated file.
+    // successfully. On crash or pipeline error, the writing tempfile is
+    // left in place (and its path logged) so an operator can inspect
+    // partial output without the final path showing a truncated file.
+    //
+    // Cross-process race-safety for `if_exists: unique_suffix` comes
+    // from `OpenOptions::create_new` reservations: each output's
+    // resolved path holds a 0-byte placeholder file from the moment
+    // `open_output` returns until persist atomically replaces it.  The
+    // placeholder is wrapped in a `tempfile::TempPath`, mirroring what
+    // the rest of the codebase already does for tempfile cleanup, so
+    // any unwind path (panic, mid-persist failure, the explicit Err
+    // arm below) auto-unlinks remaining placeholders via `Drop`.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let mut output_temps: Vec<(String, std::path::PathBuf, tempfile::NamedTempFile)> = Vec::new();
+    let mut output_temps: Vec<PendingOutput> = Vec::new();
     // output_name → final resolved path, kept after output_temps is
     // consumed by the persist loop so the provenance sidecar can
     // record the actual file written (not the bare template-rendered
@@ -614,16 +623,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        // open_output claims the slot race-safely via OpenOptions::create_new
-        // and returns the reservation file. Drop the handle but leave the
-        // empty file on disk: it blocks any concurrent unique_suffix walk
-        // from picking the same path, and the success-path persist below
-        // atomically renames our writing tempfile over it. The error path
-        // explicitly unlinks the reservation so the failed-run contract
-        // (final_path must not exist) still holds.
-        let (final_path, reservation) =
+        let (final_path, reservation_file) =
             clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
-        drop(reservation);
+        drop(reservation_file);
+        let reservation = tempfile::TempPath::try_from_path(&final_path)?;
         let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
         let temp = match parent {
             Some(dir) => {
@@ -638,7 +641,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
         resolved_output_paths.insert(output.name.clone(), final_path.clone());
-        output_temps.push((output.name.clone(), final_path, temp));
+        output_temps.push(PendingOutput {
+            name: output.name.clone(),
+            final_path,
+            temp,
+            reservation,
+        });
     }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
@@ -650,37 +658,37 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     ) {
         Ok(report) => report,
         Err(e) => {
-            for (name, final_path, temp) in output_temps {
-                let kept = temp.into_temp_path().keep().ok();
-                // Unlink the reservation placeholder so the failed-run
-                // contract (`final_path` does not exist) holds. A failure
-                // here only leaks an empty file at `final_path`; log it
-                // and continue tearing down the other outputs.
-                if let Err(rm_err) = std::fs::remove_file(&final_path)
-                    && rm_err.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
-                        output = %name,
-                        final_path = %final_path.display(),
-                        error = %rm_err,
-                        "failed to unlink reservation placeholder after pipeline error",
-                    );
-                }
+            // Reservations auto-unlink via TempPath::Drop when output_temps
+            // is dropped at end of scope. We just need to preserve the
+            // writing tempfiles for operator inspection and log.
+            for pending in output_temps {
+                let kept = pending.temp.into_temp_path().keep().ok();
                 tracing::warn!(
-                    output = %name,
-                    final_path = %final_path.display(),
+                    output = %pending.name,
+                    final_path = %pending.final_path.display(),
                     partial_path = ?kept,
                     "pipeline failed; partial output preserved at temp path",
                 );
+                // pending.reservation drops here, unlinking the placeholder.
             }
             return Err(e);
         }
     };
 
     // Pipeline succeeded — atomically promote each tempfile to its
-    // final path. Failure here aborts the run with the temp file still
-    // on disk under its tempfile name.
-    for (_name, final_path, temp) in output_temps {
+    // final path. Order: persist first (rename atomically replaces the
+    // reservation placeholder); only on success forget the reservation
+    // so its TempPath::Drop does not unlink the now-persisted output.
+    // Then fsync the parent dir so the rename's metadata is durable
+    // across a crash (Linux ext4/xfs default mount options do not
+    // synchronously flush parent-dir entries on rename).
+    for pending in output_temps {
+        let PendingOutput {
+            name: _,
+            final_path,
+            temp,
+            reservation,
+        } = pending;
         temp.persist(&final_path).map_err(|e| {
             tracing::error!(
                 final_path = %final_path.display(),
@@ -692,6 +700,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 e.error
             ))
         })?;
+        // Persist replaced the placeholder atomically; the file at
+        // `final_path` is now the actual output. Forget the TempPath
+        // so Drop does not unlink it. Equivalent to `keep()` but avoids
+        // surfacing platform-specific keep failures that, post-persist,
+        // would just confuse the operator.
+        std::mem::forget(reservation);
+        if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(e) = fsync_dir(parent)
+        {
+            tracing::warn!(
+                final_path = %final_path.display(),
+                error = %e,
+                "fsync(parent_dir) failed; rename metadata may not survive a crash",
+            );
+        }
     }
 
     let counters = &report.counters;
@@ -917,6 +940,39 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
 /// Resolve thread count from CLI args or default to `num_cpus`.
 fn num_threads(args: &RunArgs) -> usize {
     args.threads.unwrap_or_else(num_cpus::get)
+}
+
+/// One per-output bookkeeping record carried from writer-loop to
+/// persist-loop. The `reservation` field is the 0-byte placeholder
+/// created by `open_output`; its `TempPath::Drop` auto-unlinks if
+/// anything between writer-loop and persist tears down (panic, Err
+/// arm, mid-persist failure).
+struct PendingOutput {
+    name: String,
+    final_path: std::path::PathBuf,
+    temp: tempfile::NamedTempFile,
+    reservation: tempfile::TempPath,
+}
+
+/// Force durable persistence of `dir`'s entry metadata to disk.
+///
+/// Called immediately after `tempfile::persist` (rename) so a crash
+/// between the rename returning and the kernel writing the parent-dir
+/// metadata cannot leave the rename invisible. Linux ext4/xfs default
+/// mount options do not implicitly fsync the parent dir on rename;
+/// see <https://yakking.branchable.com/posts/atomic-file-creation-tmpfile/>.
+///
+/// On non-Unix targets this is a no-op — opening directories for
+/// `fsync` is a Unix-ism, and Windows' `MoveFileExW` provides
+/// equivalent durability via the journal.
+#[cfg(unix)]
+fn fsync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Render a "Resolved Outputs" block listing each output's expanded
