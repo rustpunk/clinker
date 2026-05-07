@@ -789,6 +789,38 @@ pub struct TransformBody {
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,
+    /// Producer-declared scoped variables this transform writes. Each
+    /// entry's `name` becomes addressable downstream as
+    /// `$<scope>.<name>`. The transform's CXL writes via
+    /// `emit $<scope>.<name> = <expr>`. Empty list means the transform
+    /// writes no scoped vars.
+    #[serde(default)]
+    pub declares: Vec<DeclareEntry>,
+    /// `phase: init` runs the transform (and its transitive ancestors)
+    /// to completion before any runtime-phase node sees a record. Used
+    /// for pre-runtime population of `$pipeline.*` / `$source.*`
+    /// values from a config source. Default is `Runtime`.
+    #[serde(default)]
+    pub phase: Phase,
+}
+
+/// One declaration of a producer-written scoped variable.
+///
+/// Lives on a Transform's `config.declares:` list. Each entry names a
+/// scoped variable the transform's CXL writes via
+/// `emit $<scope>.<name> = ...`, with the type the registry will hold
+/// and an optional default for reads that fire before the writer
+/// (typical case: an init-phase reader of a value the runtime walk
+/// hasn't reached yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclareEntry {
+    pub name: String,
+    pub scope: VarScope,
+    #[serde(rename = "type")]
+    pub var_type: crate::config::ScopedVarType,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
 }
 
 /// Miss handling for combine: how a driver record with no matching
