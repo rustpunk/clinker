@@ -1,129 +1,271 @@
-# Pipeline Variables
+# Scoped Variables
 
-Pipeline variables are constants defined in the YAML `pipeline:` header and accessible in CXL expressions. They provide a way to parameterize pipeline behavior without modifying CXL logic.
+Clinker's scoped-variable system lets a pipeline read and write
+named values at three lifetimes: the pipeline run, the source, and
+the record. Variables are **declared statically** at pipeline top
+with their type and scope, **read inline** from CXL via the `$pipeline.*`,
+`$source.*`, and `$record.*` namespaces, and **written exclusively**
+by a dedicated `state` node.
 
-## Defining variables
+## The three scopes
 
-Variables are declared in the `vars:` block of the `pipeline:` section:
+| Scope      | Lifetime                                  | Reset             | Reader namespace        |
+| ---------- | ----------------------------------------- | ----------------- | ----------------------- |
+| `pipeline` | Entire pipeline run                       | Never (per run)   | `$pipeline.<key>`       |
+| `source`   | One per source file (`Arc<str>`-keyed)    | Per source-file   | `$source.<key>`         |
+| `record`   | A single record as it flows through nodes | Per record        | `$record.<key>`         |
+
+`$record.<key>` is a separate namespace from `$meta.<key>`. Metadata
+is written via `emit $meta.x = ...` from a transform and survives only
+to the immediate downstream operator. Record-scope vars survive the
+whole row pipeline (every transform along the row's path can read
+them) but never serialize as output columns unless explicitly emitted
+as a regular column.
+
+## Declaring variables
+
+Every scoped variable must be declared in the pipeline's top-level
+`vars:` block, named, scoped, typed, and optionally given a default:
 
 ```yaml
 pipeline:
   name: order_processing
   vars:
-    high_value_threshold: 500
-    express_surcharge: 5.99
-    report_title: "Monthly Orders"
-    apply_discount: true
-    tax_rate: 0.085
+    pipeline:
+      cutoff_date:
+        type: date
+        default: "2024-01-01"
+      fuzzy_threshold:
+        type: float
+        default: 0.85
+    source:
+      batch_id:
+        type: string
+      ingestion_label:
+        type: string
+    record:
+      fuzzy_score:
+        type: float
 ```
 
-Variables are scalar values only: strings, numbers (integers and floats), and booleans. Complex types (arrays, objects) are not supported.
+Allowed types: `int`, `float`, `string`, `bool`, `date`, `date_time`.
 
-## Accessing variables in CXL
+Built-in members of each scope (`$source.file`, `$source.row`,
+`$source.path`, `$source.count`, `$source.batch`,
+`$source.ingestion_timestamp`; `$pipeline.start_time`,
+`$pipeline.name`, `$pipeline.execution_id`, `$pipeline.batch_id`,
+`$pipeline.total_count`, `$pipeline.ok_count`, `$pipeline.dlq_count`,
+`$pipeline.filtered_count`, `$pipeline.distinct_count`) are reserved —
+declaring a user variable with one of those names is rejected at
+parse time.
 
-Use the `$vars.*` namespace to reference variables in CXL expressions:
+## Reading variables
+
+CXL access is identical for declared and built-in keys:
 
 ```yaml
 - type: transform
-  name: classify_orders
+  name: filter_recent
   input: orders
   config:
     cxl: |
-      emit order_id = order_id
-      emit amount = amount
-      emit is_high_value = amount > $vars.high_value_threshold
-      emit surcharge = if shipping == "express" then $vars.express_surcharge else 0
-      emit total = amount + surcharge
+      emit id = id
+      filter received_at > $pipeline.cutoff_date
+      emit batch = $source.batch_id
+      emit confidence = $record.fuzzy_score
 ```
 
-The `$pipeline.*` namespace also provides access to pipeline-level metadata.
+Reads of undeclared keys are rejected with **E200** (CXL name
+resolution failed) at compile time, with a "did you mean" suggestion
+that scans the declared registry.
 
-## Variable semantics
+## Writing variables: the `state` node
 
-Variables are **frozen at pipeline start** and **constant across all records**. They cannot be modified during execution. This makes them suitable for:
-
-- Thresholds and cutoff values
-- Fixed surcharges, tax rates, and multipliers
-- Labels and titles for report headers
-- Feature flags that control conditional logic
-
-## Using variables with channels
-
-Variables defined in `pipeline.vars` serve as defaults. The [channel system](channels.md) can override these values per client or environment without modifying the pipeline YAML:
+The only way to mutate a scoped variable is a dedicated `state`
+node. The node is a **pass-through** for records — its input record
+forwards unchanged on the output edge — but evaluates its `set:`
+assignments and writes the results into the appropriate scope-keyed
+runtime registry.
 
 ```yaml
-# Pipeline: pipeline.yaml
-pipeline:
-  name: invoice_processing
-  vars:
-    express_surcharge: 5.99
-    late_fee: 25.00
+- type: state
+  name: capture_header
+  input: salesforce_in
+  config:
+    scope: source
+    set:
+      - var: batch_id
+        cxl: "first(this.batch)"
+      - var: ingestion_label
+        cxl: "$source.file.file_stem()"
 
-# Channel: channels/acme-corp/channel.yaml
-_channel:
-  id: acme-corp
-  name: "Acme Corp"
-  active: true
-variables:
-  EXPRESS_SURCHARGE: "8.99"
+- type: state
+  name: row_score
+  input: enrich
+  config:
+    scope: record
+    set:
+      - var: fuzzy_score
+        cxl: "fuzzy_match(this.name, $pipeline.canonical_name)"
 ```
 
-When run with `--channel acme-corp`, the channel variable overrides the pipeline default.
+Inline mutation from a regular transform (`emit $pipeline.x = ...`)
+is a parse error. The dedicated-node design keeps the dependency
+between writers and readers visible at plan time.
 
-## Complete example
+## Init phase: pre-runtime population
+
+A state node may declare `phase: init` to run **to completion**
+before any runtime-phase node sees a record:
 
 ```yaml
-pipeline:
-  name: sales_report
-  vars:
-    min_amount: 100
-    commission_rate: 0.12
-    region_label: "North America"
-    include_pending: false
+- type: source
+  name: config_src
+  config:
+    name: config_src
+    type: csv
+    path: config.csv
+    schema:
+      - { name: cutoff, type: int }
+
+- type: aggregate
+  name: max_agg
+  input: config_src
+  config:
+    group_by: []
+    cxl: |
+      emit cap = max(cutoff)
+
+- type: state
+  name: precompute_cutoff
+  input: max_agg
+  config:
+    scope: pipeline
+    phase: init
+    set:
+      - var: cutoff_date
+        cxl: "cap"
+```
+
+Init-phase nodes **must be terminal** — no runtime-phase node may
+consume from an init-phase state node. (Init-phase state nodes can
+chain through init-only descendants for compositions.) Use disjoint
+Sources for init vs runtime when you need both, since a Source shared
+between an init and a runtime branch only feeds the init pass.
+
+## Compile-time validation
+
+Scoped variables earn their architectural payoff at plan time.
+Every reference and every writer is checked against a static
+registry, and every cross-DAG flow is verified against the topology.
+
+| Code | What it catches                                                        |
+| ---- | ---------------------------------------------------------------------- |
+| E164 | An init-phase state node has a runtime descendant.                     |
+| E170 | Two state nodes write the same `(scope, var)` in runtime phase.        |
+| E171 | A reader is not a transitive DAG descendant of its writer.             |
+| E172 | Bare `$source.<custom>` read downstream of a Merge or Combine.         |
+| E173 | Composition body reads a parent scoped var without opting in.          |
+| E174 | Composition `_compose.scoped_vars` declares a different type than the parent. |
+| E175 | An init-phase node reads a runtime-only writer's variable.             |
+| E200 | A reference to an undeclared scoped variable (resolver-level failure). |
+
+Each diagnostic carries the offending span plus secondary spans
+pointing at the conflicting writer or the parent declaration, so
+the report shows up where the user is reading or writing — not in
+some unrelated configuration block.
+
+## Post-merge access: qualified `$source.<input>.<key>`
+
+After a Merge or Combine, the bare `$source.<custom>` form is
+ambiguous: each record carries its own source's value, but the
+reader's intent is usually to compare across inputs. E172 rejects
+the unqualified form and the qualified form is the legal alternative:
+
+```yaml
+- type: transform
+  name: read_after_merge
+  input: merged
+  config:
+    cxl: |
+      emit id = id
+      emit lt = $source.left_input.left_label
+      emit rt = $source.right_input.right_label
+```
+
+The `<input_name>` segment matches the named input on the Combine
+(its IndexMap key) or the upstream node name on the Merge.
+
+## Composition opt-in
+
+A composition body cannot see parent scoped variables by default —
+the seal is enforced by E173. To pass values across the boundary,
+the composition declares the schema of parent vars it consumes in
+its `_compose.scoped_vars` block:
+
+```yaml
+# read_pipeline_var.comp.yaml
+_compose:
+  name: read_pipeline_var
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: int }
+  outputs:
+    out: tap
+  scoped_vars:
+    pipeline:
+      cutoff:
+        type: int
 
 nodes:
-  - type: source
-    name: sales
-    config:
-      name: sales
-      type: csv
-      path: "./data/sales.csv"
-      schema:
-        - { name: sale_id, type: int }
-        - { name: rep_name, type: string }
-        - { name: amount, type: float }
-        - { name: status, type: string }
-
   - type: transform
-    name: compute
-    input: sales
+    name: tap
+    input: inp
     config:
       cxl: |
-        filter amount >= $vars.min_amount
-        filter if $vars.include_pending then true else status == "closed"
-        emit sale_id = sale_id
-        emit rep_name = rep_name
-        emit amount = amount
-        emit commission = amount * $vars.commission_rate
-        emit region = $vars.region_label
-
-  - type: aggregate
-    name: rep_totals
-    input: compute
-    config:
-      group_by: [rep_name]
-      cxl: |
-        emit total_sales = sum(amount)
-        emit total_commission = sum(commission)
-        emit deal_count = count(*)
-
-  - type: output
-    name: report
-    input: rep_totals
-    config:
-      name: report
-      type: csv
-      path: "./output/sales_report.csv"
-      sort_order:
-        - { field: "total_sales", order: desc }
+        emit id = id
+        emit cutoff_seen = $pipeline.cutoff
 ```
+
+The parent must declare `cutoff` with the matching type; mismatches
+raise E174.
+
+## What scoped variables are not
+
+These are intentional non-features:
+
+- **No persistence across runs.** State is in-memory only. A pipeline
+  run starts with declaration defaults; the writes don't survive
+  the process.
+- **No inline `emit $pipeline.x` writes.** Convenience-style
+  mutation from a transform body is forbidden — empirical evidence
+  from comparable engines shows it leads to race conditions and
+  hidden DAG dependencies.
+- **No dynamic var creation.** The set of variables is closed at
+  plan time, by design. This bounds memory and makes the validation
+  matrix above tractable.
+
+## Channel overrides
+
+Channels still override declaration defaults for `pipeline`-scope
+variables (the original use case):
+
+```yaml
+# Pipeline
+pipeline:
+  vars:
+    pipeline:
+      express_surcharge:
+        type: float
+        default: 5.99
+
+# channels/acme-corp/channel.yaml
+_channel:
+  id: acme-corp
+variables:
+  express_surcharge: 8.99
+```
+
+Channel overrides currently apply only to the `pipeline` scope.
+Override surface for `source` and `record` scopes is a follow-up.
