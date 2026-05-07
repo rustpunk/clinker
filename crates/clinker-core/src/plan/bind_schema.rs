@@ -2556,7 +2556,7 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
         if let cxl::ast::Statement::Emit {
             name,
             expr,
-            is_meta,
+            target,
             ..
         } = stmt
         {
@@ -2564,7 +2564,7 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
             // to the output row — skip them so the row/schema view
             // downstream operators see only reflects user-visible data
             // fields.
-            if *is_meta {
+            if matches!(target, cxl::ast::EmitTarget::Meta) {
                 continue;
             }
             let emit_type = typed
@@ -2608,11 +2608,11 @@ fn propagate_aggregate(
         if let cxl::ast::Statement::Emit {
             name,
             expr,
-            is_meta,
+            target,
             ..
         } = stmt
         {
-            if *is_meta {
+            if matches!(target, cxl::ast::EmitTarget::Meta) {
                 continue;
             }
             let emit_type = typed
@@ -2980,7 +2980,7 @@ fn bind_combine(
         .program
         .statements
         .iter()
-        .any(|s| matches!(s, Statement::Emit { is_meta: false, .. }));
+        .any(|s| matches!(s, Statement::Emit { target: cxl::ast::EmitTarget::Field, .. }));
     if !has_emit {
         diags.push(combine_e309(name, span));
     }
@@ -3607,11 +3607,11 @@ fn combine_output_row(
         if let Statement::Emit {
             name,
             expr,
-            is_meta,
+            target,
             ..
         } = stmt
         {
-            if *is_meta {
+            if matches!(target, cxl::ast::EmitTarget::Meta) {
                 continue;
             }
             let emit_type = typed

@@ -343,8 +343,12 @@ impl Parser {
         let start = self.current_span();
         self.advance(); // consume 'emit'
 
-        // Check for `emit $meta.field = expr`
-        let (name, is_meta) = if *self.peek() == Token::Dollar {
+        // Detect `emit $<ns>.field = expr`. Allowed namespaces:
+        // - `meta`: per-record metadata sidecar (deleted in Stage 6).
+        // - `pipeline` / `source` / `record`: producer-declared scoped
+        //   state. The variable name must be declared in the
+        //   transform's `config.declares:` block; bind_schema enforces.
+        let (name, target) = if *self.peek() == Token::Dollar {
             self.advance(); // consume '$'
             let ns = self.expect_ident("system namespace after '$'")?;
             if ns == "ck" {
@@ -355,22 +359,40 @@ impl Parser {
                     "To override the user-visible value, write `emit <field_name> = ...` instead",
                 ));
             }
-            if ns != "meta" {
+            if ns == "vars" {
                 return Err(self.error(
-                    &format!(
-                        "emit ${}... is not valid; only emit $meta.field is allowed",
-                        ns
-                    ),
-                    "Only $meta fields can be set with emit",
-                    "Use: emit $meta.field_name = expr",
+                    "the `$vars` namespace is read-only static configuration \
+                     and cannot be assigned by `emit`",
+                    "$vars.* values are declared at the pipeline's top-level vars: block, \
+                     channel-overridable, and frozen at pipeline start",
+                    "Move computed values to `$pipeline.<key>` (declared via the producer's \
+                     `config.declares:` block) — those are writable.",
                 ));
             }
+            let target = match ns.as_str() {
+                "meta" => EmitTarget::Meta,
+                "pipeline" => EmitTarget::Pipeline,
+                "source" => EmitTarget::Source,
+                "record" => EmitTarget::Record,
+                _ => {
+                    return Err(self.error(
+                        &format!(
+                            "emit ${}... is not valid; emit accepts $meta, $pipeline, $source, \
+                             or $record namespaces",
+                            ns
+                        ),
+                        "Only $meta and producer-declared scope namespaces are writable",
+                        "Use one of: emit name = expr, emit $meta.x = expr, \
+                         emit $pipeline.x = expr, emit $source.x = expr, emit $record.x = expr",
+                    ));
+                }
+            };
             self.expect_token(&Token::Dot, "'.'")?;
-            let field = self.expect_ident("metadata field name")?;
-            (field, true)
+            let field = self.expect_ident("emit target name")?;
+            (field, target)
         } else {
             let field = self.expect_ident("output field name")?;
-            (field, false)
+            (field, EmitTarget::Field)
         };
 
         self.expect_token(&Token::Eq, "'='")?;
@@ -380,7 +402,7 @@ impl Parser {
             node_id: nid,
             name: name.into(),
             expr,
-            is_meta,
+            target,
             span: Span::new(start.start as usize, end.end as usize),
         })
     }
@@ -1356,13 +1378,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_emit_other_dollar_namespace_keeps_generic_message() {
+    fn test_parse_emit_pipeline_namespace_succeeds() {
+        // The variable-system redesign accepts producer-declared scope
+        // writes via `emit $pipeline.x = ...` (and $source / $record).
+        // Bind-schema rejects undeclared names; the parser accepts the
+        // syntax.
         let result = Parser::parse("emit $pipeline.x = 1");
+        assert!(
+            result.errors.is_empty(),
+            "emit $pipeline.x parses; bind-schema is the layer that \
+             rejects undeclared scope vars. Got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_parse_emit_unknown_namespace_rejected() {
+        let result = Parser::parse("emit $undeclared_namespace.x = 1");
         assert!(!result.errors.is_empty());
         let msg = &result.errors[0].message;
         assert!(
-            msg.contains("$pipeline") && msg.contains("only emit $meta"),
-            "non-$ck namespaces still hit the generic gate; got: {msg}",
+            msg.contains("$undeclared_namespace"),
+            "unknown $namespace.* should mention the offending namespace; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_parse_emit_vars_namespace_rejected_as_readonly() {
+        let result = Parser::parse("emit $vars.x = 1");
+        assert!(!result.errors.is_empty());
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$vars") && msg.contains("read-only"),
+            "$vars.* writes should be rejected as read-only; got: {msg}",
         );
     }
 

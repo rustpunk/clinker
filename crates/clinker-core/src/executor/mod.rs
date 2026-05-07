@@ -2496,6 +2496,7 @@ pub(crate) fn evaluate_single_transform(
         EvalResult::Emit {
             fields: emitted,
             metadata,
+            record_vars,
         } => {
             let mut out = record_with_emitted_fields(input, &emitted);
             for (name, value) in &emitted {
@@ -2503,6 +2504,9 @@ pub(crate) fn evaluate_single_transform(
             }
             for (key, value) in &metadata {
                 let _ = out.set_meta(key, value.clone());
+            }
+            for (key, value) in record_vars {
+                let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))
         }
@@ -2581,6 +2585,7 @@ pub(crate) fn evaluate_single_transform_windowed(
         EvalResult::Emit {
             fields: emitted,
             metadata,
+            record_vars,
         } => {
             let mut out = record_with_emitted_fields(record, &emitted);
             for (name, value) in &emitted {
@@ -2588,6 +2593,9 @@ pub(crate) fn evaluate_single_transform_windowed(
             }
             for (key, value) in &metadata {
                 let _ = out.set_meta(key, value.clone());
+            }
+            for (key, value) in record_vars {
+                let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))
         }

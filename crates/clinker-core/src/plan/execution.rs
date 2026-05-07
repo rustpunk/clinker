@@ -4340,7 +4340,7 @@ pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     for stmt in &typed.program.statements {
         if let Statement::Emit {
             name,
-            is_meta: false,
+            target: cxl::ast::EmitTarget::Field,
             ..
         } = stmt
         {

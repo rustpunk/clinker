@@ -72,9 +72,19 @@ pub fn extract_aggregates(
             Statement::Emit {
                 name,
                 expr,
-                is_meta,
+                target,
+                span,
                 ..
             } => {
+                use crate::ast::EmitTarget;
+                let is_meta = match target {
+                    EmitTarget::Field => false,
+                    EmitTarget::Meta => true,
+                    EmitTarget::Pipeline | EmitTarget::Source | EmitTarget::Record => {
+                        diagnostics.push(diag_scope_emit_in_aggregate(*span));
+                        continue;
+                    }
+                };
                 let mut residual = expr.clone();
                 substitute_let_bindings(&mut residual, &let_bindings);
                 if let Err(e) =
@@ -87,7 +97,7 @@ pub fn extract_aggregates(
                 emits.push(CompiledEmit {
                     output_name: name.clone(),
                     residual,
-                    is_meta: *is_meta,
+                    is_meta,
                 });
             }
             Statement::Trace { .. } | Statement::UseStmt { .. } | Statement::ExprStmt { .. } => {
@@ -714,6 +724,23 @@ fn diag_distinct_in_aggregate(span: Span) -> TypeDiagnostic {
         span,
         message: "`distinct` is not permitted inside an aggregate transform".to_string(),
         help: Some("place a separate distinct transform upstream of the aggregate".to_string()),
+        related_span: None,
+        is_warning: false,
+    }
+}
+
+fn diag_scope_emit_in_aggregate(span: Span) -> TypeDiagnostic {
+    TypeDiagnostic {
+        span,
+        message: "`emit $pipeline.x` / `emit $source.x` / `emit $record.x` are \
+                  not permitted inside an aggregate transform"
+            .to_string(),
+        help: Some(
+            "scoped-variable writes belong on a regular Transform with a \
+             matching `declares:` entry; place that transform upstream or \
+             downstream of the aggregate."
+                .to_string(),
+        ),
         related_span: None,
         is_warning: false,
     }

@@ -2945,6 +2945,7 @@ pub(crate) fn dispatch_plan_node(
                                         Ok(EvalResult::Emit {
                                             fields: emitted,
                                             metadata,
+                                            record_vars,
                                         }) => {
                                             let mut rec = match combine_output_schema.as_ref() {
                                                 Some(s) => widen_record_to_schema(&probe_record, s),
@@ -2955,6 +2956,9 @@ pub(crate) fn dispatch_plan_node(
                                             }
                                             for (k, v) in metadata {
                                                 let _ = rec.set_meta(&k, v);
+                                            }
+                                            for (k, v) in record_vars {
+                                                let _ = rec.set_record_var(&k, v);
                                             }
                                             output_records.push((rec, rn));
                                             emitted_since_check += 1;
@@ -2984,6 +2988,7 @@ pub(crate) fn dispatch_plan_node(
                                     Ok(EvalResult::Emit {
                                         fields: emitted,
                                         metadata,
+                                        record_vars,
                                     }) => {
                                         let mut rec = match combine_output_schema.as_ref() {
                                             Some(s) => widen_record_to_schema(&probe_record, s),
@@ -2994,6 +2999,9 @@ pub(crate) fn dispatch_plan_node(
                                         }
                                         for (k, v) in metadata {
                                             let _ = rec.set_meta(&k, v);
+                                        }
+                                        for (k, v) in record_vars {
+                                            let _ = rec.set_record_var(&k, v);
                                         }
                                         // Build-side `$ck.<field>` propagation
                                         // for this matched row. Driver-only

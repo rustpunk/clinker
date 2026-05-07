@@ -1761,6 +1761,7 @@ fn emit_for_probe<'a>(
                             Ok(EvalResult::Emit {
                                 fields: emitted,
                                 metadata,
+                                record_vars,
                             }) => {
                                 let mut rec = match output_schema {
                                     Some(s) => widen_record_to_schema(probe_record, s),
@@ -1771,6 +1772,9 @@ fn emit_for_probe<'a>(
                                 }
                                 for (k, v) in metadata {
                                     let _ = rec.set_meta(&k, v);
+                                }
+                                for (k, v) in record_vars {
+                                    let _ = rec.set_record_var(&k, v);
                                 }
                                 output.push((rec, rn));
                             }
@@ -1787,6 +1791,7 @@ fn emit_for_probe<'a>(
                         Ok(EvalResult::Emit {
                             fields: emitted,
                             metadata,
+                            record_vars,
                         }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(probe_record, s),
@@ -1797,6 +1802,9 @@ fn emit_for_probe<'a>(
                             }
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
+                            }
+                            for (k, v) in record_vars {
+                                let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(&mut rec, m, propagate_ck);
                             output.push((rec, rn));

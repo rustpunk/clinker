@@ -774,7 +774,7 @@ pub(crate) fn execute_combine_iejoin(
                                 Some(build_record),
                             );
                             match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                                Ok(EvalResult::Emit { fields, metadata }) => {
+                                Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
                                     let mut rec = match output_schema {
                                         Some(s) => widen_record_to_schema(driver_record, s),
                                         None => driver_record.clone(),
@@ -784,6 +784,9 @@ pub(crate) fn execute_combine_iejoin(
                                     }
                                     for (k, v) in metadata {
                                         let _ = rec.set_meta(&k, v);
+                                    }
+                                    for (k, v) in record_vars {
+                                        let _ = rec.set_record_var(&k, v);
                                     }
                                     crate::executor::copy_build_ck_columns(
                                         &mut rec,
@@ -935,7 +938,7 @@ pub(crate) fn execute_combine_iejoin(
                         .to_string(),
                 })?;
                 match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                    Ok(EvalResult::Emit { fields, metadata }) => {
+                    Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
                         let mut rec = match output_schema {
                             Some(s) => widen_record_to_schema(driver_record, s),
                             None => driver_record.clone(),
@@ -945,6 +948,9 @@ pub(crate) fn execute_combine_iejoin(
                         }
                         for (k, v) in metadata {
                             let _ = rec.set_meta(&k, v);
+                        }
+                        for (k, v) in record_vars {
+                            let _ = rec.set_record_var(&k, v);
                         }
                         output_records.push((rec, driver_order));
                         emitted_since_check += 1;

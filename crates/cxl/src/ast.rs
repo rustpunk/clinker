@@ -23,6 +23,33 @@ pub enum TraceLevel {
     Error,
 }
 
+/// Where a `Statement::Emit` writes its value.
+///
+/// `Meta` is transitional — Stage 6 of the variable-system redesign
+/// deletes the `$meta.*` namespace entirely and this variant goes with
+/// it. The `Pipeline`, `Source`, and `Record` variants carry the new
+/// producer-declared scoped-state writes that replaced the dedicated
+/// `state` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitTarget {
+    /// Regular output column. `emit name = expr`.
+    Field,
+    /// Per-record metadata. `emit $meta.<key> = expr`.
+    Meta,
+    /// Pipeline-scope declared state. `emit $pipeline.<key> = expr`.
+    /// Routed through `StableEvalContext::pipeline_vars` at eval time;
+    /// reader sees the value via `$pipeline.<key>` from any DAG
+    /// descendant.
+    Pipeline,
+    /// Source-scope declared state. `emit $source.<key> = expr`.
+    /// Keyed by per-record `source_file` Arc; multi-file Sources get
+    /// per-file slots.
+    Source,
+    /// Record-scope declared state. `emit $record.<key> = expr`.
+    /// Per-record private slot; never serializes to output.
+    Record,
+}
+
 /// Top-level CXL statement.
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -36,8 +63,18 @@ pub enum Statement {
         node_id: NodeId,
         name: Box<str>,
         expr: Expr,
-        /// When true, writes to per-record metadata (`$meta.*`) instead of output.
-        is_meta: bool,
+        /// Where the emitted value lands:
+        /// - `Field`: regular output column on the record (`emit name = expr`).
+        /// - `Meta`: per-record metadata sidecar (`emit $meta.<key> = expr`).
+        ///   Stage 6 of the redesign deletes this variant; until then it
+        ///   continues to drive the `$meta.*` channel writes.
+        /// - `Pipeline`/`Source`/`Record`: producer-declared scoped state,
+        ///   read downstream via `$pipeline.<key>` / `$source.<key>` /
+        ///   `$record.<key>`. The variable must be declared in a Transform's
+        ///   `config.declares:` block; the eval routing writes through
+        ///   `StableEvalContext` (pipeline/source) or `Record::record_vars`
+        ///   (record) per the variant.
+        target: EmitTarget,
         span: Span,
     },
     Trace {
@@ -487,7 +524,7 @@ mod tests {
                         name: "x".into(),
                         span,
                     },
-                    is_meta: false,
+                    target: EmitTarget::Field,
                     span,
                 },
                 Statement::ExprStmt {
@@ -516,7 +553,7 @@ mod tests {
                 name: "label".into(),
                 span,
             },
-            is_meta: false,
+            target: EmitTarget::Field,
             span,
         };
         if let Statement::Emit { name, .. } = stmt {

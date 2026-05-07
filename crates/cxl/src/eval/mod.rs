@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
 
-use crate::ast::{BinOp, Expr, LiteralValue, Statement, UnaryOp};
+use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
@@ -25,10 +25,15 @@ pub use error::{EvalError, EvalErrorKind};
 #[derive(Debug)]
 pub enum EvalResult {
     /// Record passed all filters and distinct checks — emit to output.
-    /// `fields` = output field values, `metadata` = `$meta.*` writes.
+    /// `fields` = output field values; `metadata` = `$meta.*` writes
+    /// (deleted in Stage 6); `record_vars` = `$record.<key>` writes
+    /// the caller applies to the record's record_vars channel
+    /// (`$pipeline.*` and `$source.*` writes go directly through
+    /// `StableEvalContext` during eval and are not surfaced here).
     Emit {
         fields: indexmap::IndexMap<String, Value>,
         metadata: indexmap::IndexMap<String, Value>,
+        record_vars: indexmap::IndexMap<String, Value>,
     },
     /// Record should be excluded from output.
     Skip(SkipReason),
@@ -125,6 +130,7 @@ impl ProgramEvaluator {
         let mut env: HashMap<String, Value> = HashMap::new();
         let mut output = indexmap::IndexMap::new();
         let mut meta_output = indexmap::IndexMap::new();
+        let mut record_var_writes: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
 
         for stmt in &self.typed.program.statements {
             match stmt {
@@ -160,15 +166,27 @@ impl ProgramEvaluator {
                 Statement::Emit {
                     name,
                     expr,
-                    is_meta,
+                    target,
                     ..
                 } => {
                     let val =
                         eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
-                    if *is_meta {
-                        meta_output.insert(name.to_string(), val);
-                    } else {
-                        output.insert(name.to_string(), val);
+                    match target {
+                        EmitTarget::Field => {
+                            output.insert(name.to_string(), val);
+                        }
+                        EmitTarget::Meta => {
+                            meta_output.insert(name.to_string(), val);
+                        }
+                        EmitTarget::Pipeline => {
+                            ctx.stable.set_pipeline_var(name, val);
+                        }
+                        EmitTarget::Source => {
+                            ctx.stable.set_source_var(ctx.source_file, name, val);
+                        }
+                        EmitTarget::Record => {
+                            record_var_writes.insert(name.to_string(), val);
+                        }
                     }
                 }
                 Statement::Trace {
@@ -237,6 +255,7 @@ impl ProgramEvaluator {
         Ok(EvalResult::Emit {
             fields: output,
             metadata: meta_output,
+            record_vars: record_var_writes,
         })
     }
 

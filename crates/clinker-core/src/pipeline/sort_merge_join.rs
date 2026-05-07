@@ -674,7 +674,7 @@ fn execute_combine_sort_merge_with_stats(
                             .to_string(),
                     })?;
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata }) => {
+                        Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(&driver_record, s),
                                 None => driver_record.clone(),
@@ -684,6 +684,9 @@ fn execute_combine_sort_merge_with_stats(
                             }
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
+                            }
+                            for (k, v) in record_vars {
+                                let _ = rec.set_record_var(&k, v);
                             }
                             output_records.push((rec, driver_order));
                         }
@@ -1161,7 +1164,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata }) => {
+                        Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(driver_record, s),
                                 None => driver_record.clone(),
@@ -1171,6 +1174,9 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             }
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
+                            }
+                            for (k, v) in record_vars {
+                                let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(
                                 &mut rec,
