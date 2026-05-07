@@ -347,6 +347,7 @@ fn source_ancestors_of(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => {
                 queue.push_back(target_name_of(&header.input.value));
             }

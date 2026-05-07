@@ -114,6 +114,20 @@ pub enum PipelineNode {
         header: NodeHeader,
         config: OutputBody,
     },
+    /// Scoped-variable writer.
+    ///
+    /// Pass-through for records (the input record is forwarded
+    /// unchanged on the output edge), the only side effect is that one
+    /// or more declared `$pipeline.<key>` / `$source.<key>` /
+    /// `$record.<key>` slots are populated from CXL expressions over
+    /// the incoming record. The dedicated-node design (NiFi `@Stateful`
+    /// posture) is the contested-axis decision locked in the plan: no
+    /// inline `emit $pipeline.x = ...` from row-scope CXL.
+    State {
+        #[serde(flatten)]
+        header: NodeHeader,
+        config: StateBody,
+    },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
     /// keyed by the `body` handle.
@@ -335,6 +349,13 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         let (header, config) = payload.into_variant_parts();
                         Ok(PipelineNode::Output { header, config })
                     }
+                    "state" => {
+                        let payload = StatePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::State { header, config })
+                    }
                     "composition" => {
                         let payload = CompositionPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
@@ -351,6 +372,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "merge",
                             "combine",
                             "output",
+                            "state",
                             "composition",
                         ],
                     )),
@@ -509,6 +531,34 @@ impl OutputPayload {
     }
 }
 
+// ---- State -----------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: StateBody,
+}
+
+impl StatePayload {
+    fn into_variant_parts(self) -> (NodeHeader, StateBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
 // ---- Merge -----------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -621,6 +671,7 @@ impl PipelineNode {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
             PipelineNode::Merge { header, .. } => &header.name,
             PipelineNode::Combine { header, .. } => &header.name,
@@ -637,6 +688,7 @@ impl PipelineNode {
             PipelineNode::Merge { .. } => "merge",
             PipelineNode::Combine { .. } => "combine",
             PipelineNode::Output { .. } => "output",
+            PipelineNode::State { .. } => "state",
             PipelineNode::Composition { .. } => "composition",
         }
     }
@@ -871,6 +923,70 @@ pub struct CombineBody {
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
+}
+
+/// Scoped-variable writer body — the only mechanism that mutates
+/// `$pipeline.<key>` / `$source.<key>` / `$record.<key>` slots at
+/// runtime.
+///
+/// Records flow through the node unchanged; the side effect is one
+/// CXL evaluation per assignment in [`StateBody::set`], with the
+/// resulting value stored in the scope-specific runtime slot
+/// identified by [`StateAssignment::var`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateBody {
+    /// Which scope this node writes to.
+    pub scope: VarScope,
+    /// Run before record flow begins (init phase) or alongside the
+    /// runtime DAG (default). Init phase is only valid for `pipeline`
+    /// or `source` scope; record-scope state nodes always run at
+    /// runtime. Validated by Phase F's compile-time pass.
+    #[serde(default)]
+    pub phase: Phase,
+    /// One assignment per declared variable being written. Variables
+    /// referenced here must exist in the pipeline-level
+    /// `vars.<scope>:` block with matching scope.
+    pub set: Vec<StateAssignment>,
+}
+
+/// One scoped-variable assignment inside a `StateBody.set` list.
+///
+/// `var` names a variable previously declared in
+/// `PipelineMeta::vars.<scope>`; `cxl` is the expression evaluated
+/// once per record (per source for source-scope; once at init for
+/// init-phase). Span tracking on `cxl` powers Phase F single-writer
+/// and read-after-write diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateAssignment {
+    pub var: String,
+    pub cxl: CxlSource,
+}
+
+/// The scope a `state` node writes to. Mirrors
+/// `clinker_core::config::ScopedVarsDecl`'s three partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VarScope {
+    Pipeline,
+    Source,
+    Record,
+}
+
+/// When a `state` node runs.
+///
+/// `Runtime` (default) interleaves with the rest of the DAG —
+/// per-record evaluation. `Init` collects the transitive ancestor
+/// sub-DAG and runs it to completion before any runtime-phase node
+/// sees a record (Beam side-input / Vector enrichment-table
+/// precedent). Phase E wires the two-phase orchestration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Runtime,
+    Init,
 }
 
 // ---------------------------------------------------------------------
@@ -1538,5 +1654,85 @@ nodes:
             msg.contains("bogus_body_field"),
             "error should name the unknown body field, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_state_node_parses_runtime_record_scope() {
+        let yaml = r#"
+pipeline:
+  name: state_smoke
+  vars:
+    record:
+      fuzzy_score: { type: float }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: id, type: string }
+  - type: state
+    name: score
+    input: orders
+    config:
+      scope: record
+      set:
+        - var: fuzzy_score
+          cxl: "0.85"
+"#;
+        let doc: PipelineConfig = crate::yaml::from_str(yaml).expect("state node should parse");
+        let state_node = doc
+            .nodes
+            .iter()
+            .find(|s| matches!(s.value, PipelineNode::State { .. }))
+            .expect("expected one state node");
+        if let PipelineNode::State { header, config } = &state_node.value {
+            assert_eq!(header.name, "score");
+            assert_eq!(config.scope, VarScope::Record);
+            assert_eq!(config.phase, Phase::Runtime);
+            assert_eq!(config.set.len(), 1);
+            assert_eq!(config.set[0].var, "fuzzy_score");
+        } else {
+            panic!("expected State variant");
+        }
+    }
+
+    #[test]
+    fn test_state_node_init_phase_pipeline_scope() {
+        let yaml = r#"
+pipeline:
+  name: state_init_smoke
+  vars:
+    pipeline:
+      cutoff_date: { type: date }
+nodes:
+  - type: source
+    name: cfg
+    config:
+      name: cfg
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: cutoff, type: string }
+  - type: state
+    name: precompute
+    input: cfg
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: cutoff_date
+          cxl: "max(cutoff)"
+"#;
+        let doc: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("init-phase state should parse");
+        if let PipelineNode::State { config, .. } = &doc.nodes[1].value {
+            assert_eq!(config.scope, VarScope::Pipeline);
+            assert_eq!(config.phase, Phase::Init);
+        } else {
+            panic!("expected State variant at index 1");
+        }
     }
 }

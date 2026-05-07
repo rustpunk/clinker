@@ -404,6 +404,20 @@ fn bind_schema_inner(
                         .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
             }
+            PipelineNode::State { header, .. } => {
+                // State is a pass-through for records — its output row
+                // equals its upstream row. Phase D will run CXL
+                // typecheck on the assignments; for now we just
+                // propagate the row so downstream nodes see a stable
+                // schema during compile.
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                }
+            }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
             //
             // Combine compile runs as a single pass in `bind_combine`.
@@ -781,7 +795,8 @@ fn bind_composition(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. } => {
                 let r = match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {
@@ -892,7 +907,8 @@ fn bind_composition(
             | PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. } => {
                 vec![match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {

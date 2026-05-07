@@ -12,8 +12,8 @@ pub use composition::{
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
-    AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, PipelineNode, RouteBody, SourceBody,
-    TransformBody,
+    AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, Phase, PipelineNode, RouteBody,
+    SourceBody, StateAssignment, StateBody, TransformBody, VarScope,
 };
 
 use crate::yaml::Spanned;
@@ -1528,6 +1528,7 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
+                | PipelineNode::State { header, .. }
                 | PipelineNode::Composition { header, .. } => {
                     if input_target(&header.input.value) == name {
                         self_ref = true;
@@ -1571,6 +1572,7 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
+                | PipelineNode::State { header, .. }
                 | PipelineNode::Composition { header, .. } => {
                     let producer = input_target(&header.input.value);
                     if producer != consumer && graph.index_of(producer).is_some() {
@@ -1842,6 +1844,10 @@ impl PipelineConfig {
             .nodes
             .iter()
             .filter_map(|spanned| match &spanned.value {
+                // State nodes never carry an analytic_window — they only
+                // read from the record to populate scoped slots — so they
+                // never appear in the planner's window-bearing entry list.
+                PipelineNode::State { .. } => None,
                 PipelineNode::Transform {
                     header,
                     config: body,
@@ -2032,7 +2038,8 @@ impl PipelineConfig {
                 PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
-                | PipelineNode::Output { header, .. } => {
+                | PipelineNode::Output { header, .. }
+                | PipelineNode::State { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
                 PipelineNode::Composition {
@@ -2940,7 +2947,8 @@ fn resolve_all_input_references(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
             PipelineNode::Merge { header, .. } => {
@@ -3163,6 +3171,18 @@ pub(crate) fn lower_node_to_plan_node(
             span,
             output_schema: schema_from_bound(name),
         }),
+        PipelineNode::State { .. } => {
+            // State nodes are not yet wired into the executor (Phase D).
+            // Surface a compile error so a pipeline with a state node
+            // fails loudly rather than silently dropping the node from
+            // the plan and severing downstream input edges.
+            diags.push(crate::error::Diagnostic::error(
+                "E160",
+                format!("state node {name:?}: executor wiring lands in Phase D; not runnable yet"),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            None
+        }
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
             // failed (E102–E109), there's no entry — silently omit the
