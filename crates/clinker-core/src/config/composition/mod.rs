@@ -127,7 +127,7 @@ pub struct CompositionSignature {
     /// Declared resource slots (two-slot split with `config_schema`).
     pub resources_schema: IndexMap<ResourceName, ResourceDecl>,
     /// Opt-in declarations of scoped variables a composition body may
-    /// read from the parent scope (Phase G).
+    /// read from the parent scope.
     ///
     /// Composition bodies are sealed by default — the resolver sees an
     /// empty `ScopedVarsRegistry` and rejects every `$pipeline.<custom>`
@@ -151,22 +151,15 @@ pub struct CompositionSignature {
     pub source_spans: SourceMap,
 }
 
-/// Per-scope opt-in maps for composition `scoped_vars` inheritance
-/// (Phase G). Each entry's value is the type the parent must declare;
-/// at bind time, the parent's declared type must match this entry's
-/// type or an E174 mismatch fires.
+/// Per-scope opt-in maps for composition `scoped_vars` inheritance.
+/// Each entry's value is the type the parent must declare; at bind
+/// time, the parent's declared type must match this entry's type or
+/// an E174 mismatch fires.
 #[derive(Debug, Clone, Default)]
 pub struct ScopedVarsSchema {
     pub pipeline: IndexMap<String, crate::config::ScopedVarType>,
     pub source: IndexMap<String, crate::config::ScopedVarType>,
     pub record: IndexMap<String, crate::config::ScopedVarType>,
-}
-
-impl ScopedVarsSchema {
-    /// True when no scoped vars are declared in any scope.
-    pub fn is_empty(&self) -> bool {
-        self.pipeline.is_empty() && self.source.is_empty() && self.record.is_empty()
-    }
 }
 
 /// An input port declaration.

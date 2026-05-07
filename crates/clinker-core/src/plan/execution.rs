@@ -329,7 +329,7 @@ pub enum PlanNode {
     /// assignment in [`PlanStatePayload::compiled`], with the resulting
     /// value written into the scope-specific runtime registry. Phase D
     /// wires pipeline-scope runtime writes only; source-scope and
-    /// record-scope writes follow in Phase D-2 / D-3.
+    /// record-scope writes follow in / D-3.
     State {
         name: String,
         #[serde(skip)]
@@ -546,9 +546,10 @@ pub struct PlanOutputPayload {
 /// Fully-resolved State payload — one compiled CXL program per
 /// assignment, plus the scope and phase from the YAML config.
 ///
-/// Phase D wires runtime-phase pipeline-scope writes; source-scope and
-/// record-scope are rejected at lowering with E162 until Phase D-2 /
-/// D-3 land. Init-phase orchestration is Phase E.
+/// All three scopes (pipeline, source, record) and both phases
+/// (runtime, init) are dispatched via this payload; the executor's
+/// state-node arm switches on `scope` and the topo-walker partitions
+/// by `phase` for the two-pass init/runtime orchestration.
 #[derive(Debug, Clone)]
 pub struct PlanStatePayload {
     pub scope: crate::config::VarScope,
@@ -3896,7 +3897,7 @@ fn compute_one(
             };
 
             // Intersect write_set with parent's sort-key field names. Note:
-            // arena `sort_partition` (Phase 6) does not appear here — only
+            // arena `sort_partition` does not appear here — only
             // record fields written via `emit name = ...` enter `write_set`.
             let lost: Vec<String> = parent_sort
                 .iter()

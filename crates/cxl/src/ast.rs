@@ -161,7 +161,7 @@ pub enum Expr {
     /// per-record sidecar bound to a single CXL program (one transform's
     /// `emit $meta.x = ...`), while `$record.<key>` is a typed,
     /// declared-at-pipeline-top, multi-writer slot resettable across
-    /// transforms via the `state` node (Phase D).
+    /// transforms via the `state` node.
     RecordAccess {
         node_id: NodeId,
         field: Box<str>,
@@ -172,7 +172,7 @@ pub enum Expr {
     /// Used downstream of `Merge` / `Combine` to disambiguate which
     /// upstream Source's source-scope value to read. The plain
     /// [`Expr::SourceAccess`] form is rejected by E172 in that
-    /// context (Phase F-2b) — this variant is the explicit
+    /// context — this variant is the explicit
     /// alternative. `input_name` matches the upstream Merge/Combine
     /// input name; `field` resolves against the same
     /// `vars.source.<key>` declaration as the unqualified form.

@@ -457,7 +457,7 @@ impl<'a> TypeChecker<'a> {
             }
 
             Expr::QualifiedSourceAccess { node_id, field, .. } => {
-                // Item 6: qualified source access only addresses
+                // qualified source access only addresses
                 // user-declared keys (builtin source members aren't
                 // valid through the qualifier). Type comes from the
                 // same registry as the unqualified form.
@@ -861,7 +861,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Phase C: enforce aggregate-context rules. Walks the program after type
+    /// enforce aggregate-context rules. Walks the program after type
     /// inference so diagnostics can reference inferred types. Runs in both
     /// `Row` and `GroupBy` modes because Direction 1 (AggCall in Row) applies
     /// universally.
@@ -1047,7 +1047,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
             | Expr::SourceAccess { .. }
-        | Expr::QualifiedSourceAccess { .. }
+            | Expr::QualifiedSourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::RecordAccess { .. }
             | Expr::Now { .. }

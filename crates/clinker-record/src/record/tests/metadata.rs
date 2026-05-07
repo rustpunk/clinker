@@ -138,7 +138,7 @@ fn test_record_metadata_cap_allows_overwrite() {
 
 #[test]
 fn test_record_var_resolves_via_field_resolver() {
-    // Phase D-3 / Item 5: record-scope state-node writes go to the
+    // record-scope state-node writes go to the
     // dedicated `record_vars` channel (independent of `$meta.*`).
     // `FieldResolver::resolve("$record.<key>")` strips the namespace
     // prefix and looks up via `get_record_var`.
@@ -160,7 +160,7 @@ fn test_record_var_resolves_via_field_resolver() {
 
 #[test]
 fn test_record_var_independent_64_key_budget() {
-    // Item 5: `$meta.*` and `$record.<key>` have INDEPENDENT 64-key
+    // `$meta.*` and `$record.<key>` have INDEPENDENT 64-key
     // budgets. Filling one to capacity must not affect the other.
     let mut record = test_record();
     for i in 0..64 {

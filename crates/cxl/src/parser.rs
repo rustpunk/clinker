@@ -912,7 +912,7 @@ impl Parser {
                     }
                     "source" => {
                         let first = self.expect_ident("source property name")?;
-                        // Item 6: peek for a qualified `.field` suffix so
+                        // peek for a qualified `.field` suffix so
                         // `$source.<input_name>.<field>` parses as a
                         // QualifiedSourceAccess. The plain `$source.<field>`
                         // form remains a SourceAccess.

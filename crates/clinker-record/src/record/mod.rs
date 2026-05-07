@@ -10,9 +10,7 @@ const MAX_METADATA_KEYS: usize = 64;
 
 /// Maximum number of `$record.<key>` user-declared scoped variables
 /// per record. Independent of the `$meta.*` cap so heavy `$meta.*`
-/// use does not starve `$record.<key>` writes (Item 5 of the
-/// sprint-close remediation; the prior `__rv_` prefix shared the
-/// metadata cap).
+/// use does not starve `$record.<key>` writes.
 const MAX_RECORD_VARS: usize = 64;
 
 /// Schema-indexed row record.
@@ -33,10 +31,9 @@ pub struct Record {
     /// Per-record metadata. Stripped from output unless `include_metadata` is set.
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
-    /// Per-record user-declared `$record.<key>` scoped variables
-    /// (Item 5 — independent 64-key budget, distinct from `metadata`).
-    /// Written by Phase D-3 state nodes with `scope: record`. Lazy-
-    /// initialized on first `set_record_var()` call.
+    /// Per-record user-declared `$record.<key>` scoped variables.
+    /// Written by state nodes with `scope: record`. Lazy-initialized
+    /// on first `set_record_var()` call.
     record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
 }
 
@@ -49,10 +46,10 @@ pub struct Record {
 ///
 /// Wire format (postcard):
 /// `(Vec<Value>, Option<Vec<(Box<str>, Value)>>, Option<Vec<(Box<str>, Value)>>)`.
-/// The `record_vars` slot was added in Item 5 to give `$record.<key>`
-/// its own 64-key budget separate from `$meta.*`. `serde(default)` on
-/// the new field keeps wire-format backward compatibility — older
-/// spill streams without the trailing field deserialize as
+/// `record_vars` lives in its own slot so `$record.<key>` writes have
+/// a 64-key budget independent of `$meta.*`. `serde(default)` on the
+/// field keeps wire-format backward compatibility — older spill
+/// streams without the trailing field deserialize as
 /// `record_vars: None`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecordPayload {
@@ -60,8 +57,8 @@ pub struct RecordPayload {
     pub values: Vec<Value>,
     /// Per-record metadata entries, or `None` if the record has no metadata.
     pub metadata: Option<Vec<(Box<str>, Value)>>,
-    /// Per-record `$record.<key>` user-declared scoped variables
-    /// (Item 5), or `None` if the record has none.
+    /// Per-record `$record.<key>` user-declared scoped variables, or
+    /// `None` if the record has none.
     #[serde(default)]
     pub record_vars: Option<Vec<(Box<str>, Value)>>,
 }
@@ -212,7 +209,7 @@ impl Record {
     ///
     /// Distinct from `get_meta`: `$record.<key>` keys live in their
     /// own 64-key budget (independent of `$meta.*`) and are written
-    /// only by Phase D-3 state nodes with `scope: record`.
+    /// only by state nodes with `scope: record`.
     pub fn get_record_var(&self, key: &str) -> Option<&Value> {
         self.record_vars.as_ref().and_then(|m| m.get(key))
     }
@@ -229,18 +226,6 @@ impl Record {
         }
         map.insert(key.into(), value);
         Ok(())
-    }
-
-    /// Whether this record has any `$record.<key>` scoped-var entries.
-    pub fn has_record_vars(&self) -> bool {
-        self.record_vars.as_ref().is_some_and(|m| !m.is_empty())
-    }
-
-    /// Iterator over all `$record.<key>` scoped-var key-value pairs.
-    pub fn iter_record_vars(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.record_vars
-            .iter()
-            .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
     }
 
     /// Collect all `$record.<key>` entries as owned pairs (for binary
@@ -325,9 +310,8 @@ impl FieldResolver for Record {
             return self.get_meta(meta_key);
         }
         // Handle $record.<key>: resolve from the dedicated record-vars
-        // channel (Item 5 — independent 64-key budget, distinct from
-        // `$meta.*`). Phase D-3 state nodes with `scope: record` write
-        // here.
+        // channel (independent 64-key budget, distinct from `$meta.*`).
+        // state nodes with `scope: record` write here.
         if let Some(record_var) = name.strip_prefix("$record.") {
             return self.get_record_var(record_var);
         }

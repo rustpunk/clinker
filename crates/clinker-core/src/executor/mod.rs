@@ -1305,7 +1305,7 @@ impl PipelineExecutor {
             }
         }
 
-        // ── Pre-load init-phase Sources (Phase E-2) ─────────────
+        // ── Pre-load init-phase Sources ─────────────
         // Init-phase state nodes' ancestors include Sources. Those
         // Sources need their records materialized before the
         // two-pass walk runs, because the Source dispatcher arm
@@ -1566,7 +1566,7 @@ impl PipelineExecutor {
         // `ctx.current_dag` (which aliases `plan`) at the field
         // granularity through every dispatcher call.
         //
-        // Phase E-2: two-pass walk for init-phase orchestration.
+        // two-pass walk for init-phase orchestration.
         // Pass 1 dispatches every node in the init-phase ancestor
         // closure (Source/Aggregate/etc. feeding `phase: init` state
         // nodes, plus the state nodes themselves). Pass 2 dispatches
@@ -2296,13 +2296,11 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
 /// edges. The state nodes themselves are included.
 ///
 /// Returns an empty set when no init-phase state nodes exist — the
-/// caller then falls through to a single-pass topo walk identical to
-/// the pre-Phase-E-2 behavior.
+/// caller then falls through to a single-pass topo walk.
 ///
-/// Phase E v1's E164 validation guarantees init state nodes are
-/// terminal (no runtime descendants), so the closure forms a
-/// well-bounded init sub-DAG that Pass 1 can run to completion
-/// before Pass 2 starts.
+/// E164 validation guarantees init state nodes are terminal (no
+/// runtime descendants), so the closure forms a well-bounded init
+/// sub-DAG that Pass 1 can run to completion before Pass 2 starts.
 fn compute_init_phase_node_set(
     plan: &crate::plan::execution::ExecutionPlanDag,
 ) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
@@ -2362,8 +2360,7 @@ fn build_stable_eval_context(
 /// the source-file `Arc<str>`s of the upstream `Source` node(s) it
 /// transitively reads from. Used by `Expr::QualifiedSourceAccess` eval
 /// to look up `source_vars` entries written by upstream source-scope
-/// state nodes (Item 6 — qualified post-merge `$source.<input>.<key>`
-/// reads).
+/// state nodes (qualified post-merge `$source.<input>.<key>` reads).
 ///
 /// For Merge, each entry in `inputs:` becomes its own input name (the
 /// referenced node name itself, since Merge does not rename). For

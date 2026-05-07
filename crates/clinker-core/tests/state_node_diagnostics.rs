@@ -1,4 +1,4 @@
-//! Phase H insta snapshot tests for the scoped-variable / state-node
+//! Insta snapshot tests for the scoped-variable / state-node
 //! diagnostics. Each test compiles a fixture YAML that triggers a
 //! specific E-code and snapshots the rendered output, so future
 //! changes that shift the wording or span trip the snapshot diff.

@@ -69,11 +69,6 @@ pub enum ScopeTag {
 }
 
 impl ScopedVarsRegistry {
-    /// True if the registry declares no variables in any visible scope.
-    pub fn is_empty(&self) -> bool {
-        self.pipeline.is_empty() && self.source.is_empty() && self.record.is_empty()
-    }
-
     /// Look up `key` in the hidden tier of `scope`. Returns `Some` when
     /// the parent declared the var but the composition's signature
     /// didn't opt it in — the resolver uses this to produce the

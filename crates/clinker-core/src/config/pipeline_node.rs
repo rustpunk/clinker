@@ -973,8 +973,8 @@ pub struct StateBody {
 /// `var` names a variable previously declared in
 /// `PipelineMeta::vars.<scope>`; `cxl` is the expression evaluated
 /// once per record (per source for source-scope; once at init for
-/// init-phase). Span tracking on `cxl` powers Phase F single-writer
-/// and read-after-write diagnostics.
+/// init-phase). Span tracking on `cxl` powers the single-writer
+/// and read-after-write diagnostics (E170, E171).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateAssignment {
@@ -998,7 +998,8 @@ pub enum VarScope {
 /// per-record evaluation. `Init` collects the transitive ancestor
 /// sub-DAG and runs it to completion before any runtime-phase node
 /// sees a record (Beam side-input / Vector enrichment-table
-/// precedent). Phase E wires the two-phase orchestration.
+/// precedent). The executor partitions the topo order into init-only
+/// and runtime-only sub-DAGs and walks each pass to completion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -1756,7 +1757,7 @@ nodes:
 
     #[test]
     fn test_state_node_pipeline_scope_lowers_to_plan_node() {
-        // Phase D smoke test: a runtime-phase pipeline-scope state
+        // smoke test: test: a runtime-phase pipeline-scope state
         // node compiles end-to-end and lowers to `PlanNode::State`
         // with the typechecked assignment programs.
         let yaml = r#"
@@ -1807,7 +1808,7 @@ nodes:
 
     #[test]
     fn test_state_node_multi_writer_emits_e170() {
-        // Phase F-1: two state nodes both writing $pipeline.cutoff is
+        // two state nodes both writing $pipeline.cutoff is
         // an E170 multi-writer error — the design forbids ambiguous
         // last-write-wins semantics, mirroring Hop's documented
         // anti-pattern. Each writer carries its own span on the diag.
@@ -1876,7 +1877,7 @@ nodes:
 
     #[test]
     fn test_state_node_init_phase_lowers_to_plan_node() {
-        // Phase E v1: `phase: init` is no longer rejected with E163
+        // `phase: init` is no longer rejected with E163
         // — it lowers to `PlanNode::State` like a runtime-phase state
         // node. The executor visits init-phase state nodes at their
         // topological position; for single-source pipelines the
@@ -1911,7 +1912,7 @@ nodes:
         let ctx = crate::config::CompileContext::default();
         let plan = cfg
             .compile(&ctx)
-            .expect("init-phase state should now lower (Phase E v1)");
+            .expect("init-phase state should now lower");
         let dag = plan.dag();
         assert!(
             dag.graph.node_indices().any(|idx| matches!(
@@ -1924,7 +1925,7 @@ nodes:
 
     #[test]
     fn test_state_node_non_descendant_reader_emits_e171() {
-        // Phase F-2a: Transform on a sibling branch reads
+        // Transform on a sibling branch reads
         // $pipeline.cutoff that's only written further down the
         // OTHER branch. Without DAG ancestry from writer to reader,
         // the read silently observes the declaration default — the
@@ -1988,7 +1989,7 @@ nodes:
 
     #[test]
     fn test_state_node_descendant_reader_ok() {
-        // Phase F-2a sanity: a Transform downstream of the writer
+        // sanity check: a Transform downstream of the writer
         // state node IS a transitive descendant, so the read is
         // legal — the executor sees the written value.
         let yaml = r#"
@@ -2028,7 +2029,7 @@ nodes:
 
     #[test]
     fn test_state_node_post_merge_source_read_emits_e172() {
-        // Phase F-2b: a Transform downstream of a Merge that reads
+        // a Transform downstream of a Merge that reads
         // user-declared `$source.<custom>` is rejected — each record
         // carries its own source's value, but cross-source intent
         // is ambiguous in the current syntax. Builtin $source.*
@@ -2089,7 +2090,7 @@ nodes:
 
     #[test]
     fn test_state_node_post_merge_source_builtin_ok() {
-        // Phase F-2b sanity: builtin $source.* members (file, row,
+        // sanity check: builtin $source.* members (file, row,
         // batch, etc.) remain valid post-merge — each record's
         // builtin provenance is per-record naturally.
         let yaml = r#"
@@ -2131,7 +2132,7 @@ nodes:
 
     #[test]
     fn test_composition_body_undeclared_parent_var_emits_e173() {
-        // Phase F-2c / Item 4: parent declares `$pipeline.cutoff`,
+        // parent declares `$pipeline.cutoff`,
         // composition body's CXL reads it but the composition's
         // `_compose.scoped_vars` schema is empty. The body's resolver
         // sees the parent var in the `hidden_pipeline` tier and
@@ -2182,7 +2183,7 @@ nodes:
 
     #[test]
     fn test_init_phase_reads_runtime_var_emits_e175() {
-        // Phase F-2 / Item 3: an init-phase state node reads a
+        // an init-phase state node reads a
         // variable that's only written by a runtime-phase state node.
         // Init runs to completion before runtime, so the read would
         // silently observe the declaration default — E175 makes the
@@ -2235,7 +2236,7 @@ nodes:
 
     #[test]
     fn test_init_phase_reads_init_var_ok() {
-        // Phase F-2 / Item 3 sanity: an init-phase state node
+        // sanity: an init-phase state node
         // reading a variable written by ANOTHER init-phase state
         // node is fine — init runs as a unit.
         let yaml = r#"
@@ -2280,7 +2281,7 @@ nodes:
 
     #[test]
     fn test_runtime_phase_reads_init_var_ok() {
-        // Phase F-2 / Item 3 sanity: a runtime reader of a variable
+        // sanity: a runtime reader of a variable
         // written by an init-phase state node compiles — init runs
         // first, so by the time the runtime reader fires the value
         // is already in pipeline_vars.
@@ -2324,9 +2325,10 @@ nodes:
 
     #[test]
     fn test_state_node_init_phase_with_runtime_descendant_emits_e164() {
-        // Phase E v1: init state nodes must be terminal — a
+        // init state nodes must be terminal — a runtime-phase
         // downstream node consuming from them is rejected with E164
-        // until Phase E-2's source-replay orchestration lands.
+        // (init values are visible via the registry, not via record
+        // flow; the runtime consumer would receive nothing).
         let yaml = r#"
 pipeline:
   name: state_init_with_consumer
@@ -2373,7 +2375,7 @@ nodes:
 
     #[test]
     fn test_state_node_record_scope_lowers_to_plan_node() {
-        // Phase D-3: a runtime-phase record-scope state node compiles
+        // a runtime-phase record-scope state node compiles
         // end-to-end and lowers to `PlanNode::State`. The executor's
         // State arm writes per-record values into the record's
         // metadata channel under `RECORD_VAR_META_PREFIX`; downstream
@@ -2419,7 +2421,7 @@ nodes:
 
     #[test]
     fn test_state_node_source_scope_lowers_to_plan_node() {
-        // Phase D-2: a runtime-phase source-scope state node compiles
+        // a runtime-phase source-scope state node compiles
         // end-to-end and lowers to `PlanNode::State` (no E162). The
         // executor's State arm dispatches to `set_source_var()` keyed
         // by the per-record `source_file` Arc.

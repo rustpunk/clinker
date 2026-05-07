@@ -1,4 +1,4 @@
-//! Phase H end-to-end integration tests for scoped variables and the
+//! End-to-end integration tests for scoped variables and the
 //! `state` node. Each test drives a complete pipeline (parse → compile
 //! → execute) and asserts on the emitted CSV. Side effects of the
 //! state node are observable only through downstream readers, so each
@@ -61,13 +61,8 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    )
-    .expect("pipeline run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+        .expect("pipeline run");
     buf.as_string()
 }
 
@@ -352,13 +347,8 @@ nodes:
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    )
-    .expect("pipeline run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+        .expect("pipeline run");
     let out = buf.as_string();
     let lines = body_lines_sorted(&out);
     assert_eq!(lines, vec!["1,99", "2,99"]);
@@ -474,7 +464,7 @@ fn state_pipeline_init_visible_in_runtime() {
     // Disjoint init / runtime Sources: the init-phase aggregate
     // computes `max(cutoff)` from `config_src` and writes
     // `$pipeline.max_amount`; the runtime walk reads from
-    // `orders_src`. Phase E-2 partitions the topo order into init
+    // `orders_src`. partitions the topo order into init
     // and runtime sub-DAGs, so a Source shared between phases would
     // run only in pass 1; disjoint sources avoid that.
     let yaml = r#"

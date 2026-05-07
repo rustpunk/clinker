@@ -287,7 +287,7 @@ impl<'a> Resolver<'a> {
                     .hidden_lookup(super::scoped_vars::ScopeTag::Pipeline, field)
                     .is_some()
                 {
-                    // Phase F-2c / Item 4 — composition body referenced a
+                    // — composition body referenced a
                     // parent-declared var that's NOT in the body's
                     // `_compose.scoped_vars` opt-in schema. E173 makes the
                     // sealing explicit instead of falling through to a
@@ -378,7 +378,7 @@ impl<'a> Resolver<'a> {
                 field,
                 span,
             } => {
-                // Item 6: `$source.<input_name>.<field>` — the qualified
+                // `$source.<input_name>.<field>` — the qualified
                 // form used downstream of Merge/Combine. Field must be
                 // declared in `vars.source`; the input_name's structural
                 // validity is checked at plan time (not at resolve, which
@@ -398,9 +398,7 @@ impl<'a> Resolver<'a> {
                         help: best_match(field, &declared, 3)
                             .map(|s| format!("did you mean '{s}'?"))
                             .or_else(|| {
-                                Some(
-                                    "declare it in the pipeline `vars.source` block".into(),
-                                )
+                                Some("declare it in the pipeline `vars.source` block".into())
                             }),
                     });
                 }

@@ -160,9 +160,9 @@ use crate::projection::project_output_from_record;
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
 /// * `preloaded_source_records` — pre-loaded non-primary source streams
 ///   the Source arm consults before falling back to `all_records`. Holds
-///   both combine build-side inputs (Phase Combine) and init-phase
-///   ancestor Sources (Phase E-2). Renamed from `combine_source_records`
-///   when Phase E-2 broadened the role.
+///   both combine build-side inputs and init-phase
+///   ancestor Sources. Renamed from `combine_source_records`
+///   when broadened the role.
 /// * `all_records` — primary driving stream materialized before the walk.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
@@ -3120,16 +3120,16 @@ pub(crate) fn dispatch_plan_node(
             ref resolved,
             ..
         } => {
-            // Phase D: pipeline-scope runtime writes. Records flow
+            // pipeline-scope runtime writes. Records flow
             // through unchanged; the side effect is that for each
             // record, we evaluate every assignment's CXL program and
             // write the result into `ctx.stable.pipeline_vars` via
             // `set_pipeline_var`. Source-scope and record-scope are
-            // rejected at lowering with E162 (Phase D-2 / D-3).
+            // are dispatched by the explicit match arms below.
             //
             // Last-write-wins per record: the design's locked decision
             // is "single writer per (scope, var)" enforced at compile
-            // time in Phase F, so multiple records flowing through the
+            // time, so multiple records flowing through the
             // same state node produce a coherent stream of values
             // (each record's evaluation overwrites the previous).
             let payload = resolved
@@ -3198,7 +3198,7 @@ pub(crate) fn dispatch_plan_node(
                                         );
                                     }
                                     crate::config::VarScope::Record => {
-                                        // Item 5 — write to the dedicated
+                                        // write to the dedicated
                                         // `record_vars` channel on Record;
                                         // independent 64-key budget from
                                         // `$meta.*`. `Record::resolve`

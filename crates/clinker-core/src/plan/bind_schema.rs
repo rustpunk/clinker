@@ -163,7 +163,7 @@ pub(crate) struct BindContext<'a> {
     /// registry. Built once from `PipelineConfig.pipeline.vars` at the
     /// `bind_schema` entry and threaded into every CXL resolve / typecheck
     /// call site. Empty for compositions that don't propagate scoped vars
-    /// (Phase G will revisit composition propagation).
+    ///.
     pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
 }
 
@@ -492,7 +492,7 @@ fn validate_read_after_write(
     // Build (scope, var) → (writer-node-name, writer-phase) map. Phase
     // is needed because init-phase writers' values are visible to ALL
     // runtime readers regardless of DAG topology — init runs to
-    // completion before runtime starts (Phase E-2 two-pass walk), so
+    // completion before runtime starts, so
     // descendant ancestry is irrelevant for those reads.
     let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
         std::collections::HashMap::new();
@@ -606,9 +606,9 @@ fn validate_read_after_write(
                 if writer_phase == ConfPhase::Init && reader_phase == ConfPhase::Runtime {
                     continue;
                 }
-                // Init reader + runtime writer is the E175 case (Phase
-                // F-2 / Item 3). Skip here to avoid a duplicate
-                // diagnostic; E175 fires from `validate_init_phase_isolation`.
+                // Init reader + runtime writer is the E175 case — skip
+                // here to avoid a duplicate diagnostic; E175 fires from
+                // `validate_init_phase_isolation`.
                 if writer_phase == ConfPhase::Runtime && reader_phase == ConfPhase::Init {
                     continue;
                 }
@@ -653,7 +653,7 @@ fn validate_read_after_write(
     }
 }
 
-/// Phase G: build a composition body's scoped-vars registry from the
+/// build a composition body's scoped-vars registry from the
 /// intersection of the body's `_compose.scoped_vars` schema and the
 /// parent's actual declarations.
 ///
@@ -667,7 +667,7 @@ fn validate_read_after_write(
 ///   contract was unfulfillable.
 ///
 /// Returns the body-visible registry. An empty schema produces an
-/// empty registry, preserving the Phase F-2c seal as the default.
+/// empty registry, preserving the seal as the default.
 fn build_body_scoped_vars(
     schema: &crate::config::ScopedVarsSchema,
     parent: &cxl::resolve::ScopedVarsRegistry,
@@ -739,7 +739,7 @@ fn build_body_scoped_vars(
         diags,
     );
 
-    // Phase F-2c / Item 4 — populate the hidden tier with parent vars
+    // — populate the hidden tier with parent vars
     // that are NOT opted into the schema. The composition body's
     // resolver consults `hidden_*` on miss to emit E173 (composition-
     // aware "this is a parent var hidden from your body — declare in
@@ -851,8 +851,8 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
 /// the DAG — no other node may consume from it. Without source-replay
 /// infrastructure, the executor cannot deliver init-phase records to
 /// runtime-phase descendants, and silent record-loss would be a
-/// debugging nightmare. Phase E v1 enforces the structural invariant
-/// up front; Phase E-2 will lift the restriction once two-pass
+/// debugging nightmare. enforces the structural invariant
+/// up front; will lift the restriction once two-pass
 /// orchestration with source replay lands.
 ///
 /// Walks each `phase: init` state node and checks whether any other
@@ -909,7 +909,7 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
         };
         let consumer_name = spanned.value.name();
         let consumer_span = span_for(spanned);
-        // Phase E-2 lifted the strict "init state nodes are terminal"
+        // lifted the strict "init state nodes are terminal"
         // rule: init state nodes can have other init-phase consumers
         // (the two-pass walk handles them as part of the init sub-DAG).
         // Only RUNTIME descendants are still forbidden — runtime nodes
@@ -958,10 +958,10 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
 /// and demands the user collapse the writes into a single state node
 /// (Hop / Talend canonical anti-pattern).
 ///
-/// Init-phase and runtime-phase writers are tracked together for now;
-/// future Phase E refinement could distinguish them since init runs to
-/// completion before runtime and a converging-init writer is
-/// architecturally distinct from a converging-runtime writer.
+/// Init-phase and runtime-phase writers are tracked together; a
+/// converging-init writer is architecturally distinct from a
+/// converging-runtime writer (init runs to completion first), but the
+/// single-writer rule applies to both pools uniformly here.
 ///
 /// Emits E170 with primary span on the second writer and secondary
 /// span on the first (the chronologically-first span in declaration
@@ -1428,13 +1428,13 @@ fn bind_composition(
             .to_path_buf(),
     );
     // Composition bodies are sealed from parent scoped vars by default
-    // (Phase F-2c) — the body sees an empty `ScopedVarsRegistry` and the
+    // — the body sees an empty `ScopedVarsRegistry` and the
     // resolver rejects every `$pipeline.<custom>` / `$source.<custom>` /
     // `$record.<custom>` read with the standard "unknown member"
     // diagnostic.
     //
-    // Phase G adds opt-in inheritance via the composition's
-    // `_compose.scoped_vars` schema. For each `(scope, key)` declared
+    // Opt-in inheritance via the composition's
+    // `_compose.scoped_vars` schema: for each `(scope, key)` declared
     // in `signature.scoped_vars_schema`, if the parent has a matching
     // declaration with the same type, the body's registry includes it.
     // Mismatches (parent missing the var, or type doesn't match) emit

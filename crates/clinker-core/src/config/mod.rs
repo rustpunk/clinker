@@ -3179,7 +3179,7 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::State { config, .. } => {
             // Phases D / D-2 / D-3 wire all three runtime scope tiers.
-            // Phase E v1 lowers `phase: init` identically to runtime —
+            // lowers `phase: init` identically to runtime —
             // both produce `PlanNode::State` and the executor visits
             // them at their topological position. For pipelines whose
             // init data flows through a single primary chain, the
@@ -3188,7 +3188,7 @@ pub(crate) fn lower_node_to_plan_node(
             // init-before-runtime ordering across disjoint sub-DAGs
             // (separate sources for init vs runtime) requires a
             // two-pass walk with source-replay infrastructure that is
-            // a future Phase E-2 follow-up.
+            // a future follow-up.
             //
             // Pull each assignment's typed program out of
             // `artifacts.typed`. `bind_schema` populates these under
@@ -3806,7 +3806,7 @@ fn check_default_type(
 /// `IndexMap<String, Value>` consumed by [`StableEvalContext::pipeline_vars`].
 ///
 /// Source- and row-scope declarations are intentionally not threaded here —
-/// their values are produced at runtime by `state` nodes (Phase D), not
+/// their values are produced at runtime by `state` nodes, not
 /// from YAML defaults. Only call after [`validate_scoped_vars`] has passed.
 pub fn convert_pipeline_vars(vars: &ScopedVarsDecl) -> IndexMap<String, clinker_record::Value> {
     vars.pipeline
