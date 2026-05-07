@@ -252,14 +252,16 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: amount, type: int }
-  - type: state
+  - type: transform
     name: capture
     input: src
     config:
-      scope: record
-      set:
-        - var: doubled
-          cxl: "amount * 2"
+      declares:
+        - { name: doubled, scope: record, type: int }
+      cxl: |
+        emit id = id
+        emit amount = amount
+        emit $record.doubled = amount * 2
   - type: transform
     name: read_back
     input: capture
@@ -396,22 +398,26 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: tag_val, type: string }
-  - type: state
+  - type: transform
     name: tag_left
     input: left_src
     config:
-      scope: source
-      set:
-        - var: left_label
-          cxl: "tag_val"
-  - type: state
+      declares:
+        - { name: left_label, scope: source, type: string }
+      cxl: |
+        emit id = id
+        emit tag_val = tag_val
+        emit $source.left_label = tag_val
+  - type: transform
     name: tag_right
     input: right_src
     config:
-      scope: source
-      set:
-        - var: right_label
-          cxl: "tag_val"
+      declares:
+        - { name: right_label, scope: source, type: string }
+      cxl: |
+        emit id = id
+        emit tag_val = tag_val
+        emit $source.right_label = tag_val
   - type: merge
     name: merged
     inputs: [tag_left, tag_right]
@@ -571,14 +577,16 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: tag, type: string }
-  - type: state
+  - type: transform
     name: capture
     input: orders
     config:
-      scope: source
-      set:
-        - var: file_label
-          cxl: "tag"
+      declares:
+        - { name: file_label, scope: source, type: string }
+      cxl: |
+        emit id = id
+        emit tag = tag
+        emit $source.file_label = tag
   - type: transform
     name: read_back
     input: capture
