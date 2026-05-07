@@ -90,58 +90,6 @@ pub fn append_suffix_before_ext(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-/// Resolve the final output path given the active collision policy
-/// without opening any file.  Sibling to [`open_output`] for callers
-/// that want to manage file creation themselves (e.g. atomic
-/// tempfile-and-rename in the binary).
-///
-/// `Overwrite` returns `bare` unchanged.  `Error` returns `bare` if
-/// the path is free or `cli_force` is set, otherwise returns a
-/// `Diagnostic`-derived `ConfigError`.  `UniqueSuffix` walks
-/// `1..=u64::MAX` integer suffixes and returns the first free slot.
-///
-/// Race window: callers that rely on the resolved path remaining free
-/// must take whatever locking is appropriate downstream — this helper
-/// only checks existence at the time of the call.
-#[allow(clippy::result_large_err)]
-pub fn resolve_output_path(
-    bare: &Path,
-    policy: IfExistsPolicy,
-    cli_force: bool,
-    unique_suffix_width: u8,
-) -> Result<PathBuf, ConfigError> {
-    match policy {
-        IfExistsPolicy::Overwrite => Ok(bare.to_path_buf()),
-        IfExistsPolicy::Error => {
-            if cli_force || !bare.exists() {
-                return Ok(bare.to_path_buf());
-            }
-            crate::security::check_overwrite(bare)
-                .map_err(|d| ConfigError::Validation(format!("{}: {}", d.code, d.message)))?;
-            Ok(bare.to_path_buf())
-        }
-        IfExistsPolicy::UniqueSuffix => {
-            if !bare.exists() {
-                return Ok(bare.to_path_buf());
-            }
-            for k in 1u64..=u64::MAX {
-                let suffix = if unique_suffix_width == 0 {
-                    format!("-{k}")
-                } else {
-                    format!("-{:0>width$}", k, width = unique_suffix_width as usize)
-                };
-                let candidate = append_suffix_before_ext(bare, &suffix);
-                if !candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-            Err(ConfigError::Validation(
-                "exhausted u64 collision counter for unique_suffix policy".into(),
-            ))
-        }
-    }
-}
-
 fn create_new(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }

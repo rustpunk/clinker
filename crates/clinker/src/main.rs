@@ -599,13 +599,31 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             continue;
         }
         let bare = std::path::PathBuf::from(&output.path);
-        let final_path = clinker_core::output::open::resolve_output_path(
-            &bare,
-            output.if_exists,
-            args.force,
-            output.unique_suffix_width,
-        )
-        .map_err(PipelineError::Config)?;
+        let unique_suffix_width = output.unique_suffix_width;
+        let path_for_n =
+            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
+                Ok(match n {
+                    None => bare.clone(),
+                    Some(k) => {
+                        let suffix = if unique_suffix_width == 0 {
+                            format!("-{k}")
+                        } else {
+                            format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                        };
+                        clinker_core::output::open::append_suffix_before_ext(&bare, &suffix)
+                    }
+                })
+            };
+        // open_output claims the slot race-safely via OpenOptions::create_new
+        // and returns the reservation file. Drop the handle but leave the
+        // empty file on disk: it blocks any concurrent unique_suffix walk
+        // from picking the same path, and the success-path persist below
+        // atomically renames our writing tempfile over it. The error path
+        // explicitly unlinks the reservation so the failed-run contract
+        // (final_path must not exist) still holds.
+        let (final_path, reservation) =
+            clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
+        drop(reservation);
         let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
         let temp = match parent {
             Some(dir) => {
@@ -634,6 +652,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         Err(e) => {
             for (name, final_path, temp) in output_temps {
                 let kept = temp.into_temp_path().keep().ok();
+                // Unlink the reservation placeholder so the failed-run
+                // contract (`final_path` does not exist) holds. A failure
+                // here only leaks an empty file at `final_path`; log it
+                // and continue tearing down the other outputs.
+                if let Err(rm_err) = std::fs::remove_file(&final_path)
+                    && rm_err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        output = %name,
+                        final_path = %final_path.display(),
+                        error = %rm_err,
+                        "failed to unlink reservation placeholder after pipeline error",
+                    );
+                }
                 tracing::warn!(
                     output = %name,
                     final_path = %final_path.display(),
