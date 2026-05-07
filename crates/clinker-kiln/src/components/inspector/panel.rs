@@ -83,6 +83,17 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         PipelineNode::Output { config: body, .. } => {
             ("OUTPUT", "output", body.output.path.clone(), None)
         }
+        PipelineNode::State { config: body, .. } => (
+            "STATE",
+            "state",
+            format!(
+                "scope {:?}, {} assignment{}",
+                body.scope,
+                body.set.len(),
+                if body.set.len() == 1 { "" } else { "s" }
+            ),
+            None,
+        ),
         PipelineNode::Composition {
             r#use, config: _, ..
         } => (
