@@ -674,7 +674,11 @@ fn execute_combine_sort_merge_with_stats(
                             .to_string(),
                     })?;
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
+                        Ok(EvalResult::Emit {
+                            fields,
+                            metadata,
+                            record_vars,
+                        }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(&driver_record, s),
                                 None => driver_record.clone(),
@@ -1164,7 +1168,11 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
+                        Ok(EvalResult::Emit {
+                            fields,
+                            metadata,
+                            record_vars,
+                        }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(driver_record, s),
                                 None => driver_record.clone(),

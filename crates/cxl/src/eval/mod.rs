@@ -168,10 +168,7 @@ impl ProgramEvaluator {
                     env.insert(name.to_string(), val);
                 }
                 Statement::Emit {
-                    name,
-                    expr,
-                    target,
-                    ..
+                    name, expr, target, ..
                 } => {
                     let val =
                         eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;

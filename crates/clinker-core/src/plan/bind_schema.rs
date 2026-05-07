@@ -2554,10 +2554,7 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit {
-            name,
-            expr,
-            target,
-            ..
+            name, expr, target, ..
         } = stmt
         {
             // Meta emits write to per-record metadata (`$meta.*`), not
@@ -2606,10 +2603,7 @@ fn propagate_aggregate(
     }
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit {
-            name,
-            expr,
-            target,
-            ..
+            name, expr, target, ..
         } = stmt
         {
             if !matches!(target, cxl::ast::EmitTarget::Field) {
@@ -2976,11 +2970,15 @@ fn bind_combine(
     // Transform (which has pass-through semantics), combine's output
     // row is defined entirely by its emits — zero emits means zero
     // output fields.
-    let has_emit = body_typed
-        .program
-        .statements
-        .iter()
-        .any(|s| matches!(s, Statement::Emit { target: cxl::ast::EmitTarget::Field, .. }));
+    let has_emit = body_typed.program.statements.iter().any(|s| {
+        matches!(
+            s,
+            Statement::Emit {
+                target: cxl::ast::EmitTarget::Field,
+                ..
+            }
+        )
+    });
     if !has_emit {
         diags.push(combine_e309(name, span));
     }
@@ -3605,10 +3603,7 @@ fn combine_output_row(
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for stmt in &typed.program.statements {
         if let Statement::Emit {
-            name,
-            expr,
-            target,
-            ..
+            name, expr, target, ..
         } = stmt
         {
             if !matches!(target, cxl::ast::EmitTarget::Field) {

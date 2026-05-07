@@ -774,7 +774,11 @@ pub(crate) fn execute_combine_iejoin(
                                 Some(build_record),
                             );
                             match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                                Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
+                                Ok(EvalResult::Emit {
+                                    fields,
+                                    metadata,
+                                    record_vars,
+                                }) => {
                                     let mut rec = match output_schema {
                                         Some(s) => widen_record_to_schema(driver_record, s),
                                         None => driver_record.clone(),
@@ -938,7 +942,11 @@ pub(crate) fn execute_combine_iejoin(
                         .to_string(),
                 })?;
                 match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                    Ok(EvalResult::Emit { fields, metadata, record_vars }) => {
+                    Ok(EvalResult::Emit {
+                        fields,
+                        metadata,
+                        record_vars,
+                    }) => {
                         let mut rec = match output_schema {
                             Some(s) => widen_record_to_schema(driver_record, s),
                             None => driver_record.clone(),
