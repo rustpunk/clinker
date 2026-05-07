@@ -1,0 +1,3 @@
+order_id,customer_id,amount
+ORD-1,CUST-A,100.0
+ORD-2,CUST-B,200.0

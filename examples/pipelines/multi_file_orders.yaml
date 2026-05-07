@@ -1,0 +1,40 @@
+pipeline:
+  name: multi_file_orders
+  description: |
+    Demo of flexible-file-matching: glob, modified_after, sort_by + take_first.
+    `glob: ./data/orders_*.csv` matches every shard at runtime; the executor's
+    MultiFileFormatReader concatenates them into one record stream and stamps
+    `$source.file` per record. Downstream `group_by` operates per-file by
+    default thanks to plan-time `FilePartitioned` lineage; insert a `merge:`
+    node before the aggregate to roll up across files.
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: ./data/orders_*.csv
+      # Optional discovery filters (uncomment in real pipelines):
+      # exclude: ["*.tmp", "*_partial.csv"]
+      # modified_after: 1d            # last 24 hours; ISO 8601 also accepted
+      # min_size: 1KB
+      files:
+        sort_by: name                  # name | created | modified
+        sort_order: asc                # asc | desc
+        # take_first: 5                # process latest N files
+        # take_last: 5
+        # recursive: true              # default: true if `**` in glob
+        on_no_match: warn              # error (default) | warn | skip
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: float }
+
+  - type: output
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out_all.csv
+      include_unmapped: true

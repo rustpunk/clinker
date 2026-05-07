@@ -580,9 +580,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     for source in pipeline_config.source_configs() {
         let outcome =
             clinker_core::source::discovery::discover(source, &workspace_root).map_err(|e| {
+                use clinker_core::source::discovery::DiscoveryError;
+                let code = match &e {
+                    DiscoveryError::MultipleMatchers { .. } => "E210",
+                    DiscoveryError::NoMatcher => "E211",
+                    DiscoveryError::InvalidGlob { .. } => "E212",
+                    DiscoveryError::InvalidRegex { .. } => "E213",
+                    DiscoveryError::NoMatch { .. } => "E216",
+                    DiscoveryError::TakeBothSpecified => "E218",
+                    DiscoveryError::Io(_) => "E216",
+                };
                 clinker_core::error::PipelineError::Config(
                     clinker_core::config::ConfigError::Validation(format!(
-                        "source '{}' discovery failed: {e}",
+                        "[{code}] source '{}' discovery failed: {e}",
                         source.name
                     )),
                 )

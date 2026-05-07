@@ -164,14 +164,20 @@ fn bench_combine_equi_2input(c: &mut Criterion) {
         group.sample_size(samples);
         group.bench_with_input(BenchmarkId::new("rows", label), &(build, probe), |b, _| {
             b.iter(|| {
-                let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+                let readers: clinker_core::executor::SourceReaders = HashMap::from([
                     (
                         "products".to_string(),
-                        Box::new(Cursor::new(build_csv.clone())) as Box<dyn std::io::Read + Send>,
+                        clinker_core::executor::single_file_reader(
+                            "test.csv",
+                            Box::new(Cursor::new(build_csv.clone())),
+                        ),
                     ),
                     (
                         "orders".to_string(),
-                        Box::new(Cursor::new(probe_csv.clone())) as Box<dyn std::io::Read + Send>,
+                        clinker_core::executor::single_file_reader(
+                            "test.csv",
+                            Box::new(Cursor::new(probe_csv.clone())),
+                        ),
                     ),
                 ]);
                 let out_buf = BenchBuffer::new();

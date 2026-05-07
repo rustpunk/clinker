@@ -296,14 +296,20 @@ fn run_iejoin_executor(
     brackets_csv: &[u8],
     params: &PipelineRunParams,
 ) -> usize {
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "employees".to_string(),
-            Box::new(Cursor::new(employees_csv.to_vec())) as Box<dyn std::io::Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(employees_csv.to_vec())),
+            ),
         ),
         (
             "brackets".to_string(),
-            Box::new(Cursor::new(brackets_csv.to_vec())) as Box<dyn std::io::Read + Send>,
+            clinker_core::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(brackets_csv.to_vec())),
+            ),
         ),
     ]);
     let out_buf = BenchBuffer::new();
