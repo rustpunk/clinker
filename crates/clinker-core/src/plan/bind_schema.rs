@@ -215,8 +215,109 @@ pub fn bind_schema(
     validate_init_phase_terminals(nodes, diags);
     validate_read_after_write(nodes, &artifacts, diags);
     validate_post_merge_source_reads(nodes, &artifacts, diags);
+    validate_init_phase_isolation(nodes, &artifacts, diags);
 
     artifacts
+}
+
+/// Compile-time check: an `phase: init` state node may not read
+/// scoped variables that are written ONLY by `phase: runtime` state
+/// nodes. The init sub-DAG runs to completion before any runtime
+/// node executes, so the read would silently observe the
+/// declaration default — exactly the "invisible default" hazard the
+/// plan called out as validation #5.
+///
+/// Reads of vars written by other init-phase state nodes are fine
+/// (init runs as one unit). Reads of vars with no writer are fine
+/// (declaration default is the intended value). Only the
+/// init-reads-runtime-only case is flagged.
+///
+/// Reuses `validate_state_writers`'s writer-map shape and
+/// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
+fn validate_init_phase_isolation(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::config::{Phase as ConfPhase, VarScope};
+
+    // Build (scope, var) → (writer-name, writer-phase) map, segregating
+    // writers by phase so a runtime-only var can be distinguished from
+    // an init-written-or-mixed var.
+    let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        if let PipelineNode::State { header, config } = &spanned.value {
+            for assignment in &config.set {
+                writers
+                    .entry((config.scope, assignment.var.clone()))
+                    .or_insert_with(|| (header.name.clone(), config.phase));
+            }
+        }
+    }
+    if writers.is_empty() {
+        return;
+    }
+
+    for spanned in nodes {
+        let PipelineNode::State { header, config } = &spanned.value else {
+            continue;
+        };
+        if config.phase != ConfPhase::Init {
+            continue;
+        }
+        let reader_name = header.name.as_str();
+        let read_span = span_for_node(spanned);
+        for assignment in &config.set {
+            let assignment_key = format!("{reader_name}::{}", assignment.var);
+            let Some(typed) = artifacts.typed.get(&assignment_key) else {
+                continue;
+            };
+            let mut reads: Vec<(VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            for (scope, var) in reads {
+                let Some((writer_name, writer_phase)) = writers.get(&(scope, var.clone())).cloned()
+                else {
+                    continue;
+                };
+                if writer_phase == ConfPhase::Init {
+                    continue;
+                }
+                if writer_name == reader_name {
+                    continue;
+                }
+                let scope_str = match scope {
+                    VarScope::Pipeline => "$pipeline",
+                    VarScope::Source => "$source",
+                    VarScope::Record => "$record",
+                };
+                let writer_span = nodes
+                    .iter()
+                    .find(|n| n.value.name() == writer_name.as_str())
+                    .map(span_for_node)
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E175",
+                        format!(
+                            "init-phase state node {reader_name:?} reads {scope_str}.{var} \
+                             which is only written by runtime-phase state node \
+                             {writer_name:?} — init runs to completion before runtime, so \
+                             the read would silently observe the declaration default. \
+                             Move the writer to `phase: init` or remove the read."
+                        ),
+                        LabeledSpan::primary(read_span, "init-phase reader".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        writer_span,
+                        Some("runtime-phase writer".to_string()),
+                    )),
+                );
+            }
+        }
+    }
 }
 
 /// Compile-time check: nodes downstream of `Merge` / `Combine` must
@@ -386,17 +487,21 @@ fn validate_read_after_write(
     artifacts: &CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
 ) {
-    use crate::config::VarScope;
+    use crate::config::{Phase as ConfPhase, VarScope};
 
-    // Build (scope, var) → writer-node-name map.
-    let mut writers: std::collections::HashMap<(VarScope, String), String> =
+    // Build (scope, var) → (writer-node-name, writer-phase) map. Phase
+    // is needed because init-phase writers' values are visible to ALL
+    // runtime readers regardless of DAG topology — init runs to
+    // completion before runtime starts (Phase E-2 two-pass walk), so
+    // descendant ancestry is irrelevant for those reads.
+    let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
         std::collections::HashMap::new();
     for spanned in nodes {
         if let PipelineNode::State { header, config } = &spanned.value {
             for assignment in &config.set {
                 writers
                     .entry((config.scope, assignment.var.clone()))
-                    .or_insert_with(|| header.name.clone());
+                    .or_insert_with(|| (header.name.clone(), config.phase));
             }
         }
     }
@@ -476,17 +581,44 @@ fn validate_read_after_write(
             for stmt in &typed.program.statements {
                 collect_scope_reads_in_statement(stmt, &mut reads);
             }
+            // Determine the reader's phase — runtime nodes that aren't
+            // state nodes are runtime by definition; state-node readers
+            // use their own `phase`. Init readers' visibility into
+            // init-only writers depends on DAG ancestry within the init
+            // pass; runtime readers see init writers regardless of
+            // topology because init completes first.
+            let reader_phase = match &spanned.value {
+                PipelineNode::State { config, .. } => config.phase,
+                _ => ConfPhase::Runtime,
+            };
             for (scope, var) in reads {
-                let Some(writer_name) = writers.get(&(scope, var.clone())) else {
+                let Some((writer_name, writer_phase)) = writers.get(&(scope, var.clone())).cloned()
+                else {
                     continue;
                 };
                 // Self-read inside the writing state node is fine.
-                if writer_name == &reader_name {
+                if writer_name == reader_name {
                     continue;
                 }
+                // Init writer + runtime reader: init runs to completion
+                // before runtime, so the value is visible everywhere
+                // downstream regardless of DAG topology.
+                if writer_phase == ConfPhase::Init && reader_phase == ConfPhase::Runtime {
+                    continue;
+                }
+                // Init reader + runtime writer is the E175 case (Phase
+                // F-2 / Item 3). Skip here to avoid a duplicate
+                // diagnostic; E175 fires from `validate_init_phase_isolation`.
+                if writer_phase == ConfPhase::Runtime && reader_phase == ConfPhase::Init {
+                    continue;
+                }
+                // Same phase (init+init or runtime+runtime): the
+                // descendant-ancestry rule applies — both run in the
+                // same pass and the writer's effect must precede the
+                // reader's evaluation in topo order.
                 let reader_anc = ancestors.get(&reader_name);
                 let is_descendant = reader_anc
-                    .map(|set| set.contains(writer_name))
+                    .map(|set| set.contains(&writer_name))
                     .unwrap_or(false);
                 if !is_descendant {
                     let scope_str = match scope {
@@ -758,6 +890,19 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
         };
         let consumer_name = spanned.value.name();
         let consumer_span = span_for(spanned);
+        // Phase E-2 lifted the strict "init state nodes are terminal"
+        // rule: init state nodes can have other init-phase consumers
+        // (the two-pass walk handles them as part of the init sub-DAG).
+        // Only RUNTIME descendants are still forbidden — runtime nodes
+        // never see the init state node's record-pass-through output
+        // because the runtime walk skips init-only sub-DAG nodes.
+        let consumer_is_init_state = matches!(
+            &spanned.value,
+            PipelineNode::State { config, .. } if config.phase == crate::config::Phase::Init
+        );
+        if consumer_is_init_state {
+            continue;
+        }
         for input_name in inputs {
             if init_state_names.contains(input_name) {
                 let init_state_span = nodes
@@ -770,15 +915,17 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
                         "E164",
                         format!(
                             "init-phase state node {input_name:?} has runtime descendant \
-                             {consumer_name:?}: init state nodes must be terminal in the DAG \
-                             (Phase E-2 will lift this restriction once two-pass orchestration \
-                             with source replay lands)"
+                             {consumer_name:?}: init state nodes can feed other init-phase \
+                             state nodes but must not be consumed by runtime-phase nodes \
+                             (their record output is not visible in the runtime walk). \
+                             Either change the consumer to `phase: init` or detach it from \
+                             this init state node."
                         ),
                         LabeledSpan::primary(init_state_span, "init state node".to_string()),
                     )
                     .with_secondary(LabeledSpan::new(
                         consumer_span,
-                        Some("downstream consumer".to_string()),
+                        Some("runtime consumer".to_string()),
                     )),
                 );
             }

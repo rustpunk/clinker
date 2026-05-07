@@ -2112,6 +2112,148 @@ nodes:
     }
 
     #[test]
+    fn test_init_phase_reads_runtime_var_emits_e175() {
+        // Phase F-2 / Item 3: an init-phase state node reads a
+        // variable that's only written by a runtime-phase state node.
+        // Init runs to completion before runtime, so the read would
+        // silently observe the declaration default — E175 makes the
+        // misalignment explicit.
+        let yaml = r#"
+pipeline:
+  name: state_init_reads_runtime
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+      run_total: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: runtime_writer
+    input: src
+    config:
+      scope: pipeline
+      set:
+        - var: run_total
+          cxl: "amount"
+  - type: state
+    name: init_reader
+    input: src
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: cutoff
+          cxl: "$pipeline.run_total"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("init reads runtime var should reject");
+        assert!(
+            err_diags.iter().any(|d| d.code == "E175"),
+            "expected E175, got: {:?}",
+            err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_init_phase_reads_init_var_ok() {
+        // Phase F-2 / Item 3 sanity: an init-phase state node
+        // reading a variable written by ANOTHER init-phase state
+        // node is fine — init runs as a unit.
+        let yaml = r#"
+pipeline:
+  name: state_init_reads_init
+  vars:
+    pipeline:
+      stage_a: { type: int, default: 0 }
+      stage_b: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: writer_a
+    input: src
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: stage_a
+          cxl: "amount"
+  - type: state
+    name: reader_b
+    input: writer_a
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: stage_b
+          cxl: "$pipeline.stage_a"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let _plan = cfg.compile(&ctx).expect("init reading init should compile");
+    }
+
+    #[test]
+    fn test_runtime_phase_reads_init_var_ok() {
+        // Phase F-2 / Item 3 sanity: a runtime reader of a variable
+        // written by an init-phase state node compiles — init runs
+        // first, so by the time the runtime reader fires the value
+        // is already in pipeline_vars.
+        let yaml = r#"
+pipeline:
+  name: state_runtime_reads_init
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: init_writer
+    input: src
+    config:
+      scope: pipeline
+      phase: init
+      set:
+        - var: cutoff
+          cxl: "amount"
+  - type: transform
+    name: runtime_reader
+    input: src
+    config:
+      cxl: |
+        emit observed = $pipeline.cutoff
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let _plan = cfg
+            .compile(&ctx)
+            .expect("runtime reading init should compile");
+    }
+
+    #[test]
     fn test_state_node_init_phase_with_runtime_descendant_emits_e164() {
         // Phase E v1: init state nodes must be terminal — a
         // downstream node consuming from them is rejected with E164
