@@ -655,6 +655,20 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             }
             PlanNode::Merge { name, .. } => (name.clone(), StageKind::Merge, String::new()),
             PlanNode::Output { name, .. } => (name.clone(), StageKind::Output, String::new()),
+            PlanNode::State { name, resolved, .. } => {
+                let subtitle = resolved
+                    .as_deref()
+                    .map(|p| {
+                        format!(
+                            "scope {:?}, {} assignment{}",
+                            p.scope,
+                            p.assignments.len(),
+                            if p.assignments.len() == 1 { "" } else { "s" }
+                        )
+                    })
+                    .unwrap_or_default();
+                (name.clone(), StageKind::State, subtitle)
+            }
             PlanNode::Sort { name, .. } => (name.clone(), StageKind::Transform, "sort".into()),
             PlanNode::Aggregation { name, strategy, .. } => {
                 (name.clone(), StageKind::Aggregate, format!("{strategy:?}"))
