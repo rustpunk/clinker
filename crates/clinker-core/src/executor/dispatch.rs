@@ -3184,7 +3184,24 @@ pub(crate) fn dispatch_plan_node(
                             // assignment in a single emit), so take
                             // the first value.
                             if let Some((_, value)) = fields.into_iter().next() {
-                                ctx.stable.set_pipeline_var(&assignment.var, value);
+                                match payload.scope {
+                                    crate::config::VarScope::Pipeline => {
+                                        ctx.stable.set_pipeline_var(&assignment.var, value);
+                                    }
+                                    crate::config::VarScope::Source => {
+                                        ctx.stable.set_source_var(
+                                            eval_ctx.source_file,
+                                            &assignment.var,
+                                            value,
+                                        );
+                                    }
+                                    crate::config::VarScope::Record => {
+                                        // Phase D-3 — rejected at lowering with E162.
+                                        unreachable!(
+                                            "record-scope state nodes rejected before lowering"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Ok(cxl::eval::EvalResult::Skip(_)) => {}

@@ -1858,7 +1858,7 @@ nodes:
 
     #[test]
     fn test_state_node_record_scope_emits_e162() {
-        // Phase D-2 (record scope) is not wired; the lowering pass
+        // Phase D-3 (record scope) is not wired; the lowering pass
         // surfaces E162 so a pipeline using it fails compile loudly.
         let yaml = r#"
 pipeline:
@@ -1893,6 +1893,51 @@ nodes:
             err_diags.iter().any(|d| d.code == "E162"),
             "expected E162 diagnostic, got: {:?}",
             err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_state_node_source_scope_lowers_to_plan_node() {
+        // Phase D-2: a runtime-phase source-scope state node compiles
+        // end-to-end and lowers to `PlanNode::State` (no E162). The
+        // executor's State arm dispatches to `set_source_var()` keyed
+        // by the per-record `source_file` Arc.
+        let yaml = r#"
+pipeline:
+  name: state_source_scope_smoke
+  vars:
+    source:
+      origin_label: { type: string }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: id, type: string }
+  - type: state
+    name: tag_origin
+    input: orders
+    config:
+      scope: source
+      set:
+        - var: origin_label
+          cxl: "\"orders\""
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let plan = cfg
+            .compile(&ctx)
+            .expect("source-scope state should compile");
+        let dag = plan.dag();
+        assert!(
+            dag.graph.node_indices().any(|idx| matches!(
+                &dag.graph[idx],
+                crate::plan::execution::PlanNode::State { .. }
+            )),
+            "expected PlanNode::State in lowered DAG"
         );
     }
 }

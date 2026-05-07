@@ -21,6 +21,18 @@ use indexmap::IndexMap;
 /// to the surrounding CXL eval; revisit if a profile says otherwise.
 pub type PipelineVarStore = Arc<RwLock<IndexMap<String, Value>>>;
 
+/// Shared, lock-protected store for `$source.<key>` runtime values,
+/// keyed by per-record `source_file` `Arc<str>`.
+///
+/// Source-scope is "stays constant for all records of one source" —
+/// for single-file Sources this is one slot; for multi-file Sources
+/// (`glob:` / `paths:`) each file gets its own slot, which is a
+/// tighter (safer) semantics than per-Source-node-name. Phase D-2
+/// adopts this Arc-keyed design because it composes cleanly with the
+/// executor's existing per-record `source_file` threading without
+/// introducing a path → source-node-name mapping.
+pub type SourceVarStore = Arc<RwLock<std::collections::HashMap<Arc<str>, IndexMap<String, Value>>>>;
+
 /// Injectable clock for testability. Production uses WallClock; tests use FixedClock.
 pub trait Clock: Send + Sync {
     fn now(&self) -> NaiveDateTime;
@@ -72,6 +84,11 @@ pub struct StableEvalContext {
     /// defaults plus any runtime writes from `state` nodes (Phase D).
     /// See [`PipelineVarStore`] for locking rationale.
     pub pipeline_vars: PipelineVarStore,
+    /// source.vars.<key> — per-source-file user-declared variables,
+    /// written by `state` nodes with `scope: source` (Phase D-2). The
+    /// outer `HashMap` keys by per-record `source_file` Arc; the inner
+    /// `IndexMap` mirrors the [`PipelineVarStore`] shape.
+    pub source_vars: SourceVarStore,
 }
 
 impl StableEvalContext {
@@ -110,6 +127,30 @@ impl StableEvalContext {
         }
     }
 
+    /// Resolve a `$source.<key>` user-declared value for the given
+    /// `source_file` Arc. Returns `None` if no `state` node has yet
+    /// written to that scope, or if the file has no entry at all
+    /// (lazy-allocated). Builtin `$source.*` members are handled by
+    /// [`EvalContext::resolve_source`]; this helper covers user-declared
+    /// keys only.
+    pub fn resolve_source_var(&self, source_file: &Arc<str>, member: &str) -> Option<Value> {
+        let map = self.source_vars.read().ok()?;
+        map.get(source_file)
+            .and_then(|inner| inner.get(member).cloned())
+    }
+
+    /// Write a `$source.<key>` value into the source-scope runtime
+    /// registry, keyed by the record's `source_file` Arc. Called by
+    /// the executor's `state` node arm (Phase D-2). Lazily allocates
+    /// the per-file inner map on first write.
+    pub fn set_source_var(&self, source_file: &Arc<str>, name: &str, value: Value) {
+        if let Ok(mut map) = self.source_vars.write() {
+            map.entry(Arc::clone(source_file))
+                .or_default()
+                .insert(name.to_string(), value);
+        }
+    }
+
     /// Create a minimal stable context for testing.
     pub fn test_default() -> Self {
         Self {
@@ -128,6 +169,7 @@ impl StableEvalContext {
             pipeline_batch_id: Arc::from("test-batch-000"),
             pipeline_counters: PipelineCounters::default(),
             pipeline_vars: Arc::new(RwLock::new(IndexMap::new())),
+            source_vars: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -165,6 +207,9 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Resolve a `$source.*` member — per-record / per-source provenance.
+    /// Falls through to the user-declared source-scope registry
+    /// (`$source.<custom>`) keyed by this record's `source_file` Arc
+    /// when the member name is not a builtin.
     pub fn resolve_source(&self, member: &str) -> Option<Value> {
         match member {
             "file" => Some(Value::String(self.source_file.to_string().into())),
@@ -173,7 +218,7 @@ impl<'a> EvalContext<'a> {
             "count" => Some(Value::Integer(self.source_count as i64)),
             "batch" => Some(Value::String(self.source_batch.to_string().into())),
             "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
-            _ => None,
+            other => self.stable.resolve_source_var(self.source_file, other),
         }
     }
 
