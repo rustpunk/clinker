@@ -113,6 +113,11 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
+            // Arrays remain best-effort empty for now (matches the
+            // CSV writer's `serde_json::to_string(arr)` behavior in
+            // shape — no canonical scalar serialization). `Map` is
+            // pre-rejected in `write_record`, so this match arm is
+            // unreachable for maps.
             Value::Array(_) | Value::Map(_) => String::new(),
         }
     }
@@ -147,6 +152,22 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         for field in &self.fields {
             let value = record.get(&field.name).cloned().unwrap_or(Value::Null);
+
+            // Reject `Value::Map` payloads explicitly. Fixed-width has
+            // no canonical scalar serialization for a map (the
+            // pre-existing `format_value` returned `String::new()`
+            // silently, dropping the payload); raising here surfaces
+            // the misroute. If the column is the `$widened`
+            // `auto_widen` sidecar, the user must opt into
+            // `include_widened: true` at the Output node so the
+            // projection layer expands the map to top-level
+            // declared columns before write.
+            if matches!(value, Value::Map(_)) {
+                return Err(FormatError::UnserializableMapValue {
+                    format: "fixed-width",
+                    column: field.name.to_string(),
+                });
+            }
 
             let formatted = self.format_value(field, &value);
 
@@ -443,5 +464,39 @@ mod tests {
         let roundtrip = reader.next_record().unwrap().unwrap();
         assert_eq!(roundtrip.get("id"), Some(&Value::Integer(42)));
         assert_eq!(roundtrip.get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    /// Fixed-width writer rejects `Value::Map` payloads with
+    /// `FormatError::UnserializableMapValue`. The previous behavior
+    /// silently emitted an empty fixed-width field for any map
+    /// in `format_value`; the explicit precheck in `write_record`
+    /// surfaces the misroute (typically a `$widened` sidecar
+    /// reaching the writer without `include_widened: true`
+    /// expansion).
+    #[test]
+    fn test_fixed_width_writer_rejects_map_value() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
+        let mut sidecar: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+        );
+        let mut id_field = field("id");
+        id_field.width = Some(5);
+        let mut payload_field = field("payload");
+        payload_field.width = Some(10);
+        let fields = vec![id_field, payload_field];
+        let mut buf = Vec::new();
+        let mut writer =
+            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "fixed-width");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
     }
 }

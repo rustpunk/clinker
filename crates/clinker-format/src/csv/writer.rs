@@ -83,17 +83,30 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             self.header_written = true;
         }
 
-        let fields: Vec<String> = if self.config.include_engine_stamped {
-            record
-                .iter_all_fields()
-                .map(|(_, v)| value_to_csv_cell(v))
-                .collect()
-        } else {
-            record
-                .iter_user_fields()
-                .map(|(_, v)| value_to_csv_cell(v))
-                .collect()
-        };
+        // Pre-walk: reject `Value::Map` payloads explicitly. CSV has
+        // no canonical scalar serialization for a map; silently
+        // JSON-encoding the map into a single cell hides routing
+        // bugs (e.g. a `$widened` sidecar reaching the writer
+        // without the projection layer's `include_widened: true`
+        // expansion). Raise `UnserializableMapValue` so the user
+        // sees the misroute and can pick a remediation path
+        // (the error's Display lists the supported escape hatches).
+        let iter: Box<dyn Iterator<Item = (&str, &clinker_record::Value)>> =
+            if self.config.include_engine_stamped {
+                Box::new(record.iter_all_fields())
+            } else {
+                Box::new(record.iter_user_fields())
+            };
+        let mut fields: Vec<String> = Vec::with_capacity(record.field_count());
+        for (col, v) in iter {
+            if matches!(v, clinker_record::Value::Map(_)) {
+                return Err(FormatError::UnserializableMapValue {
+                    format: "CSV",
+                    column: col.to_string(),
+                });
+            }
+            fields.push(value_to_csv_cell(v));
+        }
 
         self.inner.write_record(&fields)?;
         Ok(())
@@ -397,6 +410,35 @@ mod tests {
             for col in schema.columns() {
                 assert_eq!(r1.get(col), r2.get(col), "mismatch on column {col}");
             }
+        }
+    }
+
+    /// CSV writer rejects `Value::Map` payloads with
+    /// `FormatError::UnserializableMapValue`. The pre-walk in
+    /// `write_record` catches the misroute (e.g. a `$widened`
+    /// sidecar reaching the writer without `include_widened: true`
+    /// expansion) before the value-to-cell function silently
+    /// JSON-encodes the map into a single CSV cell.
+    #[test]
+    fn test_csv_writer_rejects_map_value() {
+        use indexmap::IndexMap;
+        let schema = make_schema(&["id", "payload"]);
+        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        sidecar.insert("b".into(), Value::String("two".into()));
+        let record = make_record(
+            &schema,
+            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+        );
+        let mut buf = Vec::new();
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
     }
 }

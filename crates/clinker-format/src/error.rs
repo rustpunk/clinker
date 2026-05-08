@@ -24,6 +24,27 @@ pub enum FormatError {
         source: String,
         field: String,
     },
+    /// A non-JSON writer (CSV / XML / fixed-width) was handed a record
+    /// carrying a `Value::Map` payload at a regular column slot.
+    /// JSON writers serialize maps natively; the other formats have
+    /// no canonical scalar serialization for a map and would silently
+    /// either JSON-encode the map into a single cell (CSV/XML) or
+    /// emit an empty field (fixed-width) — neither is the user's
+    /// intent. Raise explicitly so the user sees the misroute.
+    ///
+    /// Routes to fix this at the user level:
+    ///
+    /// - If the column is the `$widened` `auto_widen` sidecar
+    ///   absorber, set `include_widened: true` on the Output node;
+    ///   the projection layer expands the map to top-level columns
+    ///   before the record reaches the writer.
+    /// - If the user explicitly emitted a map (rare), call a CXL
+    ///   coercion that produces a scalar (`to_string` / equivalent)
+    ///   before the emit.
+    UnserializableMapValue {
+        format: &'static str,
+        column: String,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -42,6 +63,13 @@ impl fmt::Display for FormatError {
                 f,
                 "source {source:?}: input record carries undeclared field {field:?} \
                  (set `on_unmapped: drop` to silently strip, or declare the field)"
+            ),
+            Self::UnserializableMapValue { format, column } => write!(
+                f,
+                "{format} writer cannot serialize a `Value::Map` payload at column {column:?}. \
+                 If this is the `$widened` auto_widen sidecar, set `include_widened: true` on \
+                 the Output node to expand the map to top-level columns before write. If the \
+                 user emitted a map explicitly, coerce to a scalar in CXL before the emit."
             ),
         }
     }

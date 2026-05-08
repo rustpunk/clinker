@@ -18,6 +18,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true }
+indexmap = { workspace = true }
 
 [[bench]]
 name = "io_throughput"

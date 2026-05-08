@@ -76,6 +76,23 @@ impl<W: Write> XmlWriter<W> {
             record.iter_user_fields().collect()
         };
 
+        // Reject `Value::Map` payloads explicitly. XML has no
+        // canonical scalar serialization for a map; silently
+        // JSON-encoding it inside an element would hide routing bugs
+        // (e.g. a `$widened` sidecar reaching the writer without the
+        // projection layer's `include_widened: true` expansion).
+        // `build_field_tree` likewise has no nested-Map representation —
+        // it expects `(&str, &Value)` leaves whose `Value` serializes
+        // to a string via `value_to_text`.
+        for (col, v) in &fields {
+            if matches!(v, Value::Map(_)) {
+                return Err(FormatError::UnserializableMapValue {
+                    format: "XML",
+                    column: (*col).to_string(),
+                });
+            }
+        }
+
         let tree = build_field_tree(&fields, self.config.preserve_nulls);
         self.write_field_tree(&tree)?;
 
@@ -420,5 +437,31 @@ mod tests {
         assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(r1.get("value"), Some(&Value::Integer(42)));
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
+    }
+
+    /// XML writer rejects `Value::Map` payloads with
+    /// `FormatError::UnserializableMapValue`. The pre-walk in
+    /// `write_fields` catches the misroute before the value-to-text
+    /// function silently JSON-encodes the map inside an element.
+    #[test]
+    fn test_xml_writer_rejects_map_value() {
+        use indexmap::IndexMap;
+        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
+        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+        );
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "XML");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
     }
 }
