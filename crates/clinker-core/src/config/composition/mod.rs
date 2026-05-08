@@ -142,7 +142,7 @@ pub struct CompositionSignature {
     ///
     /// Mirrors the YAML shape of `PipelineMeta.vars` (per-scope name →
     /// type maps) but without defaults — the body always inherits the
-    /// runtime value the parent's state nodes wrote (or the parent's
+    /// runtime value parent producer Transforms wrote (or the parent's
     /// declaration default).
     pub scoped_vars_schema: ScopedVarsSchema,
     /// Absolute path to the `.comp.yaml` file that produced this signature.

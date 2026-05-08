@@ -220,29 +220,22 @@ pub fn bind_schema(
     artifacts
 }
 
-/// Compile-time check: an `phase: init` state node may not read
-/// scoped variables that are written ONLY by `phase: runtime` state
-/// nodes. The init sub-DAG runs to completion before any runtime
-/// node executes, so the read would silently observe the
-/// declaration default — exactly the "invisible default" hazard the
-/// plan called out as validation #5.
+/// Compile-time check: a `phase: init` Transform may not read
+/// scoped variables that are written ONLY by `phase: runtime`
+/// Transforms. The init sub-DAG runs to completion before any
+/// runtime node executes, so the read would silently observe the
+/// declaration default — the "invisible default" hazard.
 ///
-/// Reads of vars written by other init-phase state nodes are fine
+/// Reads of vars written by other init-phase Transforms are fine
 /// (init runs as one unit). Reads of vars with no writer are fine
 /// (declaration default is the intended value). Only the
 /// init-reads-runtime-only case is flagged.
 ///
 /// Reuses `validate_producer_writers`'s writer-map shape and
 /// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
-/// Iterate every (scope, var) writer in the pipeline, regardless of
-/// the writer's variant kind (State node `set:` entry or Transform
-/// `config.declares:` entry). Used by every plan validator that
-/// keys off the producer registry.
-///
-/// During the redesign transition, both kinds coexist: legacy State
-/// nodes still write via dispatch, and new Transforms write via
-/// inline `emit $<scope>.<key>` routing. Stage 5 deletes State, after
-/// which only the Transform branch remains.
+/// Iterate every (scope, var) writer in the pipeline. Each writer is
+/// a Transform with one or more `config.declares:` entries; one
+/// `WriterInfo` is emitted per (Transform, declare-entry) pair.
 struct WriterInfo<'a> {
     scope: crate::config::VarScope,
     var: &'a str,
@@ -278,7 +271,7 @@ fn validate_init_phase_isolation(
     use crate::config::{Phase as ConfPhase, VarScope};
 
     // Build (scope, var) → (writer-name, writer-phase) map from every
-    // declared writer regardless of variant kind.
+    // declared writer.
     let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
         std::collections::HashMap::new();
     for w in iter_writers(nodes) {
@@ -291,9 +284,8 @@ fn validate_init_phase_isolation(
     }
 
     // Collect (reader_name, read_span, typed_keys) for every init-phase
-    // writer regardless of variant kind. State nodes use per-assignment
-    // synthetic keys (`{name}::{var}`); Transforms use the bare node
-    // name (one CXL block per node).
+    // writer. Each Transform contributes one entry whose typed_keys
+    // is its bare node name (one CXL block per node).
     type ReaderEntry<'a> = (&'a str, Span, Vec<String>);
     let mut readers: Vec<ReaderEntry<'_>> = Vec::new();
     for spanned in nodes {
@@ -476,8 +468,8 @@ fn validate_post_merge_source_reads(
                              access is ambiguous (each record carries its own source's value, \
                              but cross-source comparison requires explicit per-input \
                              qualification). Project the value into a record field before \
-                             merging, or write a per-input value via a state node placed \
-                             upstream of the merge."
+                             merging, or write a per-input value via a Transform with \
+                             `declares:` placed upstream of the merge."
                         ),
                         LabeledSpan::primary(span, "post-merge reader".to_string()),
                     )
@@ -506,17 +498,17 @@ fn is_builtin_source_member(field: &str) -> bool {
 /// the written value — exactly the "hidden DAG edge" anti-pattern
 /// Airflow Variables and Talend `globalMap` are infamous for.
 ///
-/// Self-reads (a state node referencing the same variable it writes)
+/// Self-reads (a Transform referencing the same variable it writes)
 /// are allowed: the read evaluates BEFORE the write within a single
 /// record's processing, observing the previous value.
 ///
 /// Reads of `(scope, key)` pairs declared in `vars:` but never written
-/// by any state node are NOT flagged here — those are valid reads of
+/// by any Transform are NOT flagged here — those are valid reads of
 /// the declaration default. Reads that aren't declared at all are
 /// already rejected by the resolver in Phase B / C-1.
 ///
 /// Emits E171 with primary span on the offending CXL reference and a
-/// secondary span on the writer state node.
+/// secondary span on the writer Transform.
 fn validate_read_after_write(
     nodes: &[Spanned<PipelineNode>],
     artifacts: &CompileArtifacts,
@@ -606,12 +598,12 @@ fn validate_read_after_write(
             for stmt in &typed.program.statements {
                 collect_scope_reads_in_statement(stmt, &mut reads);
             }
-            // Determine the reader's phase — runtime nodes that aren't
-            // state nodes are runtime by definition; state-node readers
-            // use their own `phase`. Init readers' visibility into
-            // init-only writers depends on DAG ancestry within the init
-            // pass; runtime readers see init writers regardless of
-            // topology because init completes first.
+            // Determine the reader's phase — Transforms carry their
+            // own `phase`; every other node kind is runtime by
+            // definition. Init readers' visibility into init-only
+            // writers depends on DAG ancestry within the init pass;
+            // runtime readers see init writers regardless of topology
+            // because init completes first.
             let reader_phase = match &spanned.value {
                 PipelineNode::Transform { config, .. } => config.phase,
                 _ => ConfPhase::Runtime,
@@ -621,7 +613,7 @@ fn validate_read_after_write(
                 else {
                     continue;
                 };
-                // Self-read inside the writing state node is fine.
+                // Self-read inside the writing Transform is fine.
                 if writer_name == reader_name {
                     continue;
                 }
@@ -661,7 +653,7 @@ fn validate_read_after_write(
                             "E171",
                             format!(
                                 "node {reader_name:?} reads {scope_str}.{var} but is not a DAG \
-                                 descendant of writer state node {writer_name:?} — the read \
+                                 descendant of writer Transform {writer_name:?} — the read \
                                  would observe the declaration default, not the written value \
                                  (move the reader downstream of the writer or remove the read)"
                             ),
@@ -669,7 +661,7 @@ fn validate_read_after_write(
                         )
                         .with_secondary(LabeledSpan::new(
                             writer_span,
-                            Some("writer state node".to_string()),
+                            Some("writer Transform".to_string()),
                         )),
                     );
                 }
@@ -977,11 +969,11 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
     }
 }
 
-/// Compile-time check: at most one state node writes any given
-/// `(scope, var)` pair. Multiple writers produce non-deterministic
-/// last-write-wins behavior — the locked-decision design forbids it
-/// and demands the user collapse the writes into a single state node
-/// (Hop / Talend canonical anti-pattern).
+/// Compile-time check: at most one Transform writes any given
+/// `(scope, var)` pair via `declares:`. Multiple writers produce
+/// non-deterministic last-write-wins behavior — the locked-decision
+/// design forbids it and demands the user collapse the writes into a
+/// single Transform (Hop / Talend canonical anti-pattern).
 ///
 /// Init-phase and runtime-phase writers are tracked together; a
 /// converging-init writer is architecturally distinct from a

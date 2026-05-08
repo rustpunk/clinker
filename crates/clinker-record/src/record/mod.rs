@@ -32,8 +32,9 @@ pub struct Record {
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
     /// Per-record user-declared `$record.<key>` scoped variables.
-    /// Written by state nodes with `scope: record`. Lazy-initialized
-    /// on first `set_record_var()` call.
+    /// Written by Transforms whose `declares:` entries have
+    /// `scope: record`. Lazy-initialized on first `set_record_var()`
+    /// call.
     record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
 }
 
@@ -209,7 +210,8 @@ impl Record {
     ///
     /// Distinct from `get_meta`: `$record.<key>` keys live in their
     /// own 64-key budget (independent of `$meta.*`) and are written
-    /// only by state nodes with `scope: record`.
+    /// only by Transforms whose `declares:` entries have
+    /// `scope: record`.
     pub fn get_record_var(&self, key: &str) -> Option<&Value> {
         self.record_vars.as_ref().and_then(|m| m.get(key))
     }
@@ -311,7 +313,8 @@ impl FieldResolver for Record {
         }
         // Handle $record.<key>: resolve from the dedicated record-vars
         // channel (independent 64-key budget, distinct from `$meta.*`).
-        // state nodes with `scope: record` write here.
+        // Transforms whose `declares:` entries have `scope: record`
+        // write here.
         if let Some(record_var) = name.strip_prefix("$record.") {
             return self.get_record_var(record_var);
         }

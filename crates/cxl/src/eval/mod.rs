@@ -461,9 +461,9 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         Expr::QualifiedSourceAccess {
             input_name, field, ..
         } => {
-            // `$source.<input_name>.<field>` looks up the
-            // value the state node wrote for records flowing through
-            // upstream Source `<input_name>`. The plan-time
+            // `$source.<input_name>.<field>` looks up the value an
+            // upstream Transform writer set for records flowing
+            // through Source `<input_name>`. The plan-time
             // `source_input_arcs` map (built by clinker-core's
             // `build_stable_eval_context`) gives the source-file Arcs
             // for each input name; we scan them and return the first

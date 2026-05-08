@@ -1310,22 +1310,14 @@ impl PipelineExecutor {
         }
 
         // ── Pre-load init-phase Sources ─────────────
-        // Init-phase state nodes' ancestors include Sources. Those
+        // Init-phase Transforms' ancestors include Sources. Those
         // Sources need their records materialized before the
         // two-pass walk runs, because the Source dispatcher arm
         // reads from `preloaded_source_records` (or `all_records` for
         // the primary). A standalone init Source isn't a combine
         // input and isn't the primary, so without this pre-load it
-        // would have nothing to feed the init-phase Aggregate / Map
-        // / state node downstream.
-        //
-        // The map is reused (not renamed) for now — the loaded
-        // records share the same per-name keying and the same
-        // dispatcher consumption path that combine inputs use.
-        // Eventually this map should rename to
-        // `preloaded_source_records` to reflect its broader role,
-        // but the rename touches every dispatcher site and is held
-        // for a follow-up cleanup commit.
+        // would have nothing to feed the init-phase Aggregate /
+        // Transform downstream.
         let init_source_names: Vec<String> = {
             let init_set = crate::executor::compute_init_phase_node_set(plan);
             init_set
@@ -1572,16 +1564,16 @@ impl PipelineExecutor {
         //
         // two-pass walk for init-phase orchestration.
         // Pass 1 dispatches every node in the init-phase ancestor
-        // closure (Source/Aggregate/etc. feeding `phase: init` state
-        // nodes, plus the state nodes themselves). Pass 2 dispatches
-        // every other node — the runtime DAG. Init state nodes are
-        // E164-validated as terminal, so Pass 2 never references
-        // their output edge. The dispatcher's `remaining_consumers`
-        // heuristic counts neighbors based on graph structure
-        // (pass-independent), so a Source feeding both an init
-        // branch and a runtime branch correctly clones its buffer
-        // for Pass 1's first consumer and removes it for Pass 2's
-        // last consumer.
+        // closure (Source/Aggregate/etc. feeding `phase: init`
+        // Transforms, plus the init-phase Transforms themselves).
+        // Pass 2 dispatches every other node — the runtime DAG.
+        // Init-phase Transforms are E164-validated as terminal, so
+        // Pass 2 never references their output edge. The
+        // dispatcher's `remaining_consumers` heuristic counts
+        // neighbors based on graph structure (pass-independent), so
+        // a Source feeding both an init branch and a runtime branch
+        // correctly clones its buffer for Pass 1's first consumer
+        // and removes it for Pass 2's last consumer.
         let init_phase_set = compute_init_phase_node_set(plan);
         if !init_phase_set.is_empty() {
             for node_idx in plan.topo_order.clone() {
@@ -2294,17 +2286,18 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
 /// dispatch site, killing the prior `String::clone` + `IndexMap::clone`
 /// Compute the init-phase ancestor closure for a compiled plan.
 ///
-/// Walks every `PlanNode::State` whose payload phase is
+/// Walks every `PlanNode::Transform` whose payload phase is
 /// [`crate::config::Phase::Init`] and unions their transitive
 /// upstream ancestors via reverse-BFS along the graph's incoming
-/// edges. The state nodes themselves are included.
+/// edges. The init-phase transforms themselves are included.
 ///
-/// Returns an empty set when no init-phase state nodes exist — the
+/// Returns an empty set when no init-phase transforms exist — the
 /// caller then falls through to a single-pass topo walk.
 ///
-/// E164 validation guarantees init state nodes are terminal (no
-/// runtime descendants), so the closure forms a well-bounded init
-/// sub-DAG that Pass 1 can run to completion before Pass 2 starts.
+/// E164 validation guarantees init-phase Transforms are terminal
+/// (no runtime descendants), so the closure forms a well-bounded
+/// init sub-DAG that Pass 1 can run to completion before Pass 2
+/// starts.
 fn compute_init_phase_node_set(
     plan: &crate::plan::execution::ExecutionPlanDag,
 ) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
@@ -2377,14 +2370,14 @@ fn build_static_vars(config: &PipelineConfig) -> IndexMap<String, Value> {
 /// the source-file `Arc<str>`s of the upstream `Source` node(s) it
 /// transitively reads from. Used by `Expr::QualifiedSourceAccess` eval
 /// to look up `source_vars` entries written by upstream source-scope
-/// state nodes (qualified post-merge `$source.<input>.<key>` reads).
+/// Transform writers (qualified post-merge `$source.<input>.<key>` reads).
 ///
 /// For Merge, each entry in `inputs:` becomes its own input name (the
 /// referenced node name itself, since Merge does not rename). For
 /// Combine, the IndexMap key is the input name. Walk-back follows the
-/// consumer-side `input:` field through Transform/Aggregate/Route/State
-/// nodes until a Source is reached; nested Merges fan out, collecting
-/// every reachable Source's path Arc.
+/// consumer-side `input:` field through Transform/Aggregate/Route nodes
+/// until a Source is reached; nested Merges fan out, collecting every
+/// reachable Source's path Arc.
 fn compute_source_input_arcs(
     config: &PipelineConfig,
 ) -> std::collections::HashMap<String, Vec<Arc<str>>> {

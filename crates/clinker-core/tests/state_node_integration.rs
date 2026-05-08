@@ -1,9 +1,10 @@
-//! End-to-end integration tests for scoped variables and the
-//! `state` node. Each test drives a complete pipeline (parse → compile
-//! → execute) and asserts on the emitted CSV. Side effects of the
-//! state node are observable only through downstream readers, so each
-//! fixture pairs a state-node writer with a reader transform that
-//! emits the variable value as a column.
+//! End-to-end integration tests for scoped variables. Each test
+//! drives a complete pipeline (parse → compile → execute) and
+//! asserts on the emitted CSV. Producer Transforms write scoped
+//! variables via `declares:`; their effects are observable only
+//! through downstream readers, so each fixture pairs a producer
+//! Transform with a reader Transform that emits the variable value
+//! as a column.
 
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
@@ -554,8 +555,9 @@ nodes:
 fn state_source_scope_per_file_isolation() {
     // Source-scope vars are keyed by the per-record `source_file`
     // `Arc<str>`. A glob-fed Source produces records whose Arcs swap
-    // at each file boundary; the state node writes the var into the
-    // per-file slot, and downstream reads see the per-file value.
+    // at each file boundary; the producer Transform writes the var
+    // into the per-file slot, and downstream reads see the per-file
+    // value.
     use clinker_core::source::multi_file::FileSlot;
     use std::path::PathBuf;
 

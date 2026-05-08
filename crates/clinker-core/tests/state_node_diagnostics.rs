@@ -1,10 +1,10 @@
-//! Insta snapshot tests for the scoped-variable / state-node
-//! diagnostics. Each test compiles a fixture YAML that triggers a
-//! specific E-code and snapshots the rendered output, so future
-//! changes that shift the wording or span trip the snapshot diff.
+//! Insta snapshot tests for the scoped-variable diagnostics. Each
+//! test compiles a fixture YAML that triggers a specific E-code and
+//! snapshots the rendered output, so future changes that shift the
+//! wording or span trip the snapshot diff.
 //!
 //! Diagnostics covered:
-//!   * E164 — init-phase state node has a runtime descendant
+//!   * E164 — init-phase Transform has a runtime descendant
 //!   * E170 — multiple writers for the same scoped variable
 //!   * E171 — runtime reader is not a transitive descendant of writer
 //!   * E172 — bare `$source.<custom>` read downstream of Merge/Combine
