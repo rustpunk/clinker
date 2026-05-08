@@ -304,18 +304,36 @@ fn validate_init_phase_isolation(
         return;
     }
 
+    // Collect (reader_name, read_span, typed_keys) for every init-phase
+    // writer regardless of variant kind. State nodes use per-assignment
+    // synthetic keys (`{name}::{var}`); Transforms use the bare node
+    // name (one CXL block per node).
+    type ReaderEntry<'a> = (&'a str, Span, Vec<String>);
+    let mut readers: Vec<ReaderEntry<'_>> = Vec::new();
     for spanned in nodes {
-        let PipelineNode::State { header, config } = &spanned.value else {
-            continue;
-        };
-        if config.phase != ConfPhase::Init {
-            continue;
+        match &spanned.value {
+            PipelineNode::State { header, config } if config.phase == ConfPhase::Init => {
+                let keys: Vec<String> = config
+                    .set
+                    .iter()
+                    .map(|a| format!("{}::{}", header.name, a.var))
+                    .collect();
+                readers.push((header.name.as_str(), span_for_node(spanned), keys));
+            }
+            PipelineNode::Transform { header, config } if config.phase == ConfPhase::Init => {
+                readers.push((
+                    header.name.as_str(),
+                    span_for_node(spanned),
+                    vec![header.name.clone()],
+                ));
+            }
+            _ => {}
         }
-        let reader_name = header.name.as_str();
-        let read_span = span_for_node(spanned);
-        for assignment in &config.set {
-            let assignment_key = format!("{reader_name}::{}", assignment.var);
-            let Some(typed) = artifacts.typed.get(&assignment_key) else {
+    }
+
+    for (reader_name, read_span, typed_keys) in readers {
+        for typed_key in &typed_keys {
+            let Some(typed) = artifacts.typed.get(typed_key) else {
                 continue;
             };
             let mut reads: Vec<(VarScope, String)> = Vec::new();
@@ -347,8 +365,8 @@ fn validate_init_phase_isolation(
                     Diagnostic::error(
                         "E175",
                         format!(
-                            "init-phase state node {reader_name:?} reads {scope_str}.{var} \
-                             which is only written by runtime-phase state node \
+                            "init-phase node {reader_name:?} reads {scope_str}.{var} \
+                             which is only written by runtime-phase node \
                              {writer_name:?} — init runs to completion before runtime, so \
                              the read would silently observe the declaration default. \
                              Move the writer to `phase: init` or remove the read."
@@ -630,6 +648,7 @@ fn validate_read_after_write(
             // topology because init completes first.
             let reader_phase = match &spanned.value {
                 PipelineNode::State { config, .. } => config.phase,
+                PipelineNode::Transform { config, .. } => config.phase,
                 _ => ConfPhase::Runtime,
             };
             for (scope, var) in reads {
