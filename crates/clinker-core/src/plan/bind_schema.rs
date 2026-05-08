@@ -255,30 +255,16 @@ fn iter_writers<'a>(nodes: &'a [Spanned<PipelineNode>]) -> Vec<WriterInfo<'a>> {
     let mut out = Vec::new();
     for spanned in nodes {
         let span = span_for_node(spanned);
-        match &spanned.value {
-            PipelineNode::State { header, config } => {
-                for assignment in &config.set {
-                    out.push(WriterInfo {
-                        scope: config.scope,
-                        var: &assignment.var,
-                        node_name: &header.name,
-                        span,
-                        phase: config.phase,
-                    });
-                }
+        if let PipelineNode::Transform { header, config } = &spanned.value {
+            for entry in &config.declares {
+                out.push(WriterInfo {
+                    scope: entry.scope,
+                    var: &entry.name,
+                    node_name: &header.name,
+                    span,
+                    phase: config.phase,
+                });
             }
-            PipelineNode::Transform { header, config } => {
-                for entry in &config.declares {
-                    out.push(WriterInfo {
-                        scope: entry.scope,
-                        var: &entry.name,
-                        node_name: &header.name,
-                        span,
-                        phase: config.phase,
-                    });
-                }
-            }
-            _ => {}
         }
     }
     out
@@ -312,14 +298,6 @@ fn validate_init_phase_isolation(
     let mut readers: Vec<ReaderEntry<'_>> = Vec::new();
     for spanned in nodes {
         match &spanned.value {
-            PipelineNode::State { header, config } if config.phase == ConfPhase::Init => {
-                let keys: Vec<String> = config
-                    .set
-                    .iter()
-                    .map(|a| format!("{}::{}", header.name, a.var))
-                    .collect();
-                readers.push((header.name.as_str(), span_for_node(spanned), keys));
-            }
             PipelineNode::Transform { header, config } if config.phase == ConfPhase::Init => {
                 readers.push((
                     header.name.as_str(),
@@ -420,7 +398,6 @@ fn validate_post_merge_source_reads(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
                 .into_iter()
                 .map(String::from)
@@ -470,11 +447,6 @@ fn validate_post_merge_source_reads(
             | PipelineNode::Combine { .. } => {
                 if artifacts.typed.contains_key(&reader_name) {
                     typed_keys.push(reader_name.clone());
-                }
-            }
-            PipelineNode::State { config, .. } => {
-                for assignment in &config.set {
-                    typed_keys.push(format!("{reader_name}::{}", assignment.var));
                 }
             }
             _ => {}
@@ -583,7 +555,6 @@ fn validate_read_after_write(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
                 .into_iter()
                 .map(String::from)
@@ -624,11 +595,6 @@ fn validate_read_after_write(
                     typed_keys.push(reader_name.clone());
                 }
             }
-            PipelineNode::State { config, .. } => {
-                for assignment in &config.set {
-                    typed_keys.push(format!("{reader_name}::{}", assignment.var));
-                }
-            }
             _ => {}
         }
         let span = span_for_node(spanned);
@@ -647,7 +613,6 @@ fn validate_read_after_write(
             // pass; runtime readers see init writers regardless of
             // topology because init completes first.
             let reader_phase = match &spanned.value {
-                PipelineNode::State { config, .. } => config.phase,
                 PipelineNode::Transform { config, .. } => config.phase,
                 _ => ConfPhase::Runtime,
             };
@@ -934,11 +899,6 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
     let init_node_names: HashSet<&str> = nodes
         .iter()
         .filter_map(|spanned| match &spanned.value {
-            PipelineNode::State { header, config }
-                if config.phase == crate::config::Phase::Init =>
-            {
-                Some(header.name.as_str())
-            }
             PipelineNode::Transform { header, config }
                 if config.phase == crate::config::Phase::Init =>
             {
@@ -961,7 +921,6 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => {
                 vec![upstream_target_name(&header.input.value).unwrap_or("")]
             }
@@ -982,7 +941,6 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
         // two-pass walk handles them as part of the init sub-DAG.
         // Only runtime descendants are forbidden.
         let consumer_is_init = match &spanned.value {
-            PipelineNode::State { config, .. } => config.phase == crate::config::Phase::Init,
             PipelineNode::Transform { config, .. } => config.phase == crate::config::Phase::Init,
             _ => false,
         };
@@ -1257,48 +1215,6 @@ fn bind_schema_inner(
                     artifacts
                         .typed
                         .insert(name, Arc::new(synthetic_typed_program(row)));
-                }
-            }
-            PipelineNode::State { header, config } => {
-                // State is a pass-through for records — its output row
-                // equals its upstream row. We also typecheck each
-                // assignment's CXL expression against the upstream
-                // schema and store the typed program under a synthetic
-                // `<node_name>::<var>` key so the lowering pass can
-                // collect them into `PlanStatePayload.assignments`.
-                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
-                    let row = upstream.clone();
-                    schema_by_name.insert(name.clone(), row.clone());
-                    artifacts
-                        .typed
-                        .insert(name.clone(), Arc::new(synthetic_typed_program(row.clone())));
-
-                    for assignment in &config.set {
-                        let assignment_name = format!("{name}::{}", assignment.var);
-                        // Wrap the assignment expression as an emit so
-                        // the CXL parser accepts it (bare expressions
-                        // aren't valid Programs). The emit-field name
-                        // is synthetic — the executor's State arm
-                        // pulls the first (and only) emitted value out
-                        // of the eval result and writes it under the
-                        // assignment's `var:` key in the runtime
-                        // registry.
-                        let wrapped = format!("emit __state_value = {}", assignment.cxl.source);
-                        match typecheck_cxl(
-                            &assignment_name,
-                            &wrapped,
-                            &row,
-                            AggregateMode::Row,
-                            span,
-                            &bind_ctx.scoped_vars,
-                        ) {
-                            Ok(mut typed) => {
-                                typed.output_row = row.clone();
-                                artifacts.typed.insert(assignment_name, Arc::new(typed));
-                            }
-                            Err(d) => diags.push(d),
-                        }
-                    }
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
@@ -1693,8 +1609,7 @@ fn bind_composition(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. } => {
+            | PipelineNode::Output { header, .. } => {
                 let r = match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {
@@ -1805,8 +1720,7 @@ fn bind_composition(
             | PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. } => {
+            | PipelineNode::Output { header, .. } => {
                 vec![match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {

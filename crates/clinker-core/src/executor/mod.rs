@@ -2316,9 +2316,6 @@ fn compute_init_phase_node_set(
         .graph
         .node_indices()
         .filter(|&idx| match &plan.graph[idx] {
-            PlanNode::State {
-                resolved: Some(p), ..
-            } => p.phase == ConfPhase::Init,
             PlanNode::Transform {
                 resolved: Some(p), ..
             } => p.phase == ConfPhase::Init,

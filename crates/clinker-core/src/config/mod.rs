@@ -13,7 +13,7 @@ pub use composition::{
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
     AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, Phase, PipelineNode, RouteBody,
-    SourceBody, StateAssignment, StateBody, TransformBody, VarScope,
+    SourceBody, TransformBody, VarScope,
 };
 
 use crate::yaml::Spanned;
@@ -1603,7 +1603,6 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
-                | PipelineNode::State { header, .. }
                 | PipelineNode::Composition { header, .. } => {
                     if input_target(&header.input.value) == name {
                         self_ref = true;
@@ -1647,7 +1646,6 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
-                | PipelineNode::State { header, .. }
                 | PipelineNode::Composition { header, .. } => {
                     let producer = input_target(&header.input.value);
                     if producer != consumer && graph.index_of(producer).is_some() {
@@ -1921,10 +1919,6 @@ impl PipelineConfig {
             .nodes
             .iter()
             .filter_map(|spanned| match &spanned.value {
-                // State nodes never carry an analytic_window — they only
-                // read from the record to populate scoped slots — so they
-                // never appear in the planner's window-bearing entry list.
-                PipelineNode::State { .. } => None,
                 PipelineNode::Transform {
                     header,
                     config: body,
@@ -2115,8 +2109,7 @@ impl PipelineConfig {
                 PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
-                | PipelineNode::Output { header, .. }
-                | PipelineNode::State { header, .. } => {
+                | PipelineNode::Output { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
                 PipelineNode::Composition {
@@ -3024,8 +3017,7 @@ fn resolve_all_input_references(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. } => {
+            | PipelineNode::Output { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
             PipelineNode::Merge { header, .. } => {
@@ -3250,45 +3242,6 @@ pub(crate) fn lower_node_to_plan_node(
             span,
             output_schema: schema_from_bound(name),
         }),
-        PipelineNode::State { config, .. } => {
-            // Phases D / D-2 / D-3 wire all three runtime scope tiers.
-            // lowers `phase: init` identically to runtime —
-            // both produce `PlanNode::State` and the executor visits
-            // them at their topological position. For pipelines whose
-            // init data flows through a single primary chain, the
-            // topological order naturally runs init writes before any
-            // runtime descendant reads them. Strict
-            // init-before-runtime ordering across disjoint sub-DAGs
-            // (separate sources for init vs runtime) requires a
-            // two-pass walk with source-replay infrastructure that is
-            // a future follow-up.
-            //
-            // Pull each assignment's typed program out of
-            // `artifacts.typed`. `bind_schema` populates these under
-            // synthetic per-assignment keys; if any are missing, a
-            // CXL error already surfaced and we skip lowering.
-            let mut compiled_assignments = Vec::with_capacity(config.set.len());
-            for assignment in &config.set {
-                let assignment_key = format!("{name}::{}", assignment.var);
-                let typed = match artifacts.typed.get(&assignment_key) {
-                    Some(t) => t.clone(),
-                    None => return None,
-                };
-                compiled_assignments.push(crate::plan::execution::CompiledStateAssignment {
-                    var: assignment.var.clone(),
-                    typed,
-                });
-            }
-            Some(PlanNode::State {
-                name: name.to_string(),
-                span,
-                resolved: Some(Box::new(crate::plan::execution::PlanStatePayload {
-                    scope: config.scope,
-                    phase: config.phase,
-                    assignments: compiled_assignments,
-                })),
-            })
-        }
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
             // failed (E102–E109), there's no entry — silently omit the

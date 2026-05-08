@@ -20,7 +20,6 @@ pub enum StageKind {
     Merge,
     Combine,
     Output,
-    State,
     Composition,
     Error,
 }
@@ -35,7 +34,6 @@ impl StageKind {
             StageKind::Merge => "merge",
             StageKind::Combine => "combine",
             StageKind::Output => "output",
-            StageKind::State => "state",
             StageKind::Composition => "composition",
             StageKind::Error => "error",
         }
@@ -50,7 +48,6 @@ impl StageKind {
             StageKind::Merge => "MERGE",
             StageKind::Combine => "COMBINE",
             StageKind::Output => "OUTPUT",
-            StageKind::State => "STATE",
             StageKind::Composition => "COMPOSITION",
             StageKind::Error => "ERROR",
         }
@@ -69,7 +66,6 @@ pub fn stage_kind_for_node(node: &PipelineNode) -> StageKind {
         PipelineNode::Merge { .. } => StageKind::Merge,
         PipelineNode::Combine { .. } => StageKind::Combine,
         PipelineNode::Output { .. } => StageKind::Output,
-        PipelineNode::State { .. } => StageKind::State,
         PipelineNode::Composition { .. } => StageKind::Composition,
     }
 }
@@ -154,7 +150,6 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => name_to_idx
                 .get(node_input_name(&header.input.value))
                 .copied()
@@ -207,7 +202,6 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
-            | PipelineNode::State { header, .. }
             | PipelineNode::Composition { header, .. } => {
                 if let Some(&from) = name_to_idx.get(node_input_name(&header.input.value)) {
                     connections.push((from, idx));
@@ -338,25 +332,6 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             label: header.name.clone(),
             kind,
             subtitle: body.output.path.clone(),
-            canvas_x: x,
-            canvas_y: y,
-            cxl_source: None,
-            description: header.description.clone(),
-            error_message: None,
-        },
-        PipelineNode::State {
-            header,
-            config: body,
-        } => StageView {
-            id: header.name.clone(),
-            label: header.name.clone(),
-            kind,
-            subtitle: format!(
-                "scope {:?}, {} assignment{}",
-                body.scope,
-                body.set.len(),
-                if body.set.len() == 1 { "" } else { "s" }
-            ),
             canvas_x: x,
             canvas_y: y,
             cxl_source: None,
@@ -655,20 +630,6 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             }
             PlanNode::Merge { name, .. } => (name.clone(), StageKind::Merge, String::new()),
             PlanNode::Output { name, .. } => (name.clone(), StageKind::Output, String::new()),
-            PlanNode::State { name, resolved, .. } => {
-                let subtitle = resolved
-                    .as_deref()
-                    .map(|p| {
-                        format!(
-                            "scope {:?}, {} assignment{}",
-                            p.scope,
-                            p.assignments.len(),
-                            if p.assignments.len() == 1 { "" } else { "s" }
-                        )
-                    })
-                    .unwrap_or_default();
-                (name.clone(), StageKind::State, subtitle)
-            }
             PlanNode::Sort { name, .. } => (name.clone(), StageKind::Transform, "sort".into()),
             PlanNode::Aggregation { name, strategy, .. } => {
                 (name.clone(), StageKind::Aggregate, format!("{strategy:?}"))
