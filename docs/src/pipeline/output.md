@@ -20,13 +20,17 @@ The `type:` field selects the output format: `csv`, `json`, `xml`, or `fixed_wid
 
 By default, output nodes write only the fields explicitly emitted by upstream transforms. Several options control which fields appear and how they are named.
 
-### Include unmapped fields
+### Include widened (auto_widen) fields
 
 ```yaml
-    include_unmapped: true    # Default: false
+    include_widened: true    # Default: false
 ```
 
-When `true`, fields that were not explicitly emitted by transforms but exist on the record are included in the output. Useful for pass-through pipelines where you want all original fields plus a few computed ones.
+When `true`, fields that the source's `on_unmapped: auto_widen` policy absorbed into the per-record `$widened` sidecar map are expanded back to top-level columns at the sink. See [Sources → on_unmapped](source.md#on_unmapped--undeclared-input-fields) for the absorption mechanism. Useful for pass-through pipelines where you want every original input field reaching the output regardless of whether it was declared in the source's `schema:` block.
+
+With `include_widened: false` (the default), the `$widened` sidecar slot is stripped from the output and only user-declared / explicitly-emitted columns reach the writer.
+
+The flag composes independently with `include_correlation_keys: true` — see below.
 
 ### Include correlation-key shadow columns
 
@@ -37,6 +41,14 @@ When `true`, fields that were not explicitly emitted by transforms but exist on 
 When the pipeline declares `error_handling.correlation_key: <field>`, the engine adds shadow columns named `$ck.<field>` to the schema. These shadow columns preserve correlation-group identity through transforms that may rewrite the user-declared field. They are an internal engine namespace and are stripped from output by default.
 
 Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](correlation-keys.md) for the full lifecycle.
+
+`include_correlation_keys` does **not** surface the `$widened` sidecar — `include_widened` is the separate flag for that. The two are independent: each, both, or neither can be set.
+
+### Writer rejection of `Value::Map` payloads
+
+CSV, XML, and fixed-width writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
+
+The most common case: the `$widened` sidecar reaches the writer because the Output node forgot to set `include_widened: true`. The remediation is to either set the flag (so the projection layer expands the map to top-level columns) or coerce the map to a scalar in CXL before the emit. The error message lists both routes.
 
 ### Field mapping
 
