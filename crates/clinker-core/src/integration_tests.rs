@@ -29,12 +29,7 @@ mod tests {
             Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
         )]);
 
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| config::convert_pipeline_vars(v))
-            .unwrap_or_default();
+        let pipeline_vars = indexmap::IndexMap::new();
         let params = PipelineRunParams {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),

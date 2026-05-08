@@ -544,17 +544,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
     // Build runtime parameters. execution_id/batch_id were generated
-    // earlier so the path-template context could embed them.
-    let pipeline_vars = pipeline_config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+    // earlier so the path-template context could embed them. Channel
+    // overlay (Stage 7) will eventually populate `pipeline_vars` from
+    // the active channel's overrides; for now it stays empty and the
+    // executor seeds defaults from each Transform's `declares:` block.
     let run_params = clinker_core::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
-        pipeline_vars,
+        pipeline_vars: Default::default(),
         shutdown_token: None,
     };
 

@@ -643,15 +643,7 @@ impl PipelineExecutor {
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
         let scoped_vars: cxl::resolve::ScopedVarsRegistry =
-            crate::config::build_scoped_vars_registry(
-                config
-                    .pipeline
-                    .vars
-                    .as_ref()
-                    .unwrap_or(&crate::config::ScopedVarsDecl::default()),
-                config.pipeline.static_vars.as_ref(),
-                &config.nodes,
-            );
+            crate::config::build_scoped_vars_registry(config.pipeline.vars.as_ref(), &config.nodes);
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
@@ -2340,6 +2332,13 @@ fn build_stable_eval_context(
     batch_id: &str,
     pipeline_vars: &IndexMap<String, Value>,
 ) -> StableEvalContext {
+    // Seed pipeline-scope vars with declared defaults from every
+    // Transform's `declares:` entries; runtime injections (channel
+    // overrides, test seeds) overlay on top.
+    let mut seeded = crate::config::collect_pipeline_var_defaults(&config.nodes);
+    for (k, v) in pipeline_vars {
+        seeded.insert(k.clone(), v.clone());
+    }
     StableEvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time,
@@ -2347,23 +2346,23 @@ fn build_stable_eval_context(
         pipeline_execution_id: Arc::from(execution_id),
         pipeline_batch_id: Arc::from(batch_id),
         pipeline_counters: PipelineCounters::default(),
-        pipeline_vars: Arc::new(std::sync::RwLock::new(pipeline_vars.clone())),
+        pipeline_vars: Arc::new(std::sync::RwLock::new(seeded)),
         source_vars: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         source_input_arcs: Arc::new(compute_source_input_arcs(config)),
         static_vars: Arc::new(build_static_vars(config)),
     }
 }
 
-/// Build the `$vars.*` runtime value map from the pipeline's
-/// `static_vars:` block. Each entry's `default` field (post-validation,
-/// already coerced to the declared type) becomes the frozen runtime
-/// value. Stage 7 will overlay channel `pipeline.vars.<key>`
-/// overrides on top of this before the pipeline starts.
+/// Build the `$vars.*` runtime value map from the pipeline's `vars:`
+/// block. Each entry's `default` field (post-validation, already
+/// coerced to the declared type) becomes the frozen runtime value.
+/// Stage 7 will overlay channel `pipeline.vars.<key>` overrides on
+/// top of this before the pipeline starts.
 fn build_static_vars(config: &PipelineConfig) -> IndexMap<String, Value> {
-    let Some(decls) = config.pipeline.static_vars.as_ref() else {
+    let Some(decls) = config.pipeline.vars.as_ref() else {
         return IndexMap::new();
     };
-    crate::config::convert_static_vars(decls)
+    crate::config::convert_vars(decls)
 }
 
 /// Walk the YAML config to map every `Merge` / `Combine` named input to
@@ -2850,16 +2849,10 @@ mod tests {
             Box::new(output_buf.clone()) as Box<dyn Write + Send>,
         )]);
 
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(crate::config::convert_pipeline_vars)
-            .unwrap_or_default();
         let params = PipelineRunParams {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
+            pipeline_vars: IndexMap::new(),
             shutdown_token: None,
         };
 

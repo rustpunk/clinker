@@ -18,12 +18,7 @@ fn run_correlated_pipeline(
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
 

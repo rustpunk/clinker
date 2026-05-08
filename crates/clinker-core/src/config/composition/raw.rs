@@ -41,11 +41,10 @@ pub(super) struct RawCompositionSignature {
     pub config_schema: IndexMap<String, RawParamDecl>,
     #[serde(default)]
     pub resources_schema: IndexMap<String, RawResourceDecl>,
-    /// opt-in declarations of which parent scoped vars
-    /// the composition body may read. Mirrors
-    /// `clinker_core::config::ScopedVarsDecl` shape, but the inner
-    /// entry is just a typed declaration (no defaults — those live
-    /// on the parent's declarations). YAML form:
+    /// opt-in declarations of which parent scoped vars the composition
+    /// body may read, partitioned by scope. The inner entry is just a
+    /// typed declaration (no defaults — those live on the parent
+    /// Transform's `declares:` entry). YAML form:
     ///     scoped_vars:
     ///       pipeline:
     ///         cutoff_date: { type: date }

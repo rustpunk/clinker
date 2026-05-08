@@ -1,9 +1,9 @@
-# Phase F-2c / Item 4 fixture: composition body that reads a parent
-# `$pipeline.<custom>` variable WITHOUT declaring it in
-# `_compose.scoped_vars`. The body's CXL resolver should reject the
-# read with E173 (composition-aware "you tried to read a parent var
-# hidden from your body — declare in `_compose.scoped_vars` to opt in")
-# rather than the generic "unknown member" diagnostic.
+# Composition body that reads a parent `$pipeline.<custom>` variable
+# WITHOUT declaring it in `_compose.scoped_vars`. The body's CXL
+# resolver should reject the read with E173 (composition-aware
+# "you tried to read a parent var hidden from your body — declare in
+# `_compose.scoped_vars` to opt in") rather than the generic
+# "unknown member" diagnostic.
 _compose:
   name: declares_undeclared
   inputs:

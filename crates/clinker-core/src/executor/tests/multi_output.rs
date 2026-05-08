@@ -24,13 +24,8 @@ fn multi_output_fixture(
 }
 
 /// Build default `PipelineRunParams` for tests.
-fn test_params(config: &crate::config::PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(|v| crate::config::convert_pipeline_vars(v))
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -328,7 +323,7 @@ fn run_multi_output(
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError> {
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
 
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -710,7 +705,7 @@ nodes:
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -1009,7 +1004,7 @@ nodes:
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -1183,7 +1178,7 @@ nodes:
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     // Enough records that "b" gets traffic and will error
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n";
@@ -1284,7 +1279,7 @@ nodes:
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -1710,7 +1705,7 @@ nodes:
     include_unmapped: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
     let input_csv = "id,name\n1,Alice\n2,Bob\n";
 
     let readers: crate::executor::SourceReaders = [(
@@ -1782,7 +1777,7 @@ nodes:
     include_unmapped: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
     let input_csv = "x\n42\n";
 
     let readers: crate::executor::SourceReaders = [(

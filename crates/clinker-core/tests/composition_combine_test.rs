@@ -45,13 +45,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "composition-combine-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -101,7 +96,7 @@ fn run_pipeline_multi_source(
         &primary,
         readers,
         writers,
-        &test_params(&config),
+        &test_params(),
     )
     .expect("pipeline run");
     (report, buf.as_string())

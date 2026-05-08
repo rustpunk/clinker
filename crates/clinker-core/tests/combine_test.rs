@@ -2090,13 +2090,7 @@ nodes:
             .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
             .collect();
 
-        let pipeline_vars = plan
-            .config()
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| clinker_core::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
+        let pipeline_vars = indexmap::IndexMap::new();
         let params = PipelineRunParams {
             execution_id: "combine-test-exec".to_string(),
             batch_id: "combine-test-batch".to_string(),

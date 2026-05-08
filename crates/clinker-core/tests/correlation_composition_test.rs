@@ -54,13 +54,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "correlation-composition-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -90,13 +85,9 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    )
-    .expect("pipeline run");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .expect("pipeline run");
     (report, buf.as_string())
 }
 

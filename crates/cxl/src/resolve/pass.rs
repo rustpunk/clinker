@@ -110,7 +110,7 @@ pub fn resolve_program_with_modules(
 /// `$source.<key>` / `$record.<key>` registry. Empty registry preserves
 /// the pre-Phase-B behavior — only builtin members of each namespace
 /// resolve. Production call sites build the registry from
-/// `clinker_core::config::ScopedVarsDecl`.
+/// `clinker_core::config::build_scoped_vars_registry`.
 pub fn resolve_program_with_modules_and_vars(
     program: Program,
     fields: &[&str],

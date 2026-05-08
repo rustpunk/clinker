@@ -1,10 +1,14 @@
 //! Scoped-variable registry consulted by the resolver and typechecker.
 //!
-//! The registry is constructed by the pipeline configuration loader from
-//! the YAML `vars:` block (see `clinker_core::config::ScopedVarsDecl`) and
+//! The registry is constructed by the pipeline configuration loader by
+//! unioning the flat `vars:` block (`$vars.<key>` static config) with
+//! every Transform's `declares:` entries (`$pipeline` / `$source` /
+//! `$record` producer-declared state); see
+//! `clinker_core::config::build_scoped_vars_registry`. The result is
 //! threaded into [`resolve_program_with_modules_and_vars`] /
-//! [`type_check_with_vars`]. CXL doesn't depend on `clinker-core`, so the
-//! types here mirror — rather than re-export — the config-side definitions.
+//! [`type_check_with_vars`]. CXL doesn't depend on `clinker-core`, so
+//! the types here mirror — rather than re-export — the config-side
+//! definitions.
 //!
 //! Three scopes match the CXL read namespaces:
 //! - [`ScopedVarsRegistry::pipeline`] — read via `$pipeline.<key>`,

@@ -23,12 +23,7 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(clinker_core::config::convert_pipeline_vars)
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
     let primary = config.source_configs().next().unwrap().name.clone();

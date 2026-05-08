@@ -923,8 +923,9 @@ pub struct OutputBody {
     pub output: crate::config::OutputConfig,
 }
 
-/// The scope a `state` node writes to. Mirrors
-/// `clinker_core::config::ScopedVarsDecl`'s three partitions.
+/// The scope a Transform's `declares:` entry writes to. Each scope is
+/// addressable via its own CXL read namespace (`$pipeline.<key>` /
+/// `$source.<key>` / `$record.<key>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VarScope {

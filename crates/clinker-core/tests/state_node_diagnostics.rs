@@ -57,11 +57,6 @@ fn snapshot_e164_init_terminal() {
     let yaml = r#"
 pipeline:
   name: e164_init_terminal
-  vars:
-    pipeline:
-      x:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -105,11 +100,6 @@ fn snapshot_e170_multi_writer() {
     let yaml = r#"
 pipeline:
   name: e170_multi_writer
-  vars:
-    pipeline:
-      x:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -154,11 +144,6 @@ fn snapshot_e171_non_descendant_reader() {
     let yaml = r#"
 pipeline:
   name: e171_non_descendant
-  vars:
-    pipeline:
-      x:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -201,10 +186,6 @@ fn snapshot_e172_post_merge_unqualified() {
     let yaml = r#"
 pipeline:
   name: e172_post_merge_unqualified
-  vars:
-    source:
-      tag:
-        type: string
 nodes:
   - type: source
     name: l
@@ -260,18 +241,13 @@ nodes:
 fn snapshot_e173_composition_body_reads_undeclared_parent_var() {
     // Uses the existing fixture composition that reads
     // `$pipeline.cutoff` without declaring it in
-    // `_compose.scoped_vars`. The parent declares `cutoff` so the
-    // body's read would resolve through the hidden tier — and the
+    // `_compose.scoped_vars`. A parent Transform declares `cutoff` so
+    // the body's read would resolve through the hidden tier — and the
     // body's resolver must emit E173 with the composition-aware help
     // ("declare it in _compose.scoped_vars").
     let yaml = r#"
 pipeline:
   name: e173_undeclared_parent_var
-  vars:
-    pipeline:
-      cutoff:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -281,12 +257,20 @@ nodes:
       path: in.csv
       schema:
         - { name: id, type: string }
+  - type: transform
+    name: parent_writer
+    input: src
+    config:
+      declares:
+        - { name: cutoff, scope: pipeline, type: int, default: 0 }
+      cxl: |
+        emit id = id
   - type: composition
     name: body
-    input: src
+    input: parent_writer
     use: ../compositions/declares_undeclared.comp.yaml
     inputs:
-      data: src
+      data: parent_writer
   - type: output
     name: out
     input: body
@@ -305,11 +289,6 @@ fn snapshot_e174_composition_scoped_vars_type_mismatch() {
     let yaml = r#"
 pipeline:
   name: e174_type_mismatch
-  vars:
-    pipeline:
-      cutoff:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -319,12 +298,20 @@ nodes:
       path: in.csv
       schema:
         - { name: id, type: int }
+  - type: transform
+    name: parent_writer
+    input: src
+    config:
+      declares:
+        - { name: cutoff, scope: pipeline, type: int, default: 0 }
+      cxl: |
+        emit id = id
   - type: composition
     name: body
-    input: src
+    input: parent_writer
     use: ../compositions/declares_type_mismatch.comp.yaml
     inputs:
-      inp: src
+      inp: parent_writer
   - type: output
     name: out
     input: body
@@ -343,14 +330,6 @@ fn snapshot_e175_init_reads_runtime_var() {
     let yaml = r#"
 pipeline:
   name: e175_init_reads_runtime
-  vars:
-    pipeline:
-      runtime_v:
-        type: int
-        default: 0
-      init_v:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src

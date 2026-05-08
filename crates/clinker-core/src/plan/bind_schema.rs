@@ -723,9 +723,10 @@ fn build_body_scoped_vars(
                         "E174",
                         format!(
                             "composition {composition_name:?}: scoped_vars schema declares \
-                                 ${scope_str}.{key} but the parent pipeline does not declare \
-                                 a matching variable — add it to the parent's `vars.{scope_str}` \
-                                 block or remove it from the composition's scoped_vars schema"
+                                 ${scope_str}.{key} but no parent Transform declares it via \
+                                 `declares:` — add a Transform with `declares: [{{ name: {key}, \
+                                 scope: {scope_str}, type: ... }}]` upstream of the composition \
+                                 or remove it from the composition's scoped_vars schema"
                         ),
                         LabeledSpan::primary(span, "composition call site".to_string()),
                     ));

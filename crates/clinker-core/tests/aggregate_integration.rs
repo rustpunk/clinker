@@ -36,13 +36,8 @@ impl Write for SharedBuffer {
 }
 
 /// Build PipelineRunParams from a parsed config.
-fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(|v| clinker_core::config::convert_pipeline_vars(v))
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "integration-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -54,7 +49,7 @@ fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunPara
 /// Run a single-input, single-output pipeline. Returns (report, output_csv).
 fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::ExecutionReport, String) {
     let config = parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),

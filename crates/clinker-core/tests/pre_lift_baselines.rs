@@ -206,13 +206,8 @@ impl Write for SharedBuffer {
     }
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "baseline-run".to_string(),
         batch_id: "batch-001".to_string(),
@@ -278,7 +273,7 @@ fn compare_or_write(baseline_name: &str, actual: &str) {
 /// Run a pipeline with in-memory readers/writers keyed by source/output name.
 fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, String> {
     let config = parse_config(yaml).expect("parse_config");
-    let params = test_params(&config);
+    let params = test_params();
 
     let readers: clinker_core::executor::SourceReaders = inputs
         .into_iter()

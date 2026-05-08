@@ -31,13 +31,8 @@ impl Write for SharedBuffer {
     }
 }
 
-fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "phase-h-test".to_string(),
         batch_id: "batch-h-001".to_string(),
@@ -62,7 +57,7 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
         .expect("pipeline run");
     buf.as_string()
 }
@@ -91,7 +86,7 @@ fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
         primary,
         readers,
         writers,
-        &test_params(&config),
+        &test_params(),
     )
     .expect("pipeline run");
     buf.as_string()
@@ -112,11 +107,6 @@ fn state_pipeline_runtime_visible_downstream() {
     let yaml = r#"
 pipeline:
   name: state_pipeline_runtime
-  vars:
-    pipeline:
-      last_amount:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: src
@@ -178,10 +168,6 @@ fn state_source_scope_visible_downstream() {
     let yaml = r#"
 pipeline:
   name: state_source_scope
-  vars:
-    source:
-      batch_label:
-        type: string
 nodes:
   - type: source
     name: src
@@ -239,10 +225,6 @@ fn state_record_scope_visible_downstream_does_not_serialize() {
     let yaml = r#"
 pipeline:
   name: state_record_scope
-  vars:
-    record:
-      doubled:
-        type: int
 nodes:
   - type: source
     name: src
@@ -296,21 +278,16 @@ nodes:
 
 #[test]
 fn state_composition_opt_in_pipeline_var_visible_in_body() {
-    // Uses the existing fixture-resident composition that opts in
-    // to `$pipeline.cutoff` via `_compose.scoped_vars.pipeline`. The
-    // parent declares `cutoff: { type: int, default: 99 }`; the body
-    // reads the parent's value and emits it as `cutoff_seen`.
+    // Uses the existing fixture-resident composition that opts in to
+    // `$pipeline.cutoff` via `_compose.scoped_vars.pipeline`. A parent
+    // Transform declares `cutoff: { type: int, default: 99 }`; the
+    // body reads the parent's value and emits it as `cutoff_seen`.
     use clinker_core::config::CompileContext;
     use std::path::PathBuf;
 
     let yaml = r#"
 pipeline:
   name: state_composition_opt_in
-  vars:
-    pipeline:
-      cutoff:
-        type: int
-        default: 99
 nodes:
   - type: source
     name: src
@@ -320,12 +297,20 @@ nodes:
       path: in.csv
       schema:
         - { name: id, type: int }
+  - type: transform
+    name: parent_writer
+    input: src
+    config:
+      declares:
+        - { name: cutoff, scope: pipeline, type: int, default: 99 }
+      cxl: |
+        emit id = id
   - type: composition
     name: body
-    input: src
+    input: parent_writer
     use: ../compositions/declares_used.comp.yaml
     inputs:
-      inp: src
+      inp: parent_writer
   - type: output
     name: out
     input: body
@@ -354,7 +339,7 @@ nodes:
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
         .expect("pipeline run");
     let out = buf.as_string();
     let lines = body_lines_sorted(&out);
@@ -374,12 +359,6 @@ fn state_qualified_post_merge_readable() {
     let yaml = r#"
 pipeline:
   name: state_qualified_post_merge
-  vars:
-    source:
-      left_label:
-        type: string
-      right_label:
-        type: string
 nodes:
   - type: source
     name: left_src
@@ -481,11 +460,6 @@ fn state_pipeline_init_visible_in_runtime() {
     let yaml = r#"
 pipeline:
   name: state_pipeline_init
-  vars:
-    pipeline:
-      max_amount:
-        type: int
-        default: 0
 nodes:
   - type: source
     name: config_src
@@ -564,10 +538,6 @@ fn state_source_scope_per_file_isolation() {
     let yaml = r#"
 pipeline:
   name: state_source_multi_file
-  vars:
-    source:
-      file_label:
-        type: string
 nodes:
   - type: source
     name: orders
@@ -626,7 +596,7 @@ nodes:
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
         .expect("pipeline run");
     let out = buf.as_string();
     let lines = body_lines_sorted(&out);
@@ -642,15 +612,15 @@ nodes:
 
 #[test]
 fn static_vars_visible_in_transform_cxl() {
-    // `static_vars:` declares a flat top-level config knob with a
-    // default. The transform's CXL filters records against
+    // The flat top-level `vars:` block declares static-config knobs
+    // with defaults. The transform's CXL filters records against
     // `$vars.cutoff` and emits the value as a column. No producer
     // writes the var; it's frozen at pipeline start (channel overrides
     // would apply once at startup but this fixture has no channel).
     let yaml = r#"
 pipeline:
   name: static_vars_smoke
-  static_vars:
+  vars:
     cutoff: { type: int, default: 100 }
     label: { type: string, default: "tier-A" }
 nodes:

@@ -49,13 +49,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "body-window-test".to_string(),
         batch_id: "batch".to_string(),
@@ -270,7 +265,7 @@ ENG,300
         &primary,
         readers,
         writers,
-        &test_params(&config),
+        &test_params(),
     )
     .expect("pipeline must run");
     let output = buf.as_string();

@@ -60,25 +60,13 @@ pub struct PipelineMeta {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
-    /// User-defined variable declarations grouped by scope (pipeline, source,
-    /// record). Pipeline-scope defaults seed the runtime registry at init;
-    /// source- and record-scope entries are placeholders for runtime writes
-    /// by `state` nodes (no readers yet).
-    ///
-    /// Stage 5 of the variable-system redesign deletes this nested form;
-    /// the new flat `static_vars` field below carries the static-config
-    /// half (read via `$vars.<key>`), and producer-declared scoped state
-    /// moves to per-node `declares:` blocks. The YAML key
-    /// `static_vars` is a transitional name — Stage 5 renames it to
-    /// `vars` once the nested form is gone.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vars: Option<ScopedVarsDecl>,
     /// Static configuration knobs read via `$vars.<key>`. Flat top-level
-    /// shape: `static_vars: { fuzzy_threshold: { type: float, default:
-    /// 0.85 } }`. Channel-overridable, frozen at pipeline start. No
-    /// producer; no DAG-descendant rule.
+    /// shape: `vars: { fuzzy_threshold: { type: float, default: 0.85 } }`.
+    /// Channel-overridable, frozen at pipeline start. No producer; no
+    /// DAG-descendant rule. Producer-written scoped state lives on
+    /// individual Transforms via their `declares:` block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub static_vars: Option<IndexMap<String, ScopedVarDecl>>,
+    pub vars: Option<IndexMap<String, ScopedVarDecl>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_formats: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,37 +111,12 @@ pub struct ConcurrencyConfig {
     pub chunk_size: Option<usize>,
 }
 
-/// User-defined variable declarations partitioned by scope.
+/// One static-config variable's declared type and optional default value.
 ///
-/// Three scopes mirror the CXL read namespaces: `$pipeline.<key>` is
-/// init-bound and broadcast to every record; `$source.<key>` is
-/// per-source with a fresh slot per ingestion stream; `$record.<key>` is
-/// per-record scratch state distinct from `$meta.*` (writable by `state`
-/// nodes only, declared with type for compile-time checking). The
-/// `record` name (rather than `row`) reflects Clinker's multi-format
-/// scope — CSV rows, JSON objects, XML elements, and fixed-width records
-/// all flow through the same `Record` type.
-///
-/// Pipeline-scope defaults flow into [`StableEvalContext.pipeline_vars`]
-/// at init via [`convert_pipeline_vars`]. Source- and record-scope
-/// readers arrive in a follow-up commit; their declarations parse and
-/// validate today so the YAML surface is stable across the sprint.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ScopedVarsDecl {
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub pipeline: IndexMap<String, ScopedVarDecl>,
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub source: IndexMap<String, ScopedVarDecl>,
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub record: IndexMap<String, ScopedVarDecl>,
-}
-
-/// One scoped variable's declared type and optional default value.
-///
-/// `default` must match `var_type` — enforced by [`validate_scoped_vars`].
-/// Source- and record-scope variables typically omit the default (their
-/// value arrives at runtime from a `state` node write).
+/// `default` must match `var_type` — enforced by [`validate_static_vars`].
+/// Static-config vars are read via `$vars.<key>`; producer-written scoped
+/// state (`$pipeline.*` / `$source.*` / `$record.*`) is declared on
+/// Transforms via their `declares:` block instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedVarDecl {
@@ -193,47 +156,35 @@ impl From<ScopedVarType> for cxl::resolve::ScopedVarType {
     }
 }
 
-/// Build a CXL-side [`cxl::resolve::ScopedVarsRegistry`] from a parsed
-/// pipeline-level [`ScopedVarsDecl`]. The CXL crate doesn't depend on
-/// `clinker-core`, so this conversion lives here at the boundary.
-///
-/// `static_vars` is the flat top-level `static_vars:` block (read via
-/// `$vars.<key>`); when None, the registry's `static_vars` tier stays
-/// empty.
-pub fn scoped_vars_registry_with_static(
-    decl: &ScopedVarsDecl,
-    static_vars: Option<&IndexMap<String, ScopedVarDecl>>,
-) -> cxl::resolve::ScopedVarsRegistry {
-    let mut reg = scoped_vars_registry(decl);
-    if let Some(sv) = static_vars {
-        reg.static_vars = sv
-            .iter()
-            .map(|(k, d)| (k.clone(), d.var_type.into()))
-            .collect();
-    }
-    reg
-}
-
-/// Build the resolver-side scoped-vars registry from the union of:
-/// (a) the legacy nested `vars:` block — pre-redesign tier sources
-///     for `$pipeline.<custom>` / `$source.<custom>` / `$record.<custom>`,
-/// (b) the new flat `static_vars:` block — frozen `$vars.<key>` config,
-/// (c) every Transform's `config.declares:` entries — producer-declared
-///     scoped state, the writer-site declaration site Stage 5 makes the
-///     sole authority once the legacy nested form is deleted.
-///
-/// During the transition (Stages 2-4), all three sources feed the
-/// registry. Stage 5 deletes (a). Each `declares:` entry merges into
-/// the per-scope tier (pipeline/source/record); collisions with
-/// (a)-declared keys are resolved last-write-wins (the declares:
-/// entry wins — it's the new authority).
+/// Build the resolver-side scoped-vars registry from:
+/// (a) the flat top-level `vars:` block — frozen `$vars.<key>` config,
+///     channel-overridable;
+/// (b) every Transform's `config.declares:` entries — producer-declared
+///     scoped state addressable as `$pipeline.<key>` / `$source.<key>` /
+///     `$record.<key>`. The writer-site declaration is the sole authority.
 pub fn build_scoped_vars_registry(
-    legacy_decl: &ScopedVarsDecl,
-    static_vars: Option<&IndexMap<String, ScopedVarDecl>>,
+    vars: Option<&IndexMap<String, ScopedVarDecl>>,
     nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
 ) -> cxl::resolve::ScopedVarsRegistry {
     use crate::config::pipeline_node::{PipelineNode, VarScope};
-    let mut reg = scoped_vars_registry_with_static(legacy_decl, static_vars);
+    let mut reg = cxl::resolve::ScopedVarsRegistry {
+        pipeline: indexmap::IndexMap::new(),
+        source: indexmap::IndexMap::new(),
+        record: indexmap::IndexMap::new(),
+        // Top-level pipelines never have hidden vars — those are
+        // populated only when entering a composition body via
+        // `build_body_scoped_vars` to support the E173 diagnostic.
+        hidden_pipeline: indexmap::IndexMap::new(),
+        hidden_source: indexmap::IndexMap::new(),
+        hidden_record: indexmap::IndexMap::new(),
+        static_vars: vars
+            .map(|sv| {
+                sv.iter()
+                    .map(|(k, d)| (k.clone(), d.var_type.into()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
     for spanned in nodes {
         if let PipelineNode::Transform { config, .. } = &spanned.value {
             for entry in &config.declares {
@@ -247,35 +198,6 @@ pub fn build_scoped_vars_registry(
         }
     }
     reg
-}
-
-pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRegistry {
-    cxl::resolve::ScopedVarsRegistry {
-        pipeline: decl
-            .pipeline
-            .iter()
-            .map(|(k, d)| (k.clone(), d.var_type.into()))
-            .collect(),
-        source: decl
-            .source
-            .iter()
-            .map(|(k, d)| (k.clone(), d.var_type.into()))
-            .collect(),
-        record: decl
-            .record
-            .iter()
-            .map(|(k, d)| (k.clone(), d.var_type.into()))
-            .collect(),
-        // Top-level pipelines never have hidden vars — those are
-        // populated only when entering a composition body via
-        // `build_body_scoped_vars` to support the E173 diagnostic.
-        hidden_pipeline: indexmap::IndexMap::new(),
-        hidden_source: indexmap::IndexMap::new(),
-        hidden_record: indexmap::IndexMap::new(),
-        // Stage 1 — empty until the new top-level flat `vars:`
-        // parser lands; Stage 2 populates from that block.
-        static_vars: indexmap::IndexMap::new(),
-    }
 }
 
 /// Input source configuration.
@@ -1856,14 +1778,8 @@ impl PipelineConfig {
         // E200 diagnostics surface here with per-node spans. Also
         // recurses into composition bodies via bind_composition,
         // populating CompileArtifacts.composition_bodies.
-        let scoped_vars_registry = build_scoped_vars_registry(
-            self.pipeline
-                .vars
-                .as_ref()
-                .unwrap_or(&ScopedVarsDecl::default()),
-            self.pipeline.static_vars.as_ref(),
-            &self.nodes,
-        );
+        let scoped_vars_registry =
+            build_scoped_vars_registry(self.pipeline.vars.as_ref(), &self.nodes);
         let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
@@ -3688,8 +3604,9 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     Ok(config)
 }
 
-/// Reserved `$pipeline.*` member names that cannot be used as user variable
-/// names. Mirrors `crates/cxl/src/resolve/pass.rs::PIPELINE_MEMBERS`.
+/// Reserved `$pipeline.*` member names that cannot be used as
+/// `declares:` entry names with `scope: pipeline`. Mirrors
+/// `crates/cxl/src/resolve/pass.rs::PIPELINE_MEMBERS`.
 const RESERVED_PIPELINE_NAMES: &[&str] = &[
     "start_time",
     "name",
@@ -3716,9 +3633,7 @@ const RESERVED_SOURCE_NAMES: &[&str] = &[
 /// Reserved `$record.*` member names. Empty today — issue #44 will add
 /// `index` (record's positional index in its source) and `source` (a
 /// back-reference to the originating source-node name) as builtin
-/// members. The empty stub is wired now so the validation pipeline
-/// rejects `vars.record.<reserved>` collisions automatically once #44
-/// fills in the names.
+/// members.
 const RESERVED_RECORD_NAMES: &[&str] = &[];
 
 /// Post-deserialization validation.
@@ -3737,9 +3652,46 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // Validate pipeline.vars (typed, scope-partitioned)
+    // Validate the flat `vars:` block (`$vars.<key>` static config)
     if let Some(ref vars) = config.pipeline.vars {
-        validate_scoped_vars(vars)?;
+        for (name, decl) in vars {
+            if let Some(default) = &decl.default {
+                check_default_type("vars", name, decl.var_type, default)?;
+            }
+        }
+    }
+
+    // Validate per-Transform `declares:` entries: reserved-name
+    // collisions per-scope, and default-type matches.
+    for spanned in &config.nodes {
+        let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &spanned.value
+        else {
+            continue;
+        };
+        for entry in &body.declares {
+            let (scope_label, reserved) = match entry.scope {
+                pipeline_node::VarScope::Pipeline => ("pipeline", RESERVED_PIPELINE_NAMES),
+                pipeline_node::VarScope::Source => ("source", RESERVED_SOURCE_NAMES),
+                pipeline_node::VarScope::Record => ("record", RESERVED_RECORD_NAMES),
+            };
+            if reserved.contains(&entry.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "transform '{}': declares: '{}' is a reserved ${} member name and cannot be used as a variable",
+                    header.name, entry.name, scope_label,
+                )));
+            }
+            if let Some(default) = &entry.default {
+                check_default_type(
+                    &format!("transform '{}' declares", header.name),
+                    &entry.name,
+                    entry.var_type,
+                    default,
+                )?;
+            }
+        }
     }
 
     // Validate log directives on Transform nodes.
@@ -3774,48 +3726,20 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate the scope-partitioned `vars:` block: each scope's keys cannot
-/// collide with that scope's reserved member names, and any declared
-/// default must match its declared type.
-fn validate_scoped_vars(vars: &ScopedVarsDecl) -> Result<(), ConfigError> {
-    validate_scope("pipeline", &vars.pipeline, RESERVED_PIPELINE_NAMES)?;
-    validate_scope("source", &vars.source, RESERVED_SOURCE_NAMES)?;
-    validate_scope("record", &vars.record, RESERVED_RECORD_NAMES)?;
-    Ok(())
-}
-
-fn validate_scope(
-    scope: &str,
-    decls: &IndexMap<String, ScopedVarDecl>,
-    reserved: &[&str],
-) -> Result<(), ConfigError> {
-    for (name, decl) in decls {
-        if reserved.contains(&name.as_str()) {
-            return Err(ConfigError::Validation(format!(
-                "vars.{scope}: '{name}' is a reserved {scope} member name and cannot be used as a variable",
-            )));
-        }
-        if let Some(default) = &decl.default {
-            check_default_type(scope, name, decl.var_type, default)?;
-        }
-    }
-    Ok(())
-}
-
 fn check_default_type(
-    scope: &str,
+    where_label: &str,
     name: &str,
     var_type: ScopedVarType,
     default: &serde_json::Value,
 ) -> Result<(), ConfigError> {
     let mismatch = || {
         ConfigError::Validation(format!(
-            "vars.{scope}.{name}: default value does not match declared type {var_type:?}",
+            "{where_label}.{name}: default value does not match declared type {var_type:?}",
         ))
     };
     match (var_type, default) {
         (_, serde_json::Value::Null) => Err(ConfigError::Validation(format!(
-            "vars.{scope}.{name}: default value cannot be null",
+            "{where_label}.{name}: default value cannot be null",
         ))),
         (
             ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
@@ -3828,28 +3752,11 @@ fn check_default_type(
     }
 }
 
-/// Convert pipeline-scope variable defaults into the runtime
-/// `IndexMap<String, Value>` consumed by [`StableEvalContext::pipeline_vars`].
-///
-/// Source- and row-scope declarations are intentionally not threaded here —
-/// their values are produced at runtime by `state` nodes, not
-/// from YAML defaults. Only call after [`validate_scoped_vars`] has passed.
-pub fn convert_pipeline_vars(vars: &ScopedVarsDecl) -> IndexMap<String, clinker_record::Value> {
-    vars.pipeline
-        .iter()
-        .filter_map(|(name, decl)| {
-            decl.default
-                .as_ref()
-                .map(|default| (name.clone(), default_to_value(decl.var_type, default)))
-        })
-        .collect()
-}
-
-/// Convert a flat `static_vars:` block into the runtime `$vars.*`
-/// value map. Entries without a `default` resolve to `Value::Null`
-/// at read time (the eval arm does the unwrap_or). Channels override
-/// these values once at pipeline start (Stage 7 wiring).
-pub fn convert_static_vars(
+/// Convert the flat `vars:` block into the runtime `$vars.*` value map.
+/// Entries without a `default` resolve to `Value::Null` at read time
+/// (the eval arm does the unwrap_or). Channels override these values
+/// once at pipeline start (Stage 7 wiring).
+pub fn convert_vars(
     vars: &IndexMap<String, ScopedVarDecl>,
 ) -> IndexMap<String, clinker_record::Value> {
     vars.iter()
@@ -3859,6 +3766,36 @@ pub fn convert_static_vars(
                 .map(|default| (name.clone(), default_to_value(decl.var_type, default)))
         })
         .collect()
+}
+
+/// Walk every Transform's `declares:` entries and collect declared
+/// defaults for variables whose `scope: pipeline`. Used at executor
+/// init to seed `StableEvalContext.pipeline_vars` before the runtime
+/// walk begins; reads of a declared `$pipeline.<key>` that fire
+/// before the writer (or whose writer never fires for a given record)
+/// resolve to the default rather than `Null`.
+pub fn collect_pipeline_var_defaults(
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+) -> IndexMap<String, clinker_record::Value> {
+    use crate::config::pipeline_node::{PipelineNode, VarScope};
+    let mut out = IndexMap::new();
+    for spanned in nodes {
+        let PipelineNode::Transform { config, .. } = &spanned.value else {
+            continue;
+        };
+        for entry in &config.declares {
+            if entry.scope != VarScope::Pipeline {
+                continue;
+            }
+            if let Some(default) = &entry.default {
+                out.insert(
+                    entry.name.clone(),
+                    default_to_value(entry.var_type, default),
+                );
+            }
+        }
+    }
+    out
 }
 
 fn default_to_value(var_type: ScopedVarType, default: &serde_json::Value) -> clinker_record::Value {
@@ -3875,8 +3812,8 @@ fn default_to_value(var_type: ScopedVarType, default: &serde_json::Value) -> cli
             ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
             serde_json::Value::String(s),
         ) => Value::String(s.clone().into_boxed_str()),
-        // validate_scoped_vars rejects every other (type, default) combo.
-        _ => unreachable!("validate_scoped_vars should reject mismatched defaults"),
+        // check_default_type rejects every other (type, default) combo.
+        _ => unreachable!("check_default_type should reject mismatched defaults"),
     }
 }
 
