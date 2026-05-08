@@ -1193,6 +1193,62 @@ fn bind_schema_inner(
                 }
             }
             PipelineNode::Merge { header, .. } => {
+                // E315 — Merge inputs must agree on `$widened` sidecar
+                // presence. The runtime concatenates streams positionally
+                // against the merge's `output_schema` (taken from the
+                // first input); if upstream A has `$widened` but
+                // upstream B does not, the dispatcher's
+                // `check_input_schema` raises E314 with a message that
+                // names neither `$widened` nor the policy mismatch,
+                // leaving the user to debug a column-count discrepancy
+                // by hand. Detecting the disagreement at plan time
+                // surfaces it with a focused message that names the
+                // disagreeing inputs and points at each source's
+                // `on_unmapped` policy.
+                let widened_col = crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN;
+                let mut presence: Vec<(String, bool)> = Vec::new();
+                for input in &header.inputs {
+                    let upstream_name = input_target(&input.value).to_string();
+                    if let Some(row) = schema_by_name.get(upstream_name.as_str()) {
+                        presence.push((upstream_name, row.has_field(widened_col)));
+                    }
+                }
+                if !presence.is_empty()
+                    && presence.iter().any(|(_, has)| *has)
+                    && presence.iter().any(|(_, has)| !*has)
+                {
+                    let with_sidecar: Vec<&str> = presence
+                        .iter()
+                        .filter(|(_, has)| *has)
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let without_sidecar: Vec<&str> = presence
+                        .iter()
+                        .filter(|(_, has)| !*has)
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    diags.push(
+                        Diagnostic::error(
+                            "E315",
+                            format!(
+                                "merge {name:?}: input schemas disagree on the `$widened` \
+                                 auto_widen sidecar column. Inputs with sidecar: {with_sidecar:?}; \
+                                 inputs without sidecar: {without_sidecar:?}. The runtime \
+                                 concatenates streams positionally against the merge's output \
+                                 schema (taken from the first input); a sidecar-present record \
+                                 cannot be merged with sidecar-absent records without losing \
+                                 either the unmapped fields or column-count alignment."
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(
+                            "set every merge upstream source to the same `on_unmapped` policy \
+                             (all `auto_widen` to keep the sidecar, or all `drop`/`reject` to \
+                             omit it). Per-source policy lives in the source's `config.on_unmapped` \
+                             block; the engine-wide default is `auto_widen`.",
+                        ),
+                    );
+                }
                 if let Some(first) = header.inputs.first()
                     && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {

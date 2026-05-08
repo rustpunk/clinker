@@ -419,6 +419,69 @@ nodes:
     );
 }
 
+/// E315 — Merge inputs disagreeing on `$widened` sidecar presence
+/// (one source on `auto_widen`, another on `drop`) fail compile with
+/// a focused diagnostic naming both groups of inputs and pointing at
+/// the per-source `on_unmapped` knob. Without this pre-check the
+/// dispatcher would raise E314 SchemaMismatch at runtime with a
+/// column-list dump that doesn't name the policy mismatch.
+#[test]
+fn test_merge_mixed_on_unmapped_policy_emits_e315() {
+    let yaml = r#"
+pipeline:
+  name: merge-mixed
+nodes:
+  - type: source
+    name: src_widen
+    config:
+      name: src_widen
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: src_drop
+    config:
+      name: src_drop
+      type: csv
+      path: b.csv
+      on_unmapped:
+        mode: drop
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: merged
+    inputs: [src_widen, src_drop]
+  - type: output
+    name: out
+    input: merged
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("E315 must reject merge of disagreeing on_unmapped policies");
+    let e315 = diags.iter().find(|d| d.code == "E315").unwrap_or_else(|| {
+        panic!(
+            "E315 must be present; got: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        e315.message.contains("src_widen") && e315.message.contains("src_drop"),
+        "E315 must name both disagreeing inputs; got: {}",
+        e315.message
+    );
+    assert!(
+        e315.message.contains("$widened") || e315.message.contains("auto_widen"),
+        "E315 must mention the sidecar / policy; got: {}",
+        e315.message
+    );
+}
+
 /// `$widened` propagates through an Aggregate node. The aggregate
 /// reduces N input rows to one output row per group; each input row's
 /// `$widened` map payload has no canonical reduction, so the
