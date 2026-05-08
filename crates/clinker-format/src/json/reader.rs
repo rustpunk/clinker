@@ -261,40 +261,20 @@ impl JsonReader {
         result
     }
 
-    /// Build a Record from a flat JSON object keyed by schema-field.
-    ///
-    /// Keys absent from the declared schema route to `$meta.*` via
-    /// `Record::set_meta`. The metadata map caps at 64 keys; the 65th
-    /// raises `FormatError::MetadataCapExceeded` carrying the partial
-    /// record so the executor can route it to DLQ.
+    /// Builds a Record carrying the JSON object's actual keys (per-record
+    /// schema). Each record's `Arc<Schema>` reflects exactly the keys
+    /// present in that record — the per-Source `OnUnmapped` policy at
+    /// the dispatch layer reconciles records against the user-declared
+    /// schema (probing for `auto_widen`, rejecting on `reject`, or
+    /// silently dropping on `drop`).
     fn map_to_record(
         &self,
         flat: &serde_json::Map<String, serde_json::Value>,
-        schema: &Arc<Schema>,
     ) -> Result<Record, FormatError> {
-        let values: Vec<Value> = schema
-            .columns()
-            .iter()
-            .map(|col| flat.get(&**col).map(json_to_value).unwrap_or(Value::Null))
-            .collect();
-        let mut record = Record::new(Arc::clone(schema), values);
-        let mut meta_count = 0usize;
-        for (key, val) in flat {
-            if schema.index(key).is_none() {
-                let value = json_to_value(val);
-                match record.set_meta(key, value) {
-                    Ok(()) => meta_count += 1,
-                    Err(_) => {
-                        return Err(FormatError::MetadataCapExceeded {
-                            record,
-                            key: key.clone(),
-                            count: meta_count,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(record)
+        let columns: Vec<Box<str>> = flat.keys().map(|k| k.clone().into_boxed_str()).collect();
+        let schema = Arc::new(Schema::new(columns));
+        let values: Vec<Value> = flat.values().map(json_to_value).collect();
+        Ok(Record::new(schema, values))
     }
 }
 
@@ -335,11 +315,10 @@ impl FormatReader for JsonReader {
         if self.schema.is_none() {
             self.schema()?;
         }
-        let schema = self.schema.as_ref().unwrap().clone();
 
         if !self.pending.is_empty() {
             let flat = self.pending.remove(0);
-            return Ok(Some(self.map_to_record(&flat, &schema)?));
+            return Ok(Some(self.map_to_record(&flat)?));
         }
 
         loop {
@@ -353,7 +332,7 @@ impl FormatReader for JsonReader {
             if expanded.is_empty() {
                 continue;
             }
-            let record = self.map_to_record(&expanded[0], &schema)?;
+            let record = self.map_to_record(&expanded[0])?;
             self.pending = expanded.into_iter().skip(1).collect();
             return Ok(Some(record));
         }
@@ -679,18 +658,20 @@ mod tests {
     }
 
     #[test]
-    fn test_json_unknown_key_routes_to_meta() {
-        // Post-overflow-rip: JSON keys absent from the inferred schema
-        // route to `$meta.*` via `Record::set_meta` — readers no longer
-        // surface them through `Record::get`.
+    fn test_json_emits_per_record_schema() {
+        // Each emitted record carries the actual keys present in its
+        // JSON object — the per-record `Arc<Schema>` reflects exactly
+        // what was parsed. The dispatch-layer `CoercingReader` then
+        // applies the per-Source `OnUnmapped` policy (drop/reject)
+        // against the user-declared schema.
         let mut r = reader_from_str("{\"a\":1}\n{\"a\":2,\"b\":3}\n", default_config());
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
-        let _r1 = r.next_record().unwrap().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("a"), Some(&Value::Integer(1)));
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("a"), Some(&Value::Integer(2)));
-        assert_eq!(r2.get("b"), None);
-        assert_eq!(r2.get_meta("b"), Some(&Value::Integer(3)));
+        assert_eq!(r2.get("b"), Some(&Value::Integer(3)));
     }
 
     #[test]
@@ -713,6 +694,10 @@ mod tests {
 
     #[test]
     fn test_json_array_paths_empty_array() {
+        // Alice's empty `orders` array suppresses her record entirely
+        // under Explode mode; Bob's expanded record is the only output.
+        // Keys absent from the inferred schema (which here is just
+        // `orders.id`) are silently dropped.
         let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
@@ -723,14 +708,17 @@ mod tests {
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
-        let _s = r.schema().unwrap();
+        let s = r.schema().unwrap();
+        // Schema inference walks Alice's record only (the streaming
+        // reader can't peek further); her empty `orders` array yields
+        // no nested columns, so the inferred schema is empty. Bob's
+        // expanded record carries its own per-record schema with
+        // `name` and the exploded `orders.id` field — the dispatch
+        // layer applies the per-Source `OnUnmapped` policy against
+        // the user-declared schema.
+        assert_eq!(s.columns().len(), 0);
         let r1 = r.next_record().unwrap().unwrap();
-        // Post-rip: `name` either lives at its schema slot (if the
-        // inferred schema included it) or in metadata (if schema
-        // inference walked Bob's expanded record and only saw
-        // `orders.id`). Consult both paths.
-        let resolved_name = r1.get("name").or_else(|| r1.get_meta("name"));
-        assert_eq!(resolved_name, Some(&Value::String("Bob".into())));
+        assert_eq!(r1.iter_all_fields().count(), 2);
         assert!(r.next_record().unwrap().is_none());
     }
 }

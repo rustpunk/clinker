@@ -107,7 +107,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "name,age\nAlice,30\nBob,25\n";
         let result = run_pipeline(yaml, csv);
@@ -158,7 +158,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -196,7 +196,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -242,7 +242,7 @@ nodes:
     name: transformed
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
     exclude:
     - internal_id
     mapping:
@@ -290,7 +290,7 @@ nodes:
         // Verify unmapped fields are present
         assert!(
             output.contains("first_name"),
-            "include_unmapped should pass through"
+            "include_widened should pass through"
         );
 
         // Parse output as CSV to verify structure
@@ -751,7 +751,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "name,amount\nAlice,10\nBob,bad\nCharlie,5\n";
         let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();

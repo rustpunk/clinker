@@ -1760,8 +1760,8 @@ fn emit_for_probe<'a>(
                         match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                             Ok(EvalResult::Emit {
                                 fields: emitted,
-                                metadata,
                                 record_vars,
+                                ..
                             }) => {
                                 let mut rec = match output_schema {
                                     Some(s) => widen_record_to_schema(probe_record, s),
@@ -1769,9 +1769,6 @@ fn emit_for_probe<'a>(
                                 };
                                 for (n, v) in emitted {
                                     rec.set(&n, v);
-                                }
-                                for (k, v) in metadata {
-                                    let _ = rec.set_meta(&k, v);
                                 }
                                 for (k, v) in *record_vars {
                                     let _ = rec.set_record_var(&k, v);
@@ -1790,8 +1787,8 @@ fn emit_for_probe<'a>(
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit {
                             fields: emitted,
-                            metadata,
                             record_vars,
+                            ..
                         }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(probe_record, s),
@@ -1799,9 +1796,6 @@ fn emit_for_probe<'a>(
                             };
                             for (n, v) in emitted {
                                 rec.set(&n, v);
-                            }
-                            for (k, v) in metadata {
-                                let _ = rec.set_meta(&k, v);
                             }
                             for (k, v) in *record_vars {
                                 let _ = rec.set_record_var(&k, v);
@@ -1838,15 +1832,7 @@ fn emit_for_probe<'a>(
                             ),
                         });
                     }
-                    let mut rec = Record::new(Arc::clone(target_schema), values);
-                    // Carry the probe's `$meta.*` forward through synthetic
-                    // chain steps. User-emitted record metadata travels with
-                    // the probe row by contract; without this copy the next
-                    // step's `widen_record_to_schema` finds no meta to
-                    // propagate.
-                    for (k, v) in probe_record.iter_meta() {
-                        let _ = rec.set_meta(k, v.clone());
-                    }
+                    let rec = Record::new(Arc::clone(target_schema), values);
                     output.push((rec, rn));
                 }
             }

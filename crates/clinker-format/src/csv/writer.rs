@@ -75,9 +75,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         // Header is built from the writer's pinned schema. Engine-stamped
         // columns (today: `$ck.<field>`) are stripped unless the Output
-        // node opts in. Framing metadata stays in `$meta.*` and only
-        // surfaces via `iter_meta` when `include_metadata` is set on the
-        // Output node.
+        // node opts in.
         if self.config.include_header && !self.header_written {
             let header: Vec<&str> =
                 filtered_header_columns(&self.schema, self.config.include_engine_stamped);
@@ -330,17 +328,6 @@ mod tests {
         };
         let output = write_to_string(&schema, config, &[record]);
         assert_eq!(output, "id,$ck.id\n7,7\n");
-    }
-
-    #[test]
-    fn test_csv_writer_emits_schema_fields_only() {
-        // Writer contract after the overflow rip: metadata stays in
-        // `$meta.*` and is stripped from the default output.
-        let schema = make_schema(&["id"]);
-        let mut record = make_record(&schema, vec![Value::Integer(1)]);
-        record.set_meta("zulu", Value::String("z".into())).unwrap();
-        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
-        assert_eq!(output, "id\n1\n");
     }
 
     #[test]

@@ -424,10 +424,6 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
-            Expr::MetaAccess { node_id, .. } => {
-                // Metadata keys are runtime-resolved — accept any field name
-                self.bind(*node_id, ResolvedBinding::PipelineMember);
-            }
             Expr::RecordAccess {
                 node_id,
                 field,

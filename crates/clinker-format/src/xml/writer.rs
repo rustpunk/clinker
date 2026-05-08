@@ -66,11 +66,9 @@ impl<W: Write> XmlWriter<W> {
         Ok(())
     }
 
-    /// Collect schema fields as (name, value) pairs, then write them as
-    /// nested XML elements. Metadata (`$meta.*`) is stripped from the
-    /// default output; the Output-node `include_metadata` flag is the
-    /// opt-in for layers that want to surface it. Engine-stamped
-    /// columns follow the same rule via `include_engine_stamped`.
+    /// Collects schema fields as (name, value) pairs, then writes them as
+    /// nested XML elements. Engine-stamped columns are stripped from the
+    /// default output; callers opt in via `include_engine_stamped`.
     fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
         let fields: Vec<(&str, &Value)> = if self.config.include_engine_stamped {
             record.iter_all_fields().collect()
@@ -422,29 +420,5 @@ mod tests {
         assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(r1.get("value"), Some(&Value::Integer(42)));
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
-    }
-
-    /// Default XML writer output contains only schema columns; metadata
-    /// stays in `$meta.*` unless a higher layer opts in via
-    /// `include_metadata: true` (which route-rewrites the Record
-    /// upstream of the writer).
-    #[test]
-    fn test_xml_writer_emits_schema_fields_only() {
-        let schema = test_schema();
-        let mut record = make_record(&schema, "Alice", 30);
-        record
-            .set_meta("audit", Value::String("flagged".into()))
-            .unwrap();
-        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
-        assert!(output.contains("<name>Alice</name>"));
-        assert!(output.contains("<age>30</age>"));
-        assert!(
-            !output.contains("audit"),
-            "default writer must strip metadata; got: {output}"
-        );
-        assert!(
-            !output.contains("flagged"),
-            "default writer must strip metadata values; got: {output}"
-        );
     }
 }

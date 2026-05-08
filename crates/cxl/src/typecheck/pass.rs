@@ -484,11 +484,6 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::MetaAccess { node_id, .. } => {
-                self.set_type(*node_id, Type::Any);
-                Type::Any
-            }
-
             Expr::RecordAccess { node_id, field, .. } => {
                 // `$record.<key>` reads against the declared registry —
                 // the resolver already rejected undeclared keys, so a miss
@@ -1012,7 +1007,7 @@ impl<'a> TypeChecker<'a> {
                 );
             }
 
-            // Recurse into children. Literals, $pipeline.*, $meta.*, now,
+            // Recurse into children. Literals, $pipeline.*, now,
             // qualified field refs, and wildcards are all exempt.
             Expr::Binary { lhs, rhs, .. } => {
                 self.walk_agg_ctx(lhs, let_exprs);
@@ -1061,7 +1056,6 @@ impl<'a> TypeChecker<'a> {
             | Expr::VarsAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
-            | Expr::MetaAccess { .. }
             | Expr::RecordAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }

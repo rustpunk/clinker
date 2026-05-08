@@ -38,7 +38,7 @@ nodes:
       name: out
       type: csv
       path: out_{source_file}.csv
-      include_unmapped: true
+      include_widened: true
 "#;
 
 #[test]

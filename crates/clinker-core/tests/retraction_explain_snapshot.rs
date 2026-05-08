@@ -78,7 +78,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let text = render_explain(yaml);
     insta::assert_snapshot!("explain_relaxed_aggregate_buffer_mode", text);
@@ -123,7 +123,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let text = render_explain(yaml);
     assert!(

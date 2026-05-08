@@ -135,7 +135,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Six HR rows summing to 60 (10+10+10+10+10+10) — `total - 60 == 0`
     // for HR, fires division-by-zero in `post_check` for HR's single
@@ -252,7 +252,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -367,7 +367,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "order_id,department,amount\n\
                O1,HR,10\nO2,HR,10\nO3,HR,10\n\
@@ -458,7 +458,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // HR sums to 60 (six 10s), triggering division-by-zero post_dept;
     // ENG is clean (sum = 600).
@@ -544,7 +544,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // HR sums to 30 (three 10s), triggers division by zero. ENG is
     // clean.

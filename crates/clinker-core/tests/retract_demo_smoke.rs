@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 

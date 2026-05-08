@@ -11,7 +11,7 @@
 //! behavior, regression-tested below.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::config::{CompileContext, PipelineConfig};

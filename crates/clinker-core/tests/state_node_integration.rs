@@ -318,7 +318,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse_config");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

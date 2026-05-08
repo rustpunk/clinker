@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use clinker_record::{Record, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
-use crate::error::PipelineError;
+use crate::config::OutputConfig;
 
 /// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
@@ -23,8 +22,9 @@ pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<St
 
 /// Apply output projection: gather → exclude → mapping.
 ///
-/// 1. **Gather**: Start with CXL-emitted fields. If `include_unmapped`,
-///    add all input fields not already emitted.
+/// 1. **Gather**: Start with CXL-emitted fields. If `include_widened`,
+///    add all input record fields not already emitted (the path that
+///    surfaces `OnUnmapped::AutoWiden`-discovered columns at the sink).
 /// 2. **Exclude**: Remove any field in `exclude` list (by current name).
 /// 3. **Mapping**: Rename surviving fields per `mapping` table.
 pub fn project_output(
@@ -39,13 +39,8 @@ pub fn project_output(
 /// bookkeeping map input).
 ///
 /// Gather order follows `Record::iter_all_fields`: schema columns in
-/// declaration order, then overflow entries in insertion (emit) order.
-/// Metadata writes land through `Record::set_meta` upstream, so
-/// `include_metadata` drives off `record.iter_meta()` here instead of
-/// a separately-threaded map.
-///
-/// Builds the output record in one pass when the config has no
-/// exclude / mapping / metadata merge — the hot path avoids an
+/// declaration order. Builds the output record in one pass when the
+/// config has no exclude / mapping — the hot path avoids an
 /// intermediate `IndexMap` entirely. Config-driven rewrites fall into
 /// the slow path, which keeps an owned `IndexMap` only for the
 /// duration of the call.
@@ -60,11 +55,12 @@ pub fn project_output_with_meta(
 
 /// Record-driven projection (Invariant 3 implementation).
 ///
-/// `include_unmapped: true` surfaces every column on the record AND any
-/// off-schema reader columns captured into `$meta.*` during schema
-/// reprojection.
+/// `include_widened: true` surfaces every column on the record. With
+/// `OnUnmapped::AutoWiden` at the source, the record's schema includes
+/// both user-declared columns and probe-discovered columns; this flag
+/// lets the sink choose to emit all of them.
 ///
-/// `include_unmapped: false`: when `cxl_emit_names` is `Some`, the output
+/// `include_widened: false`: when `cxl_emit_names` is `Some`, the output
 /// is restricted to those names — upstream passthroughs the user did
 /// NOT explicitly emit are dropped. This matches the documented Output
 /// projection semantic. When `cxl_emit_names` is `None` (caller has no
@@ -75,19 +71,18 @@ pub fn project_output_from_record(
     config: &OutputConfig,
     cxl_emit_names: Option<&[String]>,
 ) -> Record {
-    let drop_unmapped = !config.include_unmapped && cxl_emit_names.is_some();
+    let drop_unmapped = !config.include_widened && cxl_emit_names.is_some();
     let needs_rewrite = config.exclude.is_some()
         || config.mapping.is_some()
-        || !config.include_metadata.is_none()
-        || config.include_unmapped
+        || config.include_widened
         || drop_unmapped;
     let include_engine_stamped = config.include_correlation_keys;
 
     if !needs_rewrite {
-        // Fast path: no exclude, no mapping, no metadata merge — emit
-        // all Record fields in natural iteration order, no
-        // intermediate allocation. Engine-stamped columns are dropped
-        // unless the Output node opts in.
+        // Fast path: no exclude, no mapping — emit all Record fields in
+        // natural iteration order, no intermediate allocation.
+        // Engine-stamped columns are dropped unless the Output node
+        // opts in.
         let field_count = input_record.total_field_count();
         let mut schema_builder = SchemaBuilder::with_capacity(field_count);
         let mut values: Vec<Value> = Vec::with_capacity(field_count);
@@ -106,8 +101,7 @@ pub fn project_output_from_record(
     }
 
     // Slow path: config requires rewriting field names / dropping
-    // fields / merging metadata, which all want the temporary
-    // IndexMap's keyed access.
+    // fields, which wants the temporary IndexMap's keyed access.
     let mut fields: IndexMap<String, Value> =
         IndexMap::with_capacity(input_record.total_field_count());
     if include_engine_stamped {
@@ -121,54 +115,14 @@ pub fn project_output_from_record(
     }
 
     // Restrict to user-emitted columns when the caller supplied the
-    // upstream node's emit-name list and `include_unmapped: false`.
-    // Walk the emit list to preserve declaration order; metadata fields
-    // (meta-prefixed below) are added after this restriction so they
-    // survive even though they are not in `cxl_emit_names`.
+    // upstream node's emit-name list and `include_widened: false`.
     if drop_unmapped {
-        let allowed: std::collections::HashSet<&str> =
-            cxl_emit_names.unwrap().iter().map(|s| s.as_str()).collect();
         let kept: IndexMap<String, Value> = cxl_emit_names
             .unwrap()
             .iter()
             .filter_map(|name| fields.get(name.as_str()).map(|v| (name.clone(), v.clone())))
             .collect();
         fields = kept;
-        let _ = allowed;
-    }
-
-    // Merge metadata into output when include_metadata is set (key is
-    // `meta.<name>`) or when include_unmapped is set (key is `<name>`,
-    // mirroring the pre-rip overflow-passthrough shape). Both paths
-    // share the `iter_meta` iterator; include_unmapped uses the bare
-    // key so downstream tools that consumed overflow fields see the
-    // same field names they did pre-rip.
-    if !config.include_metadata.is_none() {
-        let meta_iter: Vec<(String, Value)> = match &config.include_metadata {
-            IncludeMetadata::None => vec![],
-            IncludeMetadata::All => input_record
-                .iter_meta()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect(),
-            IncludeMetadata::Allowlist(allow) => input_record
-                .iter_meta()
-                .filter(|(k, _)| allow.iter().any(|a| a.as_str() == *k))
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect(),
-        };
-        for (key, value) in meta_iter {
-            let output_name = format!("meta.{key}");
-            if !fields.contains_key(&output_name) {
-                fields.insert(output_name, value);
-            }
-        }
-    }
-    if config.include_unmapped {
-        for (key, value) in input_record.iter_meta() {
-            if !fields.contains_key(key) {
-                fields.insert(key.to_string(), value.clone());
-            }
-        }
     }
 
     if let Some(ref exclude_list) = config.exclude {
@@ -193,40 +147,6 @@ pub fn project_output_from_record(
         .build();
     let values: Vec<Value> = fields.into_values().collect();
     Record::new(schema, values)
-}
-
-/// Merge per-record metadata into the projected output fields.
-///
-/// Called after `project_output` when `include_metadata` is set.
-/// Metadata fields appear with `meta.` prefix (e.g., `meta.tier`).
-/// Returns `Err` if a source field collides with a metadata field.
-pub fn merge_metadata_into_output(
-    record: &Record,
-    fields: &mut IndexMap<String, Value>,
-    include: &IncludeMetadata,
-) -> Result<(), PipelineError> {
-    let meta_keys: Vec<(&str, &Value)> = match include {
-        IncludeMetadata::None => return Ok(()),
-        IncludeMetadata::All => record.iter_meta().collect(),
-        IncludeMetadata::Allowlist(allow) => record
-            .iter_meta()
-            .filter(|(k, _)| allow.iter().any(|a| a == k))
-            .collect(),
-    };
-
-    for (key, value) in meta_keys {
-        let output_name = format!("meta.{key}");
-        if fields.contains_key(&output_name) {
-            return Err(PipelineError::Config(ConfigError::Validation(format!(
-                "metadata collision: output already contains field '{}' \
-                 and metadata key '{}' would produce the same output name",
-                output_name, key
-            ))));
-        }
-        fields.insert(output_name, value.clone());
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -257,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_emitted_plus_unmapped() {
+    fn test_gather_emitted_plus_widened() {
         // project_output drives off the Record itself, so emitted fields
         // must land on the Record before the projection is invoked. The
         // widened schema guarantees every `Record::set` at emit sites
@@ -270,13 +190,12 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_unmapped: true,
+            include_widened: true,
             include_header: None,
             mapping: None,
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
-            include_metadata: Default::default(),
             include_correlation_keys: false,
             correlation_fanout_policy: None,
             if_exists: Default::default(),
@@ -311,13 +230,12 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_unmapped: true,
+            include_widened: true,
             include_header: None,
             mapping: None,
             exclude: Some(vec!["secret".into()]),
             sort_order: None,
             preserve_nulls: None,
-            include_metadata: Default::default(),
             include_correlation_keys: false,
             correlation_fanout_policy: None,
             if_exists: Default::default(),
@@ -345,13 +263,12 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_unmapped: true,
+            include_widened: true,
             include_header: None,
             mapping: Some(mapping),
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
-            include_metadata: Default::default(),
             include_correlation_keys: false,
             correlation_fanout_policy: None,
             if_exists: Default::default(),
@@ -393,13 +310,12 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_unmapped: false,
+            include_widened: false,
             include_header: None,
             mapping: None,
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
-            include_metadata: Default::default(),
             include_correlation_keys,
             correlation_fanout_policy: None,
             if_exists: Default::default(),

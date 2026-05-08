@@ -157,9 +157,8 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. } => {
-            // pipeline.*/vars.*/source.*/record.*/meta.* not allowed in module constants —
+            // pipeline.*/vars.*/source.*/record.* not allowed in module constants —
             // but we don't reject here; the evaluator will catch it at runtime.
         }
         Expr::AggCall { args, .. } => {
@@ -271,7 +270,6 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }

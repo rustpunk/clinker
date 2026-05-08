@@ -856,7 +856,6 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
         Expr::Literal { .. }
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
-        | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -2480,10 +2479,6 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
             name, expr, target, ..
         } = stmt
         {
-            // Meta emits write to per-record metadata (`$meta.*`), not
-            // to the output row — skip them so the row/schema view
-            // downstream operators see only reflects user-visible data
-            // fields.
             if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
@@ -3409,7 +3404,6 @@ fn walk_for_unknown_refs(
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -3487,9 +3481,6 @@ fn walk_statement_exprs(
 /// Unlike `propagate_row` (Transform), combine's output is a FRESH
 /// closed row — no pass-through of the merged row's qualified fields.
 /// Emit LHS names are always unqualified (`QualifiedField::bare`).
-/// Meta emits (`emit $meta.x = ...`) don't contribute to the output
-/// row schema; they write to per-record metadata, not the record
-/// itself.
 ///
 /// The driver's `$ck.<field>` shadow columns always land on the output
 /// row so the combined record carries the driver's frozen-identity

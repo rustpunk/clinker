@@ -18,9 +18,9 @@
 //!   builtin provenance (`file`, `row`, `path`, `count`, `batch`,
 //!   `ingestion_timestamp`).
 //! - [`ScopedVarsRegistry::record`] — read via `$record.<key>`. No
-//!   builtins. Per-record scratch state distinct from `$meta.*` (which
-//!   is single-writer-within-a-CXL-program); `$record.*` is multi-writer
-//!   across nodes within a record's lifetime. Naming follows the
+//!   builtins. Per-record scratch state, multi-writer across nodes
+//!   within a record's lifetime. Written by Transforms whose
+//!   `declares:` entries have `scope: record`. Naming follows the
 //!   workspace's `Record` type — applies uniformly to CSV rows, JSON
 //!   objects, XML elements, and fixed-width records.
 

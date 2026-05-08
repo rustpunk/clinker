@@ -410,7 +410,6 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }

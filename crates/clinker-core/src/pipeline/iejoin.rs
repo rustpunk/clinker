@@ -776,8 +776,8 @@ pub(crate) fn execute_combine_iejoin(
                             match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                                 Ok(EvalResult::Emit {
                                     fields,
-                                    metadata,
                                     record_vars,
+                                    ..
                                 }) => {
                                     let mut rec = match output_schema {
                                         Some(s) => widen_record_to_schema(driver_record, s),
@@ -785,9 +785,6 @@ pub(crate) fn execute_combine_iejoin(
                                     };
                                     for (n, v) in fields {
                                         rec.set(&n, v);
-                                    }
-                                    for (k, v) in metadata {
-                                        let _ = rec.set_meta(&k, v);
                                     }
                                     for (k, v) in *record_vars {
                                         let _ = rec.set_record_var(&k, v);
@@ -851,16 +848,7 @@ pub(crate) fn execute_combine_iejoin(
                                     ),
                                 });
                             }
-                            let mut rec = Record::new(Arc::clone(target_schema), values);
-                            // Carry the driver's `$meta.*` forward through
-                            // synthetic chain steps. User-emitted record
-                            // metadata travels with the driver row by
-                            // contract; without this copy the next step's
-                            // `widen_record_to_schema` finds no meta to
-                            // propagate.
-                            for (k, v) in driver_record.iter_meta() {
-                                let _ = rec.set_meta(k, v.clone());
-                            }
+                            let rec = Record::new(Arc::clone(target_schema), values);
                             output_records.push((rec, driver_order));
                             matched_driver[driver_idx] = true;
                             emitted_since_check += 1;
@@ -944,8 +932,8 @@ pub(crate) fn execute_combine_iejoin(
                 match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                     Ok(EvalResult::Emit {
                         fields,
-                        metadata,
                         record_vars,
+                        ..
                     }) => {
                         let mut rec = match output_schema {
                             Some(s) => widen_record_to_schema(driver_record, s),
@@ -953,9 +941,6 @@ pub(crate) fn execute_combine_iejoin(
                         };
                         for (n, v) in fields {
                             rec.set(&n, v);
-                        }
-                        for (k, v) in metadata {
-                            let _ = rec.set_meta(&k, v);
                         }
                         for (k, v) in *record_vars {
                             let _ = rec.set_record_var(&k, v);

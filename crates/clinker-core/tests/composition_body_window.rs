@@ -14,11 +14,11 @@
 //! Each test below pins a different rooting variant.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::plan::index::PlanIndexRoot;
 
@@ -92,7 +92,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();
@@ -168,7 +168,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();
@@ -231,7 +231,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 department,amount
@@ -335,7 +335,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();

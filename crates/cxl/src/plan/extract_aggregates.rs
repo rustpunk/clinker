@@ -77,14 +77,13 @@ pub fn extract_aggregates(
                 ..
             } => {
                 use crate::ast::EmitTarget;
-                let is_meta = match target {
-                    EmitTarget::Field => false,
-                    EmitTarget::Meta => true,
+                match target {
+                    EmitTarget::Field => {}
                     EmitTarget::Pipeline | EmitTarget::Source | EmitTarget::Record => {
                         diagnostics.push(diag_scope_emit_in_aggregate(*span));
                         continue;
                     }
-                };
+                }
                 let mut residual = expr.clone();
                 substitute_let_bindings(&mut residual, &let_bindings);
                 if let Err(e) =
@@ -97,7 +96,6 @@ pub fn extract_aggregates(
                 emits.push(CompiledEmit {
                     output_name: name.clone(),
                     residual,
-                    is_meta,
                 });
             }
             Statement::Trace { .. } | Statement::UseStmt { .. } | Statement::ExprStmt { .. } => {
@@ -205,7 +203,6 @@ fn extract_aggs_from_expr(
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -349,7 +346,6 @@ fn rewrite_group_key_refs(
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -435,7 +431,6 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -485,7 +480,6 @@ fn contains_agg_call(expr: &Expr) -> bool {
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
@@ -559,9 +553,6 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
             input_name, field, ..
         } => {
             let _ = write!(buf, "qs:{input_name}.{field}");
-        }
-        Expr::MetaAccess { field, .. } => {
-            let _ = write!(buf, "m:{field}");
         }
         Expr::RecordAccess { field, .. } => {
             let _ = write!(buf, "r:{field}");

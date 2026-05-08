@@ -370,20 +370,19 @@ impl Parser {
                 ));
             }
             let target = match ns.as_str() {
-                "meta" => EmitTarget::Meta,
                 "pipeline" => EmitTarget::Pipeline,
                 "source" => EmitTarget::Source,
                 "record" => EmitTarget::Record,
                 _ => {
                     return Err(self.error(
                         &format!(
-                            "emit ${}... is not valid; emit accepts $meta, $pipeline, $source, \
+                            "emit ${}... is not valid; emit accepts $pipeline, $source, \
                              or $record namespaces",
                             ns
                         ),
-                        "Only $meta and producer-declared scope namespaces are writable",
-                        "Use one of: emit name = expr, emit $meta.x = expr, \
-                         emit $pipeline.x = expr, emit $source.x = expr, emit $record.x = expr",
+                        "Only producer-declared scope namespaces are writable",
+                        "Use one of: emit name = expr, emit $pipeline.x = expr, \
+                         emit $source.x = expr, emit $record.x = expr",
                     ));
                 }
             };
@@ -914,12 +913,11 @@ impl Parser {
                 })
             }
 
-            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn(), $meta.field
+            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn()
             Token::Dollar => {
                 self.advance(); // consume '$'
-                let ns = self.expect_ident(
-                    "system namespace (pipeline, vars, source, record, window, meta)",
-                )?;
+                let ns =
+                    self.expect_ident("system namespace (pipeline, vars, source, record, window)")?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
                 match ns.as_str() {
@@ -1004,20 +1002,10 @@ impl Parser {
                             })
                         }
                     }
-                    "meta" => {
-                        let nid = self.alloc_id();
-                        let field = self.expect_ident("metadata field name")?;
-                        let end = self.prev_span();
-                        Ok(Expr::MetaAccess {
-                            node_id: nid,
-                            field: field.into(),
-                            span: Span::new(start.start as usize, end.end as usize),
-                        })
-                    }
                     other => Err(self.error(
                         &format!("unknown system namespace '${other}'"),
-                        "Valid system namespaces are: pipeline, source, record, window, meta",
-                        "Use $pipeline.field, $source.field, $record.field, $window.fn(), or $meta.field",
+                        "Valid system namespaces are: pipeline, source, record, window",
+                        "Use $pipeline.field, $source.field, $record.field, or $window.fn()",
                     )),
                 }
             }
@@ -1445,18 +1433,6 @@ mod tests {
             Statement::Emit { name, target, .. } => {
                 assert_eq!(&**name, "last");
                 assert_eq!(*target, EmitTarget::Pipeline);
-            }
-            _ => panic!("expected Emit"),
-        }
-    }
-
-    #[test]
-    fn test_parse_emit_meta_target_tag() {
-        let r = parse_ok("emit $meta.tier = \"A\"");
-        match first_stmt(&r) {
-            Statement::Emit { name, target, .. } => {
-                assert_eq!(&**name, "tier");
-                assert_eq!(*target, EmitTarget::Meta);
             }
             _ => panic!("expected Emit"),
         }

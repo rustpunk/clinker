@@ -18,11 +18,11 @@
 //! `executor::tests::correlated_dlq::group_identity_fixed_at_ingest_when_transform_rewrites_key`.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 
 #[derive(Clone, Default)]
@@ -141,7 +141,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
     let (report, output) = run_with_composition(yaml, csv);
@@ -229,7 +229,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
     let (report, _output) = run_with_composition(yaml, csv);

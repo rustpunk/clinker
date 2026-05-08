@@ -688,6 +688,13 @@ pub struct SourceBody {
     /// source has no CK and DLQs per-record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_key: Option<crate::config::CorrelationKey>,
+    /// Policy for fields the reader discovers in input records that
+    /// the declared `schema:` does not name. Default `auto_widen` with
+    /// `probe_records: 1024`, `max_widened_fields: 256`,
+    /// `on_late_unmapped: drop`. See [`OnUnmapped`] for the design
+    /// rationale and citations.
+    #[serde(default)]
+    pub on_unmapped: OnUnmapped,
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
 }
@@ -715,6 +722,43 @@ pub struct ColumnDecl {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: cxl::typecheck::Type,
+}
+
+/// Policy for fields a reader discovers in an input record that the
+/// declared `schema:` does not name.
+///
+/// - **`drop`** (default): silently strip undeclared fields at read
+///   time. Matches Snowflake's `MATCH_BY_COLUMN_NAME` with
+///   `ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE` and dbt's
+///   `on_schema_change=ignore`.
+/// - **`reject`**: fail the source on the first record carrying an
+///   undeclared field. Strict; matches dlt's `freeze` mode and
+///   Iceberg's column-ID-mismatch behavior.
+///
+/// YAML accepts the discriminated form. Omission of the field uses
+/// `Default::default()` — `drop`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum OnUnmapped {
+    /// Fail the source on any undeclared field. Use when input shape is
+    /// a hard contract (regulated data, partner integration with a
+    /// frozen schema).
+    Reject,
+    /// Silently strip undeclared fields at read time. Fields not in the
+    /// declared schema do not reach the record.
+    #[default]
+    Drop,
+}
+
+impl OnUnmapped {
+    /// Stable identifier for diagnostics and metrics. Returns
+    /// `"reject"` or `"drop"`.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            OnUnmapped::Reject => "reject",
+            OnUnmapped::Drop => "drop",
+        }
+    }
 }
 
 /// Transform variant body. The new shape: a mandatory `cxl:` field

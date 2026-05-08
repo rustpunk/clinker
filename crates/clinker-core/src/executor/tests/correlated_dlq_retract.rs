@@ -102,7 +102,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nB,200\n";
     let (counters, dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
@@ -159,7 +159,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE3,ENG,100\n";
     let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
@@ -218,7 +218,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "emp_id,value\nA,100\nA,bad\nB,200\n";
     let (counters, dlq_entries, _output) = run_pipeline(yaml, csv).unwrap();
@@ -266,7 +266,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
     correlation_fanout_policy: primary
 "#;
     let csv = "emp_id,value\nA,100\nB,200\n";
@@ -341,7 +341,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Twelve rows across two departments. Order O7 in HR carries the
     // sentinel `BAD` amount; the validate transform's `to_int` fires
@@ -496,7 +496,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Order O3 in HR carries the bad amount; the survivors are
     // {10, 20, 40, 50}. Group ENG is clean.
@@ -626,7 +626,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // HR has bad row O4 (amount BAD); survivors are {10,20,30,40} →
     // total=100 / n=4 → per_capita=25. ENG is clean: {100,200,300} →
@@ -750,7 +750,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -893,7 +893,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Order O3 has BOTH amount=BAD and tag=BAD — two distinct failures
     // upstream of the aggregate. Survivors in HR: {10, 20, 40} → total
@@ -1025,7 +1025,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1110,7 +1110,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1193,7 +1193,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1273,7 +1273,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\nO3,ENG,100\n";
 

@@ -293,7 +293,6 @@ fn walk_expr(
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }

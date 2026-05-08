@@ -566,10 +566,7 @@ pub(crate) fn project_rows_to_buffer_schema(
                     .unwrap_or(Value::Null);
                 values.push(v);
             }
-            let mut narrow = Record::new(Arc::clone(&narrow_schema), values);
-            for (k, v) in record.iter_meta() {
-                let _ = narrow.set_meta(k, v.clone());
-            }
+            let narrow = Record::new(Arc::clone(&narrow_schema), values);
             (narrow, rn)
         })
         .collect()
@@ -917,11 +914,7 @@ pub(crate) fn dispatch_plan_node(
                                     values[*target_idx] = r.values()[src_idx].clone();
                                 }
                             }
-                            let mut rebuilt = Record::new(Arc::clone(target), values);
-                            for (k, v) in r.iter_meta() {
-                                let _ = rebuilt.set_meta(k, v.clone());
-                            }
-                            rebuilt
+                            Record::new(Arc::clone(target), values)
                         }
                     }
                     None => r.clone(),
@@ -1506,11 +1499,7 @@ pub(crate) fn dispatch_plan_node(
                             // regardless of which input the record
                             // originated from.
                             let values = record.values().to_vec();
-                            let mut rebuilt = Record::new(Arc::clone(canonical), values);
-                            for (k, v) in record.iter_meta() {
-                                let _ = rebuilt.set_meta(k, v.clone());
-                            }
-                            record = rebuilt;
+                            record = Record::new(Arc::clone(canonical), values);
                         }
                         merged.push((record, rn));
                     }
@@ -2046,7 +2035,7 @@ pub(crate) fn dispatch_plan_node(
                 .unwrap_or(ctx.primary_output);
 
             // Compute the upstream node's CXL emit names once.
-            // `include_unmapped: false` consults this to drop upstream
+            // `include_widened: false` consults this to drop upstream
             // passthroughs the user did not explicitly emit.
             let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
             let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
@@ -2944,8 +2933,8 @@ pub(crate) fn dispatch_plan_node(
                                     {
                                         Ok(EvalResult::Emit {
                                             fields: emitted,
-                                            metadata,
                                             record_vars,
+                                            ..
                                         }) => {
                                             let mut rec = match combine_output_schema.as_ref() {
                                                 Some(s) => widen_record_to_schema(&probe_record, s),
@@ -2953,9 +2942,6 @@ pub(crate) fn dispatch_plan_node(
                                             };
                                             for (n, v) in emitted {
                                                 rec.set(&n, v);
-                                            }
-                                            for (k, v) in metadata {
-                                                let _ = rec.set_meta(&k, v);
                                             }
                                             for (k, v) in *record_vars {
                                                 let _ = rec.set_record_var(&k, v);
@@ -2987,8 +2973,8 @@ pub(crate) fn dispatch_plan_node(
                                 {
                                     Ok(EvalResult::Emit {
                                         fields: emitted,
-                                        metadata,
                                         record_vars,
+                                        ..
                                     }) => {
                                         let mut rec = match combine_output_schema.as_ref() {
                                             Some(s) => widen_record_to_schema(&probe_record, s),
@@ -2996,9 +2982,6 @@ pub(crate) fn dispatch_plan_node(
                                         };
                                         for (n, v) in emitted {
                                             rec.set(&n, v);
-                                        }
-                                        for (k, v) in metadata {
-                                            let _ = rec.set_meta(&k, v);
                                         }
                                         for (k, v) in *record_vars {
                                             let _ = rec.set_record_var(&k, v);
@@ -3076,16 +3059,7 @@ pub(crate) fn dispatch_plan_node(
                                         ),
                                     });
                                 }
-                                let mut rec = Record::new(Arc::clone(target_schema), values);
-                                // Driver-side `$meta.*` carries through an
-                                // N-ary chain — without this copy the next
-                                // chain step's `widen_record_to_schema`
-                                // finds no meta to forward and user-emitted
-                                // record metadata is lost on the final
-                                // output row.
-                                for (k, v) in probe_record.iter_meta() {
-                                    let _ = rec.set_meta(k, v.clone());
-                                }
+                                let rec = Record::new(Arc::clone(target_schema), values);
                                 output_records.push((rec, rn));
                                 emitted_since_check += 1;
                             }

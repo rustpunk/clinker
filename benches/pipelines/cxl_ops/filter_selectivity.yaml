@@ -45,7 +45,7 @@ nodes:
       name: high_pass
       type: csv
       path: bench://output_90.csv
-      include_unmapped: true
+      include_widened: true
 
   - type: output
     name: mid_pass
@@ -54,7 +54,7 @@ nodes:
       name: mid_pass
       type: csv
       path: bench://output_50.csv
-      include_unmapped: true
+      include_widened: true
 
   - type: output
     name: low_pass
@@ -63,4 +63,4 @@ nodes:
       name: low_pass
       type: csv
       path: bench://output_10.csv
-      include_unmapped: true
+      include_widened: true

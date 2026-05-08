@@ -676,8 +676,8 @@ fn execute_combine_sort_merge_with_stats(
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit {
                             fields,
-                            metadata,
                             record_vars,
+                            ..
                         }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(&driver_record, s),
@@ -685,9 +685,6 @@ fn execute_combine_sort_merge_with_stats(
                             };
                             for (n, v) in fields {
                                 rec.set(&n, v);
-                            }
-                            for (k, v) in metadata {
-                                let _ = rec.set_meta(&k, v);
                             }
                             for (k, v) in *record_vars {
                                 let _ = rec.set_record_var(&k, v);
@@ -1170,8 +1167,8 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit {
                             fields,
-                            metadata,
                             record_vars,
+                            ..
                         }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(driver_record, s),
@@ -1179,9 +1176,6 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             };
                             for (n, v) in fields {
                                 rec.set(&n, v);
-                            }
-                            for (k, v) in metadata {
-                                let _ = rec.set_meta(&k, v);
                             }
                             for (k, v) in *record_vars {
                                 let _ = rec.set_record_var(&k, v);
@@ -1235,15 +1229,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             ),
                         });
                     }
-                    let mut rec = Record::new(Arc::clone(target_schema), values);
-                    // Carry the driver's `$meta.*` forward through synthetic
-                    // chain steps. User-emitted record metadata travels with
-                    // the driver row by contract; without this copy the
-                    // next step's `widen_record_to_schema` finds no meta to
-                    // propagate.
-                    for (k, v) in driver_record.iter_meta() {
-                        let _ = rec.set_meta(k, v.clone());
-                    }
+                    let rec = Record::new(Arc::clone(target_schema), values);
                     args.output.push((rec, driver_order));
                 } else {
                     // No body and no output schema (test-mode pass-through):

@@ -24,7 +24,7 @@ mod tests {
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use std::collections::HashMap;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     /// Verifies the test module compiles and is discovered by cargo test.
     #[test]
@@ -2683,7 +2683,7 @@ nodes:
       name: fulfilled_orders
       type: csv
       path: fulfilled_orders.csv
-      include_unmapped: true
+      include_widened: true
   - type: output
     name: priority_report
     input: priority_split
@@ -2691,7 +2691,7 @@ nodes:
       name: priority_report
       type: csv
       path: priority_report.csv
-      include_unmapped: true
+      include_widened: true
 "#
     }
 
@@ -2758,7 +2758,7 @@ nodes:
       name: high_priority_out
       type: csv
       path: high_priority_out.csv
-      include_unmapped: true
+      include_widened: true
   - type: output
     name: standard_out
     input: priority_split
@@ -2766,7 +2766,7 @@ nodes:
       name: standard_out
       type: csv
       path: standard_out.csv
-      include_unmapped: true
+      include_widened: true
 "#
     }
 
@@ -3207,7 +3207,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
@@ -3280,7 +3280,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_empty.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         // ORD-1's product_id is PROD-X — no matching build row.
         let orders = "order_id,product_id,amount\nORD-1,PROD-X,10\n";
@@ -3352,7 +3352,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_cap.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let mut products = String::from("product_id,name,category\n");

@@ -611,8 +611,13 @@ impl SourceConfig {
 pub struct OutputConfig {
     pub name: String,
     pub path: String,
+    /// Pass through every column on the upstream record, not just the
+    /// names the upstream node explicitly emitted. This is the path
+    /// that surfaces `OnUnmapped::AutoWiden`-discovered columns at the
+    /// sink. Default `false` — only user-emitted columns reach the
+    /// sink.
     #[serde(default)]
-    pub include_unmapped: bool,
+    pub include_widened: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_header: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -623,10 +628,6 @@ pub struct OutputConfig {
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preserve_nulls: Option<bool>,
-    /// Controls whether per-record `$meta.*` metadata is included in output.
-    /// Default: none (metadata stripped from output).
-    #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
-    pub include_metadata: IncludeMetadata,
     /// Controls whether engine-stamped correlation snapshot columns
     /// (`$ck.<field>`) appear in the default writer output. The shadow
     /// columns preserve correlation-group identity through Transforms
@@ -669,25 +670,6 @@ pub struct OutputConfig {
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
-}
-
-/// Controls which `$meta.*` fields appear in output.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IncludeMetadata {
-    /// No metadata in output (default).
-    #[default]
-    None,
-    /// Include all metadata fields, prefixed with `meta.`.
-    All,
-    /// Include only the listed metadata keys, prefixed with `meta.`.
-    Allowlist(Vec<String>),
-}
-
-impl IncludeMetadata {
-    pub fn is_none(&self) -> bool {
-        matches!(self, IncludeMetadata::None)
-    }
 }
 
 /// Collision policy when an Output node's resolved path already exists.
@@ -1951,7 +1933,7 @@ impl PipelineConfig {
                 name: o.name.clone(),
                 mapping: o.mapping.clone().unwrap_or_default(),
                 exclude: o.exclude.clone().unwrap_or_default(),
-                include_unmapped: o.include_unmapped,
+                include_widened: o.include_widened,
             })
             .collect();
 

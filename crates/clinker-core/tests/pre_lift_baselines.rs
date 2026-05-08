@@ -18,11 +18,11 @@
 //! every `DualRun` fixture. Default is strict byte-compare.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{PipelineConfig, parse_config};
+use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 // ───────────────────────── tiered policy ─────────────────────────

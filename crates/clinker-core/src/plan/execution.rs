@@ -272,12 +272,11 @@ pub enum PlanNode {
         /// How to look up the partition for this transform's window.
         #[serde(skip)]
         partition_lookup: Option<PartitionLookupKind>,
-        /// Field names this transform writes (assigns to via `emit name = ...`,
-        /// excluding `$meta.*` writes). Populated at compile time from the CXL
-        /// `TypedProgram`. Single source of truth for
-        /// `compute_node_properties`'s `DestroyedByTransformWriteSet` rule —
-        /// the property pass reads this directly off the node, no executor
-        /// coupling.
+        /// Field names this transform writes (assigns to via `emit name = ...`).
+        /// Populated at compile time from the CXL `TypedProgram`. Single source
+        /// of truth for `compute_node_properties`'s
+        /// `DestroyedByTransformWriteSet` rule — the property pass reads this
+        /// directly off the node, no executor coupling.
         #[serde(skip_serializing_if = "BTreeSet::is_empty")]
         write_set: BTreeSet<String>,
         /// True iff the CXL transform contains a `distinct` statement. Populated
@@ -572,7 +571,7 @@ impl PlanNode {
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
-    /// `include_unmapped: false` projection at the Output boundary.
+    /// `include_widened: false` projection at the Output boundary.
     ///
     /// - Source: every column is user-declared in the source schema, so
     ///   the full schema counts as "explicitly emitted".
@@ -2577,7 +2576,7 @@ pub struct OutputSpec {
     pub name: String,
     pub mapping: IndexMap<String, String>,
     pub exclude: Vec<String>,
-    pub include_unmapped: bool,
+    pub include_widened: bool,
 }
 
 /// Pipeline-level parallelism configuration.
@@ -4258,9 +4257,9 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// Extract the set of record-field names a CXL transform writes.
 ///
 /// Walks the `TypedProgram`'s top-level statements and collects the names of
-/// every `emit name = ...` whose target is the record (not `$meta.*`). `let`
-/// statements bind locals only and are ignored; `filter`, `distinct`, `trace`,
-/// and bare expression statements do not write to fields.
+/// every `emit name = ...` whose target is the record. `let` statements bind
+/// locals only and are ignored; `filter`, `distinct`, `trace`, and bare
+/// expression statements do not write to fields.
 ///
 /// Consumed by `compute_node_properties` to populate the
 /// `DestroyedByTransformWriteSet` provenance variant. The write set

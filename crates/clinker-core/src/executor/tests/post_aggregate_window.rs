@@ -122,7 +122,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 /// Single-row-per-partition: `running_total == total`.
@@ -213,7 +213,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 /// Multi-row-per-partition: `$window.sum(total)` over a partition with
@@ -354,7 +354,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 /// `$window.cumulative_sum(total)` produces a running total over the
@@ -467,7 +467,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 /// `1 / (total - 60)` evaluates against the post-aggregate row whose
@@ -550,7 +550,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).expect("parse");
     let result = config.compile(&crate::config::CompileContext::default());
@@ -609,7 +609,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).expect("parse");
     let plan = config
@@ -697,7 +697,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).expect("parse");
     let result = config.compile(&crate::config::CompileContext::default());

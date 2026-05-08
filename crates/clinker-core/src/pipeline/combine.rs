@@ -442,17 +442,8 @@ impl KeyExtractor {
         out: &mut Vec<Value>,
     ) -> Result<(), EvalError> {
         let env: HashMap<String, Value> = HashMap::new();
-        let meta_state: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for kp in &self.programs {
-            let v = eval_expr::<NullStorage>(
-                &kp.expr,
-                &kp.typed,
-                ctx,
-                resolver,
-                None,
-                &env,
-                &meta_state,
-            )?;
+            let v = eval_expr::<NullStorage>(&kp.expr, &kp.typed, ctx, resolver, None, &env)?;
             out.push(v);
         }
         Ok(())

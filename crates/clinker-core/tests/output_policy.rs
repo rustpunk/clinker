@@ -193,7 +193,7 @@ nodes:
       name: out
       type: csv
       path: /tmp/{source_name}-out.csv
-      include_unmapped: true
+      include_widened: true
 error_handling:
   strategy: fail_fast
 "#;
@@ -233,7 +233,7 @@ nodes:
       name: out
       type: csv
       path: /tmp/{source_name:nope}-out.csv
-      include_unmapped: true
+      include_widened: true
 error_handling:
   strategy: fail_fast
 "#;
@@ -269,7 +269,7 @@ nodes:
       name: out
       type: csv
       path: /tmp/{source_name}.csv
-      include_unmapped: true
+      include_widened: true
 error_handling:
   strategy: fail_fast
 "#;

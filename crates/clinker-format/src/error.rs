@@ -17,15 +17,12 @@ pub enum FormatError {
         message: String,
     },
     SchemaInference(String),
-    /// Reader saw >64 off-schema keys on a single input record. The
-    /// partial record (first 64 off-schema keys captured into
-    /// `$meta.*`) travels with the error so the executor can route it
-    /// to DLQ. The 65th key (the one that triggered the cap) is
-    /// returned verbatim alongside.
-    MetadataCapExceeded {
-        record: clinker_record::Record,
-        key: String,
-        count: usize,
+    /// A source with `on_unmapped: reject` encountered an input record
+    /// carrying a key the user did not declare in the source's
+    /// `schema:` block.
+    UndeclaredField {
+        source: String,
+        field: String,
     },
 }
 
@@ -41,9 +38,10 @@ impl fmt::Display for FormatError {
                 write!(f, "invalid record at row {row}: {message}")
             }
             Self::SchemaInference(msg) => write!(f, "schema inference failed: {msg}"),
-            Self::MetadataCapExceeded { key, count, .. } => write!(
+            Self::UndeclaredField { source, field } => write!(
                 f,
-                "per-record metadata cap exceeded at key {key:?} (captured {count} keys before the cap)"
+                "source {source:?}: input record carries undeclared field {field:?} \
+                 (set `on_unmapped: drop` to silently strip, or declare the field)"
             ),
         }
     }

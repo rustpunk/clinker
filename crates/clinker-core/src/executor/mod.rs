@@ -362,9 +362,8 @@ impl CompiledRoute {
     /// In Inclusive mode: all matching branches (or default if none match).
     ///
     /// Branch predicates resolve field references through the Record's
-    /// own [`FieldResolver`] impl — schema + overflow for bare names,
-    /// `$meta.*` prefix stripping for per-record metadata. No parallel
-    /// bookkeeping map is required (Invariant 3).
+    /// own [`FieldResolver`] impl — schema + overflow for bare names.
+    /// No parallel bookkeeping map is required (Invariant 3).
     pub(crate) fn evaluate(
         &mut self,
         record: &Record,
@@ -939,26 +938,6 @@ impl PipelineExecutor {
                     per_record_source_files.push(file_arc);
                 }
                 Ok(None) => break,
-                Err(clinker_format::error::FormatError::MetadataCapExceeded {
-                    record,
-                    key,
-                    count,
-                }) => {
-                    row_num += 1;
-                    counters.total_count += 1;
-                    counters.dlq_count += 1;
-                    dlq_entries.push(DlqEntry {
-                        source_row: row_num,
-                        category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
-                        error_message: format!(
-                            "per-record metadata cap exceeded at key {key:?} (count={count})"
-                        ),
-                        original_record: record,
-                        stage: Some(DlqEntry::stage_source()),
-                        route: None,
-                        trigger: true,
-                    });
-                }
                 Err(other) => return Err(other.into()),
             }
         }
@@ -1273,27 +1252,6 @@ impl PipelineExecutor {
                             recs.push((record, rn));
                         }
                         Ok(None) => break,
-                        Err(clinker_format::error::FormatError::MetadataCapExceeded {
-                            record,
-                            key,
-                            count,
-                        }) => {
-                            rn += 1;
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
-                                error_message: format!(
-                                    "per-record metadata cap exceeded at key {key:?} \
-                                     (count={count}) reading combine build-side source \
-                                     {upstream:?}"
-                                ),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_source()),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
                         Err(other) => return Err(other.into()),
                     }
                 }
@@ -1832,26 +1790,31 @@ fn wrap_with_schema_coercion(
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::config::PipelineNode;
 
-    // Find the source node's schema declaration
-    let schema_decl = config.nodes.iter().find_map(|s| {
+    // Find the source node's schema declaration + on_unmapped policy.
+    let body_data = config.nodes.iter().find_map(|s| {
         if let PipelineNode::Source {
             header,
             config: body,
         } = &s.value
             && header.name == source_name
         {
-            return Some(&body.schema.columns);
+            return Some((&body.schema.columns, body.on_unmapped.clone()));
         }
         None
     });
 
-    match schema_decl {
-        Some(columns) if !columns.is_empty() => {
-            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(reader, columns)
-                .map_err(|e| PipelineError::Compilation {
-                    transform_name: source_name.to_string(),
-                    messages: vec![format!("schema coercion init error: {e}")],
-                })?;
+    match body_data {
+        Some((columns, policy)) if !columns.is_empty() => {
+            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(
+                reader,
+                columns,
+                policy,
+                source_name,
+            )
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: source_name.to_string(),
+                messages: vec![format!("schema coercion init error: {e}")],
+            })?;
             Ok(Box::new(coercing))
         }
         _ => Ok(reader),
@@ -2487,15 +2450,12 @@ pub(crate) fn evaluate_single_transform(
     {
         EvalResult::Emit {
             fields: emitted,
-            metadata,
             record_vars,
+            ..
         } => {
             let mut out = record_with_emitted_fields(input, &emitted);
             for (name, value) in &emitted {
                 out.set(name, value.clone());
-            }
-            for (key, value) in &metadata {
-                let _ = out.set_meta(key, value.clone());
             }
             for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
@@ -2576,15 +2536,12 @@ pub(crate) fn evaluate_single_transform_windowed(
     match result {
         EvalResult::Emit {
             fields: emitted,
-            metadata,
             record_vars,
+            ..
         } => {
             let mut out = record_with_emitted_fields(record, &emitted);
             for (name, value) in &emitted {
                 out.set(name, value.clone());
-            }
-            for (key, value) in &metadata {
-                let _ = out.set_meta(key, value.clone());
             }
             for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
@@ -2612,11 +2569,7 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         };
         values.push(v);
     }
-    let mut out = Record::new(Arc::clone(target), values);
-    for (k, v) in input.iter_meta() {
-        let _ = out.set_meta(k, v.clone());
-    }
-    out
+    Record::new(Arc::clone(target), values)
 }
 
 /// Recover an engine-stamped column's value when the input does not

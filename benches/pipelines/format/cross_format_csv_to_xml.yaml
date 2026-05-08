@@ -31,4 +31,4 @@ nodes:
       options:
         root_element: records
         record_element: record
-      include_unmapped: true
+      include_widened: true

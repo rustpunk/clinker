@@ -55,7 +55,7 @@ nodes:
       name: rollup
       type: csv
       path: ./output/invoice_rollup.csv
-      include_unmapped: false
+      include_widened: false
 
 error_handling:
   strategy: continue

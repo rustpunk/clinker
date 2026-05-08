@@ -103,7 +103,8 @@ nodes:
     options:
       format: ndjson
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -112,7 +113,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let input_data = ndjson_input(&[
         serde_json::json!({"name": "Alice", "age": "30"}),
@@ -146,7 +147,8 @@ nodes:
     options:
       record_path: records/record
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -155,7 +157,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let input_data = xml_input(
         "records",
@@ -189,7 +191,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -200,7 +203,7 @@ nodes:
     path: output.json
     options:
       format: ndjson
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -236,7 +239,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -248,7 +252,7 @@ nodes:
     options:
       root_element: records
       record_element: record
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -292,6 +296,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: value, type: string }
 
 - type: output
   name: dest
@@ -302,7 +307,7 @@ nodes:
     path: output.json
     options:
       format: ndjson
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv_input = "id,value\n1,alpha\n2,beta\n3,gamma\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -335,7 +340,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -344,7 +350,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -396,7 +402,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
     let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
@@ -424,7 +430,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest
@@ -441,7 +448,7 @@ nodes:
       - name: age
         type: integer
         width: 5
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -492,7 +499,8 @@ nodes:
     type: fixed_width
     path: input.dat
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest

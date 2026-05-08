@@ -9,11 +9,11 @@
 //! context.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 #[derive(Clone, Default)]
@@ -116,7 +116,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n5\n7\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -167,7 +167,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n3\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -223,7 +223,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n3\n5\n12\n42\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -274,7 +274,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\nnot-an-integer\n";
     let config = parse_config(yaml).expect("parse pipeline yaml");

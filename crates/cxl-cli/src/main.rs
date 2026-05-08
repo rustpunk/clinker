@@ -550,7 +550,6 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::QualifiedSourceAccess {
             input_name, field, ..
         } => format!("$source.{}.{}", input_name, field),
-        cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
         cxl::ast::Expr::RecordAccess { field, .. } => format!("$record.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {

@@ -5,7 +5,7 @@
 //! schema derivation, and multi-output aggregation.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 use clinker_core::config::parse_config;
@@ -146,7 +146,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -208,7 +208,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\neng,300\nsales,50\nsales,150\n";
     let (report, output) = run_single(yaml, csv);
@@ -269,7 +269,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
     let (report, output) = run_single(yaml, csv);
@@ -344,7 +344,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary,hours\neng,100,40\neng,200,20\nsales,50,40\n";
     let (report, output) = run_single(yaml, csv);
@@ -418,7 +418,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "amount\n10\n20\n30\n40\n";
     let (report, output) = run_single(yaml, csv);
@@ -482,7 +482,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -553,7 +553,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -620,7 +620,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Streaming variant — declare sort_order on dept. Input is already
     // dept-sorted (eng, eng, eng, sales, sales) so the streaming aggregator
@@ -675,7 +675,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let (hash_report, hash_out) = run_single(yaml_hash, csv);
     let (stream_report, stream_out) = run_single(yaml_streaming, csv);
@@ -747,7 +747,7 @@ nodes:
     name: sink
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // Two partitions on f0 (window group-by):

@@ -197,12 +197,6 @@ impl<'a> CombineResolver<'a> {
 
 impl FieldResolver for CombineResolver<'_> {
     fn resolve(&self, name: &str) -> Option<&Value> {
-        // $meta.* routes to the probe record's metadata; combine bodies
-        // operate "in the frame of" the driving record, so meta reads
-        // follow the driver.
-        if name.starts_with("$meta.") {
-            return self.probe_record.resolve(name);
-        }
         let (side, idx) = self.mapping.bare_to_side.get(name)?;
         self.fetch(*side, *idx)
     }
