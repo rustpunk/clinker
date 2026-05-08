@@ -1789,8 +1789,11 @@ fn wrap_with_schema_coercion(
     source_name: &str,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::config::PipelineNode;
+    use crate::config::pipeline_node::OnUnmapped;
 
-    // Find the source node's schema declaration + on_unmapped policy.
+    // Find the source node's schema declaration + on_unmapped policy
+    // + format. Format is needed for the auto_widen-on-fixed-width
+    // structural-inertness diagnostic below.
     let body_data = config.nodes.iter().find_map(|s| {
         if let PipelineNode::Source {
             header,
@@ -1798,13 +1801,40 @@ fn wrap_with_schema_coercion(
         } = &s.value
             && header.name == source_name
         {
-            return Some((&body.schema.columns, body.on_unmapped.clone()));
+            return Some((
+                &body.schema.columns,
+                body.on_unmapped.clone(),
+                body.source.format.clone(),
+            ));
         }
         None
     });
 
     match body_data {
-        Some((columns, policy)) if !columns.is_empty() => {
+        Some((columns, policy, format)) if !columns.is_empty() => {
+            // Fixed-width format: the reader's schema is constructed
+            // positionally from the user-declared `FieldDef` list,
+            // so the reader cannot ever produce an "undeclared
+            // field" — every byte that isn't covered by a FieldDef
+            // is structurally invisible. `auto_widen`'s sidecar
+            // therefore stays Null forever for fixed-width sources.
+            // Surface the inertness once per source at compile time
+            // so a user who set `auto_widen` (the engine-wide
+            // default) on a fixed-width source sees the no-op
+            // explicitly and can either pick `drop`/`reject` (the
+            // honest scalar policies for fixed-width) or accept the
+            // empty sidecar.
+            if matches!(policy, OnUnmapped::AutoWiden)
+                && matches!(format, crate::config::InputFormat::FixedWidth(_))
+            {
+                tracing::info!(
+                    source = source_name,
+                    "on_unmapped: auto_widen is structurally inert for fixed_width sources — \
+                     the schema is positional, so the reader cannot detect undeclared \
+                     fields. The `$widened` sidecar slot will always carry Value::Null. \
+                     Set `on_unmapped: drop` or `reject` to make the policy explicit."
+                );
+            }
             let coercing = crate::pipeline::schema_coerce::CoercingReader::new(
                 reader,
                 columns,

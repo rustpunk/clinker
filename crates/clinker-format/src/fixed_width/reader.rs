@@ -1,3 +1,22 @@
+//! Fixed-width record reader.
+//!
+//! The schema is constructed positionally from the user-declared
+//! `FieldDef` list (`width` / `start..end` byte ranges). Bytes
+//! outside the declared ranges are structurally invisible to the
+//! reader — there is no "extra column" concept the way CSV's
+//! header row or JSON's per-record key set has one.
+//!
+//! Consequence for `on_unmapped: auto_widen` (the engine-wide
+//! default): the `$widened` sidecar absorber slot exists on the
+//! source's plan-time schema (the engine adds it uniformly), but
+//! the fixed-width reader cannot ever populate it — the slot's
+//! payload stays `Value::Null` for every record. The executor's
+//! `wrap_with_schema_coercion` emits a one-time `tracing::info`
+//! per fixed-width source whose policy is `auto_widen`, naming
+//! the source so the user can either accept the empty sidecar or
+//! switch to `on_unmapped: drop` / `reject` for explicit scalar
+//! semantics.
+
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 

@@ -379,4 +379,56 @@ mod tests {
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get(WIDENED_SIDECAR_COLUMN), Some(&Value::Null));
     }
+
+    /// Fixed-width sources are structurally incapable of producing
+    /// undeclared fields — the schema is positional. A
+    /// `CoercingReader` wrapping a fixed-width reader with
+    /// `auto_widen` therefore always emits records whose `$widened`
+    /// slot is `Value::Null`, regardless of the byte content.
+    /// Verified via a synthetic positional reader (a stub that
+    /// emits records keyed by the user-declared schema only —
+    /// matching the structural shape `FixedWidthReader` produces).
+    #[test]
+    fn test_auto_widen_inert_for_positional_reader() {
+        use clinker_format::traits::FormatReader as FRTrait;
+        use clinker_record::Schema as RecordSchema;
+        use std::sync::Arc as StdArc;
+
+        struct PositionalReader {
+            schema: StdArc<RecordSchema>,
+            rows: std::vec::IntoIter<Vec<Value>>,
+        }
+        impl FRTrait for PositionalReader {
+            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
+                Ok(StdArc::clone(&self.schema))
+            }
+            fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+                Ok(self
+                    .rows
+                    .next()
+                    .map(|values| Record::new(StdArc::clone(&self.schema), values)))
+            }
+        }
+
+        let declared_schema = StdArc::new(RecordSchema::new(vec!["id".into(), "name".into()]));
+        let reader = Box::new(PositionalReader {
+            schema: StdArc::clone(&declared_schema),
+            rows: vec![
+                vec![Value::String("1".into()), Value::String("Alice".into())],
+                vec![Value::String("2".into()), Value::String("Bob".into())],
+            ]
+            .into_iter(),
+        });
+        let decl = vec![col("id", Type::String), col("name", Type::String)];
+        let mut coercing =
+            CoercingReader::new(reader, &decl, auto_widen_policy(), "fw_src").unwrap();
+        for _ in 0..2 {
+            let rec = coercing.next_record().unwrap().unwrap();
+            assert_eq!(
+                rec.get(WIDENED_SIDECAR_COLUMN),
+                Some(&Value::Null),
+                "auto_widen sidecar must stay Null for positional readers"
+            );
+        }
+    }
 }
