@@ -580,8 +580,9 @@ mod tests {
             .expect("collected publishes a bound output row");
 
         // Driver = orders (default first-in-IndexMap, no `drive:` hint).
-        // Driver fields: order_id, product_id, amount. Plus auto-added
-        // `products` field of Type::Array.
+        // Driver fields: order_id, product_id, amount, plus the
+        // `$widened` engine-stamped sidecar (auto_widen default).
+        // Then the auto-added `products` field of Type::Array.
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
         assert_eq!(
             names,
@@ -589,6 +590,7 @@ mod tests {
                 "order_id".to_string(),
                 "product_id".to_string(),
                 "amount".to_string(),
+                "$widened".to_string(),
                 "products".to_string(),
             ],
             "auto-derived row = driver fields + (build_qualifier: Array)"

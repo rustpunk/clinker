@@ -727,8 +727,18 @@ pub struct ColumnDecl {
 /// Policy for fields a reader discovers in an input record that the
 /// declared `schema:` does not name.
 ///
-/// - **`drop`** (default): silently strip undeclared fields at read
-///   time. Matches Snowflake's `MATCH_BY_COLUMN_NAME` with
+/// - **`auto_widen`** (default): per-Source sidecar absorber column
+///   `$widened` is appended to the source's plan-time schema (engine-
+///   stamped, so the typechecker is blind to its contents — CXL
+///   expressions cannot read or write it). Each input record's keys
+///   that are not in the declaration land in a `Value::Map` payload
+///   on that slot. The Output node opts the contents back into
+///   top-level columns via `include_widened: true`. Pattern precedent:
+///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
+///   column for unmatched fields) and ClickHouse's `JSON` data type
+///   (single typed column absorbing arbitrary structure).
+/// - **`drop`**: silently strip undeclared fields at read time.
+///   Matches Snowflake's `MATCH_BY_COLUMN_NAME` with
 ///   `ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE` and dbt's
 ///   `on_schema_change=ignore`.
 /// - **`reject`**: fail the source on the first record carrying an
@@ -736,30 +746,48 @@ pub struct ColumnDecl {
 ///   Iceberg's column-ID-mismatch behavior.
 ///
 /// YAML accepts the discriminated form. Omission of the field uses
-/// `Default::default()` — `drop`.
+/// `Default::default()` — `auto_widen`. The sidecar absorber design
+/// avoids the silent-loss bug class documented across the schema-
+/// drift literature (Polars #23190, Spark `mergeSchema`, Auto Loader
+/// `_rescued_data` introduction): the runtime view never drifts from
+/// the planner view because the planner already accounts for the
+/// `$widened` slot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OnUnmapped {
+    /// Sidecar absorber. Plan-time schema gains a `$widened` engine-
+    /// stamped column carrying `Value::Map` of undeclared input
+    /// fields per record.
+    #[default]
+    AutoWiden,
     /// Fail the source on any undeclared field. Use when input shape is
     /// a hard contract (regulated data, partner integration with a
     /// frozen schema).
     Reject,
     /// Silently strip undeclared fields at read time. Fields not in the
     /// declared schema do not reach the record.
-    #[default]
     Drop,
 }
 
 impl OnUnmapped {
-    /// Stable identifier for diagnostics and metrics. Returns
-    /// `"reject"` or `"drop"`.
+    /// Stable identifier for diagnostics and metrics.
     pub fn mode_name(&self) -> &'static str {
         match self {
+            OnUnmapped::AutoWiden => "auto_widen",
             OnUnmapped::Reject => "reject",
             OnUnmapped::Drop => "drop",
         }
     }
+
+    /// Whether this mode reserves the `$widened` sidecar slot on the
+    /// source's plan-time schema. Only `AutoWiden` does.
+    pub fn reserves_widened_sidecar(&self) -> bool {
+        matches!(self, OnUnmapped::AutoWiden)
+    }
 }
+
+/// Stable column name for the `auto_widen` sidecar absorber slot.
+pub const WIDENED_SIDECAR_COLUMN: &str = "$widened";
 
 /// Transform variant body. The new shape: a mandatory `cxl:` field
 /// carrying the CXL source as a `CxlSource` (so it captures its YAML

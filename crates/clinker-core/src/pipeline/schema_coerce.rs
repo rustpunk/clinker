@@ -1,9 +1,18 @@
 //! Schema-based type coercion + declared-schema reprojection for source records.
 //!
 //! Wraps a `FormatReader` and returns records whose `Arc<Schema>` is the
-//! source's user-declared schema, with the per-Source `OnUnmapped`
-//! policy applied to undeclared input fields:
+//! source's user-declared schema (extended with the `$widened` engine-
+//! stamped sidecar column for `OnUnmapped::AutoWiden`), with the
+//! per-Source `OnUnmapped` policy applied to undeclared input fields:
 //!
+//! - **`OnUnmapped::AutoWiden`** (default): per-record undeclared input
+//!   fields land in a `Value::Map` carried by a `$widened` engine-
+//!   stamped sidecar column appended to the declared schema. The
+//!   typechecker is blind to its contents (CXL has no Map operators
+//!   in the user surface); `include_widened: true` at an Output node
+//!   expands the map back to top-level columns at the sink. Pattern
+//!   precedent: Databricks Auto Loader's `_rescued_data` and
+//!   ClickHouse's `JSON` column type.
 //! - **`OnUnmapped::Drop`** (matches Snowflake `MATCH_BY_COLUMN_NAME`
 //!   "extra columns ignored" and dbt's `on_schema_change=ignore`):
 //!   reader columns absent from the declaration drop silently.
@@ -22,25 +31,32 @@ use std::sync::Arc;
 
 use clinker_format::error::FormatError;
 use clinker_format::traits::FormatReader;
-use clinker_record::{Record, Schema, SchemaBuilder, Value, coercion};
+use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coercion};
 use cxl::typecheck::Type;
+use indexmap::IndexMap;
 
-use crate::config::pipeline_node::{ColumnDecl, OnUnmapped};
+use crate::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
 
 /// Wraps a `FormatReader` and reprojects every record onto the
-/// user-declared `Arc<Schema>`, applying the per-Source `OnUnmapped`
-/// policy to undeclared input fields.
+/// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped
+/// sidecar slot for `AutoWiden`), applying the per-Source
+/// `OnUnmapped` policy to undeclared input fields.
 pub struct CoercingReader {
     inner: Box<dyn FormatReader>,
-    /// Declared column names — lookup set for the `Reject` policy's
-    /// "is this key in the declaration?" check.
+    /// Declared column names — lookup set for the policy's "is this
+    /// key in the declaration?" check.
     declared_names: HashSet<Box<str>>,
-    /// Declared schema — the single `Arc<Schema>` every reprojected
-    /// record carries.
-    declared_schema: Arc<Schema>,
-    /// Per-declared-column coercion target (`None` for pass-through).
-    /// Indexed by position in the declared schema.
+    /// Output schema — declared columns followed (under `AutoWiden`)
+    /// by the `$widened` engine-stamped sidecar column.
+    output_schema: Arc<Schema>,
+    /// Per-output-column coercion target (`None` for pass-through).
+    /// Indexed by position in `output_schema`. The `$widened` sidecar
+    /// slot, when present, gets `None` (no coercion — payload is a
+    /// `Value::Map`).
     targets: Vec<Option<Type>>,
+    /// Position of the `$widened` sidecar column in `output_schema`,
+    /// or `None` for `Drop` / `Reject` policies (no sidecar slot).
+    widened_idx: Option<usize>,
     policy: OnUnmapped,
     /// Source identifier for diagnostics.
     source_name: Box<str>,
@@ -59,14 +75,9 @@ impl CoercingReader {
         // record isn't gated behind an on-demand schema call.
         inner.schema()?;
 
-        let declared_schema: Arc<Schema> = schema_decl
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<SchemaBuilder>()
-            .build();
         let declared_names: HashSet<Box<str>> =
             schema_decl.iter().map(|c| c.name.as_str().into()).collect();
-        let targets: Vec<Option<Type>> = schema_decl
+        let mut targets: Vec<Option<Type>> = schema_decl
             .iter()
             .map(|c| {
                 let target = unwrap_nullable(&c.ty);
@@ -77,38 +88,72 @@ impl CoercingReader {
             })
             .collect();
 
+        let mut builder = SchemaBuilder::new();
+        for c in schema_decl {
+            builder = builder.with_field(c.name.as_str());
+        }
+        let widened_idx = if policy.reserves_widened_sidecar() {
+            // Append the `$widened` engine-stamped sidecar column. The
+            // dispatch canonicalize invariant accepts engine-stamped
+            // tail columns; `WidenedSidecar` joins `SourceCorrelation`
+            // and `AggregateGroupIndex` in that role.
+            let idx = schema_decl.len();
+            builder =
+                builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
+            targets.push(None);
+            Some(idx)
+        } else {
+            None
+        };
+        let output_schema: Arc<Schema> = builder.build();
+
         Ok(CoercingReader {
             inner,
             declared_names,
-            declared_schema,
+            output_schema,
             targets,
+            widened_idx,
             policy,
             source_name: source_name.into(),
         })
     }
 
-    /// Reproject `record` onto the declared schema Arc.
-    ///
-    /// For each declared column, pull the value from the underlying
-    /// record (by name), coerce if the declaration has a target type,
-    /// and write at the declared position. When `policy` is
-    /// [`OnUnmapped::Reject`], any input key absent from the
-    /// declaration fails the source. Otherwise reader columns absent
-    /// from the declaration drop silently.
+    /// Reproject `record` onto the output schema (declared columns
+    /// plus the `$widened` sidecar for `AutoWiden`).
     fn reproject(&self, record: &Record) -> Result<Record, FormatError> {
-        if matches!(self.policy, OnUnmapped::Reject) {
-            for (k, _) in record.iter_all_fields() {
-                if !self.declared_names.contains(k) {
-                    return Err(FormatError::UndeclaredField {
-                        source: self.source_name.to_string(),
-                        field: k.to_string(),
-                    });
+        // Collect undeclared keys for the policy decision.
+        let mut sidecar: Option<IndexMap<Box<str>, Value>> = None;
+        for (k, v) in record.iter_all_fields() {
+            if !self.declared_names.contains(k) {
+                match self.policy {
+                    OnUnmapped::Reject => {
+                        return Err(FormatError::UndeclaredField {
+                            source: self.source_name.to_string(),
+                            field: k.to_string(),
+                        });
+                    }
+                    OnUnmapped::Drop => { /* silent strip */ }
+                    OnUnmapped::AutoWiden => {
+                        sidecar
+                            .get_or_insert_with(IndexMap::new)
+                            .insert(k.into(), v.clone());
+                    }
                 }
             }
         }
 
-        let mut values: Vec<Value> = Vec::with_capacity(self.declared_schema.column_count());
-        for (i, col) in self.declared_schema.columns().iter().enumerate() {
+        let cols = self.output_schema.columns();
+        let mut values: Vec<Value> = Vec::with_capacity(cols.len());
+        for (i, col) in cols.iter().enumerate() {
+            // The widened slot is filled from the sidecar map (if any
+            // non-declared keys were observed); otherwise Null.
+            if Some(i) == self.widened_idx {
+                values.push(match sidecar.take() {
+                    Some(map) if !map.is_empty() => Value::Map(Box::new(map)),
+                    _ => Value::Null,
+                });
+                continue;
+            }
             let raw = record.get(col).cloned().unwrap_or(Value::Null);
             let coerced = match &self.targets[i] {
                 Some(target) => coerce_value(&raw, target).unwrap_or(raw),
@@ -116,13 +161,13 @@ impl CoercingReader {
             };
             values.push(coerced);
         }
-        Ok(Record::new(Arc::clone(&self.declared_schema), values))
+        Ok(Record::new(Arc::clone(&self.output_schema), values))
     }
 }
 
 impl FormatReader for CoercingReader {
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.declared_schema))
+        Ok(Arc::clone(&self.output_schema))
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -194,6 +239,10 @@ mod tests {
         OnUnmapped::Reject
     }
 
+    fn auto_widen_policy() -> OnUnmapped {
+        OnUnmapped::AutoWiden
+    }
+
     #[test]
     fn test_coerce_int_and_float() {
         let schema = vec![
@@ -259,7 +308,8 @@ mod tests {
     }
 
     /// `Drop` policy silently strips CSV header columns not in the
-    /// declared schema. The output schema equals the declaration.
+    /// declared schema. The output schema equals the declaration —
+    /// no `$widened` sidecar slot.
     #[test]
     fn test_on_unmapped_drop_strips_extras() {
         let schema = vec![col("id", Type::String)];
@@ -272,6 +322,7 @@ mod tests {
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("id"), Some(&Value::String("1".into())));
         assert!(rec.get("extra").is_none());
+        assert!(rec.get(WIDENED_SIDECAR_COLUMN).is_none());
     }
 
     /// `Reject` policy fails the source on the first record carrying
@@ -290,5 +341,42 @@ mod tests {
             }
             other => panic!("expected UndeclaredField, got {other:?}"),
         }
+    }
+
+    /// `AutoWiden` appends `$widened` to the output schema and absorbs
+    /// undeclared input fields into a `Value::Map` payload at that slot.
+    #[test]
+    fn test_on_unmapped_auto_widen_absorbs_into_sidecar() {
+        let schema = vec![col("id", Type::String)];
+        let reader = csv_reader("id,extra1,extra2\n1,foo,42\n2,bar,99\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+
+        let schema_arc = coercing.schema().unwrap();
+        let cols: Vec<&str> = schema_arc.columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", WIDENED_SIDECAR_COLUMN]);
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("id"), Some(&Value::String("1".into())));
+        match rec.get(WIDENED_SIDECAR_COLUMN) {
+            Some(Value::Map(m)) => {
+                assert_eq!(m.get("extra1"), Some(&Value::String("foo".into())));
+                assert_eq!(m.get("extra2"), Some(&Value::String("42".into())));
+            }
+            other => panic!("expected Map sidecar payload, got {other:?}"),
+        }
+    }
+
+    /// `AutoWiden` with no extras leaves the `$widened` slot Null —
+    /// the column exists on the schema but the payload is absent.
+    #[test]
+    fn test_on_unmapped_auto_widen_null_when_no_extras() {
+        let schema = vec![col("id", Type::String), col("name", Type::String)];
+        let reader = csv_reader("id,name\n1,Alice\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get(WIDENED_SIDECAR_COLUMN), Some(&Value::Null));
     }
 }

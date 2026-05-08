@@ -3015,6 +3015,8 @@ pub(crate) fn lower_node_to_plan_node(
                         )
                     } else if let Some(field) = col.strip_prefix("$ck.") {
                         builder.with_field_meta(col, FieldMetadata::source_correlation(field))
+                    } else if col == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN {
+                        builder.with_field_meta(col, FieldMetadata::widened_sidecar())
                     } else {
                         builder.with_field(col)
                     };

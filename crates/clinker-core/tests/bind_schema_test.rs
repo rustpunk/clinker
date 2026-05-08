@@ -56,9 +56,13 @@ nodes:
     let row = plan
         .typed_output_row("source1")
         .expect("source1 must have a bound row");
-    assert_eq!(row.field_count(), 2);
+    // Schema includes the user-declared `a` + `b` plus the
+    // `$widened` engine-stamped sidecar column (auto_widen is the
+    // default `OnUnmapped` policy).
+    assert_eq!(row.field_count(), 3);
     assert!(row.has_field("a"), "expected column 'a'");
     assert!(row.has_field("b"), "expected column 'b'");
+    assert!(row.has_field("$widened"), "expected $widened sidecar");
     assert_eq!(
         row.tail,
         cxl::typecheck::row::RowTail::Closed,
@@ -224,9 +228,12 @@ nodes:
 "#;
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
-    assert_eq!(schema.column_count(), 2);
+    // User-declared columns + `$widened` engine-stamped sidecar
+    // (auto_widen is the default `OnUnmapped` policy).
+    assert_eq!(schema.column_count(), 3);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
+    assert_eq!(&*schema.columns()[2], "$widened");
     assert!(
         schema.field_metadata_by_name("employee_id").is_none(),
         "user-declared column must not carry engine-stamp metadata"
@@ -234,6 +241,10 @@ nodes:
     assert!(
         !schema.contains("$ck.employee_id"),
         "absent correlation_key must produce no shadow column"
+    );
+    assert!(
+        schema.field_metadata_by_name("$widened").is_some(),
+        "$widened sidecar must carry engine-stamp metadata"
     );
 }
 
@@ -269,17 +280,18 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
-    // User-declared columns stay at their declared positions.
-    assert_eq!(schema.column_count(), 3);
+    // User-declared columns stay at their declared positions, then
+    // engine-stamped tail: `$ck.<field>` shadow columns first, then
+    // the `$widened` sidecar (auto_widen default).
+    assert_eq!(schema.column_count(), 4);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
-
-    // Shadow column tail-appended.
     assert_eq!(
         &*schema.columns()[2],
         "$ck.employee_id",
-        "shadow column must sit at schema tail (Spark `_metadata` shape)"
+        "CK shadow column tail-appended before sidecar"
     );
+    assert_eq!(&*schema.columns()[3], "$widened");
     assert_eq!(schema.index("$ck.employee_id"), Some(2));
 
     // Engine-stamp metadata points back at the user-declared field.
@@ -331,10 +343,12 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
-    assert_eq!(schema.column_count(), 5);
-    // Tail-append order matches `correlation_key.fields()` order.
+    // 3 declared + 2 `$ck.*` shadows + `$widened` sidecar = 6 columns.
+    assert_eq!(schema.column_count(), 6);
+    // Tail-append order matches `correlation_key.fields()` order, then sidecar.
     assert_eq!(&*schema.columns()[3], "$ck.tenant");
     assert_eq!(&*schema.columns()[4], "$ck.employee_id");
+    assert_eq!(&*schema.columns()[5], "$widened");
 
     assert_eq!(
         source_correlation_field(schema.field_metadata_by_name("$ck.tenant")),

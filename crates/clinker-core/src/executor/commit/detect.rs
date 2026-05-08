@@ -204,6 +204,12 @@ pub(crate) fn detect_retract_scope(
                             }
                         }
                     }
+                    Some(FieldMetadata::WidenedSidecar) => {
+                        // The `auto_widen` sidecar slot carries no
+                        // correlation lineage — it's a passthrough
+                        // map of input fields, not an engine-stamped
+                        // CK lattice column.
+                    }
                     None => {}
                 }
             }

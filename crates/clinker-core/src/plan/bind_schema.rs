@@ -33,7 +33,7 @@ use crate::config::composition::{
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
-    CombineBody, MatchMode, PipelineNode, PropagateCkSpec, SchemaDecl,
+    CombineBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, SchemaDecl,
 };
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::combine::{
@@ -1065,8 +1065,11 @@ fn bind_schema_inner(
         match node {
             PipelineNode::Source { config, .. } => {
                 let schema_decl: &SchemaDecl = &config.schema;
-                let (columns, missing) =
-                    columns_from_decl(schema_decl, config.correlation_key.as_ref());
+                let (columns, missing) = columns_from_decl(
+                    schema_decl,
+                    config.correlation_key.as_ref(),
+                    &config.on_unmapped,
+                );
                 for missing_field in &missing {
                     diags.push(Diagnostic::error(
                         "E153",
@@ -2065,20 +2068,29 @@ fn build_input_port_rows(
             }
         }
 
-        // Append the parent's engine-stamped tail columns ($ck.<field>
-        // shadow columns from each parent source's `correlation_key:`
-        // widening) to the body's port declared set. The runtime port-
-        // synthetic Source built at body entry adopts every parent
-        // column, so the body sees these at runtime; declaring them
-        // here keeps the compile-time Row aligned with that runtime
-        // shape — without this step the open-tail mechanism would
-        // silently drop engine-stamped columns from the body's
-        // compile-time view and surface as a schema mismatch when
-        // records flow back to the parent (the composition's
-        // `output_schema` is derived from the body's terminal Row).
+        // Append the parent's engine-stamped tail columns to the
+        // body's port declared set. Two engine-stamp shapes propagate
+        // from parent to body:
+        //
+        // - `$ck.<field>` source-CK shadow columns from each parent
+        //   source's `correlation_key:` widening.
+        // - `$widened` sidecar absorber column from
+        //   `on_unmapped: auto_widen`.
+        //
+        // The runtime port-synthetic Source built at body entry adopts
+        // every parent column, so the body sees these at runtime;
+        // declaring them here keeps the compile-time Row aligned with
+        // that runtime shape — without this step the open-tail
+        // mechanism would silently drop engine-stamped columns from
+        // the body's compile-time view and surface as a schema
+        // mismatch when records flow back to the parent (the
+        // composition's `output_schema` is derived from the body's
+        // terminal Row).
         let mut declared_columns = declared_columns;
         for (qf, ty) in upstream_row.fields() {
-            if qf.name.starts_with("$ck.") && !declared_columns.contains_key(qf) {
+            let is_engine_stamped = qf.name.starts_with("$ck.")
+                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN;
+            if is_engine_stamped && !declared_columns.contains_key(qf) {
                 declared_columns.insert(qf.clone(), ty.clone());
             }
         }
@@ -2299,13 +2311,15 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Build a runtime `Arc<Schema>` from an iterator of column names,
 /// stamping engine-stamp metadata on every column whose name begins
-/// with the `$ck.` prefix. Two prefix shapes are recognized:
+/// with a recognized engine prefix:
 ///
 /// - `$ck.aggregate.<aggregate_name>` — synthetic group-index column
 ///   emitted by a relaxed aggregate. Stamped
 ///   [`FieldMetadata::AggregateGroupIndex`].
 /// - `$ck.<source_field>` — source-CK shadow column. Stamped
 ///   [`FieldMetadata::SourceCorrelation`].
+/// - `$widened` — `auto_widen` sidecar absorber. Stamped
+///   [`FieldMetadata::WidenedSidecar`].
 ///
 /// The aggregate prefix is checked first because `$ck.aggregate.x`
 /// also matches the generic `$ck.` prefix; misordering would mis-
@@ -2325,6 +2339,8 @@ where
             builder.with_field_meta(name, FieldMetadata::aggregate_group_index(aggregate_name))
         } else if let Some(field) = name.strip_prefix("$ck.") {
             builder.with_field_meta(name, FieldMetadata::source_correlation(field))
+        } else if name == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN {
+            builder.with_field_meta(name, FieldMetadata::widened_sidecar())
         } else {
             builder.with_field(name)
         };
@@ -2333,12 +2349,17 @@ where
 }
 
 /// Build the `Row.declared` map for a Source from its author-declared
-/// `schema:` block, tail-appending one `$ck.<field>` shadow column per
-/// field listed in the source's own `correlation_key:`.
+/// `schema:` block, tail-appending engine-stamped columns:
 ///
-/// Each shadow column is typed identically to the user-declared field
-/// of the same name. Tail-append preserves user-declared positional
-/// indices, mirroring Spark `_metadata`.
+/// - One `$ck.<field>` shadow column per field listed in the source's
+///   own `correlation_key:`. Each shadow column is typed identically
+///   to the user-declared field of the same name.
+/// - One `$widened` sidecar absorber (typed `Any`, carries
+///   `Value::Map`) when `on_unmapped: auto_widen` is the source's
+///   policy. Tail-append preserves user-declared positional indices
+///   while keeping the planner's view aligned with the runtime
+///   reader's emitted schema — the dispatch canonicalize invariant
+///   holds because `$widened` is engine-stamped.
 ///
 /// Returns the column map paired with a list of `correlation_key`
 /// field names that did NOT appear in `decl.columns`. The caller emits
@@ -2347,12 +2368,19 @@ where
 fn columns_from_decl(
     decl: &SchemaDecl,
     correlation_key: Option<&crate::config::CorrelationKey>,
+    on_unmapped: &OnUnmapped,
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
     let mut cols: IndexMap<QualifiedField, Type> = decl
         .columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
+    // Engine-stamped tail order: `$ck.<field>` shadow columns first,
+    // then the `$widened` sidecar last. The order is load-bearing —
+    // CK-aligned aggregate / combine propagation walks the schema
+    // expecting `$ck.*` immediately after declared columns; pushing
+    // `$widened` between them would break that propagation. Sources
+    // with `auto_widen` get `$widened` after every `$ck.<field>` slot.
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
@@ -2369,6 +2397,12 @@ fn columns_from_decl(
                 None => missing.push(field.to_string()),
             }
         }
+    }
+    if on_unmapped.reserves_widened_sidecar() {
+        cols.insert(
+            QualifiedField::bare(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN),
+            Type::Any,
+        );
     }
     (cols, missing)
 }

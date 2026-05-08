@@ -51,30 +51,47 @@ fn key_is_null(key: &[GroupByKey]) -> bool {
     key.iter().all(|k| matches!(k, GroupByKey::Null))
 }
 
-/// Build the buffer key for a record by reading every engine-stamped
-/// snapshot column (i.e. each `$ck.<field>` shadow column the source
-/// widening pass attached to the schema). The shadow column carries
-/// the user-declared field's value at Source ingest, so a downstream
-/// Transform that rewrites the user-visible field cannot change a
-/// row's group identity.
+/// Build the buffer key for a record by reading every correlation-
+/// lattice engine-stamped column. Two kinds of engine-stamped column
+/// participate in the correlation lattice:
+///
+/// - `$ck.<field>` source-CK shadow columns. The shadow column carries
+///   the user-declared field's value at Source ingest, so a downstream
+///   Transform that rewrites the user-visible field cannot change a
+///   row's group identity.
+/// - `$ck.aggregate.<aggregate_name>` synthetic columns from relaxed
+///   aggregates, carrying the aggregator's group index.
+///
+/// The `$widened` `auto_widen` sidecar absorber is engine-stamped but
+/// **not** a lattice column — its `Value::Map` payload is a
+/// per-record passthrough of unmapped fields, not a correlation
+/// identity. Including it would split records of the same correlation
+/// group into separate buffer cells (each record's distinct map
+/// payload becomes a distinct key), defeating the source-CK invariant
+/// that a downstream rewrite of the user-declared field cannot move
+/// rows between buffer cells. The match arm below filters
+/// `WidenedSidecar` out of the lattice walk.
 ///
 /// When every component of the key is null — either because the
-/// record carries no engine-stamped columns (e.g. an Aggregate output
-/// that did not propagate `$ck.*` because the user did not list it
-/// in `group_by`) or because every snapshot value is itself Null — a
-/// row-number disambiguator lands the record in its own buffer cell,
-/// preserving per-record null-rejection semantics without forcing the
-/// Output arm onto a separate non-buffered writer path.
+/// record carries no correlation-lattice columns (e.g. an Aggregate
+/// output that did not propagate `$ck.*` because the user did not
+/// list it in `group_by`) or because every snapshot value is itself
+/// Null — a row-number disambiguator lands the record in its own
+/// buffer cell, preserving per-record null-rejection semantics
+/// without forcing the Output arm onto a separate non-buffered writer
+/// path.
 fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
+    use clinker_record::FieldMetadata;
     let schema = record.schema();
     let mut key: Vec<GroupByKey> = Vec::new();
     for i in 0..schema.column_count() {
-        if schema
-            .field_metadata(i)
-            .is_some_and(|m| m.is_engine_stamped())
-        {
-            let idx = key.len();
-            key.push(value_to_correlation_key(&record.values()[i], idx));
+        match schema.field_metadata(i) {
+            Some(FieldMetadata::SourceCorrelation { .. })
+            | Some(FieldMetadata::AggregateGroupIndex { .. }) => {
+                let idx = key.len();
+                key.push(value_to_correlation_key(&record.values()[i], idx));
+            }
+            Some(FieldMetadata::WidenedSidecar) | None => {}
         }
     }
     if key.is_empty() || key_is_null(&key) {
@@ -865,8 +882,11 @@ pub(crate) fn dispatch_plan_node(
                             }) => Some((i, source_field.clone())),
                             // Aggregate-emitted synthetic CK columns are
                             // stamped at aggregate finalize, not at source
-                            // ingest, so they are not part of this mapping.
+                            // ingest. The `$widened` sidecar is filled by
+                            // CoercingReader from input-record keys, not
+                            // by name-based mapping from the reader.
                             Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
+                            | Some(clinker_record::FieldMetadata::WidenedSidecar)
                             | None => None,
                         })
                         .collect()
@@ -878,40 +898,49 @@ pub(crate) fn dispatch_plan_node(
                         if Arc::ptr_eq(r.schema(), target) {
                             r.clone()
                         } else {
-                            // The reader's `Arc<Schema>` covers the user-declared
-                            // columns; the plan-time target may extend that with
-                            // engine-stamped tail columns (`$ck.<field>` shadow
-                            // columns from each source's own `correlation_key:`
-                            // widening). Reader columns must equal the user-
-                            // declared prefix of the target; tail slots are
-                            // filled by the snapshot stamp below.
-                            debug_assert!(
-                                target
-                                    .columns()
-                                    .iter()
-                                    .zip(r.schema().columns())
-                                    .all(|(t, s)| t == s)
-                                    && r.schema().column_count() <= target.column_count()
-                                    && (r.schema().column_count()..target.column_count())
-                                        .all(|i| target.field_metadata(i).is_some()),
-                                "Source reader columns must form the user-declared prefix \
-                                 of the plan-time target schema; any tail columns must \
-                                 carry engine-stamp metadata. reader: {:?}, target: {:?}",
-                                r.schema().columns(),
-                                target.columns(),
-                            );
-                            let mut values = r.values().to_vec();
-                            values.resize(target.column_count(), Value::Null);
-                            // Stamp the engine-stamped tail at ingest: each
-                            // `$ck.<field>` slot captures the user-declared
-                            // field's value here, before any downstream
-                            // Transform can rewrite it. Frozen-identity
-                            // semantics flow through the schema column for
-                            // the rest of the DAG.
+                            // Build target-positional values by name lookup
+                            // from the reader's record. This admits both
+                            // narrower readers (extra target slots are
+                            // engine-stamped — `$ck.<field>` filled by the
+                            // snapshot stamp loop below; `$widened` left
+                            // Null when absent on the reader) and wider
+                            // readers (e.g. composition-body port-sources
+                            // whose port schema is a subset of the parent
+                            // producer's auto_widen-extended schema —
+                            // sidecar columns the body never declared
+                            // simply do not get copied through).
+                            //
+                            // The integrity contract: every user-declared
+                            // column on the target appears under the same
+                            // name on the reader, OR the target column is
+                            // engine-stamped (filled here) or `$widened`
+                            // (copied if reader has it, Null otherwise).
                             let reader = r.schema();
+                            let reader_vals = r.values();
+                            let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
+                            for (target_idx, target_name) in target.columns().iter().enumerate() {
+                                if let Some(src_idx) = reader.index(target_name) {
+                                    values.push(reader_vals[src_idx].clone());
+                                } else {
+                                    debug_assert!(
+                                        target.field_metadata(target_idx).is_some(),
+                                        "target column {target_name:?} absent on reader and \
+                                         not engine-stamped — reader: {:?}, target: {:?}",
+                                        reader.columns(),
+                                        target.columns(),
+                                    );
+                                    values.push(Value::Null);
+                                }
+                            }
+                            // Stamp the engine-stamped CK tail at ingest:
+                            // each `$ck.<field>` slot captures the user-
+                            // declared field's value here, before any
+                            // downstream Transform can rewrite it. Frozen-
+                            // identity semantics flow through the schema
+                            // column for the rest of the DAG.
                             for (target_idx, source_field) in &engine_stamped {
                                 if let Some(src_idx) = reader.index(source_field) {
-                                    values[*target_idx] = r.values()[src_idx].clone();
+                                    values[*target_idx] = reader_vals[src_idx].clone();
                                 }
                             }
                             Record::new(Arc::clone(target), values)

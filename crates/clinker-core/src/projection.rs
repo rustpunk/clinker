@@ -114,15 +114,37 @@ pub fn project_output_from_record(
         }
     }
 
+    // `include_widened: true` expands the `auto_widen` sidecar
+    // absorber column (`$widened`, carrying `Value::Map`) back into
+    // top-level fields at the sink. Pattern precedent: Auto Loader's
+    // `_rescued_data` JSON column expands to top-level when the
+    // destination schema accepts it. The sidecar is engine-stamped so
+    // `iter_user_fields` skips it by default; this branch is the
+    // opt-in path.
+    if config.include_widened {
+        let sidecar_payload = input_record
+            .get(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+            .cloned();
+        // Strip the sidecar slot itself — its payload is being
+        // expanded; the slot name should never appear in output.
+        fields.swap_remove(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN);
+        if let Some(Value::Map(map)) = sidecar_payload {
+            for (k, v) in map.iter() {
+                fields.entry(k.to_string()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
     // Restrict to user-emitted columns when the caller supplied the
     // upstream node's emit-name list and `include_widened: false`.
+    // Sidecar-expanded fields land in `fields` *before* this filter
+    // and survive it because they're not in `cxl_emit_names`; the
+    // filter below would drop them. Restrict only when the sidecar
+    // was not expanded.
     if drop_unmapped {
-        let kept: IndexMap<String, Value> = cxl_emit_names
-            .unwrap()
-            .iter()
-            .filter_map(|name| fields.get(name.as_str()).map(|v| (name.clone(), v.clone())))
-            .collect();
-        fields = kept;
+        let allowed: std::collections::HashSet<&str> =
+            cxl_emit_names.unwrap().iter().map(|s| s.as_str()).collect();
+        fields.retain(|k, _| allowed.contains(k.as_str()));
     }
 
     if let Some(ref exclude_list) = config.exclude {
