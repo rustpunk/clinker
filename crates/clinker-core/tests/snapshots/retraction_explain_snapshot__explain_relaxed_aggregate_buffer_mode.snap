@@ -1,6 +1,5 @@
 ---
 source: crates/clinker-core/tests/retraction_explain_snapshot.rs
-assertion_line: 84
 expression: text
 ---
 === Execution Plan ===
@@ -76,7 +75,7 @@ Window index [0] (root source(orders), partition_by ["department"]):
   worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.
 
 Deferred Region: dept_totals → [out]
-  buffer_schema: ["department", "total", "lo", "n", "$ck.aggregate.dept_totals"]
+  buffer_schema: ["department", "total", "lo", "n", "$ck.aggregate.dept_totals", "$widened"]
 
 === CXL Expressions ===
 

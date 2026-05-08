@@ -2592,6 +2592,25 @@ fn propagate_aggregate(
             Type::Int,
         );
     }
+    // Carry the `$widened` sidecar column through aggregation when the
+    // upstream row has it. The aggregator's `finalize_group_inner`
+    // initializes values to `Value::Null` for any slot not covered by
+    // group_by stamping or an emit, so the post-aggregate `$widened`
+    // is always `Value::Null` — the per-row map payload has no
+    // canonical reduction semantic, and unioning maps across N input
+    // rows would produce arbitrary key collisions. Users who need an
+    // unmapped field at the aggregate output should add it to
+    // `group_by` or emit it explicitly via an aggregate function.
+    // The slot itself stays on the schema (engine-stamped) so
+    // downstream `include_widened: true` projections, dispatch
+    // canonicalize invariants, and composition body propagation all
+    // see a stable column shape across the aggregate boundary.
+    if upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN) {
+        out.insert(
+            QualifiedField::bare(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN),
+            Type::Any,
+        );
+    }
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }
 

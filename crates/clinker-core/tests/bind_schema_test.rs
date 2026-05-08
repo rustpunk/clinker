@@ -419,6 +419,84 @@ nodes:
     );
 }
 
+/// `$widened` propagates through an Aggregate node. The aggregate
+/// reduces N input rows to one output row per group; each input row's
+/// `$widened` map payload has no canonical reduction, so the
+/// aggregate's output `$widened` slot is `Value::Null` (an empty
+/// sidecar). The slot itself must remain on the output schema —
+/// dropping it would break the dispatch canonicalize invariant for
+/// any downstream consumer that expects the upstream's engine-stamped
+/// tail (composition-body port-source schemas, deferred-region
+/// buffer-key extraction) and would surface as an E314 SchemaMismatch.
+#[test]
+fn test_widened_sidecar_propagates_through_aggregate_as_null() {
+    use clinker_record::FieldMetadata;
+    let yaml = r#"
+pipeline:
+  name: agg-widen
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/a.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: salary, type: int }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by:
+        - dept
+      cxl: "emit total = sum(salary)"
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile_yaml(yaml);
+    let agg_row = plan
+        .typed_output_row("agg")
+        .expect("aggregate must have a bound row");
+    assert!(
+        agg_row.has_field("$widened"),
+        "aggregate's bound row must include `$widened` when the upstream source's auto_widen \
+         policy reserves the sidecar slot — dropping it breaks composition body propagation \
+         and the dispatch canonicalize invariant for downstream Output nodes"
+    );
+
+    // The PlanNode::Aggregation's lowered output_schema must carry the
+    // `WidenedSidecar` metadata so the Output's projection-fast-path
+    // and `iter_user_fields` filter agree on which column is the
+    // sidecar.
+    let agg_node = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find(|n| matches!(n, PlanNode::Aggregation { name, .. } if name == "agg"))
+        .expect("aggregate node");
+    let agg_schema = match agg_node {
+        PlanNode::Aggregation { output_schema, .. } => output_schema,
+        _ => unreachable!(),
+    };
+    assert!(
+        agg_schema.contains("$widened"),
+        "aggregate's PlanNode output_schema must list `$widened`"
+    );
+    assert!(
+        matches!(
+            agg_schema.field_metadata_by_name("$widened"),
+            Some(FieldMetadata::WidenedSidecar)
+        ),
+        "aggregate's `$widened` slot must carry WidenedSidecar engine-stamp metadata"
+    );
+}
+
 /// A `correlation_key` listing a field absent from the source's own
 /// `schema:` block fails compile with E153. Every CK field declared
 /// on a source MUST appear in that source's schema — silently
