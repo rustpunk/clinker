@@ -1,9 +1,8 @@
 pipeline:
   name: order_fulfillment
-  vars:
-    pipeline:
-      express_surcharge: { type: float, default: 5.99 }
-      high_value_threshold: { type: int, default: 500 }
+  static_vars:
+    express_surcharge: { type: float, default: 5.99 }
+    high_value_threshold: { type: int, default: 500 }
 
 nodes:
   - type: source

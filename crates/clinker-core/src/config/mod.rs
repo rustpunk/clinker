@@ -3216,6 +3216,8 @@ pub(crate) fn lower_node_to_plan_node(
                     validations: config.validations.clone().unwrap_or_default(),
                     dlq_node: None,
                     typed,
+                    declares: config.declares.clone(),
+                    phase: config.phase,
                 })),
                 parallelism_class,
                 tier: 0,

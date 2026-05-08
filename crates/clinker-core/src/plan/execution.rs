@@ -525,6 +525,12 @@ pub struct PlanTransformPayload {
     /// as a compile-time E200 diagnostic and the enclosing `compile()`
     /// call returns `Err` before this payload is built.
     pub typed: Arc<TypedProgram>,
+    /// Producer-declared scoped variables this transform writes via
+    /// `emit $<scope>.<key>`. Empty list means no scope writes.
+    pub declares: Vec<crate::config::pipeline_node::DeclareEntry>,
+    /// `phase: init` runs the transform (and its transitive ancestors)
+    /// to completion before any runtime-phase node sees a record.
+    pub phase: crate::config::pipeline_node::Phase,
 }
 
 /// Fully-resolved Output payload.

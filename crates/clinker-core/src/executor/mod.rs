@@ -2319,6 +2319,9 @@ fn compute_init_phase_node_set(
             PlanNode::State {
                 resolved: Some(p), ..
             } => p.phase == ConfPhase::Init,
+            PlanNode::Transform {
+                resolved: Some(p), ..
+            } => p.phase == ConfPhase::Init,
             _ => false,
         })
         .collect();

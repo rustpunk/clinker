@@ -71,15 +71,16 @@ nodes:
       path: in.csv
       schema:
         - { name: a, type: int }
-  - type: state
+  - type: transform
     name: init_writer
     input: src
     config:
-      scope: pipeline
+      declares:
+        - { name: x, scope: pipeline, type: int }
       phase: init
-      set:
-        - var: x
-          cxl: "a"
+      cxl: |
+        emit a = a
+        emit $pipeline.x = a
   - type: transform
     name: runtime_reader
     input: init_writer
@@ -118,22 +119,24 @@ nodes:
       path: in.csv
       schema:
         - { name: a, type: int }
-  - type: state
+  - type: transform
     name: w1
     input: src
     config:
-      scope: pipeline
-      set:
-        - var: x
-          cxl: "a"
-  - type: state
+      declares:
+        - { name: x, scope: pipeline, type: int }
+      cxl: |
+        emit a = a
+        emit $pipeline.x = a
+  - type: transform
     name: w2
     input: w1
     config:
-      scope: pipeline
-      set:
-        - var: x
-          cxl: "a + 1"
+      declares:
+        - { name: x, scope: pipeline, type: int }
+      cxl: |
+        emit a = a
+        emit $pipeline.x = a + 1
   - type: output
     name: out
     input: w2
@@ -165,14 +168,15 @@ nodes:
       path: in.csv
       schema:
         - { name: a, type: int }
-  - type: state
+  - type: transform
     name: writer
     input: src
     config:
-      scope: pipeline
-      set:
-        - var: x
-          cxl: "a"
+      declares:
+        - { name: x, scope: pipeline, type: int }
+      cxl: |
+        emit a = a
+        emit $pipeline.x = a
   - type: transform
     name: sibling_reader
     input: src
@@ -220,14 +224,16 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: t, type: string }
-  - type: state
+  - type: transform
     name: writer
     input: l
     config:
-      scope: source
-      set:
-        - var: tag
-          cxl: "t"
+      declares:
+        - { name: tag, scope: source, type: string }
+      cxl: |
+        emit id = id
+        emit t = t
+        emit $source.tag = t
   - type: merge
     name: m
     inputs: [writer, r]
@@ -354,14 +360,15 @@ nodes:
       path: in.csv
       schema:
         - { name: a, type: int }
-  - type: state
+  - type: transform
     name: runtime_w
     input: src
     config:
-      scope: pipeline
-      set:
-        - var: runtime_v
-          cxl: "a"
+      declares:
+        - { name: runtime_v, scope: pipeline, type: int }
+      cxl: |
+        emit a = a
+        emit $pipeline.runtime_v = a
   - type: source
     name: init_src
     config:
@@ -370,15 +377,16 @@ nodes:
       path: init.csv
       schema:
         - { name: b, type: int }
-  - type: state
+  - type: transform
     name: init_w
     input: init_src
     config:
-      scope: pipeline
+      declares:
+        - { name: init_v, scope: pipeline, type: int }
       phase: init
-      set:
-        - var: init_v
-          cxl: "b + $pipeline.runtime_v"
+      cxl: |
+        emit b = b
+        emit $pipeline.init_v = b + $pipeline.runtime_v
   - type: output
     name: out
     input: runtime_w

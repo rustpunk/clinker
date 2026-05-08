@@ -501,15 +501,16 @@ nodes:
       group_by: []
       cxl: |
         emit cap = max(cutoff)
-  - type: state
+  - type: transform
     name: capture_init
     input: max_agg
     config:
-      scope: pipeline
+      declares:
+        - { name: max_amount, scope: pipeline, type: int }
       phase: init
-      set:
-        - var: max_amount
-          cxl: "cap"
+      cxl: |
+        emit cap = cap
+        emit $pipeline.max_amount = cap
   - type: source
     name: orders_src
     config:
