@@ -832,3 +832,58 @@ nodes:
         );
     }
 }
+
+#[test]
+fn aggregate_rejects_scope_emit_with_diagnostic() {
+    // The scope-emit routing introduced for producer-declared vars
+    // (`emit $pipeline.x = ...`) is invalid inside aggregate
+    // transforms — there's no per-record write context to anchor the
+    // scope-write semantics. extract_aggregates emits a TypeDiagnostic
+    // surfaced as E200 at compile time.
+    let yaml = r#"
+pipeline:
+  name: aggregate_scope_emit_rejection
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: salary, type: int }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by: [dept]
+      cxl: |
+        emit dept = dept
+        emit total = sum(salary)
+        emit $pipeline.last_total = sum(salary)
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse");
+    let result = clinker_core::config::PipelineConfig::compile(
+        &config,
+        &clinker_core::config::CompileContext::default(),
+    );
+    let diags = result.expect_err("aggregate with emit $pipeline.x should fail compile");
+    let combined = diags
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("aggregate")
+            && (combined.contains("$pipeline") || combined.contains("scoped-variable")),
+        "expected aggregate-rejects-scope-emit diagnostic, got:\n{combined}",
+    );
+}

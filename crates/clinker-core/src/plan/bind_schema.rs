@@ -211,7 +211,7 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    validate_state_writers(nodes, diags);
+    validate_producer_writers(nodes, diags);
     validate_init_phase_terminals(nodes, diags);
     validate_read_after_write(nodes, &artifacts, diags);
     validate_post_merge_source_reads(nodes, &artifacts, diags);
@@ -232,7 +232,7 @@ pub fn bind_schema(
 /// (declaration default is the intended value). Only the
 /// init-reads-runtime-only case is flagged.
 ///
-/// Reuses `validate_state_writers`'s writer-map shape and
+/// Reuses `validate_producer_writers`'s writer-map shape and
 /// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
 /// Iterate every (scope, var) writer in the pipeline, regardless of
 /// the writer's variant kind (State node `set:` entry or Transform
@@ -912,17 +912,16 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
     }
 }
 
-/// Compile-time check: an init-phase state node must be terminal in
-/// the DAG — no other node may consume from it. Without source-replay
-/// infrastructure, the executor cannot deliver init-phase records to
-/// runtime-phase descendants, and silent record-loss would be a
-/// debugging nightmare. enforces the structural invariant
-/// up front; will lift the restriction once two-pass
-/// orchestration with source replay lands.
+/// Compile-time check: an init-phase node may feed only other
+/// init-phase nodes — runtime-phase consumers never see init-phase
+/// nodes' record-pass-through output because the runtime walk skips
+/// init-only sub-DAG nodes. Silent record-loss would be a debugging
+/// nightmare; this rule surfaces the structural mismatch up front.
 ///
-/// Walks each `phase: init` state node and checks whether any other
-/// node in the topology references it as input. Emits E164 with the
-/// state node's span and the offending downstream node's name.
+/// Walks each `phase: init` node (State or Transform) and checks
+/// whether any non-init node in the topology references it as input.
+/// Emits E164 with the init node's span and the offending downstream
+/// runtime node's name.
 fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
     let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
         let line = spanned.referenced.line() as u32;
@@ -932,7 +931,7 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
             Span::SYNTHETIC
         }
     };
-    let init_state_names: HashSet<&str> = nodes
+    let init_node_names: HashSet<&str> = nodes
         .iter()
         .filter_map(|spanned| match &spanned.value {
             PipelineNode::State { header, config }
@@ -948,14 +947,14 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
             _ => None,
         })
         .collect();
-    if init_state_names.is_empty() {
+    if init_node_names.is_empty() {
         return;
     }
     for spanned in nodes {
-        // For every node, check its inputs against the init-state-name
+        // For every node, check its inputs against the init-node-name
         // set. Each input declared on a node implies a downstream
-        // dependency on that input, so an init state node showing up
-        // as an input means it has a non-init descendant.
+        // dependency on that input, so an init node showing up as an
+        // input means it has a non-init descendant.
         let inputs: Vec<&str> = match &spanned.value {
             PipelineNode::Source { .. } => Vec::new(),
             PipelineNode::Transform { header, .. }
@@ -979,22 +978,20 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
         };
         let consumer_name = spanned.value.name();
         let consumer_span = span_for(spanned);
-        // lifted the strict "init state nodes are terminal"
-        // rule: init state nodes can have other init-phase consumers
-        // (the two-pass walk handles them as part of the init sub-DAG).
-        // Only RUNTIME descendants are still forbidden — runtime nodes
-        // never see the init state node's record-pass-through output
-        // because the runtime walk skips init-only sub-DAG nodes.
-        let consumer_is_init_state = matches!(
-            &spanned.value,
-            PipelineNode::State { config, .. } if config.phase == crate::config::Phase::Init
-        );
-        if consumer_is_init_state {
+        // Init-phase consumers (State or Transform) are fine — the
+        // two-pass walk handles them as part of the init sub-DAG.
+        // Only runtime descendants are forbidden.
+        let consumer_is_init = match &spanned.value {
+            PipelineNode::State { config, .. } => config.phase == crate::config::Phase::Init,
+            PipelineNode::Transform { config, .. } => config.phase == crate::config::Phase::Init,
+            _ => false,
+        };
+        if consumer_is_init {
             continue;
         }
         for input_name in inputs {
-            if init_state_names.contains(input_name) {
-                let init_state_span = nodes
+            if init_node_names.contains(input_name) {
+                let init_node_span = nodes
                     .iter()
                     .find(|n| n.value.name() == input_name)
                     .map(span_for)
@@ -1003,14 +1000,14 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
                     Diagnostic::error(
                         "E164",
                         format!(
-                            "init-phase state node {input_name:?} has runtime descendant \
-                             {consumer_name:?}: init state nodes can feed other init-phase \
-                             state nodes but must not be consumed by runtime-phase nodes \
+                            "init-phase node {input_name:?} has runtime descendant \
+                             {consumer_name:?}: init nodes can feed other init-phase \
+                             nodes but must not be consumed by runtime-phase nodes \
                              (their record output is not visible in the runtime walk). \
                              Either change the consumer to `phase: init` or detach it from \
-                             this init state node."
+                             this init node."
                         ),
-                        LabeledSpan::primary(init_state_span, "init state node".to_string()),
+                        LabeledSpan::primary(init_node_span, "init node".to_string()),
                     )
                     .with_secondary(LabeledSpan::new(
                         consumer_span,
@@ -1036,7 +1033,7 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
 /// Emits E170 with primary span on the second writer and secondary
 /// span on the first (the chronologically-first span in declaration
 /// order is the "canonical" writer; downstream nodes are duplicates).
-fn validate_state_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
+fn validate_producer_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
     let mut seen: std::collections::HashMap<(crate::config::VarScope, String), (Span, String)> =
         std::collections::HashMap::new();
     let scope_str = |scope: crate::config::VarScope| match scope {

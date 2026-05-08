@@ -3,7 +3,7 @@
 # Compile must reject with E174 — types must match between parent
 # and composition opt-in.
 _compose:
-  name: state_type_mismatch
+  name: declares_type_mismatch
   inputs:
     inp:
       schema:

@@ -284,7 +284,7 @@ nodes:
   - type: composition
     name: body
     input: src
-    use: ../compositions/state_uses_undeclared.comp.yaml
+    use: ../compositions/declares_undeclared.comp.yaml
     inputs:
       data: src
   - type: output
@@ -322,7 +322,7 @@ nodes:
   - type: composition
     name: body
     input: src
-    use: ../compositions/state_type_mismatch.comp.yaml
+    use: ../compositions/declares_type_mismatch.comp.yaml
     inputs:
       inp: src
   - type: output

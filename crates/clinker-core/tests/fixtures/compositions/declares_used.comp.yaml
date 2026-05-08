@@ -4,7 +4,7 @@
 # declared parent var and emits it; the integration test asserts the
 # parent's value is visible to the body.
 _compose:
-  name: state_uses_declared
+  name: declares_used
   inputs:
     inp:
       schema:

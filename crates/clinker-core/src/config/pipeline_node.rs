@@ -2187,7 +2187,7 @@ nodes:
   - type: composition
     name: caller
     input: src
-    use: compositions/state_uses_undeclared.comp.yaml
+    use: compositions/declares_undeclared.comp.yaml
     inputs:
       data: src
     outputs:

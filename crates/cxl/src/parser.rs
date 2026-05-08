@@ -1415,6 +1415,66 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_emit_source_namespace_succeeds() {
+        let r = parse_ok("emit $source.batch = id");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "batch");
+                assert_eq!(*target, EmitTarget::Source);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_record_namespace_succeeds() {
+        let r = parse_ok("emit $record.score = amount * 2");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "score");
+                assert_eq!(*target, EmitTarget::Record);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_pipeline_target_tag() {
+        let r = parse_ok("emit $pipeline.last = amount");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "last");
+                assert_eq!(*target, EmitTarget::Pipeline);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_meta_target_tag() {
+        let r = parse_ok("emit $meta.tier = \"A\"");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "tier");
+                assert_eq!(*target, EmitTarget::Meta);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_field_default_target_tag() {
+        let r = parse_ok("emit total = a + b");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "total");
+                assert_eq!(*target, EmitTarget::Field);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
     fn test_parse_arithmetic() {
         let r = parse_ok("let x = 1 + 2 * 3");
         let expr = let_expr(&r);

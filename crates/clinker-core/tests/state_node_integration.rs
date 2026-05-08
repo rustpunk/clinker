@@ -322,7 +322,7 @@ nodes:
   - type: composition
     name: body
     input: src
-    use: ../compositions/state_uses_declared.comp.yaml
+    use: ../compositions/declares_used.comp.yaml
     inputs:
       inp: src
   - type: output
@@ -632,4 +632,56 @@ nodes:
     // row 3 (from orders_b.csv) carries "beta". Each Arc keys its own
     // entry in `source_vars`.
     assert_eq!(lines, vec!["1,alpha", "2,alpha", "3,beta"]);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Fixture 8 — $vars.<key> static config, frozen at pipeline start
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn static_vars_visible_in_transform_cxl() {
+    // `static_vars:` declares a flat top-level config knob with a
+    // default. The transform's CXL filters records against
+    // `$vars.cutoff` and emits the value as a column. No producer
+    // writes the var; it's frozen at pipeline start (channel overrides
+    // would apply once at startup but this fixture has no channel).
+    let yaml = r#"
+pipeline:
+  name: static_vars_smoke
+  static_vars:
+    cutoff: { type: int, default: 100 }
+    label: { type: string, default: "tier-A" }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amount, type: int }
+  - type: transform
+    name: filter_and_tag
+    input: src
+    config:
+      cxl: |
+        filter amount > $vars.cutoff
+        emit id = id
+        emit tier = $vars.label
+        emit threshold = $vars.cutoff
+  - type: output
+    name: out
+    input: filter_and_tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let csv = "id,amount\n1,50\n2,150\n3,200\n";
+    let out = run_single(yaml, csv);
+    let lines = body_lines_sorted(&out);
+    // Records with amount > 100 (cutoff) survive: ids 2 and 3.
+    // Each emits the static label and cutoff.
+    assert_eq!(lines, vec!["2,tier-A,100", "3,tier-A,100"]);
 }

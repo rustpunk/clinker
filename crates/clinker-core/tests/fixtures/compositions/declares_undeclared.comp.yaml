@@ -5,7 +5,7 @@
 # hidden from your body — declare in `_compose.scoped_vars` to opt in")
 # rather than the generic "unknown member" diagnostic.
 _compose:
-  name: state_uses_undeclared
+  name: declares_undeclared
   inputs:
     data:
       schema:
