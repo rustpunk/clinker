@@ -76,18 +76,30 @@ pub fn project_output_from_record(
         || config.mapping.is_some()
         || config.include_widened
         || drop_unmapped;
-    let include_engine_stamped = config.include_correlation_keys;
+    // `include_correlation_keys: true` surfaces `$ck.<field>` source-CK
+    // shadows and `$ck.aggregate.<name>` synthetic-CK lineage to the
+    // sink — but NOT the `$widened` sidecar absorber. Sidecar
+    // expansion is gated independently by `include_widened: true`,
+    // which expands the `Value::Map` payload to top-level fields.
+    // Routing both through one engine-stamped toggle would surface
+    // the raw `$widened` `Value::Map` as a literal column to the
+    // downstream writer, which CSV/XML writers JSON-encode and the
+    // fixed-width writer silently empties — neither is the user's
+    // intent when they opt into CK visibility.
+    let include_correlation_keys = config.include_correlation_keys;
 
     if !needs_rewrite {
         // Fast path: no exclude, no mapping — emit all Record fields in
         // natural iteration order, no intermediate allocation.
         // Engine-stamped columns are dropped unless the Output node
-        // opts in.
+        // opts in via the appropriate flag (CK → include_correlation_keys;
+        // sidecar → include_widened, handled in the slow path because
+        // expansion needs IndexMap-keyed access).
         let field_count = input_record.total_field_count();
         let mut schema_builder = SchemaBuilder::with_capacity(field_count);
         let mut values: Vec<Value> = Vec::with_capacity(field_count);
-        if include_engine_stamped {
-            for (name, value) in input_record.iter_all_fields() {
+        if include_correlation_keys {
+            for (name, value) in input_record.iter_user_and_correlation_fields() {
                 schema_builder = schema_builder.with_field(name);
                 values.push(value.clone());
             }
@@ -104,8 +116,8 @@ pub fn project_output_from_record(
     // fields, which wants the temporary IndexMap's keyed access.
     let mut fields: IndexMap<String, Value> =
         IndexMap::with_capacity(input_record.total_field_count());
-    if include_engine_stamped {
-        for (name, value) in input_record.iter_all_fields() {
+    if include_correlation_keys {
+        for (name, value) in input_record.iter_user_and_correlation_fields() {
             fields.insert(name.to_string(), value.clone());
         }
     } else {
@@ -367,5 +379,160 @@ mod tests {
         let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
         assert_eq!(cols, vec!["id", "name", "$ck.id"]);
         assert_eq!(result.get("$ck.id"), Some(&Value::Integer(1)));
+    }
+
+    /// `include_correlation_keys: true` surfaces `$ck.<field>` shadow
+    /// columns to the sink but does NOT leak the `$widened` sidecar
+    /// absorber. Sidecar expansion is a separate `include_widened: true`
+    /// concern; routing both through one engine-stamped toggle would
+    /// surface the raw `Value::Map` payload as a literal column to
+    /// the writer (CSV/XML JSON-encode, fixed-width silently empties),
+    /// which is never the user's intent when they opt into CK
+    /// visibility. Verified on both the fast path (no rewrite) and
+    /// the slow path (rewrite triggered by `include_widened: true`).
+    #[test]
+    fn test_include_correlation_keys_does_not_leak_widened_sidecar() {
+        use clinker_record::FieldMetadata;
+        use clinker_record::SchemaBuilder;
+        let schema = SchemaBuilder::new()
+            .with_field("id")
+            .with_field("name")
+            .with_field_meta("$ck.id", FieldMetadata::source_correlation("id"))
+            .with_field_meta("$widened", FieldMetadata::widened_sidecar())
+            .build();
+        let mut sidecar = IndexMap::new();
+        sidecar.insert("extra".into(), Value::String("payload".into()));
+        let input = Record::new(
+            schema,
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".into()),
+                Value::Integer(1),
+                Value::Map(Box::new(sidecar)),
+            ],
+        );
+
+        // Fast path: include_correlation_keys=true, include_widened=false,
+        // no rewrite. Output gets [id, name, $ck.id] — `$widened`
+        // dropped, sidecar payload not surfaced.
+        let config = fast_path_output_config(true);
+        let result = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(
+            cols,
+            vec!["id", "name", "$ck.id"],
+            "include_correlation_keys must surface $ck.* but never $widened"
+        );
+        assert!(
+            result.get("$widened").is_none(),
+            "$widened must not appear on the output schema"
+        );
+        assert!(
+            result.get("extra").is_none(),
+            "sidecar payload must not be expanded — that is the include_widened flag"
+        );
+
+        // Slow path: same flags, but force rewrite via mapping.
+        let config_slow = OutputConfig {
+            name: "out".into(),
+            format: crate::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_widened: false,
+            include_header: None,
+            mapping: Some({
+                let mut m = IndexMap::new();
+                m.insert("name".into(), "person".into());
+                m
+            }),
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_correlation_keys: true,
+            correlation_fanout_policy: None,
+            if_exists: Default::default(),
+            unique_suffix_width: 0,
+            write_meta: false,
+            schema: None,
+            split: None,
+            notes: None,
+        };
+        let result_slow = project_output_from_record(&input, &config_slow, None);
+        let cols_slow: Vec<&str> = result_slow
+            .schema()
+            .columns()
+            .iter()
+            .map(|c| &**c)
+            .collect();
+        assert_eq!(
+            cols_slow,
+            vec!["id", "person", "$ck.id"],
+            "slow path: include_correlation_keys must surface $ck.* but never $widened"
+        );
+        assert!(
+            result_slow.get("$widened").is_none(),
+            "slow path: $widened must not appear on the output schema"
+        );
+    }
+
+    /// `include_widened: true` expands the sidecar map even when
+    /// `include_correlation_keys: false`. The two flags are
+    /// independent: each gates a distinct engine-stamped surface.
+    #[test]
+    fn test_include_widened_expands_independently_of_correlation_keys() {
+        use clinker_record::FieldMetadata;
+        use clinker_record::SchemaBuilder;
+        let schema = SchemaBuilder::new()
+            .with_field("id")
+            .with_field_meta("$ck.id", FieldMetadata::source_correlation("id"))
+            .with_field_meta("$widened", FieldMetadata::widened_sidecar())
+            .build();
+        let mut sidecar = IndexMap::new();
+        sidecar.insert("extra".into(), Value::String("payload".into()));
+        let input = Record::new(
+            schema,
+            vec![
+                Value::Integer(7),
+                Value::Integer(7),
+                Value::Map(Box::new(sidecar)),
+            ],
+        );
+        let config = OutputConfig {
+            name: "out".into(),
+            format: crate::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_widened: true,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_correlation_keys: false,
+            correlation_fanout_policy: None,
+            if_exists: Default::default(),
+            unique_suffix_width: 0,
+            write_meta: false,
+            schema: None,
+            split: None,
+            notes: None,
+        };
+        let result = project_output_from_record(&input, &config, None);
+        // Output: id (declared) + extra (expanded sidecar). $ck.id is
+        // dropped because include_correlation_keys is false; $widened
+        // slot is stripped before the map expansion.
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "extra"]);
+        assert_eq!(
+            result.get("extra"),
+            Some(&Value::String("payload".into())),
+            "sidecar map's `extra` key must expand to a top-level field"
+        );
+        assert!(
+            result.get("$ck.id").is_none(),
+            "include_correlation_keys: false must drop $ck.* even when include_widened: true"
+        );
+        assert!(
+            result.get("$widened").is_none(),
+            "$widened slot must be stripped after expansion"
+        );
     }
 }

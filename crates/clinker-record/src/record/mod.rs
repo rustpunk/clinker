@@ -175,10 +175,12 @@ impl Record {
     }
 
     /// Iterator over user-declared schema fields in schema order,
-    /// skipping engine-stamped columns (today: `$ck.<field>` correlation
-    /// snapshots). The default writer surface and the default projection
-    /// fast path consult this iterator so engine-internal namespaces do
-    /// not leak into output files unless the Output node opts in.
+    /// skipping every engine-stamped column. The default writer
+    /// surface and the default projection fast path consult this
+    /// iterator so engine-internal namespaces (`$ck.<field>` source
+    /// correlation, `$ck.aggregate.<name>` synthetic correlation, the
+    /// `$widened` `auto_widen` sidecar) do not leak into output files
+    /// unless the Output node opts in via a specific flag.
     pub fn iter_user_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.schema
             .columns()
@@ -188,6 +190,35 @@ impl Record {
                 self.schema
                     .field_metadata(*i)
                     .is_none_or(|m| !m.is_engine_stamped())
+            })
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
+    }
+
+    /// Iterator over user-declared schema fields **plus** correlation-
+    /// lattice columns (`$ck.<field>` source-CK shadows and
+    /// `$ck.aggregate.<name>` synthetic-CK lineage), but skipping the
+    /// `auto_widen` sidecar absorber `$widened`. The Output node's
+    /// `include_correlation_keys: true` flag consults this iterator
+    /// so a user opting into CK column visibility gets exactly the
+    /// CK lattice — not the sidecar's `Value::Map` payload (which
+    /// would surface as a JSON-encoded blob in CSV/XML writers and
+    /// silently drop in fixed-width).
+    ///
+    /// `include_widened: true` is the **separate** opt-in for sidecar
+    /// expansion at the Output projection layer; it routes through
+    /// `Record::get(\"$widened\")` directly and expands the
+    /// `Value::Map` payload to top-level columns.
+    pub fn iter_user_and_correlation_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        use crate::schema::FieldMetadata;
+        self.schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| match self.schema.field_metadata(*i) {
+                Some(FieldMetadata::WidenedSidecar) => false,
+                Some(FieldMetadata::SourceCorrelation { .. })
+                | Some(FieldMetadata::AggregateGroupIndex { .. })
+                | None => true,
             })
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
