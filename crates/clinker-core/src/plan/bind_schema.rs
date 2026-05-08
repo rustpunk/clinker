@@ -3586,9 +3586,29 @@ fn combine_output_row(
     }
     // Driver's engine-stamped tail always rides through. `widen_record_to_schema`
     // picks up the values from the driver record by name at runtime.
+    //
+    // Two driver-side engine-stamp shapes propagate:
+    //
+    // - `$ck.<field>` source-CK shadow columns. The driver carries the
+    //   authoritative correlation identity for the joined output; the
+    //   `widen_record_to_schema` name-lookup at runtime picks the
+    //   driver's CK value for the output's CK slot.
+    // - `$widened` `auto_widen` sidecar absorber. The driver's per-row
+    //   undeclared-fields map carries through to the output's
+    //   `$widened` slot. Build-side `$widened` is intentionally
+    //   dropped — build records' undeclared fields are passthrough
+    //   payload that the user did not ask the join to surface; users
+    //   who need a build-side unmapped field on the joined output
+    //   must declare it in the build source's `schema:` block (which
+    //   makes it referenceable via `<build_qualifier>.<field>` in the
+    //   combine body) or explicitly emit it via the body's CXL.
+    //   Mirrors `propagate_ck: Driver` (the default) which suppresses
+    //   build-side user-declared CK by the same rationale.
     if let Some(driver) = driver_row {
         for (qf, ty) in driver.fields() {
-            if qf.name.starts_with("$ck.") {
+            if qf.name.starts_with("$ck.")
+                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
+            {
                 let bare = QualifiedField::bare(qf.name.clone());
                 out.entry(bare).or_insert_with(|| ty.clone());
             }

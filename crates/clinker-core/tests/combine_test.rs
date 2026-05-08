@@ -753,6 +753,45 @@ mod tests {
     // `artifacts.typed[name]`.
 
     /// Emit statements publish an output row whose declared field
+    /// Combine drops build-side `$widened` from the output Row by
+    /// design. Both sources have `auto_widen` (the engine-wide
+    /// default), so each carries its own `$widened` sidecar; the
+    /// joined output retains the driver's sidecar (via the
+    /// unconditional driver-engine-stamp loop in `combine_output_row`)
+    /// and discards every build-side `$widened`. Build-side
+    /// undeclared fields are passthrough payload that the user did
+    /// not ask the join to surface — explicitly emitting
+    /// `<build_qualifier>.<field>` in the body is the supported way
+    /// to lift a build-side unmapped value into the joined output.
+    /// Mirrors `propagate_ck: Driver` (the default) for user-declared
+    /// CK by the same rationale.
+    ///
+    /// The output row therefore lists exactly one `$widened` slot
+    /// (the driver's) — never two, never a renamed `<qualifier>.$widened`
+    /// pair. Verified here by inspecting `field_names()` for any
+    /// occurrence of `$widened` and asserting the count is exactly 1.
+    #[test]
+    fn test_combine_drops_build_side_widened_sidecar() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let row = artifacts
+            .typed
+            .get("enriched")
+            .map(|tp| &tp.output_row)
+            .expect("enriched publishes a bound output row");
+        let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        let widened_count = names.iter().filter(|n| n.as_str() == "$widened").count();
+        assert_eq!(
+            widened_count, 1,
+            "combine output row must list `$widened` exactly once (driver-only); \
+             build-side sidecar must be dropped. names = {names:?}"
+        );
+    }
+
     /// names (bare) are exactly the LHS emit names in source order.
     /// Also asserts `artifacts.typed[name]` is populated with the
     /// body TypedProgram.
@@ -764,6 +803,11 @@ mod tests {
             "two_input_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
+        // Driver source `orders` carries the `$widened` engine-stamped
+        // sidecar (auto_widen is the default `OnUnmapped` policy), so
+        // the combine's output row inherits it. Build-side `$widened`
+        // is intentionally dropped — see the rustdoc on
+        // `combine_output_row` in `bind_schema.rs`.
         assert_output_row(
             &artifacts,
             "enriched",
@@ -773,6 +817,7 @@ mod tests {
                 "product_name",
                 "category",
                 "amount",
+                "$widened",
             ],
         );
         assert!(
