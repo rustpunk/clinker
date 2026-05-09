@@ -26,11 +26,9 @@ By default, output nodes write only the fields explicitly emitted by upstream tr
     include_widened: true    # Default: false
 ```
 
-When `true`, fields that the source's `on_unmapped: auto_widen` policy absorbed into the per-record `$widened` sidecar map are expanded back to top-level columns at the sink. See [Sources → on_unmapped](source.md#on_unmapped--undeclared-input-fields) for the absorption mechanism. Useful for pass-through pipelines where you want every original input field reaching the output regardless of whether it was declared in the source's `schema:` block.
+When `true`, fields the source's `on_unmapped: auto_widen` policy absorbed into the per-record `$widened` sidecar map are expanded back to top-level columns at the sink. With `include_widened: false` (the default), the sidecar slot is stripped and only user-declared / explicitly-emitted columns reach the writer.
 
-With `include_widened: false` (the default), the `$widened` sidecar slot is stripped from the output and only user-declared / explicitly-emitted columns reach the writer.
-
-The flag composes independently with `include_correlation_keys: true` — see below.
+The flag composes independently with `include_correlation_keys: true` — see below. See [Auto-Widen & Schema Drift → Output controls](auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
 
 ### Include correlation-key shadow columns
 
@@ -48,7 +46,7 @@ Set `include_correlation_keys: true` to surface the shadow columns in the writer
 
 CSV, XML, and fixed-width writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
 
-The most common case: the `$widened` sidecar reaches the writer because the Output node forgot to set `include_widened: true`. The remediation is to either set the flag (so the projection layer expands the map to top-level columns) or coerce the map to a scalar in CXL before the emit. The error message lists both routes.
+The typical cause is a `$widened` sidecar reaching the writer because the Output node forgot `include_widened: true`. See [Auto-Widen & Schema Drift → Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
 
 ### Field mapping
 

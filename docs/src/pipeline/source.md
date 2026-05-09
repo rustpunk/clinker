@@ -143,7 +143,7 @@ Fixed-width sources require a separate format schema (`.schema.yaml` file) that 
 
 ## `on_unmapped` — undeclared input fields
 
-When the reader encounters input fields that the source's `schema:` block does not name, the per-source `on_unmapped` policy decides what to do:
+The per-source `on_unmapped` policy decides what to do with input fields the source's `schema:` block does not name. Three modes — `auto_widen` (default), `drop`, `reject`:
 
 ```yaml
 - type: source
@@ -159,30 +159,10 @@ When the reader encounters input fields that the source's `schema:` block does n
       - { name: amount, type: numeric }
 ```
 
-Three modes:
-
-- **`auto_widen`** *(default)*: per-record undeclared fields are absorbed into a `Value::Map` payload carried by an engine-stamped `$widened` sidecar column appended to the source's schema. CXL expressions cannot read or write the sidecar (the typechecker is blind to its contents), but the sidecar's payload propagates through downstream nodes and can be expanded back to top-level columns at any Output sink via `include_widened: true`. This is the engine-wide default — running a pipeline against an input file that has columns beyond the declared `schema:` will preserve those columns end-to-end without any user-visible breakage. Pattern precedent: Databricks Auto Loader's `_rescued_data` sidecar and ClickHouse's `JSON` column type.
-
-- **`drop`**: undeclared input fields are silently stripped at read time. No sidecar; the source's plan-time schema equals the declared `schema:`. Matches Snowflake's `MATCH_BY_COLUMN_NAME='CASE_INSENSITIVE'` with `ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE` and dbt's `on_schema_change=ignore`.
-
-- **`reject`**: any input record carrying a key not in the declared schema fails the source with a `FormatError::UndeclaredField` diagnostic naming the offending field. Strict; matches dlt's `freeze` mode.
-
-### Auto-widen propagation through the DAG
-
-The `$widened` sidecar follows these rules through downstream nodes:
-
-| Node type | Sidecar behavior |
-|---|---|
-| Transform | Inherits unchanged from input (transforms are row-preserving). |
-| Aggregate | Output's `$widened` slot is `Value::Null` — per-row payloads have no canonical aggregation. Users who need an unmapped field at aggregate output must add it to `group_by` or emit it explicitly via an aggregate function. |
-| Combine | Driver's sidecar rides through; build-side sidecars are dropped (mirrors `propagate_ck: Driver`). Users can lift a build-side unmapped field via `<build_qualifier>.<field>` in the combine body's CXL. |
-| Route / Merge | Row-preserving — sidecar passes through. `Merge` requires every input source to share the same `on_unmapped` policy; mixing fails compile with E315. |
-| Composition | Body inherits the parent's sidecar via the synthetic input port; whatever the body's terminal node carries flows back to the parent. |
-| Output | Sidecar is stripped by default. Set `include_widened: true` to expand the map's keys back to top-level columns at the sink. |
-
-### Fixed-width is structurally inert
-
-Fixed-width sources are positional — the schema is constructed from `width` / `start..end` byte ranges, and bytes outside the declared ranges are invisible to the reader. `auto_widen` therefore can never populate the sidecar for fixed-width sources; the slot stays `Value::Null` for every record. The executor logs one `tracing::info` per fixed-width source with `auto_widen` policy at run time, naming the source. Switch to `on_unmapped: drop` (or `reject`) for explicit scalar semantics, or accept the empty sidecar.
+See [Auto-Widen & Schema Drift](auto-widen.md) for the full
+specification: the `$widened` sidecar absorber design, propagation
+rules per downstream node type, the `include_widened` Output flag,
+**E315** merge-policy mismatch, and fixed-width inertness.
 
 ## Sort order
 
