@@ -30,8 +30,8 @@ use crate::plan::row_type::{QualifiedField, Row};
 use crate::span::Span;
 use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
 use cxl::typecheck::Type;
+use cxl::typecheck::TypeDiagnostic;
 use cxl::typecheck::pass::TypedProgram;
-use cxl::typecheck::{TypeDiagnostic, type_check};
 
 /// Execution strategy for a combine node, selected by the planner based on
 /// predicate decomposition and input characteristics.
@@ -407,8 +407,10 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -489,6 +491,7 @@ fn build_residual_program(
     merged_row: &Row,
     original_node_count: u32,
     filter_span: cxl::lexer::Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<Arc<TypedProgram>, Vec<TypeDiagnostic>> {
     debug_assert!(
         !residual_exprs.is_empty(),
@@ -533,20 +536,31 @@ fn build_residual_program(
         .field_names()
         .map(|qf| qf.name.as_ref())
         .collect();
-    let resolved =
-        cxl::resolve::resolve_program(program, &field_refs, next_id).map_err(|diags| {
-            diags
-                .into_iter()
-                .map(|d| TypeDiagnostic {
-                    span: d.span,
-                    message: d.message,
-                    help: d.help,
-                    related_span: None,
-                    is_warning: false,
-                })
-                .collect::<Vec<_>>()
-        })?;
-    let typed = type_check(resolved, merged_row)?;
+    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
+        program,
+        &field_refs,
+        next_id,
+        &std::collections::HashMap::new(),
+        scoped_vars,
+    )
+    .map_err(|diags| {
+        diags
+            .into_iter()
+            .map(|d| TypeDiagnostic {
+                span: d.span,
+                message: d.message,
+                help: d.help,
+                related_span: None,
+                is_warning: false,
+            })
+            .collect::<Vec<_>>()
+    })?;
+    let typed = cxl::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        merged_row,
+        cxl::typecheck::pass::AggregateMode::Row,
+        scoped_vars,
+    )?;
     Ok(Arc::new(typed))
 }
 
@@ -567,6 +581,7 @@ pub(crate) fn decompose_predicate(
     typed_where: &Arc<TypedProgram>,
     merged_row: &Row,
     filter_span: cxl::lexer::Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<DecomposedPredicate, Vec<TypeDiagnostic>> {
     let predicate = match typed_where.program.statements.first() {
         Some(Statement::Filter { predicate, .. }) => predicate,
@@ -610,6 +625,7 @@ pub(crate) fn decompose_predicate(
             merged_row,
             typed_where.node_count,
             filter_span,
+            scoped_vars,
         )?)
     };
 

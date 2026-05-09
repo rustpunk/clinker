@@ -146,3 +146,9 @@ Merge nodes can combine records from multiple source files that share the same s
       emit total = sum(amount)
       emit count = count(*)
 ```
+
+## Schema constraints across inputs
+
+Merge concatenates streams positionally against the merge node's `output_schema` (taken from the first input). Every input must therefore agree on column shape — same column names, same `on_unmapped` policy, same `correlation_key` set.
+
+Disagreement on the `$widened` `auto_widen` sidecar (one source uses `auto_widen`, another uses `drop` / `reject`) fails compile with **E315**. See [Auto-Widen & Schema Drift → E315](auto-widen.md#e315--merge-inputs-must-agree-on-policy) for the full diagnostic shape and remediation.

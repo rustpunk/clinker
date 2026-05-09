@@ -5,54 +5,52 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Maximum number of metadata keys per record.
-const MAX_METADATA_KEYS: usize = 64;
+/// Maximum number of `$record.<key>` user-declared scoped variables per record.
+const MAX_RECORD_VARS: usize = 64;
 
 /// Schema-indexed row record.
 ///
 /// Values live in a positional `Vec<Value>` whose length equals
 /// `schema.column_count()`. Every write lands at a known schema slot;
-/// there is no side map for unknown fields. Plan-time schema widening
-/// guarantees every emit site addresses a column declared on the
-/// operator's `Arc<Schema>`.
-///
-/// Per-record framing data (unknown keys discovered by readers,
-/// reader/writer context) lives in the separate `metadata` map under
-/// the `$meta.*` namespace, capped at 64 keys per record.
+/// there is no side map for unknown fields. The reader's
+/// `OnUnmapped` policy decides at read time whether undeclared input
+/// fields widen the source's `Arc<Schema>` (`auto_widen`), are
+/// silently dropped (`drop`), or cause the source to fail (`reject`)
+/// — by the time a Record exists, its schema already names every
+/// value it carries.
 #[derive(Debug, Clone)]
 pub struct Record {
     schema: Arc<Schema>,
     values: Vec<Value>,
-    /// Per-record metadata. Stripped from output unless `include_metadata` is set.
-    /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
-    metadata: Option<Box<IndexMap<Box<str>, Value>>>,
+    /// Per-record user-declared `$record.<key>` scoped variables.
+    /// Written by Transforms whose `declares:` entries have
+    /// `scope: record`. Lazy-initialized on first `set_record_var()`
+    /// call.
+    record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
 }
 
 /// Wire payload for a [`Record`] in binary spill streams.
 ///
 /// Schema is not embedded — the spill stream writes the schema once in
-/// a header line, so each record body carries only positional values and
-/// optional per-record metadata. Callers reconstruct a full `Record` via
-/// [`RecordPayload::into_record`].
-///
-/// Wire format (postcard): `(Vec<Value>, Option<Vec<(Box<str>, Value)>>)`.
+/// a header line, so each record body carries only positional values
+/// and optional per-record `$record.<key>` scoped variables. Callers
+/// reconstruct a full `Record` via [`RecordPayload::into_record`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecordPayload {
     /// Positional field values in schema column order.
     pub values: Vec<Value>,
-    /// Per-record metadata entries, or `None` if the record has no metadata.
-    pub metadata: Option<Vec<(Box<str>, Value)>>,
+    /// Per-record `$record.<key>` user-declared scoped variables, or
+    /// `None` if the record has none.
+    pub record_vars: Option<Vec<(Box<str>, Value)>>,
 }
 
 impl RecordPayload {
     /// Reconstruct a [`Record`] from this payload using a caller-supplied schema.
     pub fn into_record(self, schema: Arc<Schema>) -> Record {
         let mut record = Record::new(schema, self.values);
-        if let Some(meta_pairs) = self.metadata {
-            for (k, v) in meta_pairs {
-                // Metadata cap errors are ignored on deserialization — the cap
-                // is a write-time guard, not a wire-format invariant.
-                let _ = record.set_meta(&k, v);
+        if let Some(rv_pairs) = self.record_vars {
+            for (k, v) in rv_pairs {
+                let _ = record.set_record_var(&k, v);
             }
         }
         record
@@ -60,16 +58,16 @@ impl RecordPayload {
 }
 
 impl Serialize for Record {
-    /// Serializes this record as a [`RecordPayload`] (values + metadata).
+    /// Serializes this record as a [`RecordPayload`] (values + record_vars).
     ///
     /// The schema is not included in the wire output. Callers that need
     /// schema information must write it separately (e.g., as a header line)
     /// and supply it on deserialization via [`RecordPayload::into_record`].
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let meta = self.metadata_pairs();
+        let rv = self.record_var_pairs();
         RecordPayload {
             values: self.values.clone(),
-            metadata: if meta.is_empty() { None } else { Some(meta) },
+            record_vars: if rv.is_empty() { None } else { Some(rv) },
         }
         .serialize(serializer)
     }
@@ -94,7 +92,7 @@ impl Record {
         Self {
             schema,
             values,
-            metadata: None,
+            record_vars: None,
         }
     }
 
@@ -132,45 +130,34 @@ impl Record {
         &self.values
     }
 
-    // ── Metadata ────────────────────────────────────────────────────
+    // ── Record-scope variables (`$record.<key>`) ────────────────────
 
-    /// Read a per-record metadata value by key.
-    pub fn get_meta(&self, key: &str) -> Option<&Value> {
-        self.metadata.as_ref().and_then(|m| m.get(key))
+    /// Read a `$record.<key>` user-declared scoped variable by key.
+    ///
+    /// Written only by Transforms whose `declares:` entries have
+    /// `scope: record`; capped at 64 keys per record.
+    pub fn get_record_var(&self, key: &str) -> Option<&Value> {
+        self.record_vars.as_ref().and_then(|m| m.get(key))
     }
 
-    /// Write a per-record metadata value. Lazy-inits the map on first call.
-    /// Returns `Err` if the per-record metadata cap (64 keys) would be exceeded.
-    pub fn set_meta(&mut self, key: &str, value: Value) -> Result<(), &'static str> {
+    /// Write a `$record.<key>` user-declared scoped variable.
+    /// Lazy-inits the map on first call. Returns `Err` if the
+    /// per-record record-vars cap (64 keys) would be exceeded.
+    pub fn set_record_var(&mut self, key: &str, value: Value) -> Result<(), &'static str> {
         let map = self
-            .metadata
+            .record_vars
             .get_or_insert_with(|| Box::new(IndexMap::new()));
-        if !map.contains_key(key) && map.len() >= MAX_METADATA_KEYS {
-            return Err("per-record metadata cap exceeded (64 keys)");
+        if !map.contains_key(key) && map.len() >= MAX_RECORD_VARS {
+            return Err("per-record `$record.<key>` cap exceeded (64 keys)");
         }
         map.insert(key.into(), value);
         Ok(())
     }
 
-    /// Whether this record has any metadata entries.
-    pub fn has_meta(&self) -> bool {
-        self.metadata.as_ref().is_some_and(|m| !m.is_empty())
-    }
-
-    /// Iterator over all metadata key-value pairs.
-    pub fn iter_meta(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.metadata
-            .iter()
-            .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
-    }
-
-    /// Collect all metadata entries as owned `(Box<str>, Value)` pairs.
-    ///
-    /// Returns an empty `Vec` when the record has no metadata. Used by
-    /// [`crate::Record`]'s `Serialize` impl to produce a [`RecordPayload`]
-    /// for binary spill encoding.
-    pub fn metadata_pairs(&self) -> Vec<(Box<str>, Value)> {
-        match &self.metadata {
+    /// Collect all `$record.<key>` entries as owned pairs (for binary
+    /// spill encoding via [`RecordPayload::record_vars`]).
+    pub fn record_var_pairs(&self) -> Vec<(Box<str>, Value)> {
+        match &self.record_vars {
             None => Vec::new(),
             Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
@@ -178,9 +165,7 @@ impl Record {
 
     // ── Fields ─────────────────────────────────────────────────────
 
-    /// Iterator over every schema field in schema order. Metadata is
-    /// exposed separately via [`Record::iter_meta`]; writers that want
-    /// to include metadata in their output layer the two iterators.
+    /// Iterator over every schema field in schema order.
     pub fn iter_all_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.schema
             .columns()
@@ -190,10 +175,12 @@ impl Record {
     }
 
     /// Iterator over user-declared schema fields in schema order,
-    /// skipping engine-stamped columns (today: `$ck.<field>` correlation
-    /// snapshots). The default writer surface and the default projection
-    /// fast path consult this iterator so engine-internal namespaces do
-    /// not leak into output files unless the Output node opts in.
+    /// skipping every engine-stamped column. The default writer
+    /// surface and the default projection fast path consult this
+    /// iterator so engine-internal namespaces (`$ck.<field>` source
+    /// correlation, `$ck.aggregate.<name>` synthetic correlation, the
+    /// `$widened` `auto_widen` sidecar) do not leak into output files
+    /// unless the Output node opts in via a specific flag.
     pub fn iter_user_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.schema
             .columns()
@@ -203,6 +190,35 @@ impl Record {
                 self.schema
                     .field_metadata(*i)
                     .is_none_or(|m| !m.is_engine_stamped())
+            })
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
+    }
+
+    /// Iterator over user-declared schema fields **plus** correlation-
+    /// lattice columns (`$ck.<field>` source-CK shadows and
+    /// `$ck.aggregate.<name>` synthetic-CK lineage), but skipping the
+    /// `auto_widen` sidecar absorber `$widened`. The Output node's
+    /// `include_correlation_keys: true` flag consults this iterator
+    /// so a user opting into CK column visibility gets exactly the
+    /// CK lattice — not the sidecar's `Value::Map` payload (which
+    /// would surface as a JSON-encoded blob in CSV/XML writers and
+    /// silently drop in fixed-width).
+    ///
+    /// `include_widened: true` is the **separate** opt-in for sidecar
+    /// expansion at the Output projection layer; it routes through
+    /// `Record::get(\"$widened\")` directly and expands the
+    /// `Value::Map` payload to top-level columns.
+    pub fn iter_user_and_correlation_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        use crate::schema::FieldMetadata;
+        self.schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| match self.schema.field_metadata(*i) {
+                Some(FieldMetadata::WidenedSidecar) => false,
+                Some(FieldMetadata::SourceCorrelation { .. })
+                | Some(FieldMetadata::AggregateGroupIndex { .. })
+                | None => true,
             })
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
@@ -222,8 +238,9 @@ impl Record {
     /// Estimated heap bytes owned by this record.
     ///
     /// Includes `Vec<Value>` backing store, per-value heap allocations
-    /// (strings, arrays), and the metadata IndexMap (if present). Used
-    /// by `SortBuffer` for self-tracking allocation counting.
+    /// (strings, arrays), and the `$record.<key>` IndexMap (if
+    /// present). Used by `SortBuffer` for self-tracking allocation
+    /// counting.
     pub fn estimated_heap_size(&self) -> usize {
         let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
         let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
@@ -236,16 +253,18 @@ impl Record {
             let values_heap: usize = m.values().map(Value::heap_size).sum();
             map_backing + keys_heap + values_heap
         };
-        let metadata_size = self.metadata.as_ref().map_or(0, |m| indexmap_heap(m));
-        values_backing + values_heap + metadata_size
+        let record_vars_size = self.record_vars.as_ref().map_or(0, |m| indexmap_heap(m));
+        values_backing + values_heap + record_vars_size
     }
 }
 
 impl FieldResolver for Record {
     fn resolve(&self, name: &str) -> Option<&Value> {
-        // Handle $meta.* namespace: resolve from per-record metadata map.
-        if let Some(meta_key) = name.strip_prefix("$meta.") {
-            return self.get_meta(meta_key);
+        // `$record.<key>` resolves from the dedicated record-vars
+        // channel. Transforms whose `declares:` entries have
+        // `scope: record` write here.
+        if let Some(record_var) = name.strip_prefix("$record.") {
+            return self.get_record_var(record_var);
         }
         self.get(name)
     }
@@ -265,8 +284,6 @@ impl FieldResolver for Record {
 
 #[cfg(test)]
 mod tests {
-    mod metadata;
-
     use super::*;
 
     fn test_schema() -> Arc<Schema> {
@@ -298,17 +315,18 @@ mod tests {
         assert_eq!(record.get("name"), Some(&Value::String("Bob".into())));
     }
 
-    /// Structural assertion: `Record` holds exactly `schema`, `values`,
-    /// and `metadata`. Adding or renaming a field fails compilation.
+    /// Structural assertion: `Record` holds exactly `schema`,
+    /// `values`, and `record_vars`. Adding or renaming a field fails
+    /// compilation.
     #[test]
-    fn test_record_struct_has_exactly_schema_values_metadata_fields() {
+    fn test_record_struct_has_exactly_schema_values_record_vars_fields() {
         let schema = test_schema();
         let values = vec![Value::Null; 5];
         let rec = Record::new(schema, values);
         let Record {
             schema: _,
             values: _,
-            metadata: _,
+            record_vars: _,
         } = rec;
     }
 
@@ -370,23 +388,6 @@ mod tests {
         assert_eq!(fields[0].0, "id");
         assert_eq!(fields[1].0, "name");
         assert_eq!(fields[4].0, "active");
-    }
-
-    /// Metadata round-trip survives the overflow rip — the metadata map
-    /// is preserved as the sole off-schema per-record storage.
-    #[test]
-    fn test_record_metadata_preserved() {
-        let schema = test_schema();
-        let values = vec![Value::Null; 5];
-        let mut record = Record::new(schema, values);
-
-        assert!(!record.has_meta());
-        record.set_meta("k", Value::Integer(1)).unwrap();
-        assert!(record.has_meta());
-        assert_eq!(record.get_meta("k"), Some(&Value::Integer(1)));
-        let collected: Vec<(&str, &Value)> = record.iter_meta().collect();
-        assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].0, "k");
     }
 
     #[test]

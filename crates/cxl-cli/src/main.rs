@@ -281,7 +281,10 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_counters: clinker_record::PipelineCounters::default(),
-        pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
+        source_vars: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
+        static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
     // REPL has no real batch context — use the same placeholder as the
@@ -542,8 +545,12 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
+        cxl::ast::Expr::VarsAccess { key, .. } => format!("$vars.{}", key),
         cxl::ast::Expr::SourceAccess { field, .. } => format!("$source.{}", field),
-        cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
+        cxl::ast::Expr::QualifiedSourceAccess {
+            input_name, field, ..
+        } => format!("$source.{}.{}", input_name, field),
+        cxl::ast::Expr::RecordAccess { field, .. } => format!("$record.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
                 cxl::ast::BinOp::Add => "+",
@@ -690,7 +697,12 @@ mod tests {
             pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+            pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
+            source_vars: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
+            static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =
@@ -738,7 +750,12 @@ mod tests {
             pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+            pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
+            source_vars: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
+            static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =

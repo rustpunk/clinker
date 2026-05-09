@@ -38,7 +38,7 @@ nodes:
       name: high
       type: csv
       path: bench://output_high.csv
-      include_unmapped: true
+      include_widened: true
 
   - type: output
     name: low
@@ -47,4 +47,4 @@ nodes:
       name: low
       type: csv
       path: bench://output_low.csv
-      include_unmapped: true
+      include_widened: true

@@ -29,12 +29,7 @@ fn run_pipeline(
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
 
@@ -107,7 +102,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 /// Compile-time D-7 unblock: `Source (CK) → Aggregate (relaxed) →
@@ -304,7 +299,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "\
 order_id,department,amount

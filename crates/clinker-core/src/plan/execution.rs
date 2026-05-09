@@ -272,12 +272,11 @@ pub enum PlanNode {
         /// How to look up the partition for this transform's window.
         #[serde(skip)]
         partition_lookup: Option<PartitionLookupKind>,
-        /// Field names this transform writes (assigns to via `emit name = ...`,
-        /// excluding `$meta.*` writes). Populated at compile time from the CXL
-        /// `TypedProgram`. Single source of truth for
-        /// `compute_node_properties`'s `DestroyedByTransformWriteSet` rule —
-        /// the property pass reads this directly off the node, no executor
-        /// coupling.
+        /// Field names this transform writes (assigns to via `emit name = ...`).
+        /// Populated at compile time from the CXL `TypedProgram`. Single source
+        /// of truth for `compute_node_properties`'s
+        /// `DestroyedByTransformWriteSet` rule — the property pass reads this
+        /// directly off the node, no executor coupling.
         #[serde(skip_serializing_if = "BTreeSet::is_empty")]
         write_set: BTreeSet<String>,
         /// True iff the CXL transform contains a `distinct` statement. Populated
@@ -510,6 +509,12 @@ pub struct PlanTransformPayload {
     /// as a compile-time E200 diagnostic and the enclosing `compile()`
     /// call returns `Err` before this payload is built.
     pub typed: Arc<TypedProgram>,
+    /// Producer-declared scoped variables this transform writes via
+    /// `emit $<scope>.<key>`. Empty list means no scope writes.
+    pub declares: Vec<crate::config::pipeline_node::DeclareEntry>,
+    /// `phase: init` runs the transform (and its transitive ancestors)
+    /// to completion before any runtime-phase node sees a record.
+    pub phase: crate::config::pipeline_node::Phase,
 }
 
 /// Fully-resolved Output payload.
@@ -566,7 +571,7 @@ impl PlanNode {
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
-    /// `include_unmapped: false` projection at the Output boundary.
+    /// `include_widened: false` projection at the Output boundary.
     ///
     /// - Source: every column is user-declared in the source schema, so
     ///   the full schema counts as "explicitly emitted".
@@ -2571,7 +2576,7 @@ pub struct OutputSpec {
     pub name: String,
     pub mapping: IndexMap<String, String>,
     pub exclude: Vec<String>,
-    pub include_unmapped: bool,
+    pub include_widened: bool,
 }
 
 /// Pipeline-level parallelism configuration.
@@ -3848,7 +3853,7 @@ fn compute_one(
             };
 
             // Intersect write_set with parent's sort-key field names. Note:
-            // arena `sort_partition` (Phase 6) does not appear here — only
+            // arena `sort_partition` does not appear here — only
             // record fields written via `emit name = ...` enter `write_set`.
             let lost: Vec<String> = parent_sort
                 .iter()
@@ -4252,9 +4257,9 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// Extract the set of record-field names a CXL transform writes.
 ///
 /// Walks the `TypedProgram`'s top-level statements and collects the names of
-/// every `emit name = ...` whose target is the record (not `$meta.*`). `let`
-/// statements bind locals only and are ignored; `filter`, `distinct`, `trace`,
-/// and bare expression statements do not write to fields.
+/// every `emit name = ...` whose target is the record. `let` statements bind
+/// locals only and are ignored; `filter`, `distinct`, `trace`, and bare
+/// expression statements do not write to fields.
 ///
 /// Consumed by `compute_node_properties` to populate the
 /// `DestroyedByTransformWriteSet` provenance variant. The write set
@@ -4265,7 +4270,7 @@ pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     for stmt in &typed.program.statements {
         if let Statement::Emit {
             name,
-            is_meta: false,
+            target: cxl::ast::EmitTarget::Field,
             ..
         } = stmt
         {

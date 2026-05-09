@@ -137,6 +137,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     // Verify: composition_body_assignments has an entry for "enrich".
@@ -218,6 +219,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let body_id = artifacts.composition_body_assignments["enrich"];
@@ -298,6 +300,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     // Binding should succeed with no E102 errors.
@@ -363,6 +366,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     // Should have 2 body assignments: nested_process (outer) + inner_normalize (inner).
@@ -428,6 +432,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e103: Vec<_> = diags.iter().filter(|d| d.code == "E103").collect();
@@ -514,6 +519,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e104: Vec<_> = diags.iter().filter(|d| d.code == "E104").collect();
@@ -584,6 +590,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e102: Vec<_> = diags.iter().filter(|d| d.code == "E102").collect();
@@ -681,6 +688,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -761,6 +769,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e108: Vec<_> = diags.iter().filter(|d| d.code == "E108").collect();
@@ -829,6 +838,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let w101: Vec<_> = diags.iter().filter(|d| d.code == "W101").collect();
@@ -935,6 +945,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        Default::default(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -1019,6 +1030,7 @@ fn test_pipeline_compile_with_workspace_root_binds_compositions() {
                 &ctx,
                 &symbol_table,
                 &ctx.pipeline_dir,
+                Default::default(),
             );
             let bound_body = artifacts
                 .body_of(*body)

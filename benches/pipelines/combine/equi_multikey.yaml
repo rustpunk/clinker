@@ -61,4 +61,4 @@ nodes:
       name: matched_out
       type: csv
       path: bench://output.csv
-      include_unmapped: true
+      include_widened: true

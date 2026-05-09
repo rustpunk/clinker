@@ -1,0 +1,5 @@
+---
+source: crates/clinker-core/tests/state_node_diagnostics.rs
+expression: render_diags(&diags)
+---
+E175: init-phase node "init_w" reads $pipeline.runtime_v which is only written by runtime-phase node "runtime_w" — init runs to completion before runtime, so the read would silently observe the declaration default. Move the writer to `phase: init` or remove the read.

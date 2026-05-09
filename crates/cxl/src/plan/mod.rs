@@ -20,10 +20,10 @@
 //!   bytes). The plan lives on the operator that authored the spill and
 //!   interprets the bytes on read-back. `CompiledAggregate` is held in
 //!   memory behind `Arc` on `PlanNode::Aggregation` with `#[serde(skip)]`;
-//!   the spill payload is `[GroupByKey || AccumulatorRow ||
-//!   MetadataCommonTracker]`, all of which are serde-derived in
-//!   `clinker-record`. Keeping `Expr` serde-free matches DataFusion's
-//!   architectural decision (see apache/arrow-datafusion#1832).
+//!   the spill payload is `[GroupByKey || AccumulatorRow]`, both of
+//!   which are serde-derived in `clinker-record`. Keeping `Expr`
+//!   serde-free matches DataFusion's architectural decision (see
+//!   apache/arrow-datafusion#1832).
 
 use clinker_record::accumulator::{AccumulatorEnum, AggregateType, Reversibility};
 
@@ -73,7 +73,6 @@ pub struct AggregateBinding {
 pub struct CompiledEmit {
     pub output_name: Box<str>,
     pub residual: Expr,
-    pub is_meta: bool,
 }
 
 /// Full extraction artifact for one aggregate transform.

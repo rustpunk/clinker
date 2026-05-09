@@ -362,9 +362,8 @@ impl CompiledRoute {
     /// In Inclusive mode: all matching branches (or default if none match).
     ///
     /// Branch predicates resolve field references through the Record's
-    /// own [`FieldResolver`] impl — schema + overflow for bare names,
-    /// `$meta.*` prefix stripping for per-record metadata. No parallel
-    /// bookkeeping map is required (Invariant 3).
+    /// own [`FieldResolver`] impl — schema + overflow for bare names.
+    /// No parallel bookkeeping map is required (Invariant 3).
     pub(crate) fn evaluate(
         &mut self,
         record: &Record,
@@ -642,6 +641,8 @@ impl PipelineExecutor {
                 })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
+        let scoped_vars: cxl::resolve::ScopedVarsRegistry =
+            crate::config::build_scoped_vars_registry(config.pipeline.vars.as_ref(), &config.nodes);
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
@@ -736,7 +737,7 @@ impl PipelineExecutor {
                             }
                         }
                     }
-                    Some(Self::compile_route(rc, &emitted_fields)?)
+                    Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
                 }
                 None => None,
             }
@@ -797,7 +798,7 @@ impl PipelineExecutor {
                         }
                     }
                 }
-                let cr = Self::compile_route(&route_config, &emitted_fields)?;
+                let cr = Self::compile_route(&route_config, &emitted_fields, &scoped_vars)?;
                 compiled_routes_by_name.insert(route_name.clone(), cr);
             }
         }
@@ -937,26 +938,6 @@ impl PipelineExecutor {
                     per_record_source_files.push(file_arc);
                 }
                 Ok(None) => break,
-                Err(clinker_format::error::FormatError::MetadataCapExceeded {
-                    record,
-                    key,
-                    count,
-                }) => {
-                    row_num += 1;
-                    counters.total_count += 1;
-                    counters.dlq_count += 1;
-                    dlq_entries.push(DlqEntry {
-                        source_row: row_num,
-                        category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
-                        error_message: format!(
-                            "per-record metadata cap exceeded at key {key:?} (count={count})"
-                        ),
-                        original_record: record,
-                        stage: Some(DlqEntry::stage_source()),
-                        route: None,
-                        trigger: true,
-                    });
-                }
                 Err(other) => return Err(other.into()),
             }
         }
@@ -1226,7 +1207,7 @@ impl PipelineExecutor {
             }
         };
 
-        let mut combine_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        let mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
         for (combine_name, combine_inputs) in &artifacts.combine_inputs {
             let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
             for combine_input in combine_inputs.values() {
@@ -1241,7 +1222,7 @@ impl PipelineExecutor {
                     // `all_records`.
                     continue;
                 }
-                if combine_source_records.contains_key(upstream) {
+                if preloaded_source_records.contains_key(upstream) {
                     continue;
                 }
                 let Some(files) = readers.remove(upstream) else {
@@ -1271,32 +1252,69 @@ impl PipelineExecutor {
                             recs.push((record, rn));
                         }
                         Ok(None) => break,
-                        Err(clinker_format::error::FormatError::MetadataCapExceeded {
-                            record,
-                            key,
-                            count,
-                        }) => {
-                            rn += 1;
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
-                                error_message: format!(
-                                    "per-record metadata cap exceeded at key {key:?} \
-                                     (count={count}) reading combine build-side source \
-                                     {upstream:?}"
-                                ),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_source()),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
                         Err(other) => return Err(other.into()),
                     }
                 }
-                combine_source_records.insert(upstream.to_string(), recs);
+                preloaded_source_records.insert(upstream.to_string(), recs);
             }
+        }
+
+        // ── Pre-load init-phase Sources ─────────────
+        // Init-phase Transforms' ancestors include Sources. Those
+        // Sources need their records materialized before the
+        // two-pass walk runs, because the Source dispatcher arm
+        // reads from `preloaded_source_records` (or `all_records` for
+        // the primary). A standalone init Source isn't a combine
+        // input and isn't the primary, so without this pre-load it
+        // would have nothing to feed the init-phase Aggregate /
+        // Transform downstream.
+        let init_source_names: Vec<String> = {
+            let init_set = crate::executor::compute_init_phase_node_set(plan);
+            init_set
+                .into_iter()
+                .filter_map(|idx| match &plan.graph[idx] {
+                    crate::plan::execution::PlanNode::Source { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for upstream in &init_source_names {
+            if upstream.as_str() == input.name {
+                // Records already in `all_records`.
+                continue;
+            }
+            if preloaded_source_records.contains_key(upstream) {
+                continue;
+            }
+            let Some(files) = readers.remove(upstream.as_str()) else {
+                continue;
+            };
+            if files.is_empty() {
+                continue;
+            }
+            let src_cfg = source_configs
+                .iter()
+                .find(|s| s.name == *upstream)
+                .ok_or_else(|| {
+                    PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                        "init-phase source '{upstream}' not declared in the pipeline",
+                    )))
+                })?;
+            let raw_reader = build_multi_file_reader(src_cfg, files)?;
+            let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
+            let mut recs: Vec<(Record, u64)> = Vec::new();
+            let mut rn: u64 = 0;
+            loop {
+                match src_reader.next_record() {
+                    Ok(Some(record)) => {
+                        rn += 1;
+                        recs.push((record, rn));
+                    }
+                    Ok(None) => break,
+                    Err(other) => return Err(other.into()),
+                }
+            }
+            preloaded_source_records.insert(upstream.clone(), recs);
         }
 
         Self::execute_dag_branching(
@@ -1304,7 +1322,7 @@ impl PipelineExecutor {
             input,
             all_records,
             per_record_source_files,
-            combine_source_records,
+            preloaded_source_records,
             writers,
             transforms,
             compiled_route,
@@ -1338,7 +1356,7 @@ impl PipelineExecutor {
         input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
         per_record_source_files: Vec<Arc<str>>,
-        combine_source_records: HashMap<String, Vec<(Record, u64)>>,
+        preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -1457,7 +1475,7 @@ impl PipelineExecutor {
             strategy,
 
             node_buffers: HashMap::new(),
-            combine_source_records,
+            preloaded_source_records,
             all_records,
             writers: writers.single,
             fan_out_writers: writers.fan_out,
@@ -1493,8 +1511,35 @@ impl PipelineExecutor {
         // of `plan` for the loop body — `&mut ctx` already borrows
         // `ctx.current_dag` (which aliases `plan`) at the field
         // granularity through every dispatcher call.
-        for node_idx in plan.topo_order.clone() {
-            dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+        //
+        // two-pass walk for init-phase orchestration.
+        // Pass 1 dispatches every node in the init-phase ancestor
+        // closure (Source/Aggregate/etc. feeding `phase: init`
+        // Transforms, plus the init-phase Transforms themselves).
+        // Pass 2 dispatches every other node — the runtime DAG.
+        // Init-phase Transforms are E164-validated as terminal, so
+        // Pass 2 never references their output edge. The
+        // dispatcher's `remaining_consumers` heuristic counts
+        // neighbors based on graph structure (pass-independent), so
+        // a Source feeding both an init branch and a runtime branch
+        // correctly clones its buffer for Pass 1's first consumer
+        // and removes it for Pass 2's last consumer.
+        let init_phase_set = compute_init_phase_node_set(plan);
+        if !init_phase_set.is_empty() {
+            for node_idx in plan.topo_order.clone() {
+                if init_phase_set.contains(&node_idx) {
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                }
+            }
+            for node_idx in plan.topo_order.clone() {
+                if !init_phase_set.contains(&node_idx) {
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                }
+            }
+        } else {
+            for node_idx in plan.topo_order.clone() {
+                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+            }
         }
 
         // Take the pipeline-scoped TempDir out of the context. Held
@@ -1570,6 +1615,7 @@ impl PipelineExecutor {
     fn compile_route(
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
+        scoped_vars: &cxl::resolve::ScopedVarsRegistry,
     ) -> Result<CompiledRoute, PipelineError> {
         let type_cols: IndexMap<cxl::typecheck::QualifiedField, Type> = emitted_fields
             .iter()
@@ -1596,17 +1642,25 @@ impl PipelineExecutor {
                 });
             }
 
-            let resolved = cxl::resolve::resolve_program(
+            let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
                 parse_result.ast,
                 &field_refs,
                 parse_result.node_count,
+                &std::collections::HashMap::new(),
+                scoped_vars,
             )
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: format!("route:{}", branch.name),
                 messages: diags.into_iter().map(|d| d.message).collect(),
             })?;
 
-            let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
+            let typed = cxl::typecheck::pass::type_check_with_mode_and_vars(
+                resolved,
+                &type_schema,
+                cxl::typecheck::pass::AggregateMode::Row,
+                scoped_vars,
+            )
+            .map_err(|diags| {
                 let errors: Vec<String> = diags
                     .iter()
                     .filter(|d| !d.is_warning)
@@ -1735,27 +1789,62 @@ fn wrap_with_schema_coercion(
     source_name: &str,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::config::PipelineNode;
+    use crate::config::pipeline_node::OnUnmapped;
 
-    // Find the source node's schema declaration
-    let schema_decl = config.nodes.iter().find_map(|s| {
+    // Find the source node's schema declaration + on_unmapped policy
+    // + format. Format is needed for the auto_widen-on-fixed-width
+    // structural-inertness diagnostic below.
+    let body_data = config.nodes.iter().find_map(|s| {
         if let PipelineNode::Source {
             header,
             config: body,
         } = &s.value
             && header.name == source_name
         {
-            return Some(&body.schema.columns);
+            return Some((
+                &body.schema.columns,
+                body.on_unmapped.clone(),
+                body.source.format.clone(),
+            ));
         }
         None
     });
 
-    match schema_decl {
-        Some(columns) if !columns.is_empty() => {
-            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(reader, columns)
-                .map_err(|e| PipelineError::Compilation {
-                    transform_name: source_name.to_string(),
-                    messages: vec![format!("schema coercion init error: {e}")],
-                })?;
+    match body_data {
+        Some((columns, policy, format)) if !columns.is_empty() => {
+            // Fixed-width format: the reader's schema is constructed
+            // positionally from the user-declared `FieldDef` list,
+            // so the reader cannot ever produce an "undeclared
+            // field" — every byte that isn't covered by a FieldDef
+            // is structurally invisible. `auto_widen`'s sidecar
+            // therefore stays Null forever for fixed-width sources.
+            // Surface the inertness once per source at compile time
+            // so a user who set `auto_widen` (the engine-wide
+            // default) on a fixed-width source sees the no-op
+            // explicitly and can either pick `drop`/`reject` (the
+            // honest scalar policies for fixed-width) or accept the
+            // empty sidecar.
+            if matches!(policy, OnUnmapped::AutoWiden)
+                && matches!(format, crate::config::InputFormat::FixedWidth(_))
+            {
+                tracing::info!(
+                    source = source_name,
+                    "on_unmapped: auto_widen is structurally inert for fixed_width sources — \
+                     the schema is positional, so the reader cannot detect undeclared \
+                     fields. The `$widened` sidecar slot will always carry Value::Null. \
+                     Set `on_unmapped: drop` or `reject` to make the policy explicit."
+                );
+            }
+            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(
+                reader,
+                columns,
+                policy,
+                source_name,
+            )
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: source_name.to_string(),
+                messages: vec![format!("schema coercion init error: {e}")],
+            })?;
             Ok(Box::new(coercing))
         }
         _ => Ok(reader),
@@ -2180,6 +2269,51 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
 /// returned `StableEvalContext` is reused (via borrow) at every per-record
 /// dispatch site, killing the prior `String::clone` + `IndexMap::clone`
+/// Compute the init-phase ancestor closure for a compiled plan.
+///
+/// Walks every `PlanNode::Transform` whose payload phase is
+/// [`crate::config::Phase::Init`] and unions their transitive
+/// upstream ancestors via reverse-BFS along the graph's incoming
+/// edges. The init-phase transforms themselves are included.
+///
+/// Returns an empty set when no init-phase transforms exist — the
+/// caller then falls through to a single-pass topo walk.
+///
+/// E164 validation guarantees init-phase Transforms are terminal
+/// (no runtime descendants), so the closure forms a well-bounded
+/// init sub-DAG that Pass 1 can run to completion before Pass 2
+/// starts.
+fn compute_init_phase_node_set(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
+    use crate::config::Phase as ConfPhase;
+    use crate::plan::execution::PlanNode;
+    let mut set: std::collections::HashSet<petgraph::graph::NodeIndex> =
+        std::collections::HashSet::new();
+    let mut stack: Vec<petgraph::graph::NodeIndex> = plan
+        .graph
+        .node_indices()
+        .filter(|&idx| match &plan.graph[idx] {
+            PlanNode::Transform {
+                resolved: Some(p), ..
+            } => p.phase == ConfPhase::Init,
+            _ => false,
+        })
+        .collect();
+    while let Some(idx) = stack.pop() {
+        if !set.insert(idx) {
+            continue;
+        }
+        for parent in plan
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+        {
+            stack.push(parent);
+        }
+    }
+    set
+}
+
 /// per-record allocation profile. `pipeline_start_time` must be frozen at
 /// pipeline start so `$pipeline.start_time` is deterministic within a run.
 /// The `now` keyword uses `ctx.stable.clock.now()` (wall-clock) and is
@@ -2191,6 +2325,13 @@ fn build_stable_eval_context(
     batch_id: &str,
     pipeline_vars: &IndexMap<String, Value>,
 ) -> StableEvalContext {
+    // Seed pipeline-scope vars with declared defaults from every
+    // Transform's `declares:` entries; runtime injections (channel
+    // overrides, test seeds) overlay on top.
+    let mut seeded = crate::config::collect_pipeline_var_defaults(&config.nodes);
+    for (k, v) in pipeline_vars {
+        seeded.insert(k.clone(), v.clone());
+    }
     StableEvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time,
@@ -2198,8 +2339,118 @@ fn build_stable_eval_context(
         pipeline_execution_id: Arc::from(execution_id),
         pipeline_batch_id: Arc::from(batch_id),
         pipeline_counters: PipelineCounters::default(),
-        pipeline_vars: Arc::new(pipeline_vars.clone()),
+        pipeline_vars: Arc::new(std::sync::RwLock::new(seeded)),
+        source_vars: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        source_input_arcs: Arc::new(compute_source_input_arcs(config)),
+        static_vars: Arc::new(build_static_vars(config)),
     }
+}
+
+/// Build the `$vars.*` runtime value map from the pipeline's `vars:`
+/// block. Each entry's `default` field (post-validation, already
+/// coerced to the declared type) becomes the frozen runtime value.
+/// Stage 7 will overlay channel `pipeline.vars.<key>` overrides on
+/// top of this before the pipeline starts.
+fn build_static_vars(config: &PipelineConfig) -> IndexMap<String, Value> {
+    let Some(decls) = config.pipeline.vars.as_ref() else {
+        return IndexMap::new();
+    };
+    crate::config::convert_vars(decls)
+}
+
+/// Walk the YAML config to map every `Merge` / `Combine` named input to
+/// the source-file `Arc<str>`s of the upstream `Source` node(s) it
+/// transitively reads from. Used by `Expr::QualifiedSourceAccess` eval
+/// to look up `source_vars` entries written by upstream source-scope
+/// Transform writers (qualified post-merge `$source.<input>.<key>` reads).
+///
+/// For Merge, each entry in `inputs:` becomes its own input name (the
+/// referenced node name itself, since Merge does not rename). For
+/// Combine, the IndexMap key is the input name. Walk-back follows the
+/// consumer-side `input:` field through Transform/Aggregate/Route nodes
+/// until a Source is reached; nested Merges fan out, collecting every
+/// reachable Source's path Arc.
+fn compute_source_input_arcs(
+    config: &PipelineConfig,
+) -> std::collections::HashMap<String, Vec<Arc<str>>> {
+    use crate::config::pipeline_node::PipelineNode;
+    let mut by_name: HashMap<&str, &PipelineNode> = HashMap::new();
+    for node in &config.nodes {
+        by_name.insert(node.value.name(), &node.value);
+    }
+    let mut out: std::collections::HashMap<String, Vec<Arc<str>>> =
+        std::collections::HashMap::new();
+    for node in &config.nodes {
+        match &node.value {
+            PipelineNode::Combine { header, .. } => {
+                for (input_name, upstream) in header.input.iter() {
+                    let arcs = arcs_reachable_from(&by_name, upstream.value.name());
+                    if !arcs.is_empty() {
+                        out.entry(input_name.clone()).or_default().extend(arcs);
+                    }
+                }
+            }
+            PipelineNode::Merge { header, .. } => {
+                for upstream in &header.inputs {
+                    let upstream_name = upstream.value.name();
+                    let arcs = arcs_reachable_from(&by_name, upstream_name);
+                    if !arcs.is_empty() {
+                        out.entry(upstream_name.to_string())
+                            .or_default()
+                            .extend(arcs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for arcs in out.values_mut() {
+        arcs.sort();
+        arcs.dedup();
+    }
+    out
+}
+
+fn arcs_reachable_from(
+    by_name: &HashMap<&str, &crate::config::pipeline_node::PipelineNode>,
+    start: &str,
+) -> Vec<Arc<str>> {
+    use crate::config::pipeline_node::PipelineNode;
+    let mut out = Vec::new();
+    let mut stack = vec![start.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(node) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Source { config: body, .. } => {
+                let path = body.source.path_str();
+                if !path.is_empty() {
+                    out.push(Arc::from(path));
+                }
+            }
+            PipelineNode::Merge { header, .. } => {
+                for upstream in &header.inputs {
+                    stack.push(upstream.value.name().to_string());
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for upstream in header.input.values() {
+                    stack.push(upstream.value.name().to_string());
+                }
+            }
+            other => {
+                if let Some(input) = other.input_node_name() {
+                    stack.push(input.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Evaluate a single transform against a record, returning the
@@ -2229,14 +2480,15 @@ pub(crate) fn evaluate_single_transform(
     {
         EvalResult::Emit {
             fields: emitted,
-            metadata,
+            record_vars,
+            ..
         } => {
             let mut out = record_with_emitted_fields(input, &emitted);
             for (name, value) in &emitted {
                 out.set(name, value.clone());
             }
-            for (key, value) in &metadata {
-                let _ = out.set_meta(key, value.clone());
+            for (key, value) in *record_vars {
+                let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))
         }
@@ -2314,14 +2566,15 @@ pub(crate) fn evaluate_single_transform_windowed(
     match result {
         EvalResult::Emit {
             fields: emitted,
-            metadata,
+            record_vars,
+            ..
         } => {
             let mut out = record_with_emitted_fields(record, &emitted);
             for (name, value) in &emitted {
                 out.set(name, value.clone());
             }
-            for (key, value) in &metadata {
-                let _ = out.set_meta(key, value.clone());
+            for (key, value) in *record_vars {
+                let _ = out.set_record_var(&key, value);
             }
             Ok((out, Ok(())))
         }
@@ -2346,11 +2599,7 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         };
         values.push(v);
     }
-    let mut out = Record::new(Arc::clone(target), values);
-    for (k, v) in input.iter_meta() {
-        let _ = out.set_meta(k, v.clone());
-    }
-    out
+    Record::new(Arc::clone(target), values)
 }
 
 /// Recover an engine-stamped column's value when the input does not
@@ -2583,16 +2832,10 @@ mod tests {
             Box::new(output_buf.clone()) as Box<dyn Write + Send>,
         )]);
 
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(crate::config::convert_pipeline_vars)
-            .unwrap_or_default();
         let params = PipelineRunParams {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
+            pipeline_vars: IndexMap::new(),
             shutdown_token: None,
         };
 

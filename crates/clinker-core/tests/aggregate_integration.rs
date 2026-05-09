@@ -5,7 +5,7 @@
 //! schema derivation, and multi-output aggregation.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 use clinker_core::config::parse_config;
@@ -36,13 +36,8 @@ impl Write for SharedBuffer {
 }
 
 /// Build PipelineRunParams from a parsed config.
-fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(|v| clinker_core::config::convert_pipeline_vars(v))
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "integration-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -54,7 +49,7 @@ fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunPara
 /// Run a single-input, single-output pipeline. Returns (report, output_csv).
 fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::ExecutionReport, String) {
     let config = parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),
@@ -151,7 +146,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -213,7 +208,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\neng,300\nsales,50\nsales,150\n";
     let (report, output) = run_single(yaml, csv);
@@ -274,7 +269,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
     let (report, output) = run_single(yaml, csv);
@@ -349,7 +344,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary,hours\neng,100,40\neng,200,20\nsales,50,40\n";
     let (report, output) = run_single(yaml, csv);
@@ -423,7 +418,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "amount\n10\n20\n30\n40\n";
     let (report, output) = run_single(yaml, csv);
@@ -487,7 +482,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -558,7 +553,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
@@ -625,7 +620,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Streaming variant — declare sort_order on dept. Input is already
     // dept-sorted (eng, eng, eng, sales, sales) so the streaming aggregator
@@ -680,7 +675,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let (hash_report, hash_out) = run_single(yaml_hash, csv);
     let (stream_report, stream_out) = run_single(yaml_streaming, csv);
@@ -752,7 +747,7 @@ nodes:
     name: sink
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // Two partitions on f0 (window group-by):
@@ -831,4 +826,59 @@ nodes:
              average, got {avg:?}"
         );
     }
+}
+
+#[test]
+fn aggregate_rejects_scope_emit_with_diagnostic() {
+    // The scope-emit routing introduced for producer-declared vars
+    // (`emit $pipeline.x = ...`) is invalid inside aggregate
+    // transforms — there's no per-record write context to anchor the
+    // scope-write semantics. extract_aggregates emits a TypeDiagnostic
+    // surfaced as E200 at compile time.
+    let yaml = r#"
+pipeline:
+  name: aggregate_scope_emit_rejection
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: salary, type: int }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by: [dept]
+      cxl: |
+        emit dept = dept
+        emit total = sum(salary)
+        emit $pipeline.last_total = sum(salary)
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse");
+    let result = clinker_core::config::PipelineConfig::compile(
+        &config,
+        &clinker_core::config::CompileContext::default(),
+    );
+    let diags = result.expect_err("aggregate with emit $pipeline.x should fail compile");
+    let combined = diags
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("aggregate")
+            && (combined.contains("$pipeline") || combined.contains("scoped-variable")),
+        "expected aggregate-rejects-scope-emit diagnostic, got:\n{combined}",
+    );
 }

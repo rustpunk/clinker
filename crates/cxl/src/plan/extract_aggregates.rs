@@ -72,9 +72,18 @@ pub fn extract_aggregates(
             Statement::Emit {
                 name,
                 expr,
-                is_meta,
+                target,
+                span,
                 ..
             } => {
+                use crate::ast::EmitTarget;
+                match target {
+                    EmitTarget::Field => {}
+                    EmitTarget::Pipeline | EmitTarget::Source | EmitTarget::Record => {
+                        diagnostics.push(diag_scope_emit_in_aggregate(*span));
+                        continue;
+                    }
+                }
                 let mut residual = expr.clone();
                 substitute_let_bindings(&mut residual, &let_bindings);
                 if let Err(e) =
@@ -87,7 +96,6 @@ pub fn extract_aggregates(
                 emits.push(CompiledEmit {
                     output_name: name.clone(),
                     residual,
-                    is_meta: *is_meta,
                 });
             }
             Statement::Trace { .. } | Statement::UseStmt { .. } | Statement::ExprStmt { .. } => {
@@ -192,8 +200,10 @@ fn extract_aggs_from_expr(
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -333,8 +343,10 @@ fn rewrite_group_key_refs(
         | Expr::QualifiedFieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggCall { .. }
@@ -416,8 +428,10 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -463,8 +477,10 @@ fn contains_agg_call(expr: &Expr) -> bool {
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -527,11 +543,19 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
         Expr::PipelineAccess { field, .. } => {
             let _ = write!(buf, "p:{field}");
         }
+        Expr::VarsAccess { key, .. } => {
+            let _ = write!(buf, "v:{key}");
+        }
         Expr::SourceAccess { field, .. } => {
             let _ = write!(buf, "s:{field}");
         }
-        Expr::MetaAccess { field, .. } => {
-            let _ = write!(buf, "m:{field}");
+        Expr::QualifiedSourceAccess {
+            input_name, field, ..
+        } => {
+            let _ = write!(buf, "qs:{input_name}.{field}");
+        }
+        Expr::RecordAccess { field, .. } => {
+            let _ = write!(buf, "r:{field}");
         }
         Expr::Binary { op, lhs, rhs, .. } => {
             let _ = write!(buf, "({:?} ", op);
@@ -691,6 +715,23 @@ fn diag_distinct_in_aggregate(span: Span) -> TypeDiagnostic {
         span,
         message: "`distinct` is not permitted inside an aggregate transform".to_string(),
         help: Some("place a separate distinct transform upstream of the aggregate".to_string()),
+        related_span: None,
+        is_warning: false,
+    }
+}
+
+fn diag_scope_emit_in_aggregate(span: Span) -> TypeDiagnostic {
+    TypeDiagnostic {
+        span,
+        message: "`emit $pipeline.x` / `emit $source.x` / `emit $record.x` are \
+                  not permitted inside an aggregate transform"
+            .to_string(),
+        help: Some(
+            "scoped-variable writes belong on a regular Transform with a \
+             matching `declares:` entry; place that transform upstream or \
+             downstream of the aggregate."
+                .to_string(),
+        ),
         related_span: None,
         is_warning: false,
     }

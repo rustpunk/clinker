@@ -15,11 +15,10 @@
 //!   accumulator slot value and `Expr::GroupKey` to a group-key column
 //!   value.
 //!
-//! The full `HashAggregator`, `MetadataCommonTracker`, spill paths,
+//! The full `HashAggregator`, spill paths,
 //! and executor dispatch arm land in Tasks 16.3.8–16.3.13 as part of
 //! the same atomic 16.3 commit.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +33,6 @@ use clinker_record::{GroupByKey, Record, RecordStorage, Value};
 use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
 use cxl::eval::{EvalContext, EvalError, ProgramEvaluator, eval_expr};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
-use indexmap::IndexMap;
 
 use crate::config::{NullOrder, SortField, SortOrder};
 use crate::error::PipelineError;
@@ -134,7 +132,7 @@ impl AccumulatorFactory {
 
 /// Conservative estimate of total memory consumed per distinct group in the
 /// hash table. Accounts for the hashbrown bucket entry, key heap, accumulator
-/// row heap, IndexMap sidecar overhead, and MetadataCommonTracker base.
+/// row heap, and IndexMap sidecar overhead.
 ///
 /// Used to pre-compute `max_groups = (budget * 0.6) / estimated_bytes` so the
 /// spill trigger can fire on a simple group-count comparison (O(1)) instead of
@@ -152,12 +150,8 @@ fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> u
     // elements are on the heap.
     let acc_heap = factory.compiled().bindings.len() * std::mem::size_of::<AccumulatorEnum>();
 
-    // MetadataCommonTracker: empty HashMap base allocation + headroom for
-    // a few observed keys.
-    let meta_base = std::mem::size_of::<MetadataCommonTracker>() + 128;
-
     // hashbrown targets ~87.5% load factor → ~1.15x bucket overallocation.
-    let raw = bucket_entry + key_heap + acc_heap + meta_base;
+    let raw = bucket_entry + key_heap + acc_heap;
     (raw as f64 * 1.15) as usize
 }
 
@@ -281,11 +275,13 @@ pub fn eval_expr_in_agg_scope(
         Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } => {
             Err(AggregateEvalError::UnsupportedResidual { what: "field-ref" })
         }
-        Expr::MetaAccess { .. } | Expr::PipelineAccess { .. } | Expr::SourceAccess { .. } => {
-            Err(AggregateEvalError::UnsupportedResidual {
-                what: "$meta/$pipeline/$source access",
-            })
-        }
+        Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
+            what: "$pipeline/$source/$record access",
+        }),
         Expr::MethodCall { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "method call",
         }),
@@ -366,306 +362,16 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataCommonTracker
-// ---------------------------------------------------------------------------
-
-/// Per-key state inside a [`MetadataCommonTracker`].
-///
-/// `value` holds the common value seen for this key as long as every
-/// observation has agreed; once a conflicting observation arrives the
-/// slot transitions to `conflicting = true` and `value` is cleared. The
-/// slot itself is retained so the merge path remains associative across
-/// spill recovery — clearing the slot would otherwise let a
-/// later-merged partial revive a value that an earlier observation had
-/// already invalidated.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CommonState {
-    pub value: Option<Value>,
-    pub conflicting: bool,
-}
-
-/// Per-group "Keep Only Common Attributes" metadata tracker (NiFi
-/// MergeContent default semantics).
-///
-/// The hash aggregator carries one of these per group-key. On every
-/// input record it walks the record's metadata map and calls
-/// [`MetadataCommonTracker::observe`] for every key that the user has
-/// not explicitly emitted via `emit $meta.X = ...`. At finalize time,
-/// keys whose `CommonState` is `!conflicting && value.is_some()` are
-/// emitted; everything else is dropped (visible by absence).
-///
-/// The tracker is serde-derived because it travels with the per-group
-/// `AccumulatorRow` through the spill path.
-/// Recovery merges partial trackers via [`MetadataCommonTracker::merge`]
-/// which is associative: any disagreement on either side, or any
-/// already-`conflicting` slot, transitions the merged slot to
-/// conflicting.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MetadataCommonTracker {
-    pub keys: HashMap<Box<str>, CommonState>,
-}
-
-/// Outcome of a single [`MetadataCommonTracker::observe`] call.
-///
-/// Both pieces of information are needed by the hash aggregator hot
-/// loop: `heap_delta` is folded into `value_heap_bytes` for memory
-/// accounting, while `became_conflict` triggers a one-shot structured
-/// WARN log via `meta_conflict_logged`. The struct surfaces both
-/// together so the caller never does a hidden second lookup.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ObserveResult {
-    /// Bytes added to `value_heap_bytes` by this observation. Always
-    /// non-negative — when an equal-value observation transitions a key
-    /// to conflicting, the slot is retained (so its `CommonState`
-    /// footprint stays charged) and the cleared `Value`'s heap bytes
-    /// are reported as `0` rather than as a negative delta. The hash
-    /// aggregator's spill trigger watches the totals through a separate
-    /// resize-aware check; precise reclamation is unnecessary here.
-    pub heap_delta: usize,
-    /// `true` iff this observation flipped the key's `CommonState` from
-    /// non-conflicting to conflicting. The aggregator emits one
-    /// structured WARN per (transform, key) on the first such flip.
-    pub became_conflict: bool,
-}
-
-impl MetadataCommonTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Observe one `(key, value)` pair from an input record's metadata.
-    pub fn observe(&mut self, key: &str, value: &Value) -> ObserveResult {
-        match self.keys.get_mut(key) {
-            None => {
-                let delta = key.len()
-                    + std::mem::size_of::<CommonState>()
-                    + std::mem::size_of::<Value>()
-                    + value.heap_size();
-                self.keys.insert(
-                    key.into(),
-                    CommonState {
-                        value: Some(value.clone()),
-                        conflicting: false,
-                    },
-                );
-                ObserveResult {
-                    heap_delta: delta,
-                    became_conflict: false,
-                }
-            }
-            Some(state) if state.conflicting => ObserveResult::default(),
-            Some(state) => {
-                // Non-conflicting slot. Compare against the stored value.
-                let agrees = matches!(state.value.as_ref(), Some(v) if v == value);
-                if agrees {
-                    ObserveResult::default()
-                } else {
-                    state.value = None;
-                    state.conflicting = true;
-                    ObserveResult {
-                        heap_delta: 0,
-                        became_conflict: true,
-                    }
-                }
-            }
-        }
-    }
-
-    /// Associative merge for spill recovery.
-    pub fn merge(&mut self, other: MetadataCommonTracker) {
-        for (k, other_state) in other.keys {
-            match self.keys.get_mut(k.as_ref()) {
-                None => {
-                    self.keys.insert(k, other_state);
-                }
-                Some(self_state) => {
-                    if self_state.conflicting || other_state.conflicting {
-                        self_state.value = None;
-                        self_state.conflicting = true;
-                    } else {
-                        let agrees = matches!(
-                            (self_state.value.as_ref(), other_state.value.as_ref()),
-                            (Some(a), Some(b)) if a == b
-                        );
-                        if !agrees {
-                            self_state.value = None;
-                            self_state.conflicting = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Heap footprint of every retained key + every retained `Value`.
-    /// Charged into `HashAggregator::value_heap_bytes` for spill-trigger
-    /// accounting (parity with `CollectState::heap_size`).
-    pub fn heap_size(&self) -> usize {
-        self.keys
-            .iter()
-            .map(|(k, s)| {
-                k.len()
-                    + std::mem::size_of::<CommonState>()
-                    + std::mem::size_of::<Value>()
-                    + s.value.as_ref().map(Value::heap_size).unwrap_or(0)
-            })
-            .sum()
-    }
-
-    /// Drain non-conflicting key/value pairs at finalize time. Conflicting
-    /// or empty slots are filtered out (visible-by-absence semantics).
-    pub fn finalize(self) -> Vec<(Box<str>, Value)> {
-        self.keys
-            .into_iter()
-            .filter_map(|(k, s)| match (s.conflicting, s.value) {
-                (false, Some(v)) => Some((k, v)),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod tracker_tests {
-    use super::*;
-
-    fn s(v: &str) -> Value {
-        Value::String(v.into())
-    }
-
-    #[test]
-    fn first_observation_inserts_with_positive_delta() {
-        let mut t = MetadataCommonTracker::new();
-        let r = t.observe("source_file", &s("a.csv"));
-        assert!(r.heap_delta > 0);
-        assert!(!r.became_conflict);
-        assert_eq!(t.keys.len(), 1);
-        assert_eq!(t.keys["source_file"].value.as_ref(), Some(&s("a.csv")));
-        assert!(!t.keys["source_file"].conflicting);
-    }
-
-    #[test]
-    fn equal_observation_is_noop() {
-        let mut t = MetadataCommonTracker::new();
-        t.observe("k", &s("v"));
-        let r = t.observe("k", &s("v"));
-        assert_eq!(r.heap_delta, 0);
-        assert!(!r.became_conflict);
-        assert!(!t.keys["k"].conflicting);
-    }
-
-    #[test]
-    fn conflict_transitions_clear_value_and_flag() {
-        let mut t = MetadataCommonTracker::new();
-        t.observe("k", &s("a"));
-        let r = t.observe("k", &s("b"));
-        assert_eq!(r.heap_delta, 0);
-        assert!(r.became_conflict);
-        assert!(t.keys["k"].conflicting);
-        assert!(t.keys["k"].value.is_none());
-        // A subsequent observation on a conflicting slot is a no-op and
-        // does NOT re-flag.
-        let r2 = t.observe("k", &s("c"));
-        assert_eq!(r2.heap_delta, 0);
-        assert!(!r2.became_conflict);
-    }
-
-    #[test]
-    fn finalize_drops_conflicting_keys() {
-        let mut t = MetadataCommonTracker::new();
-        t.observe("keep", &s("v"));
-        t.observe("keep", &s("v"));
-        t.observe("drop", &s("a"));
-        t.observe("drop", &s("b"));
-        let mut out = t.finalize();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(out, vec![("keep".into(), s("v"))]);
-    }
-
-    #[test]
-    fn test_metadata_common_tracker_serde_roundtrip() {
-        let mut t = MetadataCommonTracker::new();
-        t.observe("source", &s("a.csv"));
-        t.observe("clash", &s("x"));
-        t.observe("clash", &s("y"));
-        let json = serde_json::to_string(&t).unwrap();
-        let back: MetadataCommonTracker = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.keys["source"].value.as_ref(), Some(&s("a.csv")));
-        assert!(!back.keys["source"].conflicting);
-        assert!(back.keys["clash"].conflicting);
-        assert!(back.keys["clash"].value.is_none());
-    }
-
-    #[test]
-    fn test_metadata_common_tracker_merge_associative() {
-        // Build three partials A, B, C and verify (A∪B)∪C == A∪(B∪C)
-        // both structurally and that any conflict in any operand
-        // propagates to the result.
-        let build = |pairs: &[(&str, &str)]| -> MetadataCommonTracker {
-            let mut t = MetadataCommonTracker::new();
-            for (k, v) in pairs {
-                t.observe(k, &s(v));
-            }
-            t
-        };
-
-        // A: {src=a, region=us}
-        // B: {src=a, env=prod}        — agrees with A on src
-        // C: {src=b, region=us}       — disagrees with A on src
-        let a = build(&[("src", "a"), ("region", "us")]);
-        let b = build(&[("src", "a"), ("env", "prod")]);
-        let c = build(&[("src", "b"), ("region", "us")]);
-
-        let mut left = a.clone();
-        left.merge(b.clone());
-        left.merge(c.clone());
-
-        let mut right_inner = b;
-        right_inner.merge(c);
-        let mut right = a;
-        right.merge(right_inner);
-
-        // src must be conflicting on both sides; region kept; env kept.
-        for t in [&left, &right] {
-            assert!(t.keys["src"].conflicting, "src should be conflicting");
-            assert!(t.keys["src"].value.is_none());
-            assert_eq!(t.keys["region"].value.as_ref(), Some(&s("us")));
-            assert!(!t.keys["region"].conflicting);
-            assert_eq!(t.keys["env"].value.as_ref(), Some(&s("prod")));
-            assert!(!t.keys["env"].conflicting);
-        }
-    }
-
-    #[test]
-    fn heap_size_grows_with_inserted_keys() {
-        let mut t = MetadataCommonTracker::new();
-        let h0 = t.heap_size();
-        t.observe("k1", &s("hello"));
-        let h1 = t.heap_size();
-        assert!(h1 > h0);
-        // Conflict transition retains the slot but clears the value:
-        // size should not exceed the post-insertion size.
-        t.observe("k1", &s("world"));
-        let h2 = t.heap_size();
-        assert!(h2 <= h1);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // HashAggregator
 // ---------------------------------------------------------------------------
 
 /// Per-group state held inside the hash table.
 ///
 /// `row` is the row of accumulators (one slot per `AggregateBinding`)
-/// being driven by the hot loop. `meta_tracker` is the per-group
-/// "Keep Only Common Attributes" propagator (D11 revised) that
-/// observes every input record's metadata so finalize can emit
-/// non-conflicting keys without per-key user wiring.
+/// being driven by the hot loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatorGroupState {
     pub row: AccumulatorRow,
-    pub meta_tracker: MetadataCommonTracker,
     /// Minimum `row_num` across every input record folded into this
     /// group. Initialized to `u64::MAX`; finalize emits this as the
     /// `SortRow` row-number so downstream sort-stable operators preserve
@@ -704,7 +410,6 @@ impl AggregatorGroupState {
     pub(crate) fn new(row: AccumulatorRow) -> Self {
         Self {
             row,
-            meta_tracker: MetadataCommonTracker::new(),
             min_row_num: u64::MAX,
             group_index: 0,
             input_rows: Vec::new(),
@@ -734,7 +439,6 @@ impl AggregatorGroupState {
 /// `Vec` either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferedGroupState {
-    pub meta_tracker: MetadataCommonTracker,
     /// Minimum `row_num` across every input record folded into this
     /// group. Same semantics as `AggregatorGroupState.min_row_num`:
     /// downstream sort-stable operators key off the earliest input
@@ -757,7 +461,6 @@ pub struct BufferedGroupState {
 impl BufferedGroupState {
     pub(crate) fn new() -> Self {
         Self {
-            meta_tracker: MetadataCommonTracker::new(),
             min_row_num: u64::MAX,
             group_index: 0,
             input_rows: Vec::new(),
@@ -768,10 +471,9 @@ impl BufferedGroupState {
 
 /// Per-node-buffer row produced by every executor node that emits into
 /// `node_buffers`. The Record is authoritative: all emitted fields have
-/// been applied via `Record::set` onto the widened schema, and all
-/// `$meta.*` writes via `Record::set_meta`. Downstream nodes resolve
-/// field references against the Record directly (no parallel
-/// bookkeeping threading).
+/// been applied via `Record::set` onto the widened schema. Downstream
+/// nodes resolve field references against the Record directly (no
+/// parallel bookkeeping threading).
 pub type SortRow = (Record, u64);
 
 /// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch
@@ -1055,13 +757,6 @@ pub struct HashAggregator {
     output_schema: Arc<Schema>,
     transform_name: String,
     evaluator: ProgramEvaluator,
-    /// User-emitted `$meta.X` keys — these are skipped by the auto
-    /// common-only tracker because the user has taken explicit control
-    /// (D11 revised). Built once at construction from `compiled.emits`.
-    explicit_meta_keys: HashSet<Box<str>>,
-    /// One-shot WARN dedup for metadata conflict logging. Per-pipeline-run
-    /// scope (D11 revised).
-    meta_conflict_logged: HashSet<Box<str>>,
     /// Source-row counter — incremented after the pre-agg filter accepts
     /// a record. Used by the global-fold empty-input special case in
     /// `finalize` (D12, D44).
@@ -1115,12 +810,6 @@ impl HashAggregator {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
         let pre_agg_filter = compiled.pre_agg_filter.clone();
-        let explicit_meta_keys: HashSet<Box<str>> = compiled
-            .emits
-            .iter()
-            .filter(|e| e.is_meta)
-            .map(|e| e.output_name.clone())
-            .collect();
         let requires_lineage = compiled.requires_lineage;
         let buffer_mode = compiled.requires_buffer_mode;
         debug_assert!(
@@ -1165,8 +854,6 @@ impl HashAggregator {
             output_schema,
             transform_name: transform_name.into(),
             evaluator,
-            explicit_meta_keys,
-            meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
             max_groups,
             records_since_rss_check: 0,
@@ -1267,9 +954,7 @@ impl HashAggregator {
     /// 3. Extract the group-key tuple.
     /// 4. Look up / insert per-group state via the prototype factory.
     /// 5. Dispatch each `BindingArg` to its accumulator slot.
-    /// 6. Walk record metadata into the per-group `MetadataCommonTracker`,
-    ///    skipping keys the user has explicitly emitted.
-    /// 7. Resize-aware spill trigger.
+    /// 6. Resize-aware spill trigger.
     pub fn add_record(
         &mut self,
         record: &Record,
@@ -1282,16 +967,8 @@ impl HashAggregator {
         // 1. Pre-aggregation filter (D9).
         if let Some(filter) = &self.pre_agg_filter {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &env,
-                &meta,
-            )?;
+            let v =
+                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &env)?;
             if v != Value::Bool(true) {
                 return Ok(());
             }
@@ -1423,7 +1100,6 @@ impl HashAggregator {
                     BindingArg::Expr(e) => {
                         let env: std::collections::HashMap<String, Value> =
                             std::collections::HashMap::new();
-                        let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
                         let v = eval_expr::<NullStorage>(
                             e,
                             self.evaluator.typed(),
@@ -1431,7 +1107,6 @@ impl HashAggregator {
                             record,
                             None,
                             &env,
-                            &meta,
                         )?;
                         row_heap_bytes = row_heap_bytes.saturating_add(v.heap_size());
                         delta += acc.add(&v);
@@ -1453,33 +1128,6 @@ impl HashAggregator {
             }
         }
         self.value_heap_bytes = self.value_heap_bytes.saturating_add(delta);
-
-        // 6. Metadata common-only propagation (D11 revised).
-        if record.has_meta() {
-            // Snapshot to a small Vec so we can mutate trackers without
-            // borrowing record metadata across the observe call.
-            let observations: Vec<(Box<str>, Value)> = record
-                .iter_meta()
-                .filter(|(k, _)| !self.explicit_meta_keys.contains(*k))
-                .map(|(k, v)| (Box::<str>::from(k), v.clone()))
-                .collect();
-            for (k, v) in observations {
-                let r = group_state.meta_tracker.observe(&k, &v);
-                self.value_heap_bytes = self.value_heap_bytes.saturating_add(r.heap_delta);
-                if r.became_conflict && self.meta_conflict_logged.insert(k.clone()) {
-                    tracing::warn!(
-                        transform = %self.transform_name,
-                        meta_key = %k,
-                        "aggregate dropped $meta.{} for at least one group: \
-                         conflicting values across input records (use `emit $meta.{} = any($meta.{})` \
-                         to keep the first-seen value)",
-                        k,
-                        k,
-                        k
-                    );
-                }
-            }
-        }
 
         // 7. Dual-threshold spill trigger (PostgreSQL hash_agg_check_limits
         // pattern). Primary: group count exceeds pre-computed max_groups
@@ -1539,16 +1187,8 @@ impl HashAggregator {
         // 1. Pre-aggregation filter (same as fold-mode).
         if let Some(filter) = &self.pre_agg_filter {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &env,
-                &meta,
-            )?;
+            let v =
+                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &env)?;
             if v != Value::Bool(true) {
                 return Ok(());
             }
@@ -1654,35 +1294,6 @@ impl HashAggregator {
         group_state.contributions.push(row_values);
         group_state.input_rows.push(row_u64);
         self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
-
-        // 6. Metadata common-only propagation, identical shape to
-        //    fold-mode. Buffer-mode does not defer metadata observation
-        //    to the rollback step because conflict tracking is
-        //    associative — rebuilding it from scratch would mean
-        //    re-walking every contribution's metadata at finalize.
-        if record.has_meta() {
-            let observations: Vec<(Box<str>, Value)> = record
-                .iter_meta()
-                .filter(|(k, _)| !self.explicit_meta_keys.contains(*k))
-                .map(|(k, v)| (Box::<str>::from(k), v.clone()))
-                .collect();
-            for (k, v) in observations {
-                let r = group_state.meta_tracker.observe(&k, &v);
-                self.value_heap_bytes = self.value_heap_bytes.saturating_add(r.heap_delta);
-                if r.became_conflict && self.meta_conflict_logged.insert(k.clone()) {
-                    tracing::warn!(
-                        transform = %self.transform_name,
-                        meta_key = %k,
-                        "aggregate dropped $meta.{} for at least one group: \
-                         conflicting values across input records (use `emit $meta.{} = any($meta.{})` \
-                         to keep the first-seen value)",
-                        k,
-                        k,
-                        k
-                    );
-                }
-            }
-        }
 
         // 7. Spill trigger — same dual-threshold check as fold-mode.
         //    `groups.len()` is always 0 in buffer-mode; the buffered
@@ -1925,12 +1536,11 @@ impl HashAggregator {
         let gb_count = self.group_by_indices.len();
         let mut prepared: Vec<(Vec<u8>, usize)> = Vec::with_capacity(drained.len());
         for (idx, (key, _state)) in drained.iter().enumerate() {
-            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 2);
+            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 1);
             for gk in key {
                 values.push(gk.to_value());
             }
             // Pad to match spill_schema column count for SortKeyEncoder.
-            values.push(Value::Null);
             values.push(Value::Null);
             let synth = Record::new(Arc::clone(&self.spill_schema), values);
             let mut buf = Vec::new();
@@ -1980,10 +1590,9 @@ impl HashAggregator {
     ///    and finalize each group through `finalize_group`.
     /// 3. **Spill recovery path**: flush remaining in-memory state as
     ///    one final spill file, then k-way merge every spill file
-    ///    through a `LoserTree`, merging `AccumulatorRow` +
-    ///    `MetadataCommonTracker` partials at each key boundary, and
-    ///    route each finalized group through the same
-    ///    `finalize_group` helper so both paths agree byte-for-byte.
+    ///    through a `LoserTree`, merging `AccumulatorRow` partials at
+    ///    each key boundary, and route each finalized group through the
+    ///    same `finalize_group` helper so both paths agree byte-for-byte.
     pub fn finalize(
         mut self,
         ctx: &EvalContext,
@@ -2062,8 +1671,8 @@ impl HashAggregator {
     /// `LoserTree` keyed on the group-by columns.
     ///
     /// Fold-mode: at every group-key boundary, merges `AccumulatorRow`
-    /// and `MetadataCommonTracker` partials associatively (both
-    /// operations are commutative and associative across spill files).
+    /// partials associatively (commutative and associative across spill
+    /// files).
     ///
     /// Buffer-mode: at every group-key boundary, concatenates raw
     /// per-row contributions and sidecars; at boundary close, folds the
@@ -2190,13 +1799,9 @@ impl HashAggregator {
 /// so all three produce byte-identical results.
 ///
 /// 1. Finalize each accumulator in `state.row` into a slot vector.
-/// 2. Evaluate every compiled emit residual in an [`AggregateEvalScope`];
-///    `is_meta` emits collect into `user_meta`, data emits populate
-///    `values` by output-schema column name.
-/// 3. Merge the auto-tracked common metadata (D11 revised) — user
-///    explicit emits win on conflict, the tracker fills only keys the
-///    user did not supply.
-/// 4. Build the output `Record` and install metadata.
+/// 2. Evaluate every compiled emit residual in an [`AggregateEvalScope`]
+///    and populate `values` by output-schema column name.
+/// 3. Build the output `Record`.
 pub(crate) fn finalize_group_inner(
     factory: &AccumulatorFactory,
     output_schema: &Arc<Schema>,
@@ -2218,7 +1823,6 @@ pub(crate) fn finalize_group_inner(
     let scope = AggregateEvalScope { key, slots: &slots };
     let compiled = factory.compiled();
     let mut values: Vec<Value> = vec![Value::Null; output_schema.column_count()];
-    let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
     // Stamp every group-by column from the group key tuple. The CXL
     // parser blocks `emit $ck.* = ...` so engine-stamped group-by
     // columns (`$ck.<field>` shadow columns) have no covering emit
@@ -2235,9 +1839,7 @@ pub(crate) fn finalize_group_inner(
     }
     for emit in &compiled.emits {
         let v = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
-        if emit.is_meta {
-            user_meta.insert(emit.output_name.clone(), v);
-        } else if let Some(idx) = output_schema.index(&emit.output_name) {
+        if let Some(idx) = output_schema.index(&emit.output_name) {
             values[idx] = v;
         }
     }
@@ -2254,17 +1856,7 @@ pub(crate) fn finalize_group_inner(
         values[idx] = Value::Integer(state.group_index as i64);
     }
 
-    let auto_pairs = state.meta_tracker.clone().finalize();
-    for (k, v) in auto_pairs {
-        if !user_meta.contains_key(&k) {
-            user_meta.insert(k, v);
-        }
-    }
-
-    let mut record = Record::new(Arc::clone(output_schema), values);
-    for (k, v) in user_meta {
-        let _ = record.set_meta(&k, v);
-    }
+    let record = Record::new(Arc::clone(output_schema), values);
     Ok(record)
 }
 
@@ -2478,8 +2070,7 @@ fn dispatch_binding(
         BindingArg::Wildcard => Ok(acc.add(&Value::Null)),
         BindingArg::Expr(e) => {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            let v = eval_expr::<NullStorage>(e, evaluator.typed(), ctx, record, None, &env, &meta)?;
+            let v = eval_expr::<NullStorage>(e, evaluator.typed(), ctx, record, None, &env)?;
             Ok(acc.add(&v))
         }
         BindingArg::Pair(a, b) => {
@@ -2506,7 +2097,6 @@ fn eval_binding_arg_value(
         BindingArg::Wildcard => Ok(Value::Null),
         BindingArg::Expr(e) => {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
             Ok(eval_expr::<NullStorage>(
                 e,
                 evaluator.typed(),
@@ -2514,7 +2104,6 @@ fn eval_binding_arg_value(
                 record,
                 None,
                 &env,
-                &meta,
             )?)
         }
         BindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError {
@@ -2537,10 +2126,10 @@ fn eval_binding_arg_value(
 //
 // The trait lives here in `clinker-core/src/aggregation.rs` (NOT
 // `clinker-record`) because `MergeState::Input` references
-// `AggregatorGroupState`, which in turn holds a `MetadataCommonTracker`
-// defined alongside the hash aggregator. `clinker-record` has no
-// dependency on `cxl`, so the `apply_row` signature — which takes
-// `&[AggregateBinding]` — would also be unexpressible there.
+// `AggregatorGroupState`, defined alongside the hash aggregator.
+// `clinker-record` has no dependency on `cxl`, so the `apply_row`
+// signature — which takes `&[AggregateBinding]` — would also be
+// unexpressible there.
 
 /// Monomorphization marker trait for the streaming aggregator's
 /// ingestion hot loop.
@@ -2561,20 +2150,15 @@ fn eval_binding_arg_value(
 ///   wired the fast path to a non-trivial binding arg.
 /// * [`MergeState`] — `Input = (Vec<u8>, AggregatorGroupState)`. Each
 ///   call carries an encoded sort key (read by the LoserTree
-///   comparator) plus the full per-group state: the `AccumulatorRow`,
-///   `min_row_num`, and the `MetadataCommonTracker`. `apply_row` folds
-///   the incoming state into the currently-open per-group `row` via
-///   `AccumulatorEnum::merge`. The `min_row_num` + tracker merges live
-///   on `GroupBoundary::push` because they operate on the open group's
-///   full `AggregatorGroupState`, not on the `row` alone.
-///
-/// **Audit fix Gap B:** pre-drill-pass-6 wording had
-/// `MergeState::Input = (Vec<u8>, AccumulatorRow)`, which silently
-/// dropped the D57 sidecar fields on the spill-recovery path. That
-/// would have produced a different `min_row_num` than the in-memory
-/// path and violated the very invariant D68 was created to enforce.
-/// Widening to the full `AggregatorGroupState` is the minimum-surface
-/// fix.
+///   comparator) plus the full per-group state: the `AccumulatorRow`
+///   and `min_row_num`. `apply_row` folds the incoming state into the
+///   currently-open per-group `row` via `AccumulatorEnum::merge`. The
+///   `min_row_num` merge lives on `GroupBoundary::push` because it
+///   operates on the open group's full `AggregatorGroupState`, not on
+///   the `row` alone. The full-state shape (rather than just
+///   `AccumulatorRow`) is required because dropping `min_row_num` on
+///   the spill-recovery path would yield a different value than the
+///   in-memory path, breaking byte-identical finalization.
 pub trait AccumulatorOp: Default + 'static {
     /// Per-call input payload. Monomorphized per implementation.
     type Input;
@@ -2652,9 +2236,8 @@ impl AccumulatorOp for MergeState {
     fn apply_row(row: &mut AccumulatorRow, _bindings: &[AggregateBinding], input: &Self::Input) {
         // Merge the incoming `AccumulatorRow` into the currently-open
         // group's row slot-by-slot via `AccumulatorEnum::merge`. The
-        // `min_row_num` and `MetadataCommonTracker` live on
-        // `AggregatorGroupState` and are merged by
-        // [`crate::pipeline::streaming_merge::GroupBoundary::push`]
+        // `min_row_num` lives on `AggregatorGroupState` and is merged
+        // by [`crate::pipeline::streaming_merge::GroupBoundary::push`]
         // when it installs / folds the open group — `apply_row` stays
         // focused on accumulator-row reduction so the two merge
         // surfaces stay decoupled.
@@ -2665,9 +2248,9 @@ impl AccumulatorOp for MergeState {
     }
 }
 
-/// Associative merge of per-group `min_row_num` plus the metadata
-/// common tracker. Operates on a currently-open group's
-/// `AggregatorGroupState` and folds another state's state in.
+/// Associative merge of per-group `min_row_num` and per-row sidecars.
+/// Operates on a currently-open group's `AggregatorGroupState` and
+/// folds another state's state in.
 ///
 /// Separated out so both the `GroupBoundary` state machine (for the
 /// raw-streaming path) and the spill-recovery path can call the
@@ -2677,8 +2260,6 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
     if src.min_row_num < dst.min_row_num {
         dst.min_row_num = src.min_row_num;
     }
-    // `MetadataCommonTracker`: associative merge per D11 revised.
-    dst.meta_tracker.merge(src.meta_tracker);
     // `input_rows`: concatenate. The lineage path is the only producer
     // of non-empty `input_rows`; the strict path leaves both sides
     // empty and the extension is a no-op. `group_index` is left at
@@ -2695,7 +2276,6 @@ pub(crate) fn merge_buffered_sidecars(dst: &mut BufferedGroupState, src: Buffere
     if src.min_row_num < dst.min_row_num {
         dst.min_row_num = src.min_row_num;
     }
-    dst.meta_tracker.merge(src.meta_tracker);
     dst.input_rows.extend(src.input_rows);
     dst.contributions.extend(src.contributions);
 }
@@ -2732,7 +2312,6 @@ fn fold_buffered_state(
     }
     Ok(AggregatorGroupState {
         row,
-        meta_tracker: buffered.meta_tracker,
         min_row_num: buffered.min_row_num,
         group_index: buffered.group_index,
         input_rows: buffered.input_rows,
@@ -2772,8 +2351,6 @@ pub struct StreamingAggregator<Op: AccumulatorOp> {
     pre_agg_filter: Option<Expr>,
     evaluator: ProgramEvaluator,
     transform_name: String,
-    explicit_meta_keys: HashSet<Box<str>>,
-    meta_conflict_logged: HashSet<Box<str>>,
     rows_seen: u64,
     boundary: crate::pipeline::streaming_merge::GroupBoundary,
     /// Output buffer — drained on every `add_record` call into the
@@ -2798,12 +2375,6 @@ impl StreamingAggregator<AddRaw> {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
         let pre_agg_filter = compiled.pre_agg_filter.clone();
-        let explicit_meta_keys: HashSet<Box<str>> = compiled
-            .emits
-            .iter()
-            .filter(|e| e.is_meta)
-            .map(|e| e.output_name.clone())
-            .collect();
         let factory = AccumulatorFactory::new(compiled);
         let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
@@ -2819,8 +2390,6 @@ impl StreamingAggregator<AddRaw> {
             pre_agg_filter,
             evaluator,
             transform_name: transform_name.into(),
-            explicit_meta_keys,
-            meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
             boundary,
             pending: Vec::new(),
@@ -2850,16 +2419,8 @@ impl StreamingAggregator<AddRaw> {
     ) -> Result<(), HashAggError> {
         if let Some(filter) = &self.pre_agg_filter {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &env,
-                &meta,
-            )?;
+            let v =
+                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &env)?;
             if v != Value::Bool(true) {
                 return Ok(());
             }
@@ -2899,27 +2460,6 @@ impl StreamingAggregator<AddRaw> {
         let bindings = self.factory.compiled().bindings.clone();
         for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
             dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
-        }
-
-        // D11 revised: walk record metadata into the fresh tracker.
-        if record.has_meta() {
-            let observations: Vec<(Box<str>, Value)> = record
-                .iter_meta()
-                .filter(|(k, _)| !self.explicit_meta_keys.contains(*k))
-                .map(|(k, v)| (Box::<str>::from(k), v.clone()))
-                .collect();
-            for (k, v) in observations {
-                let r = state.meta_tracker.observe(&k, &v);
-                if r.became_conflict && self.meta_conflict_logged.insert(k.clone()) {
-                    tracing::warn!(
-                        transform = %self.transform_name,
-                        meta_key = %k,
-                        "streaming aggregate dropped $meta.{} for at least one group: \
-                         conflicting values across input records",
-                        k
-                    );
-                }
-            }
         }
 
         // Seed `min_row_num` on the fresh per-group state; the boundary
@@ -3043,12 +2583,6 @@ impl StreamingAggregator<MergeState> {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
         let pre_agg_filter = compiled.pre_agg_filter.clone();
-        let explicit_meta_keys: HashSet<Box<str>> = compiled
-            .emits
-            .iter()
-            .filter(|e| e.is_meta)
-            .map(|e| e.output_name.clone())
-            .collect();
         let factory = AccumulatorFactory::new(compiled);
         let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
@@ -3064,8 +2598,6 @@ impl StreamingAggregator<MergeState> {
             pre_agg_filter,
             evaluator,
             transform_name: transform_name.into(),
-            explicit_meta_keys,
-            meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
             boundary,
             pending: Vec::new(),
@@ -3272,10 +2804,6 @@ mod accumulator_op_tests {
     use super::*;
     use clinker_record::accumulator::{AccumulatorEnum, AggregateType};
 
-    fn sv(s: &str) -> Value {
-        Value::String(s.into())
-    }
-
     fn state_with_row(row: AccumulatorRow) -> AggregatorGroupState {
         AggregatorGroupState::new(row)
     }
@@ -3299,27 +2827,6 @@ mod accumulator_op_tests {
         let src = state_with_row(Vec::new()); // min_row_num = u64::MAX
         merge_group_sidecars(&mut dst, src);
         assert_eq!(dst.min_row_num, 7, "u64::MAX must act as identity");
-    }
-
-    #[test]
-    fn test_merge_sidecars_metadata_tracker_associative() {
-        // dst sees {source_file: a.csv}; src sees {source_file: a.csv,
-        // other: x}. After merge dst must retain source_file and pick
-        // up `other` as common-only (both trackers saw it consistently).
-        let mut dst = state_with_row(Vec::new());
-        let _ = dst.meta_tracker.observe("source_file", &sv("a.csv"));
-
-        let mut src = state_with_row(Vec::new());
-        let _ = src.meta_tracker.observe("source_file", &sv("a.csv"));
-        let _ = src.meta_tracker.observe("other", &sv("x"));
-
-        merge_group_sidecars(&mut dst, src);
-        let finalized = dst.meta_tracker.finalize();
-        let keys: Vec<&str> = finalized.iter().map(|(k, _)| k.as_ref()).collect();
-        assert!(
-            keys.contains(&"source_file"),
-            "source_file missing: {keys:?}"
-        );
     }
 
     // ----- AccumulatorOp::apply_row: AddRaw -----
@@ -3373,18 +2880,16 @@ mod accumulator_op_tests {
     #[test]
     fn test_mergestate_input_type_carries_full_group_state() {
         // Compile-time proof that the `Input` associated type is the
-        // full `(Vec<u8>, AggregatorGroupState)` (audit fix Gap B).
-        // If `MergeState::Input` ever regresses to
-        // `(Vec<u8>, AccumulatorRow)` this test stops compiling.
+        // full `(Vec<u8>, AggregatorGroupState)`. If `MergeState::Input`
+        // ever regresses to `(Vec<u8>, AccumulatorRow)` this test stops
+        // compiling.
         fn assert_input_is_full_state(_: &<MergeState as AccumulatorOp>::Input) {}
         let st = state_with_row(Vec::new());
         let input: (Vec<u8>, AggregatorGroupState) = (Vec::new(), st);
         assert_input_is_full_state(&input);
-        // Confirm `min_row_num` + tracker are addressable on the
-        // `Input` type — if they are missing this line fails to
-        // compile.
+        // Confirm `min_row_num` is addressable on the `Input` type —
+        // if it is missing this line fails to compile.
         let _ = input.1.min_row_num;
-        let _ = &input.1.meta_tracker;
     }
 
     // ----- qualifies_for_streaming -----
@@ -3555,6 +3060,7 @@ mod spill_trigger_tests {
     use cxl::typecheck::Row;
     use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::types::Type;
+    use indexmap::IndexMap;
 
     fn make_schema(cols: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
@@ -3631,7 +3137,6 @@ mod spill_trigger_tests {
         let output_columns: Vec<Box<str>> = compiled
             .emits
             .iter()
-            .filter(|e| !e.is_meta)
             .map(|e| e.output_name.clone())
             .collect();
         let output_schema = Arc::new(Schema::new(output_columns));
@@ -3641,7 +3146,6 @@ mod spill_trigger_tests {
             .map(|s| Box::<str>::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        spill_cols.push("__meta_tracker".into());
         let spill_schema = Arc::new(Schema::new(spill_cols));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
@@ -4718,7 +4222,7 @@ mod spill_trigger_tests {
         // Build the output schema mirroring the widening pass: user
         // emits first, then the synthetic CK column at the tail.
         let mut builder = clinker_record::SchemaBuilder::new();
-        for emit in compiled.emits.iter().filter(|e| !e.is_meta) {
+        for emit in compiled.emits.iter() {
             builder = builder.with_field(emit.output_name.clone());
         }
         let synthetic_name = format!("$ck.aggregate.{transform_name}");
@@ -4733,7 +4237,6 @@ mod spill_trigger_tests {
             .map(|s| Box::<str>::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        spill_cols.push("__meta_tracker".into());
         let spill_schema = Arc::new(Schema::new(spill_cols));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);

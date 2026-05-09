@@ -104,8 +104,24 @@ impl<W: Write> FixedWidthWriter<W> {
         &self.truncation_warnings
     }
 
-    fn format_value(&self, _field: &WriteField, value: &Value) -> String {
-        match value {
+    /// Convert a `Value` to its fixed-width string form.
+    ///
+    /// `Value::Map` has no canonical scalar serialization for a
+    /// fixed-width column (the prior behavior of returning an empty
+    /// string silently dropped the payload, hiding routing bugs —
+    /// e.g. a `$widened` sidecar reaching the writer without
+    /// `include_widened: true` expansion), so this returns
+    /// `FormatError::UnserializableMapValue` carrying the offending
+    /// column. The fixed-width writer is the single point of truth
+    /// for map rejection on this path; there is no upstream pre-walk.
+    ///
+    /// `Value::Array` retains the prior empty-cell shape because
+    /// fixed-width's strict positional layout makes JSON-in-cell
+    /// unworkable. Users who need an array's contents in a
+    /// fixed-width field must coerce to a scalar in CXL before
+    /// the emit.
+    fn format_value(&self, field: &WriteField, value: &Value) -> Result<String, FormatError> {
+        Ok(match value {
             Value::Null => String::new(),
             Value::String(s) => s.to_string(),
             Value::Integer(i) => i.to_string(),
@@ -113,8 +129,14 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-            Value::Array(_) | Value::Map(_) => String::new(),
-        }
+            Value::Array(_) => String::new(),
+            Value::Map(_) => {
+                return Err(FormatError::UnserializableMapValue {
+                    format: "fixed-width",
+                    column: field.name.clone(),
+                });
+            }
+        })
     }
 
     fn pad_and_justify(&self, field: &WriteField, value: &str) -> String {
@@ -148,7 +170,7 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         for field in &self.fields {
             let value = record.get(&field.name).cloned().unwrap_or(Value::Null);
 
-            let formatted = self.format_value(field, &value);
+            let formatted = self.format_value(field, &value)?;
 
             // Check truncation
             if formatted.len() > field.width {
@@ -443,5 +465,39 @@ mod tests {
         let roundtrip = reader.next_record().unwrap().unwrap();
         assert_eq!(roundtrip.get("id"), Some(&Value::Integer(42)));
         assert_eq!(roundtrip.get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    /// Fixed-width writer rejects `Value::Map` payloads with
+    /// `FormatError::UnserializableMapValue`. The previous behavior
+    /// silently emitted an empty fixed-width field for any map
+    /// in `format_value`; the explicit precheck in `write_record`
+    /// surfaces the misroute (typically a `$widened` sidecar
+    /// reaching the writer without `include_widened: true`
+    /// expansion).
+    #[test]
+    fn test_fixed_width_writer_rejects_map_value() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
+        let mut sidecar: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+        );
+        let mut id_field = field("id");
+        id_field.width = Some(5);
+        let mut payload_field = field("payload");
+        payload_field.width = Some(10);
+        let fields = vec![id_field, payload_field];
+        let mut buf = Vec::new();
+        let mut writer =
+            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "fixed-width");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
     }
 }

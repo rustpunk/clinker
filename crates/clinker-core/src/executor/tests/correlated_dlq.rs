@@ -18,12 +18,7 @@ fn run_correlated_pipeline(
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
 
@@ -88,7 +83,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#,
         correlation_key
     )
@@ -225,7 +220,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "employee_id,dept,value\nA,HR,100\nA,HR,bad\nA,ENG,200\nB,HR,300\n";
     let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
@@ -287,7 +282,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Group A has 5 records — exceeds max_group_buffer of 3. Per the
     // deferred-commit design, every record of the overflowing group
@@ -367,7 +362,7 @@ nodes:
     name: out_a
     path: out_a.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 
 - type: output
   name: out_b
@@ -376,7 +371,7 @@ nodes:
     name: out_b
     path: out_b.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Group A: 1 bad among 3 → all 3 records DLQ'd. Each record
     // reaches BOTH outputs (inclusive Route) so without correlation
@@ -474,7 +469,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
     let result = config.compile(&crate::config::CompileContext::default());
@@ -531,7 +526,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
     let plan = config
@@ -626,7 +621,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,7\nB,11\n";
     let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
@@ -704,7 +699,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // Group A: 2 good, 1 bad → the rewrite would change the field
     // value to "REWRITTEN" but group identity is the original "A".
@@ -777,7 +772,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "employee_id,value\nA,1\nA,3\nB,7\n";
     let (counters, _dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
@@ -813,11 +808,10 @@ fn combine_output_inherits_driver_correlation_meta() {
     // Mechanism: the combine arm emits each combined record by either
     // (a) cloning the driver record and overlaying the body's emitted
     // fields, or (b) widening the driver record to the combine's
-    // output schema via `widen_record_to_schema`, which copies
-    // `iter_meta()` from the driver onto the widened record. Either
-    // way the driver's `$ck.<field>` snapshot column propagates onto
-    // the combined output's schema and the buffer-key extractor
-    // recovers the original correlation group on the emitted row.
+    // output schema via `widen_record_to_schema`. Either way the
+    // driver's `$ck.<field>` snapshot column propagates onto the
+    // combined output's schema and the buffer-key extractor recovers
+    // the original correlation group on the emitted row.
     //
     // Test pipeline: orders (driver) → validate (transform that fails
     // on a bad amount) → combine with departments (build) on
@@ -885,7 +879,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: false
+    include_widened: false
 "#;
     let orders_csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,7\n";
     let departments_csv = "employee_id,dept\nA,HR\nB,ENG\n";
@@ -1070,7 +1064,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: false
+    include_widened: false
 "#;
     let orders_csv = "order_id,department_id,product_id,amount\nO1,A,P1,100\nO2,A,P1,bad\nO3,A,P2,300\nO4,B,P2,400\n";
     let products_csv = "product_id,name,category_id\nP1,Widget,C1\nP2,Gadget,C2\n";
@@ -1204,7 +1198,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,4\n";
     let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
@@ -1228,11 +1222,10 @@ nodes:
 #[test]
 fn combine_iejoin_output_inherits_driver_correlation_meta() {
     // The IEJoin combine strategy (selected for mixed equi+range
-    // predicates) must inherit driver meta the same way the
-    // HashBuildProbe path does. The kernel emits combined records via
-    // its local `widen_record_to_schema` helper (pipeline/iejoin.rs),
-    // which already copies `iter_meta()` from the driver record onto
-    // the widened output. This test locks that behavior so a future
+    // predicates) must inherit driver `$ck.<field>` snapshot columns
+    // the same way the HashBuildProbe path does. The kernel emits
+    // combined records via its local `widen_record_to_schema` helper
+    // (pipeline/iejoin.rs). This test locks that behavior so a future
     // refactor that swaps the helper for a bare `Record::new(...)`
     // would surface here.
     //
@@ -1302,7 +1295,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: false
+    include_widened: false
 "#;
     let orders_csv = "employee_id,amount,event_time\nA,1,5\nA,bad,10\nA,3,15\nB,4,25\n";
     let sessions_csv = "employee_id,session_start,session_end\nA,0,20\nB,20,30\n";

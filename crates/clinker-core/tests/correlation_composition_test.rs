@@ -18,11 +18,11 @@
 //! `executor::tests::correlated_dlq::group_identity_fixed_at_ingest_when_transform_rewrites_key`.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 
 #[derive(Clone, Default)]
@@ -54,13 +54,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "correlation-composition-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -90,13 +85,9 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    )
-    .expect("pipeline run");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .expect("pipeline run");
     (report, buf.as_string())
 }
 
@@ -150,7 +141,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
     let (report, output) = run_with_composition(yaml, csv);
@@ -238,7 +229,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
     let (report, _output) = run_with_composition(yaml, csv);

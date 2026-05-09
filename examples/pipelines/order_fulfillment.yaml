@@ -1,8 +1,8 @@
 pipeline:
   name: order_fulfillment
   vars:
-    express_surcharge: 5.99
-    high_value_threshold: 500
+    express_surcharge: { type: float, default: 5.99 }
+    high_value_threshold: { type: int, default: 500 }
 
 nodes:
   - type: source
@@ -87,7 +87,7 @@ nodes:
       name: fulfilled_orders
       type: csv
       path: ./output/fulfilled_orders.csv
-      include_unmapped: false
+      include_widened: false
 
   - type: output
     name: priority_report

@@ -290,8 +290,10 @@ fn walk_expr(
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }

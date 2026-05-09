@@ -51,7 +51,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     // o3 (HR, 30) hits divide-by-zero → 1 DLQ. The other rows reach
     // the writer.

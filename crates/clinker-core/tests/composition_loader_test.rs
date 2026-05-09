@@ -39,8 +39,8 @@ fn test_phase1_scanner_loads_all_fixtures() {
 
     assert_eq!(
         table.len(),
-        19,
-        "expected 19 composition signatures, got {}: {:?}",
+        22,
+        "expected 22 composition signatures, got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );

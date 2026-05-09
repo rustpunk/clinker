@@ -75,18 +75,16 @@ mod dispatch {
         let output_columns: Vec<Box<str>> = compiled
             .emits
             .iter()
-            .filter(|e| !e.is_meta)
             .map(|e| e.output_name.clone())
             .collect();
         let output_schema = Arc::new(Schema::new(output_columns));
 
-        // Spill schema: group-by columns ++ __acc_state ++ __meta_tracker.
+        // Spill schema: group-by columns ++ __acc_state.
         let mut spill_cols: Vec<Box<str>> = group_by_owned
             .iter()
             .map(|s| Box::<str>::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        spill_cols.push("__meta_tracker".into());
         let spill_schema = Arc::new(Schema::new(spill_cols));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
@@ -163,7 +161,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
         let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
@@ -225,7 +223,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let config = crate::config::parse_config(yaml).expect("config parses");
         // The canonical compile entry point lowers via `bind_schema` +
@@ -332,7 +330,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         // Header-only input — zero data rows.
         let csv = "x\n";
@@ -472,7 +470,6 @@ nodes:
         let output_columns: Vec<Box<str>> = compiled
             .emits
             .iter()
-            .filter(|e| !e.is_meta)
             .map(|e| e.output_name.clone())
             .collect();
         let output_schema = Arc::new(Schema::new(output_columns));
@@ -1453,7 +1450,6 @@ mod two_phase_bytes_spill {
         let output_columns: Vec<Box<str>> = compiled
             .emits
             .iter()
-            .filter(|e| !e.is_meta)
             .map(|e| e.output_name.clone())
             .collect();
         let output_schema = Arc::new(Schema::new(output_columns));
@@ -1463,7 +1459,6 @@ mod two_phase_bytes_spill {
             .map(|s| Box::<str>::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        spill_cols.push("__meta_tracker".into());
         let spill_schema = Arc::new(Schema::new(spill_cols));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);

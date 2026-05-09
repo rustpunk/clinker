@@ -33,7 +33,7 @@ use crate::config::composition::{
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
-    CombineBody, MatchMode, PipelineNode, PropagateCkSpec, SchemaDecl,
+    CombineBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, SchemaDecl,
 };
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::combine::{
@@ -159,6 +159,12 @@ pub(crate) struct BindContext<'a> {
     /// pipeline this is typically `"pipelines/"` or similar; for nested
     /// compositions it's the directory of the `.comp.yaml` file.
     pub origin_dir: PathBuf,
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$row.<key>`
+    /// registry. Built once from `PipelineConfig.pipeline.vars` at the
+    /// `bind_schema` entry and threaded into every CXL resolve / typecheck
+    /// call site. Empty for compositions that don't propagate scoped vars
+    ///.
+    pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -184,6 +190,7 @@ pub fn bind_schema(
     ctx: &CompileContext,
     symbol_table: &CompositionSymbolTable,
     pipeline_dir: &Path,
+    scoped_vars: cxl::resolve::ScopedVarsRegistry,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -194,6 +201,7 @@ pub fn bind_schema(
         depth: 0,
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
+        scoped_vars,
     };
     bind_schema_inner(
         nodes,
@@ -203,7 +211,812 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
+    validate_producer_writers(nodes, diags);
+    validate_init_phase_terminals(nodes, diags);
+    validate_read_after_write(nodes, &artifacts, diags);
+    validate_post_merge_source_reads(nodes, &artifacts, diags);
+    validate_init_phase_isolation(nodes, &artifacts, diags);
+
     artifacts
+}
+
+/// Compile-time check: a `phase: init` Transform may not read
+/// scoped variables that are written ONLY by `phase: runtime`
+/// Transforms. The init sub-DAG runs to completion before any
+/// runtime node executes, so the read would silently observe the
+/// declaration default — the "invisible default" hazard.
+///
+/// Reads of vars written by other init-phase Transforms are fine
+/// (init runs as one unit). Reads of vars with no writer are fine
+/// (declaration default is the intended value). Only the
+/// init-reads-runtime-only case is flagged.
+///
+/// Reuses `validate_producer_writers`'s writer-map shape and
+/// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
+/// Iterate every (scope, var) writer in the pipeline. Each writer is
+/// a Transform with one or more `config.declares:` entries; one
+/// `WriterInfo` is emitted per (Transform, declare-entry) pair.
+struct WriterInfo<'a> {
+    scope: crate::config::VarScope,
+    var: &'a str,
+    node_name: &'a str,
+    span: Span,
+    phase: crate::config::Phase,
+}
+
+fn iter_writers<'a>(nodes: &'a [Spanned<PipelineNode>]) -> Vec<WriterInfo<'a>> {
+    let mut out = Vec::new();
+    for spanned in nodes {
+        let span = span_for_node(spanned);
+        if let PipelineNode::Transform { header, config } = &spanned.value {
+            for entry in &config.declares {
+                out.push(WriterInfo {
+                    scope: entry.scope,
+                    var: &entry.name,
+                    node_name: &header.name,
+                    span,
+                    phase: config.phase,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn validate_init_phase_isolation(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::config::{Phase as ConfPhase, VarScope};
+
+    // Build (scope, var) → (writer-name, writer-phase) map from every
+    // declared writer.
+    let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
+        std::collections::HashMap::new();
+    for w in iter_writers(nodes) {
+        writers
+            .entry((w.scope, w.var.to_string()))
+            .or_insert_with(|| (w.node_name.to_string(), w.phase));
+    }
+    if writers.is_empty() {
+        return;
+    }
+
+    // Collect (reader_name, read_span, typed_keys) for every init-phase
+    // writer. Each Transform contributes one entry whose typed_keys
+    // is its bare node name (one CXL block per node).
+    type ReaderEntry<'a> = (&'a str, Span, Vec<String>);
+    let mut readers: Vec<ReaderEntry<'_>> = Vec::new();
+    for spanned in nodes {
+        match &spanned.value {
+            PipelineNode::Transform { header, config } if config.phase == ConfPhase::Init => {
+                readers.push((
+                    header.name.as_str(),
+                    span_for_node(spanned),
+                    vec![header.name.clone()],
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    for (reader_name, read_span, typed_keys) in readers {
+        for typed_key in &typed_keys {
+            let Some(typed) = artifacts.typed.get(typed_key) else {
+                continue;
+            };
+            let mut reads: Vec<(VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            for (scope, var) in reads {
+                let Some((writer_name, writer_phase)) = writers.get(&(scope, var.clone())).cloned()
+                else {
+                    continue;
+                };
+                if writer_phase == ConfPhase::Init {
+                    continue;
+                }
+                if writer_name == reader_name {
+                    continue;
+                }
+                let scope_str = match scope {
+                    VarScope::Pipeline => "$pipeline",
+                    VarScope::Source => "$source",
+                    VarScope::Record => "$record",
+                };
+                let writer_span = nodes
+                    .iter()
+                    .find(|n| n.value.name() == writer_name.as_str())
+                    .map(span_for_node)
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E175",
+                        format!(
+                            "init-phase node {reader_name:?} reads {scope_str}.{var} \
+                             which is only written by runtime-phase node \
+                             {writer_name:?} — init runs to completion before runtime, so \
+                             the read would silently observe the declaration default. \
+                             Move the writer to `phase: init` or remove the read."
+                        ),
+                        LabeledSpan::primary(read_span, "init-phase reader".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        writer_span,
+                        Some("runtime-phase writer".to_string()),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+/// Compile-time check: nodes downstream of `Merge` / `Combine` must
+/// not read user-declared `$source.<key>` (custom keys); the
+/// per-source-file Arc keying that backs source-scope state means
+/// each record reads its OWN origin source's value, but in cross-
+/// source comparison contexts the user might intend "give me Source
+/// A's batch_id and Source B's batch_id" — which is ambiguous in the
+/// current syntax. Avoids Talend's `globalMap`-collapse-after-merge
+/// surprise (each record sees its own source value, but the
+/// cross-source intent is silently lost).
+///
+/// Builtin `$source.*` members (`file`, `row`, `path`, `count`,
+/// `batch`, `ingestion_timestamp`) remain valid post-merge — those
+/// are per-record provenance and the per-record-source semantic is
+/// the desired one.
+///
+/// Emits E172 with primary span on the offending CXL reference and a
+/// secondary span on the closest Merge/Combine ancestor.
+fn validate_post_merge_source_reads(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Compute per-node "closest merge/combine ancestor" map. A node is
+    // post-merge iff this entry is `Some(_)`. The same declaration-
+    // order walk used by `validate_read_after_write` works here
+    // because Stage-3 already proved topological soundness.
+    let mut post_merge: std::collections::HashMap<String, Option<(String, Span)>> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        let name = spanned.value.name().to_string();
+        let span = span_for_node(spanned);
+        let direct_inputs: Vec<String> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+        };
+        // A Merge or Combine node IS the merge ancestor for everything
+        // downstream — including itself in the lookup so its own
+        // direct descendants pick it up.
+        let self_is_merge = matches!(
+            &spanned.value,
+            PipelineNode::Merge { .. } | PipelineNode::Combine { .. }
+        );
+        let inherited = direct_inputs
+            .iter()
+            .find_map(|inp| post_merge.get(inp).cloned().unwrap_or(None));
+        let entry = if self_is_merge {
+            Some((name.clone(), span))
+        } else {
+            inherited
+        };
+        post_merge.insert(name, entry);
+    }
+
+    // Walk every CXL-bearing node's typed program(s); for each
+    // `$source.<custom>` read in a post-merge node, emit E172.
+    for spanned in nodes {
+        let reader_name = spanned.value.name().to_string();
+        let Some(Some((merge_name, merge_span))) = post_merge.get(&reader_name).cloned() else {
+            continue;
+        };
+        let mut typed_keys: Vec<String> = Vec::new();
+        match &spanned.value {
+            PipelineNode::Transform { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. } => {
+                if artifacts.typed.contains_key(&reader_name) {
+                    typed_keys.push(reader_name.clone());
+                }
+            }
+            _ => {}
+        }
+        let span = span_for_node(spanned);
+        for key in typed_keys {
+            let Some(typed) = artifacts.typed.get(&key) else {
+                continue;
+            };
+            let mut reads: Vec<(crate::config::VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            for (scope, var) in reads {
+                if scope != crate::config::VarScope::Source {
+                    continue;
+                }
+                if is_builtin_source_member(&var) {
+                    continue;
+                }
+                diags.push(
+                    Diagnostic::error(
+                        "E172",
+                        format!(
+                            "node {reader_name:?} reads user-declared $source.{var} downstream \
+                             of Merge/Combine node {merge_name:?}: post-merge cross-source \
+                             access is ambiguous (each record carries its own source's value, \
+                             but cross-source comparison requires explicit per-input \
+                             qualification). Project the value into a record field before \
+                             merging, or write a per-input value via a Transform with \
+                             `declares:` placed upstream of the merge."
+                        ),
+                        LabeledSpan::primary(span, "post-merge reader".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        merge_span,
+                        Some("merge / combine ancestor".to_string()),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn is_builtin_source_member(field: &str) -> bool {
+    matches!(
+        field,
+        "file" | "row" | "path" | "count" | "batch" | "ingestion_timestamp"
+    )
+}
+
+/// Compile-time check: every `$pipeline.<key>` / `$source.<key>` /
+/// `$record.<key>` read whose `(scope, key)` pair is written by some
+/// `state` node must originate at a node whose DAG ancestor set
+/// includes that writer. A reader on a sibling branch (no path from
+/// writer to reader) would observe the variable's default value, not
+/// the written value — exactly the "hidden DAG edge" anti-pattern
+/// Airflow Variables and Talend `globalMap` are infamous for.
+///
+/// Self-reads (a Transform referencing the same variable it writes)
+/// are allowed: the read evaluates BEFORE the write within a single
+/// record's processing, observing the previous value.
+///
+/// Reads of `(scope, key)` pairs declared in `vars:` but never written
+/// by any Transform are NOT flagged here — those are valid reads of
+/// the declaration default. Reads that aren't declared at all are
+/// already rejected by the resolver in Phase B / C-1.
+///
+/// Emits E171 with primary span on the offending CXL reference and a
+/// secondary span on the writer Transform.
+fn validate_read_after_write(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::config::{Phase as ConfPhase, VarScope};
+
+    // Build (scope, var) → (writer-node-name, writer-phase) map. Phase
+    // is needed because init-phase writers' values are visible to ALL
+    // runtime readers regardless of DAG topology — init runs to
+    // completion before runtime starts, so
+    // descendant ancestry is irrelevant for those reads.
+    let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
+        std::collections::HashMap::new();
+    for w in iter_writers(nodes) {
+        writers
+            .entry((w.scope, w.var.to_string()))
+            .or_insert_with(|| (w.node_name.to_string(), w.phase));
+    }
+    if writers.is_empty() {
+        return;
+    }
+
+    // Build transitive ancestor map keyed by node name. Iterates
+    // `nodes` in declaration order, which is topologically sound per
+    // Stage-3 validation, so each node's ancestor set can be assembled
+    // from already-processed predecessors.
+    let mut ancestors: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        let name = spanned.value.name().to_string();
+        let mut anc: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let direct: Vec<String> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+        };
+        for parent in direct {
+            anc.insert(parent.clone());
+            if let Some(parent_anc) = ancestors.get(&parent) {
+                anc.extend(parent_anc.iter().cloned());
+            }
+        }
+        ancestors.insert(name, anc);
+    }
+
+    // Walk every CXL-bearing node's typed program(s); for each scope
+    // read whose key has a known writer, check the writer is in the
+    // reader's ancestor set.
+    for spanned in nodes {
+        let reader_name = spanned.value.name().to_string();
+        let mut typed_keys: Vec<String> = Vec::new();
+        match &spanned.value {
+            PipelineNode::Transform { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. } => {
+                if artifacts.typed.contains_key(&reader_name) {
+                    typed_keys.push(reader_name.clone());
+                }
+            }
+            _ => {}
+        }
+        let span = span_for_node(spanned);
+        for key in typed_keys {
+            let Some(typed) = artifacts.typed.get(&key) else {
+                continue;
+            };
+            let mut reads: Vec<(VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            // Determine the reader's phase — Transforms carry their
+            // own `phase`; every other node kind is runtime by
+            // definition. Init readers' visibility into init-only
+            // writers depends on DAG ancestry within the init pass;
+            // runtime readers see init writers regardless of topology
+            // because init completes first.
+            let reader_phase = match &spanned.value {
+                PipelineNode::Transform { config, .. } => config.phase,
+                _ => ConfPhase::Runtime,
+            };
+            for (scope, var) in reads {
+                let Some((writer_name, writer_phase)) = writers.get(&(scope, var.clone())).cloned()
+                else {
+                    continue;
+                };
+                // Self-read inside the writing Transform is fine.
+                if writer_name == reader_name {
+                    continue;
+                }
+                // Init writer + runtime reader: init runs to completion
+                // before runtime, so the value is visible everywhere
+                // downstream regardless of DAG topology.
+                if writer_phase == ConfPhase::Init && reader_phase == ConfPhase::Runtime {
+                    continue;
+                }
+                // Init reader + runtime writer is the E175 case — skip
+                // here to avoid a duplicate diagnostic; E175 fires from
+                // `validate_init_phase_isolation`.
+                if writer_phase == ConfPhase::Runtime && reader_phase == ConfPhase::Init {
+                    continue;
+                }
+                // Same phase (init+init or runtime+runtime): the
+                // descendant-ancestry rule applies — both run in the
+                // same pass and the writer's effect must precede the
+                // reader's evaluation in topo order.
+                let reader_anc = ancestors.get(&reader_name);
+                let is_descendant = reader_anc
+                    .map(|set| set.contains(&writer_name))
+                    .unwrap_or(false);
+                if !is_descendant {
+                    let scope_str = match scope {
+                        VarScope::Pipeline => "$pipeline",
+                        VarScope::Source => "$source",
+                        VarScope::Record => "$record",
+                    };
+                    let writer_span = nodes
+                        .iter()
+                        .find(|n| n.value.name() == writer_name.as_str())
+                        .map(span_for_node)
+                        .unwrap_or(Span::SYNTHETIC);
+                    diags.push(
+                        Diagnostic::error(
+                            "E171",
+                            format!(
+                                "node {reader_name:?} reads {scope_str}.{var} but is not a DAG \
+                                 descendant of writer Transform {writer_name:?} — the read \
+                                 would observe the declaration default, not the written value \
+                                 (move the reader downstream of the writer or remove the read)"
+                            ),
+                            LabeledSpan::primary(span, "non-descendant reader".to_string()),
+                        )
+                        .with_secondary(LabeledSpan::new(
+                            writer_span,
+                            Some("writer Transform".to_string()),
+                        )),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// build a composition body's scoped-vars registry from the
+/// intersection of the body's `_compose.scoped_vars` schema and the
+/// parent's actual declarations.
+///
+/// For each `(scope, key)` declared in the schema:
+/// - If the parent has the same `(scope, key)` with the same type,
+///   include it in the body's registry.
+/// - If the parent doesn't declare it (or declares it with a different
+///   type), emit E174 and skip the entry. The body's CXL referencing
+///   that name then falls back to the resolver's "unknown member"
+///   diagnostic — which is the right outcome because the schema's
+///   contract was unfulfillable.
+///
+/// Returns the body-visible registry. An empty schema produces an
+/// empty registry, preserving the seal as the default.
+fn build_body_scoped_vars(
+    schema: &crate::config::ScopedVarsSchema,
+    parent: &cxl::resolve::ScopedVarsRegistry,
+    composition_name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> cxl::resolve::ScopedVarsRegistry {
+    use cxl::resolve::ScopedVarsRegistry;
+
+    let mut registry = ScopedVarsRegistry::default();
+
+    let check = |scope_str: &str,
+                 schema_map: &indexmap::IndexMap<String, crate::config::ScopedVarType>,
+                 parent_map: &indexmap::IndexMap<String, cxl::resolve::ScopedVarType>,
+                 out_map: &mut indexmap::IndexMap<String, cxl::resolve::ScopedVarType>,
+                 diags: &mut Vec<Diagnostic>| {
+        for (key, schema_ty) in schema_map {
+            let cxl_schema_ty: cxl::resolve::ScopedVarType = (*schema_ty).into();
+            match parent_map.get(key) {
+                Some(parent_ty) if *parent_ty == cxl_schema_ty => {
+                    out_map.insert(key.clone(), cxl_schema_ty);
+                }
+                Some(parent_ty) => {
+                    diags.push(Diagnostic::error(
+                        "E174",
+                        format!(
+                            "composition {composition_name:?}: scoped_vars schema declares \
+                                 ${scope_str}.{key} as {cxl_schema_ty:?}, but the parent \
+                                 pipeline declares it as {parent_ty:?} — types must match"
+                        ),
+                        LabeledSpan::primary(span, "composition call site".to_string()),
+                    ));
+                }
+                None => {
+                    diags.push(Diagnostic::error(
+                        "E174",
+                        format!(
+                            "composition {composition_name:?}: scoped_vars schema declares \
+                                 ${scope_str}.{key} but no parent Transform declares it via \
+                                 `declares:` — add a Transform with `declares: [{{ name: {key}, \
+                                 scope: {scope_str}, type: ... }}]` upstream of the composition \
+                                 or remove it from the composition's scoped_vars schema"
+                        ),
+                        LabeledSpan::primary(span, "composition call site".to_string()),
+                    ));
+                }
+            }
+        }
+    };
+
+    check(
+        "pipeline",
+        &schema.pipeline,
+        &parent.pipeline,
+        &mut registry.pipeline,
+        diags,
+    );
+    check(
+        "source",
+        &schema.source,
+        &parent.source,
+        &mut registry.source,
+        diags,
+    );
+    check(
+        "record",
+        &schema.record,
+        &parent.record,
+        &mut registry.record,
+        diags,
+    );
+
+    // — populate the hidden tier with parent vars
+    // that are NOT opted into the schema. The composition body's
+    // resolver consults `hidden_*` on miss to emit E173 (composition-
+    // aware "this is a parent var hidden from your body — declare in
+    // _compose.scoped_vars to opt in") rather than the generic
+    // "unknown member" diagnostic.
+    for (key, ty) in &parent.pipeline {
+        if !schema.pipeline.contains_key(key) {
+            registry.hidden_pipeline.insert(key.clone(), *ty);
+        }
+    }
+    for (key, ty) in &parent.source {
+        if !schema.source.contains_key(key) {
+            registry.hidden_source.insert(key.clone(), *ty);
+        }
+    }
+    for (key, ty) in &parent.record {
+        if !schema.record.contains_key(key) {
+            registry.hidden_record.insert(key.clone(), *ty);
+        }
+    }
+
+    registry
+}
+
+fn span_for_node(spanned: &Spanned<PipelineNode>) -> Span {
+    let line = spanned.referenced.line() as u32;
+    if line > 0 {
+        Span::line_only(line)
+    } else {
+        Span::SYNTHETIC
+    }
+}
+
+fn collect_scope_reads_in_statement(
+    stmt: &Statement,
+    out: &mut Vec<(crate::config::VarScope, String)>,
+) {
+    match stmt {
+        Statement::Emit { expr, .. }
+        | Statement::Let { expr, .. }
+        | Statement::ExprStmt { expr, .. } => collect_scope_reads_in_expr(expr, out),
+        Statement::Filter { predicate, .. } => collect_scope_reads_in_expr(predicate, out),
+        Statement::Trace { guard, message, .. } => {
+            if let Some(g) = guard {
+                collect_scope_reads_in_expr(g, out);
+            }
+            collect_scope_reads_in_expr(message, out);
+        }
+        Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+    }
+}
+
+fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarScope, String)>) {
+    use crate::config::VarScope;
+    match expr {
+        Expr::PipelineAccess { field, .. } => out.push((VarScope::Pipeline, field.to_string())),
+        Expr::SourceAccess { field, .. } => out.push((VarScope::Source, field.to_string())),
+        Expr::RecordAccess { field, .. } => out.push((VarScope::Record, field.to_string())),
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            collect_scope_reads_in_expr(lhs, out);
+            collect_scope_reads_in_expr(rhs, out);
+        }
+        Expr::Unary { operand, .. } => collect_scope_reads_in_expr(operand, out),
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_scope_reads_in_expr(condition, out);
+            collect_scope_reads_in_expr(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_scope_reads_in_expr(eb, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject {
+                collect_scope_reads_in_expr(s, out);
+            }
+            for arm in arms {
+                collect_scope_reads_in_expr(&arm.pattern, out);
+                collect_scope_reads_in_expr(&arm.body, out);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_scope_reads_in_expr(receiver, out);
+            for a in args {
+                collect_scope_reads_in_expr(a, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                collect_scope_reads_in_expr(a, out);
+            }
+        }
+        Expr::Literal { .. }
+        | Expr::FieldRef { .. }
+        | Expr::QualifiedFieldRef { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::VarsAccess { .. } => {
+            // $vars.* reads are global static config — no producer, no
+            // DAG-descendant rule applies. Skipped from the scope-read
+            // accounting that drives E170/E171/E175 validation.
+        }
+    }
+}
+
+/// Compile-time check: an init-phase node may feed only other
+/// init-phase nodes — runtime-phase consumers never see init-phase
+/// nodes' record-pass-through output because the runtime walk skips
+/// init-only sub-DAG nodes. Silent record-loss would be a debugging
+/// nightmare; this rule surfaces the structural mismatch up front.
+///
+/// Walks each `phase: init` node (State or Transform) and checks
+/// whether any non-init node in the topology references it as input.
+/// Emits E164 with the init node's span and the offending downstream
+/// runtime node's name.
+fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
+    let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
+        let line = spanned.referenced.line() as u32;
+        if line > 0 {
+            Span::line_only(line)
+        } else {
+            Span::SYNTHETIC
+        }
+    };
+    let init_node_names: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|spanned| match &spanned.value {
+            PipelineNode::Transform { header, config }
+                if config.phase == crate::config::Phase::Init =>
+            {
+                Some(header.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if init_node_names.is_empty() {
+        return;
+    }
+    for spanned in nodes {
+        // For every node, check its inputs against the init-node-name
+        // set. Each input declared on a node implies a downstream
+        // dependency on that input, so an init node showing up as an
+        // input means it has a non-init descendant.
+        let inputs: Vec<&str> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => {
+                vec![upstream_target_name(&header.input.value).unwrap_or("")]
+            }
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .collect(),
+        };
+        let consumer_name = spanned.value.name();
+        let consumer_span = span_for(spanned);
+        // Init-phase consumers (State or Transform) are fine — the
+        // two-pass walk handles them as part of the init sub-DAG.
+        // Only runtime descendants are forbidden.
+        let consumer_is_init = match &spanned.value {
+            PipelineNode::Transform { config, .. } => config.phase == crate::config::Phase::Init,
+            _ => false,
+        };
+        if consumer_is_init {
+            continue;
+        }
+        for input_name in inputs {
+            if init_node_names.contains(input_name) {
+                let init_node_span = nodes
+                    .iter()
+                    .find(|n| n.value.name() == input_name)
+                    .map(span_for)
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E164",
+                        format!(
+                            "init-phase node {input_name:?} has runtime descendant \
+                             {consumer_name:?}: init nodes can feed other init-phase \
+                             nodes but must not be consumed by runtime-phase nodes \
+                             (their record output is not visible in the runtime walk). \
+                             Either change the consumer to `phase: init` or detach it from \
+                             this init node."
+                        ),
+                        LabeledSpan::primary(init_node_span, "init node".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        consumer_span,
+                        Some("runtime consumer".to_string()),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+/// Compile-time check: at most one Transform writes any given
+/// `(scope, var)` pair via `declares:`. Multiple writers produce
+/// non-deterministic last-write-wins behavior — the locked-decision
+/// design forbids it and demands the user collapse the writes into a
+/// single Transform (Hop / Talend canonical anti-pattern).
+///
+/// Init-phase and runtime-phase writers are tracked together; a
+/// converging-init writer is architecturally distinct from a
+/// converging-runtime writer (init runs to completion first), but the
+/// single-writer rule applies to both pools uniformly here.
+///
+/// Emits E170 with primary span on the second writer and secondary
+/// span on the first (the chronologically-first span in declaration
+/// order is the "canonical" writer; downstream nodes are duplicates).
+fn validate_producer_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
+    let mut seen: std::collections::HashMap<(crate::config::VarScope, String), (Span, String)> =
+        std::collections::HashMap::new();
+    let scope_str = |scope: crate::config::VarScope| match scope {
+        crate::config::VarScope::Pipeline => "$pipeline",
+        crate::config::VarScope::Source => "$source",
+        crate::config::VarScope::Record => "$record",
+    };
+    for w in iter_writers(nodes) {
+        let key = (w.scope, w.var.to_string());
+        if let Some((first_span, first_node)) = seen.get(&key) {
+            diags.push(
+                Diagnostic::error(
+                    "E170",
+                    format!(
+                        "scoped variable '{}.{}' has multiple writers: \
+                         {:?} duplicates the write from earlier writer {:?} — \
+                         collapse into a single producer",
+                        scope_str(w.scope),
+                        w.var,
+                        w.node_name,
+                        first_node
+                    ),
+                    LabeledSpan::primary(w.span, "second writer".to_string()),
+                )
+                .with_secondary(LabeledSpan::new(
+                    *first_span,
+                    Some("first writer".to_string()),
+                )),
+            );
+        } else {
+            seen.insert(key, (w.span, w.node_name.to_string()));
+        }
+    }
 }
 
 /// Build a placeholder `TypedProgram` carrying only `output_row`, for
@@ -252,8 +1065,11 @@ fn bind_schema_inner(
         match node {
             PipelineNode::Source { config, .. } => {
                 let schema_decl: &SchemaDecl = &config.schema;
-                let (columns, missing) =
-                    columns_from_decl(schema_decl, config.correlation_key.as_ref());
+                let (columns, missing) = columns_from_decl(
+                    schema_decl,
+                    config.correlation_key.as_ref(),
+                    &config.on_unmapped,
+                );
                 for missing_field in &missing {
                     diags.push(Diagnostic::error(
                         "E153",
@@ -299,6 +1115,7 @@ fn bind_schema_inner(
                     &upstream,
                     AggregateMode::Row,
                     span,
+                    &bind_ctx.scoped_vars,
                 ) {
                     Ok(mut typed) => {
                         let out = propagate_row(&upstream, &typed);
@@ -341,7 +1158,14 @@ fn bind_schema_inner(
                 let agg_mode = AggregateMode::GroupBy {
                     group_by_fields: config.group_by.iter().cloned().collect(),
                 };
-                match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
+                match typecheck_cxl(
+                    &name,
+                    &config.cxl.source,
+                    &upstream,
+                    agg_mode,
+                    span,
+                    &bind_ctx.scoped_vars,
+                ) {
                     Ok(mut typed) => {
                         let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
@@ -354,9 +1178,14 @@ fn bind_schema_inner(
             PipelineNode::Route { header, config: _ } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
-                    if let Ok(mut empty) =
-                        typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span)
-                    {
+                    if let Ok(mut empty) = typecheck_cxl(
+                        &name,
+                        "",
+                        &cloned,
+                        AggregateMode::Row,
+                        span,
+                        &bind_ctx.scoped_vars,
+                    ) {
                         empty.output_row = cloned.clone();
                         artifacts.typed.insert(name.clone(), Arc::new(empty));
                     }
@@ -364,6 +1193,62 @@ fn bind_schema_inner(
                 }
             }
             PipelineNode::Merge { header, .. } => {
+                // E315 — Merge inputs must agree on `$widened` sidecar
+                // presence. The runtime concatenates streams positionally
+                // against the merge's `output_schema` (taken from the
+                // first input); if upstream A has `$widened` but
+                // upstream B does not, the dispatcher's
+                // `check_input_schema` raises E314 with a message that
+                // names neither `$widened` nor the policy mismatch,
+                // leaving the user to debug a column-count discrepancy
+                // by hand. Detecting the disagreement at plan time
+                // surfaces it with a focused message that names the
+                // disagreeing inputs and points at each source's
+                // `on_unmapped` policy.
+                let widened_col = crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN;
+                let mut presence: Vec<(String, bool)> = Vec::new();
+                for input in &header.inputs {
+                    let upstream_name = input_target(&input.value).to_string();
+                    if let Some(row) = schema_by_name.get(upstream_name.as_str()) {
+                        presence.push((upstream_name, row.has_field(widened_col)));
+                    }
+                }
+                if !presence.is_empty()
+                    && presence.iter().any(|(_, has)| *has)
+                    && presence.iter().any(|(_, has)| !*has)
+                {
+                    let with_sidecar: Vec<&str> = presence
+                        .iter()
+                        .filter(|(_, has)| *has)
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let without_sidecar: Vec<&str> = presence
+                        .iter()
+                        .filter(|(_, has)| !*has)
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    diags.push(
+                        Diagnostic::error(
+                            "E315",
+                            format!(
+                                "merge {name:?}: input schemas disagree on the `$widened` \
+                                 auto_widen sidecar column. Inputs with sidecar: {with_sidecar:?}; \
+                                 inputs without sidecar: {without_sidecar:?}. The runtime \
+                                 concatenates streams positionally against the merge's output \
+                                 schema (taken from the first input); a sidecar-present record \
+                                 cannot be merged with sidecar-absent records without losing \
+                                 either the unmapped fields or column-count alignment."
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(
+                            "set every merge upstream source to the same `on_unmapped` policy \
+                             (all `auto_widen` to keep the sidecar, or all `drop`/`reject` to \
+                             omit it). Per-source policy lives in the source's `config.on_unmapped` \
+                             block; the engine-wide default is `auto_widen`.",
+                        ),
+                    );
+                }
                 if let Some(first) = header.inputs.first()
                     && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {
@@ -400,6 +1285,7 @@ fn bind_schema_inner(
                     diags,
                     artifacts,
                     schema_by_name,
+                    &bind_ctx.scoped_vars,
                 );
             }
             PipelineNode::Composition {
@@ -564,6 +1450,26 @@ fn bind_composition(
             .unwrap_or(Path::new(""))
             .to_path_buf(),
     );
+    // Composition bodies are sealed from parent scoped vars by default
+    // — the body sees an empty `ScopedVarsRegistry` and the
+    // resolver rejects every `$pipeline.<custom>` / `$source.<custom>` /
+    // `$record.<custom>` read with the standard "unknown member"
+    // diagnostic.
+    //
+    // Opt-in inheritance via the composition's
+    // `_compose.scoped_vars` schema: for each `(scope, key)` declared
+    // in `signature.scoped_vars_schema`, if the parent has a matching
+    // declaration with the same type, the body's registry includes it.
+    // Mismatches (parent missing the var, or type doesn't match) emit
+    // E174.
+    let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
+    bind_ctx.scoped_vars = build_body_scoped_vars(
+        &signature.scoped_vars_schema,
+        &saved_scoped_vars,
+        &signature.name,
+        span,
+        diags,
+    );
     // The new enclosing_scope is the parent's node names (for E108).
     bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
     // Also include the enclosing scope's names so nested compositions
@@ -594,6 +1500,7 @@ fn bind_composition(
     bind_ctx.depth -= 1;
     bind_ctx.use_path_stack.pop();
     bind_ctx.enclosing_scope_names = saved_enclosing;
+    bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
 
     // 9. Compute output rows from signature.outputs → body schemas.
@@ -1217,20 +2124,29 @@ fn build_input_port_rows(
             }
         }
 
-        // Append the parent's engine-stamped tail columns ($ck.<field>
-        // shadow columns from each parent source's `correlation_key:`
-        // widening) to the body's port declared set. The runtime port-
-        // synthetic Source built at body entry adopts every parent
-        // column, so the body sees these at runtime; declaring them
-        // here keeps the compile-time Row aligned with that runtime
-        // shape — without this step the open-tail mechanism would
-        // silently drop engine-stamped columns from the body's
-        // compile-time view and surface as a schema mismatch when
-        // records flow back to the parent (the composition's
-        // `output_schema` is derived from the body's terminal Row).
+        // Append the parent's engine-stamped tail columns to the
+        // body's port declared set. Two engine-stamp shapes propagate
+        // from parent to body:
+        //
+        // - `$ck.<field>` source-CK shadow columns from each parent
+        //   source's `correlation_key:` widening.
+        // - `$widened` sidecar absorber column from
+        //   `on_unmapped: auto_widen`.
+        //
+        // The runtime port-synthetic Source built at body entry adopts
+        // every parent column, so the body sees these at runtime;
+        // declaring them here keeps the compile-time Row aligned with
+        // that runtime shape — without this step the open-tail
+        // mechanism would silently drop engine-stamped columns from
+        // the body's compile-time view and surface as a schema
+        // mismatch when records flow back to the parent (the
+        // composition's `output_schema` is derived from the body's
+        // terminal Row).
         let mut declared_columns = declared_columns;
         for (qf, ty) in upstream_row.fields() {
-            if qf.name.starts_with("$ck.") && !declared_columns.contains_key(qf) {
+            let is_engine_stamped = qf.name.starts_with("$ck.")
+                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN;
+            if is_engine_stamped && !declared_columns.contains_key(qf) {
                 declared_columns.insert(qf.clone(), ty.clone());
             }
         }
@@ -1451,13 +2367,15 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Build a runtime `Arc<Schema>` from an iterator of column names,
 /// stamping engine-stamp metadata on every column whose name begins
-/// with the `$ck.` prefix. Two prefix shapes are recognized:
+/// with a recognized engine prefix:
 ///
 /// - `$ck.aggregate.<aggregate_name>` — synthetic group-index column
 ///   emitted by a relaxed aggregate. Stamped
 ///   [`FieldMetadata::AggregateGroupIndex`].
 /// - `$ck.<source_field>` — source-CK shadow column. Stamped
 ///   [`FieldMetadata::SourceCorrelation`].
+/// - `$widened` — `auto_widen` sidecar absorber. Stamped
+///   [`FieldMetadata::WidenedSidecar`].
 ///
 /// The aggregate prefix is checked first because `$ck.aggregate.x`
 /// also matches the generic `$ck.` prefix; misordering would mis-
@@ -1477,6 +2395,8 @@ where
             builder.with_field_meta(name, FieldMetadata::aggregate_group_index(aggregate_name))
         } else if let Some(field) = name.strip_prefix("$ck.") {
             builder.with_field_meta(name, FieldMetadata::source_correlation(field))
+        } else if name == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN {
+            builder.with_field_meta(name, FieldMetadata::widened_sidecar())
         } else {
             builder.with_field(name)
         };
@@ -1485,12 +2405,17 @@ where
 }
 
 /// Build the `Row.declared` map for a Source from its author-declared
-/// `schema:` block, tail-appending one `$ck.<field>` shadow column per
-/// field listed in the source's own `correlation_key:`.
+/// `schema:` block, tail-appending engine-stamped columns:
 ///
-/// Each shadow column is typed identically to the user-declared field
-/// of the same name. Tail-append preserves user-declared positional
-/// indices, mirroring Spark `_metadata`.
+/// - One `$ck.<field>` shadow column per field listed in the source's
+///   own `correlation_key:`. Each shadow column is typed identically
+///   to the user-declared field of the same name.
+/// - One `$widened` sidecar absorber (typed `Any`, carries
+///   `Value::Map`) when `on_unmapped: auto_widen` is the source's
+///   policy. Tail-append preserves user-declared positional indices
+///   while keeping the planner's view aligned with the runtime
+///   reader's emitted schema — the dispatch canonicalize invariant
+///   holds because `$widened` is engine-stamped.
 ///
 /// Returns the column map paired with a list of `correlation_key`
 /// field names that did NOT appear in `decl.columns`. The caller emits
@@ -1499,12 +2424,19 @@ where
 fn columns_from_decl(
     decl: &SchemaDecl,
     correlation_key: Option<&crate::config::CorrelationKey>,
+    on_unmapped: &OnUnmapped,
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
     let mut cols: IndexMap<QualifiedField, Type> = decl
         .columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
+    // Engine-stamped tail order: `$ck.<field>` shadow columns first,
+    // then the `$widened` sidecar last. The order is load-bearing —
+    // CK-aligned aggregate / combine propagation walks the schema
+    // expecting `$ck.*` immediately after declared columns; pushing
+    // `$widened` between them would break that propagation. Sources
+    // with `auto_widen` get `$widened` after every `$ck.<field>` slot.
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
@@ -1521,6 +2453,12 @@ fn columns_from_decl(
                 None => missing.push(field.to_string()),
             }
         }
+    }
+    if on_unmapped.reserves_widened_sidecar() {
+        cols.insert(
+            QualifiedField::bare(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN),
+            Type::Any,
+        );
     }
     (cols, missing)
 }
@@ -1551,6 +2489,7 @@ fn typecheck_cxl(
     schema: &Row,
     mode: AggregateMode,
     span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
     let parse_result = cxl::parser::Parser::parse(source);
     if !parse_result.errors.is_empty() {
@@ -1572,43 +2511,49 @@ fn typecheck_cxl(
     // qualified fields via `Expr::QualifiedFieldRef` (handled in
     // typecheck/pass.rs, not resolve).
     let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
-    let resolved =
-        cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
-            .map_err(|diags| {
-                Diagnostic::error(
-                    "E200",
-                    format!(
-                        "CXL name resolution failed in {node_name:?}: {}",
-                        diags
-                            .into_iter()
-                            .map(|d| d.message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                )
-            })?;
-    cxl::typecheck::type_check_with_mode(resolved, schema, mode).map_err(|diags| {
-        let errors: Vec<String> = diags
-            .iter()
-            .filter(|d| !d.is_warning)
-            .map(|d| d.message.clone())
-            .collect();
-        let joined = if errors.is_empty() {
-            diags
-                .into_iter()
-                .map(|d| d.message)
-                .collect::<Vec<_>>()
-                .join("; ")
-        } else {
-            errors.join("; ")
-        };
+    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
+        parse_result.ast,
+        &field_refs,
+        parse_result.node_count,
+        &std::collections::HashMap::new(),
+        scoped_vars,
+    )
+    .map_err(|diags| {
         Diagnostic::error(
             "E200",
-            format!("CXL type error in {node_name:?}: {joined}"),
+            format!(
+                "CXL name resolution failed in {node_name:?}: {}",
+                diags
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             LabeledSpan::primary(span, String::new()),
         )
-    })
+    })?;
+    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
+        .map_err(|diags| {
+            let errors: Vec<String> = diags
+                .iter()
+                .filter(|d| !d.is_warning)
+                .map(|d| d.message.clone())
+                .collect();
+            let joined = if errors.is_empty() {
+                diags
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                errors.join("; ")
+            };
+            Diagnostic::error(
+                "E200",
+                format!("CXL type error in {node_name:?}: {joined}"),
+                LabeledSpan::primary(span, String::new()),
+            )
+        })
 }
 
 /// Propagate an upstream row through a Transform node: start with all
@@ -1621,17 +2566,10 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit {
-            name,
-            expr,
-            is_meta,
-            ..
+            name, expr, target, ..
         } = stmt
         {
-            // Meta emits write to per-record metadata (`$meta.*`), not
-            // to the output row — skip them so the row/schema view
-            // downstream operators see only reflects user-visible data
-            // fields.
-            if *is_meta {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
@@ -1673,13 +2611,10 @@ fn propagate_aggregate(
     }
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit {
-            name,
-            expr,
-            is_meta,
-            ..
+            name, expr, target, ..
         } = stmt
         {
-            if *is_meta {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
@@ -1711,6 +2646,25 @@ fn propagate_aggregate(
         out.insert(
             QualifiedField::bare(format!("$ck.aggregate.{aggregate_name}").as_str()),
             Type::Int,
+        );
+    }
+    // Carry the `$widened` sidecar column through aggregation when the
+    // upstream row has it. The aggregator's `finalize_group_inner`
+    // initializes values to `Value::Null` for any slot not covered by
+    // group_by stamping or an emit, so the post-aggregate `$widened`
+    // is always `Value::Null` — the per-row map payload has no
+    // canonical reduction semantic, and unioning maps across N input
+    // rows would produce arbitrary key collisions. Users who need an
+    // unmapped field at the aggregate output should add it to
+    // `group_by` or emit it explicitly via an aggregate function.
+    // The slot itself stays on the schema (engine-stamped) so
+    // downstream `include_widened: true` projections, dispatch
+    // canonicalize invariants, and composition body propagation all
+    // see a stable column shape across the aggregate boundary.
+    if upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN) {
+        out.insert(
+            QualifiedField::bare(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN),
+            Type::Any,
         );
     }
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
@@ -1751,6 +2705,7 @@ fn bind_combine(
     diags: &mut Vec<Diagnostic>,
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) {
     // E300: combine requires at least 2 inputs.
     if header.input.len() < 2 {
@@ -1835,14 +2790,19 @@ fn bind_combine(
     let merged_row = Row::closed(merged_declared, cxl_span);
 
     // ── Where-clause typecheck ─────────────────────────────────────
-    let typed_where =
-        match typecheck_combine_where(name, config.where_expr.as_ref(), &merged_row, span) {
-            Ok(t) => Arc::new(t),
-            Err(mut new_diags) => {
-                diags.append(&mut new_diags);
-                return;
-            }
-        };
+    let typed_where = match typecheck_combine_where(
+        name,
+        config.where_expr.as_ref(),
+        &merged_row,
+        span,
+        scoped_vars,
+    ) {
+        Ok(t) => Arc::new(t),
+        Err(mut new_diags) => {
+            diags.append(&mut new_diags);
+            return;
+        }
+    };
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
     let e304_before = diags.iter().filter(|d| d.code == "E304").count();
@@ -1864,7 +2824,7 @@ fn bind_combine(
     // typed program needed by `cxl::eval::eval_expr` at runtime — no
     // re-typecheck per side, since equality sub-`Expr`s preserve their
     // NodeIds and the where-program's regex cache covers them.
-    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span) {
+    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span, scoped_vars) {
         Ok(d) => d,
         Err(type_diags) => {
             for td in type_diags {
@@ -2019,6 +2979,7 @@ fn bind_combine(
         &merged_row,
         AggregateMode::Row,
         span,
+        scoped_vars,
     ) {
         Ok(t) => t,
         Err(d) => {
@@ -2036,11 +2997,15 @@ fn bind_combine(
     // Transform (which has pass-through semantics), combine's output
     // row is defined entirely by its emits — zero emits means zero
     // output fields.
-    let has_emit = body_typed
-        .program
-        .statements
-        .iter()
-        .any(|s| matches!(s, Statement::Emit { is_meta: false, .. }));
+    let has_emit = body_typed.program.statements.iter().any(|s| {
+        matches!(
+            s,
+            Statement::Emit {
+                target: cxl::ast::EmitTarget::Field,
+                ..
+            }
+        )
+    });
     if !has_emit {
         diags.push(combine_e309(name, span));
     }
@@ -2240,6 +3205,7 @@ fn typecheck_combine_where(
     where_src: &str,
     merged_row: &Row,
     span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Vec<Diagnostic>> {
     let wrapped = format!("filter {where_src}");
     let parse_result = cxl::parser::Parser::parse(&wrapped);
@@ -2261,25 +3227,34 @@ fn typecheck_combine_where(
         .field_names()
         .map(|qf| qf.name.as_ref())
         .collect();
-    let resolved =
-        match cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
-        {
-            Ok(r) => r,
-            Err(rd) => {
-                let msg = rd
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(vec![Diagnostic::error(
-                    "E200",
-                    format!("combine {combine_name:?} where-clause name resolution: {msg}"),
-                    LabeledSpan::primary(span, String::new()),
-                )]);
-            }
-        };
+    let resolved = match cxl::resolve::resolve_program_with_modules_and_vars(
+        parse_result.ast,
+        &field_refs,
+        parse_result.node_count,
+        &std::collections::HashMap::new(),
+        scoped_vars,
+    ) {
+        Ok(r) => r,
+        Err(rd) => {
+            let msg = rd
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(vec![Diagnostic::error(
+                "E200",
+                format!("combine {combine_name:?} where-clause name resolution: {msg}"),
+                LabeledSpan::primary(span, String::new()),
+            )]);
+        }
+    };
 
-    match cxl::typecheck::type_check(resolved, merged_row) {
+    match cxl::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        merged_row,
+        cxl::typecheck::pass::AggregateMode::Row,
+        scoped_vars,
+    ) {
         Ok(typed) => Ok(typed),
         Err(type_diags) => {
             let mut out = Vec::new();
@@ -2535,8 +3510,10 @@ fn walk_for_unknown_refs(
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
-        | Expr::MetaAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -2613,9 +3590,6 @@ fn walk_statement_exprs(
 /// Unlike `propagate_row` (Transform), combine's output is a FRESH
 /// closed row — no pass-through of the merged row's qualified fields.
 /// Emit LHS names are always unqualified (`QualifiedField::bare`).
-/// Meta emits (`emit $meta.x = ...`) don't contribute to the output
-/// row schema; they write to per-record metadata, not the record
-/// itself.
 ///
 /// The driver's `$ck.<field>` shadow columns always land on the output
 /// row so the combined record carries the driver's frozen-identity
@@ -2652,13 +3626,10 @@ fn combine_output_row(
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for stmt in &typed.program.statements {
         if let Statement::Emit {
-            name,
-            expr,
-            is_meta,
-            ..
+            name, expr, target, ..
         } = stmt
         {
-            if *is_meta {
+            if !matches!(target, cxl::ast::EmitTarget::Field) {
                 continue;
             }
             let emit_type = typed
@@ -2671,9 +3642,29 @@ fn combine_output_row(
     }
     // Driver's engine-stamped tail always rides through. `widen_record_to_schema`
     // picks up the values from the driver record by name at runtime.
+    //
+    // Two driver-side engine-stamp shapes propagate:
+    //
+    // - `$ck.<field>` source-CK shadow columns. The driver carries the
+    //   authoritative correlation identity for the joined output; the
+    //   `widen_record_to_schema` name-lookup at runtime picks the
+    //   driver's CK value for the output's CK slot.
+    // - `$widened` `auto_widen` sidecar absorber. The driver's per-row
+    //   undeclared-fields map carries through to the output's
+    //   `$widened` slot. Build-side `$widened` is intentionally
+    //   dropped — build records' undeclared fields are passthrough
+    //   payload that the user did not ask the join to surface; users
+    //   who need a build-side unmapped field on the joined output
+    //   must declare it in the build source's `schema:` block (which
+    //   makes it referenceable via `<build_qualifier>.<field>` in the
+    //   combine body) or explicitly emit it via the body's CXL.
+    //   Mirrors `propagate_ck: Driver` (the default) which suppresses
+    //   build-side user-declared CK by the same rationale.
     if let Some(driver) = driver_row {
         for (qf, ty) in driver.fields() {
-            if qf.name.starts_with("$ck.") {
+            if qf.name.starts_with("$ck.")
+                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
+            {
                 let bare = QualifiedField::bare(qf.name.clone());
                 out.entry(bare).or_insert_with(|| ty.clone());
             }

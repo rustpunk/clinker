@@ -37,7 +37,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
 
@@ -110,7 +110,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
 
@@ -172,7 +172,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
 
@@ -245,7 +245,7 @@ nodes:
     path: out.csv
     type: csv
     if_exists: unique_suffix
-    include_unmapped: true
+    include_widened: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
 

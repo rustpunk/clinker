@@ -66,11 +66,9 @@ impl<W: Write> XmlWriter<W> {
         Ok(())
     }
 
-    /// Collect schema fields as (name, value) pairs, then write them as
-    /// nested XML elements. Metadata (`$meta.*`) is stripped from the
-    /// default output; the Output-node `include_metadata` flag is the
-    /// opt-in for layers that want to surface it. Engine-stamped
-    /// columns follow the same rule via `include_engine_stamped`.
+    /// Collects schema fields as (name, value) pairs, then writes them as
+    /// nested XML elements. Engine-stamped columns are stripped from the
+    /// default output; callers opt in via `include_engine_stamped`.
     fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
         let fields: Vec<(&str, &Value)> = if self.config.include_engine_stamped {
             record.iter_all_fields().collect()
@@ -78,7 +76,7 @@ impl<W: Write> XmlWriter<W> {
             record.iter_user_fields().collect()
         };
 
-        let tree = build_field_tree(&fields, self.config.preserve_nulls);
+        let tree = build_field_tree(&fields, self.config.preserve_nulls)?;
         self.write_field_tree(&tree)?;
 
         Ok(())
@@ -173,18 +171,26 @@ enum FieldNode {
 /// Build a tree from dotted field names. Fields with shared prefixes
 /// are grouped under a single parent branch.
 /// E.g., `Address.City` and `Address.State` → Branch("Address", [Leaf("City"), Leaf("State")])
-fn build_field_tree(fields: &[(&str, &Value)], preserve_nulls: bool) -> Vec<FieldNode> {
+///
+/// Returns `FormatError::UnserializableMapValue` if any field carries
+/// a `Value::Map` payload — XML elements have no canonical scalar
+/// serialization for a map, and `value_to_text` raises from the Map
+/// arm directly.
+fn build_field_tree(
+    fields: &[(&str, &Value)],
+    preserve_nulls: bool,
+) -> Result<Vec<FieldNode>, FormatError> {
     let mut roots: Vec<FieldNode> = Vec::new();
 
     for &(name, val) in fields {
         if val.is_null() && !preserve_nulls {
             continue;
         }
-        let text = value_to_text(val);
+        let text = value_to_text(name, val)?;
         insert_field(&mut roots, name, &text);
     }
 
-    roots
+    Ok(roots)
 }
 
 /// Insert a dotted field name into the tree, creating branches as needed.
@@ -213,8 +219,19 @@ fn insert_field(nodes: &mut Vec<FieldNode>, path: &str, text: &str) {
 }
 
 /// Convert a clinker Value to XML text content.
-fn value_to_text(val: &Value) -> String {
-    match val {
+///
+/// `Value::Map` has no canonical scalar serialization for an XML
+/// element body (silently JSON-encoding hides routing bugs — e.g. a
+/// `$widened` sidecar reaching the writer without
+/// `include_widened: true` expansion), so this returns
+/// `FormatError::UnserializableMapValue` carrying the offending
+/// column. XML is the single point of truth for map rejection on
+/// this path; there is no upstream pre-walk.
+///
+/// Array elements that themselves contain a `Value::Map` propagate
+/// the same rejection (the array is joined element-wise).
+fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
+    Ok(match val {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
@@ -222,9 +239,18 @@ fn value_to_text(val: &Value) -> String {
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.to_string(),
         Value::DateTime(dt) => dt.to_string(),
-        Value::Array(arr) => arr.iter().map(value_to_text).collect::<Vec<_>>().join(","),
-        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
-    }
+        Value::Array(arr) => arr
+            .iter()
+            .map(|v| value_to_text(col, v))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(","),
+        Value::Map(_) => {
+            return Err(FormatError::UnserializableMapValue {
+                format: "XML",
+                column: col.to_string(),
+            });
+        }
+    })
 }
 
 #[cfg(test)]
@@ -424,27 +450,29 @@ mod tests {
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
     }
 
-    /// Default XML writer output contains only schema columns; metadata
-    /// stays in `$meta.*` unless a higher layer opts in via
-    /// `include_metadata: true` (which route-rewrites the Record
-    /// upstream of the writer).
+    /// XML writer rejects `Value::Map` payloads with
+    /// `FormatError::UnserializableMapValue`. The pre-walk in
+    /// `write_fields` catches the misroute before the value-to-text
+    /// function silently JSON-encodes the map inside an element.
     #[test]
-    fn test_xml_writer_emits_schema_fields_only() {
-        let schema = test_schema();
-        let mut record = make_record(&schema, "Alice", 30);
-        record
-            .set_meta("audit", Value::String("flagged".into()))
-            .unwrap();
-        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
-        assert!(output.contains("<name>Alice</name>"));
-        assert!(output.contains("<age>30</age>"));
-        assert!(
-            !output.contains("audit"),
-            "default writer must strip metadata; got: {output}"
+    fn test_xml_writer_rejects_map_value() {
+        use indexmap::IndexMap;
+        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
+        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
         );
-        assert!(
-            !output.contains("flagged"),
-            "default writer must strip metadata values; got: {output}"
-        );
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "XML");
+                assert_eq!(column, "payload");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
     }
 }

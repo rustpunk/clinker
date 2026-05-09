@@ -864,6 +864,7 @@ dependencies = [
  "clinker-record",
  "criterion",
  "csv",
+ "indexmap",
  "miette",
  "quick-xml 0.37.5",
  "serde",

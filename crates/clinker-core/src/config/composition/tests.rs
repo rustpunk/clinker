@@ -25,6 +25,7 @@ fn dummy_signature(name: &str) -> CompositionSignature {
         outputs: IndexMap::new(),
         config_schema: IndexMap::new(),
         resources_schema: IndexMap::new(),
+        scoped_vars_schema: Default::default(),
         source_path: PathBuf::from(format!("{name}.comp.yaml")),
         source_spans: IndexMap::new(),
     }

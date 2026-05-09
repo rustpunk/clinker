@@ -29,12 +29,7 @@ mod tests {
             Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
         )]);
 
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| config::convert_pipeline_vars(v))
-            .unwrap_or_default();
+        let pipeline_vars = indexmap::IndexMap::new();
         let params = PipelineRunParams {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
@@ -112,7 +107,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "name,age\nAlice,30\nBob,25\n";
         let result = run_pipeline(yaml, csv);
@@ -163,7 +158,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -201,7 +196,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -247,7 +242,7 @@ nodes:
     name: transformed
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
     exclude:
     - internal_id
     mapping:
@@ -295,7 +290,7 @@ nodes:
         // Verify unmapped fields are present
         assert!(
             output.contains("first_name"),
-            "include_unmapped should pass through"
+            "include_widened should pass through"
         );
 
         // Parse output as CSV to verify structure
@@ -756,7 +751,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
         let csv = "name,amount\nAlice,10\nBob,bad\nCharlie,5\n";
         let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();

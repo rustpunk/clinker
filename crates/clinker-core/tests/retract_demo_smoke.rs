@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -142,12 +142,7 @@ fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Strin
     let params = PipelineRunParams {
         execution_id: "retract-demo-smoke".to_string(),
         batch_id: "smoke-001".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(clinker_core::config::convert_pipeline_vars)
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
 

@@ -351,6 +351,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "merge",
                             "combine",
                             "output",
+                            "state",
                             "composition",
                         ],
                     )),
@@ -627,6 +628,23 @@ impl PipelineNode {
         }
     }
 
+    /// Name of the upstream consumer-side input, when the variant has
+    /// exactly one. Returns `None` for `Source` (no input), `Merge`
+    /// and `Combine` (multiple inputs — caller must walk them
+    /// individually).
+    pub fn input_node_name(&self) -> Option<&str> {
+        match self {
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
+            PipelineNode::Source { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Combine { .. } => None,
+        }
+    }
+
     /// String tag of the variant for display.
     pub fn type_tag(&self) -> &'static str {
         match self {
@@ -670,6 +688,13 @@ pub struct SourceBody {
     /// source has no CK and DLQs per-record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_key: Option<crate::config::CorrelationKey>,
+    /// Policy for fields the reader discovers in input records that
+    /// the declared `schema:` does not name. Default `auto_widen` with
+    /// `probe_records: 1024`, `max_widened_fields: 256`,
+    /// `on_late_unmapped: drop`. See [`OnUnmapped`] for the design
+    /// rationale and citations.
+    #[serde(default)]
+    pub on_unmapped: OnUnmapped,
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
 }
@@ -699,6 +724,71 @@ pub struct ColumnDecl {
     pub ty: cxl::typecheck::Type,
 }
 
+/// Policy for fields a reader discovers in an input record that the
+/// declared `schema:` does not name.
+///
+/// - **`auto_widen`** (default): per-Source sidecar absorber column
+///   `$widened` is appended to the source's plan-time schema (engine-
+///   stamped, so the typechecker is blind to its contents — CXL
+///   expressions cannot read or write it). Each input record's keys
+///   that are not in the declaration land in a `Value::Map` payload
+///   on that slot. The Output node opts the contents back into
+///   top-level columns via `include_widened: true`. Pattern precedent:
+///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
+///   column for unmatched fields) and ClickHouse's `JSON` data type
+///   (single typed column absorbing arbitrary structure).
+/// - **`drop`**: silently strip undeclared fields at read time.
+///   Matches Snowflake's `MATCH_BY_COLUMN_NAME` with
+///   `ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE` and dbt's
+///   `on_schema_change=ignore`.
+/// - **`reject`**: fail the source on the first record carrying an
+///   undeclared field. Strict; matches dlt's `freeze` mode and
+///   Iceberg's column-ID-mismatch behavior.
+///
+/// YAML accepts the discriminated form. Omission of the field uses
+/// `Default::default()` — `auto_widen`. The sidecar absorber design
+/// avoids the silent-loss bug class documented across the schema-
+/// drift literature (Polars #23190, Spark `mergeSchema`, Auto Loader
+/// `_rescued_data` introduction): the runtime view never drifts from
+/// the planner view because the planner already accounts for the
+/// `$widened` slot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum OnUnmapped {
+    /// Sidecar absorber. Plan-time schema gains a `$widened` engine-
+    /// stamped column carrying `Value::Map` of undeclared input
+    /// fields per record.
+    #[default]
+    AutoWiden,
+    /// Fail the source on any undeclared field. Use when input shape is
+    /// a hard contract (regulated data, partner integration with a
+    /// frozen schema).
+    Reject,
+    /// Silently strip undeclared fields at read time. Fields not in the
+    /// declared schema do not reach the record.
+    Drop,
+}
+
+impl OnUnmapped {
+    /// Stable identifier for diagnostics and metrics.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            OnUnmapped::AutoWiden => "auto_widen",
+            OnUnmapped::Reject => "reject",
+            OnUnmapped::Drop => "drop",
+        }
+    }
+
+    /// Whether this mode reserves the `$widened` sidecar slot on the
+    /// source's plan-time schema. Only `AutoWiden` does.
+    pub fn reserves_widened_sidecar(&self) -> bool {
+        matches!(self, OnUnmapped::AutoWiden)
+    }
+}
+
+/// Stable column name for the `auto_widen` sidecar absorber slot.
+pub const WIDENED_SIDECAR_COLUMN: &str = "$widened";
+
 /// Transform variant body. The new shape: a mandatory `cxl:` field
 /// carrying the CXL source as a `CxlSource` (so it captures its YAML
 /// span where serde-saphyr can deliver one), plus the row-level
@@ -719,6 +809,38 @@ pub struct TransformBody {
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,
+    /// Producer-declared scoped variables this transform writes. Each
+    /// entry's `name` becomes addressable downstream as
+    /// `$<scope>.<name>`. The transform's CXL writes via
+    /// `emit $<scope>.<name> = <expr>`. Empty list means the transform
+    /// writes no scoped vars.
+    #[serde(default)]
+    pub declares: Vec<DeclareEntry>,
+    /// `phase: init` runs the transform (and its transitive ancestors)
+    /// to completion before any runtime-phase node sees a record. Used
+    /// for pre-runtime population of `$pipeline.*` / `$source.*`
+    /// values from a config source. Default is `Runtime`.
+    #[serde(default)]
+    pub phase: Phase,
+}
+
+/// One declaration of a producer-written scoped variable.
+///
+/// Lives on a Transform's `config.declares:` list. Each entry names a
+/// scoped variable the transform's CXL writes via
+/// `emit $<scope>.<name> = ...`, with the type the registry will hold
+/// and an optional default for reads that fire before the writer
+/// (typical case: an init-phase reader of a value the runtime walk
+/// hasn't reached yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclareEntry {
+    pub name: String,
+    pub scope: VarScope,
+    #[serde(rename = "type")]
+    pub var_type: crate::config::ScopedVarType,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
 }
 
 /// Miss handling for combine: how a driver record with no matching
@@ -871,6 +993,33 @@ pub struct CombineBody {
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
+}
+
+/// The scope a Transform's `declares:` entry writes to. Each scope is
+/// addressable via its own CXL read namespace (`$pipeline.<key>` /
+/// `$source.<key>` / `$record.<key>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VarScope {
+    Pipeline,
+    Source,
+    Record,
+}
+
+/// When a `state` node runs.
+///
+/// `Runtime` (default) interleaves with the rest of the DAG —
+/// per-record evaluation. `Init` collects the transitive ancestor
+/// sub-DAG and runs it to completion before any runtime-phase node
+/// sees a record (Beam side-input / Vector enrichment-table
+/// precedent). The executor partitions the topo order into init-only
+/// and runtime-only sub-DAGs and walks each pass to completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Runtime,
+    Init,
 }
 
 // ---------------------------------------------------------------------

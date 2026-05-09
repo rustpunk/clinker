@@ -56,9 +56,13 @@ nodes:
     let row = plan
         .typed_output_row("source1")
         .expect("source1 must have a bound row");
-    assert_eq!(row.field_count(), 2);
+    // Schema includes the user-declared `a` + `b` plus the
+    // `$widened` engine-stamped sidecar column (auto_widen is the
+    // default `OnUnmapped` policy).
+    assert_eq!(row.field_count(), 3);
     assert!(row.has_field("a"), "expected column 'a'");
     assert!(row.has_field("b"), "expected column 'b'");
+    assert!(row.has_field("$widened"), "expected $widened sidecar");
     assert_eq!(
         row.tail,
         cxl::typecheck::row::RowTail::Closed,
@@ -224,9 +228,12 @@ nodes:
 "#;
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
-    assert_eq!(schema.column_count(), 2);
+    // User-declared columns + `$widened` engine-stamped sidecar
+    // (auto_widen is the default `OnUnmapped` policy).
+    assert_eq!(schema.column_count(), 3);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
+    assert_eq!(&*schema.columns()[2], "$widened");
     assert!(
         schema.field_metadata_by_name("employee_id").is_none(),
         "user-declared column must not carry engine-stamp metadata"
@@ -234,6 +241,10 @@ nodes:
     assert!(
         !schema.contains("$ck.employee_id"),
         "absent correlation_key must produce no shadow column"
+    );
+    assert!(
+        schema.field_metadata_by_name("$widened").is_some(),
+        "$widened sidecar must carry engine-stamp metadata"
     );
 }
 
@@ -269,17 +280,18 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
-    // User-declared columns stay at their declared positions.
-    assert_eq!(schema.column_count(), 3);
+    // User-declared columns stay at their declared positions, then
+    // engine-stamped tail: `$ck.<field>` shadow columns first, then
+    // the `$widened` sidecar (auto_widen default).
+    assert_eq!(schema.column_count(), 4);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
-
-    // Shadow column tail-appended.
     assert_eq!(
         &*schema.columns()[2],
         "$ck.employee_id",
-        "shadow column must sit at schema tail (Spark `_metadata` shape)"
+        "CK shadow column tail-appended before sidecar"
     );
+    assert_eq!(&*schema.columns()[3], "$widened");
     assert_eq!(schema.index("$ck.employee_id"), Some(2));
 
     // Engine-stamp metadata points back at the user-declared field.
@@ -331,10 +343,12 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
-    assert_eq!(schema.column_count(), 5);
-    // Tail-append order matches `correlation_key.fields()` order.
+    // 3 declared + 2 `$ck.*` shadows + `$widened` sidecar = 6 columns.
+    assert_eq!(schema.column_count(), 6);
+    // Tail-append order matches `correlation_key.fields()` order, then sidecar.
     assert_eq!(&*schema.columns()[3], "$ck.tenant");
     assert_eq!(&*schema.columns()[4], "$ck.employee_id");
+    assert_eq!(&*schema.columns()[5], "$widened");
 
     assert_eq!(
         source_correlation_field(schema.field_metadata_by_name("$ck.tenant")),
@@ -402,6 +416,147 @@ nodes:
         source_correlation_field(tx_schema.field_metadata_by_name("$ck.id")),
         Some("id"),
         "engine-stamp metadata must travel with the column through the DAG"
+    );
+}
+
+/// E315 — Merge inputs disagreeing on `$widened` sidecar presence
+/// (one source on `auto_widen`, another on `drop`) fail compile with
+/// a focused diagnostic naming both groups of inputs and pointing at
+/// the per-source `on_unmapped` knob. Without this pre-check the
+/// dispatcher would raise E314 SchemaMismatch at runtime with a
+/// column-list dump that doesn't name the policy mismatch.
+#[test]
+fn test_merge_mixed_on_unmapped_policy_emits_e315() {
+    let yaml = r#"
+pipeline:
+  name: merge-mixed
+nodes:
+  - type: source
+    name: src_widen
+    config:
+      name: src_widen
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: src_drop
+    config:
+      name: src_drop
+      type: csv
+      path: b.csv
+      on_unmapped:
+        mode: drop
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: merged
+    inputs: [src_widen, src_drop]
+  - type: output
+    name: out
+    input: merged
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("E315 must reject merge of disagreeing on_unmapped policies");
+    let e315 = diags.iter().find(|d| d.code == "E315").unwrap_or_else(|| {
+        panic!(
+            "E315 must be present; got: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        e315.message.contains("src_widen") && e315.message.contains("src_drop"),
+        "E315 must name both disagreeing inputs; got: {}",
+        e315.message
+    );
+    assert!(
+        e315.message.contains("$widened") || e315.message.contains("auto_widen"),
+        "E315 must mention the sidecar / policy; got: {}",
+        e315.message
+    );
+}
+
+/// `$widened` propagates through an Aggregate node. The aggregate
+/// reduces N input rows to one output row per group; each input row's
+/// `$widened` map payload has no canonical reduction, so the
+/// aggregate's output `$widened` slot is `Value::Null` (an empty
+/// sidecar). The slot itself must remain on the output schema —
+/// dropping it would break the dispatch canonicalize invariant for
+/// any downstream consumer that expects the upstream's engine-stamped
+/// tail (composition-body port-source schemas, deferred-region
+/// buffer-key extraction) and would surface as an E314 SchemaMismatch.
+#[test]
+fn test_widened_sidecar_propagates_through_aggregate_as_null() {
+    use clinker_record::FieldMetadata;
+    let yaml = r#"
+pipeline:
+  name: agg-widen
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/a.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: salary, type: int }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by:
+        - dept
+      cxl: "emit total = sum(salary)"
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile_yaml(yaml);
+    let agg_row = plan
+        .typed_output_row("agg")
+        .expect("aggregate must have a bound row");
+    assert!(
+        agg_row.has_field("$widened"),
+        "aggregate's bound row must include `$widened` when the upstream source's auto_widen \
+         policy reserves the sidecar slot — dropping it breaks composition body propagation \
+         and the dispatch canonicalize invariant for downstream Output nodes"
+    );
+
+    // The PlanNode::Aggregation's lowered output_schema must carry the
+    // `WidenedSidecar` metadata so the Output's projection-fast-path
+    // and `iter_user_fields` filter agree on which column is the
+    // sidecar.
+    let agg_node = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find(|n| matches!(n, PlanNode::Aggregation { name, .. } if name == "agg"))
+        .expect("aggregate node");
+    let agg_schema = match agg_node {
+        PlanNode::Aggregation { output_schema, .. } => output_schema,
+        _ => unreachable!(),
+    };
+    assert!(
+        agg_schema.contains("$widened"),
+        "aggregate's PlanNode output_schema must list `$widened`"
+    );
+    assert!(
+        matches!(
+            agg_schema.field_metadata_by_name("$widened"),
+            Some(FieldMetadata::WidenedSidecar)
+        ),
+        "aggregate's `$widened` slot must carry WidenedSidecar engine-stamp metadata"
     );
 }
 

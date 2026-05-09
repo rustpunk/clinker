@@ -49,6 +49,14 @@ impl<'de> Deserialize<'de> for NodeInput {
     }
 }
 
+impl NodeInput {
+    pub fn name(&self) -> &str {
+        match self {
+            NodeInput::Single(name) | NodeInput::Port { node: name, .. } => name,
+        }
+    }
+}
+
 fn parse_node_input(s: &str) -> Result<NodeInput, String> {
     if s.is_empty() {
         return Err("empty input ref".to_string());

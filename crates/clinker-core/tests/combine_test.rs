@@ -24,7 +24,7 @@ mod tests {
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use std::collections::HashMap;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     /// Verifies the test module compiles and is discovered by cargo test.
     #[test]
@@ -168,6 +168,7 @@ mod tests {
             &ctx,
             &symbol_table,
             std::path::Path::new(""),
+            Default::default(),
         );
         (artifacts, diags)
     }
@@ -579,8 +580,9 @@ mod tests {
             .expect("collected publishes a bound output row");
 
         // Driver = orders (default first-in-IndexMap, no `drive:` hint).
-        // Driver fields: order_id, product_id, amount. Plus auto-added
-        // `products` field of Type::Array.
+        // Driver fields: order_id, product_id, amount, plus the
+        // `$widened` engine-stamped sidecar (auto_widen default).
+        // Then the auto-added `products` field of Type::Array.
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
         assert_eq!(
             names,
@@ -588,6 +590,7 @@ mod tests {
                 "order_id".to_string(),
                 "product_id".to_string(),
                 "amount".to_string(),
+                "$widened".to_string(),
                 "products".to_string(),
             ],
             "auto-derived row = driver fields + (build_qualifier: Array)"
@@ -750,6 +753,45 @@ mod tests {
     // `artifacts.typed[name]`.
 
     /// Emit statements publish an output row whose declared field
+    /// Combine drops build-side `$widened` from the output Row by
+    /// design. Both sources have `auto_widen` (the engine-wide
+    /// default), so each carries its own `$widened` sidecar; the
+    /// joined output retains the driver's sidecar (via the
+    /// unconditional driver-engine-stamp loop in `combine_output_row`)
+    /// and discards every build-side `$widened`. Build-side
+    /// undeclared fields are passthrough payload that the user did
+    /// not ask the join to surface — explicitly emitting
+    /// `<build_qualifier>.<field>` in the body is the supported way
+    /// to lift a build-side unmapped value into the joined output.
+    /// Mirrors `propagate_ck: Driver` (the default) for user-declared
+    /// CK by the same rationale.
+    ///
+    /// The output row therefore lists exactly one `$widened` slot
+    /// (the driver's) — never two, never a renamed `<qualifier>.$widened`
+    /// pair. Verified here by inspecting `field_names()` for any
+    /// occurrence of `$widened` and asserting the count is exactly 1.
+    #[test]
+    fn test_combine_drops_build_side_widened_sidecar() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let row = artifacts
+            .typed
+            .get("enriched")
+            .map(|tp| &tp.output_row)
+            .expect("enriched publishes a bound output row");
+        let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        let widened_count = names.iter().filter(|n| n.as_str() == "$widened").count();
+        assert_eq!(
+            widened_count, 1,
+            "combine output row must list `$widened` exactly once (driver-only); \
+             build-side sidecar must be dropped. names = {names:?}"
+        );
+    }
+
     /// names (bare) are exactly the LHS emit names in source order.
     /// Also asserts `artifacts.typed[name]` is populated with the
     /// body TypedProgram.
@@ -761,6 +803,11 @@ mod tests {
             "two_input_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
+        // Driver source `orders` carries the `$widened` engine-stamped
+        // sidecar (auto_widen is the default `OnUnmapped` policy), so
+        // the combine's output row inherits it. Build-side `$widened`
+        // is intentionally dropped — see the rustdoc on
+        // `combine_output_row` in `bind_schema.rs`.
         assert_output_row(
             &artifacts,
             "enriched",
@@ -770,6 +817,7 @@ mod tests {
                 "product_name",
                 "category",
                 "amount",
+                "$widened",
             ],
         );
         assert!(
@@ -2089,13 +2137,7 @@ nodes:
             .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
             .collect();
 
-        let pipeline_vars = plan
-            .config()
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| clinker_core::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
+        let pipeline_vars = indexmap::IndexMap::new();
         let params = PipelineRunParams {
             execution_id: "combine-test-exec".to_string(),
             batch_id: "combine-test-batch".to_string(),
@@ -2688,7 +2730,7 @@ nodes:
       name: fulfilled_orders
       type: csv
       path: fulfilled_orders.csv
-      include_unmapped: true
+      include_widened: true
   - type: output
     name: priority_report
     input: priority_split
@@ -2696,7 +2738,7 @@ nodes:
       name: priority_report
       type: csv
       path: priority_report.csv
-      include_unmapped: true
+      include_widened: true
 "#
     }
 
@@ -2763,7 +2805,7 @@ nodes:
       name: high_priority_out
       type: csv
       path: high_priority_out.csv
-      include_unmapped: true
+      include_widened: true
   - type: output
     name: standard_out
     input: priority_split
@@ -2771,7 +2813,7 @@ nodes:
       name: standard_out
       type: csv
       path: standard_out.csv
-      include_unmapped: true
+      include_widened: true
 "#
     }
 
@@ -3212,7 +3254,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
@@ -3285,7 +3327,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_empty.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         // ORD-1's product_id is PROD-X — no matching build row.
         let orders = "order_id,product_id,amount\nORD-1,PROD-X,10\n";
@@ -3357,7 +3399,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_cap.csv
-      include_unmapped: true
+      include_widened: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let mut products = String::from("product_id,name,category\n");

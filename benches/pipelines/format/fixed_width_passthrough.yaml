@@ -44,4 +44,4 @@ nodes:
           - name: f1
             type: string
             width: 10
-      include_unmapped: true
+      include_widened: true

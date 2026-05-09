@@ -1,8 +1,37 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::{NaiveDateTime, Utc};
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
+
+/// Shared, lock-protected store for `$pipeline.<key>` runtime values.
+///
+/// Values arrive from two sources:
+/// 1. **Init-time defaults** — populated from `PipelineMeta.vars.pipeline.*`
+///    declarations at pipeline start and pre-runtime State
+///    nodes marked `phase: init`.
+/// 2. **Runtime writes** — emitted by Phase D's `state` node arm,
+///    one write per record (last-write-wins per the locked design
+///    decision).
+///
+/// `Arc<RwLock<...>>` keeps the read fast path lock-free for everyone
+/// holding the `Arc` while still allowing `state` nodes to mutate
+/// without `&mut StableEvalContext`. The RwLock contention cost on the
+/// hot read path (every `$pipeline.<key>` resolve) is small relative
+/// to the surrounding CXL eval; revisit if a profile says otherwise.
+pub type PipelineVarStore = Arc<RwLock<IndexMap<String, Value>>>;
+
+/// Shared, lock-protected store for `$source.<key>` runtime values,
+/// keyed by per-record `source_file` `Arc<str>`.
+///
+/// Source-scope is "stays constant for all records of one source" —
+/// for single-file Sources this is one slot; for multi-file Sources
+/// (`glob:` / `paths:`) each file gets its own slot, which is a
+/// tighter (safer) semantics than per-Source-node-name. The Arc-keyed
+/// design composes cleanly with the executor's existing per-record
+/// `source_file` threading without introducing a path →
+/// source-node-name mapping.
+pub type SourceVarStore = Arc<RwLock<std::collections::HashMap<Arc<str>, IndexMap<String, Value>>>>;
 
 /// Injectable clock for testability. Production uses WallClock; tests use FixedClock.
 pub trait Clock: Send + Sync {
@@ -51,8 +80,28 @@ pub struct StableEvalContext {
     pub pipeline_batch_id: Arc<str>,
     /// pipeline.total_count / ok_count / dlq_count.
     pub pipeline_counters: PipelineCounters,
-    /// pipeline.vars.* — user-defined constants from YAML config.
-    pub pipeline_vars: Arc<IndexMap<String, Value>>,
+    /// pipeline.vars.* — user-declared variables. Holds init-time
+    /// defaults plus any runtime writes from `state` nodes.
+    /// See [`PipelineVarStore`] for locking rationale.
+    pub pipeline_vars: PipelineVarStore,
+    /// source.vars.<key> — per-source-file user-declared variables,
+    /// written by `state` nodes with `scope: source`. The
+    /// outer `HashMap` keys by per-record `source_file` Arc; the inner
+    /// `IndexMap` mirrors the [`PipelineVarStore`] shape.
+    pub source_vars: SourceVarStore,
+    /// Plan-time map from Merge/Combine input-name to the source-file
+    /// `Arc<str>`s of the upstream Source(s) reachable from that input.
+    /// Used by [`Expr::QualifiedSourceAccess`] eval to look
+    /// up the right `source_vars` entry for `$source.<input_name>.<key>`
+    /// reads. Empty for non-pipeline contexts.
+    pub source_input_arcs: Arc<std::collections::HashMap<String, Vec<Arc<str>>>>,
+    /// Static configuration knobs read via `$vars.<key>`. Built from
+    /// the pipeline's top-level `vars:` block (channel overrides
+    /// applied) and frozen for the pipeline run. Distinct from
+    /// `pipeline_vars` (which holds producer-written `$pipeline.*`
+    /// state); `static_vars` is the immutable configuration surface
+    /// channels override.
+    pub static_vars: Arc<IndexMap<String, Value>>,
 }
 
 impl StableEvalContext {
@@ -70,7 +119,48 @@ impl StableEvalContext {
             "dlq_count" => Some(Value::Integer(self.pipeline_counters.dlq_count as i64)),
             "filtered_count" => Some(Value::Integer(self.pipeline_counters.filtered_count as i64)),
             "distinct_count" => Some(Value::Integer(self.pipeline_counters.distinct_count as i64)),
-            _ => self.pipeline_vars.get(member).cloned(),
+            _ => self
+                .pipeline_vars
+                .read()
+                .ok()
+                .and_then(|map| map.get(member).cloned()),
+        }
+    }
+
+    /// Write a value into the pipeline-scope runtime registry.
+    ///
+    /// Called by the executor's `state` node arm. Reads via
+    /// [`Self::resolve_pipeline_stable`] observe the new value
+    /// immediately; the locking discipline matches a Rust `RwLock` —
+    /// concurrent readers and a single writer per moment, with no
+    /// guarantee of FIFO ordering between competing writers.
+    pub fn set_pipeline_var(&self, name: &str, value: Value) {
+        if let Ok(mut map) = self.pipeline_vars.write() {
+            map.insert(name.to_string(), value);
+        }
+    }
+
+    /// Resolve a `$source.<key>` user-declared value for the given
+    /// `source_file` Arc. Returns `None` if no `state` node has yet
+    /// written to that scope, or if the file has no entry at all
+    /// (lazy-allocated). Builtin `$source.*` members are handled by
+    /// [`EvalContext::resolve_source`]; this helper covers user-declared
+    /// keys only.
+    pub fn resolve_source_var(&self, source_file: &Arc<str>, member: &str) -> Option<Value> {
+        let map = self.source_vars.read().ok()?;
+        map.get(source_file)
+            .and_then(|inner| inner.get(member).cloned())
+    }
+
+    /// Write a `$source.<key>` value into the source-scope runtime
+    /// registry, keyed by the record's `source_file` Arc. Called by
+    /// the executor's `state` node arm. Lazily allocates
+    /// the per-file inner map on first write.
+    pub fn set_source_var(&self, source_file: &Arc<str>, name: &str, value: Value) {
+        if let Ok(mut map) = self.source_vars.write() {
+            map.entry(Arc::clone(source_file))
+                .or_default()
+                .insert(name.to_string(), value);
         }
     }
 
@@ -91,7 +181,10 @@ impl StableEvalContext {
             pipeline_execution_id: Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: Arc::from("test-batch-000"),
             pipeline_counters: PipelineCounters::default(),
-            pipeline_vars: Arc::new(IndexMap::new()),
+            pipeline_vars: Arc::new(RwLock::new(IndexMap::new())),
+            source_vars: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_input_arcs: Arc::new(std::collections::HashMap::new()),
+            static_vars: Arc::new(IndexMap::new()),
         }
     }
 }
@@ -129,6 +222,9 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Resolve a `$source.*` member — per-record / per-source provenance.
+    /// Falls through to the user-declared source-scope registry
+    /// (`$source.<custom>`) keyed by this record's `source_file` Arc
+    /// when the member name is not a builtin.
     pub fn resolve_source(&self, member: &str) -> Option<Value> {
         match member {
             "file" => Some(Value::String(self.source_file.to_string().into())),
@@ -137,7 +233,7 @@ impl<'a> EvalContext<'a> {
             "count" => Some(Value::Integer(self.source_count as i64)),
             "batch" => Some(Value::String(self.source_batch.to_string().into())),
             "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
-            _ => None,
+            other => self.stable.resolve_source_var(self.source_file, other),
         }
     }
 

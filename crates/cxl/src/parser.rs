@@ -343,8 +343,12 @@ impl Parser {
         let start = self.current_span();
         self.advance(); // consume 'emit'
 
-        // Check for `emit $meta.field = expr`
-        let (name, is_meta) = if *self.peek() == Token::Dollar {
+        // Detect `emit $<ns>.field = expr`. Allowed namespaces:
+        // - `meta`: per-record metadata sidecar (deleted in Stage 6).
+        // - `pipeline` / `source` / `record`: producer-declared scoped
+        //   state. The variable name must be declared in the
+        //   transform's `config.declares:` block; bind_schema enforces.
+        let (name, target) = if *self.peek() == Token::Dollar {
             self.advance(); // consume '$'
             let ns = self.expect_ident("system namespace after '$'")?;
             if ns == "ck" {
@@ -355,22 +359,39 @@ impl Parser {
                     "To override the user-visible value, write `emit <field_name> = ...` instead",
                 ));
             }
-            if ns != "meta" {
+            if ns == "vars" {
                 return Err(self.error(
-                    &format!(
-                        "emit ${}... is not valid; only emit $meta.field is allowed",
-                        ns
-                    ),
-                    "Only $meta fields can be set with emit",
-                    "Use: emit $meta.field_name = expr",
+                    "the `$vars` namespace is read-only static configuration \
+                     and cannot be assigned by `emit`",
+                    "$vars.* values are declared at the pipeline's top-level vars: block, \
+                     channel-overridable, and frozen at pipeline start",
+                    "Move computed values to `$pipeline.<key>` (declared via the producer's \
+                     `config.declares:` block) — those are writable.",
                 ));
             }
+            let target = match ns.as_str() {
+                "pipeline" => EmitTarget::Pipeline,
+                "source" => EmitTarget::Source,
+                "record" => EmitTarget::Record,
+                _ => {
+                    return Err(self.error(
+                        &format!(
+                            "emit ${}... is not valid; emit accepts $pipeline, $source, \
+                             or $record namespaces",
+                            ns
+                        ),
+                        "Only producer-declared scope namespaces are writable",
+                        "Use one of: emit name = expr, emit $pipeline.x = expr, \
+                         emit $source.x = expr, emit $record.x = expr",
+                    ));
+                }
+            };
             self.expect_token(&Token::Dot, "'.'")?;
-            let field = self.expect_ident("metadata field name")?;
-            (field, true)
+            let field = self.expect_ident("emit target name")?;
+            (field, target)
         } else {
             let field = self.expect_ident("output field name")?;
-            (field, false)
+            (field, EmitTarget::Field)
         };
 
         self.expect_token(&Token::Eq, "'='")?;
@@ -380,7 +401,7 @@ impl Parser {
             node_id: nid,
             name: name.into(),
             expr,
-            is_meta,
+            target,
             span: Span::new(start.start as usize, end.end as usize),
         })
     }
@@ -892,10 +913,11 @@ impl Parser {
                 })
             }
 
-            // $pipeline.field, $source.field, $window.fn(), $meta.field
+            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn()
             Token::Dollar => {
                 self.advance(); // consume '$'
-                let ns = self.expect_ident("system namespace (pipeline, source, window, meta)")?;
+                let ns =
+                    self.expect_ident("system namespace (pipeline, vars, source, record, window)")?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
                 match ns.as_str() {
@@ -909,11 +931,48 @@ impl Parser {
                             span: Span::new(start.start as usize, end.end as usize),
                         })
                     }
-                    "source" => {
+                    "vars" => {
                         let nid = self.alloc_id();
-                        let field = self.expect_ident("source property name")?;
+                        let key = self.expect_ident("vars key name")?;
                         let end = self.prev_span();
-                        Ok(Expr::SourceAccess {
+                        Ok(Expr::VarsAccess {
+                            node_id: nid,
+                            key: key.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    "source" => {
+                        let first = self.expect_ident("source property name")?;
+                        // peek for a qualified `.field` suffix so
+                        // `$source.<input_name>.<field>` parses as a
+                        // QualifiedSourceAccess. The plain `$source.<field>`
+                        // form remains a SourceAccess.
+                        if *self.peek() == Token::Dot {
+                            self.advance();
+                            let nid = self.alloc_id();
+                            let field = self.expect_ident("source property name")?;
+                            let end = self.prev_span();
+                            Ok(Expr::QualifiedSourceAccess {
+                                node_id: nid,
+                                input_name: first.into(),
+                                field: field.into(),
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        } else {
+                            let nid = self.alloc_id();
+                            let end = self.prev_span();
+                            Ok(Expr::SourceAccess {
+                                node_id: nid,
+                                field: first.into(),
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        }
+                    }
+                    "record" => {
+                        let nid = self.alloc_id();
+                        let field = self.expect_ident("record property name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::RecordAccess {
                             node_id: nid,
                             field: field.into(),
                             span: Span::new(start.start as usize, end.end as usize),
@@ -943,20 +1002,10 @@ impl Parser {
                             })
                         }
                     }
-                    "meta" => {
-                        let nid = self.alloc_id();
-                        let field = self.expect_ident("metadata field name")?;
-                        let end = self.prev_span();
-                        Ok(Expr::MetaAccess {
-                            node_id: nid,
-                            field: field.into(),
-                            span: Span::new(start.start as usize, end.end as usize),
-                        })
-                    }
                     other => Err(self.error(
                         &format!("unknown system namespace '${other}'"),
-                        "Valid system namespaces are: pipeline, source, window, meta",
-                        "Use $pipeline.field, $source.field, $window.fn(), or $meta.field",
+                        "Valid system namespaces are: pipeline, source, record, window",
+                        "Use $pipeline.field, $source.field, $record.field, or $window.fn()",
                     )),
                 }
             }
@@ -1317,14 +1366,133 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_emit_other_dollar_namespace_keeps_generic_message() {
+    fn test_parse_emit_pipeline_namespace_succeeds() {
+        // The variable-system redesign accepts producer-declared scope
+        // writes via `emit $pipeline.x = ...` (and $source / $record).
+        // Bind-schema rejects undeclared names; the parser accepts the
+        // syntax.
         let result = Parser::parse("emit $pipeline.x = 1");
+        assert!(
+            result.errors.is_empty(),
+            "emit $pipeline.x parses; bind-schema is the layer that \
+             rejects undeclared scope vars. Got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_parse_emit_unknown_namespace_rejected() {
+        let result = Parser::parse("emit $undeclared_namespace.x = 1");
         assert!(!result.errors.is_empty());
         let msg = &result.errors[0].message;
         assert!(
-            msg.contains("$pipeline") && msg.contains("only emit $meta"),
-            "non-$ck namespaces still hit the generic gate; got: {msg}",
+            msg.contains("$undeclared_namespace"),
+            "unknown $namespace.* should mention the offending namespace; got: {msg}",
         );
+    }
+
+    #[test]
+    fn test_parse_emit_vars_namespace_rejected_as_readonly() {
+        let result = Parser::parse("emit $vars.x = 1");
+        assert!(!result.errors.is_empty());
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$vars") && msg.contains("read-only"),
+            "$vars.* writes should be rejected as read-only; got: {msg}",
+        );
+    }
+
+    /// `$widened` is the engine-stamped sidecar absorber for the
+    /// `on_unmapped: auto_widen` policy. CXL has no syntax for
+    /// reading or writing it: the parser rejects `$widened.<key>`
+    /// in expression position via the catch-all "unknown system
+    /// namespace" path. The typechecker is blind to the sidecar's
+    /// keys; users who need an absorbed input field at output
+    /// time set `include_widened: true` on the Output node and the
+    /// projection layer expands the map to top-level columns.
+    #[test]
+    fn test_parse_rejects_widened_in_read_position() {
+        let result = Parser::parse("emit foo = $widened.bar");
+        assert!(
+            !result.errors.is_empty(),
+            "$widened.* in expression position must be rejected"
+        );
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("unknown system namespace"),
+            "diagnostic must explain it's an unknown namespace; got: {msg}"
+        );
+        assert!(
+            msg.contains("$widened"),
+            "diagnostic must name the offending namespace; got: {msg}"
+        );
+    }
+
+    /// `emit $widened.<key> = ...` is rejected by the emit-target
+    /// parser path. Different error surface than the read-side
+    /// (the emit parser maintains its own list of writable
+    /// namespaces — pipeline / source / record), but the rejection
+    /// must be unambiguous.
+    #[test]
+    fn test_parse_rejects_widened_in_emit_target() {
+        let result = Parser::parse("emit $widened.foo = 1");
+        assert!(
+            !result.errors.is_empty(),
+            "emit $widened.<key> = ... must be rejected"
+        );
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$widened") || msg.contains("widened"),
+            "diagnostic must name the offending namespace; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_emit_source_namespace_succeeds() {
+        let r = parse_ok("emit $source.batch = id");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "batch");
+                assert_eq!(*target, EmitTarget::Source);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_record_namespace_succeeds() {
+        let r = parse_ok("emit $record.score = amount * 2");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "score");
+                assert_eq!(*target, EmitTarget::Record);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_pipeline_target_tag() {
+        let r = parse_ok("emit $pipeline.last = amount");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "last");
+                assert_eq!(*target, EmitTarget::Pipeline);
+            }
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_field_default_target_tag() {
+        let r = parse_ok("emit total = a + b");
+        match first_stmt(&r) {
+            Statement::Emit { name, target, .. } => {
+                assert_eq!(&**name, "total");
+                assert_eq!(*target, EmitTarget::Field);
+            }
+            _ => panic!("expected Emit"),
+        }
     }
 
     #[test]
@@ -1600,6 +1768,21 @@ mod tests {
                 assert_eq!(&**field, "row");
             }
             _ => panic!("expected SourceAccess"),
+        }
+    }
+
+    #[test]
+    fn test_parse_qualified_source_access() {
+        let r = parse_ok("let x = $source.salesforce.batch_id");
+        let expr = let_expr(&r);
+        match expr {
+            Expr::QualifiedSourceAccess {
+                input_name, field, ..
+            } => {
+                assert_eq!(&**input_name, "salesforce");
+                assert_eq!(&**field, "batch_id");
+            }
+            other => panic!("expected QualifiedSourceAccess, got {other:?}"),
         }
     }
 

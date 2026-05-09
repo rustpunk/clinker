@@ -102,10 +102,10 @@ impl GraceSpillWriter {
 
     /// Append one record to the partition body.
     pub(crate) fn write_record(&mut self, record: &Record) -> std::io::Result<()> {
-        let meta = record.metadata_pairs();
+        let rv = record.record_var_pairs();
         let payload = RecordPayload {
             values: record.values().to_vec(),
-            metadata: if meta.is_empty() { None } else { Some(meta) },
+            record_vars: if rv.is_empty() { None } else { Some(rv) },
         };
         let bytes =
             postcard::to_stdvec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;

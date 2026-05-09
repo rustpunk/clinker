@@ -43,7 +43,7 @@ nodes:
       name: results
       type: csv
       path: ./output/customers.csv
-      include_unmapped: true
+      include_widened: true
 
 error_handling:
   strategy: fail_fast

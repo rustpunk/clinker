@@ -9,11 +9,11 @@
 //! composition call-site line.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 #[derive(Clone, Default)]
@@ -45,13 +45,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "composition-combine-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -101,7 +96,7 @@ fn run_pipeline_multi_source(
         &primary,
         readers,
         writers,
-        &test_params(&config),
+        &test_params(),
     )
     .expect("pipeline run");
     (report, buf.as_string())
@@ -153,7 +148,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();
@@ -218,7 +213,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let orders_csv = "order_id,product_id,quantity\n1,A,2\n";
     let products_csv = "product_id,name,price\nA,Widget,10.0\n";
@@ -299,7 +294,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let orders_csv = "order_id,product_id,quantity\n7,B,3\n";
     let products_csv = "product_id,name,price\nB,Gadget,5.0\n";
@@ -370,7 +365,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     // Driver row 1 matches two build rows (A → Widget, A → WidgetPro);
     // driver row 2 matches one build row (B → Gadget).
@@ -467,7 +462,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();

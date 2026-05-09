@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::levenshtein::best_match;
+use super::scoped_vars::ScopedVarsRegistry;
 use crate::ast::{Expr, MatchArm, NodeId, Program, Statement};
 use crate::lexer::Span;
 
@@ -94,6 +95,29 @@ pub fn resolve_program_with_modules(
     node_count: u32,
     module_exports: &HashMap<String, ModuleExports>,
 ) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
+    resolve_program_with_modules_and_vars(
+        program,
+        fields,
+        node_count,
+        module_exports,
+        &ScopedVarsRegistry::default(),
+    )
+}
+
+/// Run Phase B with module + scoped-vars awareness.
+///
+/// `scoped_vars` carries the pipeline's declared `$pipeline.<key>` /
+/// `$source.<key>` / `$record.<key>` registry. Empty registry preserves
+/// the pre-Phase-B behavior — only builtin members of each namespace
+/// resolve. Production call sites build the registry from
+/// `clinker_core::config::build_scoped_vars_registry`.
+pub fn resolve_program_with_modules_and_vars(
+    program: Program,
+    fields: &[&str],
+    node_count: u32,
+    module_exports: &HashMap<String, ModuleExports>,
+    scoped_vars: &ScopedVarsRegistry,
+) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
     let mut resolver = Resolver {
         fields,
         let_vars: Vec::new(),
@@ -102,6 +126,7 @@ pub fn resolve_program_with_modules(
         context: ResolveContext::Primary,
         module_aliases: HashMap::new(),
         module_exports,
+        scoped_vars,
     };
 
     for stmt in &program.statements {
@@ -129,6 +154,9 @@ struct Resolver<'a> {
     module_aliases: HashMap<String, String>,
     /// Available module exports, keyed by module path
     module_exports: &'a HashMap<String, ModuleExports>,
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$record.<key>`
+    /// registry consulted alongside the builtin member sets.
+    scoped_vars: &'a ScopedVarsRegistry,
 }
 
 impl<'a> Resolver<'a> {
@@ -250,13 +278,74 @@ impl<'a> Resolver<'a> {
                 field,
                 span,
             } => {
-                if PIPELINE_MEMBERS.contains(&&**field) {
+                let is_builtin = PIPELINE_MEMBERS.contains(&&**field);
+                let is_declared = self.scoped_vars.pipeline.contains_key(&**field);
+                if is_builtin || is_declared {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Pipeline, field)
+                    .is_some()
+                {
+                    // — composition body referenced a
+                    // parent-declared var that's NOT in the body's
+                    // `_compose.scoped_vars` opt-in schema. E173 makes the
+                    // sealing explicit instead of falling through to a
+                    // generic "unknown member" diagnostic.
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$pipeline.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.pipeline` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.pipeline` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
+                } else {
+                    let declared: Vec<&str> = self
+                        .scoped_vars
+                        .pipeline
+                        .keys()
+                        .map(|s| s.as_str())
+                        .collect();
+                    let candidates: Vec<&str> = PIPELINE_MEMBERS
+                        .iter()
+                        .copied()
+                        .chain(declared.iter().copied())
+                        .collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown pipeline member '$pipeline.{field}'"),
+                        help: best_match(field, &candidates, 3)
+                            .map(|s| format!("did you mean '$pipeline.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.pipeline` block".into())
+                            }),
+                    });
+                }
+            }
+            Expr::VarsAccess { node_id, key, span } => {
+                if self.scoped_vars.static_vars.contains_key(&**key) {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
                 } else {
-                    // Could be a user-defined pipeline.vars.* variable
-                    // For now, accept anything under pipeline.* and let runtime resolve
-                    self.bind(*node_id, ResolvedBinding::PipelineMember);
-                    let _ = span;
+                    let declared: Vec<&str> = self
+                        .scoped_vars
+                        .static_vars
+                        .keys()
+                        .map(|s| s.as_str())
+                        .collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown vars key '$vars.{key}'"),
+                        help: best_match(key, &declared, 3)
+                            .map(|s| format!("did you mean '$vars.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline's top-level `vars:` block".into())
+                            }),
+                    });
                 }
             }
             Expr::SourceAccess {
@@ -264,20 +353,116 @@ impl<'a> Resolver<'a> {
                 field,
                 span,
             } => {
-                if SOURCE_MEMBERS.contains(&&**field) {
+                let is_builtin = SOURCE_MEMBERS.contains(&&**field);
+                let is_declared = self.scoped_vars.source.contains_key(&**field);
+                if is_builtin || is_declared {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Source, field)
+                    .is_some()
+                {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$source.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.source` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.source` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
                 } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.source.keys().map(|s| s.as_str()).collect();
+                    let candidates: Vec<&str> = SOURCE_MEMBERS
+                        .iter()
+                        .copied()
+                        .chain(declared.iter().copied())
+                        .collect();
                     self.diagnostics.push(ResolveDiagnostic {
                         span: *span,
                         message: format!("unknown source member '$source.{field}'"),
-                        help: best_match(field, SOURCE_MEMBERS, 3)
-                            .map(|s| format!("did you mean '$source.{s}'?")),
+                        help: best_match(field, &candidates, 3)
+                            .map(|s| format!("did you mean '$source.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.source` block".into())
+                            }),
                     });
                 }
             }
-            Expr::MetaAccess { node_id, .. } => {
-                // Metadata keys are runtime-resolved — accept any field name
-                self.bind(*node_id, ResolvedBinding::PipelineMember);
+            Expr::QualifiedSourceAccess {
+                node_id,
+                input_name: _,
+                field,
+                span,
+            } => {
+                // `$source.<input_name>.<field>` — the qualified
+                // form used downstream of Merge/Combine. Field must be
+                // declared in `vars.source`; the input_name's structural
+                // validity is checked at plan time (not at resolve, which
+                // doesn't know DAG structure). Builtin source members are
+                // NOT valid via the qualified form (qualifier addresses
+                // user-declared scope only).
+                if self.scoped_vars.source.contains_key(&**field) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.source.keys().map(|s| s.as_str()).collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "unknown source member '$source.<input>.{field}' (qualified form)"
+                        ),
+                        help: best_match(field, &declared, 3)
+                            .map(|s| format!("did you mean '{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.source` block".into())
+                            }),
+                    });
+                }
+            }
+            Expr::RecordAccess {
+                node_id,
+                field,
+                span,
+            } => {
+                // `$record.<key>` has no builtin members today (those are
+                // tracked in #44). Only declared user-scope vars resolve.
+                if self.scoped_vars.record.contains_key(&**field) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else if self
+                    .scoped_vars
+                    .hidden_lookup(super::scoped_vars::ScopeTag::Record, field)
+                    .is_some()
+                {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "[E173] composition body references parent-scope variable \
+                             '$record.{field}' which is not opted into the body's \
+                             `_compose.scoped_vars.record` schema"
+                        ),
+                        help: Some(format!(
+                            "add `{field}: {{ type: <type> }}` to `_compose.scoped_vars.record` \
+                             in this composition's `.comp.yaml`, OR remove the read"
+                        )),
+                    });
+                } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.record.keys().map(|s| s.as_str()).collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown record member '$record.{field}'"),
+                        help: best_match(field, &declared, 3)
+                            .map(|s| format!("did you mean '$record.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.record` block".into())
+                            }),
+                    });
+                }
             }
             Expr::Now { .. } => {
                 // `now` is a keyword, no binding needed — evaluator handles directly
@@ -533,6 +718,91 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_undeclared_record_member() {
+        // `$record.<key>` has no builtins yet — declared user keys are
+        // the only way to resolve. With an empty registry, every read
+        // is rejected with the help suggesting the `vars.record` block.
+        let diags = resolve_err("emit val = $record.fuzzy_score", &[]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("$record.fuzzy_score")),
+            "expected diagnostic for undeclared $record member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_declared_record_member() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .record
+            .insert("fuzzy_score".to_string(), ScopedVarType::Float);
+        let parsed = Parser::parse("emit ok = $record.fuzzy_score");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared record var should resolve");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared fuzzy_score"
+        );
+    }
+
+    #[test]
+    fn test_resolve_undeclared_pipeline_member() {
+        // After Phase B, undeclared $pipeline.<key> is a hard error;
+        // pre-Phase-B it silently resolved to a runtime null. Empty
+        // registry (the resolve_ok / resolve_err helpers' default) means
+        // the user has declared no pipeline-scope variables.
+        let diags = resolve_err("emit val = $pipeline.cutoff_date", &[]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("$pipeline.cutoff_date")),
+            "expected diagnostic for undeclared $pipeline member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_declared_pipeline_member() {
+        // Build a registry that declares `cutoff_date`; the resolver
+        // should accept the read and bind it as PipelineMember.
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .pipeline
+            .insert("cutoff_date".to_string(), ScopedVarType::Date);
+        let parsed = Parser::parse("emit ok = $pipeline.cutoff_date");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared pipeline var should resolve");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared cutoff_date"
+        );
+    }
+
+    #[test]
     fn test_resolve_pipeline_member() {
         let resolved = resolve_ok("emit ts = $pipeline.start_time", &[]);
         let has_pipeline = resolved
@@ -561,6 +831,52 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("$source.unknown")),
             "expected diagnostic for unknown $source member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_qualified_source_member_declared() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .source
+            .insert("batch_id".to_string(), ScopedVarType::String);
+        let parsed = Parser::parse("emit b = $source.salesforce.batch_id");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared source var should resolve through qualified form");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared $source.<input>.batch_id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_qualified_source_member_undeclared() {
+        let parsed = Parser::parse("emit b = $source.salesforce.unknown_field");
+        assert!(parsed.errors.is_empty());
+        let registry = ScopedVarsRegistry::default();
+        let err = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect_err("undeclared qualified source field should fail");
+        assert!(
+            err.iter().any(|d| d.message.contains("unknown_field")),
+            "expected diagnostic for undeclared qualified $source member: {err:?}"
         );
     }
 

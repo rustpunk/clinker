@@ -54,7 +54,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
 fn run(csv: &str) -> String {

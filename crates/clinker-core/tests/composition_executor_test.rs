@@ -9,11 +9,11 @@
 //! context.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 #[derive(Clone, Default)]
@@ -45,13 +45,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "composition-executor-test".to_string(),
         batch_id: "batch-001".to_string(),
@@ -84,13 +79,9 @@ fn run_with_composition(
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    )
-    .expect("pipeline run");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .expect("pipeline run");
     (report, buf.as_string())
 }
 
@@ -125,7 +116,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n5\n7\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -176,7 +167,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n3\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -232,7 +223,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\n3\n5\n12\n42\n";
     let (_report, output) = run_with_composition(yaml, csv_input);
@@ -283,7 +274,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_unmapped: true
+      include_widened: true
 "#;
     let csv_input = "a\nnot-an-integer\n";
     let config = parse_config(yaml).expect("parse pipeline yaml");
@@ -305,12 +296,8 @@ nodes:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let result = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        writers,
-        &test_params(&config),
-    );
+    let result =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params());
     let err = result.expect_err("expected pipeline run to fail");
     let msg = err.to_string();
     assert!(

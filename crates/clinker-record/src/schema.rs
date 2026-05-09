@@ -23,6 +23,14 @@ use std::sync::Arc;
 ///   the aggregator's group index. Detect-phase walks this lineage to
 ///   resolve a downstream failure back to every contributing source
 ///   row, matching the upstream-failure DLQ-fan-out semantic.
+/// - [`FieldMetadata::WidenedSidecar`] — a per-Source absorber column
+///   added by `on_unmapped: auto_widen`. Carries a `Value::Map` of
+///   undeclared input fields keyed by their original name. The
+///   typechecker is blind to its contents (CXL has no Map operators
+///   in the user surface); the Output node opts the contents back
+///   into top-level columns via `include_widened: true`. Pattern
+///   precedent: Databricks Auto Loader's `_rescued_data` and
+///   ClickHouse's `JSON` column type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldMetadata {
     /// Source-CK shadow column. `source_field` is the user-declared
@@ -34,6 +42,10 @@ pub enum FieldMetadata {
     /// named `$ck.aggregate.<aggregate_name>` and carries the group
     /// index assigned by the aggregator at finalize.
     AggregateGroupIndex { aggregate_name: Box<str> },
+    /// Sidecar absorber column for `on_unmapped: auto_widen`. The
+    /// column is named `$widened` and carries a `Value::Map` of every
+    /// input-record key that was not in the user-declared schema.
+    WidenedSidecar,
 }
 
 impl FieldMetadata {
@@ -50,6 +62,13 @@ impl FieldMetadata {
         Self::AggregateGroupIndex {
             aggregate_name: aggregate_name.into(),
         }
+    }
+
+    /// Marks this column as the per-Source `auto_widen` sidecar
+    /// absorber. Always named `$widened`; carries a `Value::Map`
+    /// payload.
+    pub fn widened_sidecar() -> Self {
+        Self::WidenedSidecar
     }
 
     /// True for every variant. The presence of [`FieldMetadata`] on a

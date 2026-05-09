@@ -674,7 +674,11 @@ fn execute_combine_sort_merge_with_stats(
                             .to_string(),
                     })?;
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata }) => {
+                        Ok(EvalResult::Emit {
+                            fields,
+                            record_vars,
+                            ..
+                        }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(&driver_record, s),
                                 None => driver_record.clone(),
@@ -682,8 +686,8 @@ fn execute_combine_sort_merge_with_stats(
                             for (n, v) in fields {
                                 rec.set(&n, v);
                             }
-                            for (k, v) in metadata {
-                                let _ = rec.set_meta(&k, v);
+                            for (k, v) in *record_vars {
+                                let _ = rec.set_record_var(&k, v);
                             }
                             output_records.push((rec, driver_order));
                         }
@@ -1108,8 +1112,20 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                 if first_build.is_none() {
                     first_build = Some(inner.clone());
                 }
+                // Build-side records contribute only their
+                // user-declared field values to the collect array.
+                // `iter_user_fields` filters every engine-stamped
+                // column — both `$ck.*` (correlation lineage; not
+                // meaningful nested inside a collect-array entry) and
+                // `$widened` (auto_widen sidecar; build-side sidecars
+                // drop at the join boundary by design, mirroring
+                // `propagate_ck: Driver`). Without this filter, a
+                // build record's `$widened` `Value::Map` payload
+                // nests inside the collect-mode `Value::Map` and
+                // reaches the writer as a nested Map, triggering
+                // `FormatError::UnserializableMapValue`.
                 let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
-                for (fname, val) in inner.iter_all_fields() {
+                for (fname, val) in inner.iter_user_fields() {
                     m.insert(fname.into(), val.clone());
                 }
                 arr.push(Value::Map(Box::new(m)));
@@ -1161,7 +1177,11 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit { fields, metadata }) => {
+                        Ok(EvalResult::Emit {
+                            fields,
+                            record_vars,
+                            ..
+                        }) => {
                             let mut rec = match output_schema {
                                 Some(s) => widen_record_to_schema(driver_record, s),
                                 None => driver_record.clone(),
@@ -1169,8 +1189,8 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             for (n, v) in fields {
                                 rec.set(&n, v);
                             }
-                            for (k, v) in metadata {
-                                let _ = rec.set_meta(&k, v);
+                            for (k, v) in *record_vars {
+                                let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(
                                 &mut rec,
@@ -1221,15 +1241,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             ),
                         });
                     }
-                    let mut rec = Record::new(Arc::clone(target_schema), values);
-                    // Carry the driver's `$meta.*` forward through synthetic
-                    // chain steps. User-emitted record metadata travels with
-                    // the driver row by contract; without this copy the
-                    // next step's `widen_record_to_schema` finds no meta to
-                    // propagate.
-                    for (k, v) in driver_record.iter_meta() {
-                        let _ = rec.set_meta(k, v.clone());
-                    }
+                    let rec = Record::new(Arc::clone(target_schema), values);
                     args.output.push((rec, driver_order));
                 } else {
                     // No body and no output schema (test-mode pass-through):

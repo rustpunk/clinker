@@ -1297,7 +1297,7 @@ fn output_consumed_columns(
                 set.insert(src_col.clone());
             }
         }
-        if cfg.include_unmapped {
+        if cfg.include_widened {
             for col in &upstream_cols {
                 set.insert(col.clone());
             }
@@ -1307,7 +1307,7 @@ fn output_consumed_columns(
                 set.remove(ex);
             }
         }
-        if !cfg.include_unmapped && cfg.mapping.is_none() {
+        if !cfg.include_widened && cfg.mapping.is_none() {
             // No mapping declared and unmapped not included — nothing
             // gets written, but the seed must not be empty: the buffer
             // schema invariant requires at least the producer emits to

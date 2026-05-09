@@ -54,12 +54,7 @@ fn run_pipeline(
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
-        pipeline_vars: config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default(),
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
     };
 
@@ -228,7 +223,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#,
         window_emit = window_emit
     )
@@ -566,7 +561,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE5,ENG,100\nE6,ENG,200\n";
     let (counters, dlq, output) = run_pipeline(yaml, csv).expect("non-relaxed pipeline runs");

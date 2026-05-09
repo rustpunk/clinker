@@ -141,6 +141,29 @@ If `format` is omitted, Clinker auto-detects based on file content.
 
 Fixed-width sources require a separate format schema (`.schema.yaml` file) that defines field positions, widths, and padding. The `schema:` on the source body declares CXL types for compile-time checking; the format schema defines the physical layout.
 
+## `on_unmapped` — undeclared input fields
+
+The per-source `on_unmapped` policy decides what to do with input fields the source's `schema:` block does not name. Three modes — `auto_widen` (default), `drop`, `reject`:
+
+```yaml
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: "./data/orders.csv"
+    on_unmapped:
+      mode: auto_widen     # default; other values: drop, reject
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: numeric }
+```
+
+See [Auto-Widen & Schema Drift](auto-widen.md) for the full
+specification: the `$widened` sidecar absorber design, propagation
+rules per downstream node type, the `include_widened` Output flag,
+**E315** merge-policy mismatch, and fixed-width inertness.
+
 ## Sort order
 
 If your source data is pre-sorted, declare the sort order so the optimizer can use streaming aggregation instead of hash aggregation:

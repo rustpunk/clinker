@@ -18,11 +18,11 @@
 //! every `DualRun` fixture. Default is strict byte-compare.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{PipelineConfig, parse_config};
+use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 // ───────────────────────── tiered policy ─────────────────────────
@@ -206,13 +206,8 @@ impl Write for SharedBuffer {
     }
 }
 
-fn test_params(config: &PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(clinker_core::config::convert_pipeline_vars)
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "baseline-run".to_string(),
         batch_id: "batch-001".to_string(),
@@ -278,7 +273,7 @@ fn compare_or_write(baseline_name: &str, actual: &str) {
 /// Run a pipeline with in-memory readers/writers keyed by source/output name.
 fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, String> {
     let config = parse_config(yaml).expect("parse_config");
-    let params = test_params(&config);
+    let params = test_params();
 
     let readers: clinker_core::executor::SourceReaders = inputs
         .into_iter()

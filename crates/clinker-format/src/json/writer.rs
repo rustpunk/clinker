@@ -62,12 +62,10 @@ impl<W: Write> JsonWriter<W> {
         }
     }
 
-    /// Serialize a record to a JSON object in schema-column order.
-    /// `preserve_nulls: false` omits keys with Null values. Metadata is
-    /// stripped from the default output; callers that want to emit
-    /// `$meta.*` keys into the JSON object must opt in at a higher
-    /// layer (the Output node's `include_metadata` flag). Engine-stamped
-    /// columns follow the same rule via `include_engine_stamped`.
+    /// Serializes a record to a JSON object in schema-column order.
+    /// `preserve_nulls: false` omits keys with Null values. Engine-stamped
+    /// columns are stripped from the default output; callers opt in via
+    /// `include_engine_stamped`.
     fn record_to_json(&self, record: &Record) -> serde_json::Value {
         use serde_json::{Map, Value as Jv};
 
@@ -288,22 +286,6 @@ mod tests {
             output.contains("\"b\":null") || output.contains("\"b\": null"),
             "Null field 'b' should be present: {output}"
         );
-    }
-
-    #[test]
-    fn test_json_writer_emits_schema_fields_only() {
-        // Default writer contract: schema columns only; metadata (and
-        // the `$meta.*` namespace) does not leak into the JSON object
-        // unless a higher layer opts in.
-        let schema = Arc::new(Schema::new(vec!["a".into()]));
-        let mut record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
-        record
-            .set_meta("ignored", Value::String("in_meta".into()))
-            .unwrap();
-        let output = write_records(JsonWriterConfig::default(), &[record], &schema);
-        assert!(output.contains("\"a\""));
-        assert!(!output.contains("ignored"));
-        assert!(!output.contains("in_meta"));
     }
 
     #[test]

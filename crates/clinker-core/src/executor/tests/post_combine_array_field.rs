@@ -61,7 +61,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let config = crate::config::parse_config(yaml).expect("parse");
     let result = config.compile(&crate::config::CompileContext::default());

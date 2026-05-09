@@ -26,12 +26,7 @@ fn run_branch_test(
         Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(|v| crate::config::convert_pipeline_vars(v))
-        .unwrap_or_default();
+    let pipeline_vars = indexmap::IndexMap::new();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -115,7 +110,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -200,7 +195,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
@@ -287,7 +282,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
@@ -373,7 +368,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
@@ -467,7 +462,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -553,7 +548,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
@@ -639,7 +634,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
@@ -715,7 +710,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
@@ -769,7 +764,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
@@ -827,7 +822,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "dept,amount\nA,10\nB,20\nA,30\n";
@@ -918,7 +913,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
@@ -998,7 +993,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,100\n";

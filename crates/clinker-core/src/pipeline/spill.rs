@@ -122,10 +122,10 @@ impl<P: Serialize> SpillWriter<P> {
     /// Each pair is written as a 4-byte little-endian length prefix
     /// followed by a postcard-encoded `(RecordPayload, P)` tuple.
     pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
-        let meta = record.metadata_pairs();
+        let rv = record.record_var_pairs();
         let rec_payload = RecordPayload {
             values: record.values().to_vec(),
-            metadata: if meta.is_empty() { None } else { Some(meta) },
+            record_vars: if rv.is_empty() { None } else { Some(rv) },
         };
         let bytes = postcard::to_stdvec(&(&rec_payload, payload))?;
         let len = bytes.len() as u32;

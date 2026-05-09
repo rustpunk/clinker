@@ -30,7 +30,7 @@ nodes:
       name: sink
       type: csv
       path: bench://output.csv
-      include_unmapped: true
+      include_widened: true
       split:
         max_records: 10000
         group_key: f0

@@ -126,10 +126,40 @@ pub struct CompositionSignature {
     pub config_schema: IndexMap<ParamName, ParamDecl>,
     /// Declared resource slots (two-slot split with `config_schema`).
     pub resources_schema: IndexMap<ResourceName, ResourceDecl>,
+    /// Opt-in declarations of scoped variables a composition body may
+    /// read from the parent scope.
+    ///
+    /// Composition bodies are sealed by default — the resolver sees an
+    /// empty `ScopedVarsRegistry` and rejects every `$pipeline.<custom>`
+    /// / `$source.<custom>` / `$record.<custom>` read with the standard
+    /// "unknown member" diagnostic. To opt a specific name back in, the
+    /// composition author lists it under `_compose.scoped_vars.<scope>:`
+    /// in the `.comp.yaml` file. At binding time, `bind_composition`
+    /// builds the body's scoped-vars registry from the intersection of
+    /// the parent's declarations and this schema, ensuring the body
+    /// only sees vars that are both (a) declared in the parent and
+    /// (b) explicitly opted into here.
+    ///
+    /// Mirrors the YAML shape of `PipelineMeta.vars` (per-scope name →
+    /// type maps) but without defaults — the body always inherits the
+    /// runtime value parent producer Transforms wrote (or the parent's
+    /// declaration default).
+    pub scoped_vars_schema: ScopedVarsSchema,
     /// Absolute path to the `.comp.yaml` file that produced this signature.
     pub source_path: PathBuf,
     /// Field-path → span index used for signature-load diagnostics (E101, E104).
     pub source_spans: SourceMap,
+}
+
+/// Per-scope opt-in maps for composition `scoped_vars` inheritance.
+/// Each entry's value is the type the parent must declare; at bind
+/// time, the parent's declared type must match this entry's type or
+/// an E174 mismatch fires.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedVarsSchema {
+    pub pipeline: IndexMap<String, crate::config::ScopedVarType>,
+    pub source: IndexMap<String, crate::config::ScopedVarType>,
+    pub record: IndexMap<String, crate::config::ScopedVarType>,
 }
 
 /// An input port declaration.

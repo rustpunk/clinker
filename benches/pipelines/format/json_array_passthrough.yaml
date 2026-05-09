@@ -30,4 +30,4 @@ nodes:
       path: bench://output.json
       options:
         format: array
-      include_unmapped: true
+      include_widened: true

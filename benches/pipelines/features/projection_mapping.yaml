@@ -29,7 +29,7 @@ nodes:
       name: sink
       type: csv
       path: bench://output.csv
-      include_unmapped: true
+      include_widened: true
       mapping:
         output_a: f0
         output_b: f1

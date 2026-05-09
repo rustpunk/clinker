@@ -23,6 +23,25 @@ pub enum TraceLevel {
     Error,
 }
 
+/// Where a `Statement::Emit` writes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitTarget {
+    /// Regular output column. `emit name = expr`.
+    Field,
+    /// Pipeline-scope declared state. `emit $pipeline.<key> = expr`.
+    /// Routed through `StableEvalContext::pipeline_vars` at eval time;
+    /// reader sees the value via `$pipeline.<key>` from any DAG
+    /// descendant.
+    Pipeline,
+    /// Source-scope declared state. `emit $source.<key> = expr`.
+    /// Keyed by per-record `source_file` Arc; multi-file Sources get
+    /// per-file slots.
+    Source,
+    /// Record-scope declared state. `emit $record.<key> = expr`.
+    /// Per-record private slot; never serializes to output.
+    Record,
+}
+
 /// Top-level CXL statement.
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -36,8 +55,15 @@ pub enum Statement {
         node_id: NodeId,
         name: Box<str>,
         expr: Expr,
-        /// When true, writes to per-record metadata (`$meta.*`) instead of output.
-        is_meta: bool,
+        /// Where the emitted value lands:
+        /// - `Field`: regular output column on the record (`emit name = expr`).
+        /// - `Pipeline`/`Source`/`Record`: producer-declared scoped state,
+        ///   read downstream via `$pipeline.<key>` / `$source.<key>` /
+        ///   `$record.<key>`. The variable must be declared in a Transform's
+        ///   `config.declares:` block; the eval routing writes through
+        ///   `StableEvalContext` (pipeline/source) or `Record::record_vars`
+        ///   (record) per the variant.
+        target: EmitTarget,
         span: Span,
     },
     Trace {
@@ -141,6 +167,18 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// Static configuration knob: `$vars.<key>`. Declared in the
+    /// pipeline's top-level `vars:` block with an optional default;
+    /// resolves to a value frozen at pipeline start (channel overrides
+    /// applied once at startup). Distinct from `$pipeline.*` /
+    /// `$source.*` / `$record.*` which are producer-written scoped
+    /// state with DAG-descendant read semantics; `$vars.*` is read-only
+    /// and visible from any node.
+    VarsAccess {
+        node_id: NodeId,
+        key: Box<str>,
+        span: Span,
+    },
     /// Per-record source provenance: `$source.file`, `$source.row`.
     /// Distinct namespace from `$pipeline.*` (pipeline-stable per-run state)
     /// because per-record values cannot be pipeline-scope when one Source
@@ -150,8 +188,28 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
-    MetaAccess {
+    /// User-declared per-record scoped variable: `$record.<key>`.
+    ///
+    /// Typed, declared-at-pipeline-top, multi-writer slot. The
+    /// variable must be declared in a Transform's `config.declares:`
+    /// block with `scope: record`.
+    RecordAccess {
         node_id: NodeId,
+        field: Box<str>,
+        span: Span,
+    },
+    /// Qualified per-input source-scope read: `$source.<input_name>.<field>`.
+    ///
+    /// Used downstream of `Merge` / `Combine` to disambiguate which
+    /// upstream Source's source-scope value to read. The plain
+    /// [`Expr::SourceAccess`] form is rejected by E172 in that
+    /// context — this variant is the explicit
+    /// alternative. `input_name` matches the upstream Merge/Combine
+    /// input name; `field` resolves against the same
+    /// `vars.source.<key>` declaration as the unqualified form.
+    QualifiedSourceAccess {
+        node_id: NodeId,
+        input_name: Box<str>,
         field: Box<str>,
         span: Span,
     },
@@ -210,8 +268,10 @@ impl Expr {
             | Expr::Coalesce { span, .. }
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
+            | Expr::VarsAccess { span, .. }
             | Expr::SourceAccess { span, .. }
-            | Expr::MetaAccess { span, .. }
+            | Expr::RecordAccess { span, .. }
+            | Expr::QualifiedSourceAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
             | Expr::AggCall { span, .. }
@@ -234,8 +294,10 @@ impl Expr {
             | Expr::Coalesce { node_id, .. }
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
+            | Expr::VarsAccess { node_id, .. }
             | Expr::SourceAccess { node_id, .. }
-            | Expr::MetaAccess { node_id, .. }
+            | Expr::RecordAccess { node_id, .. }
+            | Expr::QualifiedSourceAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
             | Expr::AggCall { node_id, .. }
@@ -250,11 +312,11 @@ impl Expr {
     /// buffer schema a producing Aggregate needs to carry forward to
     /// commit time.
     ///
-    /// `$pipeline.*`, `$meta.*`, and `$ck.*` are skipped — they are
-    /// system namespaces, not record-schema columns. The deferred
-    /// buffer carries `$ck.*` shadow columns implicitly via row
-    /// identity, so they don't need tracking here. This mirrors the
-    /// analyzer's `walk_expr` namespace-exclusion convention.
+    /// `$pipeline.*` and `$ck.*` are skipped — they are system
+    /// namespaces, not record-schema columns. The deferred buffer
+    /// carries `$ck.*` shadow columns implicitly via row identity, so
+    /// they don't need tracking here. This mirrors the analyzer's
+    /// `walk_expr` namespace-exclusion convention.
     pub fn support_into(&self, fields: &mut std::collections::HashSet<String>) {
         match self {
             Expr::FieldRef { name, .. } => {
@@ -313,8 +375,10 @@ impl Expr {
                 }
             }
             Expr::PipelineAccess { .. }
+            | Expr::VarsAccess { .. }
             | Expr::SourceAccess { .. }
-            | Expr::MetaAccess { .. }
+            | Expr::RecordAccess { .. }
+            | Expr::QualifiedSourceAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::Literal { .. }
@@ -327,8 +391,8 @@ impl Expr {
 fn is_system_namespace(name: &str) -> bool {
     name.starts_with("$pipeline")
         || name.starts_with("$source")
-        || name.starts_with("$meta")
         || name.starts_with("$ck")
+        || name.starts_with("$widened")
 }
 
 #[derive(Debug, Clone)]
@@ -439,7 +503,7 @@ mod tests {
                         name: "x".into(),
                         span,
                     },
-                    is_meta: false,
+                    target: EmitTarget::Field,
                     span,
                 },
                 Statement::ExprStmt {
@@ -468,7 +532,7 @@ mod tests {
                 name: "label".into(),
                 span,
             },
-            is_meta: false,
+            target: EmitTarget::Field,
             span,
         };
         if let Statement::Emit { name, .. } = stmt {
@@ -733,16 +797,11 @@ mod support_into_tests {
         assert!(f.is_empty());
     }
 
-    #[test]
-    fn meta_namespace_excluded() {
-        let f = fields_of("$meta.source");
-        assert!(f.is_empty());
-    }
-
-    /// `$ck.*` references appear only as engine-stamped FieldRef names — the
-    /// parser rejects `$ck.field` syntax (only `$pipeline`, `$window`, `$meta`
-    /// are recognized system namespaces). Construct the FieldRef directly to
-    /// exercise the namespace-exclusion path that fires on engine-injected
+    /// `$ck.*` references appear only as engine-stamped FieldRef
+    /// names — the parser rejects `$ck.field` syntax (only
+    /// `$pipeline` and `$window` are recognized system namespaces).
+    /// Construct the FieldRef directly to exercise the
+    /// namespace-exclusion path that fires on engine-injected
     /// shadow-column references.
     #[test]
     fn ck_namespace_excluded() {
@@ -755,5 +814,30 @@ mod support_into_tests {
         let mut f = HashSet::new();
         expr.support_into(&mut f);
         assert!(f.is_empty());
+    }
+
+    /// `$widened` is the engine-stamped sidecar absorber for
+    /// `on_unmapped: auto_widen`. The parser rejects
+    /// `$widened.<key>` syntax (catch-all "unknown system
+    /// namespace"), but the column itself appears as a real
+    /// Schema entry (`FieldMetadata::WidenedSidecar`); any
+    /// engine-injected FieldRef whose name starts with `$widened`
+    /// must be excluded from `support_into`'s buffer-schema
+    /// computation. Constructs the FieldRef directly to exercise
+    /// the namespace-exclusion arm in `is_system_namespace`.
+    #[test]
+    fn widened_namespace_excluded() {
+        let span = Span::new(0, 0);
+        let expr = Expr::FieldRef {
+            node_id: NodeId(0),
+            name: "$widened".into(),
+            span,
+        };
+        let mut f = HashSet::new();
+        expr.support_into(&mut f);
+        assert!(
+            f.is_empty(),
+            "$widened FieldRef must be excluded; got {f:?}"
+        );
     }
 }

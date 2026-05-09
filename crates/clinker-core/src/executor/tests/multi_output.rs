@@ -24,13 +24,8 @@ fn multi_output_fixture(
 }
 
 /// Build default `PipelineRunParams` for tests.
-fn test_params(config: &crate::config::PipelineConfig) -> PipelineRunParams {
-    let pipeline_vars = config
-        .pipeline
-        .vars
-        .as_ref()
-        .map(|v| crate::config::convert_pipeline_vars(v))
-        .unwrap_or_default();
+fn test_params() -> PipelineRunParams {
+    let pipeline_vars = indexmap::IndexMap::new();
     PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -43,7 +38,7 @@ fn test_params(config: &crate::config::PipelineConfig) -> PipelineRunParams {
 fn compile_test_route(route_yaml: &str, fields: &[&str]) -> CompiledRoute {
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    PipelineExecutor::compile_route(&route_config, &emitted_fields).unwrap()
+    PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default()).unwrap()
 }
 
 /// Helper: build an EvalContext for route evaluation tests.
@@ -58,24 +53,15 @@ fn test_eval_context() -> cxl::eval::EvalContext<'static> {
     )
 }
 
-/// Helper: assemble a Record from an `(emitted, metadata)` field pair
-/// for the post-rip `CompiledRoute::evaluate(&Record, ...)` shape.
-/// Schema columns take insertion order of `emitted`; metadata writes
-/// route through `Record::set_meta` so the resolver's `$meta.*`
-/// prefix-strip sees them.
-fn test_record(
-    emitted: &indexmap::IndexMap<String, Value>,
-    metadata: &indexmap::IndexMap<String, Value>,
-) -> clinker_record::Record {
+/// Helper: assemble a Record from an `emitted` map for the
+/// `CompiledRoute::evaluate(&Record, ...)` shape. Schema columns
+/// take insertion order of `emitted`.
+fn test_record(emitted: &indexmap::IndexMap<String, Value>) -> clinker_record::Record {
     use std::sync::Arc;
     let columns: Vec<Box<str>> = emitted.keys().map(|k| k.as_str().into()).collect();
     let schema = Arc::new(clinker_record::Schema::new(columns));
     let values: Vec<Value> = emitted.values().cloned().collect();
-    let mut record = clinker_record::Record::new(schema, values);
-    for (key, value) in metadata {
-        let _ = record.set_meta(key, value.clone());
-    }
-    record
+    clinker_record::Record::new(schema, values)
 }
 
 // --- Route evaluation unit tests ---
@@ -97,9 +83,7 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(50000))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["high"]);
 }
 
@@ -120,9 +104,7 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["medium"]);
 }
 
@@ -143,9 +125,7 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(500))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["low"]);
 }
 
@@ -166,9 +146,7 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["audit", "report"]);
 }
 
@@ -191,9 +169,7 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["report"]);
 }
 
@@ -214,9 +190,7 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(100))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
 
@@ -239,9 +213,7 @@ default: standard
         ("amount".to_string(), Value::Integer(50000)),
         ("country".to_string(), Value::String("UK".into())),
     ]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["intl_high"]);
 
     // Does not match: high amount but US
@@ -249,9 +221,7 @@ default: standard
         ("amount".to_string(), Value::Integer(50000)),
         ("country".to_string(), Value::String("US".into())),
     ]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
 
@@ -269,9 +239,7 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Null)]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     // Null > 10000 is not true → default
     assert_eq!(targets, vec!["standard"]);
 }
@@ -291,9 +259,7 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("computed_score".to_string(), Value::Integer(95))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["high"]);
 }
 
@@ -314,9 +280,7 @@ default: regular
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("tier".to_string(), Value::String("gold".into()))]);
-    let targets = route
-        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
-        .unwrap();
+    let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["vip"]);
 }
 
@@ -328,7 +292,7 @@ fn run_multi_output(
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError> {
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
 
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -401,7 +365,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: low
   input: classify
@@ -409,7 +373,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -471,7 +435,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: medium
   input: classify
@@ -479,7 +443,7 @@ nodes:
     name: medium
     path: medium.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: low
   input: classify
@@ -487,7 +451,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,5000\n2,500\n3,50\n";
@@ -536,7 +500,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: small
   input: classify
@@ -544,7 +508,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n5,300\n";
@@ -598,7 +562,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: small
   input: classify
@@ -606,7 +570,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // All go to "big" — order must match input order
@@ -698,7 +662,7 @@ nodes:
     name: good
     path: good.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: bad
   input: classify
@@ -706,11 +670,11 @@ nodes:
     name: bad
     path: bad.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -782,7 +746,7 @@ nodes:
     name: audit
     path: audit.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: report
   input: classify
@@ -790,7 +754,7 @@ nodes:
     name: report
     path: report.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: standard
   input: classify
@@ -798,7 +762,7 @@ nodes:
     name: standard
     path: standard.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // amount=500 matches both audit (>100) and report (>50)
@@ -855,7 +819,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id\n1\n2\n3\n";
@@ -904,7 +868,7 @@ nodes:
     name: special
     path: special.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: normal
   input: classify
@@ -912,7 +876,7 @@ nodes:
     name: normal
     path: normal.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // No records match "special" (all < 99999)
@@ -997,7 +961,7 @@ nodes:
     name: good
     path: good.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: bad
   input: classify
@@ -1005,11 +969,11 @@ nodes:
     name: bad
     path: bad.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -1087,7 +1051,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: small
   input: classify
@@ -1095,7 +1059,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // "bad" will fail to_int → DLQ, but other records should still be written
@@ -1171,7 +1135,7 @@ nodes:
     name: a
     path: a.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: b
   input: classify
@@ -1179,11 +1143,11 @@ nodes:
     name: b
     path: b.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     // Enough records that "b" gets traffic and will error
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n";
@@ -1272,7 +1236,7 @@ nodes:
     name: a
     path: a.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: b
   input: classify
@@ -1280,11 +1244,11 @@ nodes:
     name: b
     path: b.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
-    let params = test_params(&config);
+    let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -1391,7 +1355,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: low
   input: classify
@@ -1399,7 +1363,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // "bad_value" cannot be converted to int → transform eval error
@@ -1462,7 +1426,7 @@ nodes:
     name: special
     path: special.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: normal
   input: calc
@@ -1470,7 +1434,7 @@ nodes:
     name: normal
     path: normal.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     let csv = "id,amount,zero\n1,100,0\n";
@@ -1548,7 +1512,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 - type: output
   name: low
   input: classify
@@ -1556,7 +1520,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // Two records fail, one succeeds
@@ -1645,7 +1609,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_unmapped: true
+    include_widened: true
 "#;
 
     // "bad" fails to_int → DLQ
@@ -1707,10 +1671,10 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
     let input_csv = "id,name\n1,Alice\n2,Bob\n";
 
     let readers: crate::executor::SourceReaders = [(
@@ -1779,10 +1743,10 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_unmapped: true
+    include_widened: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
-    let params = test_params(&config);
+    let params = test_params();
     let input_csv = "x\n42\n";
 
     let readers: crate::executor::SourceReaders = [(
@@ -1838,7 +1802,8 @@ default: fallback
 "#;
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
-    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    let result =
+        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
     match result {
         Err(e) => {
             let err = e.to_string();
@@ -1863,7 +1828,8 @@ default: low
 "#;
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
-    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    let result =
+        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
     assert!(
         result.is_ok(),
         "boolean route condition should pass typecheck: {}",
