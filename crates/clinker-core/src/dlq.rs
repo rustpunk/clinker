@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use clinker_record::{Schema, Value};
+use clinker_record::{FieldMetadata, Schema, Value};
 
 use crate::executor::DlqEntry;
 
@@ -72,7 +72,17 @@ pub const DLQ_COLUMNS: &[&str] = &[
 /// Column layout:
 /// - Always: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_row
 /// - If include_reason: _cxl_dlq_error_category, _cxl_dlq_error_detail
-/// - If include_source_row: all original source fields in schema order
+/// - If include_source_row: all *user-declared* source fields plus
+///   correlation-lattice columns (`$ck.<field>`,
+///   `$ck.aggregate.<name>`) in schema order. Engine-stamped
+///   sidecar columns (`$widened`) are filtered out — they carry
+///   `Value::Map` payloads which would JSON-encode into a single
+///   CSV cell and hide routing bugs the same way the regular
+///   non-JSON writers' silent map-degrade did before commit
+///   `f5ae145`. Users who need the auto_widen sidecar surfaced in
+///   their normal output can opt into `include_widened: true` on
+///   the relevant Output node; the DLQ keeps a stable user-shape
+///   schema regardless.
 pub fn write_dlq<W: Write>(
     writer: W,
     entries: &[DlqEntry],
@@ -99,8 +109,8 @@ pub fn write_dlq<W: Write>(
     header.push("_cxl_dlq_route");
     header.push("_cxl_dlq_trigger");
     if include_source_row {
-        for col in source_schema.columns() {
-            header.push(col.as_ref());
+        for (_, name) in dlq_user_columns(source_schema) {
+            header.push(name);
         }
     }
     csv_writer.write_record(&header)?;
@@ -127,8 +137,8 @@ pub fn write_dlq<W: Write>(
         row.push(entry.trigger.to_string());
 
         if include_source_row {
-            for col in source_schema.columns() {
-                let value = entry.original_record.get(col).unwrap_or(&Value::Null);
+            for (_, name) in dlq_user_columns(source_schema) {
+                let value = entry.original_record.get(name).unwrap_or(&Value::Null);
                 row.push(value_to_string(value));
             }
         }
@@ -138,6 +148,26 @@ pub fn write_dlq<W: Write>(
 
     csv_writer.flush()?;
     Ok(())
+}
+
+/// Iterator over schema columns that should appear in DLQ output:
+/// user-declared columns plus correlation-lattice columns
+/// (`$ck.<field>`, `$ck.aggregate.<name>`). The `$widened`
+/// `auto_widen` sidecar absorber is filtered out — its
+/// `Value::Map` payload has no canonical scalar serialization and
+/// would silently JSON-encode into a single CSV cell, hiding
+/// routing bugs.
+fn dlq_user_columns(schema: &Schema) -> impl Iterator<Item = (usize, &str)> {
+    schema
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match schema.field_metadata(i) {
+            Some(FieldMetadata::WidenedSidecar) => None,
+            Some(FieldMetadata::SourceCorrelation { .. })
+            | Some(FieldMetadata::AggregateGroupIndex { .. })
+            | None => Some((i, c.as_ref())),
+        })
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -150,6 +180,15 @@ fn value_to_string(value: &Value) -> String {
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
         Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
+        // `Value::Map` only reaches the DLQ row builder if it lives at a
+        // non-`$widened` column slot — i.e. the user explicitly emitted a
+        // map at a regular column. The `dlq_user_columns` filter above
+        // already drops `$widened`, so a Map here is intentional user
+        // output. JSON-encode for shape consistency with the
+        // `Value::Array` case (regular non-JSON writers raise
+        // `UnserializableMapValue` for the same situation; DLQ is
+        // best-effort capture, not user-serializable output, so it
+        // accepts the JSON-string degrade rather than failing).
         Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
     }
 }
@@ -491,6 +530,87 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::ValidationFailure.as_str(),
             "validation_failure"
+        );
+    }
+
+    /// `write_dlq` filters the engine-stamped `$widened` sidecar
+    /// column from both the header and the body. The `$widened`
+    /// column carries `Value::Map` payloads which would otherwise
+    /// JSON-encode into a single CSV cell — the same silent-degrade
+    /// pattern commit `f5ae145` rejected in the regular non-JSON
+    /// writers. Correlation-lattice columns (`$ck.<field>`) are
+    /// retained for collateral DLQ debugging.
+    #[test]
+    fn test_dlq_filters_widened_sidecar_column() {
+        use clinker_record::SchemaBuilder;
+        // Schema mirrors what an `auto_widen` source produces:
+        // user-declared columns + `$ck.<field>` shadow + `$widened`.
+        let schema = Arc::new(
+            SchemaBuilder::new()
+                .with_field("employee_id")
+                .with_field("salary")
+                .with_field_meta(
+                    "$ck.employee_id",
+                    FieldMetadata::source_correlation("employee_id"),
+                )
+                .with_field_meta("$widened", FieldMetadata::widened_sidecar())
+                .build(),
+        );
+        let mut sidecar = indexmap::IndexMap::new();
+        sidecar.insert("region".into(), Value::String("US".into()));
+        sidecar.insert("dept".into(), Value::String("eng".into()));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("E001".into()),
+                Value::Integer(50000),
+                Value::String("E001".into()),
+                Value::Map(Box::new(sidecar)),
+            ],
+        );
+        let entry = DlqEntry {
+            source_row: 1,
+            category: DlqErrorCategory::TypeCoercionFailure,
+            error_message: "test".to_string(),
+            original_record: record,
+            stage: None,
+            route: None,
+            trigger: true,
+        };
+        let mut buf = Vec::new();
+        write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let header = output.lines().next().expect("header line");
+        let columns: Vec<&str> = header.split(',').collect();
+
+        assert!(
+            !columns.contains(&"$widened"),
+            "DLQ header must not contain `$widened` (silent JSON-blob degrade); \
+             got header: {header}"
+        );
+        assert!(
+            columns.contains(&"$ck.employee_id"),
+            "DLQ header must retain `$ck.<field>` correlation lineage for \
+             collateral DLQ debugging; got header: {header}"
+        );
+        assert!(
+            columns.contains(&"employee_id") && columns.contains(&"salary"),
+            "DLQ header must retain user-declared columns; got header: {header}"
+        );
+
+        // Body row has the same column count as the header — no
+        // trailing JSON-blob cell from a leaked `$widened` payload.
+        let body = output.lines().nth(1).expect("body line");
+        let body_cells: Vec<&str> = body.split(',').collect();
+        assert_eq!(
+            body_cells.len(),
+            columns.len(),
+            "body row column count must match header; got body: {body}"
+        );
+        assert!(
+            !body.contains("region"),
+            "sidecar map's `region` key must not appear in any DLQ body cell; \
+             got body: {body}"
         );
     }
 }
