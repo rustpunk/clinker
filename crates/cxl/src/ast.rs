@@ -815,4 +815,29 @@ mod support_into_tests {
         expr.support_into(&mut f);
         assert!(f.is_empty());
     }
+
+    /// `$widened` is the engine-stamped sidecar absorber for
+    /// `on_unmapped: auto_widen`. The parser rejects
+    /// `$widened.<key>` syntax (catch-all "unknown system
+    /// namespace"), but the column itself appears as a real
+    /// Schema entry (`FieldMetadata::WidenedSidecar`); any
+    /// engine-injected FieldRef whose name starts with `$widened`
+    /// must be excluded from `support_into`'s buffer-schema
+    /// computation. Constructs the FieldRef directly to exercise
+    /// the namespace-exclusion arm in `is_system_namespace`.
+    #[test]
+    fn widened_namespace_excluded() {
+        let span = Span::new(0, 0);
+        let expr = Expr::FieldRef {
+            node_id: NodeId(0),
+            name: "$widened".into(),
+            span,
+        };
+        let mut f = HashSet::new();
+        expr.support_into(&mut f);
+        assert!(
+            f.is_empty(),
+            "$widened FieldRef must be excluded; got {f:?}"
+        );
+    }
 }
