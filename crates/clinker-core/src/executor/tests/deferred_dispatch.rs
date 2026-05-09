@@ -203,6 +203,7 @@ o3,ENG,100
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers(
         &config,
@@ -330,6 +331,7 @@ nodes:
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
     // The pipeline either errors at the producer's region tee (E310 from
@@ -461,6 +463,7 @@ o3,HR,30
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
     with_test_loop_cap(0, || {
@@ -618,6 +621,7 @@ ENG,500
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers(
         &config,
@@ -810,6 +814,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     // Run via the standard `run_with_readers_writers` entry point;
     // composition resolution flows through the same `_compose:` loader
@@ -1054,6 +1059,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
@@ -1284,6 +1290,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
@@ -1487,6 +1494,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
@@ -1672,6 +1680,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
@@ -1829,6 +1838,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
     let report = PipelineExecutor::run_with_readers_writers(
@@ -2020,6 +2030,7 @@ nodes:
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
     let result = PipelineExecutor::run_with_readers_writers(

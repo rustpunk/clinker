@@ -96,6 +96,7 @@ o3,ENG,100
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let config = crate::config::parse_config(STRICT_PIPELINE).expect("parse");
     let report = PipelineExecutor::run_with_readers_writers(

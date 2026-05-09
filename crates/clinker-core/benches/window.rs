@@ -286,6 +286,7 @@ nodes:
         batch_id: "bench-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let mut group = c.benchmark_group("node_rooted_window");
@@ -398,6 +399,7 @@ nodes:
         batch_id: "bench-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     // Build dept lookup once.

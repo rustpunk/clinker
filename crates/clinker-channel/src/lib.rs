@@ -59,4 +59,4 @@ pub use binding::{
     ChannelBinding, ChannelTarget, DottedPath, scan_workspace_channels, validate_channel_bindings,
 };
 pub use error::ChannelError;
-pub use overlay::apply_channel_overlay;
+pub use overlay::{ChannelOverlayResult, apply_channel_overlay};

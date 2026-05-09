@@ -211,7 +211,10 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    validate_producer_writers(nodes, diags);
+    // Cross-Transform duplicate `declares:` (the only path that
+    // produced multi-writer for a `(scope, var)` pair) is now caught at
+    // config-validation time by `validate_unique_scoped_declarations`,
+    // so the previous compile-time E170 multi-writer check is dead.
     validate_init_phase_terminals(nodes, diags);
     validate_read_after_write(nodes, &artifacts, diags);
     validate_post_merge_source_reads(nodes, &artifacts, diags);
@@ -231,7 +234,7 @@ pub fn bind_schema(
 /// (declaration default is the intended value). Only the
 /// init-reads-runtime-only case is flagged.
 ///
-/// Reuses `validate_producer_writers`'s writer-map shape and
+/// Reuses `iter_writers` for the writer-map shape and
 /// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
 /// Iterate every (scope, var) writer in the pipeline. Each writer is
 /// a Transform with one or more `config.declares:` entries; one
@@ -240,21 +243,18 @@ struct WriterInfo<'a> {
     scope: crate::config::VarScope,
     var: &'a str,
     node_name: &'a str,
-    span: Span,
     phase: crate::config::Phase,
 }
 
 fn iter_writers<'a>(nodes: &'a [Spanned<PipelineNode>]) -> Vec<WriterInfo<'a>> {
     let mut out = Vec::new();
     for spanned in nodes {
-        let span = span_for_node(spanned);
         if let PipelineNode::Transform { header, config } = &spanned.value {
             for entry in &config.declares {
                 out.push(WriterInfo {
                     scope: entry.scope,
                     var: &entry.name,
                     node_name: &header.name,
-                    span,
                     phase: config.phase,
                 });
             }
@@ -965,56 +965,6 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
                     )),
                 );
             }
-        }
-    }
-}
-
-/// Compile-time check: at most one Transform writes any given
-/// `(scope, var)` pair via `declares:`. Multiple writers produce
-/// non-deterministic last-write-wins behavior — the locked-decision
-/// design forbids it and demands the user collapse the writes into a
-/// single Transform (Hop / Talend canonical anti-pattern).
-///
-/// Init-phase and runtime-phase writers are tracked together; a
-/// converging-init writer is architecturally distinct from a
-/// converging-runtime writer (init runs to completion first), but the
-/// single-writer rule applies to both pools uniformly here.
-///
-/// Emits E170 with primary span on the second writer and secondary
-/// span on the first (the chronologically-first span in declaration
-/// order is the "canonical" writer; downstream nodes are duplicates).
-fn validate_producer_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
-    let mut seen: std::collections::HashMap<(crate::config::VarScope, String), (Span, String)> =
-        std::collections::HashMap::new();
-    let scope_str = |scope: crate::config::VarScope| match scope {
-        crate::config::VarScope::Pipeline => "$pipeline",
-        crate::config::VarScope::Source => "$source",
-        crate::config::VarScope::Record => "$record",
-    };
-    for w in iter_writers(nodes) {
-        let key = (w.scope, w.var.to_string());
-        if let Some((first_span, first_node)) = seen.get(&key) {
-            diags.push(
-                Diagnostic::error(
-                    "E170",
-                    format!(
-                        "scoped variable '{}.{}' has multiple writers: \
-                         {:?} duplicates the write from earlier writer {:?} — \
-                         collapse into a single producer",
-                        scope_str(w.scope),
-                        w.var,
-                        w.node_name,
-                        first_node
-                    ),
-                    LabeledSpan::primary(w.span, "second writer".to_string()),
-                )
-                .with_secondary(LabeledSpan::new(
-                    *first_span,
-                    Some("first writer".to_string()),
-                )),
-            );
-        } else {
-            seen.insert(key, (w.span, w.node_name.to_string()));
         }
     }
 }

@@ -41,6 +41,7 @@ fn test_params() -> PipelineRunParams {
         batch_id: "batch-001".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     }
 }
 

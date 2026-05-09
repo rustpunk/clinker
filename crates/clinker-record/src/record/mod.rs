@@ -163,6 +163,27 @@ impl Record {
         }
     }
 
+    /// Pre-seed `$record.<key>` defaults into this record before any
+    /// per-record writer fires. Used at materialization to plant
+    /// channel-supplied and Transform-declared `scope: record` defaults
+    /// so init-phase reads observe the right value when the writer
+    /// hasn't run yet. Existing entries are preserved (writers that
+    /// fired earlier in the materialization path win).
+    pub fn seed_record_vars(&mut self, seed: &IndexMap<String, Value>) {
+        if seed.is_empty() {
+            return;
+        }
+        let map = self
+            .record_vars
+            .get_or_insert_with(|| Box::new(IndexMap::new()));
+        for (k, v) in seed {
+            if map.len() >= MAX_RECORD_VARS && !map.contains_key(k.as_str()) {
+                break;
+            }
+            map.entry(k.as_str().into()).or_insert_with(|| v.clone());
+        }
+    }
+
     // ── Fields ─────────────────────────────────────────────────────
 
     /// Iterator over every schema field in schema order.

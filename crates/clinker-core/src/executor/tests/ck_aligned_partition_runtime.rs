@@ -83,6 +83,7 @@ o6,ENG,300
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_with_readers_writers(
         &config,

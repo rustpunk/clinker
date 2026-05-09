@@ -17,4 +17,6 @@ pub enum ChannelError {
     },
     #[error("invalid dotted path `{path}`: {reason}")]
     InvalidDottedPath { path: String, reason: String },
+    #[error("invalid var name `{name}`: {reason}")]
+    InvalidVarName { name: String, reason: String },
 }

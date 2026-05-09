@@ -1,0 +1,42 @@
+# Fixture pipeline used by `channel_var_overlay_test`. Declares one
+# `$vars.*` and one `$pipeline.*` / `$source.*` / `$record.*` to exercise
+# every channel-overlay path.
+pipeline:
+  name: channel_vars_pipeline
+  vars:
+    fuzzy_threshold:
+      type: float
+      default: 0.85
+    cohort_label:
+      type: string
+      default: "baseline"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: numeric }
+
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      declares:
+        - { name: cutoff_date, scope: pipeline, type: date, default: "2024-01-01" }
+        - { name: ingest_label, scope: source, type: string, default: "prod" }
+        - { name: tier, scope: record, type: string, default: "bronze" }
+      cxl: |
+        emit order_id = order_id
+        emit amount = amount
+
+  - type: output
+    name: sink
+    input: enrich
+    config:
+      name: sink
+      type: csv
+      path: data/channel_vars_output.csv

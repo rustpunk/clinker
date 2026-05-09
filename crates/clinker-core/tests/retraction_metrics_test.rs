@@ -25,6 +25,7 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
         batch_id: "test-batch".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers = HashMap::from([(

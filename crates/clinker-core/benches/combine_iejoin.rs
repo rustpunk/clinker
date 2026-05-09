@@ -283,6 +283,7 @@ fn bench_params() -> PipelineRunParams {
         batch_id: "iejoin-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     }
 }
 

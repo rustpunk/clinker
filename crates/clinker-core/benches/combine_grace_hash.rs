@@ -206,6 +206,7 @@ fn bench_params() -> PipelineRunParams {
         batch_id: "grace-hash-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     }
 }
 

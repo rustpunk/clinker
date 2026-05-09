@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use clinker_core::config::ScopedVarDecl;
 use clinker_core::config::composition::CompositionSymbolTable;
 use clinker_core::error::{Diagnostic, LabeledSpan};
 use clinker_core::span::Span;
@@ -116,6 +117,22 @@ pub struct ChannelBinding {
     pub config_fixed: IndexMap<DottedPath, serde_json::Value>,
     pub resources_default: IndexMap<DottedPath, serde_json::Value>,
     pub resources_fixed: IndexMap<DottedPath, serde_json::Value>,
+    /// Channel-supplied overrides/adds for the pipeline-level `vars:`
+    /// block (read via `$vars.<key>`). Each entry mirrors the pipeline
+    /// declaration shape: `{ type, default }`. Override-existing matches
+    /// the declared type; add-new becomes the new declaration.
+    pub vars_static: IndexMap<String, ScopedVarDecl>,
+    /// Channel-supplied overrides/adds for `$pipeline.<key>` declared
+    /// on Transforms via `declares: { scope: pipeline }`.
+    pub vars_pipeline: IndexMap<String, ScopedVarDecl>,
+    /// Channel-supplied overrides/adds for `$source.<key>` declared
+    /// on Transforms via `declares: { scope: source }`. Outer key is
+    /// the source-node name; inner key is the var name.
+    pub vars_source: IndexMap<String, IndexMap<String, ScopedVarDecl>>,
+    /// Channel-supplied overrides/adds for `$record.<key>` declared
+    /// on Transforms via `declares: { scope: record }`. Channel-wide
+    /// (every record sees the same channel-supplied default).
+    pub vars_record: IndexMap<String, ScopedVarDecl>,
     pub source_path: PathBuf,
     /// BLAKE3 hash of the raw file bytes, used as cache-invalidation identity.
     pub channel_hash: [u8; 32],
@@ -144,6 +161,14 @@ impl ChannelBinding {
         let resources_default = validate_dotted_keys(raw.resources.default)?;
         let resources_fixed = validate_dotted_keys(raw.resources.fixed)?;
 
+        validate_var_names(raw.vars.static_block.keys())?;
+        validate_var_names(raw.vars.pipeline.keys())?;
+        validate_var_names(raw.vars.record.keys())?;
+        for (src_name, inner) in &raw.vars.source {
+            validate_var_name(src_name)?;
+            validate_var_names(inner.keys())?;
+        }
+
         Ok(ChannelBinding {
             name: raw.channel.name,
             target,
@@ -151,6 +176,10 @@ impl ChannelBinding {
             config_fixed,
             resources_default,
             resources_fixed,
+            vars_static: raw.vars.static_block,
+            vars_pipeline: raw.vars.pipeline,
+            vars_source: raw.vars.source,
+            vars_record: raw.vars.record,
             source_path,
             channel_hash,
         })
@@ -172,6 +201,8 @@ struct RawChannelFile {
     config: RawChannelConfig,
     #[serde(default)]
     resources: RawChannelConfig,
+    #[serde(default)]
+    vars: RawChannelVars,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +217,18 @@ struct RawChannelConfig {
     default: IndexMap<String, serde_json::Value>,
     #[serde(default)]
     fixed: IndexMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawChannelVars {
+    #[serde(default, rename = "static")]
+    static_block: IndexMap<String, ScopedVarDecl>,
+    #[serde(default)]
+    pipeline: IndexMap<String, ScopedVarDecl>,
+    #[serde(default)]
+    source: IndexMap<String, IndexMap<String, ScopedVarDecl>>,
+    #[serde(default)]
+    record: IndexMap<String, ScopedVarDecl>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -207,6 +250,46 @@ fn validate_dotted_keys(
             Ok((path, v))
         })
         .collect()
+}
+
+/// Channel `vars:` keys are flat names — accept the same character set
+/// CXL identifiers use. Reject empties, dotted forms (declarations are
+/// per-scope and per-source-name; nesting under `vars.<scope>` already
+/// resolves the scope), and leading-digit names.
+fn validate_var_name(name: &str) -> Result<(), ChannelError> {
+    if name.is_empty() {
+        return Err(ChannelError::InvalidVarName {
+            name: name.to_string(),
+            reason: "name is empty".to_string(),
+        });
+    }
+    if name.contains('.') {
+        return Err(ChannelError::InvalidVarName {
+            name: name.to_string(),
+            reason: "dots are not allowed in flat var names".to_string(),
+        });
+    }
+    let first = name.as_bytes()[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(ChannelError::InvalidVarName {
+            name: name.to_string(),
+            reason: "name must start with a letter or '_'".to_string(),
+        });
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(ChannelError::InvalidVarName {
+            name: name.to_string(),
+            reason: "only [a-zA-Z0-9_] characters are allowed".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_var_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Result<(), ChannelError> {
+    for n in names {
+        validate_var_name(n)?;
+    }
+    Ok(())
 }
 
 // ── Channel validation ─────────────────────────────────────────────────

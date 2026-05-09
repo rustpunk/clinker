@@ -15,8 +15,13 @@ fn channel_fixtures_dir() -> PathBuf {
     fixtures_dir().join("channels")
 }
 
-/// Compile a pipeline fixture into a CompiledPlan for overlay testing.
-fn compile_fixture(rel_pipeline_path: &str) -> clinker_core::plan::CompiledPlan {
+/// Compile a pipeline fixture into (config, plan) for overlay testing.
+fn compile_fixture(
+    rel_pipeline_path: &str,
+) -> (
+    clinker_core::config::PipelineConfig,
+    clinker_core::plan::CompiledPlan,
+) {
     let root = fixtures_dir();
     let yaml_path = root.join(rel_pipeline_path);
     let yaml = std::fs::read_to_string(&yaml_path)
@@ -28,7 +33,9 @@ fn compile_fixture(rel_pipeline_path: &str) -> clinker_core::plan::CompiledPlan 
         .unwrap_or(std::path::Path::new(""))
         .to_path_buf();
     let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
-    clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile fixture")
+    let plan =
+        clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile fixture");
+    (config, plan)
 }
 
 // ── Channel overlay merge tests ─────────────────────────────────────────
@@ -37,7 +44,7 @@ fn compile_fixture(rel_pipeline_path: &str) -> clinker_core::plan::CompiledPlan 
 fn test_channel_overlay_applies_fixed_binding_wins() {
     // nested_composition_pipeline has composition `nested_process` with
     // `strict_mode: false` at the call site (CompositionDefault).
-    let mut plan = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+    let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
 
     // Verify provenance exists before overlay
     assert!(
@@ -58,7 +65,7 @@ config:
     let binding =
         ChannelBinding::from_yaml_bytes(yaml, PathBuf::from("test.channel.yaml")).unwrap();
 
-    let _diags = apply_channel_overlay(&mut plan, &binding);
+    let _result = apply_channel_overlay(&mut plan, &binding, &config);
 
     let resolved = plan
         .provenance()
@@ -80,7 +87,7 @@ config:
 
 #[test]
 fn test_channel_overlay_default_does_not_override_fixed() {
-    let mut plan = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+    let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
 
     // First apply a ChannelFixed layer
     let fixed_yaml = br#"
@@ -93,7 +100,7 @@ config:
 "#;
     let fixed_binding =
         ChannelBinding::from_yaml_bytes(fixed_yaml, PathBuf::from("fixed.channel.yaml")).unwrap();
-    apply_channel_overlay(&mut plan, &fixed_binding);
+    apply_channel_overlay(&mut plan, &fixed_binding, &config);
 
     // Now apply a ChannelDefault layer — it should NOT override the fixed winner
     let default_yaml = br#"
@@ -107,7 +114,7 @@ config:
     let default_binding =
         ChannelBinding::from_yaml_bytes(default_yaml, PathBuf::from("default.channel.yaml"))
             .unwrap();
-    apply_channel_overlay(&mut plan, &default_binding);
+    apply_channel_overlay(&mut plan, &default_binding, &config);
 
     let resolved = plan
         .provenance()
@@ -129,8 +136,8 @@ config:
 
 #[test]
 fn test_channel_identity_stable_across_reruns() {
-    let mut plan1 = compile_fixture("pipelines/nested_composition_pipeline.yaml");
-    let mut plan2 = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+    let (config, mut plan1) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+    let (_, mut plan2) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
 
     let yaml = br#"
 channel:
@@ -143,8 +150,8 @@ config:
     let binding1 = ChannelBinding::from_yaml_bytes(yaml, PathBuf::from("a.channel.yaml")).unwrap();
     let binding2 = ChannelBinding::from_yaml_bytes(yaml, PathBuf::from("b.channel.yaml")).unwrap();
 
-    apply_channel_overlay(&mut plan1, &binding1);
-    apply_channel_overlay(&mut plan2, &binding2);
+    apply_channel_overlay(&mut plan1, &binding1, &config);
+    apply_channel_overlay(&mut plan2, &binding2, &config);
 
     let id1 = plan1
         .channel_identity()
@@ -188,8 +195,8 @@ fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
         let binding = ChannelBinding::load(&channel_path)
             .unwrap_or_else(|e| panic!("load {channel_name}: {e}"));
 
-        let mut plan = compile_fixture("pipelines/nested_composition_pipeline.yaml");
-        let diags = apply_channel_overlay(&mut plan, &binding);
+        let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+        let result = apply_channel_overlay(&mut plan, &binding, &config);
 
         // Channel identity should be stamped
         assert!(
@@ -198,7 +205,8 @@ fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
         );
 
         // No error-severity diagnostics
-        let errors: Vec<_> = diags
+        let errors: Vec<_> = result
+            .diagnostics
             .iter()
             .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
             .collect();
@@ -213,7 +221,7 @@ fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
 
 #[test]
 fn test_channel_identity_is_none_before_overlay() {
-    let plan = compile_fixture("pipelines/nested_composition_pipeline.yaml");
+    let (_, plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
     assert!(
         plan.channel_identity().is_none(),
         "channel_identity should be None for base compiled plan"

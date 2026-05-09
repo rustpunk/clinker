@@ -195,6 +195,13 @@ pub struct RunArgs {
     /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
     #[arg(long, help_heading = "Metrics")]
     pub metrics_spool_dir: Option<PathBuf>,
+
+    /// Channel YAML file to overlay before execution.
+    /// The channel can override or add `$vars.*` / `$pipeline.*` /
+    /// `$source.*` / `$record.*` defaults. Reserved system field names
+    /// are rejected.
+    #[arg(long, help_heading = "Configuration")]
+    pub channel: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -411,6 +418,36 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
     eprintln!("{report:?}");
 }
 
+/// Print every diagnostic from a channel-overlay result and convert
+/// any error-severity entry into a `PipelineError::Compilation` so
+/// the run aborts before executor init.
+fn abort_on_overlay_errors(
+    overlay: &clinker_channel::ChannelOverlayResult,
+) -> Result<(), PipelineError> {
+    use clinker_core::error::Severity;
+    let mut had_error = false;
+    let mut messages: Vec<String> = Vec::new();
+    for d in &overlay.diagnostics {
+        let severity_label = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        };
+        eprintln!("{}: [{}] {}", severity_label, d.code, d.message);
+        if matches!(d.severity, Severity::Error) {
+            had_error = true;
+            messages.push(format!("[{}] {}", d.code, d.message));
+        }
+    }
+    if had_error {
+        return Err(PipelineError::Compilation {
+            transform_name: String::from("<channel overlay>"),
+            messages,
+        });
+    }
+    Ok(())
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -421,10 +458,39 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    // Load pipeline YAML directly — single-model scan, no composition or
-    // channel overlay at this entry point.
     let mut pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
         .map_err(PipelineError::Config)?;
+
+    // Load the channel binding once if `--channel` was supplied. The
+    // overlay itself runs against each `compile()` result below; the
+    // binding is borrowed by the `--explain` arm and the main run.
+    let channel_binding = match args.channel.as_deref() {
+        Some(path) => Some(clinker_channel::ChannelBinding::load(path).map_err(|e| {
+            PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
+                "channel '{}': {e}",
+                path.display(),
+            )))
+        })?),
+        None => None,
+    };
+    if let Some(b) = &channel_binding {
+        let target = match &b.target {
+            clinker_channel::ChannelTarget::Pipeline(p) => p,
+            clinker_channel::ChannelTarget::Composition(p) => p,
+        };
+        let canon_target = std::fs::canonicalize(target).ok();
+        let canon_config = std::fs::canonicalize(&args.config).ok();
+        if let (Some(t), Some(c)) = (canon_target.as_ref(), canon_config.as_ref())
+            && t != c
+        {
+            eprintln!(
+                "W104: channel {:?} targets {:?} but run loaded {:?}; proceeding",
+                b.name,
+                target.display(),
+                args.config.display(),
+            );
+        }
+    }
 
     // Resolve workspace_root ONCE at the entry point.
     // Production CLI path — never call env::current_dir() inside compile().
@@ -464,7 +530,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let template_ctx = clinker_core::output::path_template::TemplateContext {
         source_name_default: source_name_default.as_deref(),
         source_name_by_node: source_name_by_node.clone(),
-        channel: None,
+        channel: channel_binding.as_ref().map(|b| b.name.as_str()),
         pipeline_hash,
         timestamp: Some(&timestamp_str),
         execution_id: Some(&execution_id),
@@ -483,13 +549,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     if let Some(format) = args.explain {
-        let compiled_plan =
+        let mut compiled_plan =
             pipeline_config
                 .compile(&compile_ctx)
                 .map_err(|diags| PipelineError::Compilation {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
+        if let Some(binding) = &channel_binding {
+            let overlay = clinker_channel::apply_channel_overlay(
+                &mut compiled_plan,
+                binding,
+                &pipeline_config,
+            );
+            abort_on_overlay_errors(&overlay)?;
+        }
         let dag = compiled_plan.dag();
         let artifacts = compiled_plan.artifacts();
         match format {
@@ -543,17 +617,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .and_then(|m| m.spool_dir.as_deref());
     let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
-    // Build runtime parameters. execution_id/batch_id were generated
-    // earlier so the path-template context could embed them. Channel
-    // overlay (Stage 7) will eventually populate `pipeline_vars` from
-    // the active channel's overrides; for now it stays empty and the
-    // executor seeds defaults from each Transform's `declares:` block.
-    let run_params = clinker_core::executor::PipelineRunParams {
-        execution_id: execution_id.clone(),
-        batch_id: batch_id.clone(),
-        pipeline_vars: Default::default(),
-        shutdown_token: None,
-    };
+    // Channel-resolved var overrides land here when --channel is set.
+    // Populated below from `apply_channel_overlay` after compile; the
+    // executor layers them atop Transform-declared defaults at init.
+    let mut channel_static_vars: indexmap::IndexMap<String, clinker_record::Value> =
+        Default::default();
+    let mut channel_pipeline_vars: indexmap::IndexMap<String, clinker_record::Value> =
+        Default::default();
+    let mut channel_source_vars: indexmap::IndexMap<
+        String,
+        indexmap::IndexMap<String, clinker_record::Value>,
+    > = Default::default();
+    let mut channel_record_vars: indexmap::IndexMap<String, clinker_record::Value> =
+        Default::default();
 
     // Run the pipeline using file-based I/O — open readers for ALL sources
     // (primary + lookup references) and writers for ALL outputs.
@@ -651,7 +727,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Compile the plan up front so output-side fan-out detection
     // (§5) can read `fan_out_per_source_file` flags before the writer
     // setup decides whether to open one writer or N.
-    let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    let mut compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    if let Some(binding) = &channel_binding {
+        let overlay =
+            clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, &pipeline_config);
+        abort_on_overlay_errors(&overlay)?;
+        channel_static_vars = overlay.static_vars;
+        channel_pipeline_vars = overlay.pipeline_vars;
+        channel_source_vars = overlay.source_vars;
+        channel_record_vars = overlay.record_vars;
+    }
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
@@ -754,6 +839,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let registry = clinker_core::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
+    };
+    let run_params = clinker_core::executor::PipelineRunParams {
+        execution_id: execution_id.clone(),
+        batch_id: batch_id.clone(),
+        pipeline_vars: channel_pipeline_vars,
+        static_vars: channel_static_vars,
+        source_vars: channel_source_vars,
+        record_vars: channel_record_vars,
+        shutdown_token: None,
     };
     let report = match PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,

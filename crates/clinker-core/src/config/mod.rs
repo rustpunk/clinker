@@ -3591,7 +3591,7 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 /// Reserved `$pipeline.*` member names that cannot be used as
 /// `declares:` entry names with `scope: pipeline`. Mirrors
 /// `crates/cxl/src/resolve/pass.rs::PIPELINE_MEMBERS`.
-const RESERVED_PIPELINE_NAMES: &[&str] = &[
+pub const RESERVED_PIPELINE_NAMES: &[&str] = &[
     "start_time",
     "name",
     "execution_id",
@@ -3605,7 +3605,7 @@ const RESERVED_PIPELINE_NAMES: &[&str] = &[
 
 /// Reserved `$source.*` member names. Mirrors
 /// `crates/cxl/src/resolve/pass.rs::SOURCE_MEMBERS`.
-const RESERVED_SOURCE_NAMES: &[&str] = &[
+pub const RESERVED_SOURCE_NAMES: &[&str] = &[
     "file",
     "row",
     "path",
@@ -3618,7 +3618,17 @@ const RESERVED_SOURCE_NAMES: &[&str] = &[
 /// `index` (record's positional index in its source) and `source` (a
 /// back-reference to the originating source-node name) as builtin
 /// members.
-const RESERVED_RECORD_NAMES: &[&str] = &[];
+pub const RESERVED_RECORD_NAMES: &[&str] = &[];
+
+/// Single source of truth for the reserved-name lookup by scope.
+/// Used by `declares:` validation and channel-overlay validation.
+pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static str] {
+    match scope {
+        pipeline_node::VarScope::Pipeline => RESERVED_PIPELINE_NAMES,
+        pipeline_node::VarScope::Source => RESERVED_SOURCE_NAMES,
+        pipeline_node::VarScope::Record => RESERVED_RECORD_NAMES,
+    }
+}
 
 /// Post-deserialization validation.
 fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
@@ -3640,7 +3650,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     if let Some(ref vars) = config.pipeline.vars {
         for (name, decl) in vars {
             if let Some(default) = &decl.default {
-                check_default_type("vars", name, decl.var_type, default)?;
+                check_scoped_var_default("vars", name, decl.var_type, default)?;
             }
         }
     }
@@ -3656,19 +3666,19 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
             continue;
         };
         for entry in &body.declares {
-            let (scope_label, reserved) = match entry.scope {
-                pipeline_node::VarScope::Pipeline => ("pipeline", RESERVED_PIPELINE_NAMES),
-                pipeline_node::VarScope::Source => ("source", RESERVED_SOURCE_NAMES),
-                pipeline_node::VarScope::Record => ("record", RESERVED_RECORD_NAMES),
+            let scope_label = match entry.scope {
+                pipeline_node::VarScope::Pipeline => "pipeline",
+                pipeline_node::VarScope::Source => "source",
+                pipeline_node::VarScope::Record => "record",
             };
-            if reserved.contains(&entry.name.as_str()) {
+            if reserved_names_for(entry.scope).contains(&entry.name.as_str()) {
                 return Err(ConfigError::Validation(format!(
                     "transform '{}': declares: '{}' is a reserved ${} member name and cannot be used as a variable",
                     header.name, entry.name, scope_label,
                 )));
             }
             if let Some(default) = &entry.default {
-                check_default_type(
+                check_scoped_var_default(
                     &format!("transform '{}' declares", header.name),
                     &entry.name,
                     entry.var_type,
@@ -3677,6 +3687,8 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
             }
         }
     }
+
+    validate_unique_scoped_declarations(config)?;
 
     // Validate log directives on Transform nodes.
     for spanned in &config.nodes {
@@ -3710,7 +3722,11 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn check_default_type(
+/// Typecheck a serde-json default value against a declared scoped-var
+/// type. Used at config-load time for pipeline `vars:` and Transform
+/// `declares:` defaults, and at channel-bind time for channel var
+/// overrides — same invariant in every caller.
+pub fn check_scoped_var_default(
     where_label: &str,
     name: &str,
     var_type: ScopedVarType,
@@ -3745,9 +3761,12 @@ pub fn convert_vars(
 ) -> IndexMap<String, clinker_record::Value> {
     vars.iter()
         .filter_map(|(name, decl)| {
-            decl.default
-                .as_ref()
-                .map(|default| (name.clone(), default_to_value(decl.var_type, default)))
+            decl.default.as_ref().map(|default| {
+                (
+                    name.clone(),
+                    coerce_scoped_var_default(decl.var_type, default),
+                )
+            })
         })
         .collect()
 }
@@ -3761,20 +3780,33 @@ pub fn convert_vars(
 pub fn collect_pipeline_var_defaults(
     nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
 ) -> IndexMap<String, clinker_record::Value> {
-    use crate::config::pipeline_node::{PipelineNode, VarScope};
+    collect_scoped_var_defaults(nodes, pipeline_node::VarScope::Pipeline)
+}
+
+/// Walk every Transform's `declares:` entries and collect declared
+/// defaults for variables whose scope matches `wanted`. Pipeline,
+/// Source, and Record scopes share the same shape — pull them through
+/// the same helper rather than duplicating the loop body. Source and
+/// record defaults use this map as their pre-seed at executor init
+/// when channel-supplied overrides are absent.
+fn collect_scoped_var_defaults(
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+    wanted: pipeline_node::VarScope,
+) -> IndexMap<String, clinker_record::Value> {
+    use crate::config::pipeline_node::PipelineNode;
     let mut out = IndexMap::new();
     for spanned in nodes {
         let PipelineNode::Transform { config, .. } = &spanned.value else {
             continue;
         };
         for entry in &config.declares {
-            if entry.scope != VarScope::Pipeline {
+            if entry.scope != wanted {
                 continue;
             }
             if let Some(default) = &entry.default {
                 out.insert(
                     entry.name.clone(),
-                    default_to_value(entry.var_type, default),
+                    coerce_scoped_var_default(entry.var_type, default),
                 );
             }
         }
@@ -3782,7 +3814,81 @@ pub fn collect_pipeline_var_defaults(
     out
 }
 
-fn default_to_value(var_type: ScopedVarType, default: &serde_json::Value) -> clinker_record::Value {
+/// Walk every Transform's `declares:` entries and collect declared
+/// defaults for variables whose `scope: source`. Channels overlay
+/// per-source-name overrides on top of this baseline.
+pub fn collect_source_var_defaults(
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+) -> IndexMap<String, clinker_record::Value> {
+    collect_scoped_var_defaults(nodes, pipeline_node::VarScope::Source)
+}
+
+/// Walk every Transform's `declares:` entries and collect declared
+/// defaults for variables whose `scope: record`. Channels overlay
+/// channel-wide defaults on top; the executor pre-seeds these into
+/// each record's `record_vars` map at materialization.
+pub fn collect_record_var_defaults(
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+) -> IndexMap<String, clinker_record::Value> {
+    collect_scoped_var_defaults(nodes, pipeline_node::VarScope::Record)
+}
+
+/// Walk the config's declared scopes ({Pipeline, Source, Record}) and
+/// reject duplicate names within each flat shared registry. Source-scope
+/// uniqueness applies globally (the runtime keys source-scope state by
+/// `Arc<str>` source-file but the declared-name namespace is shared).
+///
+/// A duplicate name implies ambiguity for downstream channel-overlay
+/// resolution and for the runtime read namespace itself — flat shared
+/// namespaces fail-fast (Beam, Flink, Kafka Streams, Dagster, Cargo,
+/// Rust statics, post-fix dbt). Authors who want shared state declare
+/// once and reference everywhere; clinker has no nested-scope construct
+/// for `$pipeline.*`/`$source.*`/`$record.*` that would justify
+/// shadowing semantics.
+fn validate_unique_scoped_declarations(config: &PipelineConfig) -> Result<(), ConfigError> {
+    use crate::config::pipeline_node::{PipelineNode, VarScope};
+    for scope in [VarScope::Pipeline, VarScope::Source, VarScope::Record] {
+        let mut first_seen: HashMap<&str, &str> = HashMap::new();
+        for spanned in &config.nodes {
+            let PipelineNode::Transform {
+                header,
+                config: body,
+            } = &spanned.value
+            else {
+                continue;
+            };
+            for entry in &body.declares {
+                if entry.scope != scope {
+                    continue;
+                }
+                if let Some(prior) = first_seen.insert(entry.name.as_str(), header.name.as_str())
+                    && prior != header.name.as_str()
+                {
+                    let scope_label = match scope {
+                        VarScope::Pipeline => "pipeline",
+                        VarScope::Source => "source",
+                        VarScope::Record => "record",
+                    };
+                    return Err(ConfigError::Validation(format!(
+                        "duplicate ${scope_label} declaration: '{name}' is declared in transforms '{prior}' and '{current}' — the {scope_label}-scope namespace is flat and shared, declare once and reference",
+                        name = entry.name,
+                        current = header.name,
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Coerce a serde-json default value into a typed `clinker_record::Value`
+/// according to the declared scoped-var type. Caller MUST have run
+/// [`check_scoped_var_default`] first; this function panics on any
+/// (type, value) combo that validator would have rejected.
+pub fn coerce_scoped_var_default(
+    var_type: ScopedVarType,
+    default: &serde_json::Value,
+) -> clinker_record::Value {
     use clinker_record::Value;
     match (var_type, default) {
         (ScopedVarType::Bool, serde_json::Value::Bool(b)) => Value::Bool(*b),
@@ -3796,8 +3902,7 @@ fn default_to_value(var_type: ScopedVarType, default: &serde_json::Value) -> cli
             ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
             serde_json::Value::String(s),
         ) => Value::String(s.clone().into_boxed_str()),
-        // check_default_type rejects every other (type, default) combo.
-        _ => unreachable!("check_default_type should reject mismatched defaults"),
+        _ => unreachable!("check_scoped_var_default should reject mismatched defaults"),
     }
 }
 
