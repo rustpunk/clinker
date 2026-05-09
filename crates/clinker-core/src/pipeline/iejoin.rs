@@ -759,8 +759,24 @@ pub(crate) fn execute_combine_iejoin(
                         first_collected_builds
                             .entry(driver_idx)
                             .or_insert_with(|| build_record.clone());
+                        // Build-side records contribute only their
+                        // user-declared field values to the collect
+                        // array. `iter_user_fields` filters every
+                        // engine-stamped column — both `$ck.*`
+                        // (correlation lineage; not meaningful nested
+                        // inside a collect-array entry) and `$widened`
+                        // (the auto_widen sidecar absorber; build-side
+                        // sidecars drop at the join boundary by
+                        // design, mirroring `propagate_ck: Driver`).
+                        // Without this filter, a build record's
+                        // `$widened` `Value::Map` payload nests inside
+                        // the collect-mode `Value::Map` and survives
+                        // projection (it's a regular column slot, not
+                        // engine-stamped) all the way to the writer,
+                        // where the nested Map triggers
+                        // `FormatError::UnserializableMapValue`.
                         let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
-                        for (fname, val) in build_record.iter_all_fields() {
+                        for (fname, val) in build_record.iter_user_fields() {
                             m.insert(fname.into(), val.clone());
                         }
                         arr.push(Value::Map(Box::new(m)));

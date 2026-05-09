@@ -227,6 +227,105 @@ nodes:
     );
 }
 
+/// Combine in `match: collect` mode produces a per-driver-row
+/// nested array of build records. Each entry in the array is a
+/// `Value::Map` of the build record's user-declared fields. This
+/// test verifies that the build's auto_widen `$widened` payload
+/// is NOT nested into those collect-array maps — `iter_user_fields`
+/// at the three collect-array build sites (`pipeline/iejoin.rs`,
+/// `pipeline/sort_merge_join.rs`, `pipeline/grace_hash.rs`) filters
+/// every engine-stamped column.
+///
+/// Without that filter, the build's `$widened` Map nests inside
+/// the collect Map, then survives projection (it's a regular column
+/// slot, not engine-stamped) all the way to a non-JSON writer,
+/// where the nested Map triggers
+/// `FormatError::UnserializableMapValue`. The test routes to JSON
+/// output (which natively serializes maps) so the assertion can
+/// inspect the nested structure directly: each entry in the
+/// `products_collected` array must list ONLY the build's
+/// user-declared fields, never `$widened`, `$ck.*`, or any keys
+/// from the build's sidecar map.
+#[test]
+fn h2b_combine_collect_drops_build_widened() {
+    let yaml = r#"
+pipeline:
+  name: h2b_collect
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    match: collect
+    on_miss: skip
+    cxl: ""
+    propagate_ck: driver
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: json
+    path: out.json
+    include_widened: true
+"#;
+    // Build (`products`) carries `extra_meta` as an unmapped column —
+    // auto_widen absorbs it into the build's `$widened` payload.
+    // Driver (`orders`) carries `region` (also unmapped, absorbed
+    // into driver's sidecar).
+    let orders = "order_id,product_id,region\nO1,P1,US\n";
+    let products = "product_id,name,extra_meta\nP1,Widget,build-leak-marker\n";
+    let (_report, output) = run_two_source_merge(yaml, "orders", orders, "products", products);
+    // Driver's sidecar key `region` rides through (include_widened
+    // expansion at the Output projection).
+    assert!(
+        output.contains("\"region\""),
+        "driver-side $widened key `region` must reach the joined output; got: {output}"
+    );
+    // Driver's `region` value rides through.
+    assert!(
+        output.contains("\"US\""),
+        "driver's `region` value must reach the joined output; got: {output}"
+    );
+    // Build's `extra_meta` is in the build's `$widened` payload,
+    // which `iter_user_fields` MUST filter out of the collect-array
+    // map. The build-side leak marker must NOT appear anywhere in
+    // the JSON output. (Before the fix, the build's $widened map
+    // would nest into the collect array — its keys/values would
+    // surface in the JSON output as part of the nested object.)
+    assert!(
+        !output.contains("build-leak-marker"),
+        "build-side $widened payload MUST NOT leak into the collect-array entries \
+         (filtered by iter_user_fields at iejoin/sort_merge_join/grace_hash). got: {output}"
+    );
+    assert!(
+        !output.contains("extra_meta"),
+        "build-side $widened key `extra_meta` MUST NOT appear nested in the \
+         collect-array entries. got: {output}"
+    );
+}
+
 // ── H3: Merge same-policy auto_widen at compile ────────────────
 
 /// E315 (covered by `bind_schema_test::test_merge_mixed_on_unmapped_policy_emits_e315`)

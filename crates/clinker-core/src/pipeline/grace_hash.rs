@@ -1694,8 +1694,20 @@ fn emit_for_probe<'a>(
                 if first_build.is_none() {
                     first_build = Some(cand.record.clone());
                 }
+                // Build-side records contribute only their
+                // user-declared field values to the collect array.
+                // `iter_user_fields` filters every engine-stamped
+                // column — both `$ck.*` (correlation lineage) and
+                // `$widened` (auto_widen sidecar; build-side
+                // sidecars drop at the join boundary by design,
+                // mirroring `propagate_ck: Driver`). Without this
+                // filter, a build record's `$widened` `Value::Map`
+                // payload nests inside the collect-mode
+                // `Value::Map` and reaches the writer as a nested
+                // Map, triggering
+                // `FormatError::UnserializableMapValue`.
                 let mut m: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
-                for (fname, val) in cand.record.iter_all_fields() {
+                for (fname, val) in cand.record.iter_user_fields() {
                     m.insert(fname.into(), val.clone());
                 }
                 arr.push(Value::Map(Box::new(m)));

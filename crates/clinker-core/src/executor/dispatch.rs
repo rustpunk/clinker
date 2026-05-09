@@ -2839,11 +2839,25 @@ pub(crate) fn dispatch_plan_node(
                             if first_collected_build.is_none() {
                                 first_collected_build = Some(candidate.record.clone());
                             }
-                            // Build a Value::Map for every
-                            // matched build record, preserving
-                            // its own schema order.
+                            // Build a Value::Map for every matched
+                            // build record, preserving its own
+                            // schema order. `iter_user_fields`
+                            // filters every engine-stamped column
+                            // — both `$ck.*` (correlation lineage;
+                            // not meaningful nested inside a
+                            // collect-array entry) and `$widened`
+                            // (auto_widen sidecar; build-side
+                            // sidecars drop at the join boundary
+                            // by design, mirroring
+                            // `propagate_ck: Driver`). Without
+                            // this filter, a build record's
+                            // `$widened` `Value::Map` payload
+                            // nests inside the collect-mode
+                            // `Value::Map` and reaches the writer
+                            // as a nested Map, triggering
+                            // `FormatError::UnserializableMapValue`.
                             let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
-                            for (fname, val) in candidate.record.iter_all_fields() {
+                            for (fname, val) in candidate.record.iter_user_fields() {
                                 m.insert(fname.into(), val.clone());
                             }
                             arr.push(Value::Map(Box::new(m)));
