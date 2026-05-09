@@ -549,15 +549,22 @@ fn h6_value_map_round_trips_postcard() {
     }
 }
 
-// ── H7: DLQ entry shape with $widened ──────────────────────────
+// ── H7: DLQ entry carries $widened in-record; DLQ CSV strips it ──
 
 /// A source row that fails downstream coercion (e.g. `to_int()` on a
-/// non-numeric value) gets routed to DLQ. The DLQ entry's CSV row
-/// includes the `$widened` slot for the source's auto_widen schema —
-/// the sidecar's payload is JSON-encoded into the DLQ row so the
-/// failure context is preserved end-to-end.
+/// non-numeric value) gets routed to DLQ. The DLQ entry's
+/// `original_record` retains the source's auto_widen schema — the
+/// `$widened` sidecar column is part of `Record::schema()`, and the
+/// in-flight payload survives end-to-end so the failure context is
+/// preserved. The on-disk DLQ CSV (driven by `dlq::write_dlq`) does
+/// NOT include the literal `$widened` column: a `Value::Map` has no
+/// canonical scalar serialization and would silently JSON-encode into
+/// a single cell, hiding routing bugs the same way the regular
+/// non-JSON writer's silent map-degrade did before commit
+/// `f5ae145`. This test locks both the in-memory DLQ entry shape
+/// AND the on-disk DLQ CSV shape simultaneously.
 #[test]
-fn h7_dlq_includes_widened_column() {
+fn h7_dlq_entry_carries_record_with_widened_but_dlq_csv_strips_it() {
     let yaml = r#"
 pipeline:
   name: h7_dlq
@@ -591,16 +598,7 @@ nodes:
 "#;
     let csv = "id,amount,note\n1,100,ok\n2,bad,broken\n";
     let (report, _output) = run_single(yaml, csv);
-    // Continue-strategy: bad row goes to DLQ, good row reaches
-    // the writer. We don't directly read dlq.csv (the test
-    // harness doesn't provide a writer for it), but the report
-    // counters reflect the routing. The point of this test is to
-    // verify the pipeline does NOT panic / crash under auto_widen
-    // when a row also has an extra column AND a coercion failure;
-    // before the sidecar was added, the same row would have routed
-    // straight to DLQ via FormatError, but now `$widened` carries
-    // `note` through and the per-row coercion failure surfaces the
-    // amount.to_int() error cleanly.
+
     assert_eq!(
         report.counters.dlq_count, 1,
         "exactly one DLQ entry expected (the bad-amount row); got {}",
@@ -610,6 +608,54 @@ nodes:
         report.counters.ok_count, 1,
         "exactly one ok output expected (the good row); got {}",
         report.counters.ok_count
+    );
+    assert_eq!(
+        report.dlq_entries.len(),
+        1,
+        "the report exposes the DLQ entry alongside the counter"
+    );
+
+    let entry = &report.dlq_entries[0];
+
+    // The DLQ entry CARRIES the original record. The record's
+    // schema retains the auto_widen `$widened` sidecar column,
+    // so a downstream consumer driving the entry through other
+    // pipelines (or post-mortem inspection) sees the full
+    // shape — same shape as on the wire before the failure.
+    let record_schema = entry.original_record.schema();
+    assert!(
+        record_schema.contains("$widened"),
+        "DLQ entry's original_record retains the auto_widen schema shape; columns: {:?}",
+        record_schema.columns()
+    );
+
+    // The on-disk DLQ CSV (via `dlq::write_dlq`) DROPS `$widened`
+    // — see `dlq::dlq_user_columns`. Drive `write_dlq` directly
+    // against the entry to verify the on-disk shape.
+    let mut buf = Vec::new();
+    clinker_core::dlq::write_dlq(
+        &mut buf,
+        std::slice::from_ref(entry),
+        record_schema,
+        "test.csv",
+        true,
+        true,
+    )
+    .expect("write_dlq");
+    let dlq_csv = String::from_utf8(buf).expect("utf8 dlq csv");
+    let header_line = dlq_csv.lines().next().expect("dlq csv has header");
+    assert!(
+        !header_line.split(',').any(|c| c.trim() == "$widened"),
+        "DLQ writer must filter `$widened` from output (single point of truth in `dlq_user_columns`); got header: {header_line}"
+    );
+    // The user-declared columns DO appear in the DLQ CSV.
+    assert!(
+        header_line.split(',').any(|c| c.trim() == "id"),
+        "DLQ writer retains user-declared columns; got header: {header_line}"
+    );
+    assert!(
+        header_line.split(',').any(|c| c.trim() == "amount"),
+        "DLQ writer retains user-declared columns; got header: {header_line}"
     );
 }
 
