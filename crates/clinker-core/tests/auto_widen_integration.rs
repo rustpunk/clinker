@@ -512,14 +512,14 @@ nodes:
     }
 }
 
-// ── H6: Spill round-trip preserves Value::Map ─────────────────
+// ── H6: Postcard wire-format invariant for Value::Map ──────────
 
 /// `Value::Map` round-trips through postcard via the Serialize /
-/// Deserialize impls in `clinker-record/src/value.rs:71-140`. The
-/// integration scaffolding is hard to drive into spill paths
-/// without forcing memory pressure, so this test exercises the
-/// canonical serialization path directly: serialize a record
-/// carrying a `$widened` Map, deserialize, verify identity.
+/// Deserialize impls in `clinker-record/src/value.rs:71-140`. This
+/// test pins the bare wire-format invariant: serialize a `$widened`
+/// Map, deserialize, verify identity. H6b below drives the same
+/// payload through the actual spill infrastructure (`SpillWriter` →
+/// `SpillFile` → `SpillReader`) to lock the integration end-to-end.
 #[test]
 fn h6_value_map_round_trips_postcard() {
     use clinker_record::Value;
@@ -546,6 +546,100 @@ fn h6_value_map_round_trips_postcard() {
             assert_eq!(m.len(), 2, "round-trip preserves map cardinality");
         }
         other => panic!("expected Value::Map after postcard round-trip, got {other:?}"),
+    }
+}
+
+/// Drive a `Value::Map` `$widened` payload through the actual
+/// spill infrastructure: `SpillWriter::write_record` →
+/// `SpillFile::reader` → `SpillReader::next`. The records that come
+/// back from the reader are byte-for-byte the records that went in,
+/// including the `$widened` map's keys / values / cardinality. The
+/// test forces the spill pipeline rather than just the bare postcard
+/// codec because the LZ4 frame and the schema-header line in
+/// `pipeline::spill::SpillWriter::new` are part of the on-disk
+/// shape that has to round-trip.
+///
+/// Three records carry distinct `$widened` payloads (different key
+/// sets and value types) so a single-record spill can't accidentally
+/// pass via cached state.
+#[test]
+fn h6b_record_round_trips_through_sort_spill() {
+    use clinker_core::pipeline::spill::SpillWriter;
+    use clinker_record::{Record, Schema, Value};
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec!["id".into(), "$widened".into()]));
+
+    let mut sidecar_a: IndexMap<Box<str>, Value> = IndexMap::new();
+    sidecar_a.insert("note".into(), Value::String("alpha".into()));
+    sidecar_a.insert("count".into(), Value::Integer(1));
+
+    let mut sidecar_b: IndexMap<Box<str>, Value> = IndexMap::new();
+    sidecar_b.insert("city".into(), Value::String("Paris".into()));
+
+    let sidecar_c: IndexMap<Box<str>, Value> = IndexMap::new();
+
+    let inputs: Vec<Record> = vec![
+        Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(1), Value::Map(Box::new(sidecar_a.clone()))],
+        ),
+        Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(2), Value::Map(Box::new(sidecar_b.clone()))],
+        ),
+        Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(3), Value::Map(Box::new(sidecar_c.clone()))],
+        ),
+    ];
+
+    let mut writer: SpillWriter<()> =
+        SpillWriter::new(Arc::clone(&schema), None).expect("open spill writer");
+    for rec in &inputs {
+        writer.write_record(rec).expect("spill write_record");
+    }
+    let spill_file = writer.finish().expect("spill finish");
+
+    let reader = spill_file.reader().expect("spill reader");
+    let mut decoded: Vec<Record> = Vec::new();
+    for item in reader {
+        let (rec, _payload) = item.expect("spill reader item");
+        decoded.push(rec);
+    }
+
+    assert_eq!(
+        decoded.len(),
+        inputs.len(),
+        "spill reader yields the same number of records that were written"
+    );
+
+    for (i, (input, output)) in inputs.iter().zip(decoded.iter()).enumerate() {
+        assert_eq!(
+            input.get("id"),
+            output.get("id"),
+            "row {i}: declared `id` survives the spill round-trip"
+        );
+        match (input.get("$widened"), output.get("$widened")) {
+            (Some(Value::Map(in_map)), Some(Value::Map(out_map))) => {
+                assert_eq!(
+                    in_map.len(),
+                    out_map.len(),
+                    "row {i}: `$widened` map cardinality preserved"
+                );
+                for (k, v) in in_map.iter() {
+                    assert_eq!(
+                        out_map.get(k),
+                        Some(v),
+                        "row {i}: `$widened` key `{k}` value preserved"
+                    );
+                }
+            }
+            (a, b) => panic!(
+                "row {i}: expected Value::Map on both sides of spill round-trip, got input={a:?} output={b:?}"
+            ),
+        }
     }
 }
 
