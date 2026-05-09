@@ -1402,6 +1402,51 @@ mod tests {
         );
     }
 
+    /// `$widened` is the engine-stamped sidecar absorber for the
+    /// `on_unmapped: auto_widen` policy. CXL has no syntax for
+    /// reading or writing it: the parser rejects `$widened.<key>`
+    /// in expression position via the catch-all "unknown system
+    /// namespace" path. The typechecker is blind to the sidecar's
+    /// keys; users who need an absorbed input field at output
+    /// time set `include_widened: true` on the Output node and the
+    /// projection layer expands the map to top-level columns.
+    #[test]
+    fn test_parse_rejects_widened_in_read_position() {
+        let result = Parser::parse("emit foo = $widened.bar");
+        assert!(
+            !result.errors.is_empty(),
+            "$widened.* in expression position must be rejected"
+        );
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("unknown system namespace"),
+            "diagnostic must explain it's an unknown namespace; got: {msg}"
+        );
+        assert!(
+            msg.contains("$widened"),
+            "diagnostic must name the offending namespace; got: {msg}"
+        );
+    }
+
+    /// `emit $widened.<key> = ...` is rejected by the emit-target
+    /// parser path. Different error surface than the read-side
+    /// (the emit parser maintains its own list of writable
+    /// namespaces — pipeline / source / record), but the rejection
+    /// must be unambiguous.
+    #[test]
+    fn test_parse_rejects_widened_in_emit_target() {
+        let result = Parser::parse("emit $widened.foo = 1");
+        assert!(
+            !result.errors.is_empty(),
+            "emit $widened.<key> = ... must be rejected"
+        );
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$widened") || msg.contains("widened"),
+            "diagnostic must name the offending namespace; got: {msg}"
+        );
+    }
+
     #[test]
     fn test_parse_emit_source_namespace_succeeds() {
         let r = parse_ok("emit $source.batch = id");

@@ -389,7 +389,10 @@ impl Expr {
 }
 
 fn is_system_namespace(name: &str) -> bool {
-    name.starts_with("$pipeline") || name.starts_with("$source") || name.starts_with("$ck")
+    name.starts_with("$pipeline")
+        || name.starts_with("$source")
+        || name.starts_with("$ck")
+        || name.starts_with("$widened")
 }
 
 #[derive(Debug, Clone)]
