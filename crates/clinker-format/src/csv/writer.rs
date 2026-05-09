@@ -206,7 +206,16 @@ fn value_to_csv_cell(value: &Value) -> String {
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
         Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
-        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
+        // `Value::Map` is rejected by the per-record precheck in
+        // `CsvWriter::write_record` before any column reaches this
+        // function. The arm exists to keep the match exhaustive
+        // and to fail loudly if a future caller bypasses the
+        // precheck — `unreachable!` panics with the message rather
+        // than silently JSON-encoding the map into a single CSV
+        // cell.
+        Value::Map(_) => unreachable!(
+            "Value::Map is rejected by the per-record precheck in CsvWriter::write_record"
+        ),
     }
 }
 

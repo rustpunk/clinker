@@ -238,7 +238,16 @@ fn value_to_text(val: &Value) -> String {
         Value::Date(d) => d.to_string(),
         Value::DateTime(dt) => dt.to_string(),
         Value::Array(arr) => arr.iter().map(value_to_text).collect::<Vec<_>>().join(","),
-        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
+        // `Value::Map` is rejected by the per-record precheck in
+        // `XmlWriter::write_fields` before any element reaches this
+        // function. The arm exists to keep the match exhaustive
+        // and to fail loudly if a future caller bypasses the
+        // precheck — `unreachable!` panics with the message rather
+        // than silently JSON-encoding the map inside an XML
+        // element.
+        Value::Map(_) => unreachable!(
+            "Value::Map is rejected by the per-record precheck in XmlWriter::write_fields"
+        ),
     }
 }
 

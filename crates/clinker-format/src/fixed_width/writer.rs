@@ -113,12 +113,24 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-            // Arrays remain best-effort empty for now (matches the
-            // CSV writer's `serde_json::to_string(arr)` behavior in
-            // shape — no canonical scalar serialization). `Map` is
-            // pre-rejected in `write_record`, so this match arm is
-            // unreachable for maps.
-            Value::Array(_) | Value::Map(_) => String::new(),
+            // `Value::Array` has no canonical scalar serialization
+            // for fixed-width records, so the writer emits an empty
+            // cell. CSV/XML writers shape-match this for arrays via
+            // `serde_json::to_string(arr)`; fixed-width's strict
+            // positional layout makes JSON-in-cell unworkable.
+            // Users who need an array's contents in a fixed-width
+            // field must coerce to a scalar in CXL before the emit.
+            Value::Array(_) => String::new(),
+            // `Value::Map` is rejected by the per-record precheck
+            // in `FixedWidthWriter::write_record` before any field
+            // reaches this function. The arm exists to keep the
+            // match exhaustive and to fail loudly if a future
+            // caller bypasses the precheck — `unreachable!` panics
+            // with the message rather than silently emitting an
+            // empty fixed-width cell for a Map.
+            Value::Map(_) => unreachable!(
+                "Value::Map is rejected by the per-record precheck in FixedWidthWriter::write_record"
+            ),
         }
     }
 
