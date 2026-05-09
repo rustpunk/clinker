@@ -76,24 +76,7 @@ impl<W: Write> XmlWriter<W> {
             record.iter_user_fields().collect()
         };
 
-        // Reject `Value::Map` payloads explicitly. XML has no
-        // canonical scalar serialization for a map; silently
-        // JSON-encoding it inside an element would hide routing bugs
-        // (e.g. a `$widened` sidecar reaching the writer without the
-        // projection layer's `include_widened: true` expansion).
-        // `build_field_tree` likewise has no nested-Map representation —
-        // it expects `(&str, &Value)` leaves whose `Value` serializes
-        // to a string via `value_to_text`.
-        for (col, v) in &fields {
-            if matches!(v, Value::Map(_)) {
-                return Err(FormatError::UnserializableMapValue {
-                    format: "XML",
-                    column: (*col).to_string(),
-                });
-            }
-        }
-
-        let tree = build_field_tree(&fields, self.config.preserve_nulls);
+        let tree = build_field_tree(&fields, self.config.preserve_nulls)?;
         self.write_field_tree(&tree)?;
 
         Ok(())
@@ -188,18 +171,26 @@ enum FieldNode {
 /// Build a tree from dotted field names. Fields with shared prefixes
 /// are grouped under a single parent branch.
 /// E.g., `Address.City` and `Address.State` → Branch("Address", [Leaf("City"), Leaf("State")])
-fn build_field_tree(fields: &[(&str, &Value)], preserve_nulls: bool) -> Vec<FieldNode> {
+///
+/// Returns `FormatError::UnserializableMapValue` if any field carries
+/// a `Value::Map` payload — XML elements have no canonical scalar
+/// serialization for a map, and `value_to_text` raises from the Map
+/// arm directly.
+fn build_field_tree(
+    fields: &[(&str, &Value)],
+    preserve_nulls: bool,
+) -> Result<Vec<FieldNode>, FormatError> {
     let mut roots: Vec<FieldNode> = Vec::new();
 
     for &(name, val) in fields {
         if val.is_null() && !preserve_nulls {
             continue;
         }
-        let text = value_to_text(val);
+        let text = value_to_text(name, val)?;
         insert_field(&mut roots, name, &text);
     }
 
-    roots
+    Ok(roots)
 }
 
 /// Insert a dotted field name into the tree, creating branches as needed.
@@ -228,8 +219,19 @@ fn insert_field(nodes: &mut Vec<FieldNode>, path: &str, text: &str) {
 }
 
 /// Convert a clinker Value to XML text content.
-fn value_to_text(val: &Value) -> String {
-    match val {
+///
+/// `Value::Map` has no canonical scalar serialization for an XML
+/// element body (silently JSON-encoding hides routing bugs — e.g. a
+/// `$widened` sidecar reaching the writer without
+/// `include_widened: true` expansion), so this returns
+/// `FormatError::UnserializableMapValue` carrying the offending
+/// column. XML is the single point of truth for map rejection on
+/// this path; there is no upstream pre-walk.
+///
+/// Array elements that themselves contain a `Value::Map` propagate
+/// the same rejection (the array is joined element-wise).
+fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
+    Ok(match val {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
@@ -237,18 +239,18 @@ fn value_to_text(val: &Value) -> String {
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.to_string(),
         Value::DateTime(dt) => dt.to_string(),
-        Value::Array(arr) => arr.iter().map(value_to_text).collect::<Vec<_>>().join(","),
-        // `Value::Map` is rejected by the per-record precheck in
-        // `XmlWriter::write_fields` before any element reaches this
-        // function. The arm exists to keep the match exhaustive
-        // and to fail loudly if a future caller bypasses the
-        // precheck — `unreachable!` panics with the message rather
-        // than silently JSON-encoding the map inside an XML
-        // element.
-        Value::Map(_) => unreachable!(
-            "Value::Map is rejected by the per-record precheck in XmlWriter::write_fields"
-        ),
-    }
+        Value::Array(arr) => arr
+            .iter()
+            .map(|v| value_to_text(col, v))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(","),
+        Value::Map(_) => {
+            return Err(FormatError::UnserializableMapValue {
+                format: "XML",
+                column: col.to_string(),
+            });
+        }
+    })
 }
 
 #[cfg(test)]

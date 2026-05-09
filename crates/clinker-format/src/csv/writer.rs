@@ -83,14 +83,6 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             self.header_written = true;
         }
 
-        // Pre-walk: reject `Value::Map` payloads explicitly. CSV has
-        // no canonical scalar serialization for a map; silently
-        // JSON-encoding the map into a single cell hides routing
-        // bugs (e.g. a `$widened` sidecar reaching the writer
-        // without the projection layer's `include_widened: true`
-        // expansion). Raise `UnserializableMapValue` so the user
-        // sees the misroute and can pick a remediation path
-        // (the error's Display lists the supported escape hatches).
         let iter: Box<dyn Iterator<Item = (&str, &clinker_record::Value)>> =
             if self.config.include_engine_stamped {
                 Box::new(record.iter_all_fields())
@@ -99,13 +91,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             };
         let mut fields: Vec<String> = Vec::with_capacity(record.field_count());
         for (col, v) in iter {
-            if matches!(v, clinker_record::Value::Map(_)) {
-                return Err(FormatError::UnserializableMapValue {
-                    format: "CSV",
-                    column: col.to_string(),
-                });
-            }
-            fields.push(value_to_csv_cell(v));
+            fields.push(value_to_csv_cell(col, v)?);
         }
 
         self.inner.write_record(&fields)?;
@@ -196,8 +182,16 @@ fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -
 }
 
 /// Serialize a Value to a CSV cell string.
-fn value_to_csv_cell(value: &Value) -> String {
-    match value {
+///
+/// `Value::Map` has no canonical scalar serialization for a CSV cell
+/// (silently JSON-encoding hides routing bugs — e.g. a `$widened`
+/// sidecar reaching the writer without the projection layer's
+/// `include_widened: true` expansion), so this returns
+/// `FormatError::UnserializableMapValue` carrying the offending
+/// column. CSV is the single point of truth for map rejection on
+/// this path; there is no upstream pre-walk.
+fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
+    Ok(match value {
         Value::Null => String::new(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Integer(n) => n.to_string(),
@@ -206,17 +200,13 @@ fn value_to_csv_cell(value: &Value) -> String {
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
         Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
-        // `Value::Map` is rejected by the per-record precheck in
-        // `CsvWriter::write_record` before any column reaches this
-        // function. The arm exists to keep the match exhaustive
-        // and to fail loudly if a future caller bypasses the
-        // precheck — `unreachable!` panics with the message rather
-        // than silently JSON-encoding the map into a single CSV
-        // cell.
-        Value::Map(_) => unreachable!(
-            "Value::Map is rejected by the per-record precheck in CsvWriter::write_record"
-        ),
-    }
+        Value::Map(_) => {
+            return Err(FormatError::UnserializableMapValue {
+                format: "CSV",
+                column: col.to_string(),
+            });
+        }
+    })
 }
 
 #[cfg(test)]
