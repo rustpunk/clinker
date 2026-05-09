@@ -1411,8 +1411,7 @@ impl PipelineExecutor {
         if (!declared_source_defaults.is_empty() || channel_for_primary.is_some())
             && let Ok(mut map) = stable.source_vars.write()
         {
-            let mut seen: std::collections::HashSet<&Arc<str>> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<&Arc<str>> = std::collections::HashSet::new();
             for file_arc in &per_record_source_files {
                 if !seen.insert(file_arc) {
                     continue;
