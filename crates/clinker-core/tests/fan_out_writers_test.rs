@@ -100,6 +100,7 @@ fn dispatch_routes_records_to_per_file_writers() {
         batch_id: "b".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)

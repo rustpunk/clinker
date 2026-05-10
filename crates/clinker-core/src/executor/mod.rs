@@ -231,13 +231,26 @@ pub fn single_file_reader(
 }
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
+#[derive(Default)]
 pub struct PipelineRunParams {
     /// UUID v7 execution ID, unique per run.
     pub execution_id: String,
     /// Batch ID from --batch-id CLI flag or auto UUID v7.
     pub batch_id: String,
-    /// Converted pipeline.vars (already validated and converted from serde_json).
+    /// Channel-supplied overrides/adds for `$pipeline.*`. Layered atop
+    /// `collect_pipeline_var_defaults` at executor init; channel wins.
     pub pipeline_vars: IndexMap<String, Value>,
+    /// Channel-supplied overrides/adds for `$vars.*`. Layered atop
+    /// `convert_vars(config.pipeline.vars)`; channel wins.
+    pub static_vars: IndexMap<String, Value>,
+    /// Channel-supplied overrides/adds for `$source.<src>.<var>`. Outer
+    /// key is source-node name; inner key is var name. Layered atop
+    /// `collect_source_var_defaults` per file Arc at materialization.
+    pub source_vars: IndexMap<String, IndexMap<String, Value>>,
+    /// Channel-supplied overrides/adds for `$record.*`. Pre-seeded into
+    /// every Record's `record_vars` map at materialization, layered
+    /// atop `collect_record_var_defaults`.
+    pub record_vars: IndexMap<String, Value>,
     /// Per-run shutdown handle. The executor checks this at chunk boundaries
     /// and inside `Arena::build`. `None` disables shutdown signaling for this
     /// run; production callers typically construct one via
@@ -1354,9 +1367,9 @@ impl PipelineExecutor {
     fn execute_dag_branching(
         config: &PipelineConfig,
         input: &crate::config::SourceConfig,
-        all_records: Vec<(Record, u64)>,
+        mut all_records: Vec<(Record, u64)>,
         per_record_source_files: Vec<Arc<str>>,
-        preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
+        mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -1381,7 +1394,62 @@ impl PipelineExecutor {
             &params.execution_id,
             &params.batch_id,
             &params.pipeline_vars,
+            &params.static_vars,
         );
+
+        // Seed source-scope vars on every distinct primary-source file
+        // Arc. Channel overrides (per source-node name) layer atop
+        // Transform-`declares: scope: source` defaults; the per-file
+        // inner map uses `or_insert` for declared defaults (so any
+        // source-scope writer that planted earlier wins) and `insert`
+        // for channel values (channel always wins). Combine
+        // build-side preloaded sources are not seeded from this point;
+        // their channel overrides apply when those sources flow
+        // through their own primary `execute_dag` call.
+        let declared_source_defaults = crate::config::collect_source_var_defaults(&config.nodes);
+        let channel_for_primary = params.source_vars.get(&input.name);
+        if (!declared_source_defaults.is_empty() || channel_for_primary.is_some())
+            && let Ok(mut map) = stable.source_vars.write()
+        {
+            let mut seen: std::collections::HashSet<&Arc<str>> = std::collections::HashSet::new();
+            for file_arc in &per_record_source_files {
+                if !seen.insert(file_arc) {
+                    continue;
+                }
+                let entry = map.entry(Arc::clone(file_arc)).or_default();
+                for (k, v) in &declared_source_defaults {
+                    entry.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                if let Some(ch) = channel_for_primary {
+                    for (k, v) in ch {
+                        entry.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        // Pre-seed `$record.<key>` defaults into every materialized
+        // record so init-phase reads observe the declared/channel
+        // default before any per-record `state` writer fires. Channel
+        // record-vars layer atop Transform-`declares: scope: record`
+        // defaults; existing per-record entries (if any) are preserved.
+        let record_var_seed: IndexMap<String, Value> = {
+            let mut seed = crate::config::collect_record_var_defaults(&config.nodes);
+            for (k, v) in &params.record_vars {
+                seed.insert(k.clone(), v.clone());
+            }
+            seed
+        };
+        if !record_var_seed.is_empty() {
+            for (record, _) in &mut all_records {
+                record.seed_record_vars(&record_var_seed);
+            }
+            for (_, recs) in preloaded_source_records.iter_mut() {
+                for (record, _) in recs {
+                    record.seed_record_vars(&record_var_seed);
+                }
+            }
+        }
         // Synthetic source-file placeholder used by dispatch sites that
         // have no live record (combine/finalize/post-aggregate emits
         // with `source_row: 0`). For multi-file sources `input.path` is
@@ -2324,6 +2392,7 @@ fn build_stable_eval_context(
     execution_id: &str,
     batch_id: &str,
     pipeline_vars: &IndexMap<String, Value>,
+    static_vars_overrides: &IndexMap<String, Value>,
 ) -> StableEvalContext {
     // Seed pipeline-scope vars with declared defaults from every
     // Transform's `declares:` entries; runtime injections (channel
@@ -2342,20 +2411,27 @@ fn build_stable_eval_context(
         pipeline_vars: Arc::new(std::sync::RwLock::new(seeded)),
         source_vars: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         source_input_arcs: Arc::new(compute_source_input_arcs(config)),
-        static_vars: Arc::new(build_static_vars(config)),
+        static_vars: Arc::new(build_static_vars(config, static_vars_overrides)),
     }
 }
 
 /// Build the `$vars.*` runtime value map from the pipeline's `vars:`
-/// block. Each entry's `default` field (post-validation, already
-/// coerced to the declared type) becomes the frozen runtime value.
-/// Stage 7 will overlay channel `pipeline.vars.<key>` overrides on
-/// top of this before the pipeline starts.
-fn build_static_vars(config: &PipelineConfig) -> IndexMap<String, Value> {
-    let Some(decls) = config.pipeline.vars.as_ref() else {
-        return IndexMap::new();
-    };
-    crate::config::convert_vars(decls)
+/// block, with `overrides` (channel-supplied) layered on top. Channel
+/// adds extend the map; channel overrides replace.
+fn build_static_vars(
+    config: &PipelineConfig,
+    overrides: &IndexMap<String, Value>,
+) -> IndexMap<String, Value> {
+    let mut out = config
+        .pipeline
+        .vars
+        .as_ref()
+        .map(crate::config::convert_vars)
+        .unwrap_or_default();
+    for (k, v) in overrides {
+        out.insert(k.clone(), v.clone());
+    }
+    out
 }
 
 /// Walk the YAML config to map every `Merge` / `Combine` named input to
@@ -2837,6 +2913,7 @@ mod tests {
             batch_id: "test-batch-id".to_string(),
             pipeline_vars: IndexMap::new(),
             shutdown_token: None,
+            ..Default::default()
         };
 
         let report = PipelineExecutor::run_with_readers_writers(

@@ -96,10 +96,16 @@ nodes:
 }
 
 #[test]
-fn snapshot_e170_multi_writer() {
+fn snapshot_duplicate_pipeline_declaration_rejected_at_parse() {
+    // Two transforms declare the same `$pipeline.x` — flat shared
+    // namespaces fail-fast (Beam, Flink, Kafka Streams, Dagster, post-fix
+    // dbt, Cargo, Rust statics). The earlier compile-time E170 multi-
+    // writer rule was unreachable in this exact form because both
+    // writers had to declare to write; the cross-Transform uniqueness
+    // check at parse time supersedes it.
     let yaml = r#"
 pipeline:
-  name: e170_multi_writer
+  name: dup_pipeline_decl
 nodes:
   - type: source
     name: src
@@ -135,8 +141,8 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let diags = compile_err_diags(yaml);
-    insta::assert_snapshot!(render_diags(&diags));
+    let err = parse_config(yaml).expect_err("expected parse-time validation error");
+    insta::assert_snapshot!(err.to_string());
 }
 
 #[test]

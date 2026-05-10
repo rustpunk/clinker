@@ -80,6 +80,7 @@ nodes:
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let primary = "src".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([(

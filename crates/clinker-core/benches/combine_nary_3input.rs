@@ -210,6 +210,7 @@ fn bench_params() -> PipelineRunParams {
         batch_id: "nary-3input-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     }
 }
 

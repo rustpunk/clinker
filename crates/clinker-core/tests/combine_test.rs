@@ -2143,6 +2143,7 @@ nodes:
             batch_id: "combine-test-batch".to_string(),
             pipeline_vars,
             shutdown_token: None,
+            ..Default::default()
         };
 
         let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(

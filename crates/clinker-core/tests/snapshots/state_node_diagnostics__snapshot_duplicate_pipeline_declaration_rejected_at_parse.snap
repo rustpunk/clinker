@@ -1,0 +1,6 @@
+---
+source: crates/clinker-core/tests/state_node_diagnostics.rs
+assertion_line: 145
+expression: err.to_string()
+---
+config validation error: duplicate $pipeline declaration: 'x' is declared in transforms 'w1' and 'w2' — the pipeline-scope namespace is flat and shared, declare once and reference

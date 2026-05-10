@@ -213,6 +213,7 @@ fn test_params() -> PipelineRunParams {
         batch_id: "batch-001".to_string(),
         pipeline_vars,
         shutdown_token: None,
+        ..Default::default()
     }
 }
 
@@ -758,7 +759,7 @@ config:
     )
     .expect("parse channel");
 
-    let _diags = apply_channel_overlay(&mut plan, &binding);
+    let _result = apply_channel_overlay(&mut plan, &binding, &config);
 
     // Verify the provenance chain contains a ChannelFixed layer
     let resolved = plan

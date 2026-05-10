@@ -84,6 +84,7 @@ fn multi_file_glob_concatenates_and_stamps_source_provenance() {
         batch_id: "b".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)

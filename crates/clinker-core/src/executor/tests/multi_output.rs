@@ -31,6 +31,7 @@ fn test_params() -> PipelineRunParams {
         batch_id: "test-batch-id".to_string(),
         pipeline_vars,
         shutdown_token: None,
+        ..Default::default()
     }
 }
 

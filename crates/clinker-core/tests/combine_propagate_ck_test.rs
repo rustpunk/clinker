@@ -57,6 +57,7 @@ fn run_with_output(
         batch_id: "propagate-ck-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
         &plan, primary, readers, writers, &params,

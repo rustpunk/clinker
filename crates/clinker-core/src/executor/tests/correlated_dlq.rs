@@ -20,6 +20,7 @@ fn run_correlated_pipeline(
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
@@ -384,6 +385,7 @@ nodes:
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers: crate::executor::SourceReaders = HashMap::from([(
@@ -890,6 +892,7 @@ nodes:
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let primary = "orders".to_string();
@@ -1076,6 +1079,7 @@ nodes:
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let primary = "orders".to_string();
@@ -1306,6 +1310,7 @@ nodes:
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let primary = "orders".to_string();

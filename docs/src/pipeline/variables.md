@@ -161,14 +161,22 @@ registry, and every cross-DAG flow is verified against the topology.
 
 | Code | What it catches                                                        |
 | ---- | ---------------------------------------------------------------------- |
+| E107 | Channel var override declares a different type than the pipeline.      |
+| E109 | Channel targets a composition but carries `vars:` overrides.           |
+| E110 | Channel var name shadows a reserved system field for that scope.       |
+| E111 | Channel `vars.source.<src>` references an unknown source-node name.    |
 | E164 | An init-phase state node has a runtime descendant.                     |
-| E170 | Two state nodes write the same `(scope, var)` in runtime phase.        |
 | E171 | A reader is not a transitive DAG descendant of its writer.             |
 | E172 | Bare `$source.<custom>` read downstream of a Merge or Combine.         |
 | E173 | Composition body reads a parent scoped var without opting in.          |
 | E174 | Composition `_compose.scoped_vars` declares a different type than the parent. |
 | E175 | An init-phase node reads a runtime-only writer's variable.             |
 | E200 | A reference to an undeclared scoped variable (resolver-level failure). |
+
+Cross-Transform duplicate `declares:` (the same `(scope, name)` declared
+on two Transforms) is rejected at config-validation time, ahead of
+compilation. `$pipeline`, `$source`, and `$record` are flat shared
+namespaces; declare each name once and reference it from every consumer.
 
 Each diagnostic carries the offending span plus secondary spans
 pointing at the conflicting writer or the parent declaration, so
@@ -248,24 +256,58 @@ These are intentional non-features:
 
 ## Channel overrides
 
-Channels still override declaration defaults for `pipeline`-scope
-variables (the original use case):
+A channel can both override a pipeline's declaration defaults and add
+new entries across all four registries (`$vars.*`, `$pipeline.*`,
+`$source.*`, `$record.*`). Each registry has its own sub-block under
+`vars:` on a `.channel.yaml`, and each entry uses the same
+`{ type, default }` shape that pipeline-side declarations use:
 
 ```yaml
-# Pipeline
+# Pipeline declarations
 pipeline:
+  name: orders
   vars:
-    pipeline:
-      express_surcharge:
-        type: float
-        default: 5.99
+    fuzzy_threshold: { type: float, default: 0.85 }   # $vars.*
+nodes:
+  - type: source
+    name: orders_src
+    config: { name: orders_src, type: csv, path: in.csv,
+              schema: [{ name: id, type: int }] }
+  - type: transform
+    name: enrich
+    input: orders_src
+    config:
+      declares:
+        - { name: cutoff_date,  scope: pipeline, type: date,   default: "2024-01-01" }
+        - { name: ingest_label, scope: source,   type: string, default: "prod" }
+        - { name: tier,         scope: record,   type: string, default: "bronze" }
+      cxl: |
+        emit id = id
 
-# channels/acme-corp/channel.yaml
-_channel:
-  id: acme-corp
-variables:
-  express_surcharge: 8.99
+# channels/acme-prod.channel.yaml
+channel:
+  name: acme-prod
+  target: ./pipelines/orders.yaml
+vars:
+  static:
+    fuzzy_threshold: { type: float, default: 0.95 }
+  pipeline:
+    cutoff_date: { type: date, default: "2026-01-01" }
+  source:
+    orders_src:
+      ingest_label: { type: string, default: "acme-prod" }
+  record:
+    tier: { type: string, default: "platinum" }
 ```
 
-Channel overrides currently apply only to the `pipeline` scope.
-Override surface for `source` and `record` scopes is a follow-up.
+Override semantics (entry name already declared) require the channel's
+`type` to match the declared type — mismatches produce **E107**. Add
+semantics (entry name not yet declared) extend the registry with a new
+declaration. `$source` overrides are keyed by source-node name; an
+unknown source name produces **E111**. The reserved-name guard
+(**E110**) blocks channels from shadowing system fields like
+`$pipeline.execution_id` or `$source.path`. Channels that target a
+`.comp.yaml` may not carry `vars:` (**E109** if they do).
+
+See [Channels](channels.md) for the full overlay rules and the channel
+manifest reference.

@@ -38,6 +38,7 @@ fn test_params() -> PipelineRunParams {
         batch_id: "batch-h-001".to_string(),
         pipeline_vars,
         shutdown_token: None,
+        ..Default::default()
     }
 }
 
@@ -609,6 +610,76 @@ nodes:
 // ─────────────────────────────────────────────────────────────────
 // Fixture 8 — $vars.<key> static config, frozen at pipeline start
 // ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn channel_static_var_override_flows_into_static_vars() {
+    // Same fixture as `static_vars_visible_in_transform_cxl`, but the
+    // executor receives a channel-resolved override for `$vars.cutoff`
+    // via PipelineRunParams. The pipeline's declared default is 100;
+    // the channel raises it to 175, so only records with amount > 175
+    // should survive the filter.
+    let yaml = r#"
+pipeline:
+  name: channel_static_smoke
+  vars:
+    cutoff: { type: int, default: 100 }
+    label: { type: string, default: "tier-A" }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amount, type: int }
+  - type: transform
+    name: filter_and_tag
+    input: src
+    config:
+      cxl: |
+        filter amount > $vars.cutoff
+        emit id = id
+        emit tier = $vars.label
+        emit threshold = $vars.cutoff
+  - type: output
+    name: out
+    input: filter_and_tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let csv = "id,amount\n1,50\n2,150\n3,200\n";
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
+        .expect("compile");
+    let readers = HashMap::from([(
+        config.source_configs().next().unwrap().name.clone(),
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv.as_bytes().to_vec())),
+        ),
+    )]);
+    let buf = SharedBuffer::default();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        config.output_configs().next().unwrap().name.clone(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    let mut static_vars = indexmap::IndexMap::new();
+    static_vars.insert("cutoff".to_string(), clinker_record::Value::Integer(175));
+    let params = PipelineRunParams {
+        execution_id: "ch-static".to_string(),
+        batch_id: "ch-static-001".to_string(),
+        static_vars,
+        ..Default::default()
+    };
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("pipeline run");
+    let lines = body_lines_sorted(&buf.as_string());
+    assert_eq!(lines, vec!["3,tier-A,175"]);
+}
 
 #[test]
 fn static_vars_visible_in_transform_cxl() {

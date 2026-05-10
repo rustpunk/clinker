@@ -107,6 +107,7 @@ impl BenchPipelineRunner {
             batch_id: "bench-batch".to_string(),
             pipeline_vars: IndexMap::new(),
             shutdown_token: None,
+            ..Default::default()
         };
 
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)

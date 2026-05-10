@@ -35,6 +35,7 @@ mod tests {
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
             shutdown_token: None,
+            ..Default::default()
         };
 
         let report = PipelineExecutor::run_with_readers_writers(
@@ -854,6 +855,7 @@ nodes:
             batch_id: "test-batch-id".to_string(),
             pipeline_vars: Default::default(),
             shutdown_token: None,
+            ..Default::default()
         };
 
         let result = PipelineExecutor::run_with_readers_writers(
@@ -921,6 +923,7 @@ nodes:
             batch_id: "test-batch-id".to_string(),
             pipeline_vars: Default::default(),
             shutdown_token: None,
+            ..Default::default()
         };
 
         let result = PipelineExecutor::run_with_readers_writers(
@@ -1044,6 +1047,7 @@ nodes:
             batch_id: "test-batch-id".to_string(),
             pipeline_vars: Default::default(),
             shutdown_token: None,
+            ..Default::default()
         };
 
         let report = PipelineExecutor::run_with_readers_writers(

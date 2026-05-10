@@ -58,10 +58,10 @@ fn bench_channel_merge(c: &mut Criterion) {
                         ),
                     );
                 }
-                plan
+                (config, plan)
             },
-            |mut plan| {
-                apply_channel_overlay(&mut plan, &binding);
+            |(config, mut plan)| {
+                apply_channel_overlay(&mut plan, &binding, &config);
             },
             criterion::BatchSize::SmallInput,
         );

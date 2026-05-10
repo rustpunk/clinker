@@ -132,6 +132,7 @@ ENG,5000
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers_with_primary(
         &plan, &primary, readers, writers, &params,
@@ -258,6 +259,7 @@ ENG,5000
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers_with_primary(
         &plan, &primary, readers, writers, &params,

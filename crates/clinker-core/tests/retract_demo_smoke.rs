@@ -144,6 +144,7 @@ fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Strin
         batch_id: "smoke-001".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)

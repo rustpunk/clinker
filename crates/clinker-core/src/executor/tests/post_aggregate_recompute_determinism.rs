@@ -76,6 +76,7 @@ fn run_once() -> u64 {
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        ..Default::default()
     };
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers: crate::executor::SourceReaders = HashMap::from([(
