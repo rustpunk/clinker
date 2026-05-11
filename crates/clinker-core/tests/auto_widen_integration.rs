@@ -334,12 +334,11 @@ nodes:
 /// success case: two sources both on auto_widen (the engine-wide
 /// default) compile cleanly, and the merge's typed output Row
 /// carries the `$widened` engine-stamped sidecar column inherited
-/// from the first input. The runtime side of multi-source merge
-/// (each source's reader populating `node_buffers`) is exercised by
-/// `route → branches → merge` topologies in
-/// `executor::tests::branching` and is independent of the auto_widen
-/// sidecar machinery — the sidecar follows whatever upstream-row
-/// shape the merge inherits, by construction.
+/// from the first input. The runtime side of multi-source Merge —
+/// each Source's records actually flowing into the Merge's input
+/// buffers — is exercised end-to-end in
+/// `tests/multi_source_ingestion.rs`, which covers the
+/// silent-corruption topology matrix from #47 / umbrella #50.
 #[test]
 fn h3_merge_same_policy_auto_widen_carries_sidecar() {
     use clinker_core::plan::execution::PlanNode;

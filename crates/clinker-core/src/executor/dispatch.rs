@@ -226,6 +226,14 @@ pub(crate) struct ExecutorContext<'a> {
     /// time when ingestion of this source began.
     pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
     pub(crate) strategy: ErrorStrategy,
+    /// Name of the primary Source (first declared in `source_configs`).
+    /// Records for this Source live in `all_records`; every other Source
+    /// has its records in `preloaded_source_records`. The Source dispatch
+    /// arm uses this to distinguish "fallthrough is correct because this
+    /// IS the primary" from "fallthrough is a defense-in-depth bug
+    /// signal because a non-primary Source somehow wasn't preloaded" —
+    /// the silent-corruption surface at the root of #47.
+    pub(crate) primary_input_name: &'a str,
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
@@ -964,11 +972,33 @@ pub(crate) fn dispatch_plan_node(
                     .iter()
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
-            } else {
+            } else if name.as_str() == ctx.primary_input_name {
                 ctx.all_records
                     .iter()
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
+            } else {
+                // Defense-in-depth: a non-primary Source reaching this
+                // arm means its records were never ingested into
+                // `preloaded_source_records` by the executor's preload
+                // pass. Before sprint 1 (umbrella #50) this branch
+                // silently emitted the primary's records — see #47.
+                // The third preload loop in
+                // `run_with_readers_writers` now covers every
+                // non-primary top-level Source, so any future
+                // regression that bypasses it surfaces here as a loud
+                // internal error rather than corrupted output.
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: name.clone(),
+                    detail: format!(
+                        "non-primary Source '{name}' has no preloaded records; \
+                         primary is '{primary}'. Preload pass missed this Source — \
+                         likely a planner regression introducing a Source topology \
+                         the preload doesn't enumerate.",
+                        primary = ctx.primary_input_name,
+                    ),
+                });
             };
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
             ctx.node_buffers.insert(node_idx, records);

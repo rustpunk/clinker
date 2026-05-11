@@ -4,6 +4,7 @@ pub mod combine;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
 mod schema_check;
+pub(crate) mod source_stream;
 pub(crate) mod window_runtime;
 
 use std::collections::{HashMap, HashSet};
@@ -1220,7 +1221,17 @@ impl PipelineExecutor {
             }
         };
 
-        let mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        // Per-non-primary-source ingest buffers, populated by three
+        // preload passes below. Each pass ingests its scope of
+        // non-primary Sources through `preload_source_into_stream`,
+        // which writes to a bounded-capacity in-memory buffer with
+        // disk-spill overflow. `execute_dag_branching` drains each
+        // stream into `preloaded_source_records` (the in-memory Vec
+        // map the dispatcher still consumes) before walking the DAG.
+        // Sprint-1 scope per umbrella #50; sub-issue #51 will collapse
+        // the primary onto `SourceStream` too.
+        let mut source_streams: HashMap<String, source_stream::DrainedSourceStream> =
+            HashMap::new();
         for (combine_name, combine_inputs) in &artifacts.combine_inputs {
             let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
             for combine_input in combine_inputs.values() {
@@ -1235,40 +1246,14 @@ impl PipelineExecutor {
                     // `all_records`.
                     continue;
                 }
-                if preloaded_source_records.contains_key(upstream) {
+                if source_streams.contains_key(upstream) {
                     continue;
                 }
-                let Some(files) = readers.remove(upstream) else {
-                    // Another combine already drained the reader (safe —
-                    // the map is shared across all combine inputs).
-                    continue;
-                };
-                if files.is_empty() {
-                    continue;
+                if let Some(drained) =
+                    preload_source_into_stream(upstream, readers, source_configs, config)?
+                {
+                    source_streams.insert(upstream.to_string(), drained);
                 }
-                let src_cfg = source_configs
-                    .iter()
-                    .find(|s| s.name == upstream)
-                    .ok_or_else(|| {
-                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                            "combine build-side source '{upstream}' not declared in the pipeline",
-                        )))
-                    })?;
-                let raw_reader = build_multi_file_reader(src_cfg, files)?;
-                let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
-                let mut recs: Vec<(Record, u64)> = Vec::new();
-                let mut rn: u64 = 0;
-                loop {
-                    match src_reader.next_record() {
-                        Ok(Some(record)) => {
-                            rn += 1;
-                            recs.push((record, rn));
-                        }
-                        Ok(None) => break,
-                        Err(other) => return Err(other.into()),
-                    }
-                }
-                preloaded_source_records.insert(upstream.to_string(), recs);
             }
         }
 
@@ -1296,38 +1281,44 @@ impl PipelineExecutor {
                 // Records already in `all_records`.
                 continue;
             }
-            if preloaded_source_records.contains_key(upstream) {
+            if source_streams.contains_key(upstream) {
                 continue;
             }
-            let Some(files) = readers.remove(upstream.as_str()) else {
-                continue;
-            };
-            if files.is_empty() {
+            if let Some(drained) =
+                preload_source_into_stream(upstream, readers, source_configs, config)?
+            {
+                source_streams.insert(upstream.clone(), drained);
+            }
+        }
+
+        // ── Pre-load every remaining non-primary top-level Source ─────
+        // Catch-all for Source nodes the combine-input and init-phase
+        // passes above don't cover — concretely: Merge inputs,
+        // disjoint parallel chains (`src_b → tfm → out_b` alongside a
+        // primary `src_a` chain), and any non-primary chain whose
+        // downstream operators are neither Combine build-side inputs
+        // nor init-phase ancestors. Without this pass those Sources
+        // would silently fall through the dispatch arm's
+        // `else { ctx.all_records.iter() ... }` branch and emit the
+        // primary's records — the silent data-corruption surface at
+        // the root of #47 and umbrella #50. The new branch in
+        // `dispatch::PlanNode::Source` (added in this sprint) treats
+        // a missing-stream non-primary as `PipelineError::Internal`
+        // so any future regression is loud, not silent.
+        let non_primary_top_level_sources: Vec<String> = source_configs
+            .iter()
+            .map(|s| s.name.clone())
+            .filter(|name| name.as_str() != input.name)
+            .collect();
+        for upstream in &non_primary_top_level_sources {
+            if source_streams.contains_key(upstream) {
                 continue;
             }
-            let src_cfg = source_configs
-                .iter()
-                .find(|s| s.name == *upstream)
-                .ok_or_else(|| {
-                    PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                        "init-phase source '{upstream}' not declared in the pipeline",
-                    )))
-                })?;
-            let raw_reader = build_multi_file_reader(src_cfg, files)?;
-            let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
-            let mut recs: Vec<(Record, u64)> = Vec::new();
-            let mut rn: u64 = 0;
-            loop {
-                match src_reader.next_record() {
-                    Ok(Some(record)) => {
-                        rn += 1;
-                        recs.push((record, rn));
-                    }
-                    Ok(None) => break,
-                    Err(other) => return Err(other.into()),
-                }
+            if let Some(drained) =
+                preload_source_into_stream(upstream, readers, source_configs, config)?
+            {
+                source_streams.insert(upstream.clone(), drained);
             }
-            preloaded_source_records.insert(upstream.clone(), recs);
         }
 
         Self::execute_dag_branching(
@@ -1335,7 +1326,7 @@ impl PipelineExecutor {
             input,
             all_records,
             per_record_source_files,
-            preloaded_source_records,
+            source_streams,
             writers,
             transforms,
             compiled_route,
@@ -1369,7 +1360,7 @@ impl PipelineExecutor {
         input: &crate::config::SourceConfig,
         mut all_records: Vec<(Record, u64)>,
         per_record_source_files: Vec<Arc<str>>,
-        mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
+        source_streams: HashMap<String, source_stream::DrainedSourceStream>,
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -1383,6 +1374,23 @@ impl PipelineExecutor {
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
         memory_budget: crate::pipeline::memory::MemoryBudget,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        // Drain each non-primary Source's bounded ingest stream into
+        // the in-memory `preloaded_source_records` map the dispatcher
+        // consumes. Spill files (if any) read sequentially here and
+        // delete themselves via `tempfile::TempPath` Drop after the
+        // reader iterator exhausts. Sprint-2 work (sub-issue #51)
+        // pushes this drain down into per-Source dispatch so we don't
+        // re-materialize spilled records into RAM at all.
+        let mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>> =
+            HashMap::with_capacity(source_streams.len());
+        for (name, stream) in source_streams {
+            let records = stream.into_records().map_err(|e| PipelineError::Internal {
+                op: "source-stream-drain",
+                node: name.clone(),
+                detail: e.to_string(),
+            })?;
+            preloaded_source_records.insert(name, records);
+        }
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1541,6 +1549,7 @@ impl PipelineExecutor {
             source_count,
             source_ingestion_timestamp,
             strategy,
+            primary_input_name: input.name.as_str(),
 
             node_buffers: HashMap::new(),
             preloaded_source_records,
@@ -1917,6 +1926,78 @@ fn wrap_with_schema_coercion(
         }
         _ => Ok(reader),
     }
+}
+
+/// Ingest one non-primary Source's records into a [`SourceStream`].
+///
+/// Returns `Ok(None)` when `upstream`'s files are missing from `readers`
+/// (already drained by an earlier preload step) or empty. Returns
+/// `Ok(Some(stream))` otherwise. The caller inserts the drained stream
+/// into the per-source map; reusing this helper across the
+/// combine-input, init-phase, and merge/disjoint preload passes keeps
+/// the ingest logic single-sourced.
+///
+/// Errors map `SpillError` to `PipelineError::Internal` because the
+/// preload pass has no recoverable strategy for a corrupted spill
+/// temp file or out-of-disk condition — the pipeline cannot make
+/// progress without the source's records.
+fn preload_source_into_stream(
+    upstream: &str,
+    readers: &mut SourceReaders,
+    source_configs: &[crate::config::SourceConfig],
+    config: &PipelineConfig,
+) -> Result<Option<source_stream::DrainedSourceStream>, PipelineError> {
+    let Some(files) = readers.remove(upstream) else {
+        return Ok(None);
+    };
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let src_cfg = source_configs
+        .iter()
+        .find(|s| s.name == upstream)
+        .ok_or_else(|| {
+            PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                "source '{upstream}' not declared in the pipeline",
+            )))
+        })?;
+    let raw_reader = build_multi_file_reader(src_cfg, files)?;
+    let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
+    let schema = src_reader.schema()?;
+    // `spill_dir = None` lets `SpillWriter` fall back to the system
+    // tempdir; per-file cleanup is handled by `tempfile::TempPath` Drop
+    // on `SpillFile<u64>`. Hoisting the pipeline-scoped TempDir up
+    // from `execute_dag_branching` so preload spill files share the
+    // secondary panic-recovery sweep is a sprint-2 follow-up tracked
+    // under umbrella #50.
+    let mut stream = source_stream::SourceStream::new(
+        schema,
+        source_stream::DEFAULT_SOURCE_STREAM_CAPACITY,
+        None,
+    );
+    let mut rn: u64 = 0;
+    loop {
+        match src_reader.next_record() {
+            Ok(Some(record)) => {
+                rn += 1;
+                stream
+                    .push(record, rn)
+                    .map_err(|e| PipelineError::Internal {
+                        op: "source-stream-spill",
+                        node: upstream.to_string(),
+                        detail: e.to_string(),
+                    })?;
+            }
+            Ok(None) => break,
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let drained = stream.finish().map_err(|e| PipelineError::Internal {
+        op: "source-stream-finish",
+        node: upstream.to_string(),
+        detail: e.to_string(),
+    })?;
+    Ok(Some(drained))
 }
 
 /// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
