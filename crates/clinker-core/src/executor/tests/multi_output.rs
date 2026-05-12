@@ -313,13 +313,8 @@ fn run_multi_output(
         })
         .collect();
 
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -698,13 +693,8 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        "src",
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(result.is_err(), "should propagate writer error");
 }
 
@@ -999,7 +989,7 @@ nodes:
 
     // Panic should be caught and propagated, not hang or abort
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers.into(), &params)
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
     }));
 
     // The panic is re-raised via resume_unwind, so catch_unwind catches it
@@ -1174,13 +1164,8 @@ nodes:
     ]);
 
     // Should not deadlock — producer handles SendError::Disconnected
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        "src",
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     // Either error (from the dying writer) or success if the writer survived long enough
     // The key assertion: no deadlock, no hang — the test completes
     let _ = result;
@@ -1271,13 +1256,8 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        "src",
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     // The DAG-walk Output arm collects every Output's write/flush
     // failure across the topo walk before aggregating into
     // PipelineError::Multiple. With both writers failing on flush, the
@@ -1698,13 +1678,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        "src",
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(
         result.is_ok(),
         "single-writer HashMap should work: {result:?}"
@@ -1770,13 +1745,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        "src",
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(
         result.is_ok(),
         "single-reader HashMap should work: {result:?}"

@@ -92,14 +92,9 @@ fn run_pipeline_multi_source(
         .first()
         .map(|(n, _)| (*n).to_string())
         .expect("at least one input source required");
-    let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan,
-        &primary,
-        readers,
-        writers,
-        &test_params(),
-    )
-    .expect("pipeline run");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .expect("pipeline run");
     (report, buf.as_string())
 }
 

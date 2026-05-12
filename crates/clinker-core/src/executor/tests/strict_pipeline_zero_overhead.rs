@@ -99,14 +99,9 @@ o3,ENG,100
         ..Default::default()
     };
     let config = crate::config::parse_config(STRICT_PIPELINE).expect("parse");
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )
-    .expect("strict pipeline must run on the FastPath without error");
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .expect("strict pipeline must run on the FastPath without error");
 
     // Strict pipelines emit every record through the strict commit
     // body — no deferred-Output speculation, no cascading-retraction

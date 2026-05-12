@@ -66,7 +66,6 @@ fn run(csv: &str) -> String {
         shutdown_token: None,
         ..Default::default()
     };
-    let primary = "src".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
         crate::executor::single_file_reader(
@@ -79,7 +78,7 @@ fn run(csv: &str) -> String {
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers.into(), &params)
+    PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
         .expect("pipeline must run");
     buf.as_string()
 }

@@ -375,7 +375,7 @@ fn recurse_into_body(
     // collide numerically). Restore on every exit.
     let body_buffers: HashMap<NodeIndex, Vec<(Record, u64)>> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_combine = std::mem::take(&mut ctx.preloaded_source_records);
+    let saved_combine = std::mem::take(&mut ctx.source_records);
     let saved_body_refs = ctx
         .current_body_node_input_refs
         .replace(bound_body.node_input_refs.clone());
@@ -467,7 +467,7 @@ fn recurse_into_body(
     ctx.window_runtime.active_stack.pop();
     ctx.window_runtime.bodies.remove(&body_id);
     ctx.current_body_node_input_refs = saved_body_refs;
-    ctx.preloaded_source_records = saved_combine;
+    ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
 
     let harvested = walk_and_harvest?;

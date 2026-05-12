@@ -581,8 +581,9 @@ mod tests {
 
         // Driver = orders (default first-in-IndexMap, no `drive:` hint).
         // Driver fields: order_id, product_id, amount, plus the
-        // `$widened` engine-stamped sidecar (auto_widen default).
-        // Then the auto-added `products` field of Type::Array.
+        // `$widened` engine-stamped sidecar (auto_widen default) and
+        // the `$source.file` per-record lineage stamp every Source
+        // carries. Then the auto-added `products` field of Type::Array.
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
         assert_eq!(
             names,
@@ -591,6 +592,7 @@ mod tests {
                 "product_id".to_string(),
                 "amount".to_string(),
                 "$widened".to_string(),
+                "$source.file".to_string(),
                 "products".to_string(),
             ],
             "auto-derived row = driver fields + (build_qualifier: Array)"
@@ -1982,8 +1984,8 @@ nodes:
     //
     // `run_combine_fixture` is the canonical end-to-end executor entry for
     // combine (and lookup, during the C.2 migration) integration tests. It
-    // wraps the public
-    // `PipelineExecutor::run_plan_with_readers_writers_with_primary` entry.
+    // wraps the public `PipelineExecutor::run_plan_with_readers_writers`
+    // entry.
     //
     // Error handling: structured `CombineFixtureError` preserves parse,
     // compile, and run distinctions. Tests that assert on specific
@@ -2085,25 +2087,18 @@ nodes:
     fn run_combine_fixture(
         yaml: &str,
         inputs: &[(&str, &str)],
-        primary_override: Option<&str>,
+        _primary_override: Option<&str>,
     ) -> Result<CombineFixtureResult, CombineFixtureError> {
         let config: PipelineConfig = clinker_core::yaml::from_str(yaml)
             .map_err(|e| CombineFixtureError::Parse(e.to_string()))?;
         let ctx = CompileContext::default();
         let plan = config.compile(&ctx).map_err(CombineFixtureError::Compile)?;
 
-        let primary: String = match primary_override {
-            Some(name) => name.to_string(),
-            None => inputs
-                .first()
-                .map(|(n, _)| (*n).to_string())
-                .ok_or_else(|| {
-                    CombineFixtureError::Precondition(
-                        "run_combine_fixture: no inputs provided and no primary_override set"
-                            .to_string(),
-                    )
-                })?,
-        };
+        if inputs.is_empty() {
+            return Err(CombineFixtureError::Precondition(
+                "run_combine_fixture: no inputs provided".to_string(),
+            ));
+        }
 
         let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
         for (name, data) in inputs {
@@ -2146,10 +2141,9 @@ nodes:
             ..Default::default()
         };
 
-        let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
-            &plan, &primary, readers, writers, &params,
-        )
-        .map_err(CombineFixtureError::Run)?;
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                .map_err(CombineFixtureError::Run)?;
 
         let outputs: HashMap<String, String> = output_buffers
             .into_iter()
@@ -2875,9 +2869,12 @@ nodes:
             Some("orders"),
         )
         .expect("combine enrichment baseline must execute");
+        // Unified ingest counts every declared source's records, so
+        // `total_count = orders (4) + products (2) = 6`. The driver-
+        // only count (4) was the historical primary-only accounting.
         assert_eq!(
-            result.report.counters.total_count, 4,
-            "expected 4 input records processed; counters: {:?}",
+            result.report.counters.total_count, 6,
+            "expected 6 input records processed (4 orders + 2 products); counters: {:?}",
             result.report.counters
         );
         let high = result

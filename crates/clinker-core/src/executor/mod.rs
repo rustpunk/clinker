@@ -199,7 +199,8 @@ pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot
 /// - `fan_out`: per-source-file writers for outputs flagged
 ///   `fan_out_per_source_file` in the plan. Outer key is the output
 ///   name; inner key is the source-file `Arc<str>` (matching the
-///   per-record Arcs in `ExecutorContext.source_file_arcs`).
+///   per-record path read from each record's `$source.file` engine-
+///   stamped column).
 ///
 /// Auto-converts from `HashMap<String, Box<dyn Write + Send>>` so
 /// existing callers that don't need fan-out keep the simpler shape.
@@ -467,15 +468,10 @@ impl PipelineExecutor {
     /// Accepts the typed `CompiledPlan` handle returned by
     /// [`crate::config::PipelineConfig::compile`] and forwards to
     /// [`Self::run_with_readers_writers`] using the plan's embedded
-    /// [`PipelineConfig`].
-    ///
-    /// The primary (driving) source is the first source node in
-    /// declaration order (`config.source_configs().next()`). Callers
-    /// that need to drive the pipeline from a non-first declared
-    /// source must use
-    /// [`Self::run_plan_with_readers_writers_with_primary`] instead —
-    /// declaration-order-as-primary is a convenience of this wrapper,
-    /// not a contract of the executor itself.
+    /// [`PipelineConfig`]. Every declared Source is ingested through
+    /// the same code path; there is no "primary" driving source. DAG
+    /// dispatch order is determined by topological walk of the plan,
+    /// not by source declaration order.
     ///
     /// Compile-fail guarantee — `&PipelineConfig` is NOT accepted:
     ///
@@ -498,38 +494,7 @@ impl PipelineExecutor {
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        let config = plan.config();
-        let primary_name = config
-            .source_configs()
-            .next()
-            .map(|s| s.name.clone())
-            .ok_or_else(|| {
-                PipelineError::Config(crate::config::ConfigError::Validation(
-                    "pipeline declares no source nodes; cannot infer primary driving input"
-                        .to_string(),
-                ))
-            })?;
-        Self::run_with_readers_writers(config, &primary_name, readers, writers.into(), params)
-    }
-
-    /// Same as [`Self::run_plan_with_readers_writers`] but with an
-    /// explicit `primary` driving-source name. Use this when the
-    /// driving input is not the first-declared source — e.g., lookup
-    /// baselines that put the reference table earlier in YAML for
-    /// readability but drive the pipeline from the probe source.
-    ///
-    /// `primary` must match the `name` of one of the source nodes
-    /// declared in the pipeline config, and a reader for that name
-    /// must be present in `readers`. Violations surface as
-    /// `PipelineError::Config(ConfigError::Validation(..))`.
-    pub fn run_plan_with_readers_writers_with_primary<W: Into<WriterRegistry>>(
-        plan: &crate::plan::CompiledPlan,
-        primary: &str,
-        readers: SourceReaders,
-        writers: W,
-        params: &PipelineRunParams,
-    ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), primary, readers, writers.into(), params)
+        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params)
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
@@ -548,28 +513,19 @@ impl PipelineExecutor {
     ///
     /// `readers` and `writers` are keyed by the input/output `name` fields from
     /// the pipeline config. For single-input/output pipelines, pass single-entry
-    /// HashMaps.
-    ///
-    /// `primary` is the name of the source node that drives the
-    /// pipeline: its reader is consumed as the streaming input, and
-    /// every other entry in `readers` feeds combine-node build sides.
-    /// Source declaration order in YAML is irrelevant — `primary` is
-    /// chosen explicitly. If `primary` does not match a declared source
-    /// name, or no reader is registered under that name, the function
-    /// returns `PipelineError::Config(ConfigError::Validation(..))`.
+    /// HashMaps. Every declared Source must have a reader entry; missing
+    /// readers and empty file lists are hard errors.
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
-        primary: &str,
         readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         Self::run_with_readers_writers_in_context(
             config,
-            primary,
             readers,
             writers,
             params,
@@ -585,7 +541,6 @@ impl PipelineExecutor {
     /// workspace roots.
     pub(crate) fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
-        primary: &str,
         mut readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
@@ -593,41 +548,16 @@ impl PipelineExecutor {
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
-        // Resolve the primary source config by name. The driving
-        // input is chosen explicitly via `primary` — declaration
-        // order in `config.source_configs()` plays no role.
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let primary_idx = source_configs
-            .iter()
-            .position(|s| s.name == primary)
-            .ok_or_else(|| {
-                PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                    "primary source '{primary}' is not declared in the pipeline config",
-                )))
-            })?;
-        let input = &source_configs[primary_idx];
-        let files = readers.remove(&input.name).ok_or_else(|| {
-            PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                "no reader registered for input '{}'",
-                input.name
-            )))
-        })?;
-        if files.is_empty() {
+        if source_configs.is_empty() {
             return Err(PipelineError::Config(
-                crate::config::ConfigError::Validation(format!(
-                    "source '{}' has empty file list",
-                    input.name
-                )),
+                crate::config::ConfigError::Validation(
+                    "pipeline declares no source nodes; nothing to execute".to_string(),
+                ),
             ));
         }
         let mut collector = stage_metrics::StageCollector::default();
-        let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
-        let raw_reader = build_multi_file_reader(input, files)?;
-        // Wrap with schema-based type coercion if the source declares typed columns.
-        let mut format_reader = wrap_with_schema_coercion(raw_reader, config, &input.name)?;
-        let schema = format_reader.schema()?;
-        collector.record(reader_timer.finish(0, 0));
 
         // Single canonical compile path.
         //
@@ -717,8 +647,28 @@ impl PipelineExecutor {
                 .find_map(|t| t.route.as_ref());
             match route_config {
                 Some(rc) => {
-                    let mut emitted_fields: Vec<String> =
-                        schema.columns().iter().map(|c| c.to_string()).collect();
+                    // Union of user-declared fields across every Source's
+                    // bound output_row. Engine-stamped tail columns
+                    // ($ck.*, $widened, $source.file) are filtered: Route
+                    // conditions reference user-declared field names, not
+                    // engine sidecars. Previously this seeded only the
+                    // primary source's reader columns, which silently
+                    // dropped non-primary fields from Route resolution in
+                    // multi-source pipelines.
+                    let mut emitted_fields: Vec<String> = Vec::new();
+                    for src_cfg in &source_configs {
+                        if let Some(typed) = validated_plan.artifacts().typed.get(&src_cfg.name) {
+                            for (qf, _) in typed.output_row.fields() {
+                                let s = qf.name.to_string();
+                                if s.starts_with('$') {
+                                    continue;
+                                }
+                                if !emitted_fields.contains(&s) {
+                                    emitted_fields.push(s);
+                                }
+                            }
+                        }
+                    }
                     for ct in &compiled_transforms {
                         for stmt in &ct.typed.program.statements {
                             if let Statement::Emit { name, .. } = stmt
@@ -839,11 +789,61 @@ impl PipelineExecutor {
             }
         }
 
+        // Pipeline-scoped TempDir. Allocated here (not inside
+        // `execute_dag_branching`) so every source-ingest spill file
+        // lands under the same panic-recovery sweep as later operator
+        // spills. Primary cleanup is per-file `tempfile::TempPath`
+        // Drop; secondary sweep is this TempDir's recursive remove on
+        // panic unwind.
+        let spill_root = Arc::new(
+            tempfile::Builder::new()
+                .prefix("clinker-spill-")
+                .tempdir()
+                .map_err(|e| PipelineError::Internal {
+                    op: "executor",
+                    node: String::new(),
+                    detail: format!("failed to allocate pipeline spill root: {e}"),
+                })?,
+        );
+        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
+
+        // ── Unified source ingest pass ───────────────────────────────
+        // Every declared Source is ingested through `SourceStream` into
+        // its own bounded buffer with disk-spill overflow. No primary
+        // asymmetry; missing reader or empty file list is a hard error.
+        // `counters.total_count` accumulates across sources.
+        let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
+        let mut counters = PipelineCounters::default();
+        let mut source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        for src_cfg in &source_configs {
+            let files = readers.remove(&src_cfg.name).ok_or_else(|| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "no reader registered for source '{}'",
+                    src_cfg.name
+                )))
+            })?;
+            let drained = ingest_source_into_stream(
+                src_cfg,
+                files,
+                config,
+                Some(Arc::clone(&spill_root_path)),
+                &mut counters,
+            )?;
+            let records = drained
+                .into_records()
+                .map_err(|e| PipelineError::Internal {
+                    op: "source-stream-drain",
+                    node: src_cfg.name.clone(),
+                    detail: e.to_string(),
+                })?;
+            source_records.insert(src_cfg.name.clone(), records);
+        }
+        let total_ingested: u64 = source_records.values().map(|v| v.len() as u64).sum();
+        collector.record(reader_timer.finish(total_ingested, total_ingested));
+
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
-            input,
-            format_reader,
-            &mut readers,
+            source_records,
             &source_configs,
             writers,
             &compiled_transforms,
@@ -853,6 +853,9 @@ impl PipelineExecutor {
             validated_plan.artifacts(),
             params,
             &mut collector,
+            spill_root,
+            spill_root_path,
+            counters,
         )?;
 
         let stages = collector.into_stages();
@@ -884,13 +887,17 @@ impl PipelineExecutor {
     /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
     /// 3. Streaming → read all, walk DAG with per-record evaluation
     ///
+    /// `source_records` holds every declared Source's pre-ingested records,
+    /// each tuple carrying the source-file `Arc<str>` engine-stamped on
+    /// the `$source.file` column. The caller's unified ingest pass
+    /// populates this map; this function does not read from any
+    /// `FormatReader` directly.
+    ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
     fn execute_dag(
         config: &PipelineConfig,
-        input: &crate::config::SourceConfig,
-        mut format_reader: Box<dyn FormatReader>,
-        readers: &mut SourceReaders,
+        source_records: HashMap<String, Vec<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -900,8 +907,10 @@ impl PipelineExecutor {
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
+        spill_root: Arc<tempfile::TempDir>,
+        spill_root_path: Arc<std::path::Path>,
+        mut counters: PipelineCounters,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let mut counters = PipelineCounters::default();
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
         // Pipeline-scoped MemoryBudget. One declared `memory_limit`
@@ -913,420 +922,105 @@ impl PipelineExecutor {
             config.pipeline.memory_limit.as_deref(),
         );
 
-        // ── Phase 0: source materialization ──
-        // Drain the primary reader into `all_records` carrying the
-        // full source schema. Records flow through the dispatcher
-        // unchanged; the windowed Transform arm reads through arena
-        // (a projected columnar view) for `$window.*` lookups but
-        // the records themselves keep every source field for
-        // downstream transforms / outputs that reference them.
-        // `MetadataCapExceeded` is recoverable per-record (DLQ);
-        // every other reader error short-circuits.
-        let mut all_records: Vec<(Record, u64)> = Vec::new();
-        // Parallel vector of per-record source-file Arcs. Index by
-        // `row_num - 1` to recover the file each record came from. For
-        // single-file sources every entry is the same Arc; for
-        // multi-file sources entries vary across file boundaries set
-        // by `MultiFileFormatReader::current_source_file()`.
-        let mut per_record_source_files: Vec<Arc<str>> = Vec::new();
-        // Fallback when the format-reader chain doesn't expose a
-        // current-file (e.g. literal `path:` sources don't go through
-        // the multi-file wrapper). Falls back to the static config
-        // path; empty for matchers that don't carry one.
-        let static_source_file: Arc<str> = if input.path_str().is_empty() {
-            Arc::from("<source>")
-        } else {
-            Arc::from(input.path_str())
-        };
-        let mut row_num: u64 = 0;
-        loop {
-            match format_reader.next_record() {
-                Ok(Some(record)) => {
-                    row_num += 1;
-                    counters.total_count += 1;
-                    let file_arc = format_reader
-                        .current_source_file()
-                        .cloned()
-                        .unwrap_or_else(|| Arc::clone(&static_source_file));
-                    all_records.push((record, row_num));
-                    per_record_source_files.push(file_arc);
-                }
-                Ok(None) => break,
-                Err(other) => return Err(other.into()),
-            }
-        }
-
         // Build per-window arena+index runtimes for every source-rooted
-        // IndexSpec whose declared source matches this primary input.
-        // Other-source `Source(..)` slots are reserved for the multi-
-        // source ingestion path (`pipeline/ingestion.rs`); node-rooted
-        // (`Node`/`ParentNode`) slots populate later at their upstream
-        // operator's dispatch-arm exit through
-        // `finalize_node_rooted_windows`.
-        //
-        // Each IndexSpec gets its own arena projected to that spec's
-        // `arena_fields` set. Per-spec projection (rather than a single
-        // union arena) lets node-rooted slots sit alongside source-
-        // rooted slots without a shared index space — every slot
-        // carries its own anchor schema. Memory accounting is shared
-        // across every build site through `memory_budget`.
+        // IndexSpec — each spec's `root: Source(name)` resolves against
+        // `source_records[name]`. Source-rooted arenas are built up-
+        // front here because their input is the Source's full ingested
+        // record set, available once the executor's ingest pass
+        // completes. Node-rooted (`Node`/`ParentNode`) slots still
+        // populate at their upstream operator's dispatch-arm exit
+        // through `finalize_node_rooted_windows`.
         let mut window_runtime =
             crate::executor::window_runtime::WindowRuntimeRegistry::new(&plan.indices_to_build);
-        if !all_records.is_empty() {
-            let source_schema = Arc::clone(all_records[0].0.schema());
-            let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
-                .schema_overrides
-                .as_ref()
-                .map(|overrides| {
-                    overrides
-                        .iter()
-                        .map(|o| (o.name.clone(), o.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+        let schema_overrides_by_name: HashMap<
+            &str,
+            HashMap<String, clinker_record::schema_def::FieldDef>,
+        > = source_configs
+            .iter()
+            .map(|s| {
+                let overrides = s
+                    .schema_overrides
+                    .as_ref()
+                    .map(|overrides| {
+                        overrides
+                            .iter()
+                            .map(|o| (o.name.clone(), o.clone()))
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                (s.name.as_str(), overrides)
+            })
+            .collect();
+        let empty_schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> =
+            HashMap::new();
+        for (idx, spec) in plan.indices_to_build.iter().enumerate() {
+            let crate::plan::index::PlanIndexRoot::Source(source_name) = &spec.root else {
+                continue;
+            };
+            let Some(records) = source_records.get(source_name.as_str()) else {
+                continue;
+            };
+            if records.is_empty() {
+                continue;
+            }
+            let source_schema = Arc::clone(records[0].0.schema());
+            let schema_pins = schema_overrides_by_name
+                .get(source_name.as_str())
+                .unwrap_or(&empty_schema_pins);
 
-            for (idx, spec) in plan.indices_to_build.iter().enumerate() {
-                let crate::plan::index::PlanIndexRoot::Source(source_name) = &spec.root else {
-                    continue;
-                };
-                if source_name != &input.name {
-                    // Other-source rooted — owned by the multi-source
-                    // ingestion path or by a future top-level pre-walk
-                    // that materializes referenced sources up front.
-                    continue;
-                }
-                let arena_timer =
-                    stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-                let arena = Arena::from_records(
-                    &all_records,
-                    &spec.arena_fields,
-                    &source_schema,
-                    &mut memory_budget,
-                )
+            let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
+            let arena = Arena::from_records(
+                records,
+                &spec.arena_fields,
+                &source_schema,
+                &mut memory_budget,
+            )
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: vec![format!("E310 source-arena build: {e}")],
+            })?;
+            let arena_len = arena.record_count();
+            collector.record(arena_timer.finish(arena_len, arena_len));
+
+            let index_name = format!("{}:{}", source_name, spec.group_by.join(","));
+            let index_timer =
+                stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
+                    name: index_name,
+                });
+            let mut secondary_index = SecondaryIndex::build(&arena, &spec.group_by, schema_pins)
                 .map_err(|e| PipelineError::Compilation {
                     transform_name: String::new(),
-                    messages: vec![format!("E310 source-arena build: {e}")],
+                    messages: vec![e.to_string()],
                 })?;
-                let arena_len = arena.record_count();
-                collector.record(arena_timer.finish(arena_len, arena_len));
+            collector.record(index_timer.finish(arena_len, arena_len));
 
-                let index_name = format!("{}:{}", source_name, spec.group_by.join(","));
-                let index_timer =
-                    stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
-                        name: index_name,
-                    });
-                let mut secondary_index =
-                    SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
-                        PipelineError::Compilation {
-                            transform_name: String::new(),
-                            messages: vec![e.to_string()],
-                        }
-                    })?;
-                collector.record(index_timer.finish(arena_len, arena_len));
-
-                if !spec.already_sorted {
-                    for partition in secondary_index.groups.values_mut() {
-                        if !sort::is_sorted(&arena, partition, &spec.sort_by) {
-                            sort::sort_partition(&arena, partition, &spec.sort_by);
-                        }
+            if !spec.already_sorted {
+                for partition in secondary_index.groups.values_mut() {
+                    if !sort::is_sorted(&arena, partition, &spec.sort_by) {
+                        sort::sort_partition(&arena, partition, &spec.sort_by);
                     }
                 }
-
-                window_runtime.top[idx] = Some(crate::executor::window_runtime::WindowRuntime {
-                    arena: Arc::new(arena),
-                    index: Arc::new(secondary_index),
-                });
             }
+
+            window_runtime.top[idx] = Some(crate::executor::window_runtime::WindowRuntime {
+                arena: Arc::new(arena),
+                index: Arc::new(secondary_index),
+            });
         }
 
-        // D12: a global-fold aggregate (group_by: []) must still emit one
-        // row over empty input, so we cannot early-return when the plan
-        // contains an Aggregation node — the DAG walk needs to fire the
-        // aggregator's empty-input special case.
-        if all_records.is_empty() && !plan.has_branching() {
+        // D12: a global-fold aggregate (group_by: []) must still emit
+        // one row over empty input, so we cannot early-return when the
+        // plan contains an Aggregation node — the DAG walk needs to
+        // fire the aggregator's empty-input special case. Generalized
+        // from primary-only to "every source ingested zero records".
+        if source_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
             return Ok((counters, dlq_entries, rss_bytes()));
-        }
-
-        // ── Pre-load combine build-side sources ──
-        // Every combine input whose upstream source is NOT the primary
-        // driving reader needs its records materialized before the DAG
-        // walk. `execute_dag_branching`'s `PlanNode::Source` arm consults
-        // this map first; primary-sourced entries fall back to
-        // `all_records`.
-        //
-        // Scope: every source name referenced by `artifacts.combine_inputs`
-        // as a build-side upstream whose reader is still in the `readers`
-        // registry (primary was removed at function entry). Drained here
-        // so the readers are consumed exactly once.
-        //
-        // Body-context translation: `combine_input.upstream_name` is the
-        // raw value from the combine's `input:` map. For top-level
-        // combines that's a parent-scope source name. For combines
-        // inside a composition body that's a port name — resolved here
-        // by walking the live edge graph one composition layer at a
-        // time. Each step finds the parent scope's incoming edge to
-        // the current body's composition node tagged with the current
-        // port name, follows to the producer, and recurses if the
-        // producer is the parent body's own synthetic-port-source
-        // (i.e., the composition's input was itself a port in the
-        // enclosing scope). The walk terminates on a non-port producer
-        // and returns its name (typically a top-level Source). This
-        // keeps reader setup aligned with the dispatcher's port
-        // resolution: both consult the live edge graph, so any
-        // planner-pass rewrite that updates edges automatically flows
-        // through both paths without a parallel name snapshot.
-        //
-        // Two reverse lookups: combine-node-name → owning body, and
-        // body → (enclosing scope, composition NodeIndex in that scope).
-        // Top-level combines are absent from `combine_owning_body`;
-        // bodies whose composition node lives in the top-level pipeline
-        // have `parent_body_id = None` in `body_to_parent`.
-        use petgraph::Direction;
-        use petgraph::graph::NodeIndex;
-        use petgraph::visit::EdgeRef;
-        let mut combine_owning_body: HashMap<
-            &str,
-            crate::plan::composition_body::CompositionBodyId,
-        > = HashMap::new();
-        for (body_id, body) in &artifacts.composition_bodies {
-            for combine_name in body.name_to_idx.keys() {
-                if artifacts.combine_inputs.contains_key(combine_name) {
-                    combine_owning_body.insert(combine_name.as_str(), *body_id);
-                }
-            }
-        }
-
-        #[derive(Clone, Copy)]
-        struct BodyParentScope {
-            parent_body_id: Option<crate::plan::composition_body::CompositionBodyId>,
-            composition_node_idx: NodeIndex,
-        }
-        let mut body_to_parent: HashMap<
-            crate::plan::composition_body::CompositionBodyId,
-            BodyParentScope,
-        > = HashMap::new();
-        for idx in plan.graph.node_indices() {
-            if let crate::plan::execution::PlanNode::Composition { body, .. } = &plan.graph[idx] {
-                body_to_parent.insert(
-                    *body,
-                    BodyParentScope {
-                        parent_body_id: None,
-                        composition_node_idx: idx,
-                    },
-                );
-            }
-        }
-        for (parent_id, parent_body) in &artifacts.composition_bodies {
-            for idx in parent_body.graph.node_indices() {
-                if let crate::plan::execution::PlanNode::Composition { body, .. } =
-                    &parent_body.graph[idx]
-                {
-                    body_to_parent.insert(
-                        *body,
-                        BodyParentScope {
-                            parent_body_id: Some(*parent_id),
-                            composition_node_idx: idx,
-                        },
-                    );
-                }
-            }
-        }
-
-        // Edge-walk a body-context port reference to its terminal name
-        // in the topmost enclosing scope. At each step the current name
-        // must be a port in the current body (otherwise it's already
-        // body-internal, terminal). The corresponding parent scope's
-        // incoming edge to the body's composition node carries the port
-        // tag; the producer of that edge is either:
-        //   - the parent body's synthetic-port-source for one of its
-        //     own input ports → recurse one layer up, AND
-        //   - any other node → terminal (return its name).
-        // Distinguishes the synthetic-port-source case by exact
-        // NodeIndex match against the parent body's
-        // `port_name_to_node_idx`, not just by name, because port names
-        // can legally collide with body-internal node names.
-        let resolve_upstream = |start_body_id: crate::plan::composition_body::CompositionBodyId,
-                                start_name: &str|
-         -> String {
-            let mut current_body_id = start_body_id;
-            let mut current_name = start_name.to_string();
-            loop {
-                let Some(body) = artifacts.composition_bodies.get(&current_body_id) else {
-                    return current_name;
-                };
-                if !body.port_name_to_node_idx.contains_key(&current_name) {
-                    // Not a port in this body — body-internal node
-                    // name (Transform/Aggregate/Source declared in the
-                    // body); terminal.
-                    return current_name;
-                }
-                let Some(scope) = body_to_parent.get(&current_body_id).copied() else {
-                    return current_name;
-                };
-                let parent_graph = match scope.parent_body_id {
-                    None => &plan.graph,
-                    Some(pid) => match artifacts.composition_bodies.get(&pid) {
-                        Some(b) => &b.graph,
-                        None => return current_name,
-                    },
-                };
-                let mut producer_idx_opt: Option<NodeIndex> = None;
-                for edge in
-                    parent_graph.edges_directed(scope.composition_node_idx, Direction::Incoming)
-                {
-                    if edge.weight().port.as_deref() == Some(current_name.as_str()) {
-                        producer_idx_opt = Some(edge.source());
-                        break;
-                    }
-                }
-                let Some(producer_idx) = producer_idx_opt else {
-                    // No port-tagged incoming edge — planner-pass
-                    // invariant violation; the dispatcher would also
-                    // surface this as PipelineError::Internal at the
-                    // composition arm. Return current_name; the caller
-                    // (reader setup) will silently skip if no reader
-                    // matches, mirroring the existing fall-through.
-                    return current_name;
-                };
-                let producer_name = parent_graph[producer_idx].name().to_string();
-                match scope.parent_body_id {
-                    None => {
-                        // Parent is top-level; producer is a top-level
-                        // node (typically a Source).
-                        return producer_name;
-                    }
-                    Some(pid) => {
-                        let parent_body = match artifacts.composition_bodies.get(&pid) {
-                            Some(b) => b,
-                            None => return producer_name,
-                        };
-                        // Synthetic-port-source identification: the
-                        // producer's NodeIndex must match the parent
-                        // body's port_name_to_node_idx entry for that
-                        // name. Name-only check is unsafe — port and
-                        // body-internal namespaces can legally collide.
-                        if parent_body
-                            .port_name_to_node_idx
-                            .get(&producer_name)
-                            .copied()
-                            == Some(producer_idx)
-                        {
-                            current_body_id = pid;
-                            current_name = producer_name;
-                        } else {
-                            return producer_name;
-                        }
-                    }
-                }
-            }
-        };
-
-        // Per-non-primary-source ingest buffers, populated by three
-        // preload passes below. Each pass ingests its scope of
-        // non-primary Sources through `preload_source_into_stream`,
-        // which writes to a bounded-capacity in-memory buffer with
-        // disk-spill overflow. `execute_dag_branching` drains each
-        // stream into `preloaded_source_records` (the in-memory Vec
-        // map the dispatcher still consumes) before walking the DAG.
-        // Sprint-1 scope per umbrella #50; sub-issue #51 will collapse
-        // the primary onto `SourceStream` too.
-        let mut source_streams: HashMap<String, source_stream::DrainedSourceStream> =
-            HashMap::new();
-        for (combine_name, combine_inputs) in &artifacts.combine_inputs {
-            let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
-            for combine_input in combine_inputs.values() {
-                let raw_upstream = combine_input.upstream_name.as_ref();
-                let resolved = match owning_body_id {
-                    Some(body_id) => resolve_upstream(body_id, raw_upstream),
-                    None => raw_upstream.to_string(),
-                };
-                let upstream: &str = resolved.as_str();
-                if upstream == input.name {
-                    // Primary source — records already live in
-                    // `all_records`.
-                    continue;
-                }
-                if source_streams.contains_key(upstream) {
-                    continue;
-                }
-                if let Some(drained) =
-                    preload_source_into_stream(upstream, readers, source_configs, config)?
-                {
-                    source_streams.insert(upstream.to_string(), drained);
-                }
-            }
-        }
-
-        // ── Pre-load init-phase Sources ─────────────
-        // Init-phase Transforms' ancestors include Sources. Those
-        // Sources need their records materialized before the
-        // two-pass walk runs, because the Source dispatcher arm
-        // reads from `preloaded_source_records` (or `all_records` for
-        // the primary). A standalone init Source isn't a combine
-        // input and isn't the primary, so without this pre-load it
-        // would have nothing to feed the init-phase Aggregate /
-        // Transform downstream.
-        let init_source_names: Vec<String> = {
-            let init_set = crate::executor::compute_init_phase_node_set(plan);
-            init_set
-                .into_iter()
-                .filter_map(|idx| match &plan.graph[idx] {
-                    crate::plan::execution::PlanNode::Source { name, .. } => Some(name.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
-        for upstream in &init_source_names {
-            if upstream.as_str() == input.name {
-                // Records already in `all_records`.
-                continue;
-            }
-            if source_streams.contains_key(upstream) {
-                continue;
-            }
-            if let Some(drained) =
-                preload_source_into_stream(upstream, readers, source_configs, config)?
-            {
-                source_streams.insert(upstream.clone(), drained);
-            }
-        }
-
-        // ── Pre-load every remaining non-primary top-level Source ─────
-        // Catch-all for Source nodes the combine-input and init-phase
-        // passes above don't cover — concretely: Merge inputs,
-        // disjoint parallel chains (`src_b → tfm → out_b` alongside a
-        // primary `src_a` chain), and any non-primary chain whose
-        // downstream operators are neither Combine build-side inputs
-        // nor init-phase ancestors. Without this pass those Sources
-        // would silently fall through the dispatch arm's
-        // `else { ctx.all_records.iter() ... }` branch and emit the
-        // primary's records — the silent data-corruption surface at
-        // the root of #47 and umbrella #50. The new branch in
-        // `dispatch::PlanNode::Source` (added in this sprint) treats
-        // a missing-stream non-primary as `PipelineError::Internal`
-        // so any future regression is loud, not silent.
-        let non_primary_top_level_sources: Vec<String> = source_configs
-            .iter()
-            .map(|s| s.name.clone())
-            .filter(|name| name.as_str() != input.name)
-            .collect();
-        for upstream in &non_primary_top_level_sources {
-            if source_streams.contains_key(upstream) {
-                continue;
-            }
-            if let Some(drained) =
-                preload_source_into_stream(upstream, readers, source_configs, config)?
-            {
-                source_streams.insert(upstream.clone(), drained);
-            }
         }
 
         Self::execute_dag_branching(
             config,
-            input,
-            all_records,
-            per_record_source_files,
-            source_streams,
+            source_records,
+            source_configs,
             writers,
             transforms,
             compiled_route,
@@ -1339,6 +1033,8 @@ impl PipelineExecutor {
             collector,
             window_runtime,
             memory_budget,
+            spill_root,
+            spill_root_path,
         )
     }
 
@@ -1357,10 +1053,8 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
         config: &PipelineConfig,
-        input: &crate::config::SourceConfig,
-        mut all_records: Vec<(Record, u64)>,
-        per_record_source_files: Vec<Arc<str>>,
-        source_streams: HashMap<String, source_stream::DrainedSourceStream>,
+        mut source_records: HashMap<String, Vec<(Record, u64)>>,
+        source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -1373,24 +1067,9 @@ impl PipelineExecutor {
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
         memory_budget: crate::pipeline::memory::MemoryBudget,
+        spill_root: Arc<tempfile::TempDir>,
+        spill_root_path: Arc<std::path::Path>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        // Drain each non-primary Source's bounded ingest stream into
-        // the in-memory `preloaded_source_records` map the dispatcher
-        // consumes. Spill files (if any) read sequentially here and
-        // delete themselves via `tempfile::TempPath` Drop after the
-        // reader iterator exhausts. Sprint-2 work (sub-issue #51)
-        // pushes this drain down into per-Source dispatch so we don't
-        // re-materialize spilled records into RAM at all.
-        let mut preloaded_source_records: HashMap<String, Vec<(Record, u64)>> =
-            HashMap::with_capacity(source_streams.len());
-        for (name, stream) in source_streams {
-            let records = stream.into_records().map_err(|e| PipelineError::Internal {
-                op: "source-stream-drain",
-                node: name.clone(),
-                detail: e.to_string(),
-            })?;
-            preloaded_source_records.insert(name, records);
-        }
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1405,32 +1084,39 @@ impl PipelineExecutor {
             &params.static_vars,
         );
 
-        // Seed source-scope vars on every distinct primary-source file
-        // Arc. Channel overrides (per source-node name) layer atop
-        // Transform-`declares: scope: source` defaults; the per-file
-        // inner map uses `or_insert` for declared defaults (so any
-        // source-scope writer that planted earlier wins) and `insert`
-        // for channel values (channel always wins). Combine
-        // build-side preloaded sources are not seeded from this point;
-        // their channel overrides apply when those sources flow
-        // through their own primary `execute_dag` call.
+        // Seed source-scope vars on every distinct per-record file Arc
+        // across every declared source. Channel overrides (per source-
+        // node name) layer atop Transform-`declares: scope: source`
+        // defaults; the per-file inner map uses `or_insert` for
+        // declared defaults (so any source-scope writer that planted
+        // earlier wins) and `insert` for channel values (channel
+        // always wins). The per-record file path is read off the
+        // `$source.file` engine-stamped column on each record.
         let declared_source_defaults = crate::config::collect_source_var_defaults(&config.nodes);
-        let channel_for_primary = params.source_vars.get(&input.name);
-        if (!declared_source_defaults.is_empty() || channel_for_primary.is_some())
+        if (!declared_source_defaults.is_empty() || !params.source_vars.is_empty())
             && let Ok(mut map) = stable.source_vars.write()
         {
-            let mut seen: std::collections::HashSet<&Arc<str>> = std::collections::HashSet::new();
-            for file_arc in &per_record_source_files {
-                if !seen.insert(file_arc) {
+            for src_cfg in source_configs {
+                let Some(records) = source_records.get(&src_cfg.name) else {
                     continue;
-                }
-                let entry = map.entry(Arc::clone(file_arc)).or_default();
-                for (k, v) in &declared_source_defaults {
-                    entry.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-                if let Some(ch) = channel_for_primary {
-                    for (k, v) in ch {
-                        entry.insert(k.clone(), v.clone());
+                };
+                let channel = params.source_vars.get(&src_cfg.name);
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (record, _) in records {
+                    let Some(file_path) = dispatch::source_file_path_of(record) else {
+                        continue;
+                    };
+                    if !seen.insert(file_path) {
+                        continue;
+                    }
+                    let entry = map.entry(Arc::from(file_path)).or_default();
+                    for (k, v) in &declared_source_defaults {
+                        entry.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    if let Some(ch) = channel {
+                        for (k, v) in ch {
+                            entry.insert(k.clone(), v.clone());
+                        }
                     }
                 }
             }
@@ -1449,34 +1135,21 @@ impl PipelineExecutor {
             seed
         };
         if !record_var_seed.is_empty() {
-            for (record, _) in &mut all_records {
-                record.seed_record_vars(&record_var_seed);
-            }
-            for (_, recs) in preloaded_source_records.iter_mut() {
+            for recs in source_records.values_mut() {
                 for (record, _) in recs {
                     record.seed_record_vars(&record_var_seed);
                 }
             }
         }
-        // Synthetic source-file placeholder used by dispatch sites that
-        // have no live record (combine/finalize/post-aggregate emits
-        // with `source_row: 0`). For multi-file sources `input.path` is
-        // empty; the placeholder string is distinguishable from a real
-        // file path so users see it clearly in `$source.file` if it
-        // ever leaks past a merge boundary.
-        let source_file_arc: Arc<str> = if input.path_str().is_empty() {
-            Arc::from("<source>")
-        } else {
-            Arc::from(input.path_str())
-        };
-        // `$source.batch` is per-source-run. Default to a fresh UUID v7
-        // that's distinct from `pipeline.batch_id` (per-pipeline-run).
+        // `$source.batch` is per-pipeline-run scalar today (sub-issue
+        // #54 introduces per-source attribution as a separate stamp).
         let source_batch_arc: Arc<str> = Arc::from(uuid::Uuid::now_v7().to_string());
         let source_ingestion_timestamp = pipeline_start_time;
 
         let strategy = config.error_handling.strategy;
-        let total_records = all_records.len() as u64;
-        // `$source.count` — total records ingested from this source.
+        // `$source.count` is the pipeline-wide total across every
+        // declared source. Per-source attribution is sub-issue #54.
+        let total_records: u64 = source_records.values().map(|v| v.len() as u64).sum();
         let source_count: u64 = total_records;
 
         // Name → index map for looking up `CompiledTransform` by node
@@ -1487,26 +1160,6 @@ impl PipelineExecutor {
             .enumerate()
             .map(|(i, t)| (t.name.as_str(), i))
             .collect();
-
-        // Pipeline-scoped spill directory. One TempDir per pipeline
-        // run; every spilling operator borrows its path. Drop runs at
-        // the end of the walk (normal exit) or during stack unwinding
-        // (panic), so any individual spill file an operator left
-        // behind mid-flight gets swept by the directory's recursive
-        // remove. This is the secondary cleanup sweep that closes the
-        // panic-leak hole; primary cleanup remains per-file via
-        // `tempfile::TempPath` Drop.
-        let spill_root = Arc::new(
-            tempfile::Builder::new()
-                .prefix("clinker-spill-")
-                .tempdir()
-                .map_err(|e| PipelineError::Internal {
-                    op: "executor",
-                    node: String::new(),
-                    detail: format!("failed to allocate pipeline spill root: {e}"),
-                })?,
-        );
-        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
         // Correlation grouping context. `Some(...)` iff at least one
         // source declares a `correlation_key:`; the planner's
@@ -1543,17 +1196,13 @@ impl PipelineExecutor {
             compiled_transforms: transforms,
             transform_by_name,
             stable: &stable,
-            source_file_arcs: &per_record_source_files,
-            synthetic_source_file: &source_file_arc,
             source_batch_arc: &source_batch_arc,
             source_count,
             source_ingestion_timestamp,
             strategy,
-            primary_input_name: input.name.as_str(),
 
             node_buffers: HashMap::new(),
-            preloaded_source_records,
-            all_records,
+            source_records,
             writers: writers.single,
             fan_out_writers: writers.fan_out,
             compiled_route,
@@ -1928,63 +1577,89 @@ fn wrap_with_schema_coercion(
     }
 }
 
-/// Ingest one non-primary Source's records into a [`SourceStream`].
+/// Ingest a Source's records into a bounded `SourceStream` and drain
+/// to the read-side handle. Used uniformly by every declared Source —
+/// no primary asymmetry.
 ///
-/// Returns `Ok(None)` when `upstream`'s files are missing from `readers`
-/// (already drained by an earlier preload step) or empty. Returns
-/// `Ok(Some(stream))` otherwise. The caller inserts the drained stream
-/// into the per-source map; reusing this helper across the
-/// combine-input, init-phase, and merge/disjoint preload passes keeps
-/// the ingest logic single-sourced.
-///
-/// Errors map `SpillError` to `PipelineError::Internal` because the
-/// preload pass has no recoverable strategy for a corrupted spill
-/// temp file or out-of-disk condition — the pipeline cannot make
-/// progress without the source's records.
-fn preload_source_into_stream(
-    upstream: &str,
-    readers: &mut SourceReaders,
-    source_configs: &[crate::config::SourceConfig],
+/// Each ingested record is widened with a tail `$source.file`
+/// engine-stamped column (`FieldMetadata::SourceFile`) carrying the
+/// per-record file `Arc<str>` from
+/// `MultiFileFormatReader::current_source_file()`. Stamping at ingest
+/// lets `$source.file` / `$source.path` resolution survive Merge /
+/// Combine downstream without an external row-keyed array.
+/// `counters.total_count` increments per record so every source
+/// contributes to the pipeline-wide total.
+fn ingest_source_into_stream(
+    src_cfg: &crate::config::SourceConfig,
+    files: Vec<crate::source::multi_file::FileSlot>,
     config: &PipelineConfig,
-) -> Result<Option<source_stream::DrainedSourceStream>, PipelineError> {
-    let Some(files) = readers.remove(upstream) else {
-        return Ok(None);
-    };
+    spill_dir: Option<Arc<std::path::Path>>,
+    counters: &mut PipelineCounters,
+) -> Result<source_stream::DrainedSourceStream, PipelineError> {
     if files.is_empty() {
-        return Ok(None);
+        return Err(PipelineError::Config(
+            crate::config::ConfigError::Validation(format!(
+                "source '{}' has empty file list",
+                src_cfg.name
+            )),
+        ));
     }
-    let src_cfg = source_configs
-        .iter()
-        .find(|s| s.name == upstream)
-        .ok_or_else(|| {
-            PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                "source '{upstream}' not declared in the pipeline",
-            )))
-        })?;
     let raw_reader = build_multi_file_reader(src_cfg, files)?;
-    let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
-    let schema = src_reader.schema()?;
-    // `spill_dir = None` lets `SpillWriter` fall back to the system
-    // tempdir; per-file cleanup is handled by `tempfile::TempPath` Drop
-    // on `SpillFile<u64>`. Hoisting the pipeline-scoped TempDir up
-    // from `execute_dag_branching` so preload spill files share the
-    // secondary panic-recovery sweep is a sprint-2 follow-up tracked
-    // under umbrella #50.
+    let mut src_reader = wrap_with_schema_coercion(raw_reader, config, &src_cfg.name)?;
+    let reader_schema = src_reader.schema()?;
+
+    // Widen the reader schema with a $source.file SourceFile-marked
+    // tail column. The stamp travels with every record so downstream
+    // operators resolve `$source.file` per-record via the column read
+    // (see `dispatch::source_file_arc_of`) instead of indexing an
+    // external row-keyed Vec.
+    let mut widened_builder =
+        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 1);
+    for (idx, col) in reader_schema.columns().iter().enumerate() {
+        widened_builder = match reader_schema.field_metadata(idx) {
+            Some(meta) => widened_builder.with_field_meta(col.as_ref(), meta.clone()),
+            None => widened_builder.with_field(col.as_ref()),
+        };
+    }
+    let widened_schema = widened_builder
+        .with_field_meta(
+            crate::config::pipeline_node::SOURCE_FILE_COLUMN,
+            clinker_record::FieldMetadata::source_file(),
+        )
+        .build();
+
+    let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
+        Arc::from("<source>")
+    } else {
+        Arc::from(src_cfg.path_str())
+    };
+
     let mut stream = source_stream::SourceStream::new(
-        schema,
+        Arc::clone(&widened_schema),
         source_stream::DEFAULT_SOURCE_STREAM_CAPACITY,
-        None,
+        spill_dir,
     );
     let mut rn: u64 = 0;
     loop {
         match src_reader.next_record() {
             Ok(Some(record)) => {
                 rn += 1;
+                counters.total_count += 1;
+                let file_arc = src_reader
+                    .current_source_file()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&static_source_file));
+                let mut values: Vec<clinker_record::Value> = record.values().to_vec();
+                values.push(clinker_record::Value::String(
+                    file_arc.as_ref().to_string().into_boxed_str(),
+                ));
+                let widened_record =
+                    clinker_record::Record::new(Arc::clone(&widened_schema), values);
                 stream
-                    .push(record, rn)
+                    .push(widened_record, rn)
                     .map_err(|e| PipelineError::Internal {
                         op: "source-stream-spill",
-                        node: upstream.to_string(),
+                        node: src_cfg.name.clone(),
                         detail: e.to_string(),
                     })?;
             }
@@ -1992,12 +1667,11 @@ fn preload_source_into_stream(
             Err(other) => return Err(other.into()),
         }
     }
-    let drained = stream.finish().map_err(|e| PipelineError::Internal {
+    stream.finish().map_err(|e| PipelineError::Internal {
         op: "source-stream-finish",
-        node: upstream.to_string(),
+        node: src_cfg.name.clone(),
         detail: e.to_string(),
-    })?;
-    Ok(Some(drained))
+    })
 }
 
 /// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
@@ -2997,13 +2671,8 @@ mod tests {
             ..Default::default()
         };
 
-        let report = PipelineExecutor::run_with_readers_writers(
-            &config,
-            &primary,
-            readers,
-            writers.into(),
-            &params,
-        )?;
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))

@@ -59,10 +59,8 @@ fn run_with_output(
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan, primary, readers, writers, &params,
-    )
-    .expect("pipeline must run cleanly");
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("pipeline must run cleanly");
     (report, buffer.as_string())
 }
 

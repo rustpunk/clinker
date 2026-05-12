@@ -1,7 +1,7 @@
 //! Bounded source-ingest buffer with disk-spill overflow.
 //!
-//! `SourceStream` ingests records from a non-primary Source into an
-//! in-memory buffer keyed by source row number. When the buffer exceeds
+//! `SourceStream` ingests records from a Source into an in-memory
+//! buffer keyed by source row number. When the buffer exceeds
 //! `capacity`, subsequent records spill to a temp file via
 //! `pipeline::spill::SpillFile<u64>` (payload = source row number,
 //! preserving FIFO order across the in-memory / on-disk boundary).
@@ -11,15 +11,15 @@
 //! record back into a `Vec<(Record, u64)>` in FIFO order — in-memory
 //! portion first, then any spilled records read sequentially from disk.
 //!
-//! Sprint-1 scope: single-threaded ingest in the executor's preload
-//! pass, drained back into `ExecutorContext.preloaded_source_records`
-//! before dispatch runs. The peak-RSS win versus today's
-//! `HashMap<String, Vec<(Record, u64)>>` preload is that each
-//! non-primary Source's overflow can spill before the next source's
+//! Every declared Source ingests through this primitive — there is no
+//! "primary" asymmetry. Single-threaded ingest in the executor's
+//! unified ingest pass, drained back into
+//! `ExecutorContext.source_records` before dispatch runs. The peak-RSS
+//! win versus a flat `HashMap<String, Vec<(Record, u64)>>` preload is
+//! that each Source's overflow can spill before the next source's
 //! ingest begins, so only one source's in-memory portion is resident
-//! at a time. Sub-issue #51 collapses the primary-source path onto
-//! `SourceStream` too; #57 swaps the impl for a concurrent
-//! channel-backed ingest under tokio.
+//! at a time. Sub-issue #57 swaps the impl for a concurrent channel-
+//! backed ingest under tokio.
 
 use std::path::Path;
 use std::sync::Arc;
