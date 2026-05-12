@@ -2075,13 +2075,15 @@ fn build_input_port_rows(
         }
 
         // Append the parent's engine-stamped tail columns to the
-        // body's port declared set. Two engine-stamp shapes propagate
-        // from parent to body:
+        // body's port declared set. Three engine-stamp shapes
+        // propagate from parent to body:
         //
         // - `$ck.<field>` source-CK shadow columns from each parent
         //   source's `correlation_key:` widening.
         // - `$widened` sidecar absorber column from
         //   `on_unmapped: auto_widen`.
+        // - `$source.file` per-record source-file lineage stamp
+        //   every Source carries.
         //
         // The runtime port-synthetic Source built at body entry adopts
         // every parent column, so the body sees these at runtime;
@@ -2095,7 +2097,8 @@ fn build_input_port_rows(
         let mut declared_columns = declared_columns;
         for (qf, ty) in upstream_row.fields() {
             let is_engine_stamped = qf.name.starts_with("$ck.")
-                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN;
+                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
+                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_FILE_COLUMN;
             if is_engine_stamped && !declared_columns.contains_key(qf) {
                 declared_columns.insert(qf.clone(), ty.clone());
             }
@@ -2326,6 +2329,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 ///   [`FieldMetadata::SourceCorrelation`].
 /// - `$widened` — `auto_widen` sidecar absorber. Stamped
 ///   [`FieldMetadata::WidenedSidecar`].
+/// - `$source.file` — per-record source-file lineage stamp. Stamped
+///   [`FieldMetadata::SourceFile`].
 ///
 /// The aggregate prefix is checked first because `$ck.aggregate.x`
 /// also matches the generic `$ck.` prefix; misordering would mis-
@@ -2347,6 +2352,8 @@ where
             builder.with_field_meta(name, FieldMetadata::source_correlation(field))
         } else if name == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN {
             builder.with_field_meta(name, FieldMetadata::widened_sidecar())
+        } else if name == crate::config::pipeline_node::SOURCE_FILE_COLUMN {
+            builder.with_field_meta(name, FieldMetadata::source_file())
         } else {
             builder.with_field(name)
         };
@@ -2382,11 +2389,13 @@ fn columns_from_decl(
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
     // Engine-stamped tail order: `$ck.<field>` shadow columns first,
-    // then the `$widened` sidecar last. The order is load-bearing —
-    // CK-aligned aggregate / combine propagation walks the schema
-    // expecting `$ck.*` immediately after declared columns; pushing
-    // `$widened` between them would break that propagation. Sources
-    // with `auto_widen` get `$widened` after every `$ck.<field>` slot.
+    // then the `$widened` sidecar, then `$source.file` last. The order
+    // is load-bearing — CK-aligned aggregate / combine propagation
+    // walks the schema expecting `$ck.*` immediately after declared
+    // columns; pushing `$widened` between them would break that
+    // propagation. Sources with `auto_widen` get `$widened` after
+    // every `$ck.<field>` slot; `$source.file` lives outside the CK
+    // lattice and tail-appends after `$widened`.
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
@@ -2410,6 +2419,10 @@ fn columns_from_decl(
             Type::Any,
         );
     }
+    cols.insert(
+        QualifiedField::bare(crate::config::pipeline_node::SOURCE_FILE_COLUMN),
+        Type::String,
+    );
     (cols, missing)
 }
 

@@ -135,25 +135,27 @@ pub(crate) fn orchestrate(
 
     // Loop cap: each iteration must add ≥ 1 source row to the trigger
     // set (otherwise the loop exits via empty `expand_with_dlq_events`
-    // return), and source rows are bounded by `ctx.all_records.len()`.
-    // The `parent + body node_count + 1` slack accounts for the initial
-    // iteration (which retracts the initial trigger set, not new rows)
-    // plus defensive headroom against any non-source-row reason the
-    // scope could grow. Body node counts fold in because a body's
-    // continuation walk can surface fresh source-row triggers across
-    // iterations; the body sum is structural headroom, not a new
-    // termination contributor (termination is still |source_rows|-
-    // bounded). Test-only override (`TEST_LOOP_CAP_OVERRIDE`) lets the
-    // defensive panic-message contract be exercised with a synthetic
-    // small cap; production callers always see the structural value.
+    // return), and source rows are bounded by the union of every
+    // declared source's ingested record count. The `parent + body
+    // node_count + 1` slack accounts for the initial iteration (which
+    // retracts the initial trigger set, not new rows) plus defensive
+    // headroom against any non-source-row reason the scope could grow.
+    // Body node counts fold in because a body's continuation walk can
+    // surface fresh source-row triggers across iterations; the body sum
+    // is structural headroom, not a new termination contributor
+    // (termination is still |source_rows|-bounded). Test-only override
+    // (`TEST_LOOP_CAP_OVERRIDE`) lets the defensive panic-message
+    // contract be exercised with a synthetic small cap; production
+    // callers always see the structural value.
     let body_node_count: usize = ctx
         .artifacts
         .composition_bodies
         .values()
         .map(|b| b.graph.node_count())
         .sum();
+    let total_source_rows: usize = ctx.source_records.values().map(|v| v.len()).sum();
     let cap = test_cap_override()
-        .unwrap_or(current_dag.graph.node_count() + body_node_count + ctx.all_records.len() + 1);
+        .unwrap_or(current_dag.graph.node_count() + body_node_count + total_source_rows + 1);
     let mut iter = 0usize;
 
     // Cumulative error archive across iterations. Each iteration's

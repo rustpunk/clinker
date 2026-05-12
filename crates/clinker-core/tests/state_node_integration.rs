@@ -82,14 +82,8 @@ fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan,
-        primary,
-        readers,
-        writers,
-        &test_params(),
-    )
-    .expect("pipeline run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .expect("pipeline run");
     buf.as_string()
 }
 

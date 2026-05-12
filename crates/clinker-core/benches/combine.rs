@@ -132,9 +132,8 @@ nodes:
 
 /// End-to-end equi-combine bench at three sizes. Each iteration
 /// re-parses readers from cached CSV bytes, recompiles the plan, and
-/// drives `PipelineExecutor::run_plan_with_readers_writers_with_primary`
-/// with `orders` as the explicit driving source. This measures the
-/// same boundary-to-boundary path as the preserved
+/// drives `PipelineExecutor::run_plan_with_readers_writers`. This
+/// measures the same boundary-to-boundary path as the preserved
 /// `lookup_baseline/10k_x_100k/lookup-v1` saved baseline so a numeric
 /// delta against that estimates.json is meaningful.
 fn bench_combine_equi_2input(c: &mut Criterion) {
@@ -191,8 +190,8 @@ fn bench_combine_equi_2input(c: &mut Criterion) {
                     &clinker_core::config::CompileContext::default(),
                 )
                 .expect("combine equi_2input must compile");
-                let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
-                    &plan, "orders", readers, writers, &params,
+                let report = PipelineExecutor::run_plan_with_readers_writers(
+                    &plan, readers, writers, &params,
                 )
                 .expect("combine equi_2input must execute");
                 black_box(report);

@@ -205,14 +205,9 @@ o3,ENG,100
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )
-    .expect("pipeline must run without error");
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .expect("pipeline must run without error");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -339,13 +334,8 @@ nodes:
     // build (E310 from the source-rooted Phase-0 arena). Either path
     // surfaces the E310 admission failure shape; assert the err string
     // carries that signature.
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
@@ -467,13 +457,8 @@ o3,HR,30
     };
     let config = crate::config::parse_config(yaml).expect("parse");
     with_test_loop_cap(0, || {
-        let _ = PipelineExecutor::run_with_readers_writers(
-            &config,
-            &primary,
-            readers,
-            writers.into(),
-            &params,
-        );
+        let _ =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     });
 }
 
@@ -498,8 +483,8 @@ o3,HR,30
 ///
 /// Build-side rows that hit DLQ during the forward pass require
 /// either a Transform-mediated build chain (which breaks
-/// `preloaded_source_records` lookup since Combine's build input must
-/// resolve to a Source directly) or source-level validation (not yet
+/// `source_records` lookup since Combine's build input must resolve
+/// to a Source directly) or source-level validation (not yet
 /// available on `Source` nodes). The contract that an at-commit
 /// Combine rebuild reads from the cross-region buffer rather than
 /// re-reading the source IS pinned indirectly: a per-iteration
@@ -594,7 +579,7 @@ ENG,500
 ";
 
     let config = crate::config::parse_config(yaml).expect("parse");
-    let primary = "orders".to_string();
+    let _primary = "orders".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -623,14 +608,9 @@ ENG,500
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )
-    .expect("combine-in-region pipeline must converge");
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .expect("combine-in-region pipeline must converge");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -827,7 +807,6 @@ o6,ENG,300
     // runner.
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
-        &primary,
         readers,
         writers.into(),
         &params,
@@ -1063,7 +1042,6 @@ o6,ENG,300
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
-        &primary,
         readers,
         writers.into(),
         &params,
@@ -1294,7 +1272,6 @@ o6,ENG,300
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
-        &primary,
         readers,
         writers.into(),
         &params,
@@ -1498,7 +1475,6 @@ o6,ENG,300
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
-        &primary,
         readers,
         writers.into(),
         &params,
@@ -1684,7 +1660,6 @@ o6,ENG,300
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
-        &primary,
         readers,
         writers.into(),
         &params,
@@ -1841,14 +1816,9 @@ o6,ENG,300
         ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )
-    .expect("fan-out pipeline must converge");
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .expect("fan-out pipeline must converge");
 
     let big_out = big_buf.as_string();
     let small_out = small_buf.as_string();
@@ -2003,7 +1973,7 @@ nodes:
         lookup_csv.push_str(&format!("D{i},lookup_payload_{i}\n"));
     }
 
-    let primary = "orders".to_string();
+    let _primary = "orders".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -2033,13 +2003,8 @@ nodes:
         ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let result = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    );
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
 
     // The pipeline either errors at the build-side cross-region tee
     // (`tee_emit_to_region_input_buffers` raising E310 from

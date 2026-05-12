@@ -38,13 +38,8 @@ mod tests {
             ..Default::default()
         };
 
-        let report = PipelineExecutor::run_with_readers_writers(
-            &config,
-            &first_source,
-            readers,
-            writers.into(),
-            &params,
-        )?;
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
@@ -797,91 +792,17 @@ emit out_code = code"#,
     // ── Combine enrichment coverage lives in
     //     `crates/clinker-core/tests/combine_test.rs`. ──
 
-    // ── Explicit-primary contract tests ──
+    // ── Source-ingest contract tests ──
     //
-    // These three gate tests pin down the contract introduced when
-    // `PipelineExecutor::run_with_readers_writers` took an explicit
-    // `primary: &str` parameter (replacing the implicit
-    // `source_configs[0]`-as-primary convention). See
-    // `crates/clinker-core/src/executor/mod.rs`.
+    // These gate tests pin down the unified-ingest contract: every
+    // declared source must have a registered reader, and declaration
+    // order is irrelevant (no "primary" asymmetry).
 
-    /// Passing a `primary` name that does not match any declared
-    /// source in the pipeline config must surface as a
-    /// `Config(ConfigError::Validation(..))` error — no panic, no
-    /// silent coercion.
-    #[test]
-    fn test_run_with_readers_writers_rejects_unknown_primary() {
-        let yaml = r#"
-pipeline:
-  name: single_source
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-- type: transform
-  name: identity
-  input: src
-  config:
-    cxl: 'emit id = id'
-- type: output
-  name: dest
-  input: identity
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-"#;
-        let config = config::parse_config(yaml).unwrap();
-
-        // `src` is registered, but we pass "nonexistent" as primary.
-        let readers: crate::executor::SourceReaders = HashMap::from([(
-            "src".to_string(),
-            crate::executor::single_file_reader(
-                "test.csv",
-                Box::new(std::io::Cursor::new(b"id\n1\n".to_vec())),
-            ),
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            "dest".to_string(),
-            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
-        )]);
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars: Default::default(),
-            shutdown_token: None,
-            ..Default::default()
-        };
-
-        let result = PipelineExecutor::run_with_readers_writers(
-            &config,
-            "nonexistent",
-            readers,
-            writers.into(),
-            &params,
-        );
-
-        match result {
-            Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
-                assert!(
-                    msg.contains("primary source 'nonexistent'") && msg.contains("not declared"),
-                    "expected 'primary source \\'nonexistent\\' not declared...' message, got: {msg}"
-                );
-            }
-            other => panic!("expected Config(Validation) for unknown primary, got: {other:?}"),
-        }
-    }
-
-    /// Passing a `primary` that IS declared in the pipeline config
-    /// but is missing from the `readers` HashMap must surface as a
-    /// `Config(ConfigError::Validation(..))` error — the same clear
-    /// error the old implementation already produced for the
-    /// positionally-selected primary.
+    /// A declared source missing from the `readers` HashMap must
+    /// surface as `Config(ConfigError::Validation(..))` — silent skip
+    /// would be a regression surface (the previous non-primary preload
+    /// passes returned `Ok(None)` on missing readers; with one
+    /// unified ingest pass that's no longer a defensible default).
     #[test]
     fn test_run_with_readers_writers_rejects_primary_missing_from_readers() {
         let yaml = r#"
@@ -926,18 +847,13 @@ nodes:
             ..Default::default()
         };
 
-        let result = PipelineExecutor::run_with_readers_writers(
-            &config,
-            "src",
-            readers,
-            writers.into(),
-            &params,
-        );
+        let result =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
 
         match result {
             Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
                 assert!(
-                    msg.contains("no reader registered for input 'src'"),
+                    msg.contains("no reader registered for source 'src'"),
                     "expected missing-reader message, got: {msg}"
                 );
             }
@@ -945,18 +861,17 @@ nodes:
         }
     }
 
-    /// Key regression-proofing test: declare sources in the order
+    /// Regression-proofing test: declare sources in the order
     /// `[reference, driving]` (so `source_configs[0]` is the reference
-    /// table, not the driving input), pass `primary = "orders"`
-    /// explicitly, and verify the pipeline runs correctly end-to-end.
+    /// table, not the driving input), and verify the pipeline runs
+    /// correctly end-to-end.
     ///
     /// Under the old positional-primary convention this configuration
-    /// would have consumed the `products` reader as the driving input
-    /// and starved the combine build side. With the explicit-primary
-    /// contract, declaration order is irrelevant — not just for
-    /// reader extraction but also for downstream provenance
-    /// (`source_file` on every emitted record) and arena-field
-    /// scoping inside `execute_dag` / `execute_dag_branching`.
+    /// would have consumed `products` as the primary driving reader
+    /// and starved the combine build side. With unified ingest there
+    /// is no "primary" — every source is ingested through
+    /// `SourceStream` and dispatch order follows the plan topology,
+    /// so declaration order is irrelevant.
     #[test]
     fn test_run_with_readers_writers_primary_is_not_first_source() {
         let yaml = r#"
@@ -1050,18 +965,13 @@ nodes:
             ..Default::default()
         };
 
-        let report = PipelineExecutor::run_with_readers_writers(
-            &config,
-            "orders", // explicit primary — NOT the first-declared source
-            readers,
-            writers.into(),
-            &params,
-        )
-        .expect("pipeline must execute when primary is declared second");
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+                .expect("pipeline must execute regardless of source declaration order");
 
         assert_eq!(
-            report.counters.total_count, 2,
-            "both orders rows must be read as the driving input"
+            report.counters.total_count, 4,
+            "every ingested record (2 orders + 2 products) contributes to total_count"
         );
         assert_eq!(
             report.counters.ok_count, 2,

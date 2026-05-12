@@ -56,13 +56,18 @@ nodes:
     let row = plan
         .typed_output_row("source1")
         .expect("source1 must have a bound row");
-    // Schema includes the user-declared `a` + `b` plus the
-    // `$widened` engine-stamped sidecar column (auto_widen is the
-    // default `OnUnmapped` policy).
-    assert_eq!(row.field_count(), 3);
+    // Schema includes the user-declared `a` + `b`, the `$widened`
+    // engine-stamped sidecar (auto_widen is the default `OnUnmapped`
+    // policy), and the `$source.file` per-record source-file lineage
+    // stamp (every Source unconditionally tail-appends this).
+    assert_eq!(row.field_count(), 4);
     assert!(row.has_field("a"), "expected column 'a'");
     assert!(row.has_field("b"), "expected column 'b'");
     assert!(row.has_field("$widened"), "expected $widened sidecar");
+    assert!(
+        row.has_field("$source.file"),
+        "expected $source.file lineage stamp"
+    );
     assert_eq!(
         row.tail,
         cxl::typecheck::row::RowTail::Closed,
@@ -229,11 +234,13 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
     // User-declared columns + `$widened` engine-stamped sidecar
-    // (auto_widen is the default `OnUnmapped` policy).
-    assert_eq!(schema.column_count(), 3);
+    // (auto_widen is the default `OnUnmapped` policy) + the
+    // `$source.file` per-record lineage stamp every Source carries.
+    assert_eq!(schema.column_count(), 4);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
     assert_eq!(&*schema.columns()[2], "$widened");
+    assert_eq!(&*schema.columns()[3], "$source.file");
     assert!(
         schema.field_metadata_by_name("employee_id").is_none(),
         "user-declared column must not carry engine-stamp metadata"
@@ -245,6 +252,10 @@ nodes:
     assert!(
         schema.field_metadata_by_name("$widened").is_some(),
         "$widened sidecar must carry engine-stamp metadata"
+    );
+    assert!(
+        schema.field_metadata_by_name("$source.file").is_some(),
+        "$source.file must carry engine-stamp metadata"
     );
 }
 
@@ -282,8 +293,8 @@ nodes:
 
     // User-declared columns stay at their declared positions, then
     // engine-stamped tail: `$ck.<field>` shadow columns first, then
-    // the `$widened` sidecar (auto_widen default).
-    assert_eq!(schema.column_count(), 4);
+    // the `$widened` sidecar (auto_widen default), then `$source.file`.
+    assert_eq!(schema.column_count(), 5);
     assert_eq!(&*schema.columns()[0], "employee_id");
     assert_eq!(&*schema.columns()[1], "salary");
     assert_eq!(
@@ -292,6 +303,7 @@ nodes:
         "CK shadow column tail-appended before sidecar"
     );
     assert_eq!(&*schema.columns()[3], "$widened");
+    assert_eq!(&*schema.columns()[4], "$source.file");
     assert_eq!(schema.index("$ck.employee_id"), Some(2));
 
     // Engine-stamp metadata points back at the user-declared field.
@@ -343,12 +355,14 @@ nodes:
     let plan = compile_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
-    // 3 declared + 2 `$ck.*` shadows + `$widened` sidecar = 6 columns.
-    assert_eq!(schema.column_count(), 6);
-    // Tail-append order matches `correlation_key.fields()` order, then sidecar.
+    // 3 declared + 2 `$ck.*` shadows + `$widened` sidecar + `$source.file` = 7 columns.
+    assert_eq!(schema.column_count(), 7);
+    // Tail-append order matches `correlation_key.fields()` order, then sidecar,
+    // then the per-record `$source.file` lineage stamp.
     assert_eq!(&*schema.columns()[3], "$ck.tenant");
     assert_eq!(&*schema.columns()[4], "$ck.employee_id");
     assert_eq!(&*schema.columns()[5], "$widened");
+    assert_eq!(&*schema.columns()[6], "$source.file");
 
     assert_eq!(
         source_correlation_field(schema.field_metadata_by_name("$ck.tenant")),

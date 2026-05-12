@@ -65,7 +65,6 @@ o5,ENG,200
 o6,ENG,300
 ";
     let config = crate::config::parse_config(yaml).expect("parse");
-    let primary = "src".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
         crate::executor::single_file_reader(
@@ -85,14 +84,9 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )
-    .expect("pipeline must run");
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .expect("pipeline must run");
     let counters = report.counters;
 
     // o3 (HR, 30) hits divide-by-zero → 1 DLQ. Other rows reach the

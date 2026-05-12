@@ -1,8 +1,8 @@
-//! End-to-end coverage for the silent-corruption topologies fixed by
-//! the multi-source `SourceStream` rewiring in sprint 1 of umbrella #50
-//! (closes #47). Each topology constructs two CSV sources with
-//! non-overlapping `id` ranges so that any leak of one source's records
-//! into the other's chain is immediately visible in the output.
+//! End-to-end coverage for the silent-corruption topologies that
+//! historically affected non-primary Sources (closes #47). Each
+//! topology constructs two CSV sources with non-overlapping `id`
+//! ranges so that any leak of one source's records into the other's
+//! chain is immediately visible in the output.
 //!
 //! Pre-fix surface (the bug, schema-match across sources):
 //!
@@ -13,11 +13,12 @@
 //! | `src_a → tfm → merge`, `src_b → tfm → merge` | same fallthrough at the Source dispatcher |
 //! | `src_a → out_a`, `src_b → tfm → out_b` | non-primary single-output chain reads primary |
 //!
-//! The fix wires every non-primary Source through `SourceStream` in the
-//! executor's preload pass, removing the silent fallthrough to
-//! `ctx.all_records`. The Source dispatcher's third arm is now a
-//! defense-in-depth `PipelineError::Internal` (loud, not silent) when
-//! a non-primary Source somehow lacks preloaded records.
+//! The fix wires every Source through `SourceStream` so dispatch
+//! reads from `ctx.source_records[name]` rather than falling through
+//! to a single primary record set. The Source dispatcher's catch-all
+//! arm is now a defense-in-depth `PipelineError::Internal` (loud,
+//! not silent) when an ingest regression leaves a declared Source
+//! without records.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -106,10 +107,10 @@ nodes:
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
             .expect("multi-source merge must execute");
-    // `report.counters.total_count` only tracks the primary stream
-    // (a sub-#51 accounting gap that closes when the primary moves
-    // onto `SourceStream` too); the output buffer is the
-    // authoritative check.
+    // Unified source ingest counts every source's records, so
+    // `total_count` reports the union (3 + 3 = 6) rather than the
+    // historical primary-only count.
+    assert_eq!(report.counters.total_count, 6);
     assert_eq!(report.counters.dlq_count, 0);
 
     let output = buf.as_string();
@@ -211,8 +212,10 @@ nodes:
         ("out_b".to_string(), writer(&buf_b)),
     ]);
 
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-        .expect("disjoint parallel chains must execute");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("disjoint parallel chains must execute");
+    assert_eq!(report.counters.total_count, 6);
 
     let out_a = buf_a.as_string();
     let out_b = buf_b.as_string();
@@ -314,10 +317,10 @@ nodes:
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
             .expect("chained-into-merge must execute");
     assert_eq!(report.counters.dlq_count, 0);
+    // Unified ingest counts every source's records — 3 + 3 = 6.
+    assert_eq!(report.counters.total_count, 6);
 
     let output = buf.as_string();
-    // Output buffer is authoritative; `total_count` is primary-only
-    // (sub-#51 accounting gap).
     assert_eq!(
         output.lines().skip(1).count(),
         6,
@@ -422,8 +425,10 @@ nodes:
         ("out_b".to_string(), writer(&buf_b)),
     ]);
 
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-        .expect("non-primary chain must execute");
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("non-primary chain must execute");
+    assert_eq!(report.counters.total_count, 6);
 
     let out_a = buf_a.as_string();
     let out_b = buf_b.as_string();
@@ -439,4 +444,101 @@ nodes:
         );
         assert!(out_a.contains(needle), "out_a missing `{needle}`: {out_a}");
     }
+}
+
+/// Topology 5 — `[src_a, src_b] → merge → transform emits $source.file
+/// → out`. Verifies per-record source-file lineage survives the merge:
+/// the engine-stamped `$source.file` column tracks the originating
+/// file path per record, so records merged from src_a carry "a.csv"
+/// and records from src_b carry "b.csv". The engine-stamped column
+/// replaces an earlier external `source_file_arcs[rn-1]` array
+/// indexed by primary-only row numbers, which leaked the primary's
+/// file path to non-primary records (or panicked on out-of-range).
+#[test]
+fn post_merge_source_file_resolves_per_record() {
+    let yaml = r#"
+pipeline:
+  name: post_merge_source_file
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+  - type: merge
+    name: merged
+    inputs: [src_a, src_b]
+  - type: transform
+    name: stamp_source
+    input: merged
+    config:
+      cxl: |
+        emit id = id
+        emit origin_file = $source.file
+  - type: output
+    name: out
+    input: stamp_source
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        ("src_a".to_string(), vec![slot("a", "id\n1\n2\n")]),
+        ("src_b".to_string(), vec![slot("b", "id\n10\n11\n")]),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+        .expect("post-merge $source.file pipeline must execute");
+
+    let output = buf.as_string();
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    assert_eq!(body.len(), 4, "expected 4 records, got:\n{output}");
+    // src_a's ids carry "a.csv"; src_b's ids carry "b.csv". The
+    // previous external-array design (indexed by primary-only rn)
+    // would have leaked src_a's file path to src_b's rows.
+    let mut a_rows = 0;
+    let mut b_rows = 0;
+    for line in &body {
+        if line.starts_with("1,") || line.starts_with("2,") {
+            assert!(
+                line.contains("a.csv"),
+                "src_a row missing 'a.csv' origin: `{line}`"
+            );
+            assert!(
+                !line.contains("b.csv"),
+                "src_a row leaked 'b.csv' — post-merge $source.file regression: `{line}`"
+            );
+            a_rows += 1;
+        }
+        if line.starts_with("10,") || line.starts_with("11,") {
+            assert!(
+                line.contains("b.csv"),
+                "src_b row missing 'b.csv' origin: `{line}`"
+            );
+            assert!(
+                !line.contains("a.csv"),
+                "src_b row leaked 'a.csv' — post-merge $source.file regression: `{line}`"
+            );
+            b_rows += 1;
+        }
+    }
+    assert_eq!(a_rows, 2, "expected 2 src_a rows");
+    assert_eq!(b_rows, 2, "expected 2 src_b rows");
 }

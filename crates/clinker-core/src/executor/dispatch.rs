@@ -18,9 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use clinker_record::{GroupByKey, PipelineCounters, Record, SchemaBuilder, Value};
+use clinker_record::{FieldMetadata, GroupByKey, PipelineCounters, Record, SchemaBuilder, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, StableEvalContext};
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
@@ -29,6 +29,45 @@ use petgraph::graph::NodeIndex;
 
 use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
+
+/// Stand-in `$source.file` value for dispatch sites that have no
+/// originating source record (Combine/finalize/post-aggregate emits with
+/// `source_row: 0`, body composition emits that lost lineage at fan-in).
+/// Used when [`source_file_of`] returns `None`.
+pub(crate) static MERGED_SOURCE_FILE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<merged>"));
+
+/// Read the per-record source-file path from the record's
+/// [`FieldMetadata::SourceFile`] engine-stamped column. Returns `None`
+/// when the record carries no such column (typical for Combine /
+/// post-aggregate synthetic emits with `source_row: 0`) or when the
+/// column's value is non-String. Callers that need an owned `Arc<str>`
+/// for `RecordContext.source_file` use [`source_file_arc_of`].
+pub(crate) fn source_file_path_of(record: &Record) -> Option<&str> {
+    let schema = record.schema();
+    for idx in 0..schema.column_count() {
+        if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceFile))
+            && let Some(Value::String(s)) = record.values().get(idx)
+        {
+            return Some(s.as_ref());
+        }
+    }
+    None
+}
+
+/// Read the per-record source-file `Arc<str>` from the record's
+/// [`FieldMetadata::SourceFile`] engine-stamped column, materializing
+/// a fresh `Arc<str>` per call. Falls back to a clone of
+/// [`MERGED_SOURCE_FILE`] when the stamp is absent. The Arc
+/// construction is O(N) on the path length per call; per-record
+/// dispatch sites accept this as a localized cost in exchange for
+/// post-merge correctness — records flowing past a Merge still resolve
+/// to their actual origin file rather than a primary-only fallback.
+pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
+    match source_file_path_of(record) {
+        Some(s) => Arc::from(s),
+        None => Arc::clone(&MERGED_SOURCE_FILE),
+    }
+}
 
 fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
     use clinker_record::value_to_group_key;
@@ -91,7 +130,7 @@ fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
                 let idx = key.len();
                 key.push(value_to_correlation_key(&record.values()[i], idx));
             }
-            Some(FieldMetadata::WidenedSidecar) | None => {}
+            Some(FieldMetadata::WidenedSidecar) | Some(FieldMetadata::SourceFile) | None => {}
         }
     }
     if key.is_empty() || key_is_null(&key) {
@@ -170,17 +209,16 @@ use crate::projection::project_output_from_record;
 /// * `transform_by_name` — name → index into `compiled_transforms`.
 /// * `compiled_transforms` — precompiled CXL programs for Transform and
 ///   Aggregation arms.
-/// * `stable` / `source_file_arc` / `strategy` — pipeline-stable scalars
+/// * `stable` / `source_batch_arc` / `strategy` — pipeline-stable scalars
 ///   reused at every per-record dispatch site.
 ///
 /// Owned (mutated across the walk):
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
-/// * `preloaded_source_records` — pre-loaded non-primary source streams
-///   the Source arm consults before falling back to `all_records`. Holds
-///   both combine build-side inputs and init-phase
-///   ancestor Sources. Renamed from `combine_source_records`
-///   when broadened the role.
-/// * `all_records` — primary driving stream materialized before the walk.
+/// * `source_records` — per-source ingested records keyed by Source node
+///   name. The Source dispatch arm reads its records from this map.
+///   Every declared Source is ingested through `SourceStream` in the
+///   executor's unified ingest pass; the `$source.file` per-record
+///   stamp travels on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
 /// * `counters` / `dlq_entries` — pipeline-wide accounting.
@@ -202,48 +240,34 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) compiled_transforms: &'a [CompiledTransform],
     pub(crate) transform_by_name: HashMap<&'a str, usize>,
     pub(crate) stable: &'a StableEvalContext,
-    /// Per-record source-file `Arc<str>`s, indexed by `source_row - 1`
-    /// (since `source_row` is 1-based). For literal-`path:` sources
-    /// every entry is the same Arc; for `glob`/`regex`/`paths` sources
-    /// entries vary across the file boundaries set by
-    /// `MultiFileFormatReader::current_source_file()`. Doubles as the
-    /// `$source.path` storage today (full canonical path).
-    pub(crate) source_file_arcs: &'a [Arc<str>],
-    /// Stand-in `Arc<str>` for dispatch sites that have no live record
-    /// (combine/finalize/post-aggregate emits with `source_row: 0`).
-    /// Set to `Arc::from("<merged>")` for multi-file sources after
-    /// merge/combine consumed the partition; matches the first
-    /// per-record Arc otherwise.
-    pub(crate) synthetic_source_file: &'a Arc<str>,
-    /// Backing storage for `$source.batch` — per-source-run UUID v7,
-    /// shared across all records ingested from this source. Distinct from
-    /// `pipeline.batch_id` which is single-valued per pipeline run.
+    /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
+    /// (per-source attribution is sub-issue #54). Distinct from
+    /// `pipeline.batch_id`.
     pub(crate) source_batch_arc: &'a Arc<str>,
     /// Backing storage for `$source.count` — the total record count
-    /// ingested from this source. Set after Phase-1 arena fill.
+    /// ingested across every declared Source. Set after the unified
+    /// ingest pass completes.
     pub(crate) source_count: u64,
     /// Backing storage for `$source.ingestion_timestamp` — wall-clock
-    /// time when ingestion of this source began.
+    /// time when the pipeline run began.
     pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
     pub(crate) strategy: ErrorStrategy,
-    /// Name of the primary Source (first declared in `source_configs`).
-    /// Records for this Source live in `all_records`; every other Source
-    /// has its records in `preloaded_source_records`. The Source dispatch
-    /// arm uses this to distinguish "fallthrough is correct because this
-    /// IS the primary" from "fallthrough is a defense-in-depth bug
-    /// signal because a non-primary Source somehow wasn't preloaded" —
-    /// the silent-corruption surface at the root of #47.
-    pub(crate) primary_input_name: &'a str,
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
-    pub(crate) preloaded_source_records: HashMap<String, Vec<(Record, u64)>>,
-    pub(crate) all_records: Vec<(Record, u64)>,
+    /// Per-source ingested records keyed by Source node name. Every
+    /// declared Source's records live here uniformly — there is no
+    /// "primary" asymmetry. The dispatch arm reads
+    /// `ctx.source_records[name]` for each Source node it walks; a
+    /// missing entry surfaces as a defense-in-depth Internal error
+    /// (loud, not silent).
+    pub(crate) source_records: HashMap<String, Vec<(Record, u64)>>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     /// Per-source-file writers for outputs marked `fan_out_per_source_file`
     /// in the plan. Outer key is the output name; inner key is the
-    /// per-file `Arc<str>` (matching the Arc stored in `source_file_arcs`).
-    /// The CLI populates this for outputs whose path templates reference
+    /// per-file `Arc<str>` (matching the path returned by
+    /// [`source_file_path_of`] for records flowing through). The CLI
+    /// populates this for outputs whose path templates reference
     /// `{source_file}` / `{source_path}` AND whose input is
     /// `FilePartitioned`. Empty map means no fan-out outputs in this run.
     pub(crate) fan_out_writers: HashMap<String, HashMap<Arc<str>, Box<dyn Write + Send>>>,
@@ -470,7 +494,6 @@ fn emit_fan_out(
     cxl_emit_names_opt: Option<&[String]>,
     output_schema: &Arc<clinker_record::Schema>,
     unbuffered: &[(Record, u64)],
-    source_file_arcs: &[Arc<str>],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
     output_errors: &mut Vec<PipelineError>,
     write_timer: &mut crate::executor::stage_metrics::CumulativeTimer,
@@ -495,19 +518,21 @@ fn emit_fan_out(
     collector.record(scan_timer.finish(1, 1));
 
     for (record, rn) in unbuffered {
-        let idx = (rn.saturating_sub(1)) as usize;
-        let Some(file_arc) = source_file_arcs.get(idx) else {
+        let Some(file_path) = source_file_path_of(record) else {
             output_errors.push(PipelineError::Internal {
                 op: "fan_out",
                 node: name.to_string(),
                 detail: format!(
-                    "row {rn} has no source-file Arc; source_file_arcs.len()={}",
-                    source_file_arcs.len()
+                    "row {rn} has no `$source.file` stamp; fan-out output requires per-record source-file lineage",
                 ),
             });
             continue;
         };
-        let Some(fw) = format_writers.get_mut(file_arc) else {
+        // Look up the writer by path; the registry keys by Arc<str>
+        // so we need to find by string equality. Build a probing Arc
+        // once per record (cheap relative to the write itself).
+        let file_arc: Arc<str> = Arc::from(file_path);
+        let Some(fw) = format_writers.get_mut(&file_arc) else {
             // Record's file isn't in the fan-out registry — typically
             // means the CLI's writer setup didn't pre-open one for
             // this file. Surface but keep going.
@@ -854,20 +879,22 @@ pub(crate) fn dispatch_plan_node(
     let node = current_dag.graph[node_idx].clone();
     match node {
         PlanNode::Source { ref name, .. } => {
-            // Three input paths feed a Source's buffer: (1) records
+            // Two input paths feed a Source's buffer: (1) records
             // already seeded into `ctx.node_buffers[node_idx]` by the
             // body executor at composition entry — composition input
             // ports surface as synthetic Source nodes in the body
             // graph, owning the records the parent scope harvested
-            // for that port; (2) combine build-side sources whose
-            // records were pre-loaded into `preloaded_source_records`
-            // before the DAG walk; (3) fall back to the primary
-            // driving reader's stream via `all_records`. Records are
-            // canonicalized onto the Source's plan-time `Arc<Schema>`
-            // so every downstream operator hits the `Arc::ptr_eq`
-            // fast path on the first record. Structural equality
-            // holds by construction: `CoercingReader` builds its Arc
-            // from the same declared `schema:` block that
+            // for that port; (2) the unified ingest pass's
+            // `source_records[name]` entry. A Source reaching this
+            // arm with neither path populated surfaces as a defense-
+            // in-depth `PipelineError::Internal` — silent fallthrough
+            // to a different source's records was the root cause of
+            // #47 and is no longer reachable. Records are canonicalized
+            // onto the Source's plan-time `Arc<Schema>` so every
+            // downstream operator hits the `Arc::ptr_eq` fast path on
+            // the first record. Structural equality holds by
+            // construction: the ingest helper builds its widened
+            // schema from the same declared `schema:` block that
             // `bind_schema` reads to populate
             // `PlanNode::Source.output_schema`, and synthetic port
             // sources adopt their parent source's column list at
@@ -893,8 +920,13 @@ pub(crate) fn dispatch_plan_node(
                             // ingest. The `$widened` sidecar is filled by
                             // CoercingReader from input-record keys, not
                             // by name-based mapping from the reader.
+                            // `$source.file` is stamped at ingest into the
+                            // record's value vector directly, so it flows
+                            // through canonicalize via the per-name copy
+                            // loop above rather than this engine-stamp tail.
                             Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
                             | Some(clinker_record::FieldMetadata::WidenedSidecar)
+                            | Some(clinker_record::FieldMetadata::SourceFile)
                             | None => None,
                         })
                         .collect()
@@ -967,36 +999,28 @@ pub(crate) fn dispatch_plan_node(
                     .into_iter()
                     .map(|(r, rn)| (canonicalize(&r), rn))
                     .collect()
-            } else if let Some(src_recs) = ctx.preloaded_source_records.get(name.as_str()) {
+            } else if let Some(src_recs) = ctx.source_records.get(name.as_str()) {
                 src_recs
                     .iter()
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
-            } else if name.as_str() == ctx.primary_input_name {
-                ctx.all_records
-                    .iter()
-                    .map(|(r, rn)| (canonicalize(r), *rn))
-                    .collect()
             } else {
-                // Defense-in-depth: a non-primary Source reaching this
-                // arm means its records were never ingested into
-                // `preloaded_source_records` by the executor's preload
-                // pass. Before sprint 1 (umbrella #50) this branch
-                // silently emitted the primary's records — see #47.
-                // The third preload loop in
-                // `run_with_readers_writers` now covers every
-                // non-primary top-level Source, so any future
-                // regression that bypasses it surfaces here as a loud
-                // internal error rather than corrupted output.
+                // Defense-in-depth: a Source reaching this arm with
+                // neither a body-port seed nor an entry in
+                // `source_records` means the executor's unified
+                // ingest pass missed it. Now that every declared
+                // Source ingests through the same `source_records`
+                // map (no primary fallthrough), any miss surfaces
+                // here as a loud internal error rather than the
+                // silent-corruption surface at the root of #47.
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: name.clone(),
                     detail: format!(
-                        "non-primary Source '{name}' has no preloaded records; \
-                         primary is '{primary}'. Preload pass missed this Source — \
+                        "Source '{name}' has no ingested records; \
+                         the executor's source-ingest pass missed this Source — \
                          likely a planner regression introducing a Source topology \
-                         the preload doesn't enumerate.",
-                        primary = ctx.primary_input_name,
+                         the ingest pass doesn't enumerate.",
                     ),
                 });
             };
@@ -1094,11 +1118,12 @@ pub(crate) fn dispatch_plan_node(
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
                 }
+                let source_file_arc = source_file_arc_of(&record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                    source_file: &source_file_arc,
                     source_row: rn,
-                    source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                    source_path: &source_file_arc,
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1369,11 +1394,12 @@ pub(crate) fn dispatch_plan_node(
 
             if let Some(ref mut route) = route_handle {
                 for (record, rn) in input_records {
+                    let source_file_arc = source_file_arc_of(&record);
                     let eval_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                        source_file: &source_file_arc,
                         source_row: rn,
-                        source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                        source_path: &source_file_arc,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1770,11 +1796,12 @@ pub(crate) fn dispatch_plan_node(
 
             let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
             for (record, row_num) in &input {
+                let source_file_arc = source_file_arc_of(record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: &ctx.source_file_arcs[(row_num.saturating_sub(1)) as usize],
+                    source_file: &source_file_arc,
                     source_row: *row_num,
-                    source_path: &ctx.source_file_arcs[(row_num.saturating_sub(1)) as usize],
+                    source_path: &source_file_arc,
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1826,9 +1853,9 @@ pub(crate) fn dispatch_plan_node(
             // pipelines pay zero overhead.
             let finalize_ctx = EvalContext {
                 stable: ctx.stable,
-                source_file: ctx.synthetic_source_file,
+                source_file: &MERGED_SOURCE_FILE,
                 source_row: 0,
-                source_path: ctx.synthetic_source_file,
+                source_path: &MERGED_SOURCE_FILE,
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2161,7 +2188,6 @@ pub(crate) fn dispatch_plan_node(
                     cxl_emit_names_opt,
                     &output_schema,
                     &unbuffered,
-                    ctx.source_file_arcs,
                     per_file,
                     &mut ctx.output_errors,
                     &mut ctx.write_timer,
@@ -2584,9 +2610,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let iejoin_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.synthetic_source_file,
+                        source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
-                        source_path: ctx.synthetic_source_file,
+                        source_path: &MERGED_SOURCE_FILE,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2637,9 +2663,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let grace_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.synthetic_source_file,
+                        source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
-                        source_path: ctx.synthetic_source_file,
+                        source_path: &MERGED_SOURCE_FILE,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2698,9 +2724,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let sm_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.synthetic_source_file,
+                        source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
-                        source_path: ctx.synthetic_source_file,
+                        source_path: &MERGED_SOURCE_FILE,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2745,9 +2771,9 @@ pub(crate) fn dispatch_plan_node(
             let estimated_rows = Some(build_records.len());
             let hash_table_ctx = EvalContext {
                 stable: ctx.stable,
-                source_file: ctx.synthetic_source_file,
+                source_file: &MERGED_SOURCE_FILE,
                 source_row: 0,
-                source_path: ctx.synthetic_source_file,
+                source_path: &MERGED_SOURCE_FILE,
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2795,11 +2821,12 @@ pub(crate) fn dispatch_plan_node(
             let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
 
             for (probe_record, rn) in driver_buf {
+                let source_file_arc = source_file_arc_of(&probe_record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                    source_file: &source_file_arc,
                     source_row: rn,
-                    source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
+                    source_path: &source_file_arc,
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -3642,12 +3669,14 @@ fn execute_composition_body(
     let output_idx = bound_body.output_port_to_node_idx.values().next().copied();
 
     // Swap node_buffers to a body-local namespace so body NodeIndices
-    // don't collide with the parent's. `preloaded_source_records` is
-    // also swapped to an empty map: the body's Source arms (if any
-    // — body-scope sources are unusual but legal) fall back to
-    // `all_records`, not parent-scope combine sources.
+    // don't collide with the parent's. `source_records` is also
+    // swapped to an empty map so body-scope Source nodes resolve
+    // through `node_buffers` (port seeding from parent scope), not
+    // through parent-scope source ingestion — bodies declare ports,
+    // not top-level sources. Any non-port-seeded body Source surfaces
+    // as the defense-in-depth `Internal` error from the Source arm.
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_combine = std::mem::take(&mut ctx.preloaded_source_records);
+    let saved_combine = std::mem::take(&mut ctx.source_records);
     // Install the body's `input:` reference table so the Route arm
     // can resolve `<route>.<branch>` references against body
     // siblings. Restored on exit.
@@ -3719,7 +3748,7 @@ fn execute_composition_body(
     // sync by hand on every exit path through this function.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
     ctx.node_buffers = saved_buffers;
-    ctx.preloaded_source_records = saved_combine;
+    ctx.source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
     // Pop the window-runtime overlay so subsequent windows in the
     // parent scope route through `top` again. Removing the body's

@@ -248,9 +248,8 @@ ENG,300
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let plan = config.compile(&ctx).expect("compile");
 
-    let primary = "src".to_string();
     let readers = HashMap::from([(
-        primary.clone(),
+        config.source_configs().next().unwrap().name.clone(),
         clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(Cursor::new(csv.as_bytes().to_vec())),
@@ -261,14 +260,8 @@ ENG,300
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan,
-        &primary,
-        readers,
-        writers,
-        &test_params(),
-    )
-    .expect("pipeline must run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .expect("pipeline must run");
     let output = buf.as_string();
 
     // Body emits one row per dept; running_total over a 1-row partition

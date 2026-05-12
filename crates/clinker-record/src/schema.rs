@@ -31,6 +31,15 @@ use std::sync::Arc;
 ///   into top-level columns via `include_widened: true`. Pattern
 ///   precedent: Databricks Auto Loader's `_rescued_data` and
 ///   ClickHouse's `JSON` column type.
+/// - [`FieldMetadata::SourceFile`] — per-Source lineage column carrying
+///   the originating file path Arc per record. Named `$source.file`;
+///   stamped at ingest with the path the record was read from
+///   (`MultiFileFormatReader::current_source_file()`). Replaces the
+///   pre-multi-source `ctx.source_file_arcs` external Vec indexed by
+///   row number — required when peer Sources merge downstream and
+///   per-source row numbers collide. Filtered out of default Output
+///   projection like the other engine-stamped variants; users opt in
+///   by projecting `emit source_file = $source.file` explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldMetadata {
     /// Source-CK shadow column. `source_field` is the user-declared
@@ -46,6 +55,12 @@ pub enum FieldMetadata {
     /// column is named `$widened` and carries a `Value::Map` of every
     /// input-record key that was not in the user-declared schema.
     WidenedSidecar,
+    /// Per-record source-file lineage column. Named `$source.file`,
+    /// stamped at Source ingest with the originating file path Arc.
+    /// Read by `$source.file` / `$source.path` resolution at dispatch
+    /// sites; survives merge so post-fan-in records still resolve to
+    /// their actual file rather than an external row-keyed lookup.
+    SourceFile,
 }
 
 impl FieldMetadata {
@@ -69,6 +84,13 @@ impl FieldMetadata {
     /// payload.
     pub fn widened_sidecar() -> Self {
         Self::WidenedSidecar
+    }
+
+    /// Marks this column as the per-record source-file lineage stamp.
+    /// Always named `$source.file`; the value is a `Value::String`
+    /// wrapping the originating file path Arc.
+    pub fn source_file() -> Self {
+        Self::SourceFile
     }
 
     /// True for every variant. The presence of [`FieldMetadata`] on a
@@ -341,6 +363,24 @@ mod tests {
             other => panic!("expected AggregateGroupIndex, got {other:?}"),
         }
         assert!(stamp.is_engine_stamped());
+    }
+
+    #[test]
+    fn test_schema_with_metadata_attaches_source_file() {
+        let cols: Vec<Box<str>> = vec!["id".into(), "$source.file".into()];
+        let meta = vec![None, Some(FieldMetadata::source_file())];
+        let schema = Schema::with_metadata(cols, meta);
+        assert!(schema.field_metadata(0).is_none());
+        let stamp = schema.field_metadata(1).expect("metadata attached");
+        match stamp {
+            FieldMetadata::SourceFile => {}
+            other => panic!("expected SourceFile, got {other:?}"),
+        }
+        assert!(stamp.is_engine_stamped());
+        match schema.field_metadata_by_name("$source.file") {
+            Some(FieldMetadata::SourceFile) => {}
+            other => panic!("expected SourceFile, got {other:?}"),
+        }
     }
 
     /// Pins the in-memory size of [`FieldMetadata`] so a future variant

@@ -789,6 +789,13 @@ impl OnUnmapped {
 /// Stable column name for the `auto_widen` sidecar absorber slot.
 pub const WIDENED_SIDECAR_COLUMN: &str = "$widened";
 
+/// Stable column name for the per-record source-file lineage stamp.
+/// Every Source's bound schema carries one such tail-appended slot;
+/// the dispatcher's Source arm stamps the originating file Arc at
+/// ingest so `$source.file` / `$source.path` resolve per-record through
+/// merges instead of via an external row-keyed array.
+pub const SOURCE_FILE_COLUMN: &str = "$source.file";
+
 /// Transform variant body. The new shape: a mandatory `cxl:` field
 /// carrying the CXL source as a `CxlSource` (so it captures its YAML
 /// span where serde-saphyr can deliver one), plus the row-level

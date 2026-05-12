@@ -315,8 +315,8 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-                        &plan, "src", readers, writers, &params,
+                    PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
                     )
                     .expect("bench pipeline runs");
                     black_box(buf);
@@ -446,8 +446,8 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-                        &plan, "orders", readers, writers, &params,
+                    PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
                     )
                     .expect("bench pipeline runs");
                     black_box(buf);

@@ -35,13 +35,8 @@ fn run_branch_test(
         ..Default::default()
     };
 
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config,
-        &primary,
-        readers,
-        writers.into(),
-        &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))

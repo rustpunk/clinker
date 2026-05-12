@@ -258,10 +258,8 @@ fn run_grace(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        plan, "probe", readers, writers, params,
-    )
-    .expect("grace hash pipeline must execute");
+    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+        .expect("grace hash pipeline must execute");
     out_buf.0.lock().unwrap().clone()
 }
 

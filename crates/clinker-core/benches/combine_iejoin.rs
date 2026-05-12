@@ -318,14 +318,8 @@ fn run_iejoin_executor(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        plan,
-        "employees",
-        readers,
-        writers,
-        params,
-    )
-    .expect("iejoin pipeline must execute");
+    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+        .expect("iejoin pipeline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");
     text.lines()

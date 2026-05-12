@@ -105,7 +105,6 @@ ENG,5000
     let plan = config
         .compile(&crate::config::CompileContext::default())
         .expect("compile");
-    let primary = "orders".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -134,10 +133,8 @@ ENG,5000
         shutdown_token: None,
         ..Default::default()
     };
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan, &primary, readers, writers, &params,
-    )
-    .expect("pipeline must run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("pipeline must run");
     let _output = buf.as_string();
     // The Output node above is wired to the combine `enriched`, so the
     // running window's emit columns aren't projected to the writer in
@@ -232,7 +229,6 @@ ENG,5000
     let plan = config
         .compile(&crate::config::CompileContext::default())
         .expect("compile");
-    let primary = "orders".to_string();
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -261,10 +257,8 @@ ENG,5000
         shutdown_token: None,
         ..Default::default()
     };
-    PipelineExecutor::run_plan_with_readers_writers_with_primary(
-        &plan, &primary, readers, writers, &params,
-    )
-    .expect("pipeline must run");
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("pipeline must run");
     let output = buf.as_string();
 
     // Per-department: HR rows (10+20+30=60), ENG rows (100+200=300).

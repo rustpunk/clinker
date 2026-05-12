@@ -3017,6 +3017,8 @@ pub(crate) fn lower_node_to_plan_node(
                         builder.with_field_meta(col, FieldMetadata::source_correlation(field))
                     } else if col == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN {
                         builder.with_field_meta(col, FieldMetadata::widened_sidecar())
+                    } else if col == crate::config::pipeline_node::SOURCE_FILE_COLUMN {
+                        builder.with_field_meta(col, FieldMetadata::source_file())
                     } else {
                         builder.with_field(col)
                     };
