@@ -16,8 +16,6 @@
 //! folds the column value into an i64-nanos max for that pair.
 //!
 //! Read-side rollup methods serve every consumer granularity:
-//! - [`file_max`](PerSourceWatermarks::file_max) — exactly one
-//!   `(source, file)` pair.
 //! - [`source_min`](PerSourceWatermarks::source_min) — min across all
 //!   files of one source (per-file watermarks compose at the source
 //!   level via min, so a glob source with one lagging file holds the
@@ -39,8 +37,9 @@
 //! is not wired here — pipeline-wide rollback rebuilds
 //! [`ExecutorContext`] from scratch, so monotonicity within a run is
 //! preserved by construction. When per-source rollback lands, the
-//! reset method lives in that sprint alongside its caller (LD-011:
-//! no unwired `pub(crate)` APIs).
+//! reset method ships in that sprint alongside its caller — the rule
+//! the project applies sprint-wide is that every `pub(crate)` API has
+//! an intra-crate caller at the closing commit.
 //!
 //! [`ExecutorContext`]: crate::executor::dispatch::ExecutorContext
 

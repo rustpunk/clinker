@@ -20,10 +20,11 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
@@ -447,4 +448,133 @@ nodes:
     assert!(report.per_source_file_watermarks.is_empty());
     // min across {None} = None (Spark-style skip-`None` semantics).
     assert_eq!(report.effective_watermark, None);
+}
+
+/// End-to-end: a glob source feeding a `fan_out_per_source_file`
+/// output. Per-file watermarks must remain separate in the report
+/// AND each output file must contain only its own source-file's
+/// records. Exercises the 1:1 source-file → sink invariant the
+/// granularity decision is designed to preserve.
+#[test]
+fn fan_out_per_source_file_watermark_isolation() {
+    let yaml = r#"
+pipeline:
+  name: fan_out_watermark_isolation
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      paths: [a.csv, b.csv]
+      watermark:
+        column: event_time
+      schema:
+        - { name: id, type: int }
+        - { name: event_time, type: date_time }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out_{source_file}.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+
+    // The reader builds its own Arc<str> for `$source.file` from the
+    // FileSlot path. Matching by string value (Arc<str> compares by
+    // contents via HashMap's Borrow<str> impl).
+    let arc_a: Arc<str> = Arc::from("a.csv");
+    let arc_b: Arc<str> = Arc::from("b.csv");
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        vec![
+            FileSlot::new(
+                PathBuf::from(arc_a.as_ref()),
+                Box::new(Cursor::new(
+                    "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n3,2026-01-01T00:00:03\n"
+                        .as_bytes()
+                        .to_vec(),
+                )),
+            ),
+            FileSlot::new(
+                PathBuf::from(arc_b.as_ref()),
+                Box::new(Cursor::new(
+                    "id,event_time\n10,2026-01-01T05:00:00\n11,2026-01-01T06:00:00\n"
+                        .as_bytes()
+                        .to_vec(),
+                )),
+            ),
+        ],
+    )]);
+
+    let buf_a = SharedBuffer::new();
+    let buf_b = SharedBuffer::new();
+    let mut per_file: HashMap<Arc<str>, Box<dyn std::io::Write + Send>> = HashMap::new();
+    per_file.insert(
+        Arc::clone(&arc_a),
+        Box::new(buf_a.clone()) as Box<dyn std::io::Write + Send>,
+    );
+    per_file.insert(
+        Arc::clone(&arc_b),
+        Box::new(buf_b.clone()) as Box<dyn std::io::Write + Send>,
+    );
+    let mut fan_out: HashMap<String, HashMap<Arc<str>, Box<dyn std::io::Write + Send>>> =
+        HashMap::new();
+    fan_out.insert("out".to_string(), per_file);
+    let writers = WriterRegistry {
+        single: HashMap::new(),
+        fan_out,
+    };
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("run fan-out watermark pipeline");
+
+    // Per-file watermarks reported independently — the early file's
+    // max watermark does not creep into the late file's slot, and
+    // vice versa.
+    let a_key = ("src".to_string(), "a.csv".to_string());
+    let b_key = ("src".to_string(), "b.csv".to_string());
+    let a_max = iso_dt_nanos("2026-01-01T00:00:03");
+    let b_max = iso_dt_nanos("2026-01-01T06:00:00");
+    assert_eq!(
+        report.per_source_file_watermarks.get(&a_key),
+        Some(&Some(a_max))
+    );
+    assert_eq!(
+        report.per_source_file_watermarks.get(&b_key),
+        Some(&Some(b_max))
+    );
+    // Source-level rollup = min over files (file a's max).
+    assert_eq!(report.per_source_watermarks.get("src"), Some(&Some(a_max)));
+
+    // The 1:1 source-file → sink invariant: each output file's buffer
+    // contains exactly that source file's records, no leakage in
+    // either direction.
+    let out_a = buf_a.as_string();
+    let out_b = buf_b.as_string();
+    for early_id in ["1", "2", "3"] {
+        assert!(
+            out_a.contains(&format!(",{early_id},")) || out_a.contains(&format!("\n{early_id},")),
+            "buf_a missing id {early_id}: {out_a}"
+        );
+        assert!(
+            !(out_b.contains(&format!(",{early_id},"))
+                || out_b.contains(&format!("\n{early_id},"))),
+            "buf_b leaked id {early_id}: {out_b}"
+        );
+    }
+    for late_id in ["10", "11"] {
+        assert!(
+            out_b.contains(&format!(",{late_id},")) || out_b.contains(&format!("\n{late_id},")),
+            "buf_b missing id {late_id}: {out_b}"
+        );
+        assert!(
+            !(out_a.contains(&format!(",{late_id},")) || out_a.contains(&format!("\n{late_id},"))),
+            "buf_a leaked id {late_id}: {out_a}"
+        );
+    }
 }
