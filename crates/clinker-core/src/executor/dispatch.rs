@@ -343,6 +343,21 @@ pub(crate) struct ExecutorContext<'a> {
     /// aggregate emitted columns the source arena could not project.
     pub(crate) window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
 
+    /// Per-(source, file) event-time watermark bookkeeping. Populated
+    /// at ingest from each `SourceConfig.watermark.column` declaration;
+    /// keyed by `(source_name, $source.file Arc)` so glob/regex/paths
+    /// sources keep per-file isolation matching the
+    /// `fan_out_per_source_file` 1:1 source-file → sink invariant.
+    /// Today's only consumer is the [`ExecutionReport`]; future time-
+    /// windowed aggregates will read
+    /// [`PerSourceWatermarks::min_across_sources`] at the
+    /// window-close decision.
+    ///
+    /// [`ExecutionReport`]: crate::executor::ExecutionReport
+    /// [`PerSourceWatermarks::min_across_sources`]:
+    ///   crate::executor::watermark::PerSourceWatermarks::min_across_sources
+    pub(crate) watermarks: crate::executor::watermark::PerSourceWatermarks,
+
     /// Pipeline-scoped memory budget shared across the source-rooted
     /// Phase-0 arena and every node-rooted arena materialized at an
     /// upstream operator's dispatch-arm exit. One declared

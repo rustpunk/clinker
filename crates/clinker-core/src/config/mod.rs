@@ -247,6 +247,16 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<FileListingControls>,
 
+    /// Event-time watermark declaration. Names the column whose value
+    /// is observed at ingest and folded into a per-(source, file)
+    /// max-event-time stamp; rolled up at the read side by
+    /// `PerSourceWatermarks::min_across_sources`. Mirrors Flink SQL's
+    /// `WATERMARK FOR <col> AS <col> - INTERVAL` declaration site
+    /// (delay column deferred to the time-window operator sprint,
+    /// https://github.com/rustpunk/clinker/issues/61).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<WatermarkConfig>,
+
     /// Format-layer schema pointer (e.g. fixed-width field layouts).
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk
@@ -268,6 +278,22 @@ pub struct SourceConfig {
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// Event-time watermark declaration on a `SourceConfig`.
+///
+/// `column` names a record field whose value is the source's event-
+/// time axis. At ingest, each record's value at this column is
+/// converted to an i64 nanosecond stamp and folded into a per-(source,
+/// file) max via [`crate::executor::watermark::PerSourceWatermarks`].
+/// The column type must coerce to [`clinker_record::Value::Timestamp`]
+/// or [`clinker_record::Value::Date`] (validated at plan time, see
+/// `crate::plan::bind_schema`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatermarkConfig {
+    /// Name of the event-time column on the source's declared schema.
+    pub column: String,
 }
 
 /// File-listing controls — file-set ordering, take-N, recursion,

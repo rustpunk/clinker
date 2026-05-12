@@ -1032,6 +1032,56 @@ fn bind_schema_inner(
                         LabeledSpan::primary(span, String::new()),
                     ));
                 }
+                // Watermark declaration: column must exist on the
+                // source's declared schema AND have an event-time-
+                // coercible CXL type (DateTime or Date).
+                if let Some(wm) = config.source.watermark.as_ref() {
+                    let declared = schema_decl.columns.iter().find(|c| c.name == wm.column);
+                    match declared {
+                        None => diags.push(
+                            Diagnostic::error(
+                                "E154",
+                                format!(
+                                    "source {name:?} declares watermark.column = {col:?} \
+                                     but the column is not present in this source's \
+                                     `schema:` block.",
+                                    col = wm.column,
+                                ),
+                                LabeledSpan::primary(span, String::new()),
+                            )
+                            .with_help(
+                                "add the watermark column to the source's `schema:` \
+                                 block, or remove the `watermark:` declaration",
+                            ),
+                        ),
+                        Some(col)
+                            if !matches!(
+                                col.ty,
+                                cxl::typecheck::Type::DateTime | cxl::typecheck::Type::Date,
+                            ) =>
+                        {
+                            diags.push(
+                                Diagnostic::error(
+                                    "E155",
+                                    format!(
+                                        "source {name:?} declares watermark.column = {col_name:?} \
+                                         but its declared type {ty:?} is not event-time-coercible; \
+                                         watermark columns must be `date_time` or `date`.",
+                                        col_name = wm.column,
+                                        ty = col.ty.display_name(),
+                                    ),
+                                    LabeledSpan::primary(span, String::new()),
+                                )
+                                .with_help(
+                                    "change the column's declared `type:` to `date_time` \
+                                     or `date`, or point `watermark.column` at a column \
+                                     that already has one of those types",
+                                ),
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
                 schema_by_name.insert(name.clone(), row.clone());
