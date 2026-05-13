@@ -193,6 +193,19 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
 /// stamps each record with the file it came from.
 pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot>>;
 
+/// Dispatch result threaded out of `execute_dag` and
+/// `execute_dag_branching` and folded into the [`ExecutionReport`].
+/// Holds the final pipeline counters, the DLQ vector built across
+/// every dispatcher arm, the peak RSS observation, the per-source
+/// watermark bookkeeping, and the per-source rollback-cursor map.
+pub(crate) type DispatchOutcome = (
+    PipelineCounters,
+    Vec<DlqEntry>,
+    Option<u64>,
+    crate::executor::watermark::PerSourceWatermarks,
+    BTreeMap<String, u64>,
+);
+
 /// Output writer registry. Holds two parallel maps:
 ///
 /// - `single`: one writer per output name (the legacy shape; matches
@@ -315,6 +328,16 @@ pub struct ExecutionReport {
     /// (future consumer). `None` when every declared source rolls up
     /// to `None`.
     pub effective_watermark: Option<i64>,
+    /// Per-source rollback cursor at run completion. Keyed by
+    /// Source-node name; the value is the highest source row number
+    /// that cleanly exited a forward operator. Sources that never
+    /// emitted a clean record (every record DLQ'd, or the source had
+    /// zero records) are absent from the map. Combine-rooted rewinds
+    /// reflect into this map via the `combine_input_snapshots`
+    /// restore path. Today's pre-drained executor surfaces these for
+    /// diagnostics and per-source-rollback test assertions; once the
+    /// async runtime lands, the cursor becomes the replay anchor.
+    pub per_source_rollback_cursors: BTreeMap<String, u64>,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
@@ -886,23 +909,24 @@ impl PipelineExecutor {
         let total_ingested: u64 = source_records.values().map(|v| v.len() as u64).sum();
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 
-        let (counters, dlq_entries, peak_rss_bytes, watermarks) = Self::execute_dag(
-            config,
-            source_records,
-            &source_configs,
-            writers,
-            &compiled_transforms,
-            compiled_route,
-            compiled_routes_by_name,
-            plan,
-            validated_plan.artifacts(),
-            params,
-            &mut collector,
-            spill_root,
-            spill_root_path,
-            counters,
-            watermarks,
-        )?;
+        let (counters, dlq_entries, peak_rss_bytes, watermarks, per_source_rollback_cursors) =
+            Self::execute_dag(
+                config,
+                source_records,
+                &source_configs,
+                writers,
+                &compiled_transforms,
+                compiled_route,
+                compiled_routes_by_name,
+                plan,
+                validated_plan.artifacts(),
+                params,
+                &mut collector,
+                spill_root,
+                spill_root_path,
+                counters,
+                watermarks,
+            )?;
 
         let stages = collector.into_stages();
         let (total_cpu_user_ns, total_cpu_sys_ns, total_io_read_bytes, total_io_write_bytes) =
@@ -943,6 +967,7 @@ impl PipelineExecutor {
             per_source_file_watermarks,
             per_source_watermarks,
             effective_watermark,
+            per_source_rollback_cursors,
         })
     }
 
@@ -979,15 +1004,7 @@ impl PipelineExecutor {
         spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
         watermarks: crate::executor::watermark::PerSourceWatermarks,
-    ) -> Result<
-        (
-            PipelineCounters,
-            Vec<DlqEntry>,
-            Option<u64>,
-            crate::executor::watermark::PerSourceWatermarks,
-        ),
-        PipelineError,
-    > {
+    ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
         // Pipeline-scoped MemoryBudget. One declared `memory_limit`
@@ -1091,7 +1108,13 @@ impl PipelineExecutor {
         // fire the aggregator's empty-input special case. Generalized
         // from primary-only to "every source ingested zero records".
         if source_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
-            return Ok((counters, dlq_entries, rss_bytes(), watermarks));
+            return Ok((
+                counters,
+                dlq_entries,
+                rss_bytes(),
+                watermarks,
+                BTreeMap::new(),
+            ));
         }
 
         Self::execute_dag_branching(
@@ -1148,15 +1171,7 @@ impl PipelineExecutor {
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         watermarks: crate::executor::watermark::PerSourceWatermarks,
-    ) -> Result<
-        (
-            PipelineCounters,
-            Vec<DlqEntry>,
-            Option<u64>,
-            crate::executor::watermark::PerSourceWatermarks,
-        ),
-        PipelineError,
-    > {
+    ) -> Result<DispatchOutcome, PipelineError> {
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1302,6 +1317,8 @@ impl PipelineExecutor {
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),
             total_per_source,
+            rollback_cursors: HashMap::new(),
+            combine_input_snapshots: HashMap::new(),
             output_errors: Vec::new(),
             ok_source_rows: HashSet::new(),
             records_emitted: 0,
@@ -1421,11 +1438,18 @@ impl PipelineExecutor {
         // this directory, and its Drop now sweeps the filesystem.
         drop(pipeline_spill_root);
 
+        let rollback_cursors: BTreeMap<String, u64> = ctx
+            .rollback_cursors
+            .iter()
+            .map(|(k, &v)| (k.as_ref().to_string(), v))
+            .collect();
+
         Ok((
             std::mem::take(counters),
             std::mem::take(dlq_entries),
             rss_bytes(),
             ctx.watermarks,
+            rollback_cursors,
         ))
     }
 
