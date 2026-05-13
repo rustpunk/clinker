@@ -33,13 +33,29 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use clinker_bench_support::CombineDataGen;
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use tokio::runtime::Runtime;
+
+/// Lazy multi-thread tokio runtime shared by every bench iteration in
+/// this binary; the executor uses `block_in_place`, which requires a
+/// multi-thread runtime. Both `run_3input` and `run_2input`
+/// `block_on` the executor here so their sync signatures stay usable
+/// from the correctness gate, `b.iter`, and `sample_wall_ns`.
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+    })
+}
 use indexmap::IndexMap;
 
 // ─── Pipeline YAML for 3-input chain ────────────────────────────────
@@ -253,7 +269,10 @@ fn run_3input(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("3-input pipeline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");
@@ -292,7 +311,10 @@ fn run_2input(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("2-input baseline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");

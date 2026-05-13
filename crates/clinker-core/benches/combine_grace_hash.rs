@@ -57,7 +57,7 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use clinker_bench_support::CombineDataGen;
@@ -65,6 +65,22 @@ use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
+use tokio::runtime::Runtime;
+
+/// Lazy multi-thread tokio runtime shared by every bench iteration in
+/// this binary; the executor uses `block_in_place`, which requires a
+/// multi-thread runtime. `run_grace` `block_on`s the executor on this
+/// runtime so its sync signature stays usable from both `b.iter` and
+/// `sample_wall_ns`.
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+    })
+}
 
 // ─── Pipeline YAML — grace-hash forced via `strategy:` hint ─────────
 //
@@ -258,7 +274,10 @@ fn run_grace(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("grace hash pipeline must execute");
     out_buf.0.lock().unwrap().clone()
 }

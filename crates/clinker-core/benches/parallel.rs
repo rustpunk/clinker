@@ -5,7 +5,23 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::runtime::Runtime;
+
+/// Lazy multi-thread tokio runtime shared by every bench iteration in
+/// this binary; the executor uses `block_in_place`, which requires a
+/// multi-thread runtime. We `block_on` the async executor call from
+/// inside a sync `b.iter` body so the surrounding `rayon::pool.install`
+/// scope still applies.
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+    })
+}
 
 /// Thread-safe in-memory buffer for parallel benchmarks.
 #[derive(Clone, Default)]
@@ -131,10 +147,11 @@ nodes:
                         &clinker_core::config::CompileContext::default(),
                     )
                     .expect("compile");
-                    let report = PipelineExecutor::run_plan_with_readers_writers(
-                        &plan, readers, writers, &params,
-                    )
-                    .unwrap();
+                    let report = runtime()
+                        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+                            &plan, readers, writers, &params,
+                        ))
+                        .unwrap();
                     black_box(report);
                 });
             });
@@ -231,10 +248,11 @@ nodes:
                         &clinker_core::config::CompileContext::default(),
                     )
                     .expect("compile");
-                    let report = PipelineExecutor::run_plan_with_readers_writers(
-                        &plan, readers, writers, &params,
-                    )
-                    .unwrap();
+                    let report = runtime()
+                        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+                            &plan, readers, writers, &params,
+                        ))
+                        .unwrap();
                     black_box(report);
                 });
             });

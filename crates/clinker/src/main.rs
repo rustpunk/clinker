@@ -293,7 +293,20 @@ fn main() -> ExitCode {
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
             tracing_subscriber::fmt().with_max_level(filter).init();
 
-            match run(args) {
+            // The executor is async; build a multi-thread runtime so
+            // `block_in_place` inside its CPU-bound operator arms is
+            // legal, and drive `run` to completion on it.
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("clinker: failed to build tokio runtime: {e}");
+                    return ExitCode::from(4);
+                }
+            };
+            match runtime.block_on(run(args)) {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     render_pipeline_error(&e, &args.config);
@@ -452,7 +465,7 @@ fn abort_on_overlay_errors(
     Ok(())
 }
 
-fn run(args: &RunArgs) -> Result<u8, PipelineError> {
+async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
         .env
@@ -858,7 +871,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         readers,
         registry,
         &run_params,
-    ) {
+    )
+    .await
+    {
         Ok(report) => report,
         Err(e) => {
             // Reservations auto-unlink via TempPath::Drop when output_temps
