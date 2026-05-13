@@ -367,11 +367,12 @@ use crate::projection::project_output_from_record;
 ///
 /// Owned (mutated across the walk):
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
-/// * `source_records` — per-source ingested records keyed by Source node
-///   name. The Source dispatch arm reads its records from this map.
-///   Every declared Source is ingested through `SourceStream` in the
-///   executor's unified ingest pass; the `$source.file` per-record
-///   stamp travels on each record's engine-stamped column.
+/// * `source_records` — per-source live `mpsc::Receiver`s keyed by
+///   Source node name. The Source dispatch arm drains its receiver
+///   via `recv().await`; the paired sender lives in a `tokio::spawn`-ed
+///   ingest task that drives the format reader and pushes through a
+///   `TokioSourceStream`. The `$source.file` per-record stamp travels
+///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
 /// * `counters` / `dlq_entries` — pipeline-wide accounting.
@@ -408,13 +409,16 @@ pub(crate) struct ExecutorContext<'a> {
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
-    /// Per-source ingested records keyed by Source node name. Every
-    /// declared Source's records live here uniformly — there is no
-    /// "primary" asymmetry. The dispatch arm reads
-    /// `ctx.source_records[name]` for each Source node it walks; a
-    /// missing entry surfaces as a defense-in-depth Internal error
-    /// (loud, not silent).
-    pub(crate) source_records: HashMap<String, Vec<(Record, u64)>>,
+    /// Per-source live ingest channels keyed by Source node name. Each
+    /// declared Source has one `tokio::spawn`-ed task pushing records
+    /// through a `TokioSourceStream`; this map holds the paired
+    /// `Receiver` the dispatch loop's Source arm drains via
+    /// `recv().await`. Replaces the pre-drained `Vec<(Record, u64)>`
+    /// carrier: producers run concurrently with consumption, bounded by
+    /// channel capacity so back-pressure flows end-to-end. A missing
+    /// entry at the Source arm surfaces as a defense-in-depth Internal
+    /// error.
+    pub(crate) source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     /// Per-source-file writers for outputs marked `fan_out_per_source_file`
     /// in the plan. Outer key is the output name; inner key is the
@@ -1060,7 +1064,7 @@ pub(crate) fn finalize_node_rooted_windows(
 /// `ctx.output_errors` instead of short-circuiting so sibling outputs still
 /// get their chance to fail (and be reported) — the caller aggregates after
 /// the walk.
-pub(crate) fn dispatch_plan_node(
+pub(crate) async fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -1082,13 +1086,14 @@ pub(crate) fn dispatch_plan_node(
             // body executor at composition entry — composition input
             // ports surface as synthetic Source nodes in the body
             // graph, owning the records the parent scope harvested
-            // for that port; (2) the unified ingest pass's
-            // `source_records[name]` entry. A Source reaching this
-            // arm with neither path populated surfaces as a defense-
-            // in-depth `PipelineError::Internal` — silent fallthrough
-            // to a different source's records was the root cause of
-            // #47 and is no longer reachable. Records are canonicalized
-            // onto the Source's plan-time `Arc<Schema>` so every
+            // for that port; (2) the live `mpsc::Receiver` in
+            // `source_records[name]`, drained via `recv().await`
+            // until the paired ingest task drops its sender. A Source
+            // reaching this arm with neither path populated surfaces
+            // as a defense-in-depth `PipelineError::Internal` — silent
+            // fallthrough to a different source's records was the root
+            // cause of #47 and is no longer reachable. Records are
+            // canonicalized onto the Source's plan-time `Arc<Schema>` so every
             // downstream operator hits the `Arc::ptr_eq` fast path on
             // the first record. Structural equality holds by
             // construction: the ingest helper builds its widened
@@ -1199,11 +1204,17 @@ pub(crate) fn dispatch_plan_node(
                     .into_iter()
                     .map(|(r, rn)| (canonicalize(&r), rn))
                     .collect()
-            } else if let Some(src_recs) = ctx.source_records.get(name.as_str()) {
-                src_recs
-                    .iter()
-                    .map(|(r, rn)| (canonicalize(r), *rn))
-                    .collect()
+            } else if let Some(rx) = ctx.source_records.get_mut(name.as_str()) {
+                // Drain the live channel synchronously into a local Vec
+                // for the duration of this arm. Streaming consumption
+                // throughout dispatch is the longer-term shape; today's
+                // arms still operate on owned `Vec<(Record, u64)>`
+                // buffers, so we materialize once here.
+                let mut drained: Vec<(Record, u64)> = Vec::new();
+                while let Some((record, rn)) = rx.recv().await {
+                    drained.push((canonicalize(&record), rn));
+                }
+                drained
             } else {
                 // Defense-in-depth: a Source reaching this arm with
                 // neither a body-port seed nor an entry in
@@ -1315,6 +1326,15 @@ pub(crate) fn dispatch_plan_node(
             let mut output_records = Vec::with_capacity(input_records.len());
 
             for (i, (record, rn)) in input_records.into_iter().enumerate() {
+                // Cooperative yield every 1024 records so long
+                // Transform chains do not starve sibling tokio tasks
+                // (Vector's in-line VRL pattern). Per-record CXL eval
+                // sits well below the 10–100 µs "what is blocking"
+                // threshold, so on-runtime execution with periodic
+                // yields beats a `block_in_place` wrap here.
+                if i > 0 && i.is_multiple_of(1024) {
+                    tokio::task::yield_now().await;
+                }
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
                 }
@@ -1607,7 +1627,14 @@ pub(crate) fn dispatch_plan_node(
             };
 
             if let Some(ref mut route) = route_handle {
-                for (record, rn) in input_records {
+                for (i, (record, rn)) in input_records.into_iter().enumerate() {
+                    // Cooperative yield every 1024 records so long
+                    // Route chains do not starve sibling tokio tasks.
+                    // Same Vector-style on-runtime + periodic yield
+                    // pattern the Transform arm uses.
+                    if i > 0 && i.is_multiple_of(1024) {
+                        tokio::task::yield_now().await;
+                    }
                     let source_file_arc = source_file_arc_of(&record);
                     let source_name_arc = source_name_arc_of(&record);
                     let eval_ctx = EvalContext {
@@ -1864,21 +1891,29 @@ pub(crate) fn dispatch_plan_node(
 
             let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let sort_count = input_records.len() as u64;
-            for (record, row_num) in input_records {
-                buf.push(record, row_num);
-                if buf.should_spill() {
-                    buf.sort_and_spill().map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort enforcer '{name}' spill failed: {e}"
-                        )))
-                    })?;
+            // CPU-bound: sort buffer push + per-batch comparison + spill
+            // I/O can saturate a worker thread. `block_in_place` runs
+            // synchronously on the current multi-thread runtime worker
+            // and moves the worker's other tasks to a sibling, keeping
+            // the runtime responsive (DataFusion/Vector pattern: CPU-
+            // bound operators stay on-runtime via `block_in_place` so
+            // borrows of `&mut ExecutorContext` survive the boundary).
+            let sorted = tokio::task::block_in_place(|| {
+                for (record, row_num) in input_records {
+                    buf.push(record, row_num);
+                    if buf.should_spill() {
+                        buf.sort_and_spill().map_err(|e| {
+                            PipelineError::Io(std::io::Error::other(format!(
+                                "sort enforcer '{name}' spill failed: {e}"
+                            )))
+                        })?;
+                    }
                 }
-            }
-
-            let sorted = buf.finish().map_err(|e| {
-                PipelineError::Io(std::io::Error::other(format!(
-                    "sort enforcer '{name}' finish failed: {e}"
-                )))
+                buf.finish().map_err(|e| {
+                    PipelineError::Io(std::io::Error::other(format!(
+                        "sort enforcer '{name}' finish failed: {e}"
+                    )))
+                })
             })?;
 
             let mut out: Vec<(Record, u64)> = Vec::with_capacity(sort_count as usize);
@@ -2019,60 +2054,69 @@ pub(crate) fn dispatch_plan_node(
             let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let input_count = input.len() as u64;
 
+            // CPU-bound: per-record accumulator updates + spill I/O.
+            // `block_in_place` keeps the `&mut ExecutorContext` borrows
+            // alive across the synchronous body while moving sibling
+            // tokio tasks off this worker (DataFusion/Vector pattern).
             let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-            for (record, row_num) in &input {
-                let source_file_arc = source_file_arc_of(record);
-                let source_name_arc = source_name_arc_of(record);
-                let eval_ctx = EvalContext {
-                    stable: ctx.stable,
-                    source_file: &source_file_arc,
-                    source_row: *row_num,
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count,
-                    source_batch: ctx.source_batch_arc,
-                    ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &source_name_arc,
-                };
-                let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
-                if add_result.is_ok() {
-                    advance_cursor(ctx, &source_name_arc, *row_num);
-                }
-                if let Err(e) = add_result {
-                    match ctx.config.error_handling.strategy {
-                        ErrorStrategy::FailFast => return Err(e.into()),
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            let stage = Some(crate::dlq::stage_aggregate(name));
-                            let routed = record_error_to_buffer_if_grouped(
-                                ctx,
-                                record,
-                                *row_num,
-                                crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                format!("aggregate {name}: {e}"),
-                                stage.clone(),
-                                None,
-                            );
-                            if !routed {
-                                let source_name = source_name_arc_of(record);
-                                push_dlq(
+            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                for (record, row_num) in &input {
+                    let source_file_arc = source_file_arc_of(record);
+                    let source_name_arc = source_name_arc_of(record);
+                    let eval_ctx = EvalContext {
+                        stable: ctx.stable,
+                        source_file: &source_file_arc,
+                        source_row: *row_num,
+                        source_path: &source_file_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &source_name_arc,
+                    };
+                    let add_result =
+                        stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
+                    if add_result.is_ok() {
+                        advance_cursor(ctx, &source_name_arc, *row_num);
+                    }
+                    if let Err(e) = add_result {
+                        match ctx.config.error_handling.strategy {
+                            ErrorStrategy::FailFast => return Err(e.into()),
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                let stage = Some(crate::dlq::stage_aggregate(name));
+                                let routed = record_error_to_buffer_if_grouped(
                                     ctx,
-                                    DlqEntry {
-                                        source_row: *row_num,
-                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                        error_message: format!("aggregate {name}: {e}"),
-                                        original_record: record.clone(),
-                                        stage,
-                                        route: None,
-                                        trigger: true,
-                                        source_name,
-                                        triggering_field: None,
-                                        triggering_value: None,
-                                    },
-                                )?;
+                                    record,
+                                    *row_num,
+                                    crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    format!("aggregate {name}: {e}"),
+                                    stage.clone(),
+                                    None,
+                                );
+                                if !routed {
+                                    let source_name = source_name_arc_of(record);
+                                    push_dlq(
+                                        ctx,
+                                        DlqEntry {
+                                            source_row: *row_num,
+                                            category:
+                                                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                            error_message: format!("aggregate {name}: {e}"),
+                                            original_record: record.clone(),
+                                            stage,
+                                            route: None,
+                                            trigger: true,
+                                            source_name,
+                                            triggering_field: None,
+                                            triggering_value: None,
+                                        },
+                                    )?;
+                                }
                             }
                         }
                     }
                 }
-            }
+                Ok(())
+            })?;
 
             // Finalize. Accumulator finalize errors get the
             // typed `PipelineError::Accumulator` mapping; under
@@ -2574,8 +2618,13 @@ pub(crate) fn dispatch_plan_node(
 
             let composition_name = name.clone();
             let port_records = collect_port_records(ctx, current_dag, node_idx, &composition_name)?;
-            let output_records =
-                execute_composition_body(ctx, body, port_records, &composition_name)?;
+            let output_records = Box::pin(execute_composition_body(
+                ctx,
+                body,
+                port_records,
+                &composition_name,
+            ))
+            .await?;
             // Materialize node-rooted window runtimes for any IndexSpec
             // rooted at this composition's call-site NodeIndex. The
             // body executor returned with `active_stack` already
@@ -2909,21 +2958,30 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_iejoin(IEJoinExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        partition_bits,
-                        propagate_ck,
-                        ctx: &iejoin_ctx,
-                        budget: &mut budget,
+                    // CPU-bound IEJoin kernel — partition + range-walk
+                    // + materialize; sized to saturate a worker thread.
+                    // `block_in_place` keeps the runtime responsive
+                    // for sibling tasks (e.g. concurrent source
+                    // ingest still pumping records into other
+                    // receivers) while this Combine arm holds the
+                    // worker.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_iejoin(IEJoinExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            partition_bits,
+                            propagate_ck,
+                            ctx: &iejoin_ctx,
+                            budget: &mut budget,
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -2963,22 +3021,28 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_grace_hash(GraceHashExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        partition_bits,
-                        propagate_ck,
-                        ctx: &grace_ctx,
-                        budget: &mut budget,
-                        spill_dir: ctx.spill_root_path.as_ref(),
+                    // CPU-bound grace-hash join kernel: partition build
+                    // + probe + spill I/O. `block_in_place` keeps the
+                    // borrow shape unchanged while letting the runtime
+                    // park other tasks during the heavy phase.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_grace_hash(GraceHashExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            partition_bits,
+                            propagate_ck,
+                            ctx: &grace_ctx,
+                            budget: &mut budget,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -3025,22 +3089,27 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_sort_merge(SortMergeExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        presorted: true,
-                        propagate_ck,
-                        ctx: &sm_ctx,
-                        budget: &mut budget,
-                        spill_dir: ctx.spill_root_path.as_ref(),
+                    // CPU-bound sort-merge join kernel: two-cursor merge
+                    // over pre-sorted inputs. `block_in_place` keeps
+                    // sibling tasks unblocked during the merge body.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_sort_merge(SortMergeExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            presorted: true,
+                            propagate_ck,
+                            ctx: &sm_ctx,
+                            budget: &mut budget,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -3501,7 +3570,7 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::CorrelationCommit { .. } => {
-            crate::executor::commit::orchestrate(ctx, current_dag)?;
+            Box::pin(crate::executor::commit::orchestrate(ctx, current_dag)).await?;
         }
     }
 
@@ -3980,7 +4049,7 @@ fn collect_port_records(
 /// fresh space; the parent buffers are restored after the walk.
 /// The depth-counter guard increments via RAII so `?`-bubbled
 /// errors can't leak the counter.
-fn execute_composition_body(
+async fn execute_composition_body(
     ctx: &mut ExecutorContext<'_>,
     body_id: crate::plan::composition_body::CompositionBodyId,
     port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
@@ -4080,7 +4149,7 @@ fn execute_composition_body(
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
     let mut walk_result: Result<(), PipelineError> = Ok(());
     for node_idx in topo {
-        if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
+        if let Err(inner) = Box::pin(dispatch_plan_node(ctx, &body_dag, node_idx)).await {
             walk_result = Err(PipelineError::compose_body_error(
                 composition_name.to_string(),
                 Box::new(inner),

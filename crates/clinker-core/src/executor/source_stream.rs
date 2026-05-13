@@ -26,6 +26,11 @@ use crate::pipeline::spill::{SpillError, SpillFile, SpillWriter};
 /// Default in-memory capacity threshold before overflow records spill
 /// to disk. Sized to cover most real-world non-primary feeds without
 /// spilling while still bounding peak RSS for vendor-feed-scale inputs.
+//
+// `#[allow(dead_code)]` removed when [`BufferedSourceSink`] wires in
+// behind `TokioSourceStream` as the spill-overflow tier (issue #57
+// closing commit).
+#[allow(dead_code)]
 pub(crate) const DEFAULT_SOURCE_STREAM_CAPACITY: usize = 64 * 1024;
 
 /// Per-source live ingest channel.
@@ -35,6 +40,13 @@ pub(crate) const DEFAULT_SOURCE_STREAM_CAPACITY: usize = 64 * 1024;
 /// production tokio impl backs the trait with `tokio::sync::mpsc` plus
 /// a [`BufferedSourceSink`] spill tier that absorbs overflow when the
 /// channel is full.
+//
+// The executor currently constructs `TokioSourceStream` directly, so
+// the trait sits without an intra-crate caller. It earns its keep
+// alongside the spill-tier wiring (issue #57 closing commit) — at
+// that point a second implementation (BufferedSourceSink-fronted)
+// joins the trait surface.
+#[allow(dead_code)]
 pub(crate) trait SourceStream: Send {
     /// Push one record onto the stream. Awaits if the channel is at
     /// capacity. Returns [`SourceStreamError::Closed`] if the consumer
@@ -95,6 +107,21 @@ impl TokioSourceStream {
     pub(crate) fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<(Record, u64)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (Self { tx }, rx)
+    }
+
+    /// Push from a synchronous worker (typically the closure inside
+    /// `tokio::task::spawn_blocking` driving a sync format reader).
+    /// Blocks the calling thread when the channel is at capacity,
+    /// providing the same back-pressure semantics as the async `push`
+    /// but without requiring the caller to be inside an `async fn`.
+    pub(crate) fn blocking_push(
+        &mut self,
+        record: Record,
+        row_num: u64,
+    ) -> Result<(), SourceStreamError> {
+        self.tx
+            .blocking_send((record, row_num))
+            .map_err(|_| SourceStreamError::Closed)
     }
 }
 

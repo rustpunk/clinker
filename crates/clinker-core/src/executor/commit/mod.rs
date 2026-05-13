@@ -103,7 +103,7 @@ pub(crate) struct DlqEvent {
 /// `ctx.correlation_max_group_buffer` directly, and the per-group
 /// emission shape carries enough context in the buffer cell itself
 /// to format DLQ trigger messages without the carrier's name.
-pub(crate) fn orchestrate(
+pub(crate) async fn orchestrate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
@@ -153,7 +153,11 @@ pub(crate) fn orchestrate(
         .values()
         .map(|b| b.graph.node_count())
         .sum();
-    let total_source_rows: usize = ctx.source_records.values().map(|v| v.len()).sum();
+    // Bound the cap by the total per-source ingest count, which is
+    // seeded once at executor entry from the unified ingest counters
+    // — the live `mpsc::Receiver`s here surface records as they
+    // arrive and have no `.len()` to inspect.
+    let total_source_rows: usize = ctx.total_per_source.values().map(|v| *v as usize).sum();
     let cap = test_cap_override()
         .unwrap_or(current_dag.graph.node_count() + body_node_count + total_source_rows + 1);
     let mut iter = 0usize;
@@ -195,7 +199,8 @@ pub(crate) fn orchestrate(
         // emit through its `input_rows_by_group_index` back to
         // contributing source rows — the same lineage the strict-path
         // detect uses.
-        let direct_events = dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)?;
+        let direct_events =
+            Box::pin(dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)).await?;
         let post_dispatch_scope = detect::detect_retract_scope(ctx, current_dag);
         archive_iteration_errors(&mut error_archive, ctx.correlation_buffers.as_ref());
         let mut new_events: Vec<DlqEvent> = direct_events;

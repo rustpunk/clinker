@@ -548,13 +548,13 @@ impl PipelineExecutor {
     ///     );
     /// }
     /// ```
-    pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
+    pub async fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params)
+        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params).await
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
@@ -578,7 +578,7 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
-    pub(crate) fn run_with_readers_writers(
+    pub(crate) async fn run_with_readers_writers(
         config: &PipelineConfig,
         readers: SourceReaders,
         writers: WriterRegistry,
@@ -591,6 +591,7 @@ impl PipelineExecutor {
             params,
             crate::config::CompileContext::default(),
         )
+        .await
     }
 
     /// Variant of [`Self::run_with_readers_writers`] that accepts an
@@ -599,7 +600,7 @@ impl PipelineExecutor {
     /// `CompileContext::default()` reads CWD at call time, which is
     /// not thread-safe across parallel test runs that need different
     /// workspace roots.
-    pub(crate) fn run_with_readers_writers_in_context(
+    pub(crate) async fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
         mut readers: SourceReaders,
         writers: WriterRegistry,
@@ -868,14 +869,23 @@ impl PipelineExecutor {
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
         // ── Unified source ingest pass ───────────────────────────────
-        // Every declared Source is ingested through `SourceStream` into
-        // its own bounded buffer with disk-spill overflow. No primary
-        // asymmetry; missing reader or empty file list is a hard error.
-        // `counters.total_count` accumulates across sources.
+        // Every declared Source spawns one `tokio::task` that drives
+        // its format reader on a blocking worker and pushes records
+        // through a `TokioSourceStream`. The paired `mpsc::Receiver`
+        // lands in `source_records[name]`; the dispatch loop's Source
+        // arm drains it via `recv().await`. No primary asymmetry;
+        // missing reader or empty file list is a hard error.
+        // Per-source totals + per-(source, file) watermark observations
+        // are returned through each task's `JoinHandle` and folded into
+        // the run's accounting once the receivers have drained.
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
-        let mut counters = PipelineCounters::default();
-        let mut source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        let counters = PipelineCounters::default();
+        let mut source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>> =
+            HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
+        let mut ingest_handles: Vec<
+            tokio::task::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
+        > = Vec::with_capacity(source_configs.len());
         for src_cfg in &source_configs {
             // Pre-declare so the report's `iter_declared_sources` view
             // emits a per-source rollup entry even when ingest produces
@@ -889,27 +899,18 @@ impl PipelineExecutor {
                     src_cfg.name
                 )))
             })?;
-            let drained = ingest_source_into_stream(
-                src_cfg,
-                files,
-                config,
-                Some(Arc::clone(&spill_root_path)),
-                &mut counters,
-                &mut watermarks,
-            )?;
-            let records = drained
-                .into_records()
-                .map_err(|e| PipelineError::Internal {
-                    op: "source-stream-drain",
-                    node: src_cfg.name.clone(),
-                    detail: e.to_string(),
-                })?;
-            source_records.insert(src_cfg.name.clone(), records);
+            let (stream, rx) = crate::executor::source_stream::TokioSourceStream::new(
+                crate::executor::source_stream::TokioSourceStream::DEFAULT_CAPACITY,
+            );
+            source_records.insert(src_cfg.name.clone(), rx);
+            let src_cfg_owned = src_cfg.clone();
+            let config_clone = config.clone();
+            ingest_handles.push(tokio::spawn(async move {
+                ingest_source_task(src_cfg_owned, files, config_clone, stream).await
+            }));
         }
-        let total_ingested: u64 = source_records.values().map(|v| v.len() as u64).sum();
-        collector.record(reader_timer.finish(total_ingested, total_ingested));
 
-        let (counters, dlq_entries, peak_rss_bytes, watermarks, per_source_rollback_cursors) =
+        let (counters, dlq_entries, peak_rss_bytes, mut watermarks, per_source_rollback_cursors) =
             Self::execute_dag(
                 config,
                 source_records,
@@ -926,7 +927,33 @@ impl PipelineExecutor {
                 spill_root_path,
                 counters,
                 watermarks,
-            )?;
+            )
+            .await?;
+
+        // Collect ingest-task outcomes: per-source row counts and the
+        // per-(source, file) watermark observations each task captured
+        // locally. The dispatch path consumed each task's receiver
+        // already, so a clean ingest task's join is the synchronization
+        // point that confirms readers + spill writers closed without
+        // error. A task error here (reader I/O, spill writer failure,
+        // closed-receiver — which can only fire if dispatch aborted
+        // before draining, in which case the dispatch error fires
+        // first) propagates after dispatch's own result.
+        let mut total_ingested: u64 = 0;
+        let mut counters = counters;
+        for handle in ingest_handles {
+            let outcome = handle.await.map_err(|e| PipelineError::Internal {
+                op: "source-ingest-task",
+                node: String::new(),
+                detail: format!("tokio task join failed: {e}"),
+            })??;
+            counters.total_count += outcome.total_count;
+            total_ingested += outcome.total_count;
+            for (file_arc, ts) in outcome.watermark_observations {
+                watermarks.observe(&outcome.source_name, &file_arc, ts);
+            }
+        }
+        collector.record(reader_timer.finish(total_ingested, total_ingested));
 
         let stages = collector.into_stages();
         let (total_cpu_user_ns, total_cpu_sys_ns, total_io_read_bytes, total_io_write_bytes) =
@@ -988,9 +1015,9 @@ impl PipelineExecutor {
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
-    fn execute_dag(
+    async fn execute_dag(
         config: &PipelineConfig,
-        source_records: HashMap<String, Vec<(Record, u64)>>,
+        mut source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1016,12 +1043,32 @@ impl PipelineExecutor {
             config.pipeline.memory_limit.as_deref(),
         );
 
+        // Drain every per-source receiver into a local Vec so the
+        // arena-build, record-var seed, and `$source.count` pre-passes
+        // below can operate on the full per-source record set. After
+        // the pre-passes complete we re-channel the records into a
+        // fresh `(Sender, Receiver)` pair per source so the dispatch
+        // loop's Source arm sees the same `mpsc::Receiver` interface
+        // it would see under live streaming. The migration to true
+        // live consumption (Source arm reads as ingest tasks push)
+        // moves these pre-passes into per-record evaluation in a
+        // follow-up commit — for today the architecture lands without
+        // disrupting source-rooted window builds or `$source.count`.
+        let mut drained_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        for (name, rx) in source_records.iter_mut() {
+            let mut buf: Vec<(Record, u64)> = Vec::new();
+            while let Some(item) = rx.recv().await {
+                buf.push(item);
+            }
+            drained_records.insert(name.clone(), buf);
+        }
+
         // Build per-window arena+index runtimes for every source-rooted
         // IndexSpec — each spec's `root: Source(name)` resolves against
-        // `source_records[name]`. Source-rooted arenas are built up-
+        // the drained record set. Source-rooted arenas are built up-
         // front here because their input is the Source's full ingested
-        // record set, available once the executor's ingest pass
-        // completes. Node-rooted (`Node`/`ParentNode`) slots still
+        // record set, available once each source's receiver has
+        // returned `None`. Node-rooted (`Node`/`ParentNode`) slots still
         // populate at their upstream operator's dispatch-arm exit
         // through `finalize_node_rooted_windows`.
         let mut window_runtime =
@@ -1051,7 +1098,7 @@ impl PipelineExecutor {
             let crate::plan::index::PlanIndexRoot::Source(source_name) = &spec.root else {
                 continue;
             };
-            let Some(records) = source_records.get(source_name.as_str()) else {
+            let Some(records) = drained_records.get(source_name.as_str()) else {
                 continue;
             };
             if records.is_empty() {
@@ -1107,7 +1154,7 @@ impl PipelineExecutor {
         // plan contains an Aggregation node — the DAG walk needs to
         // fire the aggregator's empty-input special case. Generalized
         // from primary-only to "every source ingested zero records".
-        if source_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
+        if drained_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
             return Ok((
                 counters,
                 dlq_entries,
@@ -1119,7 +1166,7 @@ impl PipelineExecutor {
 
         Self::execute_dag_branching(
             config,
-            source_records,
+            drained_records,
             source_configs,
             writers,
             transforms,
@@ -1137,6 +1184,7 @@ impl PipelineExecutor {
             spill_root_path,
             watermarks,
         )
+        .await
     }
 
     /// Execute a branching DAG by walking nodes in topological order.
@@ -1152,7 +1200,7 @@ impl PipelineExecutor {
     /// branch-level fork-join — scheduling overhead exceeds benefit at
     /// typical ETL branch sizes (2-4 branches, millisecond chains).
     #[allow(clippy::too_many_arguments)]
-    fn execute_dag_branching(
+    async fn execute_dag_branching(
         config: &PipelineConfig,
         mut source_records: HashMap<String, Vec<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
@@ -1295,6 +1343,32 @@ impl PipelineExecutor {
             .map(|(name, records)| (Arc::from(name.as_str()), records.len() as u64))
             .collect();
 
+        // Re-channel each source's drained record set into a fresh
+        // bounded `(Sender, Receiver)` pair so the dispatch loop's
+        // Source arm consumes records through the same
+        // `mpsc::Receiver` interface it would see under live
+        // streaming. Capacity is sized to the source's record count
+        // (with a `.max(1)` to satisfy `channel`'s non-zero
+        // requirement), and the sender is fed synchronously then
+        // dropped so `recv().await` returns `None` once the records
+        // drain.
+        let mut source_records_rx: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>> =
+            HashMap::with_capacity(source_records.len());
+        for (name, records) in source_records.drain() {
+            let (tx, rx) = tokio::sync::mpsc::channel(records.len().max(1));
+            for item in records {
+                if tx.try_send(item).is_err() {
+                    return Err(PipelineError::Internal {
+                        op: "executor",
+                        node: name.clone(),
+                        detail: "source re-channel try_send failed unexpectedly".to_string(),
+                    });
+                }
+            }
+            drop(tx);
+            source_records_rx.insert(name, rx);
+        }
+
         let mut ctx = dispatch::ExecutorContext {
             config,
             artifacts,
@@ -1309,7 +1383,7 @@ impl PipelineExecutor {
             strategy,
 
             node_buffers: HashMap::new(),
-            source_records,
+            source_records: source_records_rx,
             writers: writers.single,
             fan_out_writers: writers.fan_out,
             compiled_route,
@@ -1366,17 +1440,17 @@ impl PipelineExecutor {
         if !init_phase_set.is_empty() {
             for node_idx in plan.topo_order.clone() {
                 if init_phase_set.contains(&node_idx) {
-                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
                 }
             }
             for node_idx in plan.topo_order.clone() {
                 if !init_phase_set.contains(&node_idx) {
-                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
                 }
             }
         } else {
             for node_idx in plan.topo_order.clone() {
-                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
             }
         }
 
@@ -1738,14 +1812,31 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
 /// without external row-keyed arrays. `counters.total_count`
 /// increments per record so every source contributes to the
 /// pipeline-wide total.
-fn ingest_source_into_stream(
-    src_cfg: &crate::config::SourceConfig,
+/// One ingest task's outcome, collected by the executor entry once
+/// dispatch has drained the paired receiver. The watermark
+/// observations are folded back into the executor's owned
+/// `PerSourceWatermarks` (per-(source, file) max-event-time map);
+/// `total_count` increments `counters.total_count` and seeds the
+/// `$source.count` pipeline-wide total.
+struct IngestTaskOutcome {
+    source_name: String,
+    total_count: u64,
+    watermark_observations: Vec<(Arc<str>, i64)>,
+}
+
+/// Drive one Source's format reader on a tokio-blocking worker and
+/// push every record through `stream`. Watermark observations are
+/// captured locally so the executor's `PerSourceWatermarks` is owned
+/// by a single task (no shared-mutex contention). The blocking
+/// closure inside `tokio::task::spawn_blocking` runs the synchronous
+/// reader; records are forwarded via `Sender::blocking_send` so the
+/// channel's back-pressure semantics still apply.
+async fn ingest_source_task(
+    src_cfg: crate::config::SourceConfig,
     files: Vec<crate::source::multi_file::FileSlot>,
-    config: &PipelineConfig,
-    spill_dir: Option<Arc<std::path::Path>>,
-    counters: &mut PipelineCounters,
-    watermarks: &mut crate::executor::watermark::PerSourceWatermarks,
-) -> Result<source_stream::DrainedSourceStream, PipelineError> {
+    config: PipelineConfig,
+    stream: crate::executor::source_stream::TokioSourceStream,
+) -> Result<IngestTaskOutcome, PipelineError> {
     if files.is_empty() {
         return Err(PipelineError::Config(
             crate::config::ConfigError::Validation(format!(
@@ -1754,123 +1845,128 @@ fn ingest_source_into_stream(
             )),
         ));
     }
-    let raw_reader = build_multi_file_reader(src_cfg, files)?;
-    let mut src_reader = wrap_with_schema_coercion(raw_reader, config, &src_cfg.name)?;
-    let reader_schema = src_reader.schema()?;
+    // Keep an owned copy of the source name so the post-await error
+    // path retains attribution even though the blocking closure moves
+    // `src_cfg` in.
+    let source_name = src_cfg.name.clone();
 
-    // Widen the reader schema with `$source.file` and `$source.name`
-    // engine-stamped tail columns. The stamps travel with every record
-    // so downstream operators resolve `$source.file` / `$source.name`
-    // per-record via column reads (see `dispatch::source_file_arc_of`
-    // and `dispatch::source_name_arc_of`) instead of indexing external
-    // row-keyed Vecs. Tail order is load-bearing — see
-    // `bind_schema::columns_from_decl`: `$ck.<field>` shadows first,
-    // then `$widened`, then `$source.file`, then `$source.name` last.
-    let mut widened_builder =
-        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 2);
-    for (idx, col) in reader_schema.columns().iter().enumerate() {
-        widened_builder = match reader_schema.field_metadata(idx) {
-            Some(meta) => widened_builder.with_field_meta(col.as_ref(), meta.clone()),
-            None => widened_builder.with_field(col.as_ref()),
-        };
-    }
-    let widened_schema = widened_builder
-        .with_field_meta(
-            crate::config::pipeline_node::SOURCE_FILE_COLUMN,
-            clinker_record::FieldMetadata::source_file(),
-        )
-        .with_field_meta(
-            crate::config::pipeline_node::SOURCE_NAME_COLUMN,
-            clinker_record::FieldMetadata::source_name(),
-        )
-        .build();
+    // `spawn_blocking` because every layer below — the format reader,
+    // schema-coercion wrapper, file I/O — is synchronous. The
+    // `TokioSourceStream` sender's `blocking_send` lives inside this
+    // closure to preserve channel back-pressure even though the
+    // producer is on a blocking worker.
+    let join = tokio::task::spawn_blocking(move || -> Result<IngestTaskOutcome, PipelineError> {
+        let raw_reader = build_multi_file_reader(&src_cfg, files)?;
+        let mut src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+        let reader_schema = src_reader.schema()?;
 
-    let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
-        Arc::from("<source>")
-    } else {
-        Arc::from(src_cfg.path_str())
-    };
-    // One shared Arc per Source — every record stamps a clone, so the
-    // per-record cost is one Arc bump rather than a fresh allocation.
-    let source_name_arc: Arc<str> = Arc::from(src_cfg.name.as_str());
-
-    // Resolve the watermark column to a position on the widened
-    // schema once per source; the per-record observation below is then
-    // a positional read with no name lookup. Resolution failure here
-    // means the planner (`crate::plan::bind_schema`) admitted a
-    // declaration that doesn't match the runtime schema — defense in
-    // depth surfaces as a config error rather than silent skip.
-    let watermark_column_idx: Option<usize> = match src_cfg.watermark.as_ref() {
-        None => None,
-        Some(wm) => match widened_schema.index(wm.column.as_str()) {
-            Some(i) => Some(i),
-            None => {
-                return Err(PipelineError::Config(
-                    crate::config::ConfigError::Validation(format!(
-                        "source '{}' declares watermark.column = '{}' but no such column \
-                         exists on the runtime schema (declared columns: {:?})",
-                        src_cfg.name,
-                        wm.column,
-                        widened_schema.columns(),
-                    )),
-                ));
-            }
-        },
-    };
-
-    let mut stream = source_stream::SourceStream::new(
-        Arc::clone(&widened_schema),
-        source_stream::DEFAULT_SOURCE_STREAM_CAPACITY,
-        spill_dir,
-    );
-    let mut rn: u64 = 0;
-    loop {
-        match src_reader.next_record() {
-            Ok(Some(record)) => {
-                rn += 1;
-                counters.total_count += 1;
-                let file_arc = src_reader
-                    .current_source_file()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&static_source_file));
-                let mut values: Vec<clinker_record::Value> = record.values().to_vec();
-                // Observe the watermark column BEFORE widening: read
-                // the value at its position, convert Timestamp / Date
-                // to i64 nanoseconds, and fold into the per-(source,
-                // file) max. Null / non-temporal / unparseable values
-                // are silently skipped — late-record dropping is the
-                // time-window operator's job, not ingest's.
-                if let Some(idx) = watermark_column_idx
-                    && let Some(value) = values.get(idx)
-                    && let Some(ts_nanos) = value_to_event_time_nanos(value)
-                {
-                    watermarks.observe(&src_cfg.name, &file_arc, ts_nanos);
-                }
-                values.push(clinker_record::Value::String(
-                    file_arc.as_ref().to_string().into_boxed_str(),
-                ));
-                values.push(clinker_record::Value::String(
-                    source_name_arc.as_ref().to_string().into_boxed_str(),
-                ));
-                let widened_record =
-                    clinker_record::Record::new(Arc::clone(&widened_schema), values);
-                stream
-                    .push(widened_record, rn)
-                    .map_err(|e| PipelineError::Internal {
-                        op: "source-stream-spill",
-                        node: src_cfg.name.clone(),
-                        detail: e.to_string(),
-                    })?;
-            }
-            Ok(None) => break,
-            Err(other) => return Err(other.into()),
+        // Widen the reader schema with `$source.file` and `$source.name`
+        // engine-stamped tail columns. The stamps travel with every record
+        // so downstream operators resolve `$source.file` / `$source.name`
+        // per-record via column reads (see `dispatch::source_file_arc_of`
+        // and `dispatch::source_name_arc_of`) instead of indexing external
+        // row-keyed Vecs. Tail order is load-bearing — see
+        // `bind_schema::columns_from_decl`: `$ck.<field>` shadows first,
+        // then `$widened`, then `$source.file`, then `$source.name` last.
+        let mut widened_builder =
+            clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 2);
+        for (idx, col) in reader_schema.columns().iter().enumerate() {
+            widened_builder = match reader_schema.field_metadata(idx) {
+                Some(meta) => widened_builder.with_field_meta(col.as_ref(), meta.clone()),
+                None => widened_builder.with_field(col.as_ref()),
+            };
         }
-    }
-    stream.finish().map_err(|e| PipelineError::Internal {
-        op: "source-stream-finish",
-        node: src_cfg.name.clone(),
-        detail: e.to_string(),
-    })
+        let widened_schema = widened_builder
+            .with_field_meta(
+                crate::config::pipeline_node::SOURCE_FILE_COLUMN,
+                clinker_record::FieldMetadata::source_file(),
+            )
+            .with_field_meta(
+                crate::config::pipeline_node::SOURCE_NAME_COLUMN,
+                clinker_record::FieldMetadata::source_name(),
+            )
+            .build();
+
+        let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
+            Arc::from("<source>")
+        } else {
+            Arc::from(src_cfg.path_str())
+        };
+        let source_name_arc: Arc<str> = Arc::from(src_cfg.name.as_str());
+
+        let watermark_column_idx: Option<usize> = match src_cfg.watermark.as_ref() {
+            None => None,
+            Some(wm) => match widened_schema.index(wm.column.as_str()) {
+                Some(i) => Some(i),
+                None => {
+                    return Err(PipelineError::Config(
+                        crate::config::ConfigError::Validation(format!(
+                            "source '{}' declares watermark.column = '{}' but no such column \
+                             exists on the runtime schema (declared columns: {:?})",
+                            src_cfg.name,
+                            wm.column,
+                            widened_schema.columns(),
+                        )),
+                    ));
+                }
+            },
+        };
+
+        let mut stream = stream;
+        let mut rn: u64 = 0;
+        let mut total_count: u64 = 0;
+        let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
+        loop {
+            match src_reader.next_record() {
+                Ok(Some(record)) => {
+                    rn += 1;
+                    total_count += 1;
+                    let file_arc = src_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    let mut values: Vec<clinker_record::Value> = record.values().to_vec();
+                    if let Some(idx) = watermark_column_idx
+                        && let Some(value) = values.get(idx)
+                        && let Some(ts_nanos) = value_to_event_time_nanos(value)
+                    {
+                        watermark_observations.push((Arc::clone(&file_arc), ts_nanos));
+                    }
+                    values.push(clinker_record::Value::String(
+                        file_arc.as_ref().to_string().into_boxed_str(),
+                    ));
+                    values.push(clinker_record::Value::String(
+                        source_name_arc.as_ref().to_string().into_boxed_str(),
+                    ));
+                    let widened_record =
+                        clinker_record::Record::new(Arc::clone(&widened_schema), values);
+                    stream.blocking_push(widened_record, rn).map_err(|e| {
+                        PipelineError::Internal {
+                            op: "source-stream-push",
+                            node: src_cfg.name.clone(),
+                            detail: e.to_string(),
+                        }
+                    })?;
+                }
+                Ok(None) => break,
+                Err(other) => return Err(other.into()),
+            }
+        }
+        // Drop the sender so the dispatch-side `recv().await` returns
+        // `None` once the channel drains.
+        drop(stream);
+        Ok(IngestTaskOutcome {
+            source_name: src_cfg.name.clone(),
+            total_count,
+            watermark_observations,
+        })
+    });
+
+    join.await.map_err(|e| PipelineError::Internal {
+        op: "source-ingest-blocking",
+        node: source_name,
+        detail: format!("blocking worker join failed: {e}"),
+    })?
 }
 
 /// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
