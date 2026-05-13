@@ -5,9 +5,10 @@ pub(crate) mod commit;
 pub(crate) mod dispatch;
 mod schema_check;
 pub(crate) mod source_stream;
+pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -295,6 +296,25 @@ pub struct ExecutionReport {
     pub finished_at: DateTime<Utc>,
     /// Per-stage instrumentation metrics, ordered by execution sequence.
     pub stages: Vec<stage_metrics::StageMetrics>,
+    /// Per-(source, file) event-time watermarks observed at ingest,
+    /// keyed by `(source_name, source_file_path)`. The max event-time
+    /// seen for that pair in i64 nanoseconds, or `None` when the
+    /// partition had no observations. Finest granularity; drives the
+    /// `fan_out_per_source_file` 1:1 source-file → sink case where
+    /// each file's watermark is independently meaningful.
+    pub per_source_file_watermarks: BTreeMap<(String, String), Option<i64>>,
+    /// Per-source rollup = `min` across the source's per-file
+    /// watermarks. One entry per declared source (sources whose
+    /// `SourceConfig.watermark.column` is set). A glob source with one
+    /// lagging file holds its source-level watermark back to that
+    /// file's max — matching the Flink/Arroyo per-partition + min
+    /// reducer pattern.
+    pub per_source_watermarks: BTreeMap<String, Option<i64>>,
+    /// Cross-source rollup = `min` across rolled-up source values.
+    /// The reducer a time-windowed aggregate's close decision reads
+    /// (future consumer). `None` when every declared source rolls up
+    /// to `None`.
+    pub effective_watermark: Option<i64>,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
@@ -815,7 +835,14 @@ impl PipelineExecutor {
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
         let mut counters = PipelineCounters::default();
         let mut source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
         for src_cfg in &source_configs {
+            // Pre-declare so the report's `iter_declared_sources` view
+            // emits a per-source rollup entry even when ingest produces
+            // zero observable records (e.g. empty input file).
+            if src_cfg.watermark.is_some() {
+                watermarks.declare(&src_cfg.name);
+            }
             let files = readers.remove(&src_cfg.name).ok_or_else(|| {
                 PipelineError::Config(crate::config::ConfigError::Validation(format!(
                     "no reader registered for source '{}'",
@@ -828,6 +855,7 @@ impl PipelineExecutor {
                 config,
                 Some(Arc::clone(&spill_root_path)),
                 &mut counters,
+                &mut watermarks,
             )?;
             let records = drained
                 .into_records()
@@ -841,7 +869,7 @@ impl PipelineExecutor {
         let total_ingested: u64 = source_records.values().map(|v| v.len() as u64).sum();
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 
-        let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
+        let (counters, dlq_entries, peak_rss_bytes, watermarks) = Self::execute_dag(
             config,
             source_records,
             &source_configs,
@@ -856,11 +884,31 @@ impl PipelineExecutor {
             spill_root,
             spill_root_path,
             counters,
+            watermarks,
         )?;
 
         let stages = collector.into_stages();
         let (total_cpu_user_ns, total_cpu_sys_ns, total_io_read_bytes, total_io_write_bytes) =
             sum_cpu_io_totals(&stages);
+
+        // Roll the per-(source, file) watermark map into the report's
+        // three granularities. BTreeMap keys are owned `String`s so the
+        // report is `'static`-clonable for snapshot testing.
+        let per_source_file_watermarks: BTreeMap<(String, String), Option<i64>> = watermarks
+            .iter_partitions()
+            .map(|(src, file, w)| {
+                (
+                    (src.to_string(), file.as_ref().to_string()),
+                    w.max_event_time_nanos,
+                )
+            })
+            .collect();
+        let per_source_watermarks: BTreeMap<String, Option<i64>> = watermarks
+            .iter_declared_sources()
+            .map(|name| (name.to_string(), watermarks.source_min(name)))
+            .collect();
+        let declared_source_names: Vec<&str> = watermarks.iter_declared_sources().collect();
+        let effective_watermark = watermarks.min_across_sources(&declared_source_names);
 
         Ok(ExecutionReport {
             counters,
@@ -875,6 +923,9 @@ impl PipelineExecutor {
             started_at,
             finished_at: Utc::now(),
             stages,
+            per_source_file_watermarks,
+            per_source_watermarks,
+            effective_watermark,
         })
     }
 
@@ -910,7 +961,16 @@ impl PipelineExecutor {
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        watermarks: crate::executor::watermark::PerSourceWatermarks,
+    ) -> Result<
+        (
+            PipelineCounters,
+            Vec<DlqEntry>,
+            Option<u64>,
+            crate::executor::watermark::PerSourceWatermarks,
+        ),
+        PipelineError,
+    > {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
         // Pipeline-scoped MemoryBudget. One declared `memory_limit`
@@ -1014,7 +1074,7 @@ impl PipelineExecutor {
         // fire the aggregator's empty-input special case. Generalized
         // from primary-only to "every source ingested zero records".
         if source_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
-            return Ok((counters, dlq_entries, rss_bytes()));
+            return Ok((counters, dlq_entries, rss_bytes(), watermarks));
         }
 
         Self::execute_dag_branching(
@@ -1035,6 +1095,7 @@ impl PipelineExecutor {
             memory_budget,
             spill_root,
             spill_root_path,
+            watermarks,
         )
     }
 
@@ -1069,7 +1130,16 @@ impl PipelineExecutor {
         memory_budget: crate::pipeline::memory::MemoryBudget,
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        watermarks: crate::executor::watermark::PerSourceWatermarks,
+    ) -> Result<
+        (
+            PipelineCounters,
+            Vec<DlqEntry>,
+            Option<u64>,
+            crate::executor::watermark::PerSourceWatermarks,
+        ),
+        PipelineError,
+    > {
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1222,6 +1292,7 @@ impl PipelineExecutor {
             spill_root,
             spill_root_path,
             window_runtime,
+            watermarks,
             memory_budget,
             correlation_buffers,
             correlation_max_group_buffer,
@@ -1330,6 +1401,7 @@ impl PipelineExecutor {
             std::mem::take(counters),
             std::mem::take(dlq_entries),
             rss_bytes(),
+            ctx.watermarks,
         ))
     }
 
@@ -1577,6 +1649,27 @@ fn wrap_with_schema_coercion(
     }
 }
 
+/// Convert a record value at a declared watermark column into the
+/// canonical i64-nanoseconds event-time stamp folded into
+/// [`crate::executor::watermark::PerSourceWatermarks`].
+///
+/// Accepts [`clinker_record::Value::DateTime`] (preserved at nano
+/// resolution via `and_utc().timestamp_nanos_opt()`) and
+/// [`clinker_record::Value::Date`] (anchored at 00:00:00 UTC). Null,
+/// non-temporal, or out-of-`i64`-nanos-range values return `None`
+/// and are silently skipped — late-record dropping is the time-window
+/// operator's job.
+fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
+    use clinker_record::Value;
+    match value {
+        Value::DateTime(nd) => nd.and_utc().timestamp_nanos_opt(),
+        Value::Date(d) => d
+            .and_hms_opt(0, 0, 0)
+            .and_then(|nd| nd.and_utc().timestamp_nanos_opt()),
+        _ => None,
+    }
+}
+
 /// Ingest a Source's records into a bounded `SourceStream` and drain
 /// to the read-side handle. Used uniformly by every declared Source —
 /// no primary asymmetry.
@@ -1595,6 +1688,7 @@ fn ingest_source_into_stream(
     config: &PipelineConfig,
     spill_dir: Option<Arc<std::path::Path>>,
     counters: &mut PipelineCounters,
+    watermarks: &mut crate::executor::watermark::PerSourceWatermarks,
 ) -> Result<source_stream::DrainedSourceStream, PipelineError> {
     if files.is_empty() {
         return Err(PipelineError::Config(
@@ -1634,6 +1728,30 @@ fn ingest_source_into_stream(
         Arc::from(src_cfg.path_str())
     };
 
+    // Resolve the watermark column to a position on the widened
+    // schema once per source; the per-record observation below is then
+    // a positional read with no name lookup. Resolution failure here
+    // means the planner (`crate::plan::bind_schema`) admitted a
+    // declaration that doesn't match the runtime schema — defense in
+    // depth surfaces as a config error rather than silent skip.
+    let watermark_column_idx: Option<usize> = match src_cfg.watermark.as_ref() {
+        None => None,
+        Some(wm) => match widened_schema.index(wm.column.as_str()) {
+            Some(i) => Some(i),
+            None => {
+                return Err(PipelineError::Config(
+                    crate::config::ConfigError::Validation(format!(
+                        "source '{}' declares watermark.column = '{}' but no such column \
+                         exists on the runtime schema (declared columns: {:?})",
+                        src_cfg.name,
+                        wm.column,
+                        widened_schema.columns(),
+                    )),
+                ));
+            }
+        },
+    };
+
     let mut stream = source_stream::SourceStream::new(
         Arc::clone(&widened_schema),
         source_stream::DEFAULT_SOURCE_STREAM_CAPACITY,
@@ -1650,6 +1768,18 @@ fn ingest_source_into_stream(
                     .cloned()
                     .unwrap_or_else(|| Arc::clone(&static_source_file));
                 let mut values: Vec<clinker_record::Value> = record.values().to_vec();
+                // Observe the watermark column BEFORE widening: read
+                // the value at its position, convert Timestamp / Date
+                // to i64 nanoseconds, and fold into the per-(source,
+                // file) max. Null / non-temporal / unparseable values
+                // are silently skipped — late-record dropping is the
+                // time-window operator's job, not ingest's.
+                if let Some(idx) = watermark_column_idx
+                    && let Some(value) = values.get(idx)
+                    && let Some(ts_nanos) = value_to_event_time_nanos(value)
+                {
+                    watermarks.observe(&src_cfg.name, &file_arc, ts_nanos);
+                }
                 values.push(clinker_record::Value::String(
                     file_arc.as_ref().to_string().into_boxed_str(),
                 ));

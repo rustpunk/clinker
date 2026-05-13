@@ -453,6 +453,9 @@ mod tests {
                     heap_alloc_count: None,
                 },
             ],
+            per_source_file_watermarks: Default::default(),
+            per_source_watermarks: Default::default(),
+            effective_watermark: None,
         };
         report.counters.total_count = 1000;
         report.counters.ok_count = 995;
@@ -525,6 +528,9 @@ mod tests {
                     heap_alloc_count: None,
                 },
             ],
+            per_source_file_watermarks: Default::default(),
+            per_source_watermarks: Default::default(),
+            effective_watermark: None,
         };
         let output = format_summary_table("test/bad", "small", &report);
         assert!(

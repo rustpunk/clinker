@@ -449,6 +449,7 @@ mod tests {
             min_size: None,
             max_size: None,
             files: None,
+            watermark: None,
             schema: None,
             schema_overrides: None,
             array_paths: None,

@@ -5,3 +5,4 @@ mod dedup_node_rooted;
 mod deferred_region;
 mod explain_polish;
 mod plan_time_window_root;
+mod watermark_validation;
