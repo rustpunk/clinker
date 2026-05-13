@@ -135,11 +135,16 @@ pub(crate) fn push_dlq(
 
 /// Advance `rollback_cursors[source_name]` to `row_num` when the
 /// argument exceeds the stored value. Called at every clean exit from
-/// a forward operator (Transform / Route success branches, post-
-/// finalize aggregate emit). Monotonic per source — the cursor never
-/// moves backward through this entry point; rewinds happen at the
-/// Combine output-failure path which restores from
-/// `combine_input_snapshots`.
+/// a forward operator: Transform / Route success branches, and the
+/// per-record `add_record` Ok path on Aggregate ingest (the absorbing
+/// step that hands a source row off to the accumulator's lineage —
+/// the post-finalize emit operates on aggregator-synthetic identity
+/// and has no per-record source row to advance against). Monotonic
+/// per source — the cursor never moves backward through this entry
+/// point. A backward write would happen only when a future
+/// rewind path consumes a `combine_input_snapshots` entry; that path
+/// is wired for the async-runtime work on #57 and has no live trigger
+/// in today's executor.
 ///
 /// `row_num` is the engine-stamped source row number stored alongside
 /// the record in `ctx.source_records[name]` and threaded through every
@@ -147,7 +152,7 @@ pub(crate) fn push_dlq(
 /// value the relaxed-CK retract orchestrator passes to
 /// [`crate::aggregation::HashAggregator::retract_row`], so a cursor
 /// stored here is directly comparable against `retract_row` arguments
-/// at rewind time.
+/// when #57's rewind path lands.
 pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<str>, row_num: u64) {
     let slot = ctx
         .rollback_cursors
@@ -456,14 +461,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// shape so the post-#57 live-channel refactor moves all three onto
     /// `SourceStream` together.
     pub(crate) rollback_cursors: HashMap<Arc<str>, u64>,
-    /// Per-Combine input-cursor snapshots captured at driver-row fold
-    /// start. The outer key is the Combine node's `NodeIndex`; the
+    /// Per-Combine input-cursor snapshots captured at Combine fold
+    /// entry. The outer key is the Combine node's `NodeIndex`; the
     /// inner map captures the `(source_name -> cursor)` pair for every
-    /// source whose record participates in the fold. On a Combine
-    /// output-row DLQ, the inner map restores into `rollback_cursors`
-    /// before the entry pushes — both contributing sources rewind to
-    /// their pre-fold position symmetrically. Cleared per-driver-record
-    /// after a successful emit so cross-row contamination is impossible.
+    /// source whose record participates in the fold. Today the snapshot
+    /// is captured at fold entry and cleared at the inline-strategy
+    /// fall-through; the symmetric rewind path that consumes a snapshot
+    /// to restore both contributing sources' cursors is wired for the
+    /// async-runtime work on #57 and has no live trigger in today's
+    /// executor (Combine errors propagate as `PipelineError::Internal`,
+    /// aborting the run before any rewind can apply).
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
     pub(crate) ok_source_rows: HashSet<u64>,
