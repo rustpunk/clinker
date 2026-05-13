@@ -212,6 +212,10 @@ pub struct EvalContext<'a> {
     /// `$source.ingestion_timestamp` — wall-clock time when ingestion of
     /// this source began.
     pub ingestion_timestamp: NaiveDateTime,
+    /// `$source.name` — originating Source node's name. Stable across
+    /// every record from the same Source; survives Merge / Combine via
+    /// the per-record `FieldMetadata::SourceName` engine-stamp.
+    pub source_name: &'a Arc<str>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -233,6 +237,7 @@ impl<'a> EvalContext<'a> {
             "count" => Some(Value::Integer(self.source_count as i64)),
             "batch" => Some(Value::String(self.source_batch.to_string().into())),
             "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
+            "name" => Some(Value::String(self.source_name.to_string().into())),
             other => self.stable.resolve_source_var(self.source_file, other),
         }
     }
@@ -255,6 +260,7 @@ impl<'a> EvalContext<'a> {
                 .unwrap()
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
+            source_name: test_default_source_name(),
         }
     }
 
@@ -279,6 +285,7 @@ impl<'a> EvalContext<'a> {
                 .unwrap()
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
+            source_name: test_default_source_name(),
         }
     }
 }
@@ -297,6 +304,15 @@ fn test_default_source_batch() -> &'static Arc<str> {
     use std::sync::OnceLock;
     static BATCH: OnceLock<Arc<str>> = OnceLock::new();
     BATCH.get_or_init(|| Arc::from("test-batch-000"))
+}
+
+/// Like `test_default_source_file` but for `$source.name`. Defaulted
+/// to `"test_source"` for test contexts that don't care about the
+/// originating Source's name.
+fn test_default_source_name() -> &'static Arc<str> {
+    use std::sync::OnceLock;
+    static NAME: OnceLock<Arc<str>> = OnceLock::new();
+    NAME.get_or_init(|| Arc::from("test_source"))
 }
 
 #[cfg(test)]
@@ -422,6 +438,7 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
+            source_name: test_default_source_name(),
         }
     }
 
@@ -465,6 +482,10 @@ mod tests {
             ctx.resolve_source("ingestion_timestamp"),
             Some(Value::DateTime(_))
         ));
+        match ctx.resolve_source("name").unwrap() {
+            Value::String(s) => assert_eq!(&*s, "test_source"),
+            other => panic!("expected String, got {:?}", other),
+        }
         assert!(ctx.resolve_source("nonexistent").is_none());
     }
 

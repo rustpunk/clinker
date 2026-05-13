@@ -453,7 +453,7 @@ impl<'a> TypeChecker<'a> {
 
             Expr::SourceAccess { node_id, field, .. } => {
                 let ty = match &**field {
-                    "file" | "path" | "batch" => Type::String,
+                    "file" | "path" | "batch" | "name" => Type::String,
                     "row" | "count" => Type::Int,
                     "ingestion_timestamp" => Type::DateTime,
                     other => self

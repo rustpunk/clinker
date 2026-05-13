@@ -1534,14 +1534,21 @@ impl HashAggregator {
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
 
         let gb_count = self.group_by_indices.len();
+        let schema_cols = self.spill_schema.column_count();
         let mut prepared: Vec<(Vec<u8>, usize)> = Vec::with_capacity(drained.len());
         for (idx, (key, _state)) in drained.iter().enumerate() {
-            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 1);
+            let mut values: Vec<Value> = Vec::with_capacity(schema_cols);
             for gk in key {
                 values.push(gk.to_value());
             }
-            // Pad to match spill_schema column count for SortKeyEncoder.
-            values.push(Value::Null);
+            // Pad the non-group-by tail (`__acc_state`, `__meta_tracker`) with
+            // Null so the synth record matches the spill schema's column count.
+            // `SortKeyEncoder` only reads the group-by prefix; everything past
+            // it is encoder-irrelevant but must be present to satisfy
+            // `Record::new`'s schema/values length invariant.
+            for _ in gb_count..schema_cols {
+                values.push(Value::Null);
+            }
             let synth = Record::new(Arc::clone(&self.spill_schema), values);
             let mut buf = Vec::new();
             encoder.encode_into(&synth, &mut buf);

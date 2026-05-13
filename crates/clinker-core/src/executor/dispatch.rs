@@ -36,6 +36,11 @@ use crate::error::PipelineError;
 /// Used when [`source_file_of`] returns `None`.
 pub(crate) static MERGED_SOURCE_FILE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<merged>"));
 
+/// Stand-in `$source.name` value for the same synthetic-emit sites that
+/// [`MERGED_SOURCE_FILE`] covers — Combine / post-aggregate finalize and
+/// composition-body emits that lost lineage at fan-in.
+pub(crate) static MERGED_SOURCE_NAME: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<merged>"));
+
 /// Read the per-record source-file path from the record's
 /// [`FieldMetadata::SourceFile`] engine-stamped column. Returns `None`
 /// when the record carries no such column (typical for Combine /
@@ -66,6 +71,35 @@ pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
     match source_file_path_of(record) {
         Some(s) => Arc::from(s),
         None => Arc::clone(&MERGED_SOURCE_FILE),
+    }
+}
+
+/// Read the per-record Source-node name from the record's
+/// [`FieldMetadata::SourceName`] engine-stamped column. Returns `None`
+/// when the column is absent (synthetic emits) or non-String.
+pub(crate) fn source_name_of(record: &Record) -> Option<&str> {
+    let schema = record.schema();
+    for idx in 0..schema.column_count() {
+        if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceName))
+            && let Some(Value::String(s)) = record.values().get(idx)
+        {
+            return Some(s.as_ref());
+        }
+    }
+    None
+}
+
+/// Read the per-record Source-node `Arc<str>` from the record's
+/// [`FieldMetadata::SourceName`] engine-stamped column, materializing
+/// a fresh `Arc<str>` per call. Falls back to a clone of
+/// [`MERGED_SOURCE_NAME`] when the stamp is absent. Same trade-off as
+/// [`source_file_arc_of`]: localized O(N) per-record Arc construction
+/// in exchange for post-merge correctness — peer Sources with shared
+/// column shape still resolve to their originating Source by name.
+pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
+    match source_name_of(record) {
+        Some(s) => Arc::from(s),
+        None => Arc::clone(&MERGED_SOURCE_NAME),
     }
 }
 
@@ -130,7 +164,10 @@ fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
                 let idx = key.len();
                 key.push(value_to_correlation_key(&record.values()[i], idx));
             }
-            Some(FieldMetadata::WidenedSidecar) | Some(FieldMetadata::SourceFile) | None => {}
+            Some(FieldMetadata::WidenedSidecar)
+            | Some(FieldMetadata::SourceFile)
+            | Some(FieldMetadata::SourceName)
+            | None => {}
         }
     }
     if key.is_empty() || key_is_null(&key) {
@@ -935,13 +972,15 @@ pub(crate) fn dispatch_plan_node(
                             // ingest. The `$widened` sidecar is filled by
                             // CoercingReader from input-record keys, not
                             // by name-based mapping from the reader.
-                            // `$source.file` is stamped at ingest into the
-                            // record's value vector directly, so it flows
-                            // through canonicalize via the per-name copy
-                            // loop above rather than this engine-stamp tail.
+                            // `$source.file` and `$source.name` are
+                            // stamped at ingest into the record's value
+                            // vector directly, so they flow through
+                            // canonicalize via the per-name copy loop
+                            // above rather than this engine-stamp tail.
                             Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
                             | Some(clinker_record::FieldMetadata::WidenedSidecar)
                             | Some(clinker_record::FieldMetadata::SourceFile)
+                            | Some(clinker_record::FieldMetadata::SourceName)
                             | None => None,
                         })
                         .collect()
@@ -1134,6 +1173,7 @@ pub(crate) fn dispatch_plan_node(
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
                 }
                 let source_file_arc = source_file_arc_of(&record);
+                let source_name_arc = source_name_arc_of(&record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
                     source_file: &source_file_arc,
@@ -1142,6 +1182,7 @@ pub(crate) fn dispatch_plan_node(
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: &source_name_arc,
                 };
 
                 let target_schema = output_schema
@@ -1234,6 +1275,7 @@ pub(crate) fn dispatch_plan_node(
                         );
                         if !routed {
                             ctx.counters.dlq_count += 1;
+                            let source_name = source_name_arc_of(&record);
                             ctx.dlq_entries.push(DlqEntry {
                                 source_row: rn,
                                 category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
@@ -1242,6 +1284,7 @@ pub(crate) fn dispatch_plan_node(
                                 stage,
                                 route: None,
                                 trigger: true,
+                                source_name,
                             });
                         }
                     }
@@ -1410,6 +1453,7 @@ pub(crate) fn dispatch_plan_node(
             if let Some(ref mut route) = route_handle {
                 for (record, rn) in input_records {
                     let source_file_arc = source_file_arc_of(&record);
+                    let source_name_arc = source_name_arc_of(&record);
                     let eval_ctx = EvalContext {
                         stable: ctx.stable,
                         source_file: &source_file_arc,
@@ -1418,6 +1462,7 @@ pub(crate) fn dispatch_plan_node(
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &source_name_arc,
                     };
 
                     let route_result = {
@@ -1455,6 +1500,7 @@ pub(crate) fn dispatch_plan_node(
                             );
                             if !routed {
                                 ctx.counters.dlq_count += 1;
+                                let source_name = source_name_arc_of(&record);
                                 ctx.dlq_entries.push(DlqEntry {
                                     source_row: rn,
                                     category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
@@ -1463,6 +1509,7 @@ pub(crate) fn dispatch_plan_node(
                                     stage,
                                     route: None,
                                     trigger: true,
+                                    source_name,
                                 });
                             }
                         }
@@ -1812,6 +1859,7 @@ pub(crate) fn dispatch_plan_node(
             let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
             for (record, row_num) in &input {
                 let source_file_arc = source_file_arc_of(record);
+                let source_name_arc = source_name_arc_of(record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
                     source_file: &source_file_arc,
@@ -1820,6 +1868,7 @@ pub(crate) fn dispatch_plan_node(
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: &source_name_arc,
                 };
                 if let Err(e) = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows) {
                     match ctx.config.error_handling.strategy {
@@ -1837,6 +1886,7 @@ pub(crate) fn dispatch_plan_node(
                             );
                             if !routed {
                                 ctx.counters.dlq_count += 1;
+                                let source_name = source_name_arc_of(record);
                                 ctx.dlq_entries.push(DlqEntry {
                                     source_row: *row_num,
                                     category: crate::dlq::DlqErrorCategory::AggregateFinalize,
@@ -1845,6 +1895,7 @@ pub(crate) fn dispatch_plan_node(
                                     stage,
                                     route: None,
                                     trigger: true,
+                                    source_name,
                                 });
                             }
                         }
@@ -1874,6 +1925,7 @@ pub(crate) fn dispatch_plan_node(
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
+                source_name: &MERGED_SOURCE_NAME,
             };
             let out_rows: Vec<AggSortRow> = if is_relaxed {
                 let mut hash_box = match stream.into_retained_hash() {
@@ -1926,6 +1978,7 @@ pub(crate) fn dispatch_plan_node(
                             } else {
                                 Record::new(Arc::clone(output_schema), Vec::new())
                             };
+                            let source_name = source_name_arc_of(&synthetic);
                             ctx.dlq_entries.push(DlqEntry {
                                 source_row: 0,
                                 category: crate::dlq::DlqErrorCategory::AggregateFinalize,
@@ -1936,6 +1989,7 @@ pub(crate) fn dispatch_plan_node(
                                 stage: Some(crate::dlq::stage_aggregate(name)),
                                 route: None,
                                 trigger: true,
+                                source_name,
                             });
                             Vec::new()
                         }
@@ -1964,6 +2018,7 @@ pub(crate) fn dispatch_plan_node(
                             } else {
                                 Record::new(Arc::clone(output_schema), Vec::new())
                             };
+                            let source_name = source_name_arc_of(&synthetic);
                             ctx.dlq_entries.push(DlqEntry {
                                 source_row: 0,
                                 category: crate::dlq::DlqErrorCategory::AggregateFinalize,
@@ -1974,6 +2029,7 @@ pub(crate) fn dispatch_plan_node(
                                 stage: Some(crate::dlq::stage_aggregate(name)),
                                 route: None,
                                 trigger: true,
+                                source_name,
                             });
                             Vec::new()
                         }
@@ -2631,6 +2687,7 @@ pub(crate) fn dispatch_plan_node(
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &MERGED_SOURCE_NAME,
                     };
                     let output_records = execute_combine_iejoin(IEJoinExec {
                         name,
@@ -2684,6 +2741,7 @@ pub(crate) fn dispatch_plan_node(
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &MERGED_SOURCE_NAME,
                     };
                     let output_records = execute_combine_grace_hash(GraceHashExec {
                         name,
@@ -2745,6 +2803,7 @@ pub(crate) fn dispatch_plan_node(
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &MERGED_SOURCE_NAME,
                     };
                     let output_records = execute_combine_sort_merge(SortMergeExec {
                         name,
@@ -2792,6 +2851,7 @@ pub(crate) fn dispatch_plan_node(
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
+                source_name: &MERGED_SOURCE_NAME,
             };
             let build_timer =
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
@@ -2837,6 +2897,7 @@ pub(crate) fn dispatch_plan_node(
 
             for (probe_record, rn) in driver_buf {
                 let source_file_arc = source_file_arc_of(&probe_record);
+                let source_name_arc = source_name_arc_of(&probe_record);
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
                     source_file: &source_file_arc,
@@ -2845,6 +2906,7 @@ pub(crate) fn dispatch_plan_node(
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: &source_name_arc,
                 };
 
                 // Probe-side key extraction routes through the
@@ -3395,6 +3457,7 @@ fn commit_one_group(
                 )
             };
             ctx.counters.dlq_count += 1;
+            let source_name = source_name_arc_of(&slot.original_record);
             ctx.dlq_entries.push(DlqEntry {
                 source_row: slot.row_num,
                 category,
@@ -3403,6 +3466,7 @@ fn commit_one_group(
                 stage: Some("correlation_commit".to_string()),
                 route: None,
                 trigger,
+                source_name,
             });
         }
         return Ok(());
@@ -3439,6 +3503,7 @@ fn commit_one_group(
             continue;
         }
         ctx.counters.dlq_count += 1;
+        let source_name = source_name_arc_of(&err.original_record);
         ctx.dlq_entries.push(DlqEntry {
             source_row: err.row_num,
             category: err.category,
@@ -3447,6 +3512,7 @@ fn commit_one_group(
             stage: err.stage.clone(),
             route: err.route.clone(),
             trigger: true,
+            source_name,
         });
     }
     // Collateral entries: every other distinct row that flowed through
@@ -3483,6 +3549,7 @@ fn commit_one_group(
             continue;
         }
         ctx.counters.dlq_count += 1;
+        let source_name = source_name_arc_of(&slot.original_record);
         ctx.dlq_entries.push(DlqEntry {
             source_row: slot.row_num,
             category: crate::dlq::DlqErrorCategory::Correlated,
@@ -3491,6 +3558,7 @@ fn commit_one_group(
             stage: Some("correlation_commit".to_string()),
             route: None,
             trigger: false,
+            source_name,
         });
     }
 

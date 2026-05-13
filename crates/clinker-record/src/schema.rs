@@ -40,6 +40,13 @@ use std::sync::Arc;
 ///   per-source row numbers collide. Filtered out of default Output
 ///   projection like the other engine-stamped variants; users opt in
 ///   by projecting `emit source_file = $source.file` explicitly.
+/// - [`FieldMetadata::SourceName`] — per-record Source-node identity
+///   column. Named `$source.name`; stamped at Source ingest with the
+///   originating Source node's name as a shared `Arc<str>`. Survives
+///   Merge / Combine so post-fan-in records still resolve to their
+///   originating Source by node name (the case schema identity alone
+///   cannot answer when peer Sources share a column shape — the
+///   silent-corruption topology at the root of #47).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldMetadata {
     /// Source-CK shadow column. `source_field` is the user-declared
@@ -61,6 +68,13 @@ pub enum FieldMetadata {
     /// sites; survives merge so post-fan-in records still resolve to
     /// their actual file rather than an external row-keyed lookup.
     SourceFile,
+    /// Per-record Source-node identity column. Named `$source.name`,
+    /// stamped at Source ingest with the originating Source node's
+    /// name as a shared `Arc<str>` (one Arc per Source, cloned per
+    /// record). Read by `$source.name` resolution at dispatch sites;
+    /// survives merge so post-fan-in records still report origin even
+    /// when peer Sources share a column shape.
+    SourceName,
 }
 
 impl FieldMetadata {
@@ -91,6 +105,13 @@ impl FieldMetadata {
     /// wrapping the originating file path Arc.
     pub fn source_file() -> Self {
         Self::SourceFile
+    }
+
+    /// Marks this column as the per-record Source-node identity stamp.
+    /// Always named `$source.name`; the value is a `Value::String`
+    /// wrapping the originating Source node's name Arc.
+    pub fn source_name() -> Self {
+        Self::SourceName
     }
 
     /// True for every variant. The presence of [`FieldMetadata`] on a
@@ -380,6 +401,24 @@ mod tests {
         match schema.field_metadata_by_name("$source.file") {
             Some(FieldMetadata::SourceFile) => {}
             other => panic!("expected SourceFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_schema_with_metadata_attaches_source_name() {
+        let cols: Vec<Box<str>> = vec!["id".into(), "$source.name".into()];
+        let meta = vec![None, Some(FieldMetadata::source_name())];
+        let schema = Schema::with_metadata(cols, meta);
+        assert!(schema.field_metadata(0).is_none());
+        let stamp = schema.field_metadata(1).expect("metadata attached");
+        match stamp {
+            FieldMetadata::SourceName => {}
+            other => panic!("expected SourceName, got {other:?}"),
+        }
+        assert!(stamp.is_engine_stamped());
+        match schema.field_metadata_by_name("$source.name") {
+            Some(FieldMetadata::SourceName) => {}
+            other => panic!("expected SourceName, got {other:?}"),
         }
     }
 

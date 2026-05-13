@@ -453,6 +453,13 @@ pub struct DlqEntry {
     /// `true` if this record's own evaluation caused the DLQ entry.
     /// Serialized as `_cxl_dlq_trigger` column in DLQ CSV.
     pub trigger: bool,
+    /// Originating Source-node name. Read from the failing record's
+    /// `FieldMetadata::SourceName` engine-stamp at the push site so a
+    /// post-Merge / post-Combine DLQ entry still identifies which
+    /// upstream Source produced the record. Serialized as
+    /// `_cxl_dlq_source_name` in DLQ CSV. Unblocks per-source DLQ
+    /// thresholds (#55).
+    pub source_name: Arc<str>,
 }
 
 impl DlqEntry {
@@ -1674,14 +1681,22 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
 /// to the read-side handle. Used uniformly by every declared Source —
 /// no primary asymmetry.
 ///
-/// Each ingested record is widened with a tail `$source.file`
-/// engine-stamped column (`FieldMetadata::SourceFile`) carrying the
-/// per-record file `Arc<str>` from
-/// `MultiFileFormatReader::current_source_file()`. Stamping at ingest
-/// lets `$source.file` / `$source.path` resolution survive Merge /
-/// Combine downstream without an external row-keyed array.
-/// `counters.total_count` increments per record so every source
-/// contributes to the pipeline-wide total.
+/// Each ingested record is widened with two tail engine-stamped
+/// columns:
+///
+/// - `$source.file` (`FieldMetadata::SourceFile`) — per-record
+///   originating file `Arc<str>` from
+///   `MultiFileFormatReader::current_source_file()`.
+/// - `$source.name` (`FieldMetadata::SourceName`) — per-record
+///   originating Source-node name as a shared `Arc<str>`. One Arc per
+///   Source, cloned by every record from that Source — the runtime
+///   cost is one Arc bump per ingested row.
+///
+/// Stamping at ingest lets `$source.file` / `$source.path` /
+/// `$source.name` resolution survive Merge / Combine downstream
+/// without external row-keyed arrays. `counters.total_count`
+/// increments per record so every source contributes to the
+/// pipeline-wide total.
 fn ingest_source_into_stream(
     src_cfg: &crate::config::SourceConfig,
     files: Vec<crate::source::multi_file::FileSlot>,
@@ -1702,13 +1717,16 @@ fn ingest_source_into_stream(
     let mut src_reader = wrap_with_schema_coercion(raw_reader, config, &src_cfg.name)?;
     let reader_schema = src_reader.schema()?;
 
-    // Widen the reader schema with a $source.file SourceFile-marked
-    // tail column. The stamp travels with every record so downstream
-    // operators resolve `$source.file` per-record via the column read
-    // (see `dispatch::source_file_arc_of`) instead of indexing an
-    // external row-keyed Vec.
+    // Widen the reader schema with `$source.file` and `$source.name`
+    // engine-stamped tail columns. The stamps travel with every record
+    // so downstream operators resolve `$source.file` / `$source.name`
+    // per-record via column reads (see `dispatch::source_file_arc_of`
+    // and `dispatch::source_name_arc_of`) instead of indexing external
+    // row-keyed Vecs. Tail order is load-bearing — see
+    // `bind_schema::columns_from_decl`: `$ck.<field>` shadows first,
+    // then `$widened`, then `$source.file`, then `$source.name` last.
     let mut widened_builder =
-        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 1);
+        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 2);
     for (idx, col) in reader_schema.columns().iter().enumerate() {
         widened_builder = match reader_schema.field_metadata(idx) {
             Some(meta) => widened_builder.with_field_meta(col.as_ref(), meta.clone()),
@@ -1720,6 +1738,10 @@ fn ingest_source_into_stream(
             crate::config::pipeline_node::SOURCE_FILE_COLUMN,
             clinker_record::FieldMetadata::source_file(),
         )
+        .with_field_meta(
+            crate::config::pipeline_node::SOURCE_NAME_COLUMN,
+            clinker_record::FieldMetadata::source_name(),
+        )
         .build();
 
     let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
@@ -1727,6 +1749,9 @@ fn ingest_source_into_stream(
     } else {
         Arc::from(src_cfg.path_str())
     };
+    // One shared Arc per Source — every record stamps a clone, so the
+    // per-record cost is one Arc bump rather than a fresh allocation.
+    let source_name_arc: Arc<str> = Arc::from(src_cfg.name.as_str());
 
     // Resolve the watermark column to a position on the widened
     // schema once per source; the per-record observation below is then
@@ -1782,6 +1807,9 @@ fn ingest_source_into_stream(
                 }
                 values.push(clinker_record::Value::String(
                     file_arc.as_ref().to_string().into_boxed_str(),
+                ));
+                values.push(clinker_record::Value::String(
+                    source_name_arc.as_ref().to_string().into_boxed_str(),
                 ));
                 let widened_record =
                     clinker_record::Record::new(Arc::clone(&widened_schema), values);

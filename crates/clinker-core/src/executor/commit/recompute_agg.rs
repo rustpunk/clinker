@@ -146,6 +146,7 @@ pub(crate) fn emit_post_recompute(
         source_count: ctx.source_count,
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
+        source_name: &crate::executor::dispatch::MERGED_SOURCE_NAME,
     };
     let emits_synthetic = retained.aggregator.emits_synthetic_ck();
     retained

@@ -16,7 +16,7 @@
 //!   `execution_id`, `batch_id`, counter set).
 //! - [`ScopedVarsRegistry::source`] — read via `$source.<key>`, alongside
 //!   builtin provenance (`file`, `row`, `path`, `count`, `batch`,
-//!   `ingestion_timestamp`).
+//!   `ingestion_timestamp`, `name`).
 //! - [`ScopedVarsRegistry::record`] — read via `$record.<key>`. No
 //!   builtins. Per-record scratch state, multi-writer across nodes
 //!   within a record's lifetime. Written by Transforms whose

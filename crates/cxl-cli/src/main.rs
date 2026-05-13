@@ -287,6 +287,11 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
+    // REPL has no Source-node context, but `$source.name` is a stable
+    // per-record namespace; surface the parameter as the originating
+    // name so `emit n = $source.name` echoes back the same string the
+    // caller passed in.
+    let source_name_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
     // REPL has no real batch context — use the same placeholder as the
     // stable execution_id so `$source.batch` is at least non-empty.
     let source_batch_arc: std::sync::Arc<str> = std::sync::Arc::clone(&stable.pipeline_batch_id);
@@ -298,6 +303,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         source_count: 1,
         source_batch: &source_batch_arc,
         ingestion_timestamp: stable.pipeline_start_time,
+        source_name: &source_name_arc,
     };
 
     let resolver = HashMapResolver::new(record_map);
@@ -705,6 +711,7 @@ mod tests {
             static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let source_name_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =
             std::sync::Arc::clone(&stable.pipeline_batch_id);
         let ctx = EvalContext {
@@ -715,6 +722,7 @@ mod tests {
             source_count: 1,
             source_batch: &source_batch_arc,
             ingestion_timestamp: stable.pipeline_start_time,
+            source_name: &source_name_arc,
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
@@ -758,6 +766,7 @@ mod tests {
             static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let source_name_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =
             std::sync::Arc::clone(&stable.pipeline_batch_id);
         let ctx = EvalContext {
@@ -768,6 +777,7 @@ mod tests {
             source_count: 1,
             source_batch: &source_batch_arc,
             ingestion_timestamp: stable.pipeline_start_time,
+            source_name: &source_name_arc,
         };
 
         let resolver = HashMapResolver::new(fields);
