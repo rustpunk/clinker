@@ -1003,6 +1003,27 @@ pub enum RouteMode {
     Inclusive,
 }
 
+/// Merge ordering discipline across declared inputs.
+///
+/// `Concat` is the deterministic default: each predecessor's records
+/// drain in declaration order, in their per-source FIFO order. Output
+/// is reproducible run-to-run.
+///
+/// `Interleave` reads concurrently from every upstream channel,
+/// emitting records as they arrive. Per-source FIFO is preserved, but
+/// cross-source order follows wall-clock arrival and is therefore
+/// non-deterministic unless `interleave_seed` is set on
+/// [`MergeBody`](crate::config::pipeline_node::MergeBody).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMode {
+    /// Drain each predecessor sequentially in declaration order.
+    #[default]
+    Concat,
+    /// Drain predecessors concurrently; first-ready-wins.
+    Interleave,
+}
+
 /// A named routing branch with a CXL boolean condition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
