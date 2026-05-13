@@ -1767,26 +1767,35 @@ pub(crate) async fn dispatch_plan_node(
         }
 
         PlanNode::Merge { ref name, .. } => {
-            // Concatenate predecessor buffers in declaration order —
-            // the order appearing in the Merge's `inputs:` YAML
-            // array, which is stable across compile runs. Under
-            // the unified taxonomy a Merge is a first-class node
-            // (no "merge_<transform>" synthesis) so we read the
-            // order straight off `PipelineNode::Merge.header.inputs`.
+            // Predecessors are sorted by Merge `inputs:` declaration
+            // order — the order appearing in the YAML array, which is
+            // stable across compile runs. Under the unified taxonomy a
+            // Merge is a first-class node (no "merge_<transform>"
+            // synthesis) so we read the order straight off
+            // `PipelineNode::Merge.header.inputs`. The mode branch then
+            // picks the cross-source ordering: Concat drains each
+            // predecessor's pre-buffered records sequentially in that
+            // order; Interleave round-robins across them. Per-source
+            // FIFO survives both modes because each predecessor's buffer
+            // is itself in arrival order.
             let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
 
-            let declaration_order: Vec<String> = {
+            let (declaration_order, mode, interleave_seed): (
+                Vec<String>,
+                crate::config::MergeMode,
+                Option<u64>,
+            ) = {
                 use crate::config::PipelineNode;
                 use crate::config::node_header::NodeInput;
                 ctx.config
                     .nodes
                     .iter()
                     .find_map(|spanned| match &spanned.value {
-                        PipelineNode::Merge { header, .. } if header.name == *name => Some(
-                            header
+                        PipelineNode::Merge { header, config, .. } if header.name == *name => {
+                            let order = header
                                 .inputs
                                 .iter()
                                 .map(|ni| match &ni.value {
@@ -1795,11 +1804,12 @@ pub(crate) async fn dispatch_plan_node(
                                         format!("{node}.{port}")
                                     }
                                 })
-                                .collect(),
-                        ),
+                                .collect();
+                            Some((order, config.mode, config.interleave_seed))
+                        }
                         _ => None,
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| (Vec::new(), crate::config::MergeMode::Concat, None))
             };
 
             // Sort predecessors by declaration order
@@ -1818,27 +1828,114 @@ pub(crate) async fn dispatch_plan_node(
                 .sum();
             let merge_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
             let mut merged = Vec::with_capacity(total);
-            for pred in &sorted_preds {
-                let upstream_name = current_dag.graph[*pred].name().to_string();
-                if let Some(buf) = ctx.node_buffers.remove(pred) {
-                    for (mut record, rn) in buf {
-                        if let Some(canonical) = merge_output_schema.as_ref() {
-                            check_input_schema(
-                                canonical,
-                                record.schema(),
-                                name,
-                                "merge",
-                                &upstream_name,
-                            )?;
-                            // Canonicalize: rebuild record with the
-                            // Merge's `Arc<Schema>` so downstream
-                            // operators hit the ptr_eq fast path
-                            // regardless of which input the record
-                            // originated from.
-                            let values = record.values().to_vec();
-                            record = Record::new(Arc::clone(canonical), values);
+
+            // Canonicalize and emit one record from a predecessor buffer
+            // into `merged`. Schema canonicalization runs per-record at
+            // consume time (not as a post-pass) so the canonical
+            // `Arc<Schema>` reaches downstream operators uniformly
+            // regardless of which mode produced the record.
+            let emit = |merged: &mut Vec<(Record, u64)>,
+                        upstream_name: &str,
+                        mut record: Record,
+                        rn: u64|
+             -> Result<(), PipelineError> {
+                if let Some(canonical) = merge_output_schema.as_ref() {
+                    check_input_schema(canonical, record.schema(), name, "merge", upstream_name)?;
+                    // Canonicalize: rebuild record with the Merge's
+                    // `Arc<Schema>` so downstream operators hit the
+                    // ptr_eq fast path regardless of which input the
+                    // record originated from.
+                    let values = record.values().to_vec();
+                    record = Record::new(Arc::clone(canonical), values);
+                }
+                merged.push((record, rn));
+                Ok(())
+            };
+
+            match mode {
+                crate::config::MergeMode::Concat => {
+                    for pred in &sorted_preds {
+                        let upstream_name = current_dag.graph[*pred].name().to_string();
+                        if let Some(buf) = ctx.node_buffers.remove(pred) {
+                            for (record, rn) in buf {
+                                emit(&mut merged, &upstream_name, record, rn)?;
+                            }
                         }
-                        merged.push((record, rn));
+                    }
+                }
+                crate::config::MergeMode::Interleave => {
+                    // Take each predecessor's buffer once so per-source
+                    // FIFO can be preserved by draining from the head.
+                    // `VecDeque` gives O(1) `pop_front` for the round-
+                    // robin pick. Empty buffers become empty deques and
+                    // drop out of the active pool on first inspection.
+                    use std::collections::VecDeque;
+                    let upstream_names: Vec<String> = sorted_preds
+                        .iter()
+                        .map(|p| current_dag.graph[*p].name().to_string())
+                        .collect();
+                    let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
+                        .iter()
+                        .map(|pred| {
+                            ctx.node_buffers
+                                .remove(pred)
+                                .map(VecDeque::from)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
+                    // `interleave_seed: Some(seed)` runs a fastrand
+                    // schedule for reproducibility across runs. The Rng
+                    // lives locally — its state is one-shot per Merge
+                    // fold (the executor's prologue pre-drains every
+                    // source into a Vec before dispatch, so this arm
+                    // runs to completion in a single call), so the plan
+                    // doc's `ctx.merge_rng_state` HashMap shape would be
+                    // dead state. If a future change splits the fold
+                    // across executor re-entries the Rng can move onto
+                    // `ExecutorContext` then.
+                    //
+                    // Unseeded → deterministic round-robin by
+                    // declaration-order index. Documented as
+                    // deterministic but not back-pressure aware: live-
+                    // channel arbitration (issue #53) needs the
+                    // executor prologue to stop materializing sources
+                    // before dispatch (issue #57).
+                    let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
+                    let mut cursor = 0usize; // unseeded round-robin head
+                    loop {
+                        // Collect indices of predecessors with records
+                        // still queued. Done when none remain.
+                        let ready: Vec<usize> = deques
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, d)| (!d.is_empty()).then_some(i))
+                            .collect();
+                        if ready.is_empty() {
+                            break;
+                        }
+                        let pick_idx = match rng.as_mut() {
+                            Some(r) => ready[r.usize(0..ready.len())],
+                            None => {
+                                // Advance the cursor through declaration
+                                // order, skipping exhausted slots.
+                                let mut chosen = ready[0];
+                                for _ in 0..deques.len() {
+                                    let candidate = cursor % deques.len();
+                                    cursor = cursor.wrapping_add(1);
+                                    if !deques[candidate].is_empty() {
+                                        chosen = candidate;
+                                        break;
+                                    }
+                                }
+                                chosen
+                            }
+                        };
+                        // `pop_front` preserves per-source FIFO — each
+                        // source's records leave in arrival order.
+                        if let Some((record, rn)) = deques[pick_idx].pop_front() {
+                            emit(&mut merged, &upstream_names[pick_idx], record, rn)?;
+                        }
                     }
                 }
             }
