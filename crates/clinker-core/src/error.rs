@@ -64,6 +64,15 @@
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
+//!
+//! DLQ threshold + per-source routing diagnostics:
+//!
+//! | Code        | Severity | Meaning                                              |
+//! |-------------|----------|------------------------------------------------------|
+//! | `E315`      | error    | Pipeline-wide DLQ rate exceeded `error_handling.dlq.max_rate` |
+//! | `E316`      | error    | Per-source DLQ rate exceeded `error_handling.dlq.per_source.<name>.max_rate` |
+//! | `E317`      | error    | `error_handling.dlq.per_source` key does not name a declared Source |
+//! | `E318`      | error    | `error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides |
 
 use std::fmt;
 
@@ -342,6 +351,19 @@ pub enum PipelineError {
         group_key: String,
         count: u64,
     },
+    /// E315 (pipeline-wide, `source: None`) or E316 (per-source,
+    /// `source: Some(name)`) — the cumulative DLQ fraction crossed
+    /// the configured `max_rate` after at least `min_records` rows
+    /// from the relevant scope had been observed. ALWAYS aborts the
+    /// run regardless of `ErrorStrategy::Continue`; this is a halt
+    /// directive, not a per-record error.
+    DlqRateExceeded {
+        source: Option<std::sync::Arc<str>>,
+        observed_rate: f64,
+        max_rate: f64,
+        observed_count: u64,
+        total_count: u64,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -451,6 +473,25 @@ impl fmt::Display for PipelineError {
                  after {count} records — remaining records of the group are \
                  DLQ'd as collateral"
             ),
+            Self::DlqRateExceeded {
+                source,
+                observed_rate,
+                max_rate,
+                observed_count,
+                total_count,
+            } => match source {
+                Some(name) => write!(
+                    f,
+                    "E316 source {name:?} DLQ rate {observed_rate:.4} exceeds \
+                     per_source.{name}.max_rate {max_rate:.4} \
+                     ({observed_count}/{total_count} records)"
+                ),
+                None => write!(
+                    f,
+                    "E315 pipeline DLQ rate {observed_rate:.4} exceeds \
+                     max_rate {max_rate:.4} ({observed_count}/{total_count} records)"
+                ),
+            },
         }
     }
 }
@@ -593,7 +634,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E313", "E314",
+            "E313", "E314", "E315", "E316", "E317", "E318",
         ] {
             let pattern = format!("`{code}`");
             assert!(

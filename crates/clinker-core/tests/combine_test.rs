@@ -4274,6 +4274,7 @@ nodes:
             regexes: Vec::new(),
             node_count: 0,
             output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+            source: None,
         });
         let predicate = DecomposedPredicate {
             equalities: vec![EqualityConjunct {

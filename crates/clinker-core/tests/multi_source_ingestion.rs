@@ -248,6 +248,115 @@ nodes:
     }
 }
 
+/// `_cxl_dlq_source_name` column round-trips through the CSV sidecar
+/// writer for every failing record produced by a Merge-fed Transform.
+/// The pipeline maps src_a records cleanly and fails 100% of src_b
+/// records via `1 / 0`; the resulting sidecar must contain three rows,
+/// all attributed to `src_b` in the `_cxl_dlq_source_name` column.
+#[test]
+fn dlq_csv_sidecar_attributes_every_row_to_originating_source() {
+    use std::sync::Arc;
+
+    use clinker_record::{Schema, SchemaBuilder};
+
+    let yaml = r#"
+pipeline:
+  name: dlq_attribution_sidecar
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: merge
+    name: merged
+    inputs: [src_a, src_b]
+  - type: transform
+    name: tfm
+    input: merged
+    config:
+      cxl: |
+        emit id = id
+        emit tag = tag
+        emit safe_ratio = if($source.name == "src_b") then (1 / 0) else 1
+  - type: output
+    name: out
+    input: tfm
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+        ),
+        (
+            "src_b".to_string(),
+            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("pipeline must complete under Continue strategy");
+    assert_eq!(report.counters.dlq_count, 3);
+
+    // Round-trip the DLQ vector through the CSV writer and read the
+    // header + body back to assert column-level attribution.
+    let dlq_schema: Arc<Schema> = SchemaBuilder::new()
+        .with_field("id")
+        .with_field("tag")
+        .build();
+    let mut buf = Vec::new();
+    clinker_core::dlq::write_dlq(
+        &mut buf,
+        &report.dlq_entries,
+        &dlq_schema,
+        "input.csv",
+        true,
+        true,
+    )
+    .expect("write_dlq must succeed");
+    let csv = String::from_utf8(buf).unwrap();
+    let mut lines = csv.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let name_col = header
+        .iter()
+        .position(|c| *c == "_cxl_dlq_source_name")
+        .expect("DLQ header must carry _cxl_dlq_source_name");
+    let rows: Vec<&str> = lines.collect();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let cells: Vec<&str> = row.split(',').collect();
+        assert_eq!(
+            cells[name_col], "src_b",
+            "every DLQ row must attribute to src_b; got row: {row}"
+        );
+    }
+}
+
 /// Topology 2 — `src_a → tfm_a → out_a`, `src_b → tfm_b → out_b`. The
 /// two chains are wholly disjoint at the DAG level; the bug pre-fix
 /// was that `src_b`'s dispatch silently emitted `src_a`'s records,

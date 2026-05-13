@@ -2113,13 +2113,13 @@ fn eval_binding_arg_value(
                 &env,
             )?)
         }
-        BindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError {
-            kind: cxl::eval::EvalErrorKind::TypeMismatch {
+        BindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError::new(
+            cxl::eval::EvalErrorKind::TypeMismatch {
                 expected: "scalar binding arg",
                 got: "nested Pair",
             },
-            span: cxl::lexer::Span::new(0, 0),
-        })),
+            cxl::lexer::Span::new(0, 0),
+        ))),
     }
 }
 
