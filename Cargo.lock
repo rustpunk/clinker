@@ -827,7 +827,6 @@ dependencies = [
  "clinker-format",
  "clinker-record",
  "criterion",
- "crossbeam-channel",
  "csv",
  "ctrlc",
  "cxl",
