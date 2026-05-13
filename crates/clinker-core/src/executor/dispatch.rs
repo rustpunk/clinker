@@ -133,6 +133,36 @@ pub(crate) fn push_dlq(
     check_dlq_rate(ctx, &source_name)
 }
 
+/// Advance `rollback_cursors[source_name]` to `row_num` when the
+/// argument exceeds the stored value. Called at every clean exit from
+/// a forward operator: Transform / Route success branches, and the
+/// per-record `add_record` Ok path on Aggregate ingest (the absorbing
+/// step that hands a source row off to the accumulator's lineage —
+/// the post-finalize emit operates on aggregator-synthetic identity
+/// and has no per-record source row to advance against). Monotonic
+/// per source — the cursor never moves backward through this entry
+/// point. A backward write would happen only when a future
+/// rewind path consumes a `combine_input_snapshots` entry; that path
+/// is wired for the async-runtime work on #57 and has no live trigger
+/// in today's executor.
+///
+/// `row_num` is the engine-stamped source row number stored alongside
+/// the record in `ctx.source_records[name]` and threaded through every
+/// `(record, row_num)` tuple in the dispatch path. It is the same
+/// value the relaxed-CK retract orchestrator passes to
+/// [`crate::aggregation::HashAggregator::retract_row`], so a cursor
+/// stored here is directly comparable against `retract_row` arguments
+/// when #57's rewind path lands.
+pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<str>, row_num: u64) {
+    let slot = ctx
+        .rollback_cursors
+        .entry(Arc::clone(source_name))
+        .or_insert(0);
+    if row_num > *slot {
+        *slot = row_num;
+    }
+}
+
 /// Resolve the configured DLQ rate ceiling for `source` and return an
 /// E316 (per-source) or E315 (pipeline-wide) error when the cumulative
 /// fraction exceeds it. Per-source thresholds win against pipeline-wide
@@ -421,6 +451,27 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`ExecutorContext::source_records`] so the rate-check
     /// denominator is the per-source ingest count, not a moving target.
     pub(crate) total_per_source: HashMap<Arc<str>, u64>,
+    /// Per-source forward-progress rollback cursor keyed by Source-node
+    /// name. Advances at each clean exit from a forward operator via
+    /// [`advance_cursor`]; consulted at every collateral-DLQ and
+    /// aggregate-retract decision point to bound rewind to records from
+    /// the failing source. Seeded empty — sources land in the map on
+    /// their first cleanly-emitted record. Sibling of `dlq_per_source`
+    /// and `total_per_source`; same source-keyed `HashMap<Arc<str>, u64>`
+    /// shape so the post-#57 live-channel refactor moves all three onto
+    /// `SourceStream` together.
+    pub(crate) rollback_cursors: HashMap<Arc<str>, u64>,
+    /// Per-Combine input-cursor snapshots captured at Combine fold
+    /// entry. The outer key is the Combine node's `NodeIndex`; the
+    /// inner map captures the `(source_name -> cursor)` pair for every
+    /// source whose record participates in the fold. Today the snapshot
+    /// is captured at fold entry and cleared at the inline-strategy
+    /// fall-through; the symmetric rewind path that consumes a snapshot
+    /// to restore both contributing sources' cursors is wired for the
+    /// async-runtime work on #57 and has no live trigger in today's
+    /// executor (Combine errors propagate as `PipelineError::Internal`,
+    /// aborting the run before any rewind can apply).
+    pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
     pub(crate) ok_source_rows: HashSet<u64>,
     pub(crate) records_emitted: u64,
@@ -1346,13 +1397,17 @@ pub(crate) fn dispatch_plan_node(
                 };
                 match eval_result {
                     Ok((modified_record, Ok(()))) => {
+                        let advance_source = source_name_arc_of(&modified_record);
                         output_records.push((modified_record, rn));
+                        advance_cursor(ctx, &advance_source, rn);
                     }
                     Ok((_record, Err(SkipReason::Filtered))) => {
                         ctx.counters.filtered_count += 1;
+                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
                     }
                     Ok((_record, Err(SkipReason::Duplicate))) => {
                         ctx.counters.distinct_count += 1;
+                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
                     }
                     Err((transform_name, eval_err)) => {
                         if ctx.strategy == ErrorStrategy::FailFast {
@@ -1584,6 +1639,7 @@ pub(crate) fn dispatch_plan_node(
                                     break;
                                 }
                             }
+                            advance_cursor(ctx, &source_name_arc, rn);
                         }
                         Err(route_err) => {
                             if ctx.strategy == ErrorStrategy::FailFast {
@@ -1977,7 +2033,11 @@ pub(crate) fn dispatch_plan_node(
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
                 };
-                if let Err(e) = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows) {
+                let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
+                if add_result.is_ok() {
+                    advance_cursor(ctx, &source_name_arc, *row_num);
+                }
+                if let Err(e) = add_result {
                     match ctx.config.error_handling.strategy {
                         ErrorStrategy::FailFast => return Err(e.into()),
                         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
@@ -2732,6 +2792,25 @@ pub(crate) fn dispatch_plan_node(
                 )?;
             }
 
+            // Snapshot per-source cursors for every Source contributing
+            // a record to this Combine's fold. Captured at fold start so
+            // a Combine-output-row failure rewinds every contributing
+            // source independently — driver and build sides treat
+            // symmetrically. Cleared at Combine exit; today's executor
+            // never fires the rewind path because Combine errors
+            // propagate as `PipelineError::Internal` (FailFast),
+            // aborting the run before any rewind can apply. The
+            // snapshot is in place for the async runtime to drive
+            // recoverable Combine failures once #57 lands.
+            let mut combine_snapshot: HashMap<Arc<str>, u64> = HashMap::new();
+            for (rec, _) in driver_buf.iter().chain(build_buf.iter()) {
+                let sn = source_name_arc_of(rec);
+                let cursor = ctx.rollback_cursors.get(&sn).copied().unwrap_or(0);
+                combine_snapshot.entry(sn).or_insert(cursor);
+            }
+            ctx.combine_input_snapshots
+                .insert(node_idx, combine_snapshot);
+
             // Build the KeyExtractor pair: one side aligned to
             // the build qualifier, the other to the probe. The
             // i-th equality conjunct contributes one key column
@@ -3413,6 +3492,12 @@ pub(crate) fn dispatch_plan_node(
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
+            // Drop the per-fold cursor snapshot: every emitted record
+            // has cleared into `node_buffers` without rewind, so the
+            // snapshot is no longer needed. The rewind path on a
+            // Combine-output-row failure reads and restores this entry
+            // before clearing.
+            ctx.combine_input_snapshots.remove(&node_idx);
         }
 
         PlanNode::CorrelationCommit { .. } => {
@@ -3576,11 +3661,14 @@ fn commit_one_group(
             count: total_records,
         }
         .to_string();
-        // Dedup distinct rows by row_num so Route fan-out (one row to N
-        // outputs) emits one DLQ entry, not N.
-        let mut seen_rows: HashSet<u64> = HashSet::new();
+        // Dedup distinct rows by (source, row_num) so Route fan-out
+        // (one row to N outputs) emits one DLQ entry, not N. Pairing on
+        // `source_name` matters under multi-source ingest where row_num
+        // is per-source.
+        let mut seen_rows: HashSet<(Arc<str>, u64)> = HashSet::new();
         for slot in &records {
-            if !seen_rows.insert(slot.row_num) {
+            let source_name = source_name_arc_of(&slot.original_record);
+            if !seen_rows.insert((Arc::clone(&source_name), slot.row_num)) {
                 continue;
             }
             let (category, trigger, error_message) = if !emitted_trigger {
@@ -3597,7 +3685,6 @@ fn commit_one_group(
                     format!("correlated with failure in group: {overflow_msg}"),
                 )
             };
-            let source_name = source_name_arc_of(&slot.original_record);
             push_dlq(
                 ctx,
                 DlqEntry {
@@ -3639,15 +3726,36 @@ fn commit_one_group(
         .map(|e| e.error_message.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let mut seen_rows: HashSet<u64> = HashSet::new();
+    // Per-source narrowing: a collateral slot is spared whenever its
+    // originating Source did not contribute any trigger error to this
+    // group. With multi-source ingest, a single trigger from `src_b`
+    // would otherwise DLQ every co-grouped `src_a` slot purely by
+    // sharing the correlation key — `src_a` had no causal role in the
+    // failure. The set is built from `error_messages` before the
+    // trigger loop so each trigger's `$source.name` stamp drives its
+    // own narrowing of the collateral walk below. Empty in a
+    // single-source pipeline by construction: every co-grouped slot
+    // shares the failing source, so the wider behavior is
+    // bit-identical to today's pipeline-wide collateral DLQ.
+    let failing_sources: HashSet<Arc<str>> = error_messages
+        .iter()
+        .map(|err| source_name_arc_of(&err.original_record))
+        .collect();
+
+    // Dedup distinct rows by (source, row_num) so Route fan-out (one
+    // row to N outputs) emits one DLQ entry, not N. Pairing on
+    // `source_name` matters under multi-source ingest where row_num is
+    // per-source — pre-sprint-7 `HashSet<u64>` collided across sources
+    // and silently dropped co-rowed slots from the collateral walk.
+    let mut seen_rows: HashSet<(Arc<str>, u64)> = HashSet::new();
     // Trigger entries: one per distinct erroring row. Multiple errors
     // per row (different branches failing) collapse to a single trigger
     // entry carrying the first error.
     for err in &error_messages {
-        if !seen_rows.insert(err.row_num) {
+        let source_name = source_name_arc_of(&err.original_record);
+        if !seen_rows.insert((Arc::clone(&source_name), err.row_num)) {
             continue;
         }
-        let source_name = source_name_arc_of(&err.original_record);
         push_dlq(
             ctx,
             DlqEntry {
@@ -3665,14 +3773,40 @@ fn commit_one_group(
         )?;
     }
     // Collateral entries: every other distinct row that flowed through
-    // the group's Output buffers but didn't itself error. The resolved
-    // CorrelationFanoutPolicy can spare individual slots; today the
-    // strict path always resolves to `Any` (every collateral DLQ'd) so
-    // sparing is a no-op here, but the wire is in place for the
-    // relaxed-CK orchestrator to substitute a different policy via
-    // per-Combine / per-Output overrides.
+    // the group's Output buffers but didn't itself error. Two sparing
+    // axes apply, in order:
+    //   1. Per-source narrowing — a slot from a non-failing source is
+    //      always spared. Falls back to today's `Any` semantics within
+    //      single-source pipelines.
+    //   2. CorrelationFanoutPolicy interpretation — Any/All/Primary
+    //      operate WITHIN the failing-source's records.
+    // The resolved policy is read per-Output (per-Combine / per-Output
+    // overrides win against the pipeline default). Today the strict
+    // path always resolves to `Any` so axis 2 sparing is a no-op; the
+    // wire is in place for the relaxed-CK orchestrator to substitute a
+    // different policy.
     for slot in &records {
-        if seen_rows.contains(&slot.row_num) {
+        let slot_source = source_name_arc_of(&slot.original_record);
+        if seen_rows.contains(&(Arc::clone(&slot_source), slot.row_num)) {
+            continue;
+        }
+        // Per-source spare: slot's Source did not contribute a trigger
+        // to this group, so it never had a causal role in the failure.
+        // Slots stamped as `MERGED_SOURCE_NAME` carry no single-source
+        // attribution — Combine outputs (multi-input fold) and
+        // synthetic aggregate emits both reach this branch. Treating
+        // them as ambiguous, they stay on the collateral path so a
+        // downstream failure on a Combine-derived row still flushes
+        // the upstream-trigger correlation under today's
+        // pipeline-wide-equivalent semantics. Per-source narrowing
+        // only spares slots whose stamp identifies a distinct
+        // non-failing Source.
+        let slot_attributable = slot_source.as_ref() != MERGED_SOURCE_NAME.as_ref();
+        if slot_attributable && !failing_sources.contains(&slot_source) {
+            clean_per_output
+                .entry(slot.output_name.clone())
+                .or_default()
+                .push(slot.clone());
             continue;
         }
         let policy = crate::executor::commit::output_fanout_policy(ctx, &slot.output_name);
@@ -3694,10 +3828,9 @@ fn commit_one_group(
                 .push(slot.clone());
             continue;
         }
-        if !seen_rows.insert(slot.row_num) {
+        if !seen_rows.insert((Arc::clone(&slot_source), slot.row_num)) {
             continue;
         }
-        let source_name = source_name_arc_of(&slot.original_record);
         push_dlq(
             ctx,
             DlqEntry {
@@ -3708,7 +3841,7 @@ fn commit_one_group(
                 stage: Some("correlation_commit".to_string()),
                 route: None,
                 trigger: false,
-                source_name,
+                source_name: slot_source,
                 triggering_field: None,
                 triggering_value: None,
             },

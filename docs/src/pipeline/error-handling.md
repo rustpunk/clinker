@@ -103,7 +103,7 @@ This acts as a circuit breaker -- if your input data is unexpectedly corrupt, th
 
 ### Correlation key
 
-Group DLQ rejections by a key field. When any record in a correlation group fails, **all records in that group** are routed to the DLQ:
+Group DLQ rejections by a key field. When any record in a correlation group fails, **records from the failing source's contribution to that group** are routed to the DLQ:
 
 ```yaml
   correlation_key: order_id
@@ -116,6 +116,8 @@ For compound keys:
 ```
 
 This is useful for transactional data where partial processing of a group is worse than rejecting the entire group. For example, if one line item in an order fails validation, you may want to reject the entire order.
+
+Under multi-source ingest, the collateral fan-out narrows to the failing source: a `src_b` trigger does NOT DLQ records from `src_a` that share the same correlation key. Single-source pipelines see bit-identical behavior to today's pipeline-wide collateral DLQ. See [Per-source rollback narrowing](correlation-keys.md#per-source-rollback-narrowing) for the full semantic and the two documented exceptions (`max_group_buffer` overflow and Combine output failures).
 
 For the full lifecycle and per-operator semantics (route, merge, aggregate, combine), see [Correlation Keys](correlation-keys.md).
 

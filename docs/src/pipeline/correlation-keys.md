@@ -79,12 +79,49 @@ A source that declares no `correlation_key:` carries no `$ck.*` widening. Record
 When a record fails inside a correlation group:
 
 - The failing record produces a **trigger** DLQ entry. Its category reflects the actual failure (e.g. `type_error`, `validation_failed`).
-- Every other record in the same group produces a **collateral** DLQ entry. Collaterals carry the category `correlated`.
+- Every other record **from a source that contributed a trigger** to the same group produces a **collateral** DLQ entry. Collaterals carry the category `correlated`.
 - Records belonging to other (clean) groups proceed normally.
 
 A record with a null value for the correlation-key field is treated as its own per-record group: it has no peers and DLQ atomicity does not span multiple records.
 
 The `dlq_count` counter sums triggers and collaterals.
+
+### Per-source rollback narrowing
+
+When two sources contribute records to the same correlation group, a failure originating from one source does NOT collaterally DLQ records from the OTHER source. The collateral fan-out is scoped to the failing source's records only.
+
+Concretely, consider `[src_a, src_b] → merge → tfm → out` with both sources declaring `correlation_key: id`. A mid-stream Transform error fires on every `src_b` record but leaves `src_a` records untouched:
+
+```yaml
+- type: transform
+  name: tfm
+  input: m
+  config:
+    cxl: |
+      emit id = id
+      emit ratio = if($source.name == "src_b") then (1 / 0) else amt
+```
+
+Under per-source rollback, the dirty correlation group for each `id` value contains:
+
+- One **trigger** DLQ entry — the `src_b` row that hit `1 / 0`.
+- The `src_a` row sharing the same `id` is **spared** and reaches the output.
+
+The engine identifies origin per record via the engine-stamped `$source.name` column. Within the failing source's records, the existing `CorrelationFanoutPolicy` (`Any` / `All` / `Primary`) determines which records DLQ — the policy semantics are unchanged. Single-source pipelines see bit-identical behavior to the pre-narrowing engine because every co-grouped record shares the failing source by construction.
+
+Records that carry no single-source attribution — synthetic aggregate emits and Combine output rows — are NOT spared by per-source narrowing. They flow through the existing collateral path because their stamp falls back to the merged-source identity which is ambiguous about origin.
+
+The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionReport`, keyed by source name and carrying the highest source row number that cleanly exited a forward operator. The map advances per record at the clean exit of Transform / Route / Aggregate; sources whose records all DLQ never land in the map. Today's executor reads the map for diagnostics and integration-test assertions; the async-runtime work tracked under [#57](https://github.com/rustpunk/clinker/issues/57) will activate the map as the replay-anchor for per-source rewind.
+
+#### Exceptions
+
+Two failure modes preserve today's pipeline-wide collateral DLQ semantics and stay scoped across every contributing source:
+
+- **`max_group_buffer` overflow.** When a correlation group exceeds its cap (see [Group buffering](#group-buffering) below), the failure has no single causal source — every contributing source shared blame proportionally. Attributing overflow to one source would be a fiction. Every record in the overflowing group lands in DLQ regardless of origin source.
+
+- **Combine output failures.** Combine's emit path is `PipelineError::Internal` today; recoverable Combine output-row failures require the live-channel runtime tracked under [#57](https://github.com/rustpunk/clinker/issues/57). Once that lands, both contributing sources will rewind to their pre-Combine cursor snapshots. The snapshot capture is wired today (each Combine entry snapshots both inputs' cursors), but the rewind half has no live trigger until the async runtime arrives.
+
+The relaxed-CK aggregator retract path — when the orchestrator emits a corrected aggregate value after retracting failing rows — does not currently track origin source per row in its lineage table. Per-source aggregate retract requires extending `HashAggregator`'s `input_rows` to carry `(row_id, source_name)` pairs and is tracked alongside the async-runtime work on #57. In the interim, the aggregate-finalize error path lands in correlation buffers and is narrowed by the per-source collateral walk above — the AC-visible behavior on `[multi_source] → aggregate → output` matches per-source semantics through that path.
 
 ## Group buffering
 
