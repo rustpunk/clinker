@@ -850,6 +850,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
  "walkdir",

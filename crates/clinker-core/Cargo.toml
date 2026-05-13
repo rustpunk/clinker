@@ -32,6 +32,7 @@ num_cpus = "1"
 petgraph = { workspace = true }
 libc = "0.2"
 walkdir = "2"
+tokio = { workspace = true }
 clinker-bench-support = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
