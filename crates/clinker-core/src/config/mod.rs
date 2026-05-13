@@ -1796,13 +1796,20 @@ impl PipelineConfig {
             &ctx.pipeline_dir,
             scoped_vars_registry,
         );
+
+        crate::plan::bind_schema::validate_dlq_per_source(
+            self.error_handling.dlq.as_ref(),
+            &self.nodes,
+            &mut diags,
+        );
+
         // Only abort on non-composition CXL errors (E200/E201) and
         // source-CK validation errors (E153). Composition binding
         // errors (E102–E109) are non-fatal for the rest of the pipeline
         // — the composition node is omitted from the DAG.
         let has_cxl_errors = diags.iter().any(|d| {
             matches!(d.severity, crate::error::Severity::Error)
-                && (d.code == "E200" || d.code == "E201" || d.code == "E153")
+                && matches!(d.code.as_str(), "E200" | "E201" | "E153" | "E317" | "E318")
         });
         if has_cxl_errors {
             return Err(diags);
@@ -3471,6 +3478,16 @@ fn default_strategy() -> ErrorStrategy {
 }
 
 /// Dead-letter queue configuration.
+///
+/// `max_rate` is a cumulative fraction in `[0.0, 1.0]`. When set, the
+/// pipeline halts once `dlq_count / total_count >= max_rate` AND
+/// `total_count >= min_records`. `min_records` defaults to 100 to avoid
+/// 1/1 = 100% false positives on the first failure.
+///
+/// `per_source` overrides keyed by Source-node name win against the
+/// pipeline-wide `max_rate` / `min_records`. A per-source `path`, if
+/// set, reroutes that source's DLQ entries to a separate sidecar file —
+/// those entries do not appear in the pipeline-wide file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DlqConfig {
@@ -3480,7 +3497,33 @@ pub struct DlqConfig {
     pub include_reason: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_source_row: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub per_source: std::collections::BTreeMap<String, DlqPerSourceConfig>,
 }
+
+/// Per-source overrides for [`DlqConfig`].
+///
+/// Operators consulting `path` should grep both the pipeline-wide DLQ
+/// file and every per-source sidecar — entries with a `per_source` path
+/// override do not duplicate into the pipeline-wide file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DlqPerSourceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_records: Option<u64>,
+}
+
+/// Default `min_records` floor used when neither pipeline-wide nor per-source
+/// override is supplied.
+pub const DEFAULT_DLQ_MIN_RECORDS: u64 = 100;
 
 /// Errors during config loading and parsing.
 #[derive(Debug)]

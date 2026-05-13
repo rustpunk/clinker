@@ -103,6 +103,92 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
     }
 }
 
+/// Push a [`DlqEntry`] to the run-scoped DLQ vector, increment both the
+/// pipeline-wide and per-source DLQ counters, then check the configured
+/// rate ceilings. Returns [`PipelineError::DlqRateExceeded`] (E315 or
+/// E316) when the per-source ratio crosses
+/// `error_handling.dlq.per_source.<name>.max_rate` or the pipeline-wide
+/// ratio crosses `error_handling.dlq.max_rate`. Per-source > pipeline-wide
+/// precedence so the offending source surfaces in the rendered diagnostic.
+///
+/// The rate denominator is the full per-source ingest count, seeded
+/// once at executor entry from
+/// [`ExecutorContext::total_per_source`] — not a moving "records
+/// processed so far" counter. This is consistent with today's
+/// pre-ingested-into-`source_records` executor model where every
+/// declared Source is fully drained before dispatch runs. When the
+/// async streaming runtime swaps `SourceStream` for a live
+/// channel-driven ingest, the denominator becomes a moving target
+/// that needs to be re-keyed off the per-source receive count instead.
+pub(crate) fn push_dlq(
+    ctx: &mut ExecutorContext<'_>,
+    entry: DlqEntry,
+) -> Result<(), PipelineError> {
+    let source_name = Arc::clone(&entry.source_name);
+    ctx.counters.dlq_count += 1;
+    *ctx.dlq_per_source
+        .entry(Arc::clone(&source_name))
+        .or_insert(0) += 1;
+    ctx.dlq_entries.push(entry);
+    check_dlq_rate(ctx, &source_name)
+}
+
+/// Resolve the configured DLQ rate ceiling for `source` and return an
+/// E316 (per-source) or E315 (pipeline-wide) error when the cumulative
+/// fraction exceeds it. Per-source thresholds win against pipeline-wide
+/// when set. Both branches honor `min_records` to avoid 1/1 = 100%
+/// false positives on the very first failure.
+pub(crate) fn check_dlq_rate(
+    ctx: &ExecutorContext<'_>,
+    source: &Arc<str>,
+) -> Result<(), PipelineError> {
+    let Some(dlq) = ctx.config.error_handling.dlq.as_ref() else {
+        return Ok(());
+    };
+    let pipeline_min = dlq
+        .min_records
+        .unwrap_or(crate::config::DEFAULT_DLQ_MIN_RECORDS);
+
+    if let Some(per) = dlq.per_source.get(source.as_ref())
+        && let Some(max) = per.max_rate
+    {
+        let total = ctx.total_per_source.get(source).copied().unwrap_or(0);
+        let observed = ctx.dlq_per_source.get(source).copied().unwrap_or(0);
+        let min = per.min_records.unwrap_or(pipeline_min);
+        if total >= min && total > 0 {
+            let rate = observed as f64 / total as f64;
+            if rate >= max {
+                return Err(PipelineError::DlqRateExceeded {
+                    source: Some(Arc::clone(source)),
+                    observed_rate: rate,
+                    max_rate: max,
+                    observed_count: observed,
+                    total_count: total,
+                });
+            }
+        }
+    }
+
+    if let Some(max) = dlq.max_rate {
+        let total: u64 = ctx.total_per_source.values().sum();
+        let observed = ctx.counters.dlq_count;
+        if total >= pipeline_min && total > 0 {
+            let rate = observed as f64 / total as f64;
+            if rate >= max {
+                return Err(PipelineError::DlqRateExceeded {
+                    source: None,
+                    observed_rate: rate,
+                    max_rate: max,
+                    observed_count: observed,
+                    total_count: total,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
     use clinker_record::value_to_group_key;
     if let Value::String(s) = v
@@ -326,6 +412,15 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) current_body_node_input_refs: Option<HashMap<String, Vec<String>>>,
     pub(crate) counters: PipelineCounters,
     pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Per-source DLQ counters keyed by Source-node name. Incremented
+    /// alongside `counters.dlq_count` at the [`push_dlq`] funnel so
+    /// per-source `max_rate` thresholds can fire with attribution.
+    pub(crate) dlq_per_source: HashMap<Arc<str>, u64>,
+    /// Per-source total record counters keyed by Source-node name.
+    /// Seeded once at executor entry from
+    /// [`ExecutorContext::source_records`] so the rate-check
+    /// denominator is the per-source ingest count, not a moving target.
+    pub(crate) total_per_source: HashMap<Arc<str>, u64>,
     pub(crate) output_errors: Vec<PipelineError>,
     pub(crate) ok_source_rows: HashSet<u64>,
     pub(crate) records_emitted: u64,
@@ -1274,18 +1369,24 @@ pub(crate) fn dispatch_plan_node(
                             None,
                         );
                         if !routed {
-                            ctx.counters.dlq_count += 1;
                             let source_name = source_name_arc_of(&record);
-                            ctx.dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: eval_err.to_string(),
-                                original_record: record,
-                                stage,
-                                route: None,
-                                trigger: true,
-                                source_name,
-                            });
+                            let triggering_field = eval_err.triggering_field.clone();
+                            let triggering_value = eval_err.triggering_value();
+                            push_dlq(
+                                ctx,
+                                DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: eval_err.to_string(),
+                                    original_record: record,
+                                    stage,
+                                    route: None,
+                                    trigger: true,
+                                    source_name,
+                                    triggering_field,
+                                    triggering_value,
+                                },
+                            )?;
                         }
                     }
                 }
@@ -1499,18 +1600,24 @@ pub(crate) fn dispatch_plan_node(
                                 None,
                             );
                             if !routed {
-                                ctx.counters.dlq_count += 1;
                                 let source_name = source_name_arc_of(&record);
-                                ctx.dlq_entries.push(DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: route_err.to_string(),
-                                    original_record: record,
-                                    stage,
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                });
+                                let triggering_field = route_err.triggering_field.clone();
+                                let triggering_value = route_err.triggering_value();
+                                push_dlq(
+                                    ctx,
+                                    DlqEntry {
+                                        source_row: rn,
+                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                        error_message: route_err.to_string(),
+                                        original_record: record,
+                                        stage,
+                                        route: None,
+                                        trigger: true,
+                                        source_name,
+                                        triggering_field,
+                                        triggering_value,
+                                    },
+                                )?;
                             }
                         }
                     }
@@ -1885,18 +1992,22 @@ pub(crate) fn dispatch_plan_node(
                                 None,
                             );
                             if !routed {
-                                ctx.counters.dlq_count += 1;
                                 let source_name = source_name_arc_of(record);
-                                ctx.dlq_entries.push(DlqEntry {
-                                    source_row: *row_num,
-                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                    error_message: format!("aggregate {name}: {e}"),
-                                    original_record: record.clone(),
-                                    stage,
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                });
+                                push_dlq(
+                                    ctx,
+                                    DlqEntry {
+                                        source_row: *row_num,
+                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        error_message: format!("aggregate {name}: {e}"),
+                                        original_record: record.clone(),
+                                        stage,
+                                        route: None,
+                                        trigger: true,
+                                        source_name,
+                                        triggering_field: None,
+                                        triggering_value: None,
+                                    },
+                                )?;
                             }
                         }
                     }
@@ -1972,25 +2083,40 @@ pub(crate) fn dispatch_plan_node(
                             });
                         }
                         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            ctx.counters.dlq_count += 1;
-                            let synthetic = if let Some((rec, _)) = input.first() {
-                                rec.clone()
+                            // Empty-input finalize failures have no real
+                            // record to attribute to a Source, so stamp
+                            // the aggregate node's own name as the
+                            // source label. The DLQ reader sees a
+                            // specific aggregate identifier instead of
+                            // the generic `<merged>` fallthrough
+                            // `source_name_arc_of` would yield for a
+                            // schema-only synthetic record.
+                            let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
+                                let sn = source_name_arc_of(rec);
+                                (rec.clone(), sn)
                             } else {
-                                Record::new(Arc::clone(output_schema), Vec::new())
+                                (
+                                    Record::new(Arc::clone(output_schema), Vec::new()),
+                                    Arc::from(name.as_str()),
+                                )
                             };
-                            let source_name = source_name_arc_of(&synthetic);
-                            ctx.dlq_entries.push(DlqEntry {
-                                source_row: 0,
-                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                error_message: format!(
-                                    "aggregate {transform}.{binding}: {source:?}"
-                                ),
-                                original_record: synthetic,
-                                stage: Some(crate::dlq::stage_aggregate(name)),
-                                route: None,
-                                trigger: true,
-                                source_name,
-                            });
+                            push_dlq(
+                                ctx,
+                                DlqEntry {
+                                    source_row: 0,
+                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    error_message: format!(
+                                        "aggregate {transform}.{binding}: {source:?}"
+                                    ),
+                                    original_record: synthetic,
+                                    stage: Some(crate::dlq::stage_aggregate(name)),
+                                    route: None,
+                                    trigger: true,
+                                    source_name,
+                                    triggering_field: None,
+                                    triggering_value: None,
+                                },
+                            )?;
                             Vec::new()
                         }
                     },
@@ -2012,25 +2138,40 @@ pub(crate) fn dispatch_plan_node(
                             });
                         }
                         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            ctx.counters.dlq_count += 1;
-                            let synthetic = if let Some((rec, _)) = input.first() {
-                                rec.clone()
+                            // Empty-input finalize failures have no real
+                            // record to attribute to a Source, so stamp
+                            // the aggregate node's own name as the
+                            // source label. The DLQ reader sees a
+                            // specific aggregate identifier instead of
+                            // the generic `<merged>` fallthrough
+                            // `source_name_arc_of` would yield for a
+                            // schema-only synthetic record.
+                            let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
+                                let sn = source_name_arc_of(rec);
+                                (rec.clone(), sn)
                             } else {
-                                Record::new(Arc::clone(output_schema), Vec::new())
+                                (
+                                    Record::new(Arc::clone(output_schema), Vec::new()),
+                                    Arc::from(name.as_str()),
+                                )
                             };
-                            let source_name = source_name_arc_of(&synthetic);
-                            ctx.dlq_entries.push(DlqEntry {
-                                source_row: 0,
-                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                error_message: format!(
-                                    "aggregate {transform}.{binding}: {source:?}"
-                                ),
-                                original_record: synthetic,
-                                stage: Some(crate::dlq::stage_aggregate(name)),
-                                route: None,
-                                trigger: true,
-                                source_name,
-                            });
+                            push_dlq(
+                                ctx,
+                                DlqEntry {
+                                    source_row: 0,
+                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    error_message: format!(
+                                        "aggregate {transform}.{binding}: {source:?}"
+                                    ),
+                                    original_record: synthetic,
+                                    stage: Some(crate::dlq::stage_aggregate(name)),
+                                    route: None,
+                                    trigger: true,
+                                    source_name,
+                                    triggering_field: None,
+                                    triggering_value: None,
+                                },
+                            )?;
                             Vec::new()
                         }
                     },
@@ -3456,18 +3597,22 @@ fn commit_one_group(
                     format!("correlated with failure in group: {overflow_msg}"),
                 )
             };
-            ctx.counters.dlq_count += 1;
             let source_name = source_name_arc_of(&slot.original_record);
-            ctx.dlq_entries.push(DlqEntry {
-                source_row: slot.row_num,
-                category,
-                error_message,
-                original_record: slot.original_record.clone(),
-                stage: Some("correlation_commit".to_string()),
-                route: None,
-                trigger,
-                source_name,
-            });
+            push_dlq(
+                ctx,
+                DlqEntry {
+                    source_row: slot.row_num,
+                    category,
+                    error_message,
+                    original_record: slot.original_record.clone(),
+                    stage: Some("correlation_commit".to_string()),
+                    route: None,
+                    trigger,
+                    source_name,
+                    triggering_field: None,
+                    triggering_value: None,
+                },
+            )?;
         }
         return Ok(());
     }
@@ -3502,18 +3647,22 @@ fn commit_one_group(
         if !seen_rows.insert(err.row_num) {
             continue;
         }
-        ctx.counters.dlq_count += 1;
         let source_name = source_name_arc_of(&err.original_record);
-        ctx.dlq_entries.push(DlqEntry {
-            source_row: err.row_num,
-            category: err.category,
-            error_message: err.error_message.clone(),
-            original_record: err.original_record.clone(),
-            stage: err.stage.clone(),
-            route: err.route.clone(),
-            trigger: true,
-            source_name,
-        });
+        push_dlq(
+            ctx,
+            DlqEntry {
+                source_row: err.row_num,
+                category: err.category,
+                error_message: err.error_message.clone(),
+                original_record: err.original_record.clone(),
+                stage: err.stage.clone(),
+                route: err.route.clone(),
+                trigger: true,
+                source_name,
+                triggering_field: None,
+                triggering_value: None,
+            },
+        )?;
     }
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. The resolved
@@ -3548,18 +3697,22 @@ fn commit_one_group(
         if !seen_rows.insert(slot.row_num) {
             continue;
         }
-        ctx.counters.dlq_count += 1;
         let source_name = source_name_arc_of(&slot.original_record);
-        ctx.dlq_entries.push(DlqEntry {
-            source_row: slot.row_num,
-            category: crate::dlq::DlqErrorCategory::Correlated,
-            error_message: format!("correlated with failure in group: {first_err_message}"),
-            original_record: slot.original_record.clone(),
-            stage: Some("correlation_commit".to_string()),
-            route: None,
-            trigger: false,
-            source_name,
-        });
+        push_dlq(
+            ctx,
+            DlqEntry {
+                source_row: slot.row_num,
+                category: crate::dlq::DlqErrorCategory::Correlated,
+                error_message: format!("correlated with failure in group: {first_err_message}"),
+                original_record: slot.original_record.clone(),
+                stage: Some("correlation_commit".to_string()),
+                route: None,
+                trigger: false,
+                source_name,
+                triggering_field: None,
+                triggering_value: None,
+            },
+        )?;
     }
 
     Ok(())

@@ -321,6 +321,10 @@ fn main() -> ExitCode {
                         // emission site. Treat as exit 4 defensively
                         // in case a future caller surfaces it.
                         PipelineError::CorrelationGroupOverflow { .. } => ExitCode::from(4),
+                        // Configured DLQ rate ceiling tripped (E315 /
+                        // E316). Treat as a data-quality halt — exit 3
+                        // sits between config (1) and infrastructure (4).
+                        PipelineError::DlqRateExceeded { .. } => ExitCode::from(3),
                     }
                 }
             }
@@ -919,54 +923,66 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
 
-    // Write DLQ if there are entries and DLQ path is configured.
-    // Same atomic temp+rename discipline as primary outputs above —
-    // operators inspecting DLQ output should never see a truncated file.
+    // Write DLQ if there are entries and at least one DLQ path is
+    // configured (pipeline-wide or per-source). Same atomic
+    // temp+rename discipline as primary outputs above — operators
+    // inspecting DLQ output should never see a truncated file.
+    // Per-source `path:` overrides partition entries into separate
+    // sidecar files; entries from sources without an override fall
+    // through to `dlq_config.path` (the pipeline-wide sink).
     if !dlq_entries.is_empty()
         && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
-        && let Some(ref dlq_path) = dlq_config.path
     {
-        let input_schema = {
-            let f = std::fs::File::open(&input_path)?;
-            let mut r = clinker_format::csv::reader::CsvReader::from_reader(
-                f,
-                clinker_format::csv::reader::CsvReaderConfig::default(),
-            );
-            r.schema().map_err(PipelineError::Format)?
-        };
-        let dlq_path_buf: std::path::PathBuf = dlq_path.clone().into();
-        let dlq_dir = dlq_path_buf
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        if !dlq_dir.exists() {
-            std::fs::create_dir_all(&dlq_dir)?;
+        let buckets = clinker_core::dlq::partition_dlq_entries(dlq_entries, dlq_config);
+        if !buckets.is_empty() {
+            let input_schema = {
+                let f = std::fs::File::open(&input_path)?;
+                let mut r = clinker_format::csv::reader::CsvReader::from_reader(
+                    f,
+                    clinker_format::csv::reader::CsvReaderConfig::default(),
+                );
+                r.schema().map_err(PipelineError::Format)?
+            };
+            let include_reason = dlq_config.include_reason.unwrap_or(true);
+            let include_source_row = dlq_config.include_source_row.unwrap_or(true);
+            for (target_path, bucket_entries) in &buckets {
+                if bucket_entries.is_empty() {
+                    continue;
+                }
+                let target_dir = target_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                if !target_dir.exists() {
+                    std::fs::create_dir_all(&target_dir)?;
+                }
+                let dlq_temp = tempfile::NamedTempFile::new_in(&target_dir)?;
+                let dlq_temp_handle = dlq_temp.reopen()?;
+                let owned: Vec<clinker_core::executor::DlqEntry> =
+                    bucket_entries.iter().map(|e| (*e).clone()).collect();
+                clinker_core::dlq::write_dlq(
+                    dlq_temp_handle,
+                    &owned,
+                    &input_schema,
+                    &input_path,
+                    include_reason,
+                    include_source_row,
+                )
+                .map_err(PipelineError::Format)?;
+                dlq_temp.persist(target_path).map_err(|e| {
+                    tracing::error!(
+                        final_path = %target_path.display(),
+                        "failed to atomically rename DLQ output into place; temp file preserved",
+                    );
+                    PipelineError::Io(std::io::Error::other(format!(
+                        "atomic DLQ rename failed for {}: {}",
+                        target_path.display(),
+                        e.error
+                    )))
+                })?;
+            }
         }
-        let dlq_temp = tempfile::NamedTempFile::new_in(&dlq_dir)?;
-        let dlq_temp_handle = dlq_temp.reopen()?;
-        let include_reason = dlq_config.include_reason.unwrap_or(true);
-        let include_source_row = dlq_config.include_source_row.unwrap_or(true);
-        clinker_core::dlq::write_dlq(
-            dlq_temp_handle,
-            dlq_entries,
-            &input_schema,
-            &input_path,
-            include_reason,
-            include_source_row,
-        )
-        .map_err(PipelineError::Format)?;
-        dlq_temp.persist(&dlq_path_buf).map_err(|e| {
-            tracing::error!(
-                final_path = %dlq_path_buf.display(),
-                "failed to atomically rename DLQ output into place; temp file preserved",
-            );
-            PipelineError::Io(std::io::Error::other(format!(
-                "atomic DLQ rename failed for {}: {}",
-                dlq_path_buf.display(),
-                e.error
-            )))
-        })?;
     }
 
     // Provenance sidecars for outputs that opted in via `write_meta`.

@@ -971,6 +971,100 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
 
 /// Build a placeholder `TypedProgram` carrying only `output_row`, for
 /// node variants without a CXL body (Source/Merge/Output/Composition).
+/// Validate `error_handling.dlq.per_source` against the declared Source
+/// nodes and the DLQ-routing path set. Emits E317 when a `per_source`
+/// key does not name a declared Source node, and E318 when a configured
+/// `max_rate` is outside `(0.0, 1.0]` (zero is rejected because a
+/// `max_rate: 0.0` config halts on the very first failure — a
+/// `min_records`-bypassing footgun that should be expressed via a
+/// dedicated halt-on-any-DLQ surface instead) or a configured DLQ
+/// output path collides with another DLQ path (pipeline-wide or
+/// per-source).
+pub(crate) fn validate_dlq_per_source(
+    dlq: Option<&crate::config::DlqConfig>,
+    nodes: &[Spanned<PipelineNode>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    /// Accepts the half-open interval `(0.0, 1.0]` — see the function-
+    /// level docstring for why zero is rejected.
+    fn is_valid_max_rate(r: f64) -> bool {
+        r > 0.0 && r <= 1.0 && r.is_finite()
+    }
+
+    let Some(dlq) = dlq else {
+        return;
+    };
+
+    // Range-check the pipeline-wide max_rate. Accepts the half-open
+    // interval `(0.0, 1.0]`: zero is rejected as an unintended
+    // halt-on-first-failure footgun (the `min_records` floor would also
+    // be bypassed when the numerator and denominator both start at 0).
+    if let Some(r) = dlq.max_rate
+        && !is_valid_max_rate(r)
+    {
+        diags.push(Diagnostic::error(
+            "E318",
+            format!("error_handling.dlq.max_rate {r} is out of range; must be in (0.0, 1.0]"),
+            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+        ));
+    }
+
+    // Collect declared Source-node names so unknown per_source keys
+    // can be flagged with a precise message.
+    let source_names: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|n| match &n.value {
+            PipelineNode::Source { header, .. } => Some(header.name.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    // Track path collisions across the pipeline-wide + every per-source
+    // entry. First insertion wins; subsequent insertions emit E318.
+    let mut paths: HashMap<&str, String> = HashMap::new();
+    if let Some(p) = dlq.path.as_deref() {
+        paths.insert(p, "error_handling.dlq.path".to_string());
+    }
+
+    for (src_name, per) in &dlq.per_source {
+        if !source_names.contains(src_name.as_str()) {
+            diags.push(Diagnostic::error(
+                "E317",
+                format!(
+                    "error_handling.dlq.per_source key {src_name:?} does not match \
+                     any declared Source node"
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+        }
+        if let Some(r) = per.max_rate
+            && !is_valid_max_rate(r)
+        {
+            diags.push(Diagnostic::error(
+                "E318",
+                format!(
+                    "error_handling.dlq.per_source.{src_name}.max_rate {r} \
+                     is out of range; must be in (0.0, 1.0]"
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+        }
+        if let Some(p) = per.path.as_deref()
+            && let Some(prev) =
+                paths.insert(p, format!("error_handling.dlq.per_source.{src_name}.path"))
+        {
+            diags.push(Diagnostic::error(
+                "E318",
+                format!(
+                    "error_handling.dlq.per_source.{src_name}.path {p:?} collides \
+                     with {prev}"
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+        }
+    }
+}
+
 fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     TypedProgram {
         program: cxl::ast::Program {
@@ -983,6 +1077,7 @@ fn synthetic_typed_program(output_row: Row) -> TypedProgram {
         regexes: Vec::new(),
         node_count: 0,
         output_row,
+        source: None,
     }
 }
 
@@ -2559,6 +2654,7 @@ fn typecheck_cxl(
         )
     })?;
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
+        .map(|typed| typed.with_source(std::sync::Arc::from(source)))
         .map_err(|diags| {
             let errors: Vec<String> = diags
                 .iter()
@@ -3281,7 +3377,7 @@ fn typecheck_combine_where(
         cxl::typecheck::pass::AggregateMode::Row,
         scoped_vars,
     ) {
-        Ok(typed) => Ok(typed),
+        Ok(typed) => Ok(typed.with_source(std::sync::Arc::from(wrapped.as_str()))),
         Err(type_diags) => {
             let mut out = Vec::new();
             for td in type_diags.into_iter().filter(|d| !d.is_warning) {

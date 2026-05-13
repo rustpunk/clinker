@@ -2290,6 +2290,7 @@ mod tests {
             regexes: Vec::new(),
             node_count: 0,
             output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+            source: None,
         });
         let mk_eq = || EqualityConjunct {
             left_expr: dummy_lit(),
@@ -2602,6 +2603,7 @@ mod tests {
             regexes: Vec::new(),
             node_count: 0,
             output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+            source: None,
         });
         let equalities: Vec<EqualityConjunct> = edges
             .iter()
@@ -2884,6 +2886,7 @@ mod tests {
                 IndexMap::new(),
                 cxl::lexer::Span::new(0, 0),
             ),
+            source: None,
         });
         let predicate = DecomposedPredicate {
             equalities: vec![
@@ -2981,6 +2984,7 @@ mod tests {
                 IndexMap::new(),
                 cxl::lexer::Span::new(0, 0),
             ),
+            source: None,
         });
         let predicate = DecomposedPredicate {
             equalities: vec![

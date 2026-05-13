@@ -1291,6 +1291,8 @@ fn test_dlq_stage_source() {
         route: None,
         trigger: true,
         source_name: std::sync::Arc::from("test_source"),
+        triggering_field: None,
+        triggering_value: None,
     };
     assert_eq!(entry.stage, Some("source".to_string()));
     assert_eq!(entry.route, None);
@@ -1450,6 +1452,8 @@ fn test_dlq_stage_output() {
         route: Some("high_value".to_string()),
         trigger: true,
         source_name: std::sync::Arc::from("test_source"),
+        triggering_field: None,
+        triggering_value: None,
     };
     assert_eq!(entry.stage, Some("output:results".to_string()));
     assert_eq!(entry.route, Some("high_value".to_string()));
@@ -1536,6 +1540,8 @@ fn test_dlq_columns_in_csv() {
         route: None,
         trigger: true,
         source_name: std::sync::Arc::from("test_source"),
+        triggering_field: None,
+        triggering_value: None,
     }];
 
     let mut buf = Vec::new();

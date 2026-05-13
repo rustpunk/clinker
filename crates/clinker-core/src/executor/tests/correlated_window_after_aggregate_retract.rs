@@ -330,7 +330,11 @@ O6,ENG,300
             .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR")),
         "trigger record must be the HR aggregate output row"
     );
-    assert_eq!(trigger.error_message, "division by zero");
+    assert!(
+        trigger.error_message.ends_with("division by zero"),
+        "trigger error must end with the eval-kind text; got: {}",
+        trigger.error_message
+    );
     assert!(
         trigger
             .original_record

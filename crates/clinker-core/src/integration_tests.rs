@@ -70,7 +70,11 @@ mod tests {
                 | PipelineError::CompositionUnknownPort { .. }
                 | PipelineError::CompositionBodyError { .. },
             ) => 1,
-            Err(PipelineError::Eval(_) | PipelineError::Accumulator { .. }) => 3,
+            Err(
+                PipelineError::Eval(_)
+                | PipelineError::Accumulator { .. }
+                | PipelineError::DlqRateExceeded { .. },
+            ) => 3,
             Err(
                 PipelineError::Io(_)
                 | PipelineError::Format(_)

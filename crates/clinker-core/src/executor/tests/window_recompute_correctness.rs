@@ -237,7 +237,11 @@ fn post_aggregate_window_recompute_corrects_running_total() {
 
     let trigger = &dlq[0];
     assert!(trigger.trigger, "the single DLQ entry is the trigger");
-    assert_eq!(trigger.error_message, "division by zero");
+    assert!(
+        trigger.error_message.ends_with("division by zero"),
+        "trigger error must end with the eval-kind text; got: {}",
+        trigger.error_message
+    );
     assert!(
         trigger
             .original_record

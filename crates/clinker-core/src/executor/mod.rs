@@ -457,9 +457,19 @@ pub struct DlqEntry {
     /// `FieldMetadata::SourceName` engine-stamp at the push site so a
     /// post-Merge / post-Combine DLQ entry still identifies which
     /// upstream Source produced the record. Serialized as
-    /// `_cxl_dlq_source_name` in DLQ CSV. Unblocks per-source DLQ
-    /// thresholds (#55).
+    /// `_cxl_dlq_source_name` in DLQ CSV.
     pub source_name: Arc<str>,
+    /// Output field the evaluator was computing when the error fired,
+    /// captured at the emit-statement boundary. `None` for collateral
+    /// entries that were not directly eval-triggered (correlation
+    /// fan-out, group-size overflow, etc.). Serialized as
+    /// `_cxl_dlq_triggering_field`.
+    pub triggering_field: Option<Arc<str>>,
+    /// Value carried by the failing `EvalErrorKind` payload, when the
+    /// variant exposes one (conversion source string, out-of-bounds
+    /// index, mismatched arity). `None` otherwise. Serialized as
+    /// `_cxl_dlq_triggering_value`.
+    pub triggering_value: Option<clinker_record::Value>,
 }
 
 impl DlqEntry {
@@ -1265,6 +1275,11 @@ impl PipelineExecutor {
         // `counters` and `dlq_entries` are taken out of their `&mut`
         // borrows here, mutated through the dispatcher, and written
         // back at the end of the walk.
+        let total_per_source: HashMap<Arc<str>, u64> = source_records
+            .iter()
+            .map(|(name, records)| (Arc::from(name.as_str()), records.len() as u64))
+            .collect();
+
         let mut ctx = dispatch::ExecutorContext {
             config,
             artifacts,
@@ -1285,6 +1300,8 @@ impl PipelineExecutor {
             compiled_route,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
+            dlq_per_source: HashMap::new(),
+            total_per_source,
             output_errors: Vec::new(),
             ok_source_rows: HashSet::new(),
             records_emitted: 0,
@@ -2455,6 +2472,7 @@ fn arcs_reachable_from(
 /// Returns `Ok((modified_record, Ok(())))` on emit,
 /// `Ok((record, Err(SkipReason)))` on skip. On error, returns
 /// `(transform_name, EvalError)`.
+#[allow(clippy::result_large_err)]
 pub(crate) fn evaluate_single_transform(
     record: &Record,
     transform_name: &str,
@@ -2508,7 +2526,7 @@ pub(crate) fn evaluate_single_transform(
 /// in any group key, or no matching partition), the evaluator runs
 /// without a window context — matching the legacy inline arena path's
 /// behavior.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub(crate) fn evaluate_single_transform_windowed(
     record: &Record,
     transform_name: &str,

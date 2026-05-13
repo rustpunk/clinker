@@ -1,8 +1,10 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, Schema, Value};
 
+use crate::config::DlqConfig;
 use crate::executor::DlqEntry;
 
 /// All 6 DLQ error categories per spec §10.4.
@@ -54,19 +56,6 @@ pub fn stage_aggregate(transform: &str) -> String {
     format!("aggregate:{transform}")
 }
 
-/// DLQ column names per spec §10.4.
-pub const DLQ_COLUMNS: &[&str] = &[
-    "_cxl_dlq_id",
-    "_cxl_dlq_timestamp",
-    "_cxl_dlq_source_file",
-    "_cxl_dlq_source_row",
-    "_cxl_dlq_error_category",
-    "_cxl_dlq_error_detail",
-    "_cxl_dlq_stage",
-    "_cxl_dlq_route",
-    "_cxl_dlq_trigger",
-];
-
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
 ///
 /// Column layout:
@@ -100,6 +89,8 @@ pub fn write_dlq<W: Write>(
         "_cxl_dlq_source_file",
         "_cxl_dlq_source_name",
         "_cxl_dlq_source_row",
+        "_cxl_dlq_triggering_field",
+        "_cxl_dlq_triggering_value",
     ];
     if include_reason {
         header.push("_cxl_dlq_error_category");
@@ -126,6 +117,12 @@ pub fn write_dlq<W: Write>(
             source_file.to_string(),
             entry.source_name.as_ref().to_string(),
             entry.source_row.to_string(),
+            entry.triggering_field.as_deref().unwrap_or("").to_string(),
+            entry
+                .triggering_value
+                .as_ref()
+                .map(value_to_string)
+                .unwrap_or_default(),
         ];
 
         if include_reason {
@@ -150,6 +147,59 @@ pub fn write_dlq<W: Write>(
 
     csv_writer.flush()?;
     Ok(())
+}
+
+/// Partition DLQ entries by configured per-source `path:` override.
+///
+/// Returns `(path, entries)` pairs. Entries whose `source_name` has a
+/// per-source `path` override land in their own bucket; the remainder
+/// fall through to `DlqConfig.path` (the pipeline-wide sidecar). When
+/// `dlq_config.path` is `None` and no per-source override matches, an
+/// entry has no destination and is dropped from the result — the CLI
+/// emits nothing for it. Insertion order is preserved within each
+/// bucket; bucket ordering is deterministic via the BTreeMap traversal
+/// over `per_source`.
+pub fn partition_dlq_entries<'a>(
+    entries: &'a [DlqEntry],
+    dlq_config: &DlqConfig,
+) -> Vec<(PathBuf, Vec<&'a DlqEntry>)> {
+    let mut per_source_paths: std::collections::BTreeMap<&str, PathBuf> =
+        std::collections::BTreeMap::new();
+    for (src, per) in &dlq_config.per_source {
+        if let Some(p) = per.path.as_deref() {
+            per_source_paths.insert(src.as_str(), PathBuf::from(p));
+        }
+    }
+
+    // Deterministic output order: pipeline-wide path first (if set),
+    // then per-source paths in BTreeMap order.
+    let mut buckets: Vec<(PathBuf, Vec<&'a DlqEntry>)> = Vec::new();
+    let mut index_of: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    if let Some(p) = dlq_config.path.as_deref() {
+        let pb = PathBuf::from(p);
+        index_of.insert(pb.clone(), 0);
+        buckets.push((pb, Vec::new()));
+    }
+    for path in per_source_paths.values() {
+        if !index_of.contains_key(path) {
+            index_of.insert(path.clone(), buckets.len());
+            buckets.push((path.clone(), Vec::new()));
+        }
+    }
+
+    for entry in entries {
+        let target = per_source_paths
+            .get(entry.source_name.as_ref())
+            .cloned()
+            .or_else(|| dlq_config.path.as_deref().map(PathBuf::from));
+        if let Some(target) = target
+            && let Some(&i) = index_of.get(&target)
+        {
+            buckets[i].1.push(entry);
+        }
+    }
+
+    buckets
 }
 
 /// Iterator over schema columns that should appear in DLQ output:
@@ -227,6 +277,8 @@ mod tests {
             route: None,
             trigger: true,
             source_name: Arc::from("test_source"),
+            triggering_field: None,
+            triggering_value: None,
         }
     }
 
@@ -251,13 +303,15 @@ mod tests {
         assert_eq!(columns[2], "_cxl_dlq_source_file");
         assert_eq!(columns[3], "_cxl_dlq_source_name");
         assert_eq!(columns[4], "_cxl_dlq_source_row");
-        assert_eq!(columns[5], "_cxl_dlq_error_category");
-        assert_eq!(columns[6], "_cxl_dlq_error_detail");
-        assert_eq!(columns[7], "_cxl_dlq_stage");
-        assert_eq!(columns[8], "_cxl_dlq_route");
-        assert_eq!(columns[9], "_cxl_dlq_trigger");
-        assert_eq!(columns[10], "name");
-        assert_eq!(columns[11], "value");
+        assert_eq!(columns[5], "_cxl_dlq_triggering_field");
+        assert_eq!(columns[6], "_cxl_dlq_triggering_value");
+        assert_eq!(columns[7], "_cxl_dlq_error_category");
+        assert_eq!(columns[8], "_cxl_dlq_error_detail");
+        assert_eq!(columns[9], "_cxl_dlq_stage");
+        assert_eq!(columns[10], "_cxl_dlq_route");
+        assert_eq!(columns[11], "_cxl_dlq_trigger");
+        assert_eq!(columns[12], "name");
+        assert_eq!(columns[13], "value");
     }
 
     #[test]
@@ -477,6 +531,8 @@ mod tests {
             route: None,
             trigger: true,
             source_name: Arc::from("test_source"),
+            triggering_field: None,
+            triggering_value: None,
         }];
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -485,12 +541,12 @@ mod tests {
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
         // Source fields in schema order (zulu, alpha, mike), not alphabetical.
-        // Columns 0-4 are the prelude (_cxl_dlq_id / timestamp / source_file /
-        // source_name / source_row); 5-6 are error category/detail; 7-9 are
+        // Columns 0-4 are the identity prelude; 5-6 are triggering_field/
+        // triggering_value; 7-8 are error category/detail; 9-11 are
         // stage/route/trigger.
-        assert_eq!(columns[10], "zulu");
-        assert_eq!(columns[11], "alpha");
-        assert_eq!(columns[12], "mike");
+        assert_eq!(columns[12], "zulu");
+        assert_eq!(columns[13], "alpha");
+        assert_eq!(columns[14], "mike");
     }
 
     #[test]
@@ -586,6 +642,8 @@ mod tests {
             route: None,
             trigger: true,
             source_name: Arc::from("test_source"),
+            triggering_field: None,
+            triggering_value: None,
         };
         let mut buf = Vec::new();
         write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();
@@ -622,5 +680,87 @@ mod tests {
             "sidecar map's `region` key must not appear in any DLQ body cell; \
              got body: {body}"
         );
+    }
+
+    #[test]
+    fn test_dlq_triggering_field_and_value_columns() {
+        let schema = make_schema();
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::String("Alice".into()), Value::String("oops".into())],
+        );
+        let entry = DlqEntry {
+            source_row: 7,
+            category: DlqErrorCategory::TypeCoercionFailure,
+            error_message: "cannot convert".to_string(),
+            original_record: record,
+            stage: None,
+            route: None,
+            trigger: true,
+            source_name: Arc::from("test_source"),
+            triggering_field: Some(Arc::from("amount")),
+            triggering_value: Some(Value::String("not-a-number".into())),
+        };
+        let mut buf = Vec::new();
+        write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let body = output.lines().nth(1).expect("body line");
+        let cells: Vec<&str> = body.split(',').collect();
+        assert_eq!(cells[5], "amount");
+        assert_eq!(cells[6], "not-a-number");
+    }
+
+    #[test]
+    fn test_partition_dlq_entries_splits_by_source_path() {
+        let schema = make_schema();
+        let mk = |src: &str| {
+            let rec = Record::new(
+                Arc::clone(&schema),
+                vec![Value::String("n".into()), Value::String("v".into())],
+            );
+            DlqEntry {
+                source_row: 0,
+                category: DlqErrorCategory::TypeCoercionFailure,
+                error_message: String::new(),
+                original_record: rec,
+                stage: None,
+                route: None,
+                trigger: true,
+                source_name: Arc::from(src),
+                triggering_field: None,
+                triggering_value: None,
+            }
+        };
+        let entries = vec![mk("src_a"), mk("src_b"), mk("src_a"), mk("src_c")];
+
+        let mut per_source = std::collections::BTreeMap::new();
+        per_source.insert(
+            "src_b".to_string(),
+            crate::config::DlqPerSourceConfig {
+                path: Some("dlq_b.csv".to_string()),
+                max_rate: None,
+                min_records: None,
+            },
+        );
+        let cfg = crate::config::DlqConfig {
+            path: Some("dlq.csv".to_string()),
+            include_reason: None,
+            include_source_row: None,
+            max_rate: None,
+            min_records: None,
+            per_source,
+        };
+
+        let buckets = partition_dlq_entries(&entries, &cfg);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].0, PathBuf::from("dlq.csv"));
+        assert_eq!(
+            buckets[0].1.len(),
+            3,
+            "src_a + src_a + src_c land in default"
+        );
+        assert_eq!(buckets[1].0, PathBuf::from("dlq_b.csv"));
+        assert_eq!(buckets[1].1.len(), 1);
+        assert_eq!(buckets[1].1[0].source_name.as_ref(), "src_b");
     }
 }

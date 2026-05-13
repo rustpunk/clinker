@@ -16,7 +16,7 @@ use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
 pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
-pub use error::{EvalError, EvalErrorKind};
+pub use error::{EvalError, EvalErrorKind, extract_triggering_value};
 
 /// Row disposition signal from CXL evaluation.
 ///
@@ -123,7 +123,36 @@ impl ProgramEvaluator {
     }
 
     /// Evaluate a record through the full program, returning Emit or Skip.
+    ///
+    /// Wraps the inner walk in a boundary `map_err` that attaches the
+    /// current `source_row` and the program's `source` text to any
+    /// [`EvalError`] surfaced from a subexpression, so DLQ entries and
+    /// miette diagnostics downstream carry "row N: ..." context and an
+    /// underlined source span without every internal constructor having
+    /// to thread those fields manually.
     pub fn eval_record<'w, S: RecordStorage + 'w>(
+        &mut self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+        window: Option<&dyn WindowContext<'w, S>>,
+    ) -> Result<EvalResult, EvalError> {
+        let source_row = ctx.source_row;
+        let source_expr = self.typed.source.clone();
+        self.eval_record_inner(ctx, resolver, window)
+            .map_err(move |mut e| {
+                if e.source_row.is_none() {
+                    e.source_row = Some(source_row);
+                }
+                if e.source_expr.is_none()
+                    && let Some(s) = source_expr
+                {
+                    e.source_expr = Some(s);
+                }
+                e
+            })
+    }
+
+    fn eval_record_inner<'w, S: RecordStorage + 'w>(
         &mut self,
         ctx: &EvalContext<'_>,
         resolver: &dyn FieldResolver,
@@ -158,7 +187,14 @@ impl ProgramEvaluator {
                 Statement::Emit {
                     name, expr, target, ..
                 } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env).map_err(
+                        |mut e| {
+                            if e.triggering_field.is_none() {
+                                e.triggering_field = Some(Arc::from(&**name));
+                            }
+                            e
+                        },
+                    )?;
                     match target {
                         EmitTarget::Field => {
                             output.insert(name.to_string(), val);

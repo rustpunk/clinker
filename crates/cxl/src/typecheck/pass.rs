@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -107,6 +108,23 @@ pub struct TypedProgram {
     /// value is `Row::closed(IndexMap::new(), Span::default())`;
     /// consumers observe the populated row after `bind_schema` completes.
     pub output_row: Row,
+    /// Original CXL source text this program was parsed from. Populated
+    /// by production callers (the pipeline compiler) so runtime
+    /// [`crate::eval::EvalError`] diagnostics can render the offending
+    /// expression with a caret on the failing span. `None` for synthetic
+    /// programs and standalone tests that do not exercise the diagnostic
+    /// renderer.
+    pub source: Option<Arc<str>>,
+}
+
+impl TypedProgram {
+    /// Attach the original CXL source text. Production pipeline-compile
+    /// callers set this so [`crate::eval::EvalError`] miette rendering
+    /// can underline the offending subexpression.
+    pub fn with_source(mut self, source: Arc<str>) -> Self {
+        self.source = Some(source);
+        self
+    }
 }
 
 /// Run Phase C: type-check a resolved program in row-level mode (the
@@ -202,6 +220,7 @@ pub fn type_check_with_mode_and_vars(
         regexes,
         node_count,
         output_row: Row::closed(IndexMap::new(), Span::default()),
+        source: None,
     })
 }
 
