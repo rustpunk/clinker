@@ -231,3 +231,123 @@ nodes:
          the dirty-group flush at commit)"
     );
 }
+
+/// AC3 (partial): a multi-source Combine ingests records from BOTH
+/// driver and build sources, snapshots their per-source cursors at
+/// fold entry, and on a clean run leaves the surfaced cursors
+/// reflecting forward progress for the driver side. The snapshot
+/// machinery underpinning the AC3 cursor-rewind is in place; the
+/// rewind-on-failure path has no live trigger in today's executor
+/// because Combine errors propagate as `PipelineError::Internal`
+/// (FailFast), so this test exercises the capture half. The full
+/// AC3 rewind ships alongside the async-runtime work on #57 when
+/// Combine output failures gain a recoverable-DLQ path.
+#[test]
+fn ac3_combine_snapshot_capture_clean_run() {
+    let yaml = r#"
+pipeline:
+  name: ac3_combine_snapshot
+nodes:
+  - type: source
+    name: src_drv
+    config:
+      name: src_drv
+      type: csv
+      path: drv.csv
+      correlation_key: id
+      schema:
+        - { name: id, type: int }
+        - { name: amt, type: int }
+  - type: source
+    name: src_bld
+    config:
+      name: src_bld
+      type: csv
+      path: bld.csv
+      correlation_key: id
+      schema:
+        - { name: id, type: int }
+        - { name: dept, type: string }
+  - type: transform
+    name: passthrough
+    input: src_drv
+    config:
+      cxl: |
+        emit id = id
+        emit amt = amt
+  - type: combine
+    name: enriched
+    input:
+      d: passthrough
+      b: src_bld
+    config:
+      where: 'd.id == b.id'
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = d.id
+        emit amt = d.amt
+        emit dept = b.dept
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_drv".to_string(),
+            vec![slot("drv", "id,amt\n1,10\n2,20\n")],
+        ),
+        (
+            "src_bld".to_string(),
+            vec![slot("bld", "id,dept\n1,HR\n2,ENG\n")],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .unwrap();
+
+    assert!(
+        report.dlq_entries.is_empty(),
+        "clean Combine run produces no DLQ entries"
+    );
+    let output = buf.as_string();
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        2,
+        "every driver row matched a build row and reached the writer: {output}"
+    );
+
+    // Driver-side records flow through the passthrough Transform's
+    // clean branch, so `advance_cursor` fires for them. The cursor
+    // surfaces on the report as the highest committed row_num
+    // (per-source) at run completion.
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_drv"),
+        Some(&2),
+        "driver source advanced through both Transform clean exits"
+    );
+    // Build-side records flow straight from ingest into Combine's
+    // build buffer without traversing a forward operator that
+    // advances the cursor — sprint 7 wires advance at Transform /
+    // Route / Aggregate clean exits, and build-direct Source → Combine
+    // is none of those. The build source still PARTICIPATES in the
+    // Combine fold (verified by output row count) and the
+    // `combine_input_snapshots` capture inside the Combine arm reads
+    // an effective cursor of 0 for the build source (the seed value).
+    // A future advance-on-Combine-build-ingest wiring would surface
+    // src_bld here; tracked alongside the async-runtime restore on
+    // #57.
+    assert_eq!(report.per_source_rollback_cursors.get("src_bld"), None);
+}
