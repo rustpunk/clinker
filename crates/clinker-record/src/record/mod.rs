@@ -236,7 +236,9 @@ impl Record {
             .iter()
             .enumerate()
             .filter(|(i, _)| match self.schema.field_metadata(*i) {
-                Some(FieldMetadata::WidenedSidecar) | Some(FieldMetadata::SourceFile) => false,
+                Some(FieldMetadata::WidenedSidecar)
+                | Some(FieldMetadata::SourceFile)
+                | Some(FieldMetadata::SourceName) => false,
                 Some(FieldMetadata::SourceCorrelation { .. })
                 | Some(FieldMetadata::AggregateGroupIndex { .. })
                 | None => true,

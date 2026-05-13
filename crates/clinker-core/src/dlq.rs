@@ -98,6 +98,7 @@ pub fn write_dlq<W: Write>(
         "_cxl_dlq_id",
         "_cxl_dlq_timestamp",
         "_cxl_dlq_source_file",
+        "_cxl_dlq_source_name",
         "_cxl_dlq_source_row",
     ];
     if include_reason {
@@ -123,6 +124,7 @@ pub fn write_dlq<W: Write>(
             id,
             timestamp,
             source_file.to_string(),
+            entry.source_name.as_ref().to_string(),
             entry.source_row.to_string(),
         ];
 
@@ -163,7 +165,9 @@ fn dlq_user_columns(schema: &Schema) -> impl Iterator<Item = (usize, &str)> {
         .iter()
         .enumerate()
         .filter_map(|(i, c)| match schema.field_metadata(i) {
-            Some(FieldMetadata::WidenedSidecar) | Some(FieldMetadata::SourceFile) => None,
+            Some(FieldMetadata::WidenedSidecar)
+            | Some(FieldMetadata::SourceFile)
+            | Some(FieldMetadata::SourceName) => None,
             Some(FieldMetadata::SourceCorrelation { .. })
             | Some(FieldMetadata::AggregateGroupIndex { .. })
             | None => Some((i, c.as_ref())),
@@ -222,6 +226,7 @@ mod tests {
             stage: None,
             route: None,
             trigger: true,
+            source_name: Arc::from("test_source"),
         }
     }
 
@@ -244,14 +249,15 @@ mod tests {
         assert_eq!(columns[0], "_cxl_dlq_id");
         assert_eq!(columns[1], "_cxl_dlq_timestamp");
         assert_eq!(columns[2], "_cxl_dlq_source_file");
-        assert_eq!(columns[3], "_cxl_dlq_source_row");
-        assert_eq!(columns[4], "_cxl_dlq_error_category");
-        assert_eq!(columns[5], "_cxl_dlq_error_detail");
-        assert_eq!(columns[6], "_cxl_dlq_stage");
-        assert_eq!(columns[7], "_cxl_dlq_route");
-        assert_eq!(columns[8], "_cxl_dlq_trigger");
-        assert_eq!(columns[9], "name");
-        assert_eq!(columns[10], "value");
+        assert_eq!(columns[3], "_cxl_dlq_source_name");
+        assert_eq!(columns[4], "_cxl_dlq_source_row");
+        assert_eq!(columns[5], "_cxl_dlq_error_category");
+        assert_eq!(columns[6], "_cxl_dlq_error_detail");
+        assert_eq!(columns[7], "_cxl_dlq_stage");
+        assert_eq!(columns[8], "_cxl_dlq_route");
+        assert_eq!(columns[9], "_cxl_dlq_trigger");
+        assert_eq!(columns[10], "name");
+        assert_eq!(columns[11], "value");
     }
 
     #[test]
@@ -470,6 +476,7 @@ mod tests {
             stage: None,
             route: None,
             trigger: true,
+            source_name: Arc::from("test_source"),
         }];
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -477,11 +484,13 @@ mod tests {
 
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
-        // Source fields in schema order (zulu, alpha, mike), not alphabetical
-        // Columns 6-8 are _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger
-        assert_eq!(columns[9], "zulu");
-        assert_eq!(columns[10], "alpha");
-        assert_eq!(columns[11], "mike");
+        // Source fields in schema order (zulu, alpha, mike), not alphabetical.
+        // Columns 0-4 are the prelude (_cxl_dlq_id / timestamp / source_file /
+        // source_name / source_row); 5-6 are error category/detail; 7-9 are
+        // stage/route/trigger.
+        assert_eq!(columns[10], "zulu");
+        assert_eq!(columns[11], "alpha");
+        assert_eq!(columns[12], "mike");
     }
 
     #[test]
@@ -576,6 +585,7 @@ mod tests {
             stage: None,
             route: None,
             trigger: true,
+            source_name: Arc::from("test_source"),
         };
         let mut buf = Vec::new();
         write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();

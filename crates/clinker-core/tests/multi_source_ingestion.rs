@@ -136,6 +136,118 @@ nodes:
     }
 }
 
+/// Engine-stamped `$source.name` survives a Merge: every record
+/// emitted from `[src_a, src_b] → merge → tfm → out` carries the
+/// originating Source-node's name, even though both Sources share the
+/// same column shape and downstream operators cannot distinguish them
+/// by schema identity alone. Closes the lineage gap that schema-match
+/// peer Sources left open at the silent-corruption root of #47.
+#[test]
+fn merge_preserves_source_name_per_record() {
+    let yaml = r#"
+pipeline:
+  name: merge_source_name
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: merge
+    name: merged
+    inputs: [src_a, src_b]
+  - type: transform
+    name: stamp
+    input: merged
+    config:
+      cxl: |
+        emit id = id
+        emit tag = tag
+        emit origin = $source.name
+  - type: output
+    name: out
+    input: stamp
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n")],
+        ),
+        (
+            "src_b".to_string(),
+            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n")],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("merge_preserves_source_name pipeline must execute");
+    assert_eq!(report.counters.total_count, 4);
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let output = buf.as_string();
+    let header = output.lines().next().expect("header line");
+    let columns: Vec<&str> = header.split(',').collect();
+    let id_col = columns.iter().position(|c| *c == "id").expect("id col");
+    let origin_col = columns
+        .iter()
+        .position(|c| *c == "origin")
+        .expect("origin col");
+    // Default Output projection strips engine-stamped columns; the
+    // `$source.name` value only reaches the writer because the
+    // Transform's `emit origin = $source.name` materialized it into
+    // the user-facing `origin` column.
+    assert!(
+        !columns.contains(&"$source.name"),
+        "$source.name must be filtered from default Output projection; columns: {columns:?}"
+    );
+
+    let body: Vec<Vec<&str>> = output
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').collect())
+        .collect();
+    assert_eq!(body.len(), 4, "expected 4 records, got:\n{output}");
+    for row in &body {
+        let id: i64 = row[id_col].parse().expect("id parses");
+        let origin = row[origin_col];
+        if (1..=2).contains(&id) {
+            assert_eq!(
+                origin, "src_a",
+                "id={id} originated from src_a; got origin={origin}"
+            );
+        } else if (10..=11).contains(&id) {
+            assert_eq!(
+                origin, "src_b",
+                "id={id} originated from src_b; got origin={origin}"
+            );
+        } else {
+            panic!("unexpected id {id} in output:\n{output}");
+        }
+    }
+}
+
 /// Topology 2 — `src_a → tfm_a → out_a`, `src_b → tfm_b → out_b`. The
 /// two chains are wholly disjoint at the DAG level; the bug pre-fix
 /// was that `src_b`'s dispatch silently emitted `src_a`'s records,

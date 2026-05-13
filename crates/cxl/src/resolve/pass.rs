@@ -77,6 +77,7 @@ const SOURCE_MEMBERS: &[&str] = &[
     "count",
     "batch",
     "ingestion_timestamp",
+    "name",
 ];
 
 /// Run Phase B: resolve all identifiers in the program.
@@ -823,6 +824,16 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
         assert!(has_binding, "Expected binding for $source.file");
+    }
+
+    #[test]
+    fn test_resolve_source_name() {
+        let resolved = resolve_ok("emit n = $source.name", &[]);
+        let has_binding = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(has_binding, "Expected builtin binding for $source.name");
     }
 
     #[test]

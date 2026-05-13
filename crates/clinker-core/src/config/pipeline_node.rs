@@ -796,6 +796,14 @@ pub const WIDENED_SIDECAR_COLUMN: &str = "$widened";
 /// merges instead of via an external row-keyed array.
 pub const SOURCE_FILE_COLUMN: &str = "$source.file";
 
+/// Stable column name for the per-record Source-node identity stamp.
+/// Every Source's bound schema carries one such tail-appended slot;
+/// ingest stamps a shared `Arc<str>` of the originating Source's name
+/// so `$source.name` resolves per-record through merges — the case
+/// schema identity alone cannot answer when peer Sources share a
+/// column shape (the silent-corruption topology at the root of #47).
+pub const SOURCE_NAME_COLUMN: &str = "$source.name";
+
 /// Transform variant body. The new shape: a mandatory `cxl:` field
 /// carrying the CXL source as a `CxlSource` (so it captures its YAML
 /// span where serde-saphyr can deliver one), plus the row-level

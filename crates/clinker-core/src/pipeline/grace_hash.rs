@@ -910,6 +910,7 @@ pub(crate) fn execute_combine_grace_hash(
             source_count: ctx.source_count,
             source_batch: ctx.source_batch,
             ingestion_timestamp: ctx.ingestion_timestamp,
+            source_name: ctx.source_name,
         };
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
         probe_keys_buf.clear();
@@ -1350,6 +1351,7 @@ fn process_spilled_partition(
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch,
                 ingestion_timestamp: ctx.ingestion_timestamp,
+                source_name: ctx.source_name,
             };
             let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
             probe_keys_buf.clear();
@@ -1559,6 +1561,7 @@ fn bnl_fallback(
                     source_count: rc.ctx.source_count,
                     source_batch: rc.ctx.source_batch,
                     ingestion_timestamp: rc.ctx.ingestion_timestamp,
+                    source_name: rc.ctx.source_name,
                 };
                 let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
                 probe_keys_buf.clear();
