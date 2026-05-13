@@ -57,7 +57,7 @@ nodes:
     include_widened: true
 "#;
 
-fn run(csv: &str) -> String {
+async fn run(csv: &str) -> String {
     let config = crate::config::parse_config(ANY_ALL_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
@@ -79,12 +79,13 @@ fn run(csv: &str) -> String {
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+        .await
         .expect("pipeline must run");
     buf.as_string()
 }
 
-#[test]
-fn any_all_window_predicates_partition_scoped() {
+#[tokio::test(flavor = "multi_thread")]
+async fn any_all_window_predicates_partition_scoped() {
     // Two partitions:
     //   HR  scores = [10, 20, 30]   → > 25: [F, F, T] → any=T, all=F
     //                                  < 25: [T, T, F] → any=T, all=F
@@ -100,7 +101,7 @@ ENG,b,60
 ENG,c,70
 ";
 
-    let out = run(csv);
+    let out = run(csv).await;
     let mut lines = out.lines();
     let header_line = lines.next().expect("header");
     let headers: Vec<&str> = header_line.split(',').collect();

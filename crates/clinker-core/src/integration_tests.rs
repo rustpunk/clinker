@@ -8,7 +8,7 @@ mod tests {
     use clinker_bench_support::io::SharedBuffer;
 
     /// Helper: run executor with in-memory CSV input/output.
-    fn run_pipeline(
+    async fn run_pipeline(
         yaml: &str,
         csv_input: &str,
     ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -39,7 +39,8 @@ mod tests {
         };
 
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+                .await?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
@@ -85,8 +86,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_exit_code_0_success() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_exit_code_0_success() {
         let yaml = r#"
 pipeline:
   name: success
@@ -110,7 +111,7 @@ nodes:
     include_widened: true
 "#;
         let csv = "name,age\nAlice,30\nBob,25\n";
-        let result = run_pipeline(yaml, csv);
+        let result = run_pipeline(yaml, csv).await;
         assert_eq!(exit_code(&result), 0);
     }
 
@@ -127,8 +128,8 @@ nodes:
         assert!(matches!(err, PipelineError::Config(_)));
     }
 
-    #[test]
-    fn test_exit_code_2_partial_success() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_exit_code_2_partial_success() {
         let yaml = r#"
 pipeline:
   name: partial
@@ -161,12 +162,12 @@ nodes:
     include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
-        let result = run_pipeline(yaml, csv);
+        let result = run_pipeline(yaml, csv).await;
         assert_eq!(exit_code(&result), 2);
     }
 
-    #[test]
-    fn test_exit_code_3_fatal_data_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_exit_code_3_fatal_data_error() {
         let yaml = r#"
 pipeline:
   name: fatal
@@ -199,12 +200,12 @@ nodes:
     include_widened: true
 "#;
         let csv = "value\n10\nbad\n20\n";
-        let result = run_pipeline(yaml, csv);
+        let result = run_pipeline(yaml, csv).await;
         assert_eq!(exit_code(&result), 3);
     }
 
-    #[test]
-    fn test_end_to_end_csv_transform() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_end_to_end_csv_transform() {
         let yaml = r#"
 pipeline:
   name: end-to-end
@@ -253,7 +254,7 @@ nodes:
                     Bob,Jones,Marketing,67890\n\
                     Charlie,Brown,Engineering,11111\n";
 
-        let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+        let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
 
         // Verify counters
         assert_eq!(counters.total_count, 3);
@@ -377,14 +378,14 @@ nodes:
 
     // ── Filter tests ──────────────────────────────────────────────
 
-    #[test]
-    fn test_filter_simple_predicate() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_simple_predicate() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 emit out_name = name"#,
         );
         let csv = "name,status\nAlice,active\nBob,inactive\nCharlie,active\n";
-        let (counters, dlq, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, dlq, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.total_count, 3);
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.filtered_count, 1);
@@ -395,22 +396,22 @@ emit out_name = name"#,
         assert!(!output.contains("Bob"));
     }
 
-    #[test]
-    fn test_filter_compound_and_or() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_compound_and_or() {
         let yaml = filter_yaml(
             r#"filter amount.to_int() > 100 or priority == "high"
 emit out_name = name
 emit out_amount = amount"#,
         );
         let csv = "name,amount,priority\nA,200,low\nB,50,high\nC,30,low\nD,150,medium\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 3); // A(200>100), B(high), D(150>100)
         assert_eq!(counters.filtered_count, 1); // C(30,low)
         assert!(!output.contains(",C,"));
     }
 
-    #[test]
-    fn test_filter_with_let_binding() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_with_let_binding() {
         let yaml = filter_yaml(
             r#"let derived = amount.to_int() * 2
 filter derived > 500
@@ -418,34 +419,34 @@ emit out_name = name
 emit derived = derived"#,
         );
         let csv = "name,amount\nAlice,300\nBob,200\nCharlie,400\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 2); // Alice(600), Charlie(800)
         assert_eq!(counters.filtered_count, 1); // Bob(400)
         assert!(output.contains("Alice"));
         assert!(!output.contains("Bob"));
     }
 
-    #[test]
-    fn test_filter_null_field_skips() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_null_field_skips() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 emit out_name = name"#,
         );
         let csv = "name,status\nAlice,active\nBob,\nCharlie,active\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.filtered_count, 1); // Bob has empty status → null == "active" is false
         assert!(!output.contains("Bob"));
     }
 
-    #[test]
-    fn test_filter_all_rows_filtered() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_all_rows_filtered() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 emit out_name = name"#,
         );
         let csv = "name,status\nAlice,inactive\nBob,inactive\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.total_count, 2);
         assert_eq!(counters.ok_count, 0);
         assert_eq!(counters.filtered_count, 2);
@@ -454,15 +455,15 @@ emit out_name = name"#,
         assert!(lines.len() <= 1); // Just header or empty
     }
 
-    #[test]
-    fn test_filter_multiple_filters_short_circuit() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_multiple_filters_short_circuit() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 filter amount.to_int() > 100
 emit out_name = name"#,
         );
         let csv = "name,status,amount\nAlice,active,200\nBob,inactive,300\nCharlie,active,50\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 1); // Only Alice passes both
         assert_eq!(counters.filtered_count, 2); // Bob(first filter), Charlie(second filter)
         assert!(output.contains("Alice"));
@@ -470,14 +471,14 @@ emit out_name = name"#,
         assert!(!output.contains("Charlie"));
     }
 
-    #[test]
-    fn test_filter_three_valued_or_with_null() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_three_valued_or_with_null() {
         let yaml = filter_yaml(
             r#"filter optional == "yes" or required == "yes"
 emit out_name = name"#,
         );
         let csv = "name,optional,required\nA,,yes\nB,,no\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         // A: null or true → true (passes)
         // B: null or false → null (filtered)
         assert_eq!(counters.ok_count, 1);
@@ -487,15 +488,15 @@ emit out_name = name"#,
 
     // ── Distinct tests ────────────────────────────────────────────
 
-    #[test]
-    fn test_distinct_by_single_field() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_by_single_field() {
         let yaml = filter_yaml(
             r#"distinct by id
 emit out_id = id
 emit out_name = name"#,
         );
         let csv = "id,name\n1,Alice\n2,Bob\n1,Charlie\n3,Dave\n2,Eve\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 3); // 1,2,3
         assert_eq!(counters.distinct_count, 2); // duplicate 1 and 2
         assert!(output.contains("Alice")); // first occurrence of id=1
@@ -505,43 +506,43 @@ emit out_name = name"#,
         assert!(!output.contains("Eve")); // duplicate id=2
     }
 
-    #[test]
-    fn test_distinct_bare_all_fields() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_bare_all_fields() {
         let yaml = filter_yaml(
             r#"distinct
 emit out_name = name
 emit out_dept = dept"#,
         );
         let csv = "name,dept\nAlice,Eng\nBob,Sales\nAlice,Eng\nBob,HR\n";
-        let (counters, _, _output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 3); // Alice+Eng, Bob+Sales, Bob+HR are unique
         assert_eq!(counters.distinct_count, 1); // Alice+Eng duplicate
     }
 
-    #[test]
-    fn test_distinct_by_let_binding() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_by_let_binding() {
         let yaml = filter_yaml(
             r#"let full = first + " " + last
 distinct by full
 emit full = full"#,
         );
         let csv = "first,last\nAlice,Smith\nBob,Jones\nAlice,Smith\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.distinct_count, 1);
         assert!(output.contains("Alice Smith"));
         assert!(output.contains("Bob Jones"));
     }
 
-    #[test]
-    fn test_distinct_null_field_deduplicates() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_null_field_deduplicates() {
         let yaml = filter_yaml(
             r#"distinct by id
 emit out_id = id
 emit out_name = name"#,
         );
         let csv = "id,name\n1,Alice\n,Bob\n,Charlie\n2,Dave\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         // null id: Bob is first, Charlie is duplicate (NULL = NULL)
         assert_eq!(counters.ok_count, 3); // 1, null(Bob), 2
         assert_eq!(counters.distinct_count, 1); // null(Charlie)
@@ -549,15 +550,15 @@ emit out_name = name"#,
         assert!(!output.contains("Charlie"));
     }
 
-    #[test]
-    fn test_distinct_preserves_first_fields() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_preserves_first_fields() {
         let yaml = filter_yaml(
             r#"distinct by id
 emit out_id = id
 emit out_value = value"#,
         );
         let csv = "id,value\nA,100\nB,200\nA,999\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 2);
         assert!(
             output.contains("A,100") || output.contains("A,\"100\"") || output.contains(",100")
@@ -565,15 +566,15 @@ emit out_value = value"#,
         assert!(!output.contains("999")); // second A is dropped
     }
 
-    #[test]
-    fn test_distinct_mixed_type_field() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_mixed_type_field() {
         // String "1" vs numeric "1" — both are strings in CSV
         let yaml = filter_yaml(
             r#"distinct by code
 emit out_code = code"#,
         );
         let csv = "code\n1\n01\n1\n";
-        let (counters, _, _output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, csv).await.unwrap();
         // "1" and "01" are different strings → both kept. Second "1" is duplicate.
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.distinct_count, 1);
@@ -581,8 +582,8 @@ emit out_code = code"#,
 
     // ── Combined filter + distinct ────────────────────────────────
 
-    #[test]
-    fn test_filter_then_distinct() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_then_distinct() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 distinct by dept
@@ -594,7 +595,7 @@ emit out_dept = dept"#,
                    Bob,inactive,Eng\n\
                    Charlie,active,Eng\n\
                    Dave,active,Sales\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         // Bob filtered. Alice first active Eng. Charlie dup active Eng. Dave first active Sales.
         assert_eq!(counters.ok_count, 2); // Alice, Dave
         assert_eq!(counters.filtered_count, 1); // Bob
@@ -605,8 +606,8 @@ emit out_dept = dept"#,
         assert!(!output.contains("Charlie"));
     }
 
-    #[test]
-    fn test_distinct_then_filter() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_then_filter() {
         let yaml = filter_yaml(
             r#"distinct by dept
 filter status == "active"
@@ -617,7 +618,7 @@ emit out_dept = dept"#,
                    Alice,inactive,Eng\n\
                    Bob,active,Sales\n\
                    Charlie,active,Eng\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         // Alice: first Eng (distinct passes), but inactive (filter rejects)
         // Bob: first Sales (distinct passes), active (filter passes)
         // Charlie: dup Eng (distinct rejects)
@@ -629,8 +630,8 @@ emit out_dept = dept"#,
         assert!(!output.contains("Charlie"));
     }
 
-    #[test]
-    fn test_filter_distinct_combined_counters() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_distinct_combined_counters() {
         let yaml = filter_yaml(
             r#"filter status == "active"
 distinct by dept
@@ -642,7 +643,7 @@ emit out_name = name"#,
                    C,active,Eng\n\
                    D,active,Sales\n\
                    E,inactive,Sales\n";
-        let (counters, _, _) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, _) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.total_count, 5);
         assert_eq!(counters.ok_count, 2); // A, D
         assert_eq!(counters.filtered_count, 2); // B, E
@@ -660,8 +661,8 @@ emit out_name = name"#,
 
     // ── Stats + streaming tests ───────────────────────────────────
 
-    #[test]
-    fn test_streaming_filter_basic() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_filter_basic() {
         // Streaming mode (no windows) — filter should work
         let yaml = filter_yaml(
             r#"filter amount.to_int() > 100
@@ -669,7 +670,7 @@ emit out_name = name
 emit out_amount = amount"#,
         );
         let csv = "name,amount\nAlice,200\nBob,50\nCharlie,150\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.filtered_count, 1);
         assert!(output.contains("Alice"));
@@ -677,8 +678,8 @@ emit out_amount = amount"#,
         assert!(!output.contains("Bob"));
     }
 
-    #[test]
-    fn test_streaming_distinct_global() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_distinct_global() {
         // Streaming mode — global distinct (no windows)
         let yaml = filter_yaml(
             r#"distinct by category
@@ -686,7 +687,7 @@ emit out_category = category
 emit out_first_item = name"#,
         );
         let csv = "name,category\nApple,Fruit\nBanana,Fruit\nCarrot,Veg\nDate,Fruit\nEgg,Protein\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         assert_eq!(counters.ok_count, 3); // Fruit, Veg, Protein
         assert_eq!(counters.distinct_count, 2); // Banana, Date
         assert!(output.contains("Apple")); // first Fruit
@@ -694,8 +695,8 @@ emit out_first_item = name"#,
         assert!(output.contains("Egg"));
     }
 
-    #[test]
-    fn test_filter_distinct_order_matters_state() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_distinct_order_matters_state() {
         // A(active), A(inactive), B(active), B(active)
         // distinct by name → filter active
         let yaml = filter_yaml(
@@ -704,7 +705,7 @@ filter status == "active"
 emit out_name = name"#,
         );
         let csv = "name,status\nA,active\nA,inactive\nB,active\nB,active\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, output) = run_pipeline(&yaml, csv).await.unwrap();
         // A first: distinct passes, filter passes → emit
         // A second: distinct rejects (dup)
         // B first: distinct passes, filter passes → emit
@@ -716,8 +717,8 @@ emit out_name = name"#,
         assert!(output.contains("B"));
     }
 
-    #[test]
-    fn test_filter_error_in_predicate_routes_to_dlq() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_filter_error_in_predicate_routes_to_dlq() {
         let yaml = r#"
 pipeline:
   name: filter_err
@@ -754,7 +755,7 @@ nodes:
     include_widened: true
 "#;
         let csv = "name,amount\nAlice,10\nBob,bad\nCharlie,5\n";
-        let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+        let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
         // Bob: "bad".to_int() → error → DLQ
         assert_eq!(counters.ok_count, 2);
         assert_eq!(counters.dlq_count, 1);
@@ -763,8 +764,8 @@ nodes:
         assert!(output.contains("Charlie"));
     }
 
-    #[test]
-    fn test_distinct_high_cardinality() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_high_cardinality() {
         let yaml = filter_yaml(
             r#"distinct by id
 emit out_id = id"#,
@@ -773,21 +774,21 @@ emit out_id = id"#,
         for i in 0..1000 {
             csv.push_str(&format!("{}\n", i % 100)); // 100 unique, 900 duplicates
         }
-        let (counters, _, _) = run_pipeline(&yaml, &csv).unwrap();
+        let (counters, _, _) = run_pipeline(&yaml, &csv).await.unwrap();
         assert_eq!(counters.ok_count, 100);
         assert_eq!(counters.distinct_count, 900);
         assert_eq!(counters.total_count, 1000);
     }
 
-    #[test]
-    fn test_distinct_empty_string_vs_null() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_distinct_empty_string_vs_null() {
         let yaml = filter_yaml(
             r#"distinct by code
 emit out_code = code"#,
         );
         // Use quoted empty strings to be explicit
         let csv = "code\n\"\"\nfoo\n\"\"\nbar\n";
-        let (counters, _, _output) = run_pipeline(&yaml, &csv).unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, &csv).await.unwrap();
         // Row 1: empty string "", Row 2: "foo", Row 3: empty string "" (dup), Row 4: "bar"
         assert_eq!(counters.ok_count, 3); // "", "foo", "bar"
         assert_eq!(counters.distinct_count, 1); // second ""
@@ -807,8 +808,8 @@ emit out_code = code"#,
     /// would be a regression surface (the previous non-primary preload
     /// passes returned `Ok(None)` on missing readers; with one
     /// unified ingest pass that's no longer a defensible default).
-    #[test]
-    fn test_run_with_readers_writers_rejects_primary_missing_from_readers() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_run_with_readers_writers_rejects_primary_missing_from_readers() {
         let yaml = r#"
 pipeline:
   name: single_source
@@ -852,7 +853,8 @@ nodes:
         };
 
         let result =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+                .await;
 
         match result {
             Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
@@ -876,8 +878,8 @@ nodes:
     /// is no "primary" — every source is ingested through
     /// `SourceStream` and dispatch order follows the plan topology,
     /// so declaration order is irrelevant.
-    #[test]
-    fn test_run_with_readers_writers_primary_is_not_first_source() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_run_with_readers_writers_primary_is_not_first_source() {
         let yaml = r#"
 pipeline:
   name: primary_not_first
@@ -971,6 +973,7 @@ nodes:
 
         let report =
             PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+                .await
                 .expect("pipeline must execute regardless of source declaration order");
 
         assert_eq!(

@@ -41,8 +41,8 @@ nodes:
       include_widened: true
 "#;
 
-#[test]
-fn dispatch_routes_records_to_per_file_writers() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_routes_records_to_per_file_writers() {
     let config = parse_config(YAML).unwrap();
     let plan = config
         .compile(&CompileContext::default())
@@ -104,6 +104,7 @@ fn dispatch_routes_records_to_per_file_writers() {
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .await
         .expect("run pipeline");
     assert_eq!(report.counters.total_count, 3);
 

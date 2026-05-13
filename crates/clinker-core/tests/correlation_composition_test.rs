@@ -65,7 +65,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
+async fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
@@ -88,12 +88,13 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
 
-#[test]
-fn composition_body_propagates_correlation_dlq() {
+#[tokio::test(flavor = "multi_thread")]
+async fn composition_body_propagates_correlation_dlq() {
     // Source → composition(correlated_validate) → output. The body's
     // single Transform runs `value.to_int()`; the bad row in group A
     // surfaces a transform error inside the body. The dispatcher
@@ -145,7 +146,7 @@ nodes:
       include_widened: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let (report, output) = run_with_composition(yaml, csv);
+    let (report, output) = run_with_composition(yaml, csv).await;
 
     assert_eq!(
         report.counters.dlq_count, 3,
@@ -186,8 +187,8 @@ nodes:
     );
 }
 
-#[test]
-fn composition_body_key_rewrite_does_not_change_group_identity() {
+#[tokio::test(flavor = "multi_thread")]
+async fn composition_body_key_rewrite_does_not_change_group_identity() {
     // Source → composition(correlated_rewrite) → output. The body's
     // Transform overwrites `employee_id` to a fixed string before the
     // `value.to_int()` failure fires. Group identity is captured at
@@ -233,7 +234,7 @@ nodes:
       include_widened: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
-    let (report, _output) = run_with_composition(yaml, csv);
+    let (report, _output) = run_with_composition(yaml, csv).await;
 
     assert_eq!(
         report.counters.dlq_count, 3,

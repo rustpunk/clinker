@@ -430,10 +430,16 @@ fn test_cap_override() -> Option<usize> {
 }
 
 /// Run `body` with the cascading-retraction loop cap forced to `cap`.
-/// Test-only; the override unsets on exit so a panicking body cannot
-/// leak the override into a sibling test on the same thread.
+/// Test-only; the override unsets on exit so a panicking body — or an
+/// awaiter cancellation — cannot leak the override into a sibling test
+/// on the same thread. `body` returns a future so the cap remains in
+/// effect for the entire awaited execution.
 #[cfg(test)]
-pub(crate) fn with_test_loop_cap<R>(cap: usize, body: impl FnOnce() -> R) -> R {
+pub(crate) async fn with_test_loop_cap<R, F, Fut>(cap: usize, body: F) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
     struct Guard {
         prev: Option<usize>,
     }
@@ -444,5 +450,5 @@ pub(crate) fn with_test_loop_cap<R>(cap: usize, body: impl FnOnce() -> R) -> R {
     }
     let prev = TEST_LOOP_CAP.with(|c| c.replace(Some(cap)));
     let _guard = Guard { prev };
-    body()
+    body().await
 }

@@ -98,7 +98,7 @@ fn read_demo_csv(name: &str) -> String {
 /// Run the demo pipeline against the supplied orders/audit_events CSV
 /// payloads. Audit events stream is held constant; orders is the dial
 /// the test turns to flip between the full input and the baseline.
-fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, String) {
+async fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, String) {
     let yaml = read_demo_yaml();
     let config: PipelineConfig = parse_config(&yaml).expect("parse demo pipeline");
 
@@ -148,6 +148,7 @@ fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Strin
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .await
         .expect("demo pipeline run");
     (report, report_buf.as_string())
 }
@@ -211,15 +212,15 @@ fn demo_files_present() {
 /// so DLQ entries shrink to a strict subset between baseline and
 /// retract: baseline emits only the post-aggregate triggers; the
 /// retract run additionally emits the upstream sentinel entry.
-#[test]
-fn demo_retract_output_matches_baseline_rerun() {
+#[tokio::test(flavor = "multi_thread")]
+async fn demo_retract_output_matches_baseline_rerun() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
     let baseline_orders = drop_orders(&orders, &["O08"]);
 
-    let (retract_report, retract_output) = run_demo(&orders, &audit_events);
-    let (baseline_report, baseline_output) = run_demo(&baseline_orders, &audit_events);
+    let (retract_report, retract_output) = run_demo(&orders, &audit_events).await;
+    let (baseline_report, baseline_output) = run_demo(&baseline_orders, &audit_events).await;
 
     // Baseline still surfaces the post-aggregate dept_validate
     // triggers because their predicate fires on every HR group whose
@@ -252,12 +253,12 @@ fn demo_retract_output_matches_baseline_rerun() {
 /// test) — those source rows do not need to land as separate
 /// collateral entries because the post-retract aggregate output
 /// already excludes them.
-#[test]
-fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
+#[tokio::test(flavor = "multi_thread")]
+async fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
-    let (report, _output) = run_demo(&orders, &audit_events);
+    let (report, _output) = run_demo(&orders, &audit_events).await;
 
     let upstream_trigger = report.dlq_entries.iter().find(|e| {
         e.trigger
@@ -303,12 +304,12 @@ fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
 /// window) exercises every retraction pathway in a single run.
 /// `degrade_fallback_count` stays at zero — the per-group memory
 /// pressure is well below the orchestrator's degrade threshold.
-#[test]
-fn demo_retraction_counters_fire_in_the_expected_direction() {
+#[tokio::test(flavor = "multi_thread")]
+async fn demo_retraction_counters_fire_in_the_expected_direction() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
-    let (report, _output) = run_demo(&orders, &audit_events);
+    let (report, _output) = run_demo(&orders, &audit_events).await;
     let r = &report.counters.retraction;
 
     // Aggregate retract path: relaxed-CK aggregator's recompute phase

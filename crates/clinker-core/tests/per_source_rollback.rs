@@ -53,8 +53,8 @@ fn run_params() -> PipelineRunParams {
 /// a single trigger (src_b id=1) and src_a id=1 spared (different
 /// source). Same for `id=2`. Two trigger DLQs total; both src_a rows
 /// reach the output.
-#[test]
-fn ac2_collateral_narrowing_spares_other_source() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac2_collateral_narrowing_spares_other_source() {
     let yaml = r#"
 pipeline:
   name: ac2_collateral_narrowing
@@ -111,6 +111,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     let dlq_by_source: HashMap<&str, usize> =
@@ -156,8 +157,8 @@ nodes:
 /// failing source. The pre-sprint-7 collateral DLQ behavior must be
 /// bit-identical. Both `bad` and the co-grouped `good` row of group
 /// `id=1` land in DLQ — the narrowing branch never spares anything.
-#[test]
-fn ac4_single_source_regression_unchanged() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac4_single_source_regression_unchanged() {
     let yaml = r#"
 pipeline:
   name: ac4_single_source
@@ -202,6 +203,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
@@ -242,8 +244,8 @@ nodes:
 /// (FailFast), so this test exercises the capture half. The full
 /// AC3 rewind ships alongside the async-runtime work on #57 when
 /// Combine output failures gain a recoverable-DLQ path.
-#[test]
-fn ac3_combine_snapshot_capture_clean_run() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_combine_snapshot_capture_clean_run() {
     let yaml = r#"
 pipeline:
   name: ac3_combine_snapshot
@@ -315,6 +317,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     assert!(

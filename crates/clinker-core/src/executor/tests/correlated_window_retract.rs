@@ -46,7 +46,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-fn run_pipeline(
+async fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -75,7 +75,8 @@ fn run_pipeline(
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .await?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -231,13 +232,15 @@ nodes:
 ///    body lines) to a baseline run with the failing rows omitted.
 /// 3. At least one DLQ entry was emitted (so the retraction protocol
 ///    actually fired).
-fn run_window_retract_case(case_name: &str, window_emit: &str, retract_kind: RetractKind) {
+async fn run_window_retract_case(case_name: &str, window_emit: &str, retract_kind: RetractKind) {
     let yaml = build_yaml(window_emit);
     let (full_csv, baseline_csv) = build_inputs(retract_kind);
 
     let (counters, dlq, output) = run_pipeline(&yaml, full_csv)
+        .await
         .unwrap_or_else(|e| panic!("[{case_name}] retract pipeline failed: {e:?}"));
     let (_, _, baseline_output) = run_pipeline(&yaml, baseline_csv)
+        .await
         .unwrap_or_else(|e| panic!("[{case_name}] baseline pipeline failed: {e:?}"));
 
     assert!(
@@ -279,184 +282,204 @@ const WINDOW_CASES: &[(&str, &str)] = &[
     ("collect", "emit w_collected = $window.collect(amount)"),
 ];
 
-#[test]
-fn window_sum_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_sum_single_row_retract() {
     run_window_retract_case(
         "sum:single",
         "emit w_total = $window.sum(amount)",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_sum_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_sum_full_partition_retract() {
     run_window_retract_case(
         "sum:full",
         "emit w_total = $window.sum(amount)",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_count_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_count_single_row_retract() {
     run_window_retract_case(
         "count:single",
         "emit w_count = $window.count()",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_count_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_count_full_partition_retract() {
     run_window_retract_case(
         "count:full",
         "emit w_count = $window.count()",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_avg_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_avg_single_row_retract() {
     run_window_retract_case(
         "avg:single",
         "emit w_avg = $window.avg(amount)",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_avg_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_avg_full_partition_retract() {
     run_window_retract_case(
         "avg:full",
         "emit w_avg = $window.avg(amount)",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_min_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_min_single_row_retract() {
     run_window_retract_case(
         "min:single",
         "emit w_min = $window.min(amount)",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_min_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_min_full_partition_retract() {
     run_window_retract_case(
         "min:full",
         "emit w_min = $window.min(amount)",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_max_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_max_single_row_retract() {
     run_window_retract_case(
         "max:single",
         "emit w_max = $window.max(amount)",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_max_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_max_full_partition_retract() {
     run_window_retract_case(
         "max:full",
         "emit w_max = $window.max(amount)",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_first_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_first_single_row_retract() {
     run_window_retract_case(
         "first:single",
         "emit w_first_emp = $window.first().emp_id",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_first_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_first_full_partition_retract() {
     run_window_retract_case(
         "first:full",
         "emit w_first_emp = $window.first().emp_id",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_last_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_last_single_row_retract() {
     run_window_retract_case(
         "last:single",
         "emit w_last_emp = $window.last().emp_id",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_last_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_last_full_partition_retract() {
     run_window_retract_case(
         "last:full",
         "emit w_last_emp = $window.last().emp_id",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_lag_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_lag_single_row_retract() {
     run_window_retract_case(
         "lag:single",
         "emit w_lag_emp = $window.lag(1).emp_id",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_lag_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_lag_full_partition_retract() {
     run_window_retract_case(
         "lag:full",
         "emit w_lag_emp = $window.lag(1).emp_id",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_lead_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_lead_single_row_retract() {
     run_window_retract_case(
         "lead:single",
         "emit w_lead_emp = $window.lead(1).emp_id",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_lead_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_lead_full_partition_retract() {
     run_window_retract_case(
         "lead:full",
         "emit w_lead_emp = $window.lead(1).emp_id",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_collect_single_row_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_collect_single_row_retract() {
     run_window_retract_case(
         "collect:single",
         "emit w_collected = $window.collect(amount)",
         RetractKind::SingleRow,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn window_collect_full_partition_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_collect_full_partition_retract() {
     run_window_retract_case(
         "collect:full",
         "emit w_collected = $window.collect(amount)",
         RetractKind::FullPartition,
-    );
+    )
+    .await;
 }
 
 /// `lag(2)` and `lead(2)` near a partition boundary: the existing
@@ -466,15 +489,19 @@ fn window_collect_full_partition_retract() {
 /// bit-for-bit baseline equivalence over a fixture where the bad row
 /// sits inside the lag/lead reach window of the partition's first /
 /// last surviving rows.
-#[test]
-fn window_lag2_and_lead2_boundary_retract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn window_lag2_and_lead2_boundary_retract() {
     let yaml = build_yaml(
         "emit w_lag2 = $window.lag(2).emp_id\n      emit w_lead2 = $window.lead(2).emp_id",
     );
     let (full_csv, baseline_csv) = build_inputs(RetractKind::SingleRow);
 
-    let (counters, dlq, output) = run_pipeline(&yaml, full_csv).expect("retract pipeline");
-    let (_, _, baseline_output) = run_pipeline(&yaml, baseline_csv).expect("baseline pipeline");
+    let (counters, dlq, output) = run_pipeline(&yaml, full_csv)
+        .await
+        .expect("retract pipeline");
+    let (_, _, baseline_output) = run_pipeline(&yaml, baseline_csv)
+        .await
+        .expect("baseline pipeline");
 
     assert!(
         !dlq.is_empty(),
@@ -523,8 +550,8 @@ fn window_matrix_covers_each_lattice_cell() {
 /// planner must not flip `requires_buffer_recompute` on. The pipeline
 /// runs through the streaming-emit window path and produces the same
 /// output the streaming-emit path always has.
-#[test]
-fn non_relaxed_window_pipeline_unaffected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn non_relaxed_window_pipeline_unaffected() {
     let yaml = r#"
 pipeline:
   name: window_no_retract
@@ -560,7 +587,9 @@ nodes:
     include_widened: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE5,ENG,100\nE6,ENG,200\n";
-    let (counters, dlq, output) = run_pipeline(yaml, csv).expect("non-relaxed pipeline runs");
+    let (counters, dlq, output) = run_pipeline(yaml, csv)
+        .await
+        .expect("non-relaxed pipeline runs");
     assert_eq!(counters.dlq_count, 0);
     assert!(dlq.is_empty());
     // Sum per partition: HR = 30, ENG = 300. Every input row appears
@@ -576,8 +605,8 @@ nodes:
 /// to baseline; only HR rows participate in the recompute. This is
 /// the bit-for-bit ENG-side check that buffer recompute does not leak
 /// retraction effects across partition boundaries.
-#[test]
-fn cross_partition_isolation_only_affected_partition_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_partition_isolation_only_affected_partition_changes() {
     let yaml = build_yaml("emit w_count = $window.count()");
     let csv = "emp_id,dept,amount\n\
                E1,HR,10\n\
@@ -591,8 +620,10 @@ fn cross_partition_isolation_only_affected_partition_changes() {
                         E5,ENG,100\n\
                         E6,ENG,200\n";
 
-    let (_, _, output) = run_pipeline(&yaml, csv).expect("retract pipeline");
-    let (_, _, baseline) = run_pipeline(&yaml, baseline_csv).expect("baseline pipeline");
+    let (_, _, output) = run_pipeline(&yaml, csv).await.expect("retract pipeline");
+    let (_, _, baseline) = run_pipeline(&yaml, baseline_csv)
+        .await
+        .expect("baseline pipeline");
 
     // The aggregate output is grouped by dept; equal sorted bodies
     // imply ENG's row is unchanged across the retract scope.

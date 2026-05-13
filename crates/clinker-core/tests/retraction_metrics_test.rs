@@ -17,7 +17,7 @@ use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::metrics::RetractionMetrics;
 use clinker_record::PipelineCounters;
 
-fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
+async fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
     let config = parse_config(yaml).expect("parse_config");
     let plan = config.compile(&CompileContext::default()).expect("compile");
     let params = PipelineRunParams {
@@ -40,6 +40,7 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {
         Box::new(buf) as Box<dyn std::io::Write + Send>,
     )]);
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .await
         .expect("run");
     report.counters
 }
@@ -129,8 +130,8 @@ nodes:
     include_widened: true
 "#;
 
-#[test]
-fn retraction_counters_fire_under_relaxed_dlq_trigger() {
+#[tokio::test(flavor = "multi_thread")]
+async fn retraction_counters_fire_under_relaxed_dlq_trigger() {
     // O3 in HR fails to_int and triggers the DLQ path. The relaxed
     // aggregator's recompute pass retracts the bad row id, emits a
     // delta for HR's aggregate output, and the replay phase
@@ -144,7 +145,7 @@ O4,HR,30
 O5,ENG,100
 O6,ENG,200
 ";
-    let counters = run_pipeline(RELAXED_YAML, csv);
+    let counters = run_pipeline(RELAXED_YAML, csv).await;
 
     // Sanity: the bad row triggered exactly one DLQ entry.
     assert_eq!(counters.dlq_count, 1, "one DLQ trigger expected");
@@ -168,15 +169,15 @@ O6,ENG,200
     assert_eq!(counters.retraction.degrade_fallback_count, 0);
 }
 
-#[test]
-fn retraction_counters_stay_zero_on_strict_pipeline_with_dlq() {
+#[tokio::test(flavor = "multi_thread")]
+async fn retraction_counters_stay_zero_on_strict_pipeline_with_dlq() {
     let csv = "\
 order_id,amount
 O1,10
 O2,bad
 O3,20
 ";
-    let counters = run_pipeline(STRICT_YAML, csv);
+    let counters = run_pipeline(STRICT_YAML, csv).await;
     assert!(
         counters.dlq_count >= 1,
         "strict pipeline must DLQ the bad row"

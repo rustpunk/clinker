@@ -2939,7 +2939,7 @@ mod tests {
     /// This mirrors `integration_tests::run_pipeline` but lives inside
     /// the `executor` module so submodules can reference it via
     /// `crate::executor::tests::run_test`.
-    pub(super) fn run_test(
+    pub(super) async fn run_test(
         yaml: &str,
         csv_input: &str,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -2968,7 +2968,8 @@ mod tests {
         };
 
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+                .await?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))

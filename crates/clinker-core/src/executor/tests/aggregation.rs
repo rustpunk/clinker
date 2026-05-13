@@ -125,8 +125,8 @@ mod dispatch {
 
     // ----- Test 1: happy path -----
 
-    #[test]
-    fn test_aggregation_dispatch_basic_group_by() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_aggregation_dispatch_basic_group_by() {
         let yaml = r#"
 pipeline:
   name: agg_basic
@@ -164,7 +164,7 @@ nodes:
     include_widened: true
 "#;
         let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
+        let (counters, dlq, output) = run_test(yaml, csv).await.expect("pipeline runs");
         assert_eq!(dlq.len(), 0, "no DLQ entries expected");
         assert_eq!(counters.ok_count, 2, "two output groups");
 
@@ -300,8 +300,8 @@ nodes:
 
     // ----- Test 6: D12 global-fold over empty input emits one row -----
 
-    #[test]
-    fn test_aggregation_dispatch_global_fold_empty_input_emits_one_row() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_aggregation_dispatch_global_fold_empty_input_emits_one_row() {
         let yaml = r#"
 pipeline:
   name: agg_global_empty
@@ -334,7 +334,7 @@ nodes:
 "#;
         // Header-only input — zero data rows.
         let csv = "x\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
+        let (counters, dlq, output) = run_test(yaml, csv).await.expect("pipeline runs");
         assert_eq!(dlq.len(), 0);
         assert_eq!(
             counters.ok_count, 1,

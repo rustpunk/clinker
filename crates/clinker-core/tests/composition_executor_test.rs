@@ -56,7 +56,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-fn run_with_composition(
+async fn run_with_composition(
     yaml: &str,
     csv_input: &str,
 ) -> (clinker_core::executor::ExecutionReport, String) {
@@ -82,12 +82,13 @@ fn run_with_composition(
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
 
-#[test]
-fn test_composition_body_executes_transform() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_composition_body_executes_transform() {
     // A composition whose body is a single transform doubling
     // `a` into `computed`. The body executor must run the
     // transform — a pass-through stub would not produce a
@@ -120,7 +121,7 @@ nodes:
       include_widened: true
 "#;
     let csv_input = "a\n5\n7\n";
-    let (_report, output) = run_with_composition(yaml, csv_input);
+    let (_report, output) = run_with_composition(yaml, csv_input).await;
 
     assert!(
         output.contains("computed"),
@@ -137,8 +138,8 @@ nodes:
     );
 }
 
-#[test]
-fn test_nested_composition_body_executes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nested_composition_body_executes() {
     // A composition body whose first node is itself a composition.
     // The body executor must recurse into the inner body so the
     // inner-emitted `computed` AND the outer-emitted `marker`
@@ -171,7 +172,7 @@ nodes:
       include_widened: true
 "#;
     let csv_input = "a\n3\n";
-    let (_report, output) = run_with_composition(yaml, csv_input);
+    let (_report, output) = run_with_composition(yaml, csv_input).await;
 
     assert!(
         output.contains("computed"),
@@ -192,8 +193,8 @@ nodes:
     );
 }
 
-#[test]
-fn test_composition_body_with_route_merge() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_composition_body_with_route_merge() {
     // The body splits inp.a into lo/hi branches via route, tags
     // each branch with a `bucket` column, then merges. Every input
     // row must reach the output exactly once with the correct
@@ -227,7 +228,7 @@ nodes:
       include_widened: true
 "#;
     let csv_input = "a\n3\n5\n12\n42\n";
-    let (_report, output) = run_with_composition(yaml, csv_input);
+    let (_report, output) = run_with_composition(yaml, csv_input).await;
 
     let lo_count = output.matches(",lo").count();
     let hi_count = output.matches(",hi").count();
@@ -241,8 +242,8 @@ nodes:
     );
 }
 
-#[test]
-fn test_composition_body_error_context() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_composition_body_error_context() {
     // A body transform that fires a runtime CXL error must surface
     // wrapped with the composition's name so users can locate the
     // failure inside the composition, not just the inner-only
@@ -298,7 +299,8 @@ nodes:
     )]);
 
     let result =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params());
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .await;
     let err = result.expect_err("expected pipeline run to fail");
     let msg = err.to_string();
     assert!(

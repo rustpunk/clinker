@@ -42,7 +42,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-fn run_single(yaml: &str, csv_input: &str) -> String {
+async fn run_single(yaml: &str, csv_input: &str) -> String {
     let config = parse_config(yaml).expect("parse_config");
     let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
@@ -59,11 +59,12 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .await
         .expect("pipeline run");
     buf.as_string()
 }
 
-fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
+async fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
     let config = parse_config(yaml).expect("parse_config");
     let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
@@ -83,6 +84,7 @@ fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .await
         .expect("pipeline run");
     buf.as_string()
 }
@@ -97,8 +99,8 @@ fn body_lines_sorted(out: &str) -> Vec<String> {
 // Fixture 1 — pipeline-scope runtime state, reader downstream
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_pipeline_runtime_visible_downstream() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_pipeline_runtime_visible_downstream() {
     let yaml = r#"
 pipeline:
   name: state_pipeline_runtime
@@ -138,7 +140,7 @@ nodes:
       path: out.csv
 "#;
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
-    let out = run_single(yaml, csv);
+    let out = run_single(yaml, csv).await;
     let lines = body_lines_sorted(&out);
     assert_eq!(
         lines.len(),
@@ -158,8 +160,8 @@ nodes:
 // Fixture 2 — source-scope state, reader downstream
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_source_scope_visible_downstream() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_source_scope_visible_downstream() {
     let yaml = r#"
 pipeline:
   name: state_source_scope
@@ -199,7 +201,7 @@ nodes:
       path: out.csv
 "#;
     let csv = "id,label\n1,alpha\n2,beta\n3,gamma\n";
-    let out = run_single(yaml, csv);
+    let out = run_single(yaml, csv).await;
     let lines = body_lines_sorted(&out);
     assert_eq!(lines.len(), 3, "expected 3 output rows: {out}");
     for line in &lines {
@@ -215,8 +217,8 @@ nodes:
 // Fixture 3 — record-scope state, reader downstream, never sinks
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_record_scope_visible_downstream_does_not_serialize() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_record_scope_visible_downstream_does_not_serialize() {
     let yaml = r#"
 pipeline:
   name: state_record_scope
@@ -256,7 +258,7 @@ nodes:
       path: out.csv
 "#;
     let csv = "id,amount\n1,5\n2,10\n3,15\n";
-    let out = run_single(yaml, csv);
+    let out = run_single(yaml, csv).await;
     let lines = body_lines_sorted(&out);
     assert_eq!(lines, vec!["1,10", "2,20", "3,30"]);
     let header = out.lines().next().unwrap();
@@ -271,8 +273,8 @@ nodes:
 // Fixture 4 — composition opt-in via _compose.scoped_vars
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_composition_opt_in_pipeline_var_visible_in_body() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_composition_opt_in_pipeline_var_visible_in_body() {
     // Uses the existing fixture-resident composition that opts in to
     // `$pipeline.cutoff` via `_compose.scoped_vars.pipeline`. A parent
     // Transform declares `cutoff: { type: int, default: 99 }`; the
@@ -335,6 +337,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .await
         .expect("pipeline run");
     let out = buf.as_string();
     let lines = body_lines_sorted(&out);
@@ -345,8 +348,8 @@ nodes:
 // Fixture 5 — qualified post-merge $source.<input>.<key> read
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_qualified_post_merge_readable() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_qualified_post_merge_readable() {
     // Each input has its own writer + var (E170 single-writer rule
     // applies per-(scope, var)). Post-merge reads the value via the
     // qualified form `$source.<input_name>.<field>` — the unqualified
@@ -418,7 +421,8 @@ nodes:
         yaml,
         "left_src",
         &[("left_src", left), ("right_src", right)],
-    );
+    )
+    .await;
     let header = out.lines().next().unwrap();
     assert_eq!(header, "id,lt,rt");
     let lines = body_lines_sorted(&out);
@@ -444,8 +448,8 @@ nodes:
 // Fixture 6 — pipeline-scope init, reader observes init-time write
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_pipeline_init_visible_in_runtime() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_pipeline_init_visible_in_runtime() {
     // Disjoint init / runtime Sources: the init-phase aggregate
     // computes `max(cutoff)` from `config_src` and writes
     // `$pipeline.max_amount`; the runtime walk reads from
@@ -511,7 +515,8 @@ nodes:
         yaml,
         "orders_src",
         &[("orders_src", orders_csv), ("config_src", config_csv)],
-    );
+    )
+    .await;
     let lines = body_lines_sorted(&out);
     assert_eq!(lines, vec!["1,9", "2,9", "3,9"]);
 }
@@ -520,8 +525,8 @@ nodes:
 // Fixture 7 — multi-file Source, source-scope state writes per-file
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn state_source_scope_per_file_isolation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn state_source_scope_per_file_isolation() {
     // Source-scope vars are keyed by the per-record `source_file`
     // `Arc<str>`. A glob-fed Source produces records whose Arcs swap
     // at each file boundary; the producer Transform writes the var
@@ -592,6 +597,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .await
         .expect("pipeline run");
     let out = buf.as_string();
     let lines = body_lines_sorted(&out);
@@ -605,8 +611,8 @@ nodes:
 // Fixture 8 — $vars.<key> static config, frozen at pipeline start
 // ─────────────────────────────────────────────────────────────────
 
-#[test]
-fn channel_static_var_override_flows_into_static_vars() {
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_static_var_override_flows_into_static_vars() {
     // Same fixture as `static_vars_visible_in_transform_cxl`, but the
     // executor receives a channel-resolved override for `$vars.cutoff`
     // via PipelineRunParams. The pipeline's declared default is 100;
@@ -670,13 +676,14 @@ nodes:
         ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .await
         .expect("pipeline run");
     let lines = body_lines_sorted(&buf.as_string());
     assert_eq!(lines, vec!["3,tier-A,175"]);
 }
 
-#[test]
-fn static_vars_visible_in_transform_cxl() {
+#[tokio::test(flavor = "multi_thread")]
+async fn static_vars_visible_in_transform_cxl() {
     // The flat top-level `vars:` block declares static-config knobs
     // with defaults. The transform's CXL filters records against
     // `$vars.cutoff` and emits the value as a column. No producer
@@ -716,7 +723,7 @@ nodes:
       path: out.csv
 "#;
     let csv = "id,amount\n1,50\n2,150\n3,200\n";
-    let out = run_single(yaml, csv);
+    let out = run_single(yaml, csv).await;
     let lines = body_lines_sorted(&out);
     // Records with amount > 100 (cutoff) survive: ids 2 and 3.
     // Each emits the static label and cutoff.
