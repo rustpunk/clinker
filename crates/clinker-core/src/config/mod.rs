@@ -294,6 +294,71 @@ pub struct SourceConfig {
 pub struct WatermarkConfig {
     /// Name of the event-time column on the source's declared schema.
     pub column: String,
+    /// Duration the source's live mpsc receiver may stay quiet before
+    /// its partitions flip to [`crate::executor::watermark::WatermarkStatus::Idle`].
+    /// `None` (default) means "never go idle" — preserves prior behavior
+    /// for pipelines without a window-close consumer.
+    ///
+    /// YAML form: a duration string with one of the `s` / `m` / `h` /
+    /// `d` / `ms` unit suffixes, e.g. `"30s"`, `"500ms"`, `"5m"`. Same
+    /// parser as [`TimeBound`]'s relative form, extended with `ms`
+    /// for the sub-second cadences a streaming consumer needs.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_idle_timeout",
+        serialize_with = "serialize_optional_idle_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+fn parse_idle_timeout(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    // `ms` must be tested before the single-char `s` suffix so that
+    // "500ms" doesn't read as 500 seconds with a stray "m".
+    if let Some(rest) = s.strip_suffix("ms") {
+        let n: u64 = rest.trim().parse().ok()?;
+        return Some(std::time::Duration::from_millis(n));
+    }
+    let (num_str, unit) = s.split_at(s.len().checked_sub(1)?);
+    let n: u64 = num_str.trim().parse().ok()?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(60 * 60)?,
+        "d" => n.checked_mul(60 * 60 * 24)?,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
+
+fn deserialize_optional_idle_timeout<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<std::time::Duration>, D::Error> {
+    let raw: Option<String> = Option::deserialize(d)?;
+    raw.map(|s| {
+        parse_idle_timeout(&s).ok_or_else(|| {
+            de::Error::custom(format!(
+                "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {s:?}"
+            ))
+        })
+    })
+    .transpose()
+}
+
+fn serialize_optional_idle_timeout<S: serde::Serializer>(
+    v: &Option<std::time::Duration>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(d) => {
+            // Round-trip as milliseconds — the most precise unit the
+            // parser accepts. Reading a serialized `idle_timeout` back
+            // through `parse_idle_timeout` yields the same `Duration`.
+            s.serialize_str(&format!("{}ms", d.as_millis()))
+        }
+        None => s.serialize_none(),
+    }
 }
 
 /// File-listing controls — file-set ordering, take-N, recursion,

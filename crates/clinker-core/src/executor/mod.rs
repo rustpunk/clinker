@@ -965,10 +965,12 @@ impl PipelineExecutor {
         let per_source_file_watermarks: BTreeMap<(String, String), Option<i64>> = watermarks
             .iter_partitions()
             .map(|(src, file, w)| {
-                (
-                    (src.to_string(), file.as_ref().to_string()),
-                    w.max_event_time_nanos,
-                )
+                let ts = match w.status {
+                    crate::executor::watermark::WatermarkStatus::Active(ts) => Some(ts),
+                    crate::executor::watermark::WatermarkStatus::NoObservation
+                    | crate::executor::watermark::WatermarkStatus::Idle => None,
+                };
+                ((src.to_string(), file.as_ref().to_string()), ts)
             })
             .collect();
         let per_source_watermarks: BTreeMap<String, Option<i64>> = watermarks
@@ -1030,9 +1032,24 @@ impl PipelineExecutor {
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
-        watermarks: crate::executor::watermark::PerSourceWatermarks,
+        mut watermarks: crate::executor::watermark::PerSourceWatermarks,
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
+
+        // Per-source idle-timeout map, derived from each
+        // `SourceConfig.watermark.idle_timeout`. Sources without a
+        // configured timeout poll receivers without a deadline (today's
+        // behavior). The window-close consumer at
+        // https://github.com/rustpunk/clinker/issues/61 reads
+        // `PerSourceWatermarks::is_idle` populated by the timeout path.
+        let idle_timeouts: HashMap<&str, std::time::Duration> = source_configs
+            .iter()
+            .filter_map(|s| {
+                s.watermark
+                    .as_ref()
+                    .and_then(|w| w.idle_timeout.map(|d| (s.name.as_str(), d)))
+            })
+            .collect();
 
         // Pipeline-scoped MemoryBudget. One declared `memory_limit`
         // envelopes the source-rooted Phase-0 arena AND every node-
@@ -1057,10 +1074,60 @@ impl PipelineExecutor {
         let mut drained_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
         for (name, rx) in source_records.iter_mut() {
             let mut buf: Vec<(Record, u64)> = Vec::new();
-            while let Some(item) = rx.recv().await {
-                buf.push(item);
+            // Track the file Arc of the most-recent record so an
+            // idle-timeout can flip THAT file's partition to `Idle`.
+            // Before any record has arrived the consumer doesn't know
+            // which file is producing — use the synthetic
+            // [`crate::executor::dispatch::MERGED_SOURCE_FILE`] Arc as
+            // the partition key, matching the same convention the
+            // engine-stamp path uses for record-less source contexts.
+            let mut last_file: Arc<str> =
+                Arc::clone(&crate::executor::dispatch::MERGED_SOURCE_FILE);
+            let timeout = idle_timeouts.get(name.as_str()).copied();
+            loop {
+                match timeout {
+                    Some(t) => match tokio::time::timeout(t, rx.recv()).await {
+                        Ok(Some(item)) => {
+                            last_file = crate::executor::dispatch::source_file_arc_of(&item.0);
+                            buf.push(item);
+                        }
+                        Ok(None) => break,
+                        Err(_elapsed) => {
+                            // Quiet for longer than `idle_timeout` —
+                            // flip the partition tracked by `last_file`
+                            // to `Idle`. The next record un-idles via
+                            // `observe`. Idempotent on repeat timeouts.
+                            watermarks.mark_idle(name, &last_file);
+                            continue;
+                        }
+                    },
+                    None => match rx.recv().await {
+                        Some(item) => {
+                            last_file = crate::executor::dispatch::source_file_arc_of(&item.0);
+                            buf.push(item);
+                        }
+                        None => break,
+                    },
+                }
             }
             drained_records.insert(name.clone(), buf);
+        }
+
+        // Emit an observability trace for any source whose consumer
+        // loop tripped at least one idle timeout AND ended with every
+        // partition still idle. The load-bearing consumer of
+        // `is_idle` is the time-window operator at
+        // https://github.com/rustpunk/clinker/issues/61; this trace
+        // keeps the rollup visible at runtime so operators can see
+        // when an idle_timeout is firing.
+        for name in idle_timeouts.keys() {
+            if watermarks.is_idle(name) {
+                tracing::debug!(
+                    target: "clinker::watermark",
+                    source = name,
+                    "source consumer ended with all partitions in WatermarkStatus::Idle"
+                );
+            }
         }
 
         // Build per-window arena+index runtimes for every source-rooted
