@@ -97,6 +97,51 @@ Common causes:
 
 **Action:** Fix file paths, permissions, or disk space, then re-run.
 
+## Plan-time diagnostic codes
+
+The process exit codes above tell a scheduler whether the run
+succeeded. The `E###` codes below appear inside the structured
+`Error:` messages a configuration error (exit code 1) prints, and
+identify the specific compile-time check that rejected the
+pipeline. The codes below cover the event-time watermark and
+time-windowed aggregate surface
+([issue #61](https://github.com/rustpunk/clinker/issues/61));
+related code sets live in
+[Pipeline Variables](../pipeline/variables.md),
+[Channels](../pipeline/channels.md), and
+[Correlation Keys](../pipeline/correlation-keys.md).
+
+| Code | Trigger | Remediation |
+|------|---------|-------------|
+| **E154** | A source declares `watermark.column: <col>` but `<col>` is not present in that source's `schema:` block. | Add the column to `schema:`, or remove the `watermark:` block. |
+| **E155** | A source declares `watermark.column: <col>` and the column exists, but its declared CXL type is not `date_time` or `date`. | Change the column's `type:` to `date_time` or `date`, or point `watermark.column` at a column that already has one of those types. |
+| **E156** | An aggregate declares `time_window:` but at least one upstream-reachable source does not declare `watermark.column`. | Add `watermark: { column: <event-time-column> }` to each listed source, or remove `time_window:` from the aggregate. Without a watermark on every upstream source, `min_across_sources` never advances past `None` and the window can never close. |
+
+See [Source Nodes → Watermarks](../pipeline/source.md#watermarks)
+and [Aggregate Nodes → Time-windowed aggregates](../pipeline/aggregate.md#time-windowed-aggregates)
+for the field semantics each code is enforcing.
+
+### DLQ category: LateRecord
+
+When a time-windowed aggregate sees a record whose event time falls
+inside an already-closed window
+(`window_end + allowed_lateness < min_across_sources`), the engine
+routes the record to the DLQ instead of attempting to fold it into
+a finalized accumulator. Mirrors Flink's
+[`sideOutputLateData`](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/#getting-late-data-as-a-side-output)
+and Spark Structured Streaming's late-data drop.
+
+The DLQ row carries:
+
+- `_cxl_dlq_error_category` = `late_record`
+- `_cxl_dlq_stage` = `time_window:<aggregate-name>`
+- `_cxl_dlq_error_detail` — the closed window's `[start, end)`
+  bounds as i64 nanoseconds since the Unix epoch
+
+Tune `watermark.delay` (source-side, applies before any aggregate)
+or `allowed_lateness` (operator-side, applies per aggregate) to
+absorb expected out-of-order tails before they reach this path.
+
 ## Scheduler integration
 
 ### Cron script

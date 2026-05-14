@@ -202,3 +202,239 @@ Omit `group_by` to aggregate all records into a single output row:
         emit record_count = count(*)
         emit average_amount = avg(amount)
 ```
+
+## Time-windowed rollups
+
+When the grouping dimension is *event-time bucket*, declare a
+[`watermark:`](../pipeline/source.md#watermarks) on every source
+and a [`time_window:`](../pipeline/aggregate.md#time-windowed-aggregates)
+on the aggregate. Three patterns cover the common shapes; all three
+ship as runnable pipelines under `examples/pipelines/`.
+
+### Tumbling: hourly click counts
+
+Non-overlapping one-hour buckets per user. Use when each record
+should contribute to exactly one reporting bucket.
+
+`examples/pipelines/tumbling_clicks.yaml`:
+
+```yaml
+pipeline:
+  name: tumbling_clicks
+
+nodes:
+  - type: source
+    name: clicks
+    description: Per-user click stream with an event-time column.
+    config:
+      name: clicks
+      type: csv
+      path: ./data/tumbling_clicks.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: kind, type: string }
+
+  - type: aggregate
+    name: hourly_clicks
+    description: Per-user click count, bucketed by event-time hour.
+    input: clicks
+    config:
+      group_by: [user_id]
+      time_window:
+        tumbling: { size: 1h }
+      cxl: |
+        emit user_id = user_id
+        emit n = count(*)
+
+  - type: output
+    name: results
+    input: hourly_clicks
+    config:
+      name: results
+      type: csv
+      path: ./output/tumbling_clicks.csv
+
+error_handling:
+  strategy: fail_fast
+```
+
+Run:
+
+```bash
+cargo run -p clinker -- run examples/pipelines/tumbling_clicks.yaml
+```
+
+The source's watermark advances with each record's `event_ts`; each
+hour-aligned bucket emits one row per `user_id` as soon as the
+watermark crosses `bucket_end`. Records observed out-of-order land
+in the DLQ as `late_record` — add `delay:` on the source or
+`allowed_lateness:` on the aggregate if the input has a known
+out-of-order tail.
+
+### Hopping: 1-hour sums advanced every 5 minutes
+
+Overlapping one-hour windows that move forward every 5 minutes. Use
+for moving averages and rolling sums where one record should
+contribute to multiple overlapping reports.
+
+`examples/pipelines/hopping_sliding_5m_1h.yaml`:
+
+```yaml
+pipeline:
+  name: hopping_sliding_5m_1h
+
+nodes:
+  - type: source
+    name: clicks
+    config:
+      name: clicks
+      type: csv
+      path: ./data/hopping_clicks.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+        delay: 5s
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: amount, type: int }
+
+  - type: aggregate
+    name: sliding_amount
+    input: clicks
+    config:
+      group_by: [user_id]
+      time_window:
+        hopping:
+          size: 1h
+          slide: 5m
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit total = sum(amount)
+        emit n = count(*)
+
+  - type: output
+    name: results
+    input: sliding_amount
+    config:
+      name: results
+      type: csv
+      path: ./output/hopping_sliding_5m_1h.csv
+
+error_handling:
+  strategy: fail_fast
+```
+
+Run:
+
+```bash
+cargo run -p clinker -- run examples/pipelines/hopping_sliding_5m_1h.yaml
+```
+
+Each record fans into `ceil(size / slide) = 12` overlapping
+windows, so the output row count is roughly 12× the active-window
+record count. The source's `delay: 5s` plus the aggregate's
+`allowed_lateness: 30s` give the pipeline 35 seconds of total grace
+beyond strict event-time order before a record drops to the DLQ.
+
+### Session: per-user multi-source login sessions
+
+Variable-duration windows bounded by inactivity, computed across
+two independent sources. Use for activity grouping where the
+window length is data-driven rather than clock-aligned.
+
+`examples/pipelines/multi_source_session.yaml`:
+
+```yaml
+pipeline:
+  name: multi_source_session
+
+nodes:
+  - type: source
+    name: src_web
+    description: Web login events.
+    config:
+      name: src_web
+      type: csv
+      path: ./data/session_logins.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: source
+    name: src_mobile
+    description: Mobile login events.
+    config:
+      name: src_mobile
+      type: csv
+      path: ./data/session_mobile.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: merge
+    name: all_logins
+    inputs: [src_web, src_mobile]
+
+  - type: aggregate
+    name: user_sessions
+    input: all_logins
+    config:
+      group_by: [user_id]
+      time_window:
+        session: { gap: 5m }
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit logins = count(*)
+
+  - type: output
+    name: results
+    input: user_sessions
+    config:
+      name: results
+      type: csv
+      path: ./output/multi_source_session.csv
+
+error_handling:
+  strategy: fail_fast
+```
+
+Run:
+
+```bash
+cargo run -p clinker -- run examples/pipelines/multi_source_session.yaml
+```
+
+Each source declares its own `watermark.column` independently. The
+aggregate's close decision reads `min_across_sources` across both
+sources' partitions: a session can't emit until both `src_web` and
+`src_mobile` have advanced past `session_end + allowed_lateness`.
+Drop the `watermark:` block on either source and the planner
+rejects the pipeline with
+[**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
+
+### When to pick each
+
+| Kind | Bucket shape | Typical use |
+|------|--------------|-------------|
+| `tumbling` | Disjoint, clock-aligned, fixed width | Hourly metrics, daily rollups, billing periods. |
+| `hopping` | Overlapping, clock-aligned, fixed width | Moving averages, sliding sums, anomaly detection where each record should affect multiple reports. |
+| `session` | Variable width, gap-bounded, per-key | User sessions, telemetry burst grouping, activity envelopes where the window length is data-driven. |
