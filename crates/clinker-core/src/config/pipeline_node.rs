@@ -891,6 +891,81 @@ pub enum MatchMode {
 /// refactor.
 pub type AnalyticWindowSpec = serde_json::Value;
 
+/// Event-time window declaration attached to an `Aggregate`. Distinct
+/// from the positional analytic window on `Transform`: that one slices
+/// records by ordinal position (lag / lead / sum_window); this one
+/// assigns each record to one or more event-time buckets, driving the
+/// close-decision against `min_across_sources`.
+///
+/// YAML form is externally tagged — the kind is the single map key:
+///
+/// ```yaml
+/// time_window:
+///   tumbling: { size: 1h }
+///   # OR
+///   hopping:  { size: 1h, slide: 5m }
+///   # OR
+///   session:  { gap: 5m }
+/// ```
+///
+/// Mirrors Flink SQL Window TVF (TUMBLE / HOP / SESSION), Spark
+/// Structured Streaming (window / session_window), and Beam
+/// (FixedWindows / SlidingWindows / Sessions).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum TimeWindowSpec {
+    /// Non-overlapping fixed-size windows. Each record lands in exactly
+    /// one window: `[floor(t / size) * size, floor(t / size) * size + size)`.
+    Tumbling {
+        #[serde(deserialize_with = "deserialize_duration_required")]
+        #[serde(serialize_with = "serialize_duration_required")]
+        size: std::time::Duration,
+    },
+    /// Overlapping fixed-size windows advanced by `slide`. Each record
+    /// lands in up to `ceil(size / slide)` windows. `slide < size`
+    /// produces overlap; `slide == size` degenerates to tumbling;
+    /// `slide > size` produces gaps (records may fall in zero windows).
+    Hopping {
+        #[serde(deserialize_with = "deserialize_duration_required")]
+        #[serde(serialize_with = "serialize_duration_required")]
+        size: std::time::Duration,
+        #[serde(deserialize_with = "deserialize_duration_required")]
+        #[serde(serialize_with = "serialize_duration_required")]
+        slide: std::time::Duration,
+    },
+    /// Per-key gap-bounded sessions. A new record extends its key's
+    /// current session if its event-time is within `gap` of the
+    /// session's last event-time; otherwise it starts a new session.
+    /// A session closes once
+    /// `min_across_sources >= last_event_time + gap + allowed_lateness`.
+    Session {
+        #[serde(deserialize_with = "deserialize_duration_required")]
+        #[serde(serialize_with = "serialize_duration_required")]
+        gap: std::time::Duration,
+    },
+}
+
+fn deserialize_duration_required<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::time::Duration, D::Error> {
+    use serde::Deserialize;
+    let raw = String::deserialize(d)?;
+    crate::config::parse_duration_with_suffix(&raw).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {raw:?}"
+        ))
+    })
+}
+
+fn serialize_duration_required<S: serde::Serializer>(
+    v: &std::time::Duration,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    // Round-trip as milliseconds — matches the duration writer used by
+    // WatermarkConfig so a serialized pipeline reads back identically.
+    s.serialize_str(&format!("{}ms", v.as_millis()))
+}
+
 /// Aggregate variant body. Peer to Transform (no longer nested).
 ///
 /// Whether the engine routes this aggregate through retraction-aware
@@ -907,6 +982,61 @@ pub struct AggregateBody {
     pub cxl: CxlSource,
     #[serde(default)]
     pub strategy: crate::config::AggregateStrategyHint,
+    /// Event-time window declaration. When set, the aggregate becomes
+    /// a time-windowed operator: each record is assigned to its
+    /// window(s) by `$source.event_time`, per-(group-by, window)
+    /// state accumulates independently, and a window closes once
+    /// `min_across_sources >= window_end + allowed_lateness`. Requires
+    /// every upstream-reachable Source to declare `watermark.column`
+    /// (enforced at plan time, E1xx).
+    ///
+    /// Absent (default): positional aggregate — all input reduces
+    /// into the same group-by buckets and emits at end-of-input. No
+    /// watermark dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<TimeWindowSpec>,
+    /// Operator-side late-record tolerance. A window with `time_window`
+    /// closes when `min_across_sources >= window_end + allowed_lateness`;
+    /// records arriving after that route to the DLQ as `LateRecord`.
+    /// Distinct from `WatermarkConfig.delay`, which is a source-system
+    /// property and trails the source's effective watermark from its
+    /// observed max event-time. `None` means no extra tolerance —
+    /// windows close as soon as the watermark crosses their end.
+    ///
+    /// YAML form: same duration string as `WatermarkConfig.delay` /
+    /// `idle_timeout`.
+    #[serde(
+        default,
+        deserialize_with = "crate::config::pipeline_node::deserialize_optional_duration_body",
+        serialize_with = "crate::config::pipeline_node::serialize_optional_duration_body",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_lateness: Option<std::time::Duration>,
+}
+
+pub(crate) fn deserialize_optional_duration_body<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<std::time::Duration>, D::Error> {
+    use serde::Deserialize;
+    let raw: Option<String> = Option::deserialize(d)?;
+    raw.map(|s| {
+        crate::config::parse_duration_with_suffix(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {s:?}"
+            ))
+        })
+    })
+    .transpose()
+}
+
+pub(crate) fn serialize_optional_duration_body<S: serde::Serializer>(
+    v: &Option<std::time::Duration>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(d) => s.serialize_str(&format!("{}ms", d.as_millis())),
+        None => s.serialize_none(),
+    }
 }
 
 /// Route variant body. `conditions:` is an [`IndexMap`] so that branch
@@ -1713,5 +1843,165 @@ nodes:
             msg.contains("bogus_body_field"),
             "error should name the unknown body field, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod time_window_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_tumbling() {
+        let yaml = "tumbling:\n  size: 1h\n";
+        let spec: TimeWindowSpec = crate::yaml::from_str(yaml).expect("tumbling parses");
+        assert_eq!(
+            spec,
+            TimeWindowSpec::Tumbling {
+                size: Duration::from_secs(60 * 60)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_hopping_with_mixed_unit_suffixes() {
+        let yaml = "hopping:\n  size: 1h\n  slide: 500ms\n";
+        let spec: TimeWindowSpec = crate::yaml::from_str(yaml).expect("hopping parses");
+        assert_eq!(
+            spec,
+            TimeWindowSpec::Hopping {
+                size: Duration::from_secs(60 * 60),
+                slide: Duration::from_millis(500),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_session() {
+        let yaml = "session:\n  gap: 5m\n";
+        let spec: TimeWindowSpec = crate::yaml::from_str(yaml).expect("session parses");
+        assert_eq!(
+            spec,
+            TimeWindowSpec::Session {
+                gap: Duration::from_secs(5 * 60)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_duration_suffix() {
+        let yaml = "tumbling:\n  size: 1week\n";
+        let err = crate::yaml::from_str::<TimeWindowSpec>(yaml)
+            .expect_err("invalid duration suffix must fail");
+        assert!(
+            err.to_string().contains("duration"),
+            "error mentions duration shape, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_inside_variant() {
+        let yaml = "tumbling:\n  size: 1h\n  bogus: oops\n";
+        let err = crate::yaml::from_str::<TimeWindowSpec>(yaml)
+            .expect_err("unknown field inside variant must fail");
+        assert!(
+            err.to_string().contains("bogus"),
+            "error names the unknown field, got: {err}"
+        );
+    }
+
+    /// Parse a full PipelineConfig with an aggregate carrying
+    /// `time_window:` + `allowed_lateness:` and confirm both surface on
+    /// the body. Single-source path keeps the validation surface small;
+    /// the plan-time E1xx guard (#61) covers the missing-watermark case.
+    #[test]
+    fn aggregate_body_carries_time_window_and_allowed_lateness() {
+        let yaml = r#"
+pipeline:
+  name: time_window_demo
+nodes:
+  - type: source
+    name: clicks
+    config:
+      name: clicks
+      type: csv
+      path: clicks.csv
+      watermark:
+        column: event_ts
+        delay: 5s
+      schema:
+        - { name: user_id,  type: string }
+        - { name: event_ts, type: date_time }
+  - type: aggregate
+    name: hourly_clicks
+    input: clicks
+    config:
+      group_by: [user_id]
+      time_window:
+        tumbling: { size: 1h }
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit n = count(*)
+"#;
+        let doc: crate::config::PipelineConfig =
+            crate::yaml::from_str(yaml).expect("pipeline parses");
+        let aggregate_body = doc
+            .nodes
+            .iter()
+            .find_map(|spanned| match &spanned.value {
+                PipelineNode::Aggregate { config, .. } => Some(config),
+                _ => None,
+            })
+            .expect("aggregate node present");
+        assert_eq!(
+            aggregate_body.time_window.as_ref(),
+            Some(&TimeWindowSpec::Tumbling {
+                size: Duration::from_secs(60 * 60)
+            })
+        );
+        assert_eq!(
+            aggregate_body.allowed_lateness,
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    /// Aggregates without `time_window:` (today's positional aggregate
+    /// path) parse identically. Both new fields default to `None`.
+    #[test]
+    fn aggregate_body_without_time_window_defaults_to_none() {
+        let yaml = r#"
+pipeline:
+  name: positional_only
+nodes:
+  - type: source
+    name: clicks
+    config:
+      name: clicks
+      type: csv
+      path: clicks.csv
+      schema:
+        - { name: user_id, type: string }
+  - type: aggregate
+    name: by_user
+    input: clicks
+    config:
+      group_by: [user_id]
+      cxl: |
+        emit user_id = user_id
+        emit n = count(*)
+"#;
+        let doc: crate::config::PipelineConfig =
+            crate::yaml::from_str(yaml).expect("pipeline parses");
+        let aggregate_body = doc
+            .nodes
+            .iter()
+            .find_map(|spanned| match &spanned.value {
+                PipelineNode::Aggregate { config, .. } => Some(config),
+                _ => None,
+            })
+            .expect("aggregate node present");
+        assert!(aggregate_body.time_window.is_none());
+        assert!(aggregate_body.allowed_lateness.is_none());
     }
 }
