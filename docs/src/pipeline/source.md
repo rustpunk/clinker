@@ -194,6 +194,71 @@ The shorthand form is also accepted -- a bare string defaults to ascending:
       - { field: "txn_date", order: desc }
 ```
 
+## Watermarks
+
+An event-time watermark declares which column on the source carries
+each record's *event time* — the wall-clock instant the event
+happened, distinct from when Clinker read the row. When set, the
+engine reads the column on every record, subtracts the source's
+`delay`, and folds the result into a per-source monotonic watermark.
+The delay-corrected value is also stamped on every record as
+[`$source.event_time`](../cxl/system-variables.md), the column a
+downstream [time-windowed aggregate](aggregate.md#time-windowed-aggregates)
+uses to assign records to windows.
+
+```yaml
+- type: source
+  name: clicks
+  config:
+    name: clicks
+    type: csv
+    path: "./data/clicks.csv"
+    options:
+      has_header: true
+    watermark:
+      column: event_ts       # must be date_time or date
+      delay: 5s              # bounded out-of-order tolerance
+      idle_timeout: 30s      # flip partitions to idle if quiet
+    schema:
+      - { name: user_id, type: string }
+      - { name: event_ts, type: date_time }
+      - { name: amount, type: int }
+```
+
+Fields:
+
+- `column` (required) — the schema column whose value is each
+  record's event time. The column's declared type must be `date_time`
+  or `date`. A `column:` that names a field absent from `schema:`
+  raises [**E154**](../ops/exit-codes.md#plan-time-diagnostic-codes);
+  a `column:` whose declared type is neither raises **E155**.
+
+- `delay` (optional duration, default unset) — bounded out-of-order
+  tolerance. Each record's event time is shifted earlier by `delay`
+  before being folded into the watermark, so the source's effective
+  watermark trails its observed max event time by this amount.
+  Mirrors Flink's
+  [`BoundedOutOfOrdernessWatermarks`](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/built_in/#fixed-amount-of-lateness).
+  Without `delay`, the watermark advances strictly to the observed
+  max — a single late record routes to the DLQ.
+
+- `idle_timeout` (optional duration, default unset) — if a live
+  source's receiver stays quiet longer than this, its partitions
+  flip to idle and stop holding back `min_across_sources`. Lets
+  downstream windows keep closing when one source pauses. `None`
+  means never go idle, preserving the prior behaviour for pipelines
+  without a window-close consumer.
+
+Durations use the suffixes `ms`, `s`, `m`, `h`, `d`. `ms` is
+matched before the single-character `s`, so `500ms` reads as 500
+milliseconds, not 500 seconds with a stray `m`.
+
+A pipeline whose aggregate declares `time_window:` **must** have a
+`watermark.column` on every upstream-reachable source. Without it,
+`min_across_sources` over the source set stays at `None` and the
+window can never close — the planner rejects this with
+[**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
+
 ## Array paths
 
 For nested data (JSON/XML sources with embedded arrays), `array_paths` controls how nested arrays are handled:
