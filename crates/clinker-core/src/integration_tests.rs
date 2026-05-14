@@ -875,9 +875,9 @@ nodes:
     /// Under the old positional-primary convention this configuration
     /// would have consumed `products` as the primary driving reader
     /// and starved the combine build side. With unified ingest there
-    /// is no "primary" — every source is ingested through
-    /// `SourceStream` and dispatch order follows the plan topology,
-    /// so declaration order is irrelevant.
+    /// is no "primary" — every source is ingested through its own
+    /// `TokioSourceStream` and dispatch order follows the plan
+    /// topology, so declaration order is irrelevant.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_run_with_readers_writers_primary_is_not_first_source() {
         let yaml = r#"

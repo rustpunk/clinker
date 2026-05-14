@@ -334,9 +334,9 @@ pub struct ExecutionReport {
     /// emitted a clean record (every record DLQ'd, or the source had
     /// zero records) are absent from the map. Combine-rooted rewinds
     /// reflect into this map via the `combine_input_snapshots`
-    /// restore path. Today's pre-drained executor surfaces these for
-    /// diagnostics and per-source-rollback test assertions; once the
-    /// async runtime lands, the cursor becomes the replay anchor.
+    /// restore path. Surfaces as both the per-source replay anchor
+    /// for the live mpsc-channel executor and the diagnostic counter
+    /// that per-source-rollback tests assert against.
     pub per_source_rollback_cursors: BTreeMap<String, u64>,
 }
 
@@ -1009,10 +1009,12 @@ impl PipelineExecutor {
     /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
     /// 3. Streaming → read all, walk DAG with per-record evaluation
     ///
-    /// `source_records` holds every declared Source's pre-ingested records,
-    /// each tuple carrying the source-file `Arc<str>` engine-stamped on
-    /// the `$source.file` column. The caller's unified ingest pass
-    /// populates this map; this function does not read from any
+    /// `source_records` holds one live `mpsc::Receiver` per declared
+    /// Source. Each `(Record, row_num)` carries the source-file
+    /// `Arc<str>` engine-stamped on the `$source.file` column. The
+    /// caller's ingest pass spawns a `tokio::task` per Source to push
+    /// through a paired `TokioSourceStream`; this function consumes
+    /// the receivers via `recv().await` and never touches a
     /// `FormatReader` directly.
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
@@ -1859,9 +1861,11 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
     }
 }
 
-/// Ingest a Source's records into a bounded `SourceStream` and drain
-/// to the read-side handle. Used uniformly by every declared Source —
-/// no primary asymmetry.
+/// Ingest a Source's records into a bounded
+/// [`TokioSourceStream`](crate::executor::source_stream::TokioSourceStream)
+/// so the dispatch loop drains the paired `mpsc::Receiver` via
+/// `recv().await`. Used uniformly by every declared Source — no
+/// primary asymmetry.
 ///
 /// Each ingested record is widened with two tail engine-stamped
 /// columns:

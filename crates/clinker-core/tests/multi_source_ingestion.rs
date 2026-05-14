@@ -13,12 +13,12 @@
 //! | `src_a → tfm → merge`, `src_b → tfm → merge` | same fallthrough at the Source dispatcher |
 //! | `src_a → out_a`, `src_b → tfm → out_b` | non-primary single-output chain reads primary |
 //!
-//! The fix wires every Source through `SourceStream` so dispatch
-//! reads from `ctx.source_records[name]` rather than falling through
-//! to a single primary record set. The Source dispatcher's catch-all
-//! arm is now a defense-in-depth `PipelineError::Internal` (loud,
-//! not silent) when an ingest regression leaves a declared Source
-//! without records.
+//! The fix wires every Source through its own `TokioSourceStream` so
+//! dispatch consumes from `ctx.source_records[name]`'s
+//! `mpsc::Receiver` rather than falling through to a single primary
+//! record set. The Source dispatcher's catch-all arm is now a
+//! defense-in-depth `PipelineError::Internal` (loud, not silent) when
+//! an ingest regression leaves a declared Source without a receiver.
 
 use std::collections::HashMap;
 use std::io::Cursor;

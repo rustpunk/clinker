@@ -4,10 +4,11 @@
 //! per-source FIFO is preserved; cross-source order follows the
 //! seeded fastrand schedule (or a deterministic round-robin when
 //! `interleave_seed` is absent). Live-channel back-pressure ("a slow
-//! upstream doesn't block a fast one") is not exercised — the
-//! executor's prologue still materializes source records before
-//! dispatch (#57), so the Interleave arm consumes from pre-buffered
-//! inputs.
+//! upstream doesn't starve a fast one") is not exercised here: the
+//! executor's prologue currently materializes each Source's mpsc
+//! receiver into a per-input deque before the Merge arm runs, so the
+//! Interleave loop reads pre-buffered inputs. Lifting the prologue's
+//! pre-pass is tracked separately from the runtime migration.
 
 use std::collections::HashMap;
 use std::io::Cursor;

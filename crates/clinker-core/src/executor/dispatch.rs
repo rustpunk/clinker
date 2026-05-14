@@ -114,12 +114,10 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
 /// The rate denominator is the full per-source ingest count, seeded
 /// once at executor entry from
 /// [`ExecutorContext::total_per_source`] — not a moving "records
-/// processed so far" counter. This is consistent with today's
-/// pre-ingested-into-`source_records` executor model where every
-/// declared Source is fully drained before dispatch runs. When the
-/// async streaming runtime swaps `SourceStream` for a live
-/// channel-driven ingest, the denominator becomes a moving target
-/// that needs to be re-keyed off the per-source receive count instead.
+/// processed so far" counter. The total is read from each ingest
+/// task's `JoinHandle` once its `mpsc::Receiver` drains, then frozen
+/// for the duration of the run, so the ratio remains stable across
+/// the dispatch loop's `recv().await` interleaving.
 pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
@@ -141,18 +139,21 @@ pub(crate) fn push_dlq(
 /// the post-finalize emit operates on aggregator-synthetic identity
 /// and has no per-record source row to advance against). Monotonic
 /// per source — the cursor never moves backward through this entry
-/// point. A backward write would happen only when a future
-/// rewind path consumes a `combine_input_snapshots` entry; that path
-/// is wired for the async-runtime work on #57 and has no live trigger
-/// in today's executor.
+/// point. A backward write happens only when a Combine output-row
+/// failure consumes a `combine_input_snapshots` entry and restores
+/// each contributing source's cursor; that path applies under the
+/// recoverable-DLQ arm and is bypassed by setup-time
+/// `PipelineError::Internal { op: "combine" }` invariant violations,
+/// which still fail-fast.
 ///
-/// `row_num` is the engine-stamped source row number stored alongside
-/// the record in `ctx.source_records[name]` and threaded through every
-/// `(record, row_num)` tuple in the dispatch path. It is the same
-/// value the relaxed-CK retract orchestrator passes to
+/// `row_num` is the engine-stamped source row number stamped on each
+/// record as it leaves the Source ingest task's `TokioSourceStream`
+/// and threaded through every `(record, row_num)` tuple in the
+/// dispatch path. It is the same value the relaxed-CK retract
+/// orchestrator passes to
 /// [`crate::aggregation::HashAggregator::retract_row`], so a cursor
-/// stored here is directly comparable against `retract_row` arguments
-/// when #57's rewind path lands.
+/// stored here is directly comparable against `retract_row`
+/// arguments at rewind time.
 pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<str>, row_num: u64) {
     let slot = ctx
         .rollback_cursors
@@ -461,20 +462,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// aggregate-retract decision point to bound rewind to records from
     /// the failing source. Seeded empty — sources land in the map on
     /// their first cleanly-emitted record. Sibling of `dlq_per_source`
-    /// and `total_per_source`; same source-keyed `HashMap<Arc<str>, u64>`
-    /// shape so the post-#57 live-channel refactor moves all three onto
-    /// `SourceStream` together.
+    /// and `total_per_source`; same source-keyed
+    /// `HashMap<Arc<str>, u64>` shape.
     pub(crate) rollback_cursors: HashMap<Arc<str>, u64>,
     /// Per-Combine input-cursor snapshots captured at Combine fold
     /// entry. The outer key is the Combine node's `NodeIndex`; the
     /// inner map captures the `(source_name -> cursor)` pair for every
-    /// source whose record participates in the fold. Today the snapshot
-    /// is captured at fold entry and cleared at the inline-strategy
-    /// fall-through; the symmetric rewind path that consumes a snapshot
-    /// to restore both contributing sources' cursors is wired for the
-    /// async-runtime work on #57 and has no live trigger in today's
-    /// executor (Combine errors propagate as `PipelineError::Internal`,
-    /// aborting the run before any rewind can apply).
+    /// source whose record participates in the fold. The snapshot is
+    /// captured at fold start, cleared at every Combine exit (inline,
+    /// IEJoin, Grace, SortMerge), and restored from at the
+    /// recoverable-DLQ rewind path — driver and build sides are
+    /// treated symmetrically. Setup-time
+    /// `PipelineError::Internal { op: "combine" }` invariant violations
+    /// still fail-fast and bypass the rewind path.
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
     pub(crate) ok_source_rows: HashSet<u64>,
@@ -1896,11 +1896,15 @@ pub(crate) async fn dispatch_plan_node(
                     // `ExecutorContext` then.
                     //
                     // Unseeded → deterministic round-robin by
-                    // declaration-order index. Documented as
-                    // deterministic but not back-pressure aware: live-
-                    // channel arbitration (issue #53) needs the
-                    // executor prologue to stop materializing sources
-                    // before dispatch (issue #57).
+                    // declaration-order index. Today's arbitration
+                    // drains the per-input deques the executor
+                    // prologue materializes; live-channel back-pressure
+                    // ("a slow upstream doesn't starve a fast one")
+                    // requires the prologue to stop pre-buffering and
+                    // route `mpsc::Receiver`s directly into the
+                    // interleave loop's `tokio::select!`. Tracked
+                    // separately from the runtime migration so the
+                    // YAML surface ships ahead of the dynamics.
                     let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
                     let mut cursor = 0usize; // unseeded round-robin head
                     loop {
@@ -2942,12 +2946,11 @@ pub(crate) async fn dispatch_plan_node(
             // a record to this Combine's fold. Captured at fold start so
             // a Combine-output-row failure rewinds every contributing
             // source independently — driver and build sides treat
-            // symmetrically. Cleared at Combine exit; today's executor
-            // never fires the rewind path because Combine errors
-            // propagate as `PipelineError::Internal` (FailFast),
-            // aborting the run before any rewind can apply. The
-            // snapshot is in place for the async runtime to drive
-            // recoverable Combine failures once #57 lands.
+            // symmetrically. Cleared at every Combine exit (inline,
+            // IEJoin, Grace, SortMerge); the recoverable-DLQ rewind
+            // path restores from this entry before clearing. Setup-time
+            // `PipelineError::Internal { op: "combine" }` invariant
+            // violations still fail-fast and bypass the rewind.
             let mut combine_snapshot: HashMap<Arc<str>, u64> = HashMap::new();
             for (rec, _) in driver_buf.iter().chain(build_buf.iter()) {
                 let sn = source_name_arc_of(rec);

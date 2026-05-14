@@ -238,12 +238,12 @@ nodes:
 /// driver and build sources, snapshots their per-source cursors at
 /// fold entry, and on a clean run leaves the surfaced cursors
 /// reflecting forward progress for the driver side. The snapshot
-/// machinery underpinning the AC3 cursor-rewind is in place; the
-/// rewind-on-failure path has no live trigger in today's executor
-/// because Combine errors propagate as `PipelineError::Internal`
-/// (FailFast), so this test exercises the capture half. The full
-/// AC3 rewind ships alongside the async-runtime work on #57 when
-/// Combine output failures gain a recoverable-DLQ path.
+/// machinery underpinning the AC3 cursor-rewind is in place; this
+/// test covers the clean-run capture half (snapshot taken at fold
+/// start, dropped at fold exit). Setup-time
+/// `PipelineError::Internal { op: "combine" }` invariant violations
+/// still fail-fast and bypass the rewind; the recoverable-DLQ
+/// rewind path is covered by separate Combine-failure tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3_combine_snapshot_capture_clean_run() {
     let yaml = r#"

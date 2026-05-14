@@ -251,9 +251,9 @@ pub struct SourceConfig {
     /// is observed at ingest and folded into a per-(source, file)
     /// max-event-time stamp; rolled up at the read side by
     /// `PerSourceWatermarks::min_across_sources`. Mirrors Flink SQL's
-    /// `WATERMARK FOR <col> AS <col> - INTERVAL` declaration site
-    /// (delay column deferred to the time-window operator sprint,
-    /// https://github.com/rustpunk/clinker/issues/61).
+    /// `WATERMARK FOR <col> AS <col> - INTERVAL` declaration site;
+    /// the `INTERVAL` delay column lands with the time-window operator
+    /// at https://github.com/rustpunk/clinker/issues/61.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<WatermarkConfig>,
 
