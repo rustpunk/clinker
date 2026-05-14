@@ -284,10 +284,11 @@ pub struct SourceConfig {
 ///
 /// `column` names a record field whose value is the source's event-
 /// time axis. At ingest, each record's value at this column is
-/// converted to an i64 nanosecond stamp and folded into a per-(source,
-/// file) max via [`crate::executor::watermark::PerSourceWatermarks`].
-/// The column type must coerce to [`clinker_record::Value::Timestamp`]
-/// or [`clinker_record::Value::Date`] (validated at plan time, see
+/// converted to an i64 nanosecond stamp, shifted earlier by `delay`,
+/// and folded into a per-(source, file) max via
+/// [`crate::executor::watermark::PerSourceWatermarks`]. The column
+/// type must coerce to [`clinker_record::Value::Timestamp`] or
+/// [`clinker_record::Value::Date`] (validated at plan time, see
 /// `crate::plan::bind_schema`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,17 +306,41 @@ pub struct WatermarkConfig {
     /// for the sub-second cadences a streaming consumer needs.
     #[serde(
         default,
-        deserialize_with = "deserialize_optional_idle_timeout",
-        serialize_with = "serialize_optional_idle_timeout",
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
         skip_serializing_if = "Option::is_none"
     )]
     pub idle_timeout: Option<std::time::Duration>,
+    /// Bounded out-of-order tolerance for this source. Each record's
+    /// event-time, before being folded into the watermark, is shifted
+    /// earlier by `delay`; equivalently, the source's effective
+    /// watermark trails its observed max event-time by this amount.
+    /// Mirrors Flink's `BoundedOutOfOrdernessWatermarks` and Beam's
+    /// `WithAllowedTimestampSkew` — a source-system property declared
+    /// once at the source, distinct from the operator-side
+    /// `allowed_lateness` knob.
+    ///
+    /// `None` (default) means no shift — the watermark advances with
+    /// the observed max. Same YAML duration form as `idle_timeout`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delay: Option<std::time::Duration>,
 }
 
-fn parse_idle_timeout(s: &str) -> Option<std::time::Duration> {
+/// Parse a duration string with an `ms` / `s` / `m` / `h` / `d` unit
+/// suffix into a [`std::time::Duration`].
+///
+/// `ms` is tested before the single-char `s` suffix so `"500ms"`
+/// doesn't read as 500 seconds with a stray `"m"`. Shared by
+/// [`WatermarkConfig::idle_timeout`], [`WatermarkConfig::delay`], and
+/// duration fields on `TimeWindowSpec` so YAML duration parsing is a
+/// single uniform contract across the schema.
+pub(crate) fn parse_duration_with_suffix(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
-    // `ms` must be tested before the single-char `s` suffix so that
-    // "500ms" doesn't read as 500 seconds with a stray "m".
     if let Some(rest) = s.strip_suffix("ms") {
         let n: u64 = rest.trim().parse().ok()?;
         return Some(std::time::Duration::from_millis(n));
@@ -332,12 +357,12 @@ fn parse_idle_timeout(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
-fn deserialize_optional_idle_timeout<'de, D: Deserializer<'de>>(
+fn deserialize_optional_duration<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<std::time::Duration>, D::Error> {
     let raw: Option<String> = Option::deserialize(d)?;
     raw.map(|s| {
-        parse_idle_timeout(&s).ok_or_else(|| {
+        parse_duration_with_suffix(&s).ok_or_else(|| {
             de::Error::custom(format!(
                 "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {s:?}"
             ))
@@ -346,15 +371,14 @@ fn deserialize_optional_idle_timeout<'de, D: Deserializer<'de>>(
     .transpose()
 }
 
-fn serialize_optional_idle_timeout<S: serde::Serializer>(
+fn serialize_optional_duration<S: serde::Serializer>(
     v: &Option<std::time::Duration>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
     match v {
         Some(d) => {
             // Round-trip as milliseconds — the most precise unit the
-            // parser accepts. Reading a serialized `idle_timeout` back
-            // through `parse_idle_timeout` yields the same `Duration`.
+            // parser accepts.
             s.serialize_str(&format!("{}ms", d.as_millis()))
         }
         None => s.serialize_none(),
