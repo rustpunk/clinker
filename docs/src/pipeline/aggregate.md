@@ -103,6 +103,261 @@ A retraction-mode aggregate emits one engine-managed `$ck.aggregate.<name>` shad
 
 The retraction protocol carries a per-aggregate cost — Reversible accumulators use a per-row lineage map, BufferRequired accumulators hold raw contributions until commit. Both paths additionally pay ~16 bytes per output row for the synthetic-CK shadow column. The [operator-by-operator retraction cost reference](correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator breakdown; `clinker run --explain` reports the live per-aggregate detail including the synthetic-CK line.
 
+## Time-windowed aggregates
+
+When `time_window:` is set on the aggregate body, the operator
+groups records not just by `group_by` but also by *event-time
+window*. Each record is assigned to one or more windows by the
+engine-stamped [`$source.event_time`](../cxl/system-variables.md)
+column; state accumulates per `(group_by, window)`; a window closes
+once `min_across_sources >= window_end + allowed_lateness` and emits
+one row per group it saw. The shape parallels Flink SQL
+[Window TVFs](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/window-tvf/),
+Spark Structured Streaming
+[window / session_window](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#window-operations-on-event-time),
+and Beam
+[windowing](https://beam.apache.org/documentation/programming-guide/#windowing).
+
+Every upstream-reachable source must declare a
+[`watermark:`](source.md#watermarks). Otherwise `min_across_sources`
+stays at `None`, no window ever closes, and the planner rejects the
+pipeline with
+[**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
+
+The engine emits user-declared columns only — window bounds do not
+appear in the output unless you compute and emit them yourself. The
+emit order is ascending `window_start` (deterministic), so output
+rows naturally group by window.
+
+### Tumbling windows
+
+Non-overlapping fixed-size buckets. Each record lands in exactly one
+window `[floor(t / size) * size, floor(t / size) * size + size)`.
+
+```yaml
+time_window:
+  tumbling: { size: 1h }
+```
+
+**Input** (`tumbling_demo.csv`):
+
+```csv
+user_id,event_ts,kind
+u1,2026-05-14T10:05:00,click
+u2,2026-05-14T10:30:00,click
+u1,2026-05-14T10:42:00,click
+u1,2026-05-14T11:03:00,click
+u2,2026-05-14T11:15:00,click
+u2,2026-05-14T11:50:00,click
+```
+
+**Output** with `tumbling: { size: 1h }`, `group_by: [user_id]`,
+`emit n = count(*)`:
+
+```csv
+user_id,n
+u1,2
+u2,1
+u1,1
+u2,2
+```
+
+Reading top-to-bottom: the first two rows are the `[10:00, 11:00)`
+bucket (u1's 10:05 and 10:42, then u2's 10:30); the next two are
+the `[11:00, 12:00)` bucket (u1's 11:03, then u2's 11:15 and 11:50).
+Each input record contributes to exactly one window.
+
+### Hopping windows
+
+Overlapping fixed-size buckets advanced by `slide`. Each record
+lands in `ceil(size / slide)` windows: `slide < size` produces
+overlap, `slide == size` degenerates to tumbling, `slide > size`
+produces gaps where some records fall in zero windows.
+
+```yaml
+time_window:
+  hopping: { size: 1h, slide: 30m }
+```
+
+**Input** (`hopping_demo.csv`):
+
+```csv
+user_id,event_ts,amount
+u1,2026-05-14T10:05:00,10
+u1,2026-05-14T10:42:00,20
+u1,2026-05-14T11:10:00,15
+```
+
+**Output** with `group_by: [user_id]`, `emit total = sum(amount)`,
+`emit n = count(*)`:
+
+```csv
+user_id,total,n
+u1,10,1
+u1,30,2
+u1,35,2
+u1,15,1
+```
+
+Three input records, four output rows — each record fans into two
+overlapping `size: 1h, slide: 30m` windows:
+
+- `[09:30, 10:30)` — just 10:05 → `total=10, n=1`
+- `[10:00, 11:00)` — 10:05 + 10:42 → `total=30, n=2`
+- `[10:30, 11:30)` — 10:42 + 11:10 → `total=35, n=2`
+- `[11:00, 12:00)` — just 11:10 → `total=15, n=1`
+
+### Session windows
+
+Per-key gap-bounded sessions. A new record extends its key's current
+session if its event time is within `gap` of the session's last
+event time; otherwise it starts a new session. The boundary is
+data-driven, not clock-aligned.
+
+```yaml
+time_window:
+  session: { gap: 10m }
+```
+
+**Input** (`session_demo.csv`):
+
+```csv
+user_id,event_ts,action
+u1,2026-05-14T10:00:00,login
+u1,2026-05-14T10:07:00,click
+u1,2026-05-14T10:13:00,click
+u1,2026-05-14T10:50:00,login
+u1,2026-05-14T10:55:00,click
+```
+
+**Output** with `group_by: [user_id]`, `emit n = count(*)`:
+
+```csv
+user_id,n
+u1,3
+u1,2
+```
+
+`u1`'s first three rows form one session (10:00 → 10:07 → 10:13,
+consecutive gaps ≤ 10m). The 37-minute idle stretch exceeds `gap`,
+so 10:50 starts a fresh session that runs through 10:55. Two
+sessions, two output rows.
+
+### Allowed lateness
+
+`allowed_lateness` is an operator-side knob, distinct from the
+source-side `watermark.delay`. A window with `time_window:` closes
+when `min_across_sources >= window_end + allowed_lateness`. Records
+arriving after a window's `end + allowed_lateness` route to the DLQ
+as `LateRecord` with stage label `time_window:<aggregate-name>`.
+See [DLQ category: LateRecord](../ops/exit-codes.md#dlq-category-laterecord)
+for the DLQ row layout.
+
+```yaml
+- type: aggregate
+  name: hourly
+  input: clicks
+  config:
+    group_by: [user_id]
+    time_window:
+      tumbling: { size: 1h }
+    allowed_lateness: 30s
+    cxl: |
+      emit n = count(*)
+```
+
+Default (unset) means no grace beyond the watermark — windows close
+the instant `min_across_sources` crosses `window_end`. Set
+`allowed_lateness` when the source's `watermark.delay` alone is too
+small to absorb the observed out-of-order tail.
+
+### Worked example: multi-source session window
+
+This pipeline merges two independent login feeds and groups per-user
+events into gap-bounded sessions. Issue
+[#61](https://github.com/rustpunk/clinker/issues/61) tracks the
+multi-source synchronisation contract: a window cannot close until
+**every** upstream source has advanced its watermark past
+`window_end + allowed_lateness`.
+
+```yaml
+pipeline:
+  name: multi_source_session
+
+nodes:
+  - type: source
+    name: src_web
+    description: Web login events.
+    config:
+      name: src_web
+      type: csv
+      path: ./data/session_logins.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: source
+    name: src_mobile
+    description: Mobile login events.
+    config:
+      name: src_mobile
+      type: csv
+      path: ./data/session_mobile.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: merge
+    name: all_logins
+    inputs: [src_web, src_mobile]
+
+  - type: aggregate
+    name: user_sessions
+    input: all_logins
+    config:
+      group_by: [user_id]
+      time_window:
+        session: { gap: 5m }
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit logins = count(*)
+
+  - type: output
+    name: results
+    input: user_sessions
+    config:
+      name: results
+      type: csv
+      path: ./output/multi_source_session.csv
+```
+
+Both sources declare their own `watermark.column` independently. At
+ingest, each record gets the engine-stamped `$source.event_time`
+column, so the aggregate is column-name-agnostic about which source
+delivered any given record. The aggregate's close decision reads
+`min_across_sources` across **both** sources' partitions: a session
+cannot emit until both `src_web` and `src_mobile` have advanced past
+the session's `end + allowed_lateness`. Drop the `watermark:` block
+on either source and the planner rejects the pipeline with
+[**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
+
+Run it from the repo:
+
+```bash
+cargo run -p clinker -- run examples/pipelines/multi_source_session.yaml
+```
+
 ## Complete example
 
 ```yaml
