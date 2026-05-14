@@ -284,6 +284,7 @@ fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
             Some(FieldMetadata::WidenedSidecar)
             | Some(FieldMetadata::SourceFile)
             | Some(FieldMetadata::SourceName)
+            | Some(FieldMetadata::SourceEventTime)
             | None => {}
         }
     }
@@ -1132,6 +1133,7 @@ pub(crate) async fn dispatch_plan_node(
                             | Some(clinker_record::FieldMetadata::WidenedSidecar)
                             | Some(clinker_record::FieldMetadata::SourceFile)
                             | Some(clinker_record::FieldMetadata::SourceName)
+                            | Some(clinker_record::FieldMetadata::SourceEventTime)
                             | None => None,
                         })
                         .collect()

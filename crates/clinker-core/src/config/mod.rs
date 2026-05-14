@@ -3164,6 +3164,8 @@ pub(crate) fn lower_node_to_plan_node(
                         builder.with_field_meta(col, FieldMetadata::source_file())
                     } else if col == crate::config::pipeline_node::SOURCE_NAME_COLUMN {
                         builder.with_field_meta(col, FieldMetadata::source_name())
+                    } else if col == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN {
+                        builder.with_field_meta(col, FieldMetadata::source_event_time())
                     } else {
                         builder.with_field(col)
                     };

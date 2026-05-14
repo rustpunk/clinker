@@ -804,6 +804,18 @@ pub const SOURCE_FILE_COLUMN: &str = "$source.file";
 /// column shape (the silent-corruption topology at the root of #47).
 pub const SOURCE_NAME_COLUMN: &str = "$source.name";
 
+/// Stable column name for the per-record delay-corrected event-time
+/// stamp. Every Source's bound schema carries this tail-appended slot;
+/// ingest stamps an `i64`-nanoseconds value derived from the source's
+/// declared `WatermarkConfig.column` (with `delay` already subtracted),
+/// or `Value::Null` when the source has no watermark declaration or the
+/// per-record value did not parse. Read by the time-windowed aggregate
+/// operator (https://github.com/rustpunk/clinker/issues/61) to assign
+/// each record to its window(s) — the unified per-record event-time
+/// column across heterogeneous sources whose declared event-time
+/// column names may differ.
+pub const SOURCE_EVENT_TIME_COLUMN: &str = "$source.event_time";
+
 /// Transform variant body. The new shape: a mandatory `cxl:` field
 /// carrying the CXL source as a `CxlSource` (so it captures its YAML
 /// span where serde-saphyr can deliver one), plus the row-level

@@ -47,6 +47,13 @@ use std::sync::Arc;
 ///   originating Source by node name (the case schema identity alone
 ///   cannot answer when peer Sources share a column shape — the
 ///   silent-corruption topology at the root of #47).
+/// - [`FieldMetadata::SourceEventTime`] — per-record event-time stamp,
+///   delay-corrected. Named `$source.event_time`; stamped at Source
+///   ingest with the i64-nanos value derived from each record's
+///   `WatermarkConfig.column`. Read by the time-windowed aggregate
+///   operator to assign each record to its window(s) — the unified
+///   per-record event-time column across heterogeneous sources whose
+///   declared event-time column names may differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldMetadata {
     /// Source-CK shadow column. `source_field` is the user-declared
@@ -75,6 +82,17 @@ pub enum FieldMetadata {
     /// survives merge so post-fan-in records still report origin even
     /// when peer Sources share a column shape.
     SourceName,
+    /// Per-record delay-corrected event-time column. Named
+    /// `$source.event_time`, value `i64` nanoseconds since the Unix
+    /// epoch. Stamped at Source ingest from the source's declared
+    /// `WatermarkConfig.column`, with any configured `delay` already
+    /// subtracted so the column matches what was folded into
+    /// `PerSourceWatermarks`. `Value::Null` when the source declared no
+    /// watermark column or the per-record value was Null / unparseable.
+    /// Read by the time-windowed aggregate operator
+    /// (https://github.com/rustpunk/clinker/issues/61) to assign each
+    /// record to its window(s).
+    SourceEventTime,
 }
 
 impl FieldMetadata {
@@ -112,6 +130,15 @@ impl FieldMetadata {
     /// wrapping the originating Source node's name Arc.
     pub fn source_name() -> Self {
         Self::SourceName
+    }
+
+    /// Marks this column as the per-record delay-corrected event-time
+    /// stamp. Always named `$source.event_time`; the value is a
+    /// `Value::Int` carrying i64 nanoseconds since the Unix epoch, or
+    /// `Value::Null` when the source has no watermark column or the
+    /// per-record value did not parse.
+    pub fn source_event_time() -> Self {
+        Self::SourceEventTime
     }
 
     /// True for every variant. The presence of [`FieldMetadata`] on a

@@ -238,7 +238,8 @@ impl Record {
             .filter(|(i, _)| match self.schema.field_metadata(*i) {
                 Some(FieldMetadata::WidenedSidecar)
                 | Some(FieldMetadata::SourceFile)
-                | Some(FieldMetadata::SourceName) => false,
+                | Some(FieldMetadata::SourceName)
+                | Some(FieldMetadata::SourceEventTime) => false,
                 Some(FieldMetadata::SourceCorrelation { .. })
                 | Some(FieldMetadata::AggregateGroupIndex { .. })
                 | None => true,

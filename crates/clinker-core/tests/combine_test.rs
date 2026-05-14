@@ -581,11 +581,10 @@ mod tests {
 
         // Driver = orders (default first-in-IndexMap, no `drive:` hint).
         // Driver fields: order_id, product_id, amount, plus the
-        // `$widened` engine-stamped sidecar (auto_widen default), the
-        // `$source.file` per-record lineage stamp, and the
-        // `$source.name` per-record Source-node identity stamp that
-        // every Source carries. Then the auto-added `products` field
-        // of Type::Array.
+        // `$widened` engine-stamped sidecar (auto_widen default) and
+        // the `$source.file` / `$source.name` / `$source.event_time`
+        // per-record lineage stamps every Source carries. Then the
+        // auto-added `products` field of Type::Array.
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
         assert_eq!(
             names,
@@ -596,6 +595,7 @@ mod tests {
                 "$widened".to_string(),
                 "$source.file".to_string(),
                 "$source.name".to_string(),
+                "$source.event_time".to_string(),
                 "products".to_string(),
             ],
             "auto-derived row = driver fields + (build_qualifier: Array)"

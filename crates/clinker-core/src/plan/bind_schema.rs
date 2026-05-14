@@ -2244,7 +2244,8 @@ fn build_input_port_rows(
             let is_engine_stamped = qf.name.starts_with("$ck.")
                 || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
                 || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_FILE_COLUMN
-                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_NAME_COLUMN;
+                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_NAME_COLUMN
+                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN;
             if is_engine_stamped && !declared_columns.contains_key(qf) {
                 declared_columns.insert(qf.clone(), ty.clone());
             }
@@ -2504,6 +2505,8 @@ where
             builder.with_field_meta(name, FieldMetadata::source_file())
         } else if name == crate::config::pipeline_node::SOURCE_NAME_COLUMN {
             builder.with_field_meta(name, FieldMetadata::source_name())
+        } else if name == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN {
+            builder.with_field_meta(name, FieldMetadata::source_event_time())
         } else {
             builder.with_field(name)
         };
@@ -2540,16 +2543,17 @@ fn columns_from_decl(
         .collect();
     // Engine-stamped tail order: `$ck.<field>` shadow columns first,
     // then the `$widened` sidecar, then `$source.file`, then
-    // `$source.name` last. The order is load-bearing — CK-aligned
-    // aggregate / combine propagation walks the schema expecting
-    // `$ck.*` immediately after declared columns; pushing `$widened`
-    // between them would break that propagation. Sources with
-    // `auto_widen` get `$widened` after every `$ck.<field>` slot;
-    // `$source.file` and `$source.name` live outside the CK lattice
-    // and tail-append after `$widened`. The same order is replayed by
-    // `executor::mod::ingest_source_into_stream` when it widens the
-    // runtime reader schema, so the planner's view stays positionally
-    // aligned with the actual records flowing through dispatch.
+    // `$source.name`, then `$source.event_time`. The order is load-
+    // bearing — CK-aligned aggregate / combine propagation walks the
+    // schema expecting `$ck.*` immediately after declared columns;
+    // pushing `$widened` between them would break that propagation.
+    // Sources with `auto_widen` get `$widened` after every `$ck.<field>`
+    // slot; the `$source.*` lineage columns live outside the CK
+    // lattice and tail-append after `$widened`. The same order is
+    // replayed by `executor::mod::ingest_source_into_stream` when it
+    // widens the runtime reader schema, so the planner's view stays
+    // positionally aligned with the actual records flowing through
+    // dispatch.
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
@@ -2580,6 +2584,10 @@ fn columns_from_decl(
     cols.insert(
         QualifiedField::bare(crate::config::pipeline_node::SOURCE_NAME_COLUMN),
         Type::String,
+    );
+    cols.insert(
+        QualifiedField::bare(crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN),
+        Type::Int,
     );
     (cols, missing)
 }

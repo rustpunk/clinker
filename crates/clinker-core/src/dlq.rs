@@ -233,7 +233,8 @@ fn dlq_user_columns(schema: &Schema) -> impl Iterator<Item = (usize, &str)> {
         .filter_map(|(i, c)| match schema.field_metadata(i) {
             Some(FieldMetadata::WidenedSidecar)
             | Some(FieldMetadata::SourceFile)
-            | Some(FieldMetadata::SourceName) => None,
+            | Some(FieldMetadata::SourceName)
+            | Some(FieldMetadata::SourceEventTime) => None,
             Some(FieldMetadata::SourceCorrelation { .. })
             | Some(FieldMetadata::AggregateGroupIndex { .. })
             | None => Some((i, c.as_ref())),
