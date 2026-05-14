@@ -1,10 +1,11 @@
 //! Time-windowed aggregate execution helpers.
 //!
-//! Sprint 9 lands the event-time window operator on
-//! [`crate::config::AggregateConfig::time_window`]. The dispatch arm
-//! at [`crate::executor::dispatch`] keeps its existing positional-
-//! aggregate fast path and branches into the helpers here when
-//! `time_window: Some(_)`.
+//! The event-time window operator lives on
+//! [`crate::config::AggregateConfig::time_window`]; see
+//! <https://github.com/rustpunk/clinker/issues/61> for the design.
+//! The dispatch arm at [`crate::executor::dispatch`] keeps its
+//! existing positional-aggregate fast path and branches into the
+//! helpers here when `time_window: Some(_)`.
 //!
 //! The helpers are deliberately stateless — they assign records to
 //! window bounds, walk the DAG to find upstream Sources, and
