@@ -548,6 +548,16 @@ impl PipelineExecutor {
     ///     );
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// The executor wraps its heavyweight CPU-bound operator arms
+    /// (sort, aggregate finalize, grace-hash, IEJoin, sort-merge) in
+    /// [`tokio::task::block_in_place`], which panics when invoked
+    /// outside a multi-thread tokio runtime. Callers must drive this
+    /// entry from a runtime built via
+    /// `tokio::runtime::Builder::new_multi_thread().enable_all().build()`
+    /// or annotate tests with `#[tokio::test(flavor = "multi_thread")]`.
     pub async fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         readers: SourceReaders,
@@ -578,6 +588,15 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
+    ///
+    /// # Panics
+    ///
+    /// Same constraint as [`Self::run_plan_with_readers_writers`]: the
+    /// executor's CPU-bound operator arms call
+    /// [`tokio::task::block_in_place`], which panics outside a
+    /// multi-thread tokio runtime. Build the runtime via
+    /// `tokio::runtime::Builder::new_multi_thread().enable_all().build()`
+    /// or use `#[tokio::test(flavor = "multi_thread")]`.
     pub(crate) async fn run_with_readers_writers(
         config: &PipelineConfig,
         readers: SourceReaders,

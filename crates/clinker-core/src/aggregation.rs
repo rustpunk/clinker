@@ -4225,6 +4225,172 @@ mod spill_trigger_tests {
     }
 
     // ----------------------------------------------------------------
+    // Per-source lineage narrowing — `retract_row` matches both row
+    // and source. Two sources independently number rows starting at 0,
+    // so the same `(row_id, group)` can land twice in one group from
+    // different upstreams; the `Vec<(u64, Arc<str>)>` lineage tuple
+    // must scope each retract to a single source's contribution.
+    // ----------------------------------------------------------------
+
+    /// Build a record carrying an engine-stamped `$source.name` column.
+    /// Mirrors what the dispatch layer hands the aggregator after
+    /// reading from a Source node — `source_name_arc_of` reads from
+    /// the `FieldMetadata::SourceName` slot, not from a separate
+    /// argument, so add_record must see the stamp on the record itself.
+    fn make_record_with_source(
+        user_schema_cols: &[&str],
+        values: Vec<Value>,
+        source_name: &str,
+    ) -> Record {
+        let mut builder = clinker_record::SchemaBuilder::new();
+        for c in user_schema_cols {
+            builder = builder.with_field(*c);
+        }
+        builder =
+            builder.with_field_meta("$source.name", clinker_record::FieldMetadata::source_name());
+        let schema = builder.build();
+        let mut full_values = values;
+        full_values.push(Value::String(source_name.into()));
+        Record::new(schema, full_values)
+    }
+
+    #[test]
+    fn test_retract_row_narrows_by_source_when_two_sources_share_a_row_id() {
+        // Lineage path: SUM is Reversible-only, so a relaxed aggregator
+        // builds in-memory groups under the lineage strategy and stores
+        // each contribution under a `(row_id, source_name)` tuple. Per-
+        // source rewinds rely on that tuple matching on both fields —
+        // a regression to bare `u64` would silently retract whichever
+        // source happened to hit the row id first.
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut agg = build_test_aggregator_relaxed(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit total = sum(v)",
+            10 * 1024 * 1024,
+            None,
+            true,
+        );
+
+        // Two sources independently emit row_num=5 into the same group
+        // "g". Without per-source narrowing the second add would
+        // collide with the first in the lineage vec.
+        let r_a = make_record_with_source(
+            &["k", "v"],
+            vec![Value::String("g".into()), Value::Integer(10)],
+            "src_a",
+        );
+        let r_b = make_record_with_source(
+            &["k", "v"],
+            vec![Value::String("g".into()), Value::Integer(100)],
+            "src_b",
+        );
+        agg.add_record(&r_a, 5, &ctx_for(&stable, &file, 5))
+            .expect("add src_a");
+        agg.add_record(&r_b, 5, &ctx_for(&stable, &file, 5))
+            .expect("add src_b");
+
+        // Sanity: both contributions present in the same group.
+        let mut out = Vec::new();
+        agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize_in_place initial");
+        assert_eq!(out.len(), 1, "single group expected");
+        let total_idx = out[0]
+            .0
+            .schema()
+            .index("total")
+            .expect("total column on output");
+        match out[0].0.values().get(total_idx).expect("total slot") {
+            Value::Integer(n) => assert_eq!(*n, 110, "sum of both sources"),
+            other => panic!("expected Integer total, got {other:?}"),
+        }
+
+        // Retract row 5 scoped to src_a: src_b's contribution at the
+        // identical row id must survive.
+        let src_a: Arc<str> = Arc::from("src_a");
+        agg.retract_row(5, &src_a).expect("retract src_a");
+        let mut out = Vec::new();
+        agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize_in_place after src_a retract");
+        assert_eq!(out.len(), 1, "group still present");
+        match out[0].0.values().get(total_idx).expect("total slot") {
+            Value::Integer(n) => assert_eq!(
+                *n, 100,
+                "src_b's 100 must remain after src_a retract at the same row id"
+            ),
+            other => panic!("expected Integer total, got {other:?}"),
+        }
+
+        // Retract the remaining src_b contribution at row 5 — the
+        // lineage tuple still matches because src_b's `(5, "src_b")`
+        // entry survived the previous narrowed retract. A successful
+        // Ok return here is the load-bearing assertion: a bare-u64
+        // lineage would have removed src_b's entry on the first
+        // retract above and this call would fail with `not found in
+        // any lineage group`.
+        let src_b: Arc<str> = Arc::from("src_b");
+        agg.retract_row(5, &src_b)
+            .expect("retract src_b at the same row id must succeed");
+    }
+
+    #[test]
+    fn test_retract_row_narrows_by_source_in_buffer_mode() {
+        // Buffer-mode path: MIN is BufferRequired, so the aggregator
+        // routes through `add_record_buffered` / `buffered_groups` and
+        // stores `(row_id, source_name)` tuples on `input_rows`. The
+        // narrowing invariant has to hold for both retract strategies,
+        // so this companion test pins the buffer path too.
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut agg = build_test_aggregator_relaxed(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit lo = min(v)",
+            10 * 1024 * 1024,
+            None,
+            true,
+        );
+        assert!(
+            agg.buffer_mode,
+            "min(v) under relaxed must select buffer-mode"
+        );
+
+        // src_a contributes a smaller value at row 5; src_b a larger
+        // one at the same row id. Retract src_a — the survivor min
+        // is src_b's 100, not src_a's 10.
+        let r_a = make_record_with_source(
+            &["k", "v"],
+            vec![Value::String("g".into()), Value::Integer(10)],
+            "src_a",
+        );
+        let r_b = make_record_with_source(
+            &["k", "v"],
+            vec![Value::String("g".into()), Value::Integer(100)],
+            "src_b",
+        );
+        agg.add_record(&r_a, 5, &ctx_for(&stable, &file, 5))
+            .expect("add src_a");
+        agg.add_record(&r_b, 5, &ctx_for(&stable, &file, 5))
+            .expect("add src_b");
+
+        let src_a: Arc<str> = Arc::from("src_a");
+        agg.retract_row(5, &src_a).expect("retract src_a");
+        let mut out = Vec::new();
+        agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize_in_place");
+        assert_eq!(out.len(), 1, "single group expected");
+        let lo_idx = out[0].0.schema().index("lo").expect("lo column on output");
+        match out[0].0.values().get(lo_idx).expect("lo slot") {
+            Value::Integer(n) => assert_eq!(
+                *n, 100,
+                "src_b's value must survive a same-row-id retract scoped to src_a"
+            ),
+            other => panic!("expected Integer lo, got {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------------
     // Synthetic aggregate-CK column emission
     //
     // Mirrors the planner's schema-widening pass: a relaxed aggregate's

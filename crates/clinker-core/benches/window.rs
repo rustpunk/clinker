@@ -1,3 +1,4 @@
+use clinker_bench_support::bench_runtime as runtime;
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::pipeline::arena::Arena;
@@ -7,21 +8,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, Mutex, OnceLock};
-use tokio::runtime::Runtime;
-
-/// Lazy multi-thread tokio runtime shared by every async bench iteration
-/// in this binary; the executor uses `block_in_place`, which requires a
-/// multi-thread runtime.
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime")
-    })
-}
+use std::sync::{Arc, Mutex};
 
 /// Build an Arena with numeric fields for window benchmarks.
 fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u64>) {
