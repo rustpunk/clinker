@@ -33,6 +33,13 @@ pub enum DlqErrorCategory {
     /// One entry per group with `trigger: true` plus collaterals for the
     /// other buffered records of the same group.
     GroupSizeExceeded,
+    /// Record arrived at a time-windowed aggregate after the window
+    /// covering its event-time had already closed
+    /// (`window_end + allowed_lateness < min_across_sources`). Routed
+    /// by the executor's aggregation dispatch arm when `time_window`
+    /// is set. Mirrors Flink sideOutputLateData / Beam late-drop /
+    /// Spark window late-drop.
+    LateRecord,
 }
 
 impl DlqErrorCategory {
@@ -47,6 +54,7 @@ impl DlqErrorCategory {
             Self::AggregateFinalize => "aggregate_finalize",
             Self::Correlated => "correlated",
             Self::GroupSizeExceeded => "group_size_exceeded",
+            Self::LateRecord => "late_record",
         }
     }
 }
@@ -54,6 +62,14 @@ impl DlqErrorCategory {
 /// Stage label helper for aggregate-transform DLQ entries.
 pub fn stage_aggregate(transform: &str) -> String {
     format!("aggregate:{transform}")
+}
+
+/// Stage label helper for time-windowed aggregate DLQ entries
+/// emitted on late-record drop. Distinct from `stage_aggregate` so a
+/// reader scanning the DLQ can tell a late-arrival drop apart from a
+/// finalize-time accumulator failure on the same node.
+pub fn stage_time_window(transform: &str) -> String {
+    format!("time_window:{transform}")
 }
 
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
@@ -595,6 +611,24 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::ValidationFailure.as_str(),
             "validation_failure"
+        );
+        assert_eq!(
+            DlqErrorCategory::AggregateFinalize.as_str(),
+            "aggregate_finalize"
+        );
+        assert_eq!(DlqErrorCategory::Correlated.as_str(), "correlated");
+        assert_eq!(
+            DlqErrorCategory::GroupSizeExceeded.as_str(),
+            "group_size_exceeded"
+        );
+        assert_eq!(DlqErrorCategory::LateRecord.as_str(), "late_record");
+    }
+
+    #[test]
+    fn test_stage_time_window_helper() {
+        assert_eq!(
+            stage_time_window("hourly_clicks"),
+            "time_window:hourly_clicks"
         );
     }
 
