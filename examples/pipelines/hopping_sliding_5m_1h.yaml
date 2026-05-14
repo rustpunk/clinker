@@ -1,0 +1,54 @@
+pipeline:
+  name: hopping_sliding_5m_1h
+
+nodes:
+  - type: source
+    name: clicks
+    description: |
+      Single source with bounded out-of-order tolerance (delay=5s) so
+      the operator's allowed_lateness has room to demonstrate the
+      layered late-record contract.
+    config:
+      name: clicks
+      type: csv
+      path: ./data/hopping_clicks.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+        delay: 5s
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: amount, type: int }
+
+  - type: aggregate
+    name: sliding_amount
+    description: |
+      Hourly sliding sum of `amount`, advanced every 5 minutes. Each
+      record fans out into every overlapping window
+      (`ceil(size / slide) = 12`); allowed_lateness gives downstream
+      30 extra seconds beyond the watermark to settle late arrivals.
+    input: clicks
+    config:
+      group_by: [user_id]
+      time_window:
+        hopping:
+          size: 1h
+          slide: 5m
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit total = sum(amount)
+        emit n = count(*)
+
+  - type: output
+    name: results
+    input: sliding_amount
+    config:
+      name: results
+      type: csv
+      path: ./output/hopping_sliding_5m_1h.csv
+
+error_handling:
+  strategy: fail_fast

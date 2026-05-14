@@ -1,0 +1,76 @@
+pipeline:
+  name: multi_source_session
+
+# [src_web, src_mobile] → merge → time_window aggregate (#61 AC1).
+#
+# The aggregate's close decision reads `min_across_sources` over both
+# Source partitions: a window cannot emit until BOTH sources have
+# advanced their watermark past the window's end + allowed_lateness.
+# Each Source declares its own `watermark.column` independently; the
+# engine-stamped `$source.event_time` unifies them per record at
+# ingest, so the aggregate can be column-name-agnostic about which
+# Source delivered any given record.
+
+nodes:
+  - type: source
+    name: src_web
+    description: Web login events.
+    config:
+      name: src_web
+      type: csv
+      path: ./data/session_logins.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: source
+    name: src_mobile
+    description: Mobile login events.
+    config:
+      name: src_mobile
+      type: csv
+      path: ./data/session_mobile.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: source, type: string }
+
+  - type: merge
+    name: all_logins
+    inputs: [src_web, src_mobile]
+
+  - type: aggregate
+    name: user_sessions
+    description: |
+      Per-user session-windowed login count. A session extends while
+      consecutive logins arrive within 5 minutes; the session closes
+      once `min_across_sources >= last_event_time + gap + allowed_lateness`.
+    input: all_logins
+    config:
+      group_by: [user_id]
+      time_window:
+        session: { gap: 5m }
+      allowed_lateness: 30s
+      cxl: |
+        emit user_id = user_id
+        emit logins = count(*)
+
+  - type: output
+    name: results
+    input: user_sessions
+    config:
+      name: results
+      type: csv
+      path: ./output/multi_source_session.csv
+
+error_handling:
+  strategy: fail_fast

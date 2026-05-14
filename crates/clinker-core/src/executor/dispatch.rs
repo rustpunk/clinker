@@ -4471,9 +4471,29 @@ fn run_time_windowed_aggregate(
     use std::collections::HashMap;
 
     let upstream_sources = upstream_source_names(current_dag, node_idx);
-    let source_refs: Vec<&str> = upstream_sources.iter().map(|s| s.as_str()).collect();
-    let watermark = ctx.watermarks.min_across_sources(&source_refs);
     let allowed_lateness_nanos = allowed_lateness.map(duration_to_nanos).unwrap_or(0);
+    // Per-record streaming watermark: as we walk `input` in arrival
+    // order, each record's `$source.event_time` advances its source's
+    // running max; the running `min_across_sources` at the moment we
+    // examine record N is the min over per-source maxes from records
+    // {0..N-1}. A record at event-time `t` whose window
+    // `[w_start, w_end)` already satisfies
+    // `w_end + allowed_lateness <= running_min` was assigned to a
+    // closed window and routes to the DLQ as `LateRecord`. This
+    // mirrors Flink's per-record watermark advance under the
+    // BoundedOutOfOrdernessWatermarks pattern and gives the dispatch
+    // arm correct late-record semantics in batch mode without waiting
+    // for the post-execute_dag `ctx.watermarks` fold (which lands
+    // after dispatch returns).
+    let mut running_per_source_max: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::with_capacity(upstream_sources.len());
+    let running_min_across =
+        |running: &std::collections::HashMap<String, i64>, sources: &[String]| -> Option<i64> {
+            sources
+                .iter()
+                .filter_map(|s| running.get(s.as_str()).copied())
+                .min()
+        };
 
     // Factory: each per-window aggregator is a fresh `AggregateStream`
     // sharing the compiled CXL, the output schema, and the spill
@@ -4561,10 +4581,29 @@ fn run_time_windowed_aggregate(
                         continue;
                     };
                     let w = tumbling_window(t, size_nanos);
-                    if window_is_closed(w.end, allowed_lateness_nanos, watermark) {
+                    // Per-record running watermark BEFORE folding this
+                    // record's event-time. Records with `event_time`
+                    // older than the watermark by more than
+                    // `allowed_lateness` past their window end route
+                    // to the DLQ as `LateRecord`.
+                    let running_min =
+                        running_min_across(&running_per_source_max, &upstream_sources);
+                    if window_is_closed(w.end, allowed_lateness_nanos, running_min) {
                         push_late_record(ctx, name, record, *row_num, w)?;
                         continue;
                     }
+                    // Fold this record into the per-source running max
+                    // AFTER the late check so a late record does not
+                    // advance its source's watermark.
+                    let src = source_name_arc_of(record).to_string();
+                    running_per_source_max
+                        .entry(src)
+                        .and_modify(|v| {
+                            if t > *v {
+                                *v = t;
+                            }
+                        })
+                        .or_insert(t);
                     add_to_window(
                         ctx,
                         name,
@@ -4597,9 +4636,23 @@ fn run_time_windowed_aggregate(
                         continue;
                     };
                     let windows = hopping_windows(t, size_nanos, slide_nanos);
+                    let running_min =
+                        running_min_across(&running_per_source_max, &upstream_sources);
+                    // A record is late iff EVERY window it would
+                    // belong to is closed at the current watermark.
+                    // For overlapping HOP windows, partial closure is
+                    // possible (some closed, some still open) — route
+                    // the record to its still-open windows and emit a
+                    // single DLQ entry only when no window remains
+                    // open. Mirrors Flink's late-event-on-sliding
+                    // semantics.
+                    let mut routed_to_any = false;
+                    let mut first_closed: Option<crate::executor::time_window::WindowBounds> = None;
                     for w in windows {
-                        if window_is_closed(w.end, allowed_lateness_nanos, watermark) {
-                            push_late_record(ctx, name, record, *row_num, w)?;
+                        if window_is_closed(w.end, allowed_lateness_nanos, running_min) {
+                            if first_closed.is_none() {
+                                first_closed = Some(w);
+                            }
                             continue;
                         }
                         add_to_window(
@@ -4612,7 +4665,28 @@ fn run_time_windowed_aggregate(
                             &make_stream,
                             &mut out_rows,
                         )?;
+                        routed_to_any = true;
                     }
+                    if !routed_to_any {
+                        if let Some(w) = first_closed {
+                            push_late_record(ctx, name, record, *row_num, w)?;
+                            continue;
+                        }
+                        // No windows at all (slide > size gap) —
+                        // record falls in no bucket; silently skip,
+                        // matching the empty-window branch in
+                        // `hopping_windows`.
+                        continue;
+                    }
+                    let src = source_name_arc_of(record).to_string();
+                    running_per_source_max
+                        .entry(src)
+                        .and_modify(|v| {
+                            if t > *v {
+                                *v = t;
+                            }
+                        })
+                        .or_insert(t);
                 }
                 Ok(())
             })?;
@@ -4627,10 +4701,10 @@ fn run_time_windowed_aggregate(
                     detail: "session window gap must be > 0".to_string(),
                 });
             }
-            // First pass: extract (group_key, event_time, record_idx) for
-            // every input record. Records with no `$source.event_time`
-            // are skipped — session assignment requires a per-record
-            // event-time anchor.
+            // First pass: bucket input indices by group-by key and
+            // record each one's event-time. Records without
+            // `$source.event_time` are skipped — session assignment
+            // requires a per-record event-time anchor.
             let mut by_key: HashMap<Vec<GroupByKey>, Vec<(usize, i64)>> = HashMap::new();
             for (i, (record, row_num)) in input.iter().enumerate() {
                 let Some(t) = record_event_time_nanos(record) else {
@@ -4639,61 +4713,95 @@ fn run_time_windowed_aggregate(
                 let key = compute_group_key(record, *row_num)?;
                 by_key.entry(key).or_default().push((i, t));
             }
-            // Second pass: per group, sort by event-time, partition
-            // into sessions, route records to per-(group, session) stream.
-            // Bucketing the AggregateStream by (group_key, session_idx)
-            // separates session emits without changing the underlying
-            // HashAggregator's group-by contract.
+            // Second pass: per group, sort indices by event-time,
+            // partition into sessions; remember the (group_key,
+            // session_idx, session_bounds) assignment per input index.
             type SessionStreamKey = (Vec<GroupByKey>, usize);
+            #[derive(Clone)]
+            struct PerRecordSession {
+                key: Vec<GroupByKey>,
+                session_idx: usize,
+                session: crate::executor::time_window::SessionInstance,
+            }
+            let mut record_session_info: Vec<Option<PerRecordSession>> = vec![None; input.len()];
+            for (key, mut indexed_times) in by_key {
+                indexed_times.sort_by_key(|(_, t)| *t);
+                let sorted_times: Vec<i64> = indexed_times.iter().map(|(_, t)| *t).collect();
+                let (assignments, sessions) = partition_into_sessions(&sorted_times, gap_nanos);
+                for ((record_idx, _t), session_idx) in indexed_times.iter().zip(assignments.iter())
+                {
+                    record_session_info[*record_idx] = Some(PerRecordSession {
+                        key: key.clone(),
+                        session_idx: *session_idx,
+                        session: sessions[*session_idx].clone(),
+                    });
+                }
+            }
+            // Third pass: walk input in arrival order so the
+            // streaming running watermark advances monotonically with
+            // the per-record check. Bucketing the AggregateStream by
+            // (group_key, session_idx) separates session emits
+            // without changing the underlying HashAggregator's
+            // group-by contract.
             let mut session_streams: HashMap<SessionStreamKey, AggregateStream> = HashMap::new();
             tokio::task::block_in_place(|| -> Result<(), PipelineError> {
-                for (key, mut indexed_times) in by_key {
-                    indexed_times.sort_by_key(|(_, t)| *t);
-                    let sorted_times: Vec<i64> = indexed_times.iter().map(|(_, t)| *t).collect();
-                    let (assignments, sessions) = partition_into_sessions(&sorted_times, gap_nanos);
-                    for ((record_idx, _t), session_idx) in
-                        indexed_times.iter().zip(assignments.iter())
-                    {
-                        let session = &sessions[*session_idx];
-                        if session_is_closed(session, gap_nanos, allowed_lateness_nanos, watermark)
-                        {
-                            let bounds = WindowBounds {
-                                start: session.start,
-                                end: session.last_event_time.saturating_add(gap_nanos),
-                            };
-                            let (rec, rn) = &input[*record_idx];
-                            push_late_record(ctx, name, rec, *rn, bounds)?;
-                            continue;
-                        }
-                        let stream_key = (key.clone(), *session_idx);
-                        let entry = session_streams.entry(stream_key);
-                        let stream = match entry {
-                            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                let fresh = make_stream(ctx)?;
-                                v.insert(fresh)
-                            }
+                for (i, (rec, rn)) in input.iter().enumerate() {
+                    let Some(info) = record_session_info[i].clone() else {
+                        continue;
+                    };
+                    let running_min =
+                        running_min_across(&running_per_source_max, &upstream_sources);
+                    if session_is_closed(
+                        &info.session,
+                        gap_nanos,
+                        allowed_lateness_nanos,
+                        running_min,
+                    ) {
+                        let bounds = WindowBounds {
+                            start: info.session.start,
+                            end: info.session.last_event_time.saturating_add(gap_nanos),
                         };
-                        let (rec, rn) = &input[*record_idx];
-                        let source_file_arc = source_file_arc_of(rec);
-                        let source_name_arc = source_name_arc_of(rec);
-                        let eval_ctx = EvalContext {
-                            stable: ctx.stable,
-                            source_file: &source_file_arc,
-                            source_row: *rn,
-                            source_path: &source_file_arc,
-                            source_count: ctx.source_count,
-                            source_batch: ctx.source_batch_arc,
-                            ingestion_timestamp: ctx.source_ingestion_timestamp,
-                            source_name: &source_name_arc,
-                        };
-                        let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
-                        if add_result.is_ok() {
-                            advance_cursor(ctx, &source_name_arc, *rn);
+                        push_late_record(ctx, name, rec, *rn, bounds)?;
+                        continue;
+                    }
+                    if let Some(t) = record_event_time_nanos(rec) {
+                        let src = source_name_arc_of(rec).to_string();
+                        running_per_source_max
+                            .entry(src)
+                            .and_modify(|v| {
+                                if t > *v {
+                                    *v = t;
+                                }
+                            })
+                            .or_insert(t);
+                    }
+                    let stream_key = (info.key, info.session_idx);
+                    let entry = session_streams.entry(stream_key);
+                    let stream = match entry {
+                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let fresh = make_stream(ctx)?;
+                            v.insert(fresh)
                         }
-                        if let Err(e) = add_result {
-                            handle_aggregate_add_error(ctx, name, rec, *rn, e)?;
-                        }
+                    };
+                    let source_file_arc = source_file_arc_of(rec);
+                    let source_name_arc = source_name_arc_of(rec);
+                    let eval_ctx = EvalContext {
+                        stable: ctx.stable,
+                        source_file: &source_file_arc,
+                        source_row: *rn,
+                        source_path: &source_file_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &source_name_arc,
+                    };
+                    let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
+                    if add_result.is_ok() {
+                        advance_cursor(ctx, &source_name_arc, *rn);
+                    }
+                    if let Err(e) = add_result {
+                        handle_aggregate_add_error(ctx, name, rec, *rn, e)?;
                     }
                 }
                 Ok(())

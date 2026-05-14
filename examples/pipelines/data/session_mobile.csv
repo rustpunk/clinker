@@ -1,0 +1,6 @@
+user_id,event_ts,source
+u1,2026-05-14T09:03:00,mobile
+u1,2026-05-14T09:21:00,mobile
+u2,2026-05-14T09:30:00,mobile
+u3,2026-05-14T10:00:00,mobile
+u3,2026-05-14T10:01:00,mobile
