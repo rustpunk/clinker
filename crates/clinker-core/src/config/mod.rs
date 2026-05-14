@@ -284,10 +284,11 @@ pub struct SourceConfig {
 ///
 /// `column` names a record field whose value is the source's event-
 /// time axis. At ingest, each record's value at this column is
-/// converted to an i64 nanosecond stamp and folded into a per-(source,
-/// file) max via [`crate::executor::watermark::PerSourceWatermarks`].
-/// The column type must coerce to [`clinker_record::Value::Timestamp`]
-/// or [`clinker_record::Value::Date`] (validated at plan time, see
+/// converted to an i64 nanosecond stamp, shifted earlier by `delay`,
+/// and folded into a per-(source, file) max via
+/// [`crate::executor::watermark::PerSourceWatermarks`]. The column
+/// type must coerce to [`clinker_record::Value::Timestamp`] or
+/// [`clinker_record::Value::Date`] (validated at plan time, see
 /// `crate::plan::bind_schema`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,17 +306,41 @@ pub struct WatermarkConfig {
     /// for the sub-second cadences a streaming consumer needs.
     #[serde(
         default,
-        deserialize_with = "deserialize_optional_idle_timeout",
-        serialize_with = "serialize_optional_idle_timeout",
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
         skip_serializing_if = "Option::is_none"
     )]
     pub idle_timeout: Option<std::time::Duration>,
+    /// Bounded out-of-order tolerance for this source. Each record's
+    /// event-time, before being folded into the watermark, is shifted
+    /// earlier by `delay`; equivalently, the source's effective
+    /// watermark trails its observed max event-time by this amount.
+    /// Mirrors Flink's `BoundedOutOfOrdernessWatermarks` and Beam's
+    /// `WithAllowedTimestampSkew` — a source-system property declared
+    /// once at the source, distinct from the operator-side
+    /// `allowed_lateness` knob.
+    ///
+    /// `None` (default) means no shift — the watermark advances with
+    /// the observed max. Same YAML duration form as `idle_timeout`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delay: Option<std::time::Duration>,
 }
 
-fn parse_idle_timeout(s: &str) -> Option<std::time::Duration> {
+/// Parse a duration string with an `ms` / `s` / `m` / `h` / `d` unit
+/// suffix into a [`std::time::Duration`].
+///
+/// `ms` is tested before the single-char `s` suffix so `"500ms"`
+/// doesn't read as 500 seconds with a stray `"m"`. Shared by
+/// [`WatermarkConfig::idle_timeout`], [`WatermarkConfig::delay`], and
+/// duration fields on `TimeWindowSpec` so YAML duration parsing is a
+/// single uniform contract across the schema.
+pub(crate) fn parse_duration_with_suffix(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
-    // `ms` must be tested before the single-char `s` suffix so that
-    // "500ms" doesn't read as 500 seconds with a stray "m".
     if let Some(rest) = s.strip_suffix("ms") {
         let n: u64 = rest.trim().parse().ok()?;
         return Some(std::time::Duration::from_millis(n));
@@ -332,12 +357,12 @@ fn parse_idle_timeout(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
-fn deserialize_optional_idle_timeout<'de, D: Deserializer<'de>>(
+fn deserialize_optional_duration<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<std::time::Duration>, D::Error> {
     let raw: Option<String> = Option::deserialize(d)?;
     raw.map(|s| {
-        parse_idle_timeout(&s).ok_or_else(|| {
+        parse_duration_with_suffix(&s).ok_or_else(|| {
             de::Error::custom(format!(
                 "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {s:?}"
             ))
@@ -346,15 +371,14 @@ fn deserialize_optional_idle_timeout<'de, D: Deserializer<'de>>(
     .transpose()
 }
 
-fn serialize_optional_idle_timeout<S: serde::Serializer>(
+fn serialize_optional_duration<S: serde::Serializer>(
     v: &Option<std::time::Duration>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
     match v {
         Some(d) => {
             // Round-trip as milliseconds — the most precise unit the
-            // parser accepts. Reading a serialized `idle_timeout` back
-            // through `parse_idle_timeout` yields the same `Duration`.
+            // parser accepts.
             s.serialize_str(&format!("{}ms", d.as_millis()))
         }
         None => s.serialize_none(),
@@ -1255,6 +1279,21 @@ pub struct AggregateConfig {
     /// `select_aggregation_strategies` post-pass in 16.4.9.
     #[serde(default)]
     pub strategy: AggregateStrategyHint,
+    /// Event-time window declaration. When `Some`, the aggregate
+    /// dispatch arm routes through the time-windowed path: each record
+    /// is assigned to its window(s) by `$source.event_time`, per-(key,
+    /// window) state accumulates independently, and emission gates on
+    /// `min_across_sources >= window_end + allowed_lateness`. Mirrors
+    /// `AggregateBody.time_window`. `None` (default) keeps today's
+    /// positional aggregate semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<crate::config::pipeline_node::TimeWindowSpec>,
+    /// Operator-side late-record tolerance for the time-windowed path.
+    /// Records arriving at a window after
+    /// `min_across_sources >= window_end + allowed_lateness` route to
+    /// the DLQ as `LateRecord`. Ignored when `time_window` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_lateness: Option<std::time::Duration>,
 }
 
 /// User-supplied hint for combine execution strategy.
@@ -3140,6 +3179,8 @@ pub(crate) fn lower_node_to_plan_node(
                         builder.with_field_meta(col, FieldMetadata::source_file())
                     } else if col == crate::config::pipeline_node::SOURCE_NAME_COLUMN {
                         builder.with_field_meta(col, FieldMetadata::source_name())
+                    } else if col == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN {
+                        builder.with_field_meta(col, FieldMetadata::source_event_time())
                     } else {
                         builder.with_field(col)
                     };
@@ -3313,6 +3354,8 @@ pub(crate) fn lower_node_to_plan_node(
                 group_by: agg_body.group_by.clone(),
                 cxl: agg_body.cxl.source.as_str().to_string(),
                 strategy: agg_body.strategy,
+                time_window: agg_body.time_window.clone(),
+                allowed_lateness: agg_body.allowed_lateness,
             };
             // `typed.field_types` is keyed and ordered by `bind_schema`'s
             // upstream `Row`, so iterating its keys yields the live

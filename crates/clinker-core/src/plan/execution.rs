@@ -4348,7 +4348,13 @@ pub(crate) fn apply_retraction_flags(dag: &mut ExecutionPlanDag) {
                 .and_then(|p| dag.node_properties.get(&p))
                 .map(|p| p.ck_set.clone())
                 .unwrap_or_default();
-            let is_relaxed = group_by_omits_any_ck_field(&config.group_by, &parent_ck);
+            // Time-windowed aggregates stay on the strict-collateral
+            // path: relaxed-CK retraction over multi-window emissions
+            // is unsupported. The dispatch arm reads the same fact
+            // (`config.time_window.is_some()`) to skip the relaxed
+            // finalize path entirely.
+            let is_relaxed = config.time_window.is_none()
+                && group_by_omits_any_ck_field(&config.group_by, &parent_ck);
             Some((idx, is_relaxed))
         })
         .collect();
@@ -4395,7 +4401,8 @@ pub(crate) fn apply_retraction_flags_in_body(body: &mut crate::plan::composition
                 }
                 cursor = upstream;
             }
-            let is_relaxed = group_by_omits_any_ck_field(&config.group_by, &ck);
+            let is_relaxed =
+                config.time_window.is_none() && group_by_omits_any_ck_field(&config.group_by, &ck);
             Some((idx, is_relaxed))
         })
         .collect();

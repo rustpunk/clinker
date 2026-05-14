@@ -223,13 +223,14 @@ pub(crate) fn detect_retract_scope(
                     }
                     Some(FieldMetadata::WidenedSidecar)
                     | Some(FieldMetadata::SourceFile)
-                    | Some(FieldMetadata::SourceName) => {
+                    | Some(FieldMetadata::SourceName)
+                    | Some(FieldMetadata::SourceEventTime) => {
                         // The `auto_widen` sidecar and the
-                        // `$source.file` / `$source.name` lineage
-                        // stamps carry no correlation linkage — they
-                        // ride alongside the CK lattice but the
-                        // retract walk routes through `$ck.*` columns
-                        // only.
+                        // `$source.file` / `$source.name` /
+                        // `$source.event_time` lineage stamps carry no
+                        // correlation linkage — they ride alongside the
+                        // CK lattice but the retract walk routes through
+                        // `$ck.*` columns only.
                     }
                     None => {}
                 }

@@ -1,0 +1,42 @@
+pipeline:
+  name: tumbling_clicks
+
+nodes:
+  - type: source
+    name: clicks
+    description: Per-user click stream with an event-time column.
+    config:
+      name: clicks
+      type: csv
+      path: ./data/tumbling_clicks.csv
+      options:
+        has_header: true
+      watermark:
+        column: event_ts
+      schema:
+        - { name: user_id, type: string }
+        - { name: event_ts, type: date_time }
+        - { name: kind, type: string }
+
+  - type: aggregate
+    name: hourly_clicks
+    description: Per-user click count, bucketed by event-time hour.
+    input: clicks
+    config:
+      group_by: [user_id]
+      time_window:
+        tumbling: { size: 1h }
+      cxl: |
+        emit user_id = user_id
+        emit n = count(*)
+
+  - type: output
+    name: results
+    input: hourly_clicks
+    config:
+      name: results
+      type: csv
+      path: ./output/tumbling_clicks.csv
+
+error_handling:
+  strategy: fail_fast

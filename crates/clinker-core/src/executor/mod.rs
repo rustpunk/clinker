@@ -5,6 +5,7 @@ pub(crate) mod commit;
 pub(crate) mod dispatch;
 mod schema_check;
 pub(crate) mod source_stream;
+pub(crate) mod time_window;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
@@ -145,6 +146,8 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         group_by: body.group_by.clone(),
                         cxl: body.cxl.as_ref().to_string(),
                         strategy: body.strategy,
+                        time_window: body.time_window.clone(),
+                        allowed_lateness: body.allowed_lateness,
                     }),
                     local_window: None,
                     route: None,
@@ -1950,16 +1953,18 @@ async fn ingest_source_task(
         let mut src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
         let reader_schema = src_reader.schema()?;
 
-        // Widen the reader schema with `$source.file` and `$source.name`
-        // engine-stamped tail columns. The stamps travel with every record
-        // so downstream operators resolve `$source.file` / `$source.name`
-        // per-record via column reads (see `dispatch::source_file_arc_of`
-        // and `dispatch::source_name_arc_of`) instead of indexing external
-        // row-keyed Vecs. Tail order is load-bearing — see
+        // Widen the reader schema with `$source.file`, `$source.name`,
+        // and `$source.event_time` engine-stamped tail columns. The
+        // stamps travel with every record so downstream operators
+        // resolve them per-record via column reads (see
+        // `dispatch::source_file_arc_of`, `dispatch::source_name_arc_of`,
+        // and the time-windowed aggregate arm) instead of indexing
+        // external row-keyed Vecs. Tail order is load-bearing — see
         // `bind_schema::columns_from_decl`: `$ck.<field>` shadows first,
-        // then `$widened`, then `$source.file`, then `$source.name` last.
+        // then `$widened`, then `$source.file`, then `$source.name`,
+        // then `$source.event_time` last.
         let mut widened_builder =
-            clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 2);
+            clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 3);
         for (idx, col) in reader_schema.columns().iter().enumerate() {
             widened_builder = match reader_schema.field_metadata(idx) {
                 Some(meta) => widened_builder.with_field_meta(col.as_ref(), meta.clone()),
@@ -1975,6 +1980,10 @@ async fn ingest_source_task(
                 crate::config::pipeline_node::SOURCE_NAME_COLUMN,
                 clinker_record::FieldMetadata::source_name(),
             )
+            .with_field_meta(
+                crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN,
+                clinker_record::FieldMetadata::source_event_time(),
+            )
             .build();
 
         let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
@@ -1984,23 +1993,29 @@ async fn ingest_source_task(
         };
         let source_name_arc: Arc<str> = Arc::from(src_cfg.name.as_str());
 
-        let watermark_column_idx: Option<usize> = match src_cfg.watermark.as_ref() {
-            None => None,
-            Some(wm) => match widened_schema.index(wm.column.as_str()) {
-                Some(i) => Some(i),
-                None => {
-                    return Err(PipelineError::Config(
-                        crate::config::ConfigError::Validation(format!(
+        let (watermark_column_idx, delay_nanos): (Option<usize>, i64) =
+            match src_cfg.watermark.as_ref() {
+                None => (None, 0),
+                Some(wm) => {
+                    let idx = widened_schema.index(wm.column.as_str()).ok_or_else(|| {
+                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
                             "source '{}' declares watermark.column = '{}' but no such column \
-                             exists on the runtime schema (declared columns: {:?})",
+                         exists on the runtime schema (declared columns: {:?})",
                             src_cfg.name,
                             wm.column,
                             widened_schema.columns(),
-                        )),
-                    ));
+                        )))
+                    })?;
+                    // Saturating i64 nanos — a 292-year `Duration` is the
+                    // theoretical ceiling. Anything beyond saturates to
+                    // `i64::MAX` and stays a useful (if extreme) shift.
+                    let delay_nanos = wm
+                        .delay
+                        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                        .unwrap_or(0);
+                    (Some(idx), delay_nanos)
                 }
-            },
-        };
+            };
 
         let mut stream = stream;
         let mut rn: u64 = 0;
@@ -2016,18 +2031,24 @@ async fn ingest_source_task(
                         .cloned()
                         .unwrap_or_else(|| Arc::clone(&static_source_file));
                     let mut values: Vec<clinker_record::Value> = record.values().to_vec();
-                    if let Some(idx) = watermark_column_idx
+                    let event_time_value: clinker_record::Value = if let Some(idx) =
+                        watermark_column_idx
                         && let Some(value) = values.get(idx)
-                        && let Some(ts_nanos) = value_to_event_time_nanos(value)
+                        && let Some(raw_nanos) = value_to_event_time_nanos(value)
                     {
-                        watermark_observations.push((Arc::clone(&file_arc), ts_nanos));
-                    }
+                        let effective = raw_nanos.saturating_sub(delay_nanos);
+                        watermark_observations.push((Arc::clone(&file_arc), effective));
+                        clinker_record::Value::Integer(effective)
+                    } else {
+                        clinker_record::Value::Null
+                    };
                     values.push(clinker_record::Value::String(
                         file_arc.as_ref().to_string().into_boxed_str(),
                     ));
                     values.push(clinker_record::Value::String(
                         source_name_arc.as_ref().to_string().into_boxed_str(),
                     ));
+                    values.push(event_time_value);
                     let widened_record =
                         clinker_record::Record::new(Arc::clone(&widened_schema), values);
                     stream.blocking_push(widened_record, rn).map_err(|e| {

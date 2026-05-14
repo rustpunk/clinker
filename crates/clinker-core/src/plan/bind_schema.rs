@@ -1102,10 +1102,53 @@ fn bind_schema_inner(
         }
     };
 
+    // Per-node set of upstream-reachable Source names, plus a flag per
+    // Source recording whether it declared `watermark.column`. Populated
+    // as we walk in topological order; consumed by the time-windowed
+    // aggregate guard (E156) below. A node's set is the union of its
+    // input nodes' sets, so the check at an Aggregate sees every Source
+    // that can deliver records to it through any path.
+    let mut source_has_watermark: HashMap<String, bool> = HashMap::new();
+    let mut upstream_sources: HashMap<String, HashSet<String>> = HashMap::new();
+
     for spanned in nodes {
         let node = &spanned.value;
         let name = node.name().to_string();
         let span = span_for(spanned);
+
+        // Compute the upstream-source set for this node BEFORE the
+        // typecheck match — Aggregate's E156 guard reads it inside the
+        // match arm. Source nodes seed the set with themselves; every
+        // other variant unions its direct inputs' sets.
+        let node_sources: HashSet<String> = match node {
+            PipelineNode::Source { .. } => {
+                let mut s = HashSet::new();
+                s.insert(name.clone());
+                s
+            }
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
+                .and_then(|n| upstream_sources.get(n).cloned())
+                .unwrap_or_default(),
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .filter_map(|n| upstream_sources.get(n))
+                .flat_map(|s| s.iter().cloned())
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .filter_map(|n| upstream_sources.get(n))
+                .flat_map(|s| s.iter().cloned())
+                .collect(),
+        };
+        upstream_sources.insert(name.clone(), node_sources);
 
         match node {
             PipelineNode::Source { config, .. } => {
@@ -1127,6 +1170,10 @@ fn bind_schema_inner(
                         LabeledSpan::primary(span, String::new()),
                     ));
                 }
+                // Record whether this source declared `watermark.column`
+                // so the downstream time-windowed aggregate guard (E156)
+                // can verify every upstream-reachable Source has one.
+                source_has_watermark.insert(name.clone(), config.source.watermark.is_some());
                 // Watermark declaration: column must exist on the
                 // source's declared schema AND have an event-time-
                 // coercible CXL type (DateTime or Date).
@@ -1226,6 +1273,47 @@ fn bind_schema_inner(
                     Some(s) => s.clone(),
                     None => continue,
                 };
+                // E156 — a time-windowed aggregate's close decision
+                // reads `min_across_sources` over the upstream-reachable
+                // Source set. Every Source on every path into this
+                // aggregate MUST declare `watermark.column` for the
+                // close to ever fire; a single watermark-less Source on
+                // any path holds the min at `None` forever, silently
+                // suppressing all window emissions. Flink TVF / Spark
+                // window do the same plan-time check.
+                if config.time_window.is_some() {
+                    let upstream_set = upstream_sources.get(&name).cloned().unwrap_or_default();
+                    let mut missing_wm: Vec<&str> = upstream_set
+                        .iter()
+                        .filter(|s| !source_has_watermark.get(*s).copied().unwrap_or(false))
+                        .map(|s| s.as_str())
+                        .collect();
+                    missing_wm.sort();
+                    if !missing_wm.is_empty() {
+                        let missing_list: Vec<String> =
+                            missing_wm.iter().map(|s| format!("{s:?}")).collect();
+                        diags.push(
+                            Diagnostic::error(
+                                "E156",
+                                format!(
+                                    "aggregate {name:?} declares `time_window:` but the \
+                                     following upstream-reachable source(s) do not declare \
+                                     `watermark.column`: {missing}. Without a watermark on \
+                                     every upstream source, `min_across_sources` stays at \
+                                     `None` and the window can never close.",
+                                    missing = missing_list.join(", "),
+                                ),
+                                LabeledSpan::primary(span, String::new()),
+                            )
+                            .with_help(
+                                "add `watermark: { column: <event-time-column> }` to each \
+                                 listed source's config, or remove `time_window:` from this \
+                                 aggregate",
+                            ),
+                        );
+                        continue;
+                    }
+                }
                 // Validate group_by fields exist in the upstream schema.
                 let mut missing = Vec::new();
                 for gb in &config.group_by {
@@ -2244,7 +2332,8 @@ fn build_input_port_rows(
             let is_engine_stamped = qf.name.starts_with("$ck.")
                 || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
                 || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_FILE_COLUMN
-                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_NAME_COLUMN;
+                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_NAME_COLUMN
+                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN;
             if is_engine_stamped && !declared_columns.contains_key(qf) {
                 declared_columns.insert(qf.clone(), ty.clone());
             }
@@ -2504,6 +2593,8 @@ where
             builder.with_field_meta(name, FieldMetadata::source_file())
         } else if name == crate::config::pipeline_node::SOURCE_NAME_COLUMN {
             builder.with_field_meta(name, FieldMetadata::source_name())
+        } else if name == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN {
+            builder.with_field_meta(name, FieldMetadata::source_event_time())
         } else {
             builder.with_field(name)
         };
@@ -2540,16 +2631,17 @@ fn columns_from_decl(
         .collect();
     // Engine-stamped tail order: `$ck.<field>` shadow columns first,
     // then the `$widened` sidecar, then `$source.file`, then
-    // `$source.name` last. The order is load-bearing — CK-aligned
-    // aggregate / combine propagation walks the schema expecting
-    // `$ck.*` immediately after declared columns; pushing `$widened`
-    // between them would break that propagation. Sources with
-    // `auto_widen` get `$widened` after every `$ck.<field>` slot;
-    // `$source.file` and `$source.name` live outside the CK lattice
-    // and tail-append after `$widened`. The same order is replayed by
-    // `executor::mod::ingest_source_into_stream` when it widens the
-    // runtime reader schema, so the planner's view stays positionally
-    // aligned with the actual records flowing through dispatch.
+    // `$source.name`, then `$source.event_time`. The order is load-
+    // bearing — CK-aligned aggregate / combine propagation walks the
+    // schema expecting `$ck.*` immediately after declared columns;
+    // pushing `$widened` between them would break that propagation.
+    // Sources with `auto_widen` get `$widened` after every `$ck.<field>`
+    // slot; the `$source.*` lineage columns live outside the CK
+    // lattice and tail-append after `$widened`. The same order is
+    // replayed by `executor::mod::ingest_source_into_stream` when it
+    // widens the runtime reader schema, so the planner's view stays
+    // positionally aligned with the actual records flowing through
+    // dispatch.
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
@@ -2580,6 +2672,10 @@ fn columns_from_decl(
     cols.insert(
         QualifiedField::bare(crate::config::pipeline_node::SOURCE_NAME_COLUMN),
         Type::String,
+    );
+    cols.insert(
+        QualifiedField::bare(crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN),
+        Type::Int,
     );
     (cols, missing)
 }
