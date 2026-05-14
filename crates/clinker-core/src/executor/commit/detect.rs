@@ -7,6 +7,7 @@
 //! `group_by`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, GroupByKey, Schema};
 use petgraph::graph::NodeIndex;
@@ -15,13 +16,20 @@ use super::DlqEvent;
 use crate::executor::dispatch::ExecutorContext;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// One row-and-source pair carrying a relaxed-CK retract trigger.
+/// The source name pairs the source-local `row_num` with its
+/// originating Source so retract matches scope by `(row_num, source)`
+/// — cross-source `row_num` collisions (each Source has its own
+/// monotonic counter) are otherwise indistinguishable in the bare
+/// `u64` shape.
+pub(crate) type RetractRow = (u64, Arc<str>);
+
 /// Output of the detect phase. Consumed by `recompute_agg` and `flush`.
 #[derive(Debug, Default)]
 pub(crate) struct RetractScope {
-    /// Affected aggregate node + group keys that need rerun. Each
-    /// entry's `Vec<u32>` carries the runtime-DLQ-triggered input row
-    /// IDs to retract from that aggregate's per-group state.
-    pub(crate) aggregates: Vec<(NodeIndex, Vec<u64>)>,
+    /// Affected aggregate node + per-source-tagged input row IDs to
+    /// retract from that aggregate's per-group state.
+    pub(crate) aggregates: Vec<(NodeIndex, Vec<RetractRow>)>,
     /// Trigger group keys (correlation-buffer keys) that drove the
     /// scope expansion. Used by `flush` to format DLQ trigger messages
     /// against the same group identifier the strict path emits. `Vec`
@@ -29,15 +37,21 @@ pub(crate) struct RetractScope {
     /// `Ord`; the keys are pre-sorted by formatted-string before they
     /// land here so deterministic emission is preserved.
     pub(crate) trigger_group_keys: Vec<Vec<GroupByKey>>,
-    /// Union of every source row id that has been folded into the
-    /// scope across all iterations of the orchestrator's commit loop.
-    /// Used by [`Self::expand_with_dlq_events`] to compute the
-    /// per-iteration delta — a DLQ event whose `source_row` is already
-    /// in this set is a no-op for the loop. Termination follows
-    /// directly: source rows are bounded, so a strictly-monotone set
-    /// caps the loop at `|source_rows|` iterations regardless of how
-    /// many DLQ events each iteration produces.
-    pub(crate) seen_source_rows: BTreeSet<u64>,
+    /// Union of every `(source_row_id, source_name)` pair that has
+    /// been folded into the scope across all iterations of the
+    /// orchestrator's commit loop. Used by
+    /// [`Self::expand_with_dlq_events`] to compute the per-iteration
+    /// delta — a DLQ event whose `(source_row, source_name)` is
+    /// already in this set is a no-op for the loop. Pairing on the
+    /// source name is load-bearing because each Source has its own
+    /// monotonic `row_num` counter (see `ingest_source_task`); without
+    /// source tagging, `src_a.row_5` would dedup against `src_b.row_5`
+    /// and the second source's retract would silently no-op.
+    /// Termination follows directly: source rows are bounded per
+    /// source, so a strictly-monotone set caps the loop at
+    /// `Σ |source_rows|` iterations regardless of how many DLQ events
+    /// each iteration produces.
+    pub(crate) seen_source_rows: BTreeSet<RetractRow>,
 }
 
 /// Compute the retract scope from `ctx.correlation_buffers` plus the
@@ -108,7 +122,10 @@ pub(crate) fn detect_retract_scope(
     // instantiated), the synthetic-CK lookup misses and the existing
     // degrade-fallback in `recompute_agg.rs` routes the affected group
     // through strict-collateral DLQ.
-    let mut affected_row_ids: BTreeSet<u64> = BTreeSet::new();
+    // Per-source row-id pairs. Cross-source `row_num` collisions
+    // (each Source has its own monotonic counter) make the source
+    // tag load-bearing for retract correctness.
+    let mut affected_row_pairs: BTreeSet<(u64, Arc<str>)> = BTreeSet::new();
     // Accumulate counter deltas locally so the immutable borrow of
     // `ctx.correlation_buffers` (and the immutable hand to
     // `ctx.relaxed_aggregator_states`) does not collide with the
@@ -199,8 +216,8 @@ pub(crate) fn detect_retract_scope(
                         if let Some(rows) = retained.aggregator.input_rows_by_group_index(group_idx)
                         {
                             synthetic_ck_rows_expanded += rows.len() as u64;
-                            for &r in rows {
-                                affected_row_ids.insert(r);
+                            for (r, sn) in rows {
+                                affected_row_pairs.insert((*r, Arc::clone(sn)));
                             }
                         }
                     }
@@ -219,17 +236,18 @@ pub(crate) fn detect_retract_scope(
             }
         }
 
-        // Source-CK or no-CK cells: the cell's `error_rows` ARE source
-        // row numbers (modulo the row-number-disambiguator path for
-        // null-keyed cells), so they feed `retract_row` directly. A
-        // pure-AggregateGroupIndex cell whose synthetic lookup landed
-        // already covered its contributing source rows; including the
-        // raw `error_rows` here would feed aggregate-output row numbers
-        // into `retract_row` and exercise the not-found tolerance,
-        // silently no-opping. Skip the raw union in that case.
+        // Source-CK or no-CK cells: the cell's `error_messages` carry
+        // both the `row_num` and the originating record, so we can
+        // pair each row with its source. A pure-AggregateGroupIndex
+        // cell whose synthetic lookup landed already covered its
+        // contributing source rows; including the raw `error_messages`
+        // entries here would feed aggregate-output row numbers into
+        // `retract_row` and exercise the not-found tolerance, silently
+        // no-opping. Skip the raw union in that case.
         if has_source_ck || !had_synthetic_lookup {
-            for &row in &group.error_rows {
-                affected_row_ids.insert(row);
+            for err in &group.error_messages {
+                let sn = crate::executor::dispatch::source_name_arc_of(&err.original_record);
+                affected_row_pairs.insert((err.row_num, sn));
             }
         }
     }
@@ -262,9 +280,13 @@ pub(crate) fn detect_retract_scope(
                 .map(|p| p.ck_set.clone())
                 .unwrap_or_default();
             if crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
-                scope
-                    .aggregates
-                    .push((idx, affected_row_ids.iter().copied().collect()));
+                scope.aggregates.push((
+                    idx,
+                    affected_row_pairs
+                        .iter()
+                        .map(|(r, sn)| (*r, Arc::clone(sn)))
+                        .collect(),
+                ));
             }
         }
     }
@@ -272,9 +294,9 @@ pub(crate) fn detect_retract_scope(
     // Seed the cumulative source-row set with the initial trigger fan-in.
     // The orchestrator's commit loop folds each iteration's deferred-DLQ
     // events into this set via [`RetractScope::expand_with_dlq_events`];
-    // a strictly-monotone set against a bounded source-row universe is
-    // the structural termination proof for the loop.
-    scope.seen_source_rows = affected_row_ids;
+    // a strictly-monotone set against a bounded `(row, source)` universe
+    // is the structural termination proof for the loop.
+    scope.seen_source_rows = affected_row_pairs;
 
     scope
 }
@@ -292,22 +314,23 @@ impl RetractScope {
     /// a prior iteration's retract scope, so further looping cannot
     /// surface new state changes.
     ///
-    /// Each appended row id flows through `retract_row`'s "not found"
-    /// tolerance for aggregates whose lineage doesn't include it, so
-    /// the wide-fanout shape (every relaxed-CK aggregate sees every
-    /// new row id) stays correct without per-aggregate filtering.
-    pub(crate) fn expand_with_dlq_events(&mut self, events: &[DlqEvent]) -> Vec<u64> {
-        let mut new_rows: Vec<u64> = Vec::new();
+    /// Each appended `(row, source)` pair flows through `retract_row`'s
+    /// "not found" tolerance for aggregates whose lineage doesn't
+    /// include it, so the wide-fanout shape (every relaxed-CK aggregate
+    /// sees every new pair) stays correct without per-aggregate
+    /// filtering.
+    pub(crate) fn expand_with_dlq_events(&mut self, events: &[DlqEvent]) -> Vec<RetractRow> {
+        let mut new_rows: Vec<RetractRow> = Vec::new();
         for event in events {
-            let row = event.source_row;
-            if !self.seen_source_rows.insert(row) {
+            let pair = (event.source_row, Arc::clone(&event.source_name));
+            if !self.seen_source_rows.insert(pair.clone()) {
                 continue;
             }
-            new_rows.push(row);
+            new_rows.push(pair);
         }
         if !new_rows.is_empty() {
             for (_, retract_ids) in &mut self.aggregates {
-                retract_ids.extend(new_rows.iter().copied());
+                retract_ids.extend(new_rows.iter().cloned());
             }
         }
         new_rows

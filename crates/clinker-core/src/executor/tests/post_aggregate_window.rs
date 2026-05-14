@@ -14,7 +14,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-fn run_pipeline(
+async fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -43,7 +43,8 @@ fn run_pipeline(
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .await?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -129,8 +130,8 @@ nodes:
 /// `total`. A node-rooted arena resolves `total` via the upstream
 /// aggregate's emit buffer; the previous source-rooted geometry would
 /// see Null because `total` is not a source column.
-#[test]
-fn post_aggregate_window_sum_equals_total_for_single_row_partition() {
+#[tokio::test(flavor = "multi_thread")]
+async fn post_aggregate_window_sum_equals_total_for_single_row_partition() {
     let csv = "\
 department,amount
 HR,10
@@ -140,7 +141,9 @@ ENG,100
 ENG,200
 ENG,300
 ";
-    let (counters, dlq, output) = run_pipeline(SUM_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, dlq, output) = run_pipeline(SUM_PIPELINE, csv)
+        .await
+        .expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0, "no failure injected");
     assert!(dlq.is_empty(), "no failure injected");
 
@@ -217,8 +220,8 @@ nodes:
 /// Two aggregate group keys (`department`, `region`) → window
 /// `partition_by: [department]`. Every row in HR sees the HR sum;
 /// every row in ENG sees the ENG sum.
-#[test]
-fn post_aggregate_full_partition_sum() {
+#[tokio::test(flavor = "multi_thread")]
+async fn post_aggregate_full_partition_sum() {
     // HR/east: 10+20=30, HR/west: 5  → HR partition total = 35
     // ENG/east: 100+200=300, ENG/west: 50, ENG/north: 7+3=10 → ENG = 360
     let csv = "\
@@ -232,8 +235,9 @@ ENG,west,50
 ENG,north,7
 ENG,north,3
 ";
-    let (counters, dlq, output) =
-        run_pipeline(MULTI_ROW_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, dlq, output) = run_pipeline(MULTI_ROW_PIPELINE, csv)
+        .await
+        .expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0);
     assert!(dlq.is_empty());
 
@@ -364,8 +368,8 @@ nodes:
 /// returned `Null` for the `total` reference; node-rooted resolution
 /// against the upstream Aggregate's emit buffer is what makes the
 /// running total well-defined here.
-#[test]
-fn post_aggregate_window_cumulative_sum_within_partition() {
+#[tokio::test(flavor = "multi_thread")]
+async fn post_aggregate_window_cumulative_sum_within_partition() {
     // HR/east: 10+20=30, HR/west: 5. ENG/east: 100+200=300, ENG/west: 50,
     // ENG/north: 7+3=10. Identical fixture to the full-partition sum test
     // so a single ground-truth set covers both arithmetic shapes.
@@ -380,8 +384,9 @@ ENG,west,50
 ENG,north,7
 ENG,north,3
 ";
-    let (counters, dlq, output) =
-        run_pipeline(CUMSUM_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, dlq, output) = run_pipeline(CUMSUM_PIPELINE, csv)
+        .await
+        .expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0);
     assert!(dlq.is_empty());
 
@@ -469,8 +474,8 @@ nodes:
 /// `1 / (total - 60)` evaluates against the post-aggregate row whose
 /// `total == 60`; the divide-by-zero must surface as a runtime error
 /// that routes to the DLQ. The successful row is preserved.
-#[test]
-fn post_aggregate_window_divide_by_zero_routes_to_dlq() {
+#[tokio::test(flavor = "multi_thread")]
+async fn post_aggregate_window_divide_by_zero_routes_to_dlq() {
     // HR's total = 60 → divisor zero; ENG's total = 600 → ratio defined.
     let csv = "\
 department,amount
@@ -481,8 +486,9 @@ ENG,100
 ENG,200
 ENG,300
 ";
-    let (counters, dlq, output) =
-        run_pipeline(DIV_BY_ZERO_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, dlq, output) = run_pipeline(DIV_BY_ZERO_PIPELINE, csv)
+        .await
+        .expect("pipeline must execute");
     assert_eq!(
         counters.dlq_count, 1,
         "exactly one row (HR, total=60) must hit divide-by-zero"

@@ -760,6 +760,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -779,6 +780,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -794,6 +796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -827,7 +830,6 @@ dependencies = [
  "clinker-format",
  "clinker-record",
  "criterion",
- "crossbeam-channel",
  "csv",
  "ctrlc",
  "cxl",
@@ -851,6 +853,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
  "walkdir",
@@ -1237,6 +1240,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
+ "futures",
  "is-terminal",
  "itertools",
  "num-traits",
@@ -1249,6 +1253,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 

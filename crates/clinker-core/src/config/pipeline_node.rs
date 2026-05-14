@@ -922,11 +922,22 @@ pub struct RouteBody {
     pub default: String,
 }
 
-/// Merge variant body. The plan-specified shape is empty: `inputs:` lives
-/// on `MergeHeader`, not in the body.
+/// Merge variant body. `inputs:` lives on `MergeHeader`, not here.
+///
+/// `mode` selects between deterministic declaration-order concat (the
+/// default, preserving today's behavior for every existing pipeline)
+/// and live-channel interleave. `interleave_seed`, when set, seeds a
+/// per-Merge `fastrand::Rng` so interleave-mode ordering is
+/// reproducible across runs; absent, interleave arbitration follows
+/// `tokio::select!` wall-clock readiness and is non-deterministic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct MergeBody {}
+pub struct MergeBody {
+    #[serde(default)]
+    pub mode: crate::config::MergeMode,
+    #[serde(default)]
+    pub interleave_seed: Option<u64>,
+}
 
 /// Selects which correlation-key columns a Combine's output records carry.
 ///

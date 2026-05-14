@@ -32,6 +32,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use clinker_bench_support::bench_runtime as runtime;
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_record::{Record, SchemaBuilder, Value};
@@ -318,7 +319,10 @@ fn run_iejoin_executor(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("iejoin pipeline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");

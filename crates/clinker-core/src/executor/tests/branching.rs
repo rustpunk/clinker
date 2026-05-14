@@ -6,7 +6,7 @@
 use super::*;
 
 /// Helper: run executor with in-memory CSV input/output for branching tests.
-fn run_branch_test(
+async fn run_branch_test(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -36,15 +36,16 @@ fn run_branch_test(
     };
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .await?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
 }
 
 /// Diamond DAG: fork -> 2 branches -> merge: all records present in output.
-#[test]
-fn test_branch_diamond_dag() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_diamond_dag() {
     let yaml = r#"
 pipeline:
   name: diamond
@@ -110,7 +111,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.ok_count, 4, "all 4 records should be in output");
     assert!(dlq.is_empty(), "no DLQ entries expected");
@@ -127,8 +128,8 @@ nodes:
 }
 
 /// Exclusive mode: input count = output count (no duplication, no loss).
-#[test]
-fn test_branch_exclusive_conservation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_exclusive_conservation() {
     let yaml = r#"
 pipeline:
   name: exclusive_conservation
@@ -195,7 +196,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
-    let (counters, _, _) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, _) = run_branch_test(yaml, csv).await.unwrap();
 
     // Exclusive mode: no duplication, no loss
     assert_eq!(
@@ -205,8 +206,8 @@ nodes:
 }
 
 /// Inclusive mode: records in multiple branches, merge has more than input.
-#[test]
-fn test_branch_inclusive_duplication() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_inclusive_duplication() {
     let yaml = r#"
 pipeline:
   name: inclusive_dup
@@ -282,7 +283,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     // id=1 (200): matches over_50 AND over_100 -> 2 writes
     // id=2 (50): matches nothing -> default (low) -> 1 write
@@ -301,8 +302,8 @@ nodes:
 }
 
 /// Records within each branch maintain input order.
-#[test]
-fn test_branch_order_within_branch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_order_within_branch() {
     let yaml = r#"
 pipeline:
   name: order_test
@@ -369,7 +370,7 @@ nodes:
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,500\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.ok_count, 5, "all records should be in output");
 
@@ -395,8 +396,8 @@ nodes:
 }
 
 /// Merge output: branch A records, then branch B records (declaration order).
-#[test]
-fn test_branch_merge_concatenation_order() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_merge_concatenation_order() {
     let yaml = r#"
 pipeline:
   name: merge_order
@@ -462,7 +463,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (_, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     // enrich_high is declared first in the merge input, so high records come first
     let lines: Vec<&str> = output.lines().collect();
@@ -481,8 +482,8 @@ nodes:
 }
 
 /// Route condition that never matches -> empty branch -> no error.
-#[test]
-fn test_branch_empty_branch_no_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_empty_branch_no_error() {
     let yaml = r#"
 pipeline:
   name: empty_branch
@@ -548,7 +549,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(yaml, csv).await.unwrap();
 
     // All records go to 'normal' branch, 'impossible' is empty
     assert_eq!(counters.ok_count, 3);
@@ -558,8 +559,8 @@ nodes:
 }
 
 /// 3 branches, each with different transforms.
-#[test]
-fn test_branch_three_way_fork() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_three_way_fork() {
     let yaml = r#"
 pipeline:
   name: three_way
@@ -634,7 +635,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.ok_count, 6, "all 6 records in output");
     assert!(output.contains("HIGH"));
@@ -643,8 +644,8 @@ nodes:
 }
 
 /// Branch A: enrichment, Branch B: filtering -- different transforms per branch.
-#[test]
-fn test_branch_different_transforms_per_branch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_different_transforms_per_branch() {
     let yaml = r#"
 pipeline:
   name: different_transforms
@@ -710,7 +711,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(
@@ -728,8 +729,8 @@ nodes:
 }
 
 /// Linear pipeline executes correctly through execute_dag() (no regression).
-#[test]
-fn test_dag_linear_execution_no_regression() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dag_linear_execution_no_regression() {
     // This test verifies that linear pipelines (no branching) still work
     // correctly through execute_dag(). It's a regression test.
     let yaml = r#"
@@ -764,7 +765,7 @@ nodes:
 "#;
 
     let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.total_count, 3);
     assert_eq!(counters.ok_count, 3);
@@ -775,8 +776,8 @@ nodes:
 }
 
 /// TwoPass node in one branch, Streaming in another -- per-node dispatch works.
-#[test]
-fn test_dag_mixed_execution_reqs() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dag_mixed_execution_reqs() {
     // When any transform requires arena (window functions), the entire
     // pipeline runs in TwoPass mode. This test verifies that a pipeline
     // mixing window and non-window transforms works correctly.
@@ -822,7 +823,7 @@ nodes:
 "#;
 
     let csv = "dept,amount\nA,10\nB,20\nA,30\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(counters.total_count, 3);
     assert_eq!(counters.ok_count, 3);
@@ -836,8 +837,8 @@ nodes:
 }
 
 /// rayon::scope indexed results: deterministic merge order for N > 2 branches.
-#[test]
-fn test_branch_rayon_scope_deterministic_order() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_rayon_scope_deterministic_order() {
     // Run the three-way fork multiple times and verify deterministic output
     let yaml = r#"
 pipeline:
@@ -915,17 +916,17 @@ nodes:
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
 
     // Run multiple times and check deterministic output
-    let (_, _, output1) = run_branch_test(yaml, csv).unwrap();
-    let (_, _, output2) = run_branch_test(yaml, csv).unwrap();
-    let (_, _, output3) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output1) = run_branch_test(yaml, csv).await.unwrap();
+    let (_, _, output2) = run_branch_test(yaml, csv).await.unwrap();
+    let (_, _, output3) = run_branch_test(yaml, csv).await.unwrap();
 
     assert_eq!(output1, output2, "output must be deterministic");
     assert_eq!(output2, output3, "output must be deterministic");
 }
 
 /// Inclusive mode clones records -- mutations in one branch don't affect another.
-#[test]
-fn test_branch_inclusive_isolation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_branch_inclusive_isolation() {
     let yaml = r#"
 pipeline:
   name: inclusive_isolation
@@ -993,7 +994,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,100\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(yaml, csv).await.unwrap();
 
     // id=1 matches both branches (inclusive) -> 2 writes from 1 input record.
     // Dual counters:

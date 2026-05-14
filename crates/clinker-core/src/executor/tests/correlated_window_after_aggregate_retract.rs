@@ -21,7 +21,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-fn run_pipeline(
+async fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -50,7 +50,8 @@ fn run_pipeline(
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .await?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -178,8 +179,8 @@ fn aggregate_relaxed_then_window_compiles_without_e150() {
 /// one row per department; the window's `partition_by: [department]`
 /// gives each emitted row its own size-1 partition, so
 /// `running_total == total` for every output row.
-#[test]
-fn aggregate_relaxed_then_window_runs_without_panic() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_relaxed_then_window_runs_without_panic() {
     let csv = "\
 order_id,department,amount
 O1,HR,10
@@ -190,6 +191,7 @@ O5,ENG,200
 O6,ENG,300
 ";
     let (counters, dlq, output) = run_pipeline(D7_PIPELINE, csv)
+        .await
         .expect("post-aggregate-window pipeline must execute without error");
     assert_eq!(
         counters.dlq_count, 0,
@@ -248,8 +250,8 @@ O6,ENG,300
 /// (driver/collateral) reach the writer is exercised end-to-end by
 /// `examples/pipelines/retract-demo` (covered by `retract_demo_smoke`);
 /// this test pins the post-aggregate single-row exclusion contract.
-#[test]
-fn aggregate_relaxed_then_window_buffer_recompute_excludes_retracted_partition() {
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_relaxed_then_window_buffer_recompute_excludes_retracted_partition() {
     let yaml = r#"
 pipeline:
   name: agg_then_window_buffer_recompute
@@ -306,8 +308,9 @@ O4,ENG,100
 O5,ENG,200
 O6,ENG,300
 ";
-    let (counters, dlq, output) =
-        run_pipeline(yaml, csv).expect("buffer-recompute pipeline must execute");
+    let (counters, dlq, output) = run_pipeline(yaml, csv)
+        .await
+        .expect("buffer-recompute pipeline must execute");
 
     // HR's aggregate output has total=60; the ratio's `1/(60-60)` divides
     // by zero. The orchestrator routes the failure through the

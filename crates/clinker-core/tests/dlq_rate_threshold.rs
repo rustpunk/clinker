@@ -108,8 +108,8 @@ fn five_each_readers() -> SourceReaders {
 /// must report `source_name == "src_b"`. CSV column ordering is
 /// validated separately in `dlq.rs` unit tests; this asserts the
 /// in-memory plumbing through the full executor walk.
-#[test]
-fn dlq_entries_carry_source_b_attribution_under_merge() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dlq_entries_carry_source_b_attribution_under_merge() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
@@ -128,6 +128,7 @@ error_handling:
         writers,
         &run_params(),
     )
+    .await
     .expect("pipeline must complete under Continue strategy");
     assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
     assert!(
@@ -162,8 +163,8 @@ error_handling:
 /// record so the first failure past the floor trips the threshold; the
 /// resulting error is `DlqRateExceeded { source: Some("src_b"), .. }`
 /// — AC3's "names the offending source" requirement.
-#[test]
-fn per_source_threshold_halts_with_attributed_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn per_source_threshold_halts_with_attributed_error() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
@@ -188,6 +189,7 @@ error_handling:
         writers,
         &run_params(),
     )
+    .await
     .expect_err("per-source threshold of 0.1 must halt the run on the first src_b failure");
     match err {
         PipelineError::DlqRateExceeded {
@@ -209,8 +211,8 @@ error_handling:
 /// fraction crosses `max_rate`. The `source: None` variant of
 /// `DlqRateExceeded` carries E315 and reports the aggregate rate
 /// rather than blaming a specific source.
-#[test]
-fn pipeline_wide_threshold_halts_with_e315() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pipeline_wide_threshold_halts_with_e315() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
@@ -233,6 +235,7 @@ error_handling:
         writers,
         &run_params(),
     )
+    .await
     .expect_err("pipeline-wide max_rate 0.4 must halt the run once 5/10 records DLQ");
     match err {
         PipelineError::DlqRateExceeded {
@@ -253,8 +256,8 @@ error_handling:
 /// exceeds `max_rate`. Without the floor, a 1/1 first failure would
 /// trip a 0.5 threshold; with `min_records: 100` the floor is never
 /// reached and the run completes normally despite a 50% DLQ rate.
-#[test]
-fn min_records_floor_suppresses_early_halt() {
+#[tokio::test(flavor = "multi_thread")]
+async fn min_records_floor_suppresses_early_halt() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
@@ -277,6 +280,7 @@ error_handling:
         writers,
         &run_params(),
     )
+    .await
     .expect("min_records floor (100) is above this run's total (10); no halt expected");
     assert_eq!(report.counters.dlq_count, 5);
 }

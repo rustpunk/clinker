@@ -53,8 +53,8 @@ fn run_params() -> PipelineRunParams {
 /// a single trigger (src_b id=1) and src_a id=1 spared (different
 /// source). Same for `id=2`. Two trigger DLQs total; both src_a rows
 /// reach the output.
-#[test]
-fn ac2_collateral_narrowing_spares_other_source() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac2_collateral_narrowing_spares_other_source() {
     let yaml = r#"
 pipeline:
   name: ac2_collateral_narrowing
@@ -111,6 +111,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     let dlq_by_source: HashMap<&str, usize> =
@@ -156,8 +157,8 @@ nodes:
 /// failing source. The pre-sprint-7 collateral DLQ behavior must be
 /// bit-identical. Both `bad` and the co-grouped `good` row of group
 /// `id=1` land in DLQ — the narrowing branch never spares anything.
-#[test]
-fn ac4_single_source_regression_unchanged() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac4_single_source_regression_unchanged() {
     let yaml = r#"
 pipeline:
   name: ac4_single_source
@@ -202,6 +203,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
@@ -236,14 +238,14 @@ nodes:
 /// driver and build sources, snapshots their per-source cursors at
 /// fold entry, and on a clean run leaves the surfaced cursors
 /// reflecting forward progress for the driver side. The snapshot
-/// machinery underpinning the AC3 cursor-rewind is in place; the
-/// rewind-on-failure path has no live trigger in today's executor
-/// because Combine errors propagate as `PipelineError::Internal`
-/// (FailFast), so this test exercises the capture half. The full
-/// AC3 rewind ships alongside the async-runtime work on #57 when
-/// Combine output failures gain a recoverable-DLQ path.
-#[test]
-fn ac3_combine_snapshot_capture_clean_run() {
+/// machinery underpinning the AC3 cursor-rewind is in place; this
+/// test covers the clean-run capture half (snapshot taken at fold
+/// start, dropped at fold exit). Setup-time
+/// `PipelineError::Internal { op: "combine" }` invariant violations
+/// still fail-fast and bypass the rewind; the recoverable-DLQ
+/// rewind path is covered by separate Combine-failure tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_combine_snapshot_capture_clean_run() {
     let yaml = r#"
 pipeline:
   name: ac3_combine_snapshot
@@ -315,6 +317,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
             .unwrap();
 
     assert!(
@@ -339,15 +342,16 @@ nodes:
         "driver source advanced through both Transform clean exits"
     );
     // Build-side records flow straight from ingest into Combine's
-    // build buffer without traversing a forward operator that
-    // advances the cursor — sprint 7 wires advance at Transform /
-    // Route / Aggregate clean exits, and build-direct Source → Combine
-    // is none of those. The build source still PARTICIPATES in the
-    // Combine fold (verified by output row count) and the
-    // `combine_input_snapshots` capture inside the Combine arm reads
-    // an effective cursor of 0 for the build source (the seed value).
-    // A future advance-on-Combine-build-ingest wiring would surface
-    // src_bld here; tracked alongside the async-runtime restore on
-    // #57.
-    assert_eq!(report.per_source_rollback_cursors.get("src_bld"), None);
+    // build buffer. The Combine arm now advances per-source cursors
+    // at operator entry for every build (and driver) record before
+    // the `row_num` is discarded, so `src_bld` surfaces here at the
+    // highest contributed row_num. The Combine arm's snapshot
+    // captures the pre-fold cursor state independently for each
+    // contributing source so a recoverable Combine-output failure
+    // can rewind each source's cursor symmetrically.
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_bld"),
+        Some(&2),
+        "build source advances at Combine operator-entry walk over build_buf"
+    );
 }

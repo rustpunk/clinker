@@ -20,7 +20,7 @@
 //! | `combine_nary_3input.rs`      | N-ary chain decomposition       |
 //! | `combine_grace_hash.rs`       | grace hash partitioning + spill |
 
-use clinker_bench_support::CombineDataGen;
+use clinker_bench_support::{CombineDataGen, bench_runtime as runtime};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -163,7 +163,7 @@ fn bench_combine_equi_2input(c: &mut Criterion) {
         group.throughput(Throughput::Elements(probe as u64));
         group.sample_size(samples);
         group.bench_with_input(BenchmarkId::new("rows", label), &(build, probe), |b, _| {
-            b.iter(|| {
+            b.to_async(runtime()).iter(|| async {
                 let readers: clinker_core::executor::SourceReaders = HashMap::from([
                     (
                         "products".to_string(),
@@ -193,6 +193,7 @@ fn bench_combine_equi_2input(c: &mut Criterion) {
                 let report = PipelineExecutor::run_plan_with_readers_writers(
                     &plan, readers, writers, &params,
                 )
+                .await
                 .expect("combine equi_2input must execute");
                 black_box(report);
             });

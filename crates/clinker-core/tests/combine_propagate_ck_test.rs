@@ -22,7 +22,7 @@ use clinker_core::plan::execution::PlanNode;
 /// returns the captured output bytes for the named output. Used by
 /// the runtime tests below; mirrors the helper in `combine_test.rs`
 /// but without the extra strategy / chain plumbing.
-fn run_with_output(
+async fn run_with_output(
     yaml: &str,
     inputs: &[(&str, &str)],
     primary: &str,
@@ -60,6 +60,7 @@ fn run_with_output(
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .await
         .expect("pipeline must run cleanly");
     (report, buffer.as_string())
 }
@@ -270,8 +271,8 @@ nodes:
 /// values land on the output row even when the driver shadow column
 /// would otherwise mask them. Uses `include_correlation_keys: true`
 /// on the Output so the CSV captures the columns.
-#[test]
-fn runtime_propagate_ck_all_carries_build_ck_into_output() {
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_propagate_ck_all_carries_build_ck_into_output() {
     let yaml = r#"
 pipeline:
   name: ck_all_runtime
@@ -320,7 +321,8 @@ nodes:
         &[("orders", orders_csv), ("ledger", ledger_csv)],
         "orders",
         "out",
-    );
+    )
+    .await;
     let header = csv_out.lines().next().expect("header line");
     assert!(
         header.contains("$ck.order_id"),
@@ -346,8 +348,8 @@ nodes:
 /// shape is preserved bit-for-bit (each existing combine fixture
 /// migrated by Phase 1 to explicit `propagate_ck: driver` must still
 /// produce the same output).
-#[test]
-fn runtime_propagate_ck_driver_matches_legacy_shape() {
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_propagate_ck_driver_matches_legacy_shape() {
     let yaml = r#"
 pipeline:
   name: ck_driver_runtime
@@ -396,7 +398,8 @@ nodes:
         &[("orders", orders_csv), ("ledger", ledger_csv)],
         "orders",
         "out",
-    );
+    )
+    .await;
     let header = csv_out.lines().next().expect("header line");
     assert!(header.contains("$ck.order_id"), "header missing driver CK");
     let body: Vec<&str> = csv_out.lines().skip(1).collect();
@@ -527,8 +530,8 @@ nodes:
 /// the same global CK set, so the chained-output `$ck.*` set equals
 /// the single CK field; the test pins that `propagate_ck` applied to
 /// every chain step does not regress.
-#[test]
-fn chained_combines_propagate_ck_composes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn chained_combines_propagate_ck_composes() {
     let yaml = r#"
 pipeline:
   name: ck_chain
@@ -586,7 +589,8 @@ nodes:
         &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
         "a_src",
         "out",
-    );
+    )
+    .await;
     let header = csv_out.lines().next().expect("header line");
     assert!(
         header.contains("$ck.order_id"),
@@ -607,9 +611,9 @@ nodes:
 /// The grace_hash strategy hint is the only override that flips a
 /// pure-equi plan onto an alternate kernel; both kernels go through
 /// the same `copy_build_ck_columns` helper.
-#[test]
-fn strategy_parity_hash_vs_grace_hash() {
-    fn run_with_strategy(strategy: &str, csv_orders: &str, csv_ledger: &str) -> String {
+#[tokio::test(flavor = "multi_thread")]
+async fn strategy_parity_hash_vs_grace_hash() {
+    async fn run_with_strategy(strategy: &str, csv_orders: &str, csv_ledger: &str) -> String {
         let yaml = format!(
             r#"
 pipeline:
@@ -659,13 +663,14 @@ nodes:
             &[("orders", csv_orders), ("ledger", csv_ledger)],
             "orders",
             "out",
-        );
+        )
+        .await;
         csv_out
     }
     let orders = "order_id,amount\nORD-A,100\nORD-B,200\nORD-C,300\n";
     let ledger = "order_id,ledger_ref\nORD-A,LED-A\nORD-B,LED-B\nORD-C,LED-C\n";
-    let auto = run_with_strategy("auto", orders, ledger);
-    let grace = run_with_strategy("grace_hash", orders, ledger);
+    let auto = run_with_strategy("auto", orders, ledger).await;
+    let grace = run_with_strategy("grace_hash", orders, ledger).await;
 
     // Both kernels must agree on the header column set and on the
     // multiset of body rows. Within-strategy ordering is determined
@@ -837,8 +842,8 @@ nodes:
 /// user-source CK column from the output (regression behavior), but
 /// the synthetic CK column from the build-side relaxed aggregate
 /// survives because it is engine-managed lineage.
-#[test]
-fn runtime_propagate_ck_driver_drops_source_ck_keeps_synthetic() {
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_propagate_ck_driver_drops_source_ck_keeps_synthetic() {
     let yaml = r#"
 pipeline:
   name: synthetic_runtime
@@ -919,7 +924,8 @@ nodes:
         &[("orders", orders_csv), ("drivers", drivers_csv)],
         "orders",
         "out",
-    );
+    )
+    .await;
     let header = csv_out.lines().next().expect("header line");
     assert!(
         header.contains("$ck.aggregate.dept_totals"),
@@ -957,8 +963,8 @@ nodes:
 /// row. Driver here is the relaxed aggregate itself; combines over a
 /// driver-side aggregate parent are the most common shape post-D-7
 /// and the most common detect-phase fan-out source.
-#[test]
-fn runtime_synthetic_ck_carries_through_driver_side_combine() {
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_synthetic_ck_carries_through_driver_side_combine() {
     let yaml = r#"
 pipeline:
   name: synthetic_driver_runtime
@@ -1022,7 +1028,8 @@ nodes:
         &[("orders", orders_csv), ("lookup", lookup_csv)],
         "orders",
         "out",
-    );
+    )
+    .await;
     let header = csv_out.lines().next().expect("header line");
     assert!(
         header.contains("$ck.aggregate.dept_totals"),

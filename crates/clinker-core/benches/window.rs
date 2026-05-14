@@ -1,3 +1,4 @@
+use clinker_bench_support::bench_runtime as runtime;
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::pipeline::arena::Arena;
@@ -302,7 +303,7 @@ nodes:
             BenchmarkId::from_parameter(row_count),
             &row_count,
             |b, _| {
-                b.iter(|| {
+                b.to_async(runtime()).iter(|| async {
                     let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                         "src".to_string(),
                         clinker_core::executor::single_file_reader(
@@ -318,6 +319,7 @@ nodes:
                     PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )
+                    .await
                     .expect("bench pipeline runs");
                     black_box(buf);
                 });
@@ -424,7 +426,7 @@ nodes:
             BenchmarkId::from_parameter(row_count),
             &row_count,
             |b, _| {
-                b.iter(|| {
+                b.to_async(runtime()).iter(|| async {
                     let readers: clinker_core::executor::SourceReaders = HashMap::from([
                         (
                             "orders".to_string(),
@@ -449,6 +451,7 @@ nodes:
                     PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )
+                    .await
                     .expect("bench pipeline runs");
                     black_box(buf);
                 });

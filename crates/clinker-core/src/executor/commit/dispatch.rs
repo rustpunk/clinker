@@ -71,7 +71,7 @@ use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 /// short-circuits the walk; `Continue` / `BestEffort` route per-record
 /// failures to `ctx.dlq_entries` (which the dispatcher captures into
 /// the returned [`DlqEvent`] vec).
-pub(crate) fn dispatch_deferred_subdag(
+pub(crate) async fn dispatch_deferred_subdag(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     scope: &RetractScope,
@@ -94,7 +94,7 @@ pub(crate) fn dispatch_deferred_subdag(
     let saved_in_deferred = ctx.in_deferred_dispatch;
     ctx.in_deferred_dispatch = true;
 
-    let result = dispatch_deferred_inner(ctx, current_dag, &mut events);
+    let result = dispatch_deferred_inner(ctx, current_dag, &mut events).await;
 
     ctx.in_deferred_dispatch = saved_in_deferred;
     result.map(|()| events)
@@ -105,7 +105,7 @@ pub(crate) fn dispatch_deferred_subdag(
 /// guard (an RAII guard holding `&mut ExecutorContext` would extend
 /// the borrow through every recursive `dispatch_plan_node` call,
 /// which the borrow-checker rejects).
-fn dispatch_deferred_inner(
+async fn dispatch_deferred_inner(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     events: &mut Vec<DlqEvent>,
@@ -131,7 +131,7 @@ fn dispatch_deferred_inner(
             .get(&producer)
             .expect("deferred_regions keys producer to its own region")
             .clone();
-        dispatch_one_region(ctx, current_dag, &region, events)?;
+        dispatch_one_region(ctx, current_dag, &region, events).await?;
     }
 
     // Body-internal regions: when any Composition node's bound body
@@ -171,7 +171,14 @@ fn dispatch_deferred_inner(
         if !needs_recurse {
             continue;
         }
-        recurse_into_body(ctx, current_dag, composition_idx, body_id, events)?;
+        Box::pin(recurse_into_body(
+            ctx,
+            current_dag,
+            composition_idx,
+            body_id,
+            events,
+        ))
+        .await?;
     }
 
     Ok(())
@@ -181,7 +188,7 @@ fn dispatch_deferred_inner(
 /// filter (`members ∪ {producer}`), seeding cross-region inputs from
 /// `region_input_buffers` before each member dispatch and capturing
 /// any DLQ entries the arm produced.
-fn dispatch_one_region(
+async fn dispatch_one_region(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     region: &DeferredRegion,
@@ -249,7 +256,7 @@ fn dispatch_one_region(
                 ..
             }
         );
-        dispatch_plan_node(ctx, current_dag, idx)?;
+        Box::pin(dispatch_plan_node(ctx, current_dag, idx)).await?;
         if is_windowed_transform {
             ctx.counters.retraction.partitions_dispatched += 1;
         }
@@ -265,6 +272,7 @@ fn dispatch_one_region(
             for entry in &ctx.dlq_entries[dlq_len_before..] {
                 events.push(DlqEvent {
                     source_row: entry.source_row,
+                    source_name: std::sync::Arc::clone(&entry.source_name),
                 });
             }
         }
@@ -357,7 +365,7 @@ fn seed_cross_region_inputs_for(
 /// continuation walk then runs against the parent DAG so its members
 /// see the seeded slot via the same predecessor-walk logic the
 /// forward pass uses.
-fn recurse_into_body(
+async fn recurse_into_body(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     composition_idx: NodeIndex,
@@ -391,22 +399,32 @@ fn recurse_into_body(
     ctx.window_runtime.bodies.insert(body_id, body_window_vec);
     ctx.window_runtime.active_stack.push(body_id);
 
-    let walk_and_harvest = (|| -> Result<Vec<(Record, u64)>, PipelineError> {
-        // Body-scoped detect + recompute: detect against the body's
-        // own DAG so the producer/region walk uses body-local
-        // NodeIndices; recompute against that body scope so each
-        // body-internal relaxed-CK aggregate's
-        // `relaxed_aggregator_states[body_local_idx]` is retracted
-        // and its `node_buffers[body_local_idx]` is re-seeded with
-        // the post-recompute narrow rows. The body's iteration
-        // structure mirrors the parent's: the parent orchestrator
-        // already drives the cascading-retract loop one level up;
-        // for body-internal cascades that stay inside the body, the
-        // outer loop's next iteration re-enters this recurse and
-        // re-runs the body detect against the updated
-        // `correlation_buffers`.
+    // Body-scoped detect + recompute: detect against the body's
+    // own DAG so the producer/region walk uses body-local
+    // NodeIndices; recompute against that body scope so each
+    // body-internal relaxed-CK aggregate's
+    // `relaxed_aggregator_states[body_local_idx]` is retracted
+    // and its `node_buffers[body_local_idx]` is re-seeded with
+    // the post-recompute narrow rows. The body's iteration
+    // structure mirrors the parent's: the parent orchestrator
+    // already drives the cascading-retract loop one level up;
+    // for body-internal cascades that stay inside the body, the
+    // outer loop's next iteration re-enters this recurse and
+    // re-runs the body detect against the updated
+    // `correlation_buffers`.
+    //
+    // Inlined (no closure wrapper) because the inner body now
+    // contains `.await` calls; an `||` closure cannot be async, and
+    // an `async ||` closure would capture `&mut` borrows the helper
+    // arms below also need. Restore the parent-scope borrows
+    // explicitly on every exit path.
+    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = async {
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
-        let body_initial_rows: Vec<u64> = body_scope.seen_source_rows.iter().copied().collect();
+        let body_initial_rows: Vec<(u64, std::sync::Arc<str>)> = body_scope
+            .seen_source_rows
+            .iter()
+            .map(|(r, sn)| (*r, std::sync::Arc::clone(sn)))
+            .collect();
         super::recompute_agg::recompute_aggregates(
             ctx,
             &body_dag,
@@ -443,7 +461,7 @@ fn recurse_into_body(
             }
         }
 
-        let inner_events = dispatch_deferred_subdag(ctx, &body_dag, &body_scope)?;
+        let inner_events = Box::pin(dispatch_deferred_subdag(ctx, &body_dag, &body_scope)).await?;
         events.extend(inner_events);
 
         // Drain every declared output port BEFORE the parent-scope
@@ -457,8 +475,9 @@ fn recurse_into_body(
                 harvested.extend(rows);
             }
         }
-        Ok(harvested)
-    })();
+        Ok::<Vec<(Record, u64)>, PipelineError>(harvested)
+    }
+    .await;
 
     // Restore parent scope on every exit. The window-runtime body
     // overlay is popped first so subsequent parent-scope walks route
@@ -489,7 +508,7 @@ fn recurse_into_body(
         .get(&composition_idx)
         .cloned()
     {
-        dispatch_continuation(ctx, parent_dag, &continuation, events)?;
+        dispatch_continuation(ctx, parent_dag, &continuation, events).await?;
     }
 
     Ok(())
@@ -508,7 +527,7 @@ fn recurse_into_body(
 /// Captures any DLQ entries the dispatched arms produce into `events`
 /// so the orchestrator's outer cascading-retract loop sees them and
 /// can widen the next iteration's scope.
-fn dispatch_continuation(
+async fn dispatch_continuation(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     continuation: &ParentContinuation,
@@ -549,11 +568,12 @@ fn dispatch_continuation(
             continue;
         }
         let dlq_len_before = ctx.dlq_entries.len();
-        dispatch_plan_node(ctx, parent_dag, idx)?;
+        Box::pin(dispatch_plan_node(ctx, parent_dag, idx)).await?;
         if ctx.dlq_entries.len() > dlq_len_before {
             for entry in &ctx.dlq_entries[dlq_len_before..] {
                 events.push(DlqEvent {
                     source_row: entry.source_row,
+                    source_name: std::sync::Arc::clone(&entry.source_name),
                 });
             }
         }

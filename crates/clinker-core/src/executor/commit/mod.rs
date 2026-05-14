@@ -83,10 +83,14 @@ pub(crate) mod recompute_agg;
 /// [`detect::RetractScope::expand_with_dlq_events`] so a member-arm
 /// failure on a record that previously did not trigger widens the
 /// next iteration's retract scope. Carries the minimum the expand
-/// pass needs: the source row id for `retract_row` reuse.
+/// pass needs: the `(source_row, source_name)` pair for `retract_row`
+/// reuse. Source identity is load-bearing because each Source has its
+/// own monotonic `row_num` counter — without it, cross-source
+/// collisions would silently dedup the second source's retract.
 #[derive(Debug, Clone)]
 pub(crate) struct DlqEvent {
     pub(crate) source_row: u64,
+    pub(crate) source_name: std::sync::Arc<str>,
 }
 
 /// Orchestrator entry point invoked from the dispatcher's
@@ -103,7 +107,7 @@ pub(crate) struct DlqEvent {
 /// `ctx.correlation_max_group_buffer` directly, and the per-group
 /// emission shape carries enough context in the buffer cell itself
 /// to format DLQ trigger messages without the carrier's name.
-pub(crate) fn orchestrate(
+pub(crate) async fn orchestrate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
@@ -122,7 +126,11 @@ pub(crate) fn orchestrate(
     // the per-iteration delta returned by `expand_with_dlq_events`,
     // because `retract_row` is not idempotent on a row already taken
     // out of the aggregator's contributions.
-    let initial_rows: Vec<u64> = scope.seen_source_rows.iter().copied().collect();
+    let initial_rows: Vec<(u64, std::sync::Arc<str>)> = scope
+        .seen_source_rows
+        .iter()
+        .map(|(r, sn)| (*r, std::sync::Arc::clone(sn)))
+        .collect();
 
     // Snapshot the forward-pass baseline buffer state. The strict-Output
     // records and forward-pass error events captured here are stable
@@ -153,7 +161,11 @@ pub(crate) fn orchestrate(
         .values()
         .map(|b| b.graph.node_count())
         .sum();
-    let total_source_rows: usize = ctx.source_records.values().map(|v| v.len()).sum();
+    // Bound the cap by the total per-source ingest count, which is
+    // seeded once at executor entry from the unified ingest counters
+    // — the live `mpsc::Receiver`s here surface records as they
+    // arrive and have no `.len()` to inspect.
+    let total_source_rows: usize = ctx.total_per_source.values().map(|v| *v as usize).sum();
     let cap = test_cap_override()
         .unwrap_or(current_dag.graph.node_count() + body_node_count + total_source_rows + 1);
     let mut iter = 0usize;
@@ -170,7 +182,7 @@ pub(crate) fn orchestrate(
     // records.
     let mut error_archive: HashMap<Vec<GroupByKey>, CorrelationGroupBuffer> = HashMap::new();
 
-    let mut iteration_rows: Vec<u64> = initial_rows;
+    let mut iteration_rows: Vec<(u64, std::sync::Arc<str>)> = initial_rows;
     loop {
         if iter >= cap {
             panic!(
@@ -195,12 +207,16 @@ pub(crate) fn orchestrate(
         // emit through its `input_rows_by_group_index` back to
         // contributing source rows — the same lineage the strict-path
         // detect uses.
-        let direct_events = dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)?;
+        let direct_events =
+            Box::pin(dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)).await?;
         let post_dispatch_scope = detect::detect_retract_scope(ctx, current_dag);
         archive_iteration_errors(&mut error_archive, ctx.correlation_buffers.as_ref());
         let mut new_events: Vec<DlqEvent> = direct_events;
-        for row in &post_dispatch_scope.seen_source_rows {
-            new_events.push(DlqEvent { source_row: *row });
+        for (row, sn) in &post_dispatch_scope.seen_source_rows {
+            new_events.push(DlqEvent {
+                source_row: *row,
+                source_name: std::sync::Arc::clone(sn),
+            });
         }
         let new_triggers = scope.expand_with_dlq_events(&new_events);
         if new_triggers.is_empty() {
@@ -425,10 +441,16 @@ fn test_cap_override() -> Option<usize> {
 }
 
 /// Run `body` with the cascading-retraction loop cap forced to `cap`.
-/// Test-only; the override unsets on exit so a panicking body cannot
-/// leak the override into a sibling test on the same thread.
+/// Test-only; the override unsets on exit so a panicking body — or an
+/// awaiter cancellation — cannot leak the override into a sibling test
+/// on the same thread. `body` returns a future so the cap remains in
+/// effect for the entire awaited execution.
 #[cfg(test)]
-pub(crate) fn with_test_loop_cap<R>(cap: usize, body: impl FnOnce() -> R) -> R {
+pub(crate) async fn with_test_loop_cap<R, F, Fut>(cap: usize, body: F) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
     struct Guard {
         prev: Option<usize>,
     }
@@ -439,5 +461,5 @@ pub(crate) fn with_test_loop_cap<R>(cap: usize, body: impl FnOnce() -> R) -> R {
     }
     let prev = TEST_LOOP_CAP.with(|c| c.replace(Some(cap)));
     let _guard = Guard { prev };
-    body()
+    body().await
 }

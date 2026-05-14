@@ -111,17 +111,11 @@ The engine identifies origin per record via the engine-stamped `$source.name` co
 
 Records that carry no single-source attribution — synthetic aggregate emits and Combine output rows — are NOT spared by per-source narrowing. They flow through the existing collateral path because their stamp falls back to the merged-source identity which is ambiguous about origin.
 
-The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionReport`, keyed by source name and carrying the highest source row number that cleanly exited a forward operator. The map advances per record at the clean exit of Transform / Route / Aggregate; sources whose records all DLQ never land in the map. Today's executor reads the map for diagnostics and integration-test assertions; the async-runtime work tracked under [#57](https://github.com/rustpunk/clinker/issues/57) will activate the map as the replay-anchor for per-source rewind.
+The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionReport`, keyed by source name and carrying the highest source row number that cleanly exited a forward operator. The map advances per record at the clean exit of Transform / Route / Aggregate, and rewinds per contributing source on `max_group_buffer` overflow to the lowest `row_num` any group member of that source contributed. Sources whose records all DLQ never land in the map. The map is the replay anchor for per-source resume: a downstream rerun reads each source's cursor as the floor for what must be reprocessed.
 
-#### Exceptions
+On `max_group_buffer` overflow, every record in the overflowing group still lands in DLQ (one `GroupSizeExceeded` trigger plus per-row collaterals), but the per-source rollback cursor rewinds independently per contributing source. Attributing the overflow failure itself to one source would be a fiction — every contributing source shared blame proportionally — so the DLQ shape stays group-wide while the rewind narrows per source.
 
-Two failure modes preserve today's pipeline-wide collateral DLQ semantics and stay scoped across every contributing source:
-
-- **`max_group_buffer` overflow.** When a correlation group exceeds its cap (see [Group buffering](#group-buffering) below), the failure has no single causal source — every contributing source shared blame proportionally. Attributing overflow to one source would be a fiction. Every record in the overflowing group lands in DLQ regardless of origin source.
-
-- **Combine output failures.** Combine's emit path is `PipelineError::Internal` today; recoverable Combine output-row failures require the live-channel runtime tracked under [#57](https://github.com/rustpunk/clinker/issues/57). Once that lands, both contributing sources will rewind to their pre-Combine cursor snapshots. The snapshot capture is wired today (each Combine entry snapshots both inputs' cursors), but the rewind half has no live trigger until the async runtime arrives.
-
-The relaxed-CK aggregator retract path — when the orchestrator emits a corrected aggregate value after retracting failing rows — does not currently track origin source per row in its lineage table. Per-source aggregate retract requires extending `HashAggregator`'s `input_rows` to carry `(row_id, source_name)` pairs and is tracked alongside the async-runtime work on #57. In the interim, the aggregate-finalize error path lands in correlation buffers and is narrowed by the per-source collateral walk above — the AC-visible behavior on `[multi_source] → aggregate → output` matches per-source semantics through that path.
+The relaxed-CK aggregator's per-row lineage carries `(row_id, source_name)` pairs so a finalize-time retract scoped to one source rewinds only that source's contributions to each affected group. Combine input snapshots are captured at fold start and cleared at every Combine arm's exit (inline, IEJoin, GraceHash, SortMerge); the snapshot restores per-contributing-source cursors if a Combine output-row eval needs to fail recoverably under a future relaxed-Combine path.
 
 ## Group buffering
 

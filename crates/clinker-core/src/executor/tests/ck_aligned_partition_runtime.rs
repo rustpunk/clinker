@@ -16,8 +16,8 @@ use std::collections::HashMap;
 /// `partitions_dispatched` stays at zero — the load-bearing FastPath
 /// performance contract for any pipeline whose aggregates cover their
 /// CK lineage.
-#[test]
-fn ck_aligned_partition_failure_does_not_engage_partition_recompute() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ck_aligned_partition_failure_does_not_engage_partition_recompute() {
     let yaml = r#"
 pipeline:
   name: ck_aligned_runtime
@@ -86,6 +86,7 @@ o6,ENG,300
     };
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+            .await
             .expect("pipeline must run");
     let counters = report.counters;
 

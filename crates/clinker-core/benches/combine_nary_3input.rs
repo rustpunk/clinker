@@ -36,7 +36,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clinker_bench_support::CombineDataGen;
+use clinker_bench_support::{CombineDataGen, bench_runtime as runtime};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -253,7 +253,10 @@ fn run_3input(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("3-input pipeline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");
@@ -292,7 +295,10 @@ fn run_2input(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+    runtime()
+        .block_on(PipelineExecutor::run_plan_with_readers_writers(
+            plan, readers, writers, params,
+        ))
         .expect("2-input baseline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");

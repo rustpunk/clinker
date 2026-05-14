@@ -114,12 +114,10 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
 /// The rate denominator is the full per-source ingest count, seeded
 /// once at executor entry from
 /// [`ExecutorContext::total_per_source`] — not a moving "records
-/// processed so far" counter. This is consistent with today's
-/// pre-ingested-into-`source_records` executor model where every
-/// declared Source is fully drained before dispatch runs. When the
-/// async streaming runtime swaps `SourceStream` for a live
-/// channel-driven ingest, the denominator becomes a moving target
-/// that needs to be re-keyed off the per-source receive count instead.
+/// processed so far" counter. The total is read from each ingest
+/// task's `JoinHandle` once its `mpsc::Receiver` drains, then frozen
+/// for the duration of the run, so the ratio remains stable across
+/// the dispatch loop's `recv().await` interleaving.
 pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
@@ -141,18 +139,21 @@ pub(crate) fn push_dlq(
 /// the post-finalize emit operates on aggregator-synthetic identity
 /// and has no per-record source row to advance against). Monotonic
 /// per source — the cursor never moves backward through this entry
-/// point. A backward write would happen only when a future
-/// rewind path consumes a `combine_input_snapshots` entry; that path
-/// is wired for the async-runtime work on #57 and has no live trigger
-/// in today's executor.
+/// point. A backward write happens only when a Combine output-row
+/// failure consumes a `combine_input_snapshots` entry and restores
+/// each contributing source's cursor; that path applies under the
+/// recoverable-DLQ arm and is bypassed by setup-time
+/// `PipelineError::Internal { op: "combine" }` invariant violations,
+/// which still fail-fast.
 ///
-/// `row_num` is the engine-stamped source row number stored alongside
-/// the record in `ctx.source_records[name]` and threaded through every
-/// `(record, row_num)` tuple in the dispatch path. It is the same
-/// value the relaxed-CK retract orchestrator passes to
+/// `row_num` is the engine-stamped source row number stamped on each
+/// record as it leaves the Source ingest task's `TokioSourceStream`
+/// and threaded through every `(record, row_num)` tuple in the
+/// dispatch path. It is the same value the relaxed-CK retract
+/// orchestrator passes to
 /// [`crate::aggregation::HashAggregator::retract_row`], so a cursor
-/// stored here is directly comparable against `retract_row` arguments
-/// when #57's rewind path lands.
+/// stored here is directly comparable against `retract_row`
+/// arguments at rewind time.
 pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<str>, row_num: u64) {
     let slot = ctx
         .rollback_cursors
@@ -367,11 +368,12 @@ use crate::projection::project_output_from_record;
 ///
 /// Owned (mutated across the walk):
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
-/// * `source_records` — per-source ingested records keyed by Source node
-///   name. The Source dispatch arm reads its records from this map.
-///   Every declared Source is ingested through `SourceStream` in the
-///   executor's unified ingest pass; the `$source.file` per-record
-///   stamp travels on each record's engine-stamped column.
+/// * `source_records` — per-source live `mpsc::Receiver`s keyed by
+///   Source node name. The Source dispatch arm drains its receiver
+///   via `recv().await`; the paired sender lives in a `tokio::spawn`-ed
+///   ingest task that drives the format reader and pushes through a
+///   `TokioSourceStream`. The `$source.file` per-record stamp travels
+///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
 /// * `counters` / `dlq_entries` — pipeline-wide accounting.
@@ -408,13 +410,16 @@ pub(crate) struct ExecutorContext<'a> {
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
-    /// Per-source ingested records keyed by Source node name. Every
-    /// declared Source's records live here uniformly — there is no
-    /// "primary" asymmetry. The dispatch arm reads
-    /// `ctx.source_records[name]` for each Source node it walks; a
-    /// missing entry surfaces as a defense-in-depth Internal error
-    /// (loud, not silent).
-    pub(crate) source_records: HashMap<String, Vec<(Record, u64)>>,
+    /// Per-source live ingest channels keyed by Source node name. Each
+    /// declared Source has one `tokio::spawn`-ed task pushing records
+    /// through a `TokioSourceStream`; this map holds the paired
+    /// `Receiver` the dispatch loop's Source arm drains via
+    /// `recv().await`. Replaces the pre-drained `Vec<(Record, u64)>`
+    /// carrier: producers run concurrently with consumption, bounded by
+    /// channel capacity so back-pressure flows end-to-end. A missing
+    /// entry at the Source arm surfaces as a defense-in-depth Internal
+    /// error.
+    pub(crate) source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     /// Per-source-file writers for outputs marked `fan_out_per_source_file`
     /// in the plan. Outer key is the output name; inner key is the
@@ -457,20 +462,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// aggregate-retract decision point to bound rewind to records from
     /// the failing source. Seeded empty — sources land in the map on
     /// their first cleanly-emitted record. Sibling of `dlq_per_source`
-    /// and `total_per_source`; same source-keyed `HashMap<Arc<str>, u64>`
-    /// shape so the post-#57 live-channel refactor moves all three onto
-    /// `SourceStream` together.
+    /// and `total_per_source`; same source-keyed
+    /// `HashMap<Arc<str>, u64>` shape.
     pub(crate) rollback_cursors: HashMap<Arc<str>, u64>,
     /// Per-Combine input-cursor snapshots captured at Combine fold
     /// entry. The outer key is the Combine node's `NodeIndex`; the
     /// inner map captures the `(source_name -> cursor)` pair for every
-    /// source whose record participates in the fold. Today the snapshot
-    /// is captured at fold entry and cleared at the inline-strategy
-    /// fall-through; the symmetric rewind path that consumes a snapshot
-    /// to restore both contributing sources' cursors is wired for the
-    /// async-runtime work on #57 and has no live trigger in today's
-    /// executor (Combine errors propagate as `PipelineError::Internal`,
-    /// aborting the run before any rewind can apply).
+    /// source whose record participates in the fold. The snapshot is
+    /// captured at fold start, cleared at every Combine exit (inline,
+    /// IEJoin, Grace, SortMerge), and restored from at the
+    /// recoverable-DLQ rewind path — driver and build sides are
+    /// treated symmetrically. Setup-time
+    /// `PipelineError::Internal { op: "combine" }` invariant violations
+    /// still fail-fast and bypass the rewind path.
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
     pub(crate) ok_source_rows: HashSet<u64>,
@@ -1060,7 +1064,7 @@ pub(crate) fn finalize_node_rooted_windows(
 /// `ctx.output_errors` instead of short-circuiting so sibling outputs still
 /// get their chance to fail (and be reported) — the caller aggregates after
 /// the walk.
-pub(crate) fn dispatch_plan_node(
+pub(crate) async fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -1082,13 +1086,14 @@ pub(crate) fn dispatch_plan_node(
             // body executor at composition entry — composition input
             // ports surface as synthetic Source nodes in the body
             // graph, owning the records the parent scope harvested
-            // for that port; (2) the unified ingest pass's
-            // `source_records[name]` entry. A Source reaching this
-            // arm with neither path populated surfaces as a defense-
-            // in-depth `PipelineError::Internal` — silent fallthrough
-            // to a different source's records was the root cause of
-            // #47 and is no longer reachable. Records are canonicalized
-            // onto the Source's plan-time `Arc<Schema>` so every
+            // for that port; (2) the live `mpsc::Receiver` in
+            // `source_records[name]`, drained via `recv().await`
+            // until the paired ingest task drops its sender. A Source
+            // reaching this arm with neither path populated surfaces
+            // as a defense-in-depth `PipelineError::Internal` — silent
+            // fallthrough to a different source's records was the root
+            // cause of #47 and is no longer reachable. Records are
+            // canonicalized onto the Source's plan-time `Arc<Schema>` so every
             // downstream operator hits the `Arc::ptr_eq` fast path on
             // the first record. Structural equality holds by
             // construction: the ingest helper builds its widened
@@ -1199,11 +1204,17 @@ pub(crate) fn dispatch_plan_node(
                     .into_iter()
                     .map(|(r, rn)| (canonicalize(&r), rn))
                     .collect()
-            } else if let Some(src_recs) = ctx.source_records.get(name.as_str()) {
-                src_recs
-                    .iter()
-                    .map(|(r, rn)| (canonicalize(r), *rn))
-                    .collect()
+            } else if let Some(rx) = ctx.source_records.get_mut(name.as_str()) {
+                // Drain the live channel synchronously into a local Vec
+                // for the duration of this arm. Streaming consumption
+                // throughout dispatch is the longer-term shape; today's
+                // arms still operate on owned `Vec<(Record, u64)>`
+                // buffers, so we materialize once here.
+                let mut drained: Vec<(Record, u64)> = Vec::new();
+                while let Some((record, rn)) = rx.recv().await {
+                    drained.push((canonicalize(&record), rn));
+                }
+                drained
             } else {
                 // Defense-in-depth: a Source reaching this arm with
                 // neither a body-port seed nor an entry in
@@ -1315,6 +1326,15 @@ pub(crate) fn dispatch_plan_node(
             let mut output_records = Vec::with_capacity(input_records.len());
 
             for (i, (record, rn)) in input_records.into_iter().enumerate() {
+                // Cooperative yield every 1024 records so long
+                // Transform chains do not starve sibling tokio tasks
+                // (Vector's in-line VRL pattern). Per-record CXL eval
+                // sits well below the 10–100 µs "what is blocking"
+                // threshold, so on-runtime execution with periodic
+                // yields beats a `block_in_place` wrap here.
+                if i > 0 && i.is_multiple_of(1024) {
+                    tokio::task::yield_now().await;
+                }
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
                 }
@@ -1607,7 +1627,14 @@ pub(crate) fn dispatch_plan_node(
             };
 
             if let Some(ref mut route) = route_handle {
-                for (record, rn) in input_records {
+                for (i, (record, rn)) in input_records.into_iter().enumerate() {
+                    // Cooperative yield every 1024 records so long
+                    // Route chains do not starve sibling tokio tasks.
+                    // Same Vector-style on-runtime + periodic yield
+                    // pattern the Transform arm uses.
+                    if i > 0 && i.is_multiple_of(1024) {
+                        tokio::task::yield_now().await;
+                    }
                     let source_file_arc = source_file_arc_of(&record);
                     let source_name_arc = source_name_arc_of(&record);
                     let eval_ctx = EvalContext {
@@ -1740,26 +1767,35 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Merge { ref name, .. } => {
-            // Concatenate predecessor buffers in declaration order —
-            // the order appearing in the Merge's `inputs:` YAML
-            // array, which is stable across compile runs. Under
-            // the unified taxonomy a Merge is a first-class node
-            // (no "merge_<transform>" synthesis) so we read the
-            // order straight off `PipelineNode::Merge.header.inputs`.
+            // Predecessors are sorted by Merge `inputs:` declaration
+            // order — the order appearing in the YAML array, which is
+            // stable across compile runs. Under the unified taxonomy a
+            // Merge is a first-class node (no "merge_<transform>"
+            // synthesis) so we read the order straight off
+            // `PipelineNode::Merge.header.inputs`. The mode branch then
+            // picks the cross-source ordering: Concat drains each
+            // predecessor's pre-buffered records sequentially in that
+            // order; Interleave round-robins across them. Per-source
+            // FIFO survives both modes because each predecessor's buffer
+            // is itself in arrival order.
             let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
 
-            let declaration_order: Vec<String> = {
+            let (declaration_order, mode, interleave_seed): (
+                Vec<String>,
+                crate::config::MergeMode,
+                Option<u64>,
+            ) = {
                 use crate::config::PipelineNode;
                 use crate::config::node_header::NodeInput;
                 ctx.config
                     .nodes
                     .iter()
                     .find_map(|spanned| match &spanned.value {
-                        PipelineNode::Merge { header, .. } if header.name == *name => Some(
-                            header
+                        PipelineNode::Merge { header, config, .. } if header.name == *name => {
+                            let order = header
                                 .inputs
                                 .iter()
                                 .map(|ni| match &ni.value {
@@ -1768,11 +1804,12 @@ pub(crate) fn dispatch_plan_node(
                                         format!("{node}.{port}")
                                     }
                                 })
-                                .collect(),
-                        ),
+                                .collect();
+                            Some((order, config.mode, config.interleave_seed))
+                        }
                         _ => None,
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| (Vec::new(), crate::config::MergeMode::Concat, None))
             };
 
             // Sort predecessors by declaration order
@@ -1791,27 +1828,118 @@ pub(crate) fn dispatch_plan_node(
                 .sum();
             let merge_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
             let mut merged = Vec::with_capacity(total);
-            for pred in &sorted_preds {
-                let upstream_name = current_dag.graph[*pred].name().to_string();
-                if let Some(buf) = ctx.node_buffers.remove(pred) {
-                    for (mut record, rn) in buf {
-                        if let Some(canonical) = merge_output_schema.as_ref() {
-                            check_input_schema(
-                                canonical,
-                                record.schema(),
-                                name,
-                                "merge",
-                                &upstream_name,
-                            )?;
-                            // Canonicalize: rebuild record with the
-                            // Merge's `Arc<Schema>` so downstream
-                            // operators hit the ptr_eq fast path
-                            // regardless of which input the record
-                            // originated from.
-                            let values = record.values().to_vec();
-                            record = Record::new(Arc::clone(canonical), values);
+
+            // Canonicalize and emit one record from a predecessor buffer
+            // into `merged`. Schema canonicalization runs per-record at
+            // consume time (not as a post-pass) so the canonical
+            // `Arc<Schema>` reaches downstream operators uniformly
+            // regardless of which mode produced the record.
+            let emit = |merged: &mut Vec<(Record, u64)>,
+                        upstream_name: &str,
+                        mut record: Record,
+                        rn: u64|
+             -> Result<(), PipelineError> {
+                if let Some(canonical) = merge_output_schema.as_ref() {
+                    check_input_schema(canonical, record.schema(), name, "merge", upstream_name)?;
+                    // Canonicalize: rebuild record with the Merge's
+                    // `Arc<Schema>` so downstream operators hit the
+                    // ptr_eq fast path regardless of which input the
+                    // record originated from.
+                    let values = record.values().to_vec();
+                    record = Record::new(Arc::clone(canonical), values);
+                }
+                merged.push((record, rn));
+                Ok(())
+            };
+
+            match mode {
+                crate::config::MergeMode::Concat => {
+                    for pred in &sorted_preds {
+                        let upstream_name = current_dag.graph[*pred].name().to_string();
+                        if let Some(buf) = ctx.node_buffers.remove(pred) {
+                            for (record, rn) in buf {
+                                emit(&mut merged, &upstream_name, record, rn)?;
+                            }
                         }
-                        merged.push((record, rn));
+                    }
+                }
+                crate::config::MergeMode::Interleave => {
+                    // Take each predecessor's buffer once so per-source
+                    // FIFO can be preserved by draining from the head.
+                    // `VecDeque` gives O(1) `pop_front` for the round-
+                    // robin pick. Empty buffers become empty deques and
+                    // drop out of the active pool on first inspection.
+                    use std::collections::VecDeque;
+                    let upstream_names: Vec<String> = sorted_preds
+                        .iter()
+                        .map(|p| current_dag.graph[*p].name().to_string())
+                        .collect();
+                    let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
+                        .iter()
+                        .map(|pred| {
+                            ctx.node_buffers
+                                .remove(pred)
+                                .map(VecDeque::from)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
+                    // `interleave_seed: Some(seed)` runs a fastrand
+                    // schedule for reproducibility across runs. The Rng
+                    // lives locally — its state is one-shot per Merge
+                    // fold (the executor's prologue pre-drains every
+                    // source into a Vec before dispatch, so this arm
+                    // runs to completion in a single call), so the plan
+                    // doc's `ctx.merge_rng_state` HashMap shape would be
+                    // dead state. If a future change splits the fold
+                    // across executor re-entries the Rng can move onto
+                    // `ExecutorContext` then.
+                    //
+                    // Unseeded → deterministic round-robin by
+                    // declaration-order index. Today's arbitration
+                    // drains the per-input deques the executor
+                    // prologue materializes; live-channel back-pressure
+                    // ("a slow upstream doesn't starve a fast one")
+                    // requires the prologue to stop pre-buffering and
+                    // route `mpsc::Receiver`s directly into the
+                    // interleave loop's `tokio::select!`. Tracked
+                    // separately from the runtime migration so the
+                    // YAML surface ships ahead of the dynamics.
+                    let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
+                    let mut cursor = 0usize; // unseeded round-robin head
+                    loop {
+                        // Collect indices of predecessors with records
+                        // still queued. Done when none remain.
+                        let ready: Vec<usize> = deques
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, d)| (!d.is_empty()).then_some(i))
+                            .collect();
+                        if ready.is_empty() {
+                            break;
+                        }
+                        let pick_idx = match rng.as_mut() {
+                            Some(r) => ready[r.usize(0..ready.len())],
+                            None => {
+                                // Advance the cursor through declaration
+                                // order, skipping exhausted slots.
+                                let mut chosen = ready[0];
+                                for _ in 0..deques.len() {
+                                    let candidate = cursor % deques.len();
+                                    cursor = cursor.wrapping_add(1);
+                                    if !deques[candidate].is_empty() {
+                                        chosen = candidate;
+                                        break;
+                                    }
+                                }
+                                chosen
+                            }
+                        };
+                        // `pop_front` preserves per-source FIFO — each
+                        // source's records leave in arrival order.
+                        if let Some((record, rn)) = deques[pick_idx].pop_front() {
+                            emit(&mut merged, &upstream_names[pick_idx], record, rn)?;
+                        }
                     }
                 }
             }
@@ -1864,21 +1992,29 @@ pub(crate) fn dispatch_plan_node(
 
             let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let sort_count = input_records.len() as u64;
-            for (record, row_num) in input_records {
-                buf.push(record, row_num);
-                if buf.should_spill() {
-                    buf.sort_and_spill().map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort enforcer '{name}' spill failed: {e}"
-                        )))
-                    })?;
+            // CPU-bound: sort buffer push + per-batch comparison + spill
+            // I/O can saturate a worker thread. `block_in_place` runs
+            // synchronously on the current multi-thread runtime worker
+            // and moves the worker's other tasks to a sibling, keeping
+            // the runtime responsive (DataFusion/Vector pattern: CPU-
+            // bound operators stay on-runtime via `block_in_place` so
+            // borrows of `&mut ExecutorContext` survive the boundary).
+            let sorted = tokio::task::block_in_place(|| {
+                for (record, row_num) in input_records {
+                    buf.push(record, row_num);
+                    if buf.should_spill() {
+                        buf.sort_and_spill().map_err(|e| {
+                            PipelineError::Io(std::io::Error::other(format!(
+                                "sort enforcer '{name}' spill failed: {e}"
+                            )))
+                        })?;
+                    }
                 }
-            }
-
-            let sorted = buf.finish().map_err(|e| {
-                PipelineError::Io(std::io::Error::other(format!(
-                    "sort enforcer '{name}' finish failed: {e}"
-                )))
+                buf.finish().map_err(|e| {
+                    PipelineError::Io(std::io::Error::other(format!(
+                        "sort enforcer '{name}' finish failed: {e}"
+                    )))
+                })
             })?;
 
             let mut out: Vec<(Record, u64)> = Vec::with_capacity(sort_count as usize);
@@ -2019,60 +2155,69 @@ pub(crate) fn dispatch_plan_node(
             let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let input_count = input.len() as u64;
 
+            // CPU-bound: per-record accumulator updates + spill I/O.
+            // `block_in_place` keeps the `&mut ExecutorContext` borrows
+            // alive across the synchronous body while moving sibling
+            // tokio tasks off this worker (DataFusion/Vector pattern).
             let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-            for (record, row_num) in &input {
-                let source_file_arc = source_file_arc_of(record);
-                let source_name_arc = source_name_arc_of(record);
-                let eval_ctx = EvalContext {
-                    stable: ctx.stable,
-                    source_file: &source_file_arc,
-                    source_row: *row_num,
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count,
-                    source_batch: ctx.source_batch_arc,
-                    ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &source_name_arc,
-                };
-                let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
-                if add_result.is_ok() {
-                    advance_cursor(ctx, &source_name_arc, *row_num);
-                }
-                if let Err(e) = add_result {
-                    match ctx.config.error_handling.strategy {
-                        ErrorStrategy::FailFast => return Err(e.into()),
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            let stage = Some(crate::dlq::stage_aggregate(name));
-                            let routed = record_error_to_buffer_if_grouped(
-                                ctx,
-                                record,
-                                *row_num,
-                                crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                format!("aggregate {name}: {e}"),
-                                stage.clone(),
-                                None,
-                            );
-                            if !routed {
-                                let source_name = source_name_arc_of(record);
-                                push_dlq(
+            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                for (record, row_num) in &input {
+                    let source_file_arc = source_file_arc_of(record);
+                    let source_name_arc = source_name_arc_of(record);
+                    let eval_ctx = EvalContext {
+                        stable: ctx.stable,
+                        source_file: &source_file_arc,
+                        source_row: *row_num,
+                        source_path: &source_file_arc,
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
+                        source_name: &source_name_arc,
+                    };
+                    let add_result =
+                        stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
+                    if add_result.is_ok() {
+                        advance_cursor(ctx, &source_name_arc, *row_num);
+                    }
+                    if let Err(e) = add_result {
+                        match ctx.config.error_handling.strategy {
+                            ErrorStrategy::FailFast => return Err(e.into()),
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                let stage = Some(crate::dlq::stage_aggregate(name));
+                                let routed = record_error_to_buffer_if_grouped(
                                     ctx,
-                                    DlqEntry {
-                                        source_row: *row_num,
-                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                        error_message: format!("aggregate {name}: {e}"),
-                                        original_record: record.clone(),
-                                        stage,
-                                        route: None,
-                                        trigger: true,
-                                        source_name,
-                                        triggering_field: None,
-                                        triggering_value: None,
-                                    },
-                                )?;
+                                    record,
+                                    *row_num,
+                                    crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    format!("aggregate {name}: {e}"),
+                                    stage.clone(),
+                                    None,
+                                );
+                                if !routed {
+                                    let source_name = source_name_arc_of(record);
+                                    push_dlq(
+                                        ctx,
+                                        DlqEntry {
+                                            source_row: *row_num,
+                                            category:
+                                                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                            error_message: format!("aggregate {name}: {e}"),
+                                            original_record: record.clone(),
+                                            stage,
+                                            route: None,
+                                            trigger: true,
+                                            source_name,
+                                            triggering_field: None,
+                                            triggering_value: None,
+                                        },
+                                    )?;
+                                }
                             }
                         }
                     }
                 }
-            }
+                Ok(())
+            })?;
 
             // Finalize. Accumulator finalize errors get the
             // typed `PipelineError::Accumulator` mapping; under
@@ -2574,8 +2719,13 @@ pub(crate) fn dispatch_plan_node(
 
             let composition_name = name.clone();
             let port_records = collect_port_records(ctx, current_dag, node_idx, &composition_name)?;
-            let output_records =
-                execute_composition_body(ctx, body, port_records, &composition_name)?;
+            let output_records = Box::pin(execute_composition_body(
+                ctx,
+                body,
+                port_records,
+                &composition_name,
+            ))
+            .await?;
             // Materialize node-rooted window runtimes for any IndexSpec
             // rooted at this composition's call-site NodeIndex. The
             // body executor returned with `active_stack` already
@@ -2796,12 +2946,11 @@ pub(crate) fn dispatch_plan_node(
             // a record to this Combine's fold. Captured at fold start so
             // a Combine-output-row failure rewinds every contributing
             // source independently — driver and build sides treat
-            // symmetrically. Cleared at Combine exit; today's executor
-            // never fires the rewind path because Combine errors
-            // propagate as `PipelineError::Internal` (FailFast),
-            // aborting the run before any rewind can apply. The
-            // snapshot is in place for the async runtime to drive
-            // recoverable Combine failures once #57 lands.
+            // symmetrically. Cleared at every Combine exit (inline,
+            // IEJoin, Grace, SortMerge); the recoverable-DLQ rewind
+            // path restores from this entry before clearing. Setup-time
+            // `PipelineError::Internal { op: "combine" }` invariant
+            // violations still fail-fast and bypass the rewind.
             let mut combine_snapshot: HashMap<Arc<str>, u64> = HashMap::new();
             for (rec, _) in driver_buf.iter().chain(build_buf.iter()) {
                 let sn = source_name_arc_of(rec);
@@ -2882,6 +3031,20 @@ pub(crate) fn dispatch_plan_node(
                 Dispatch::IEJoin(partition_bits) => {
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Advance per-source `rollback_cursors` for every
+                    // build-side record before its `row_num` is dropped
+                    // in the `(r, _)` map. Source→Combine direct paths
+                    // (no intermediate Transform/Aggregate to advance the
+                    // cursor on the way through) would otherwise leave
+                    // the build source's cursor anchored at zero. Same
+                    // pass advances driver-side cursors for symmetry —
+                    // a Source→Combine direct driver has the same gap.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -2909,21 +3072,30 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_iejoin(IEJoinExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        partition_bits,
-                        propagate_ck,
-                        ctx: &iejoin_ctx,
-                        budget: &mut budget,
+                    // CPU-bound IEJoin kernel — partition + range-walk
+                    // + materialize; sized to saturate a worker thread.
+                    // `block_in_place` keeps the runtime responsive
+                    // for sibling tasks (e.g. concurrent source
+                    // ingest still pumping records into other
+                    // receivers) while this Combine arm holds the
+                    // worker.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_iejoin(IEJoinExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            partition_bits,
+                            propagate_ck,
+                            ctx: &iejoin_ctx,
+                            budget: &mut budget,
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -2931,11 +3103,28 @@ pub(crate) fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Every emitted record has cleared into
+                    // `node_buffers` without rewind, so the snapshot is
+                    // no longer needed. Mirrors the inline arm's
+                    // post-emit clear.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Same per-source cursor advance the IEJoin arm
+                    // performs; Source→Combine direct paths on either
+                    // side need the explicit walk because the build /
+                    // driver bufs flow directly out of `node_buffers`
+                    // with no operator in between to advance.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -2963,22 +3152,28 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_grace_hash(GraceHashExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        partition_bits,
-                        propagate_ck,
-                        ctx: &grace_ctx,
-                        budget: &mut budget,
-                        spill_dir: ctx.spill_root_path.as_ref(),
+                    // CPU-bound grace-hash join kernel: partition build
+                    // + probe + spill I/O. `block_in_place` keeps the
+                    // borrow shape unchanged while letting the runtime
+                    // park other tasks during the heavy phase.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_grace_hash(GraceHashExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            partition_bits,
+                            propagate_ck,
+                            ctx: &grace_ctx,
+                            budget: &mut budget,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -2986,6 +3181,11 @@ pub(crate) fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Mirrors the inline arm's post-emit
+                    // clear so non-inline strategies do not leak
+                    // stale snapshot entries across runs.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::SortMerge => {
@@ -2998,6 +3198,18 @@ pub(crate) fn dispatch_plan_node(
                     // merge.
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Same per-source cursor advance the IEJoin /
+                    // Grace arms perform; Source→Combine direct paths
+                    // on either side need the explicit walk because
+                    // the build / driver bufs flow directly out of
+                    // `node_buffers` with no operator in between to
+                    // advance.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -3025,22 +3237,27 @@ pub(crate) fn dispatch_plan_node(
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
                     };
-                    let output_records = execute_combine_sort_merge(SortMergeExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        presorted: true,
-                        propagate_ck,
-                        ctx: &sm_ctx,
-                        budget: &mut budget,
-                        spill_dir: ctx.spill_root_path.as_ref(),
+                    // CPU-bound sort-merge join kernel: two-cursor merge
+                    // over pre-sorted inputs. `block_in_place` keeps
+                    // sibling tasks unblocked during the merge body.
+                    let output_records = tokio::task::block_in_place(|| {
+                        execute_combine_sort_merge(SortMergeExec {
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            presorted: true,
+                            propagate_ck,
+                            ctx: &sm_ctx,
+                            budget: &mut budget,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                        })
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -3048,6 +3265,10 @@ pub(crate) fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Mirrors the inline arm's post-emit
+                    // clear.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::Inline => {}
@@ -3060,6 +3281,19 @@ pub(crate) fn dispatch_plan_node(
             // recording (matches the `StageTimer` "no report on
             // error" contract documented at its definition).
             let mut budget = MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+            // Per-source cursor advance for both build and driver.
+            // Source→Combine direct paths bypass the Transform /
+            // Aggregate advance points so the cursor never moved off
+            // zero for those records; this is the operator-entry
+            // advance that catches the gap. The inline arm's driver
+            // loop below does not advance per-row inline, so this is
+            // the single advance point for driver and build alike.
+            for (rec, rn) in &driver_buf {
+                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+            }
+            for (rec, rn) in &build_buf {
+                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+            }
             let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
             let build_records_in = build_records.len() as u64;
             let estimated_rows = Some(build_records.len());
@@ -3501,7 +3735,7 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::CorrelationCommit { .. } => {
-            crate::executor::commit::orchestrate(ctx, current_dag)?;
+            Box::pin(crate::executor::commit::orchestrate(ctx, current_dag)).await?;
         }
     }
 
@@ -3700,6 +3934,29 @@ fn commit_one_group(
                     triggering_value: None,
                 },
             )?;
+        }
+        // Per-source rollback rewind: each contributing source rewinds
+        // its `rollback_cursors` entry to the lowest `row_num` of any
+        // group member from that source. The cursor narrows the replay
+        // anchor so a downstream resume reprocesses every record that
+        // contributed to the overflowing group, including those whose
+        // forward operators had already advanced the cursor past them.
+        // No causal-source attribution is required for an overflow —
+        // every contributing source shared blame proportionally — so
+        // every source contributing a slot rewinds independently.
+        let mut per_source_min: HashMap<Arc<str>, u64> = HashMap::new();
+        for slot in &records {
+            let sn = source_name_arc_of(&slot.original_record);
+            per_source_min
+                .entry(sn)
+                .and_modify(|m| *m = (*m).min(slot.row_num))
+                .or_insert(slot.row_num);
+        }
+        for (sn, min_rn) in per_source_min {
+            ctx.rollback_cursors
+                .entry(sn)
+                .and_modify(|c| *c = (*c).min(min_rn))
+                .or_insert(min_rn);
         }
         return Ok(());
     }
@@ -3980,7 +4237,7 @@ fn collect_port_records(
 /// fresh space; the parent buffers are restored after the walk.
 /// The depth-counter guard increments via RAII so `?`-bubbled
 /// errors can't leak the counter.
-fn execute_composition_body(
+async fn execute_composition_body(
     ctx: &mut ExecutorContext<'_>,
     body_id: crate::plan::composition_body::CompositionBodyId,
     port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
@@ -4080,7 +4337,7 @@ fn execute_composition_body(
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
     let mut walk_result: Result<(), PipelineError> = Ok(());
     for node_idx in topo {
-        if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
+        if let Err(inner) = Box::pin(dispatch_plan_node(ctx, &body_dag, node_idx)).await {
             walk_result = Err(PipelineError::compose_body_error(
                 composition_name.to_string(),
                 Box::new(inner),
