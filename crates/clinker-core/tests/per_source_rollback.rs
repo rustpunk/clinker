@@ -342,15 +342,16 @@ nodes:
         "driver source advanced through both Transform clean exits"
     );
     // Build-side records flow straight from ingest into Combine's
-    // build buffer without traversing a forward operator that
-    // advances the cursor — sprint 7 wires advance at Transform /
-    // Route / Aggregate clean exits, and build-direct Source → Combine
-    // is none of those. The build source still PARTICIPATES in the
-    // Combine fold (verified by output row count) and the
-    // `combine_input_snapshots` capture inside the Combine arm reads
-    // an effective cursor of 0 for the build source (the seed value).
-    // A future advance-on-Combine-build-ingest wiring would surface
-    // src_bld here; tracked alongside the async-runtime restore on
-    // #57.
-    assert_eq!(report.per_source_rollback_cursors.get("src_bld"), None);
+    // build buffer. The Combine arm now advances per-source cursors
+    // at operator entry for every build (and driver) record before
+    // the `row_num` is discarded, so `src_bld` surfaces here at the
+    // highest contributed row_num. The Combine arm's snapshot
+    // captures the pre-fold cursor state independently for each
+    // contributing source so a recoverable Combine-output failure
+    // can rewind each source's cursor symmetrically.
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_bld"),
+        Some(&2),
+        "build source advances at Combine operator-entry walk over build_buf"
+    );
 }

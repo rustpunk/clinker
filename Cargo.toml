@@ -30,7 +30,7 @@ clinker-schema = { path = "crates/clinker-schema" }
 clinker-git = { path = "crates/clinker-git" }
 
 toml = "0.8"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde-saphyr = { version = "=0.0.23", features = ["miette"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -3028,6 +3028,20 @@ pub(crate) async fn dispatch_plan_node(
                 Dispatch::IEJoin(partition_bits) => {
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Advance per-source `rollback_cursors` for every
+                    // build-side record before its `row_num` is dropped
+                    // in the `(r, _)` map. Source→Combine direct paths
+                    // (no intermediate Transform/Aggregate to advance the
+                    // cursor on the way through) would otherwise leave
+                    // the build source's cursor anchored at zero. Same
+                    // pass advances driver-side cursors for symmetry —
+                    // a Source→Combine direct driver has the same gap.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -3086,11 +3100,28 @@ pub(crate) async fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Every emitted record has cleared into
+                    // `node_buffers` without rewind, so the snapshot is
+                    // no longer needed. Mirrors the inline arm's
+                    // post-emit clear.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Same per-source cursor advance the IEJoin arm
+                    // performs; Source→Combine direct paths on either
+                    // side need the explicit walk because the build /
+                    // driver bufs flow directly out of `node_buffers`
+                    // with no operator in between to advance.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -3147,6 +3178,11 @@ pub(crate) async fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Mirrors the inline arm's post-emit
+                    // clear so non-inline strategies do not leak
+                    // stale snapshot entries across runs.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::SortMerge => {
@@ -3159,6 +3195,18 @@ pub(crate) async fn dispatch_plan_node(
                     // merge.
                     let mut budget =
                         MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    // Same per-source cursor advance the IEJoin /
+                    // Grace arms perform; Source→Combine direct paths
+                    // on either side need the explicit walk because
+                    // the build / driver bufs flow directly out of
+                    // `node_buffers` with no operator in between to
+                    // advance.
+                    for (rec, rn) in &driver_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
+                    for (rec, rn) in &build_buf {
+                        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                    }
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
@@ -3214,6 +3262,10 @@ pub(crate) async fn dispatch_plan_node(
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
+                    // Combine arm clean-exit: drop the per-fold cursor
+                    // snapshot. Mirrors the inline arm's post-emit
+                    // clear.
+                    ctx.combine_input_snapshots.remove(&node_idx);
                     return Ok(());
                 }
                 Dispatch::Inline => {}
@@ -3226,6 +3278,19 @@ pub(crate) async fn dispatch_plan_node(
             // recording (matches the `StageTimer` "no report on
             // error" contract documented at its definition).
             let mut budget = MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+            // Per-source cursor advance for both build and driver.
+            // Source→Combine direct paths bypass the Transform /
+            // Aggregate advance points so the cursor never moved off
+            // zero for those records; this is the operator-entry
+            // advance that catches the gap. The inline arm's driver
+            // loop below does not advance per-row inline, so this is
+            // the single advance point for driver and build alike.
+            for (rec, rn) in &driver_buf {
+                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+            }
+            for (rec, rn) in &build_buf {
+                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+            }
             let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
             let build_records_in = build_records.len() as u64;
             let estimated_rows = Some(build_records.len());
@@ -3866,6 +3931,29 @@ fn commit_one_group(
                     triggering_value: None,
                 },
             )?;
+        }
+        // Per-source rollback rewind: each contributing source rewinds
+        // its `rollback_cursors` entry to the lowest `row_num` of any
+        // group member from that source. The cursor narrows the replay
+        // anchor so a downstream resume reprocesses every record that
+        // contributed to the overflowing group, including those whose
+        // forward operators had already advanced the cursor past them.
+        // No causal-source attribution is required for an overflow —
+        // every contributing source shared blame proportionally — so
+        // every source contributing a slot rewinds independently.
+        let mut per_source_min: HashMap<Arc<str>, u64> = HashMap::new();
+        for slot in &records {
+            let sn = source_name_arc_of(&slot.original_record);
+            per_source_min
+                .entry(sn)
+                .and_modify(|m| *m = (*m).min(slot.row_num))
+                .or_insert(slot.row_num);
+        }
+        for (sn, min_rn) in per_source_min {
+            ctx.rollback_cursors
+                .entry(sn)
+                .and_modify(|c| *c = (*c).min(min_rn))
+                .or_insert(min_rn);
         }
         return Ok(());
     }

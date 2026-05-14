@@ -385,12 +385,17 @@ pub struct AggregatorGroupState {
     /// a parallel HashMap. Meaningless after spill+merge — index space
     /// is reassigned by the recovery loop.
     pub group_index: u32,
-    /// Per-group input-row-number list. Populated only on the lineage
-    /// path; empty otherwise (an empty `Vec` does not allocate). Spilled
-    /// alongside accumulator state so the post-merge `AggregatorGroupState`
-    /// preserves which input rows folded into each group across the
-    /// round trip.
-    pub input_rows: Vec<u64>,
+    /// Per-group `(input_row_number, source_name)` list. Populated only
+    /// on the lineage path; empty otherwise (an empty `Vec` does not
+    /// allocate). The source name pairs each entry with its originating
+    /// Source so a relaxed-CK retract can scope rewinds per source
+    /// without colliding across the per-source `row_num` namespaces.
+    /// Spilled alongside accumulator state so the post-merge
+    /// `AggregatorGroupState` preserves which input rows folded into
+    /// each group across the round trip; serialization uses serde's
+    /// `rc` feature to deserialize `Arc<str>` from owned strings on
+    /// recovery.
+    pub input_rows: Vec<(u64, Arc<str>)>,
     /// Per-row evaluated binding values, parallel to `input_rows`.
     /// `retract_values[i]` is the per-binding `Vec<Value>` produced by
     /// the i-th ingested row (in `CompiledAggregate.bindings[]` order),
@@ -448,10 +453,12 @@ pub struct BufferedGroupState {
     /// `HashAggregator.buffered_groups` at insertion time, mirroring
     /// the lineage path's group index. Meaningless after spill+merge.
     pub group_index: u32,
-    /// Per-group input-row-number list. Mirrors
+    /// Per-group `(input_row_number, source_name)` list. Mirrors
     /// `AggregatorGroupState.input_rows` so the spill-merge concat
     /// round-trips through the same shape on both retraction strategies.
-    pub input_rows: Vec<u64>,
+    /// `Arc<str>` deserialization uses serde's `rc` feature (owned
+    /// copy on recovery).
+    pub input_rows: Vec<(u64, Arc<str>)>,
     /// Per-row evaluated binding values. `contributions[i][slot]`
     /// holds the value the binding at slot `slot` produced for the
     /// i-th ingested row, in `CompiledAggregate.bindings[]` order.
@@ -889,7 +896,7 @@ impl HashAggregator {
     /// is an obvious future optimization but not warranted at current
     /// call frequencies (one walk per detect-phase synthetic-CK
     /// trigger column).
-    pub(crate) fn input_rows_by_group_index(&self, group_index: u32) -> Option<&[u64]> {
+    pub(crate) fn input_rows_by_group_index(&self, group_index: u32) -> Option<&[(u64, Arc<str>)]> {
         if self.buffer_mode {
             self.buffered_groups
                 .values()
@@ -1041,10 +1048,21 @@ impl HashAggregator {
             let row_u64 = row_num;
             let group_idx = group_state.group_index;
             lin.push((row_u64, group_idx));
-            group_state.input_rows.push(row_u64);
-            self.value_heap_bytes = self
-                .value_heap_bytes
-                .saturating_add(std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<u64>());
+            // Source identity is extracted from the record's
+            // engine-stamped `$source.name` column so retract scopes can
+            // narrow rewinds to the failing source's contributions only.
+            let source_name = crate::executor::dispatch::source_name_arc_of(record);
+            group_state.input_rows.push((row_u64, source_name));
+            // Lineage memory: flat `(row_u64, group_idx)` plus the
+            // per-group `(u64, Arc<str>)` entry. The Arc fat pointer is
+            // 16 bytes and shares the underlying source-name allocation
+            // across every row's entry, so per-row charge is dominated
+            // by the inline tuple bytes; the source-name allocation
+            // itself is charged once per distinct source (small,
+            // bounded) and folded into the flat-vec accounting below.
+            self.value_heap_bytes = self.value_heap_bytes.saturating_add(
+                std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<(u64, Arc<str>)>(),
+            );
         }
 
         // 5. BindingArg dispatch hot loop (D1).
@@ -1269,12 +1287,13 @@ impl HashAggregator {
         }
         // Memory cost for this row: enum-tag bytes for every Value slot
         // plus the recursive heap of each Value plus the outer `Vec`'s
-        // capacity (one inner Vec per row).
+        // capacity (one inner Vec per row) plus the per-row
+        // `(u64, Arc<str>)` lineage tuple.
         let row_value_count = row_values.len();
         let row_charge = std::mem::size_of::<Value>().saturating_mul(row_value_count)
             + row_heap_bytes
             + std::mem::size_of::<Vec<Value>>()
-            + std::mem::size_of::<u64>();
+            + std::mem::size_of::<(u64, Arc<str>)>();
         // Hard-limit guard. A single record whose contributions alone
         // exceed the entire memory budget cannot be held in memory and
         // cannot be salvaged by spilling — the very next add of the same
@@ -1291,8 +1310,12 @@ impl HashAggregator {
                 row_charge, self.memory_budget
             );
         }
+        // Source identity is extracted at ingest so the buffer path's
+        // retract walk can scope rewinds per source, matching the
+        // lineage path's per-source narrowing semantics.
+        let source_name = crate::executor::dispatch::source_name_arc_of(record);
         group_state.contributions.push(row_values);
-        group_state.input_rows.push(row_u64);
+        group_state.input_rows.push((row_u64, source_name));
         self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
 
         // 7. Spill trigger — same dual-threshold check as fold-mode.
@@ -1351,7 +1374,11 @@ impl HashAggregator {
     /// state. The orchestrator's degrade-fallback surface catches that
     /// case and routes the affected groups through strict-collateral DLQ
     /// per the relaxed-CK fallback contract.
-    pub(crate) fn retract_row(&mut self, input_row_id: u64) -> Result<(), HashAggError> {
+    pub(crate) fn retract_row(
+        &mut self,
+        input_row_id: u64,
+        source: &Arc<str>,
+    ) -> Result<(), HashAggError> {
         if !self.spill_files.is_empty() {
             return Err(HashAggError::Spill(format!(
                 "retract_row {input_row_id} called on aggregator with spilled groups; \
@@ -1361,13 +1388,17 @@ impl HashAggregator {
 
         if self.buffer_mode {
             for state in self.buffered_groups.values_mut() {
-                if let Some(idx) = state.input_rows.iter().position(|r| *r == input_row_id) {
+                if let Some(idx) = state
+                    .input_rows
+                    .iter()
+                    .position(|(r, sn)| *r == input_row_id && sn.as_ref() == source.as_ref())
+                {
                     let removed = state.contributions.remove(idx);
                     state.input_rows.remove(idx);
                     let row_charge = std::mem::size_of::<Value>().saturating_mul(removed.len())
                         + removed.iter().map(Value::heap_size).sum::<usize>()
                         + std::mem::size_of::<Vec<Value>>()
-                        + std::mem::size_of::<u64>();
+                        + std::mem::size_of::<(u64, Arc<str>)>();
                     self.value_heap_bytes = self.value_heap_bytes.saturating_sub(row_charge);
                     return Ok(());
                 }
@@ -1381,7 +1412,11 @@ impl HashAggregator {
         // sub each binding's accumulator with the cached retract Value.
         let bindings = self.factory.compiled().bindings.clone();
         for state in self.groups.values_mut() {
-            let Some(idx) = state.input_rows.iter().position(|r| *r == input_row_id) else {
+            let Some(idx) = state
+                .input_rows
+                .iter()
+                .position(|(r, sn)| *r == input_row_id && sn.as_ref() == source.as_ref())
+            else {
                 continue;
             };
             let values = state.retract_values.remove(idx);
@@ -1411,7 +1446,7 @@ impl HashAggregator {
             let removed_row_charge = std::mem::size_of::<Value>().saturating_mul(values.len())
                 + values.iter().map(Value::heap_size).sum::<usize>()
                 + std::mem::size_of::<Vec<Value>>()
-                + std::mem::size_of::<u64>();
+                + std::mem::size_of::<(u64, Arc<str>)>();
             self.value_heap_bytes = self.value_heap_bytes.saturating_sub(removed_row_charge);
             // Negative `total_delta` is a shrink; saturating-sub clamps
             // at zero against the running total.
@@ -3475,8 +3510,10 @@ mod spill_trigger_tests {
         // Per-group input_rows mirror the flat lineage partition.
         let groups = agg.groups();
         assert_eq!(groups.len(), 2);
-        let mut input_row_lists: Vec<Vec<u64>> =
-            groups.values().map(|s| s.input_rows.clone()).collect();
+        let mut input_row_lists: Vec<Vec<u64>> = groups
+            .values()
+            .map(|s| s.input_rows.iter().map(|(r, _)| *r).collect())
+            .collect();
         input_row_lists.sort();
         assert_eq!(input_row_lists, vec![vec![0, 2, 4], vec![1, 3]]);
     }
@@ -3532,7 +3569,7 @@ mod spill_trigger_tests {
                 by_key
                     .entry(key_str)
                     .or_default()
-                    .extend(folded.input_rows.iter().copied());
+                    .extend(folded.input_rows.iter().map(|(r, _)| *r));
             }
         }
         // Drain in-memory groups too — anything spill missed.
@@ -3544,7 +3581,7 @@ mod spill_trigger_tests {
             by_key
                 .entry(key_str)
                 .or_default()
-                .extend(state.input_rows.iter().copied());
+                .extend(state.input_rows.iter().map(|(r, _)| *r));
         }
 
         for (k, mut rows) in by_key.into_iter() {
@@ -3721,7 +3758,7 @@ mod spill_trigger_tests {
             .buffered_groups
             .iter()
             .find(|(k, _)| matches!(&k[0], GroupByKey::Str(s) if s.as_ref() == "a"))
-            .map(|(_, s)| s.input_rows.clone())
+            .map(|(_, s)| s.input_rows.iter().map(|(r, _)| *r).collect())
             .unwrap();
         a_rows.sort();
         assert_eq!(a_rows, vec![0, 2, 4]);
@@ -3815,7 +3852,7 @@ mod spill_trigger_tests {
                     }
                 };
                 let bucket = by_key.entry(key_str).or_default();
-                for (row, contrib) in buffered
+                for ((row, _src), contrib) in buffered
                     .input_rows
                     .iter()
                     .zip(buffered.contributions.iter())
@@ -3834,7 +3871,7 @@ mod spill_trigger_tests {
                 other => panic!("unexpected group key shape: {other:?}"),
             };
             let bucket = by_key.entry(key_str).or_default();
-            for (row, contrib) in state.input_rows.iter().zip(state.contributions.iter()) {
+            for ((row, _src), contrib) in state.input_rows.iter().zip(state.contributions.iter()) {
                 let v = match contrib.first().expect("one slot for min(v)") {
                     Value::Integer(n) => *n,
                     other => panic!("expected Integer, got {other:?}"),
@@ -4000,8 +4037,17 @@ mod spill_trigger_tests {
                 )
                 .expect("add_record");
         }
+        // Test records carry no `$source.name` stamp, so every ingest
+        // landed under `MERGED_SOURCE_NAME` — pass the same Arc here so
+        // the source-equality match resolves.
+        let merged_name = crate::executor::dispatch::source_name_arc_of(&make_record(
+            &input,
+            rows.first().expect("at least one input row").0.clone(),
+        ));
         for &row_id in retract {
-            full_agg.retract_row(row_id).expect("retract_row");
+            full_agg
+                .retract_row(row_id, &merged_name)
+                .expect("retract_row");
         }
         let mut out_after_retract = Vec::new();
         full_agg

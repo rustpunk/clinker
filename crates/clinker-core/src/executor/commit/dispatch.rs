@@ -272,6 +272,7 @@ async fn dispatch_one_region(
             for entry in &ctx.dlq_entries[dlq_len_before..] {
                 events.push(DlqEvent {
                     source_row: entry.source_row,
+                    source_name: std::sync::Arc::clone(&entry.source_name),
                 });
             }
         }
@@ -419,7 +420,11 @@ async fn recurse_into_body(
     // explicitly on every exit path.
     let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = async {
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
-        let body_initial_rows: Vec<u64> = body_scope.seen_source_rows.iter().copied().collect();
+        let body_initial_rows: Vec<(u64, std::sync::Arc<str>)> = body_scope
+            .seen_source_rows
+            .iter()
+            .map(|(r, sn)| (*r, std::sync::Arc::clone(sn)))
+            .collect();
         super::recompute_agg::recompute_aggregates(
             ctx,
             &body_dag,
@@ -568,6 +573,7 @@ async fn dispatch_continuation(
             for entry in &ctx.dlq_entries[dlq_len_before..] {
                 events.push(DlqEvent {
                     source_row: entry.source_row,
+                    source_name: std::sync::Arc::clone(&entry.source_name),
                 });
             }
         }

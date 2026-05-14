@@ -83,10 +83,14 @@ pub(crate) mod recompute_agg;
 /// [`detect::RetractScope::expand_with_dlq_events`] so a member-arm
 /// failure on a record that previously did not trigger widens the
 /// next iteration's retract scope. Carries the minimum the expand
-/// pass needs: the source row id for `retract_row` reuse.
+/// pass needs: the `(source_row, source_name)` pair for `retract_row`
+/// reuse. Source identity is load-bearing because each Source has its
+/// own monotonic `row_num` counter — without it, cross-source
+/// collisions would silently dedup the second source's retract.
 #[derive(Debug, Clone)]
 pub(crate) struct DlqEvent {
     pub(crate) source_row: u64,
+    pub(crate) source_name: std::sync::Arc<str>,
 }
 
 /// Orchestrator entry point invoked from the dispatcher's
@@ -122,7 +126,11 @@ pub(crate) async fn orchestrate(
     // the per-iteration delta returned by `expand_with_dlq_events`,
     // because `retract_row` is not idempotent on a row already taken
     // out of the aggregator's contributions.
-    let initial_rows: Vec<u64> = scope.seen_source_rows.iter().copied().collect();
+    let initial_rows: Vec<(u64, std::sync::Arc<str>)> = scope
+        .seen_source_rows
+        .iter()
+        .map(|(r, sn)| (*r, std::sync::Arc::clone(sn)))
+        .collect();
 
     // Snapshot the forward-pass baseline buffer state. The strict-Output
     // records and forward-pass error events captured here are stable
@@ -174,7 +182,7 @@ pub(crate) async fn orchestrate(
     // records.
     let mut error_archive: HashMap<Vec<GroupByKey>, CorrelationGroupBuffer> = HashMap::new();
 
-    let mut iteration_rows: Vec<u64> = initial_rows;
+    let mut iteration_rows: Vec<(u64, std::sync::Arc<str>)> = initial_rows;
     loop {
         if iter >= cap {
             panic!(
@@ -204,8 +212,11 @@ pub(crate) async fn orchestrate(
         let post_dispatch_scope = detect::detect_retract_scope(ctx, current_dag);
         archive_iteration_errors(&mut error_archive, ctx.correlation_buffers.as_ref());
         let mut new_events: Vec<DlqEvent> = direct_events;
-        for row in &post_dispatch_scope.seen_source_rows {
-            new_events.push(DlqEvent { source_row: *row });
+        for (row, sn) in &post_dispatch_scope.seen_source_rows {
+            new_events.push(DlqEvent {
+                source_row: *row,
+                source_name: std::sync::Arc::clone(sn),
+            });
         }
         let new_triggers = scope.expand_with_dlq_events(&new_events);
         if new_triggers.is_empty() {

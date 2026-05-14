@@ -44,7 +44,7 @@ pub(crate) fn recompute_aggregates(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     scope: &RetractScope,
-    new_retract_rows: &[u64],
+    new_retract_rows: &[(u64, std::sync::Arc<str>)],
 ) -> Result<(), PipelineError> {
     if scope.aggregates.is_empty() || new_retract_rows.is_empty() {
         return Ok(());
@@ -98,12 +98,19 @@ pub(crate) fn recompute_aggregates(
 /// Apply the per-iteration retract delta to the retained aggregator
 /// in place. Returns `Ok(())` on success, including the wide-net
 /// "row not in this aggregator's lineage" case (treated as no-op).
+///
+/// Each retract id is paired with its originating source so the
+/// retract match scopes by `(row_num, source)` rather than `row_num`
+/// alone. Cross-source `row_num` namespaces would otherwise collide
+/// under multi-source ingest where each Source has its own monotonic
+/// counter, and a retract intended for `src_a.row_5` would silently
+/// retract `src_b.row_5` from the same group.
 fn retract_and_refinalize(
     retained: &mut crate::executor::dispatch::RetainedAggregatorState,
-    retract_ids: &[u64],
+    retract_ids: &[(u64, std::sync::Arc<str>)],
 ) -> Result<(), HashAggError> {
-    for &row_id in retract_ids {
-        if let Err(e) = retained.aggregator.retract_row(row_id) {
+    for (row_id, source) in retract_ids {
+        if let Err(e) = retained.aggregator.retract_row(*row_id, source) {
             // Wide-net no-op: the orchestrator hands every relaxed-CK
             // aggregate every newly-failed source row, so an aggregate
             // that didn't ingest this row reports `not found` — that's
