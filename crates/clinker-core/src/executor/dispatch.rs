@@ -339,6 +339,7 @@ fn record_error_to_buffer_if_grouped(
     });
     true
 }
+use crate::aggregation::AggregateStrategy;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     CompiledRoute, CompiledTransform, DlqEntry, NullStorage, build_format_writer,
@@ -349,6 +350,7 @@ use crate::pipeline::memory::MemoryBudget;
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 use crate::projection::project_output_from_record;
+use clinker_record::Schema;
 
 /// Mutable per-walk and borrowed plan-time state passed to
 /// [`dispatch_plan_node`].
@@ -2067,6 +2069,7 @@ pub(crate) async fn dispatch_plan_node(
             ref compiled,
             strategy: agg_strategy,
             ref output_schema,
+            ref config,
             ..
         } => {
             // Whether this aggregate participates in retraction-mode
@@ -2075,8 +2078,12 @@ pub(crate) async fn dispatch_plan_node(
             // for all-Reversible bindings, `requires_buffer_mode` for
             // any BufferRequired binding. Strict aggregates have both
             // flags `false` and bypass the retain-finalize-into-state
-            // path entirely.
-            let is_relaxed = compiled.requires_lineage || compiled.requires_buffer_mode;
+            // path entirely. Time-windowed aggregates always take the
+            // strict path — relaxed-CK retraction over multi-window
+            // emissions is not supported (see `apply_retraction_flags`).
+            let is_time_windowed = config.time_window.is_some();
+            let is_relaxed =
+                !is_time_windowed && (compiled.requires_lineage || compiled.requires_buffer_mode);
             // Hash-aggregation dispatch arm.
             //
             // DataFusion PR #9241 / #12086 lesson: any
@@ -2143,246 +2150,278 @@ pub(crate) async fn dispatch_plan_node(
 
             let memory_limit = parse_memory_limit(ctx.config);
 
-            let mut stream = crate::aggregation::AggregateStream::for_node(
-                Arc::clone(compiled),
-                evaluator,
-                agg_strategy,
-                Arc::clone(output_schema),
-                spill_schema,
-                memory_limit,
-                Some(ctx.spill_root_path.to_path_buf()),
-                name.clone(),
-            )?;
-
             let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let input_count = input.len() as u64;
 
-            // CPU-bound: per-record accumulator updates + spill I/O.
-            // `block_in_place` keeps the `&mut ExecutorContext` borrows
-            // alive across the synchronous body while moving sibling
-            // tokio tasks off this worker (DataFusion/Vector pattern).
-            let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
-                for (record, row_num) in &input {
-                    let source_file_arc = source_file_arc_of(record);
-                    let source_name_arc = source_name_arc_of(record);
-                    let eval_ctx = EvalContext {
-                        stable: ctx.stable,
-                        source_file: &source_file_arc,
-                        source_row: *row_num,
-                        source_path: &source_file_arc,
-                        source_count: ctx.source_count,
-                        source_batch: ctx.source_batch_arc,
-                        ingestion_timestamp: ctx.source_ingestion_timestamp,
-                        source_name: &source_name_arc,
-                    };
-                    let add_result =
-                        stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
-                    if add_result.is_ok() {
-                        advance_cursor(ctx, &source_name_arc, *row_num);
-                    }
-                    if let Err(e) = add_result {
-                        match ctx.config.error_handling.strategy {
-                            ErrorStrategy::FailFast => return Err(e.into()),
-                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                                let stage = Some(crate::dlq::stage_aggregate(name));
-                                let routed = record_error_to_buffer_if_grouped(
-                                    ctx,
-                                    record,
-                                    *row_num,
-                                    crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                    format!("aggregate {name}: {e}"),
-                                    stage.clone(),
-                                    None,
-                                );
-                                if !routed {
-                                    let source_name = source_name_arc_of(record);
-                                    push_dlq(
+            let out_rows: Vec<AggSortRow> = if is_time_windowed {
+                // Time-windowed path: per-(window) AggregateStream
+                // instances dispatched in `run_time_windowed_aggregate`.
+                // The single positional `stream` built above is unused
+                // here — drop it so its spill files (if any) are cleaned
+                // up promptly. Building a fresh evaluator + spill setup
+                // per window keeps the time-windowed code self-
+                // contained at the cost of one extra evaluator clone per
+                // window (the heavy `TypedProgram` lives behind an Arc).
+                drop(evaluator);
+                run_time_windowed_aggregate(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    name,
+                    compiled,
+                    agg_strategy,
+                    Arc::clone(output_schema),
+                    spill_schema,
+                    memory_limit,
+                    &input,
+                    config
+                        .time_window
+                        .as_ref()
+                        .expect("guarded by is_time_windowed"),
+                    config.allowed_lateness,
+                    transform_idx,
+                )?
+            } else {
+                let mut stream = crate::aggregation::AggregateStream::for_node(
+                    Arc::clone(compiled),
+                    evaluator,
+                    agg_strategy,
+                    Arc::clone(output_schema),
+                    spill_schema,
+                    memory_limit,
+                    Some(ctx.spill_root_path.to_path_buf()),
+                    name.clone(),
+                )?;
+
+                // CPU-bound: per-record accumulator updates + spill I/O.
+                // `block_in_place` keeps the `&mut ExecutorContext` borrows
+                // alive across the synchronous body while moving sibling
+                // tokio tasks off this worker (DataFusion/Vector pattern).
+                let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
+                tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                    for (record, row_num) in &input {
+                        let source_file_arc = source_file_arc_of(record);
+                        let source_name_arc = source_name_arc_of(record);
+                        let eval_ctx = EvalContext {
+                            stable: ctx.stable,
+                            source_file: &source_file_arc,
+                            source_row: *row_num,
+                            source_path: &source_file_arc,
+                            source_count: ctx.source_count,
+                            source_batch: ctx.source_batch_arc,
+                            ingestion_timestamp: ctx.source_ingestion_timestamp,
+                            source_name: &source_name_arc,
+                        };
+                        let add_result =
+                            stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
+                        if add_result.is_ok() {
+                            advance_cursor(ctx, &source_name_arc, *row_num);
+                        }
+                        if let Err(e) = add_result {
+                            match ctx.config.error_handling.strategy {
+                                ErrorStrategy::FailFast => return Err(e.into()),
+                                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                    let stage = Some(crate::dlq::stage_aggregate(name));
+                                    let routed = record_error_to_buffer_if_grouped(
                                         ctx,
-                                        DlqEntry {
-                                            source_row: *row_num,
-                                            category:
-                                                crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                            error_message: format!("aggregate {name}: {e}"),
-                                            original_record: record.clone(),
-                                            stage,
-                                            route: None,
-                                            trigger: true,
-                                            source_name,
-                                            triggering_field: None,
-                                            triggering_value: None,
-                                        },
-                                    )?;
+                                        record,
+                                        *row_num,
+                                        crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        format!("aggregate {name}: {e}"),
+                                        stage.clone(),
+                                        None,
+                                    );
+                                    if !routed {
+                                        let source_name = source_name_arc_of(record);
+                                        push_dlq(
+                                            ctx,
+                                            DlqEntry {
+                                                source_row: *row_num,
+                                                category:
+                                                    crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                                error_message: format!("aggregate {name}: {e}"),
+                                                original_record: record.clone(),
+                                                stage,
+                                                route: None,
+                                                trigger: true,
+                                                source_name,
+                                                triggering_field: None,
+                                                triggering_value: None,
+                                            },
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
 
-            // Finalize. Accumulator finalize errors get the
-            // typed `PipelineError::Accumulator` mapping; under
-            // `Continue` we route to the DLQ and emit zero rows
-            // for the failed group. All other engine errors
-            // propagate (Internal/Spill/Residual always abort).
-            //
-            // Relaxed-CK aggregates split the finalize path: instead
-            // of consuming the wrapper, the Hash-arm boxed aggregator
-            // is extracted and kept on `ExecutorContext.relaxed_aggregator_states`
-            // so the correlation-commit orchestrator can call
-            // `retract_row` + `finalize_in_place` against the same
-            // instance that produced these rows. Strict aggregates
-            // continue to consume-and-discard so non-relaxed
-            // pipelines pay zero overhead.
-            let finalize_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count,
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-            };
-            let out_rows: Vec<AggSortRow> = if is_relaxed {
-                let mut hash_box = match stream.into_retained_hash() {
-                    Some(b) => b,
-                    None => {
-                        // Streaming + retraction-mode is rejected at
-                        // compile time (E15Y); reaching this branch is
-                        // a planner-pass bug.
-                        return Err(PipelineError::Internal {
-                            op: "aggregation",
-                            node: name.clone(),
-                            detail: "retraction-mode aggregate produced a non-Hash \
-                                 stream — E15Y should have rejected this at compile time"
-                                .to_string(),
-                        });
-                    }
+                // Finalize. Accumulator finalize errors get the
+                // typed `PipelineError::Accumulator` mapping; under
+                // `Continue` we route to the DLQ and emit zero rows
+                // for the failed group. All other engine errors
+                // propagate (Internal/Spill/Residual always abort).
+                //
+                // Relaxed-CK aggregates split the finalize path: instead
+                // of consuming the wrapper, the Hash-arm boxed aggregator
+                // is extracted and kept on `ExecutorContext.relaxed_aggregator_states`
+                // so the correlation-commit orchestrator can call
+                // `retract_row` + `finalize_in_place` against the same
+                // instance that produced these rows. Strict aggregates
+                // continue to consume-and-discard so non-relaxed
+                // pipelines pay zero overhead.
+                let finalize_ctx = EvalContext {
+                    stable: ctx.stable,
+                    source_file: &MERGED_SOURCE_FILE,
+                    source_row: 0,
+                    source_path: &MERGED_SOURCE_FILE,
+                    source_count: ctx.source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: &MERGED_SOURCE_NAME,
                 };
-                let emits_synthetic = hash_box.emits_synthetic_ck();
-                let pre_finalize_len = emitted_rows.len();
-                match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
-                    Ok(()) => {
-                        if emits_synthetic {
-                            ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
-                                (emitted_rows.len() - pre_finalize_len) as u64;
+                if is_relaxed {
+                    let mut hash_box = match stream.into_retained_hash() {
+                        Some(b) => b,
+                        None => {
+                            // Streaming + retraction-mode is rejected at
+                            // compile time (E15Y); reaching this branch is
+                            // a planner-pass bug.
+                            return Err(PipelineError::Internal {
+                                op: "aggregation",
+                                node: name.clone(),
+                                detail: "retraction-mode aggregate produced a non-Hash \
+                                 stream — E15Y should have rejected this at compile time"
+                                    .to_string(),
+                            });
                         }
-                        ctx.relaxed_aggregator_states.insert(
-                            node_idx,
-                            RetainedAggregatorState {
-                                aggregator: hash_box,
-                            },
-                        );
-                        emitted_rows
+                    };
+                    let emits_synthetic = hash_box.emits_synthetic_ck();
+                    let pre_finalize_len = emitted_rows.len();
+                    match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
+                        Ok(()) => {
+                            if emits_synthetic {
+                                ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
+                                    (emitted_rows.len() - pre_finalize_len) as u64;
+                            }
+                            ctx.relaxed_aggregator_states.insert(
+                                node_idx,
+                                RetainedAggregatorState {
+                                    aggregator: hash_box,
+                                },
+                            );
+                            emitted_rows
+                        }
+                        Err(HashAggError::Accumulator {
+                            transform,
+                            binding,
+                            source,
+                        }) => match ctx.config.error_handling.strategy {
+                            ErrorStrategy::FailFast => {
+                                return Err(PipelineError::Accumulator {
+                                    transform,
+                                    binding,
+                                    source,
+                                });
+                            }
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                // Empty-input finalize failures have no real
+                                // record to attribute to a Source, so stamp
+                                // the aggregate node's own name as the
+                                // source label. The DLQ reader sees a
+                                // specific aggregate identifier instead of
+                                // the generic `<merged>` fallthrough
+                                // `source_name_arc_of` would yield for a
+                                // schema-only synthetic record.
+                                let (synthetic, source_name) = if let Some((rec, _)) = input.first()
+                                {
+                                    let sn = source_name_arc_of(rec);
+                                    (rec.clone(), sn)
+                                } else {
+                                    (
+                                        Record::new(Arc::clone(output_schema), Vec::new()),
+                                        Arc::from(name.as_str()),
+                                    )
+                                };
+                                push_dlq(
+                                    ctx,
+                                    DlqEntry {
+                                        source_row: 0,
+                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        error_message: format!(
+                                            "aggregate {transform}.{binding}: {source:?}"
+                                        ),
+                                        original_record: synthetic,
+                                        stage: Some(crate::dlq::stage_aggregate(name)),
+                                        route: None,
+                                        trigger: true,
+                                        source_name,
+                                        triggering_field: None,
+                                        triggering_value: None,
+                                    },
+                                )?;
+                                Vec::new()
+                            }
+                        },
+                        Err(other) => return Err(other.into()),
                     }
-                    Err(HashAggError::Accumulator {
-                        transform,
-                        binding,
-                        source,
-                    }) => match ctx.config.error_handling.strategy {
-                        ErrorStrategy::FailFast => {
-                            return Err(PipelineError::Accumulator {
-                                transform,
-                                binding,
-                                source,
-                            });
-                        }
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            // Empty-input finalize failures have no real
-                            // record to attribute to a Source, so stamp
-                            // the aggregate node's own name as the
-                            // source label. The DLQ reader sees a
-                            // specific aggregate identifier instead of
-                            // the generic `<merged>` fallthrough
-                            // `source_name_arc_of` would yield for a
-                            // schema-only synthetic record.
-                            let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
-                                let sn = source_name_arc_of(rec);
-                                (rec.clone(), sn)
-                            } else {
-                                (
-                                    Record::new(Arc::clone(output_schema), Vec::new()),
-                                    Arc::from(name.as_str()),
-                                )
-                            };
-                            push_dlq(
-                                ctx,
-                                DlqEntry {
-                                    source_row: 0,
-                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                    error_message: format!(
-                                        "aggregate {transform}.{binding}: {source:?}"
-                                    ),
-                                    original_record: synthetic,
-                                    stage: Some(crate::dlq::stage_aggregate(name)),
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                    triggering_field: None,
-                                    triggering_value: None,
-                                },
-                            )?;
-                            Vec::new()
-                        }
-                    },
-                    Err(other) => return Err(other.into()),
-                }
-            } else {
-                match stream.finalize(&finalize_ctx, &mut emitted_rows) {
-                    Ok(()) => emitted_rows,
-                    Err(HashAggError::Accumulator {
-                        transform,
-                        binding,
-                        source,
-                    }) => match ctx.config.error_handling.strategy {
-                        ErrorStrategy::FailFast => {
-                            return Err(PipelineError::Accumulator {
-                                transform,
-                                binding,
-                                source,
-                            });
-                        }
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            // Empty-input finalize failures have no real
-                            // record to attribute to a Source, so stamp
-                            // the aggregate node's own name as the
-                            // source label. The DLQ reader sees a
-                            // specific aggregate identifier instead of
-                            // the generic `<merged>` fallthrough
-                            // `source_name_arc_of` would yield for a
-                            // schema-only synthetic record.
-                            let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
-                                let sn = source_name_arc_of(rec);
-                                (rec.clone(), sn)
-                            } else {
-                                (
-                                    Record::new(Arc::clone(output_schema), Vec::new()),
-                                    Arc::from(name.as_str()),
-                                )
-                            };
-                            push_dlq(
-                                ctx,
-                                DlqEntry {
-                                    source_row: 0,
-                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                    error_message: format!(
-                                        "aggregate {transform}.{binding}: {source:?}"
-                                    ),
-                                    original_record: synthetic,
-                                    stage: Some(crate::dlq::stage_aggregate(name)),
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                    triggering_field: None,
-                                    triggering_value: None,
-                                },
-                            )?;
-                            Vec::new()
-                        }
-                    },
-                    Err(other) => return Err(other.into()),
+                } else {
+                    match stream.finalize(&finalize_ctx, &mut emitted_rows) {
+                        Ok(()) => emitted_rows,
+                        Err(HashAggError::Accumulator {
+                            transform,
+                            binding,
+                            source,
+                        }) => match ctx.config.error_handling.strategy {
+                            ErrorStrategy::FailFast => {
+                                return Err(PipelineError::Accumulator {
+                                    transform,
+                                    binding,
+                                    source,
+                                });
+                            }
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                // Empty-input finalize failures have no real
+                                // record to attribute to a Source, so stamp
+                                // the aggregate node's own name as the
+                                // source label. The DLQ reader sees a
+                                // specific aggregate identifier instead of
+                                // the generic `<merged>` fallthrough
+                                // `source_name_arc_of` would yield for a
+                                // schema-only synthetic record.
+                                let (synthetic, source_name) = if let Some((rec, _)) = input.first()
+                                {
+                                    let sn = source_name_arc_of(rec);
+                                    (rec.clone(), sn)
+                                } else {
+                                    (
+                                        Record::new(Arc::clone(output_schema), Vec::new()),
+                                        Arc::from(name.as_str()),
+                                    )
+                                };
+                                push_dlq(
+                                    ctx,
+                                    DlqEntry {
+                                        source_row: 0,
+                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        error_message: format!(
+                                            "aggregate {transform}.{binding}: {source:?}"
+                                        ),
+                                        original_record: synthetic,
+                                        stage: Some(crate::dlq::stage_aggregate(name)),
+                                        route: None,
+                                        trigger: true,
+                                        source_name,
+                                        triggering_field: None,
+                                        triggering_value: None,
+                                    },
+                                )?;
+                                Vec::new()
+                            }
+                        },
+                        Err(other) => return Err(other.into()),
+                    }
                 }
             };
 
@@ -4387,4 +4426,556 @@ async fn execute_composition_body(
 
     walk_result?;
     Ok(output_records)
+}
+
+/// Dispatch arm for time-windowed aggregates. Branches the existing
+/// strict `PlanNode::Aggregation` flow when `AggregateConfig.time_window`
+/// is `Some(_)`. Each window (tumbling / hopping window or per-key
+/// session) gets its own [`crate::aggregation::AggregateStream`]
+/// instance so the existing per-group hash-aggregator machinery is
+/// reused without duplication — windowing partitions records, not the
+/// accumulator implementation.
+///
+/// Close-readiness is decided once at dispatch entry: every window
+/// whose `end + allowed_lateness <= min_across_sources` over the
+/// upstream Source set is treated as closed, and any record whose
+/// assigned window falls in that closed set routes to the DLQ as
+/// `DlqErrorCategory::LateRecord`. Open windows accumulate every
+/// in-order record; at end-of-input (drain-to-Vec batch model) every
+/// open window finalizes and contributes one emit row per
+/// (group-by-key) group it observed.
+#[allow(clippy::too_many_arguments)]
+fn run_time_windowed_aggregate(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+    compiled: &Arc<cxl::plan::CompiledAggregate>,
+    strategy: AggregateStrategy,
+    output_schema: Arc<Schema>,
+    spill_schema: Arc<Schema>,
+    memory_limit: usize,
+    input: &[(Record, u64)],
+    spec: &crate::config::pipeline_node::TimeWindowSpec,
+    allowed_lateness: Option<std::time::Duration>,
+    transform_idx: Option<usize>,
+) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
+    use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
+    use crate::config::pipeline_node::TimeWindowSpec;
+    use crate::executor::time_window::{
+        WindowBounds, duration_to_nanos, hopping_windows, partition_into_sessions,
+        record_event_time_nanos, session_is_closed, tumbling_window, upstream_source_names,
+        window_is_closed,
+    };
+    use clinker_record::group_key::value_to_group_key;
+    use std::collections::HashMap;
+
+    let upstream_sources = upstream_source_names(current_dag, node_idx);
+    let source_refs: Vec<&str> = upstream_sources.iter().map(|s| s.as_str()).collect();
+    let watermark = ctx.watermarks.min_across_sources(&source_refs);
+    let allowed_lateness_nanos = allowed_lateness.map(duration_to_nanos).unwrap_or(0);
+
+    // Factory: each per-window aggregator is a fresh `AggregateStream`
+    // sharing the compiled CXL, the output schema, and the spill
+    // schema. Building a new `ProgramEvaluator` per window is cheap —
+    // the heavy CXL pipeline lives behind `Arc<TypedProgram>` inside
+    // `compiled_transforms`.
+    let make_stream = |ctx: &ExecutorContext<'_>| -> Result<AggregateStream, PipelineError> {
+        let evaluator = match transform_idx {
+            Some(idx) => ProgramEvaluator::new(
+                Arc::clone(&ctx.compiled_transforms[idx].typed),
+                ctx.compiled_transforms[idx].has_distinct(),
+            ),
+            None => {
+                return Err(PipelineError::Internal {
+                    op: "time-windowed-aggregation",
+                    node: name.to_string(),
+                    detail: "no compiled transform found for time-windowed aggregate node"
+                        .to_string(),
+                });
+            }
+        };
+        AggregateStream::for_node(
+            Arc::clone(compiled),
+            evaluator,
+            strategy,
+            Arc::clone(&output_schema),
+            Arc::clone(&spill_schema),
+            memory_limit,
+            Some(ctx.spill_root_path.to_path_buf()),
+            name.to_string(),
+        )
+    };
+
+    let mut out_rows: Vec<AggSortRow> = Vec::new();
+    // Per-(group_by) key extraction for session bucketing: mirrors
+    // `HashAggregator::add_record`'s prefix walk so session assignment
+    // here groups records identically to how the underlying aggregator
+    // would have grouped them post-walk.
+    let compute_group_key = |record: &Record,
+                             row_num: u64|
+     -> Result<Vec<GroupByKey>, PipelineError> {
+        let mut key: Vec<GroupByKey> = Vec::with_capacity(compiled.group_by_indices.len());
+        for (i, idx) in compiled.group_by_indices.iter().enumerate() {
+            let field_name = compiled
+                .group_by_fields
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("");
+            let val = record
+                .values()
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            match value_to_group_key(&val, field_name, None, row_num) {
+                Ok(Some(gk)) => key.push(gk),
+                Ok(None) => key.push(GroupByKey::Null),
+                Err(e) => {
+                    return Err(PipelineError::Internal {
+                        op: "time-windowed-aggregation",
+                        node: name.to_string(),
+                        detail: format!(
+                            "group-by key extraction failed for field {field_name:?} at row {row_num}: {e}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(key)
+    };
+
+    match spec {
+        TimeWindowSpec::Tumbling { size } => {
+            let size_nanos = duration_to_nanos(*size);
+            if size_nanos <= 0 {
+                return Err(PipelineError::Internal {
+                    op: "time-windowed-aggregation",
+                    node: name.to_string(),
+                    detail: "tumbling window size must be > 0".to_string(),
+                });
+            }
+            let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
+            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                for (record, row_num) in input {
+                    let Some(t) = record_event_time_nanos(record) else {
+                        continue;
+                    };
+                    let w = tumbling_window(t, size_nanos);
+                    if window_is_closed(w.end, allowed_lateness_nanos, watermark) {
+                        push_late_record(ctx, name, record, *row_num, w)?;
+                        continue;
+                    }
+                    add_to_window(
+                        ctx,
+                        name,
+                        record,
+                        *row_num,
+                        w.start,
+                        &mut per_window,
+                        &make_stream,
+                        &mut out_rows,
+                    )?;
+                }
+                Ok(())
+            })?;
+            finalize_windows(ctx, name, per_window, &mut out_rows, &output_schema, input)?;
+        }
+        TimeWindowSpec::Hopping { size, slide } => {
+            let size_nanos = duration_to_nanos(*size);
+            let slide_nanos = duration_to_nanos(*slide);
+            if size_nanos <= 0 || slide_nanos <= 0 {
+                return Err(PipelineError::Internal {
+                    op: "time-windowed-aggregation",
+                    node: name.to_string(),
+                    detail: "hopping window size and slide must both be > 0".to_string(),
+                });
+            }
+            let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
+            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                for (record, row_num) in input {
+                    let Some(t) = record_event_time_nanos(record) else {
+                        continue;
+                    };
+                    let windows = hopping_windows(t, size_nanos, slide_nanos);
+                    for w in windows {
+                        if window_is_closed(w.end, allowed_lateness_nanos, watermark) {
+                            push_late_record(ctx, name, record, *row_num, w)?;
+                            continue;
+                        }
+                        add_to_window(
+                            ctx,
+                            name,
+                            record,
+                            *row_num,
+                            w.start,
+                            &mut per_window,
+                            &make_stream,
+                            &mut out_rows,
+                        )?;
+                    }
+                }
+                Ok(())
+            })?;
+            finalize_windows(ctx, name, per_window, &mut out_rows, &output_schema, input)?;
+        }
+        TimeWindowSpec::Session { gap } => {
+            let gap_nanos = duration_to_nanos(*gap);
+            if gap_nanos <= 0 {
+                return Err(PipelineError::Internal {
+                    op: "time-windowed-aggregation",
+                    node: name.to_string(),
+                    detail: "session window gap must be > 0".to_string(),
+                });
+            }
+            // First pass: extract (group_key, event_time, record_idx) for
+            // every input record. Records with no `$source.event_time`
+            // are skipped — session assignment requires a per-record
+            // event-time anchor.
+            let mut by_key: HashMap<Vec<GroupByKey>, Vec<(usize, i64)>> = HashMap::new();
+            for (i, (record, row_num)) in input.iter().enumerate() {
+                let Some(t) = record_event_time_nanos(record) else {
+                    continue;
+                };
+                let key = compute_group_key(record, *row_num)?;
+                by_key.entry(key).or_default().push((i, t));
+            }
+            // Second pass: per group, sort by event-time, partition
+            // into sessions, route records to per-(group, session) stream.
+            // Bucketing the AggregateStream by (group_key, session_idx)
+            // separates session emits without changing the underlying
+            // HashAggregator's group-by contract.
+            type SessionStreamKey = (Vec<GroupByKey>, usize);
+            let mut session_streams: HashMap<SessionStreamKey, AggregateStream> = HashMap::new();
+            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                for (key, mut indexed_times) in by_key {
+                    indexed_times.sort_by_key(|(_, t)| *t);
+                    let sorted_times: Vec<i64> = indexed_times.iter().map(|(_, t)| *t).collect();
+                    let (assignments, sessions) = partition_into_sessions(&sorted_times, gap_nanos);
+                    for ((record_idx, _t), session_idx) in
+                        indexed_times.iter().zip(assignments.iter())
+                    {
+                        let session = &sessions[*session_idx];
+                        if session_is_closed(session, gap_nanos, allowed_lateness_nanos, watermark)
+                        {
+                            let bounds = WindowBounds {
+                                start: session.start,
+                                end: session.last_event_time.saturating_add(gap_nanos),
+                            };
+                            let (rec, rn) = &input[*record_idx];
+                            push_late_record(ctx, name, rec, *rn, bounds)?;
+                            continue;
+                        }
+                        let stream_key = (key.clone(), *session_idx);
+                        let entry = session_streams.entry(stream_key);
+                        let stream = match entry {
+                            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                let fresh = make_stream(ctx)?;
+                                v.insert(fresh)
+                            }
+                        };
+                        let (rec, rn) = &input[*record_idx];
+                        let source_file_arc = source_file_arc_of(rec);
+                        let source_name_arc = source_name_arc_of(rec);
+                        let eval_ctx = EvalContext {
+                            stable: ctx.stable,
+                            source_file: &source_file_arc,
+                            source_row: *rn,
+                            source_path: &source_file_arc,
+                            source_count: ctx.source_count,
+                            source_batch: ctx.source_batch_arc,
+                            ingestion_timestamp: ctx.source_ingestion_timestamp,
+                            source_name: &source_name_arc,
+                        };
+                        let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
+                        if add_result.is_ok() {
+                            advance_cursor(ctx, &source_name_arc, *rn);
+                        }
+                        if let Err(e) = add_result {
+                            handle_aggregate_add_error(ctx, name, rec, *rn, e)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            // Finalize every (group, session) stream. Walk in
+            // deterministic order (sorted by (group_key, session_idx))
+            // so emit order is stable across runs.
+            let mut entries: Vec<(SessionStreamKey, AggregateStream)> =
+                session_streams.into_iter().collect();
+            // `GroupByKey` does not implement `Ord`; fall back to a
+            // Debug-formatted key for deterministic finalize order
+            // across runs. The session_idx breaks ties for the same
+            // group key.
+            entries.sort_by(|a, b| {
+                let ka: Vec<String> = a.0.0.iter().map(|k| format!("{k:?}")).collect();
+                let kb: Vec<String> = b.0.0.iter().map(|k| format!("{k:?}")).collect();
+                ka.cmp(&kb).then(a.0.1.cmp(&b.0.1))
+            });
+            let finalize_ctx = EvalContext {
+                stable: ctx.stable,
+                source_file: &MERGED_SOURCE_FILE,
+                source_row: 0,
+                source_path: &MERGED_SOURCE_FILE,
+                source_count: ctx.source_count,
+                source_batch: ctx.source_batch_arc,
+                ingestion_timestamp: ctx.source_ingestion_timestamp,
+                source_name: &MERGED_SOURCE_NAME,
+            };
+            for (_, stream) in entries {
+                match stream.finalize(&finalize_ctx, &mut out_rows) {
+                    Ok(()) => {}
+                    Err(HashAggError::Accumulator {
+                        transform,
+                        binding,
+                        source,
+                    }) => match ctx.config.error_handling.strategy {
+                        ErrorStrategy::FailFast => {
+                            return Err(PipelineError::Accumulator {
+                                transform,
+                                binding,
+                                source,
+                            });
+                        }
+                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                            emit_aggregate_finalize_dlq(
+                                ctx,
+                                name,
+                                input,
+                                &output_schema,
+                                &transform,
+                                &binding,
+                                &source,
+                            )?;
+                        }
+                    },
+                    Err(other) => return Err(other.into()),
+                }
+            }
+        }
+    }
+
+    Ok(out_rows)
+}
+
+/// Route a per-window add for tumbling/hopping. Wraps
+/// `AggregateStream::add_record` with the existing per-record DLQ /
+/// failfast policy.
+#[allow(clippy::too_many_arguments)]
+fn add_to_window<F>(
+    ctx: &mut ExecutorContext<'_>,
+    name: &str,
+    record: &Record,
+    row_num: u64,
+    window_start: i64,
+    per_window: &mut std::collections::HashMap<i64, crate::aggregation::AggregateStream>,
+    make_stream: &F,
+    out_rows: &mut Vec<crate::aggregation::SortRow>,
+) -> Result<(), PipelineError>
+where
+    F: Fn(&ExecutorContext<'_>) -> Result<crate::aggregation::AggregateStream, PipelineError>,
+{
+    let source_file_arc = source_file_arc_of(record);
+    let source_name_arc = source_name_arc_of(record);
+    let eval_ctx = EvalContext {
+        stable: ctx.stable,
+        source_file: &source_file_arc,
+        source_row: row_num,
+        source_path: &source_file_arc,
+        source_count: ctx.source_count,
+        source_batch: ctx.source_batch_arc,
+        ingestion_timestamp: ctx.source_ingestion_timestamp,
+        source_name: &source_name_arc,
+    };
+    let stream = match per_window.entry(window_start) {
+        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            let fresh = make_stream(ctx)?;
+            v.insert(fresh)
+        }
+    };
+    let add_result = stream.add_record(record, row_num, &eval_ctx, out_rows);
+    if add_result.is_ok() {
+        advance_cursor(ctx, &source_name_arc, row_num);
+        return Ok(());
+    }
+    let e = add_result.err().unwrap();
+    handle_aggregate_add_error(ctx, name, record, row_num, e)
+}
+
+/// Shared per-record `add_record` error handler for both
+/// tumbling/hopping and session arms. Mirrors the positional
+/// aggregate arm's error-strategy switch.
+fn handle_aggregate_add_error(
+    ctx: &mut ExecutorContext<'_>,
+    name: &str,
+    record: &Record,
+    row_num: u64,
+    e: crate::aggregation::HashAggError,
+) -> Result<(), PipelineError> {
+    match ctx.config.error_handling.strategy {
+        ErrorStrategy::FailFast => Err(e.into()),
+        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+            let stage = Some(crate::dlq::stage_aggregate(name));
+            let routed = record_error_to_buffer_if_grouped(
+                ctx,
+                record,
+                row_num,
+                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                format!("aggregate {name}: {e}"),
+                stage.clone(),
+                None,
+            );
+            if !routed {
+                let source_name = source_name_arc_of(record);
+                push_dlq(
+                    ctx,
+                    DlqEntry {
+                        source_row: row_num,
+                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                        error_message: format!("aggregate {name}: {e}"),
+                        original_record: record.clone(),
+                        stage,
+                        route: None,
+                        trigger: true,
+                        source_name,
+                        triggering_field: None,
+                        triggering_value: None,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Finalize every per-window aggregator after the per-record walk.
+/// Walks windows in ascending `window_start` order for deterministic
+/// emit ordering. Accumulator failures route to the DLQ as
+/// `AggregateFinalize`, mirroring the positional aggregate arm.
+fn finalize_windows(
+    ctx: &mut ExecutorContext<'_>,
+    name: &str,
+    per_window: std::collections::HashMap<i64, crate::aggregation::AggregateStream>,
+    out_rows: &mut Vec<crate::aggregation::SortRow>,
+    output_schema: &Arc<Schema>,
+    input: &[(Record, u64)],
+) -> Result<(), PipelineError> {
+    use crate::aggregation::HashAggError;
+    let mut entries: Vec<(i64, crate::aggregation::AggregateStream)> =
+        per_window.into_iter().collect();
+    entries.sort_by_key(|(start, _)| *start);
+    let finalize_ctx = EvalContext {
+        stable: ctx.stable,
+        source_file: &MERGED_SOURCE_FILE,
+        source_row: 0,
+        source_path: &MERGED_SOURCE_FILE,
+        source_count: ctx.source_count,
+        source_batch: ctx.source_batch_arc,
+        ingestion_timestamp: ctx.source_ingestion_timestamp,
+        source_name: &MERGED_SOURCE_NAME,
+    };
+    for (_, stream) in entries {
+        match stream.finalize(&finalize_ctx, out_rows) {
+            Ok(()) => {}
+            Err(HashAggError::Accumulator {
+                transform,
+                binding,
+                source,
+            }) => match ctx.config.error_handling.strategy {
+                ErrorStrategy::FailFast => {
+                    return Err(PipelineError::Accumulator {
+                        transform,
+                        binding,
+                        source,
+                    });
+                }
+                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                    emit_aggregate_finalize_dlq(
+                        ctx,
+                        name,
+                        input,
+                        output_schema,
+                        &transform,
+                        &binding,
+                        &source,
+                    )?;
+                }
+            },
+            Err(other) => return Err(other.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Route a late-arriving record to the DLQ as
+/// `DlqErrorCategory::LateRecord`. The error detail carries the
+/// window bounds in nanoseconds so a downstream reader can correlate
+/// each late drop to the specific time bucket that had closed.
+fn push_late_record(
+    ctx: &mut ExecutorContext<'_>,
+    transform: &str,
+    record: &Record,
+    row_num: u64,
+    bounds: crate::executor::time_window::WindowBounds,
+) -> Result<(), PipelineError> {
+    let source_name = source_name_arc_of(record);
+    push_dlq(
+        ctx,
+        DlqEntry {
+            source_row: row_num,
+            category: crate::dlq::DlqErrorCategory::LateRecord,
+            error_message: format!(
+                "time-window {transform}: record at event-time inside window \
+                 [{}, {}) (nanos) which had already closed",
+                bounds.start, bounds.end
+            ),
+            original_record: record.clone(),
+            stage: Some(crate::dlq::stage_time_window(transform)),
+            route: None,
+            trigger: true,
+            source_name,
+            triggering_field: None,
+            triggering_value: None,
+        },
+    )
+}
+
+/// Emit an `AggregateFinalize` DLQ entry for an accumulator failure at
+/// finalize-time. Shared by tumbling/hopping `finalize_windows` and
+/// the session arm; mirrors the positional aggregate arm's
+/// synthetic-record fallback when input is empty.
+fn emit_aggregate_finalize_dlq(
+    ctx: &mut ExecutorContext<'_>,
+    name: &str,
+    input: &[(Record, u64)],
+    output_schema: &Arc<Schema>,
+    transform: &str,
+    binding: &str,
+    source: &clinker_record::accumulator::AccumulatorError,
+) -> Result<(), PipelineError> {
+    let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
+        let sn = source_name_arc_of(rec);
+        (rec.clone(), sn)
+    } else {
+        (
+            Record::new(Arc::clone(output_schema), Vec::new()),
+            Arc::from(name),
+        )
+    };
+    push_dlq(
+        ctx,
+        DlqEntry {
+            source_row: 0,
+            category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+            error_message: format!("aggregate {transform}.{binding}: {source:?}"),
+            original_record: synthetic,
+            stage: Some(crate::dlq::stage_aggregate(name)),
+            route: None,
+            trigger: true,
+            source_name,
+            triggering_field: None,
+            triggering_value: None,
+        },
+    )
 }

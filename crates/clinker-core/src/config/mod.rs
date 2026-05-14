@@ -1279,6 +1279,21 @@ pub struct AggregateConfig {
     /// `select_aggregation_strategies` post-pass in 16.4.9.
     #[serde(default)]
     pub strategy: AggregateStrategyHint,
+    /// Event-time window declaration. When `Some`, the aggregate
+    /// dispatch arm routes through the time-windowed path: each record
+    /// is assigned to its window(s) by `$source.event_time`, per-(key,
+    /// window) state accumulates independently, and emission gates on
+    /// `min_across_sources >= window_end + allowed_lateness`. Mirrors
+    /// `AggregateBody.time_window`. `None` (default) keeps today's
+    /// positional aggregate semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<crate::config::pipeline_node::TimeWindowSpec>,
+    /// Operator-side late-record tolerance for the time-windowed path.
+    /// Records arriving at a window after
+    /// `min_across_sources >= window_end + allowed_lateness` route to
+    /// the DLQ as `LateRecord`. Ignored when `time_window` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_lateness: Option<std::time::Duration>,
 }
 
 /// User-supplied hint for combine execution strategy.
@@ -3339,6 +3354,8 @@ pub(crate) fn lower_node_to_plan_node(
                 group_by: agg_body.group_by.clone(),
                 cxl: agg_body.cxl.source.as_str().to_string(),
                 strategy: agg_body.strategy,
+                time_window: agg_body.time_window.clone(),
+                allowed_lateness: agg_body.allowed_lateness,
             };
             // `typed.field_types` is keyed and ordered by `bind_schema`'s
             // upstream `Row`, so iterating its keys yields the live

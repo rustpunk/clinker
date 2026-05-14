@@ -5,6 +5,7 @@ pub(crate) mod commit;
 pub(crate) mod dispatch;
 mod schema_check;
 pub(crate) mod source_stream;
+pub(crate) mod time_window;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
@@ -145,6 +146,8 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         group_by: body.group_by.clone(),
                         cxl: body.cxl.as_ref().to_string(),
                         strategy: body.strategy,
+                        time_window: body.time_window.clone(),
+                        allowed_lateness: body.allowed_lateness,
                     }),
                     local_window: None,
                     route: None,
