@@ -27,20 +27,6 @@ $ cxl eval -e 'emit name = $pipeline.name' \
 }
 ```
 
-### Per-record provenance
-
-| Variable | Type | Description |
-|----------|------|-------------|
-| `$pipeline.source_file` | String | Path of the source file for the current record |
-| `$pipeline.source_row` | Int | Row number within the source file |
-
-These change per record, tracking where each record originated. Useful for diagnostics and auditing.
-
-```
-emit meta audit_source = $pipeline.source_file
-emit meta audit_row = $pipeline.source_row
-```
-
 ### Counters
 
 | Variable | Type | Description |
@@ -54,6 +40,35 @@ emit meta audit_row = $pipeline.source_row
 ```
 trace info if $pipeline.total_count % 10000 == 0 then "processed " + $pipeline.total_count.to_string() + " records"
 ```
+
+## $source.* -- Per-record source lineage
+
+`$source.*` exposes engine-stamped columns that travel with every
+record from its origin Source node downstream through merges,
+combines, and transforms. They identify *where the record came
+from* and *when in event-time it happened*. All three columns are
+filtered out of default Output projections — reference them
+explicitly with `emit` if you need them in your output schema.
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `$source.file` | String | Path of the input file the current record was read from. |
+| `$source.name` | String | Name of the Source node that produced the current record. Survives through `merge` / `combine` so downstream nodes can branch on origin. |
+| `$source.event_time` | DateTime | Engine-stamped event time, delay-corrected by the source's `watermark.delay`. `Null` when the source has no `watermark:` block, or when the per-record value did not parse. |
+
+```
+filter $source.name == "src_web"
+emit origin = $source.name
+emit ingest_file = $source.file
+emit ts = $source.event_time
+```
+
+`$source.event_time` is the column a
+[time-windowed aggregate](../pipeline/aggregate.md#time-windowed-aggregates)
+reads to assign records to windows. It is only populated for
+records from a source that declares
+[`watermark:`](../pipeline/source.md#watermarks) — otherwise it
+holds `Null`.
 
 ## $vars.* -- User-defined variables
 
@@ -151,7 +166,7 @@ pipeline:
         emit tax = amount * $vars.tax_rate
         emit total = amount * (1 - discount) + tax
         emit processed_at = now
-        emit meta source_row = $pipeline.source_row
+        emit meta source_file = $source.file
         emit pipeline_run = $pipeline.execution_id
 
     - name: output
