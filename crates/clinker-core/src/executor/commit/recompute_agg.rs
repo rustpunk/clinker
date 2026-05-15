@@ -140,6 +140,8 @@ pub(crate) fn emit_post_recompute(
 ) -> Result<usize, HashAggError> {
     use cxl::eval::EvalContext;
 
+    let merged_source_count =
+        ctx.source_count_by_name(&crate::executor::dispatch::MERGED_SOURCE_NAME);
     let retained = ctx
         .relaxed_aggregator_states
         .get_mut(&agg_idx)
@@ -150,7 +152,7 @@ pub(crate) fn emit_post_recompute(
         source_file: &crate::executor::dispatch::MERGED_SOURCE_FILE,
         source_row: 0,
         source_path: &crate::executor::dispatch::MERGED_SOURCE_FILE,
-        source_count: ctx.source_count,
+        source_count: merged_source_count,
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &crate::executor::dispatch::MERGED_SOURCE_NAME,

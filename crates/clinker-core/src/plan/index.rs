@@ -15,21 +15,19 @@ use crate::config::SortField;
 
 /// Where a window's secondary index is rooted in the execution plan.
 ///
-/// A windowed transform's arena+index pair is materialized from the rows
-/// of some upstream operator. Today's source-rooted geometry is one
-/// degenerate case; post-aggregate / post-combine / post-transform
-/// windows are rooted at the upstream operator's emit buffer instead.
+/// A windowed transform's arena+index pair is materialized from the
+/// rows of some upstream operator. Every window — including one whose
+/// immediate ancestor is a Source — anchors at that operator's
+/// `NodeIndex`; the arena builds at the upstream operator's
+/// dispatch-arm exit through `finalize_node_rooted_windows`.
 ///
-/// The `Arc<Schema>` carried by the `Node` and `ParentNode` variants is
-/// the upstream operator's `output_schema` at lowering time. It is
-/// **not** part of equality / hashing — only `upstream: NodeIndex` is.
-/// Two `IndexSpec`s with the same `upstream` always carry the same
+/// The `Arc<Schema>` carried by both variants is the upstream
+/// operator's `output_schema` at lowering time. It is **not** part of
+/// equality / hashing — only `upstream: NodeIndex` is. Two
+/// `IndexSpec`s with the same `upstream` always carry the same
 /// `Arc<Schema>` instance from that upstream node, so dedup keyed on
 /// `upstream` alone is correct.
 pub enum PlanIndexRoot {
-    /// Source-rooted: arena built from the named source's record stream
-    /// at Phase-0 setup.
-    Source(String),
     /// Node-rooted in the current DAG: arena built at the upstream
     /// operator's dispatch-arm exit from `node_buffers[upstream]`.
     Node {
@@ -49,7 +47,6 @@ pub enum PlanIndexRoot {
 impl Clone for PlanIndexRoot {
     fn clone(&self) -> Self {
         match self {
-            Self::Source(s) => Self::Source(s.clone()),
             Self::Node {
                 upstream,
                 anchor_schema,
@@ -71,7 +68,6 @@ impl Clone for PlanIndexRoot {
 impl std::fmt::Debug for PlanIndexRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Source(name) => f.debug_tuple("Source").field(name).finish(),
             Self::Node { upstream, .. } => f
                 .debug_struct("Node")
                 .field("upstream", upstream)
@@ -87,7 +83,6 @@ impl std::fmt::Debug for PlanIndexRoot {
 impl PartialEq for PlanIndexRoot {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Source(a), Self::Source(b)) => a == b,
             (Self::Node { upstream: a, .. }, Self::Node { upstream: b, .. }) => a == b,
             (Self::ParentNode { upstream: a, .. }, Self::ParentNode { upstream: b, .. }) => a == b,
             _ => false,
@@ -99,14 +94,13 @@ impl Eq for PlanIndexRoot {}
 
 impl Hash for PlanIndexRoot {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Discriminant + payload: Source by string, Node/ParentNode by
-        // upstream NodeIndex. The Arc<Schema> is a side-channel — every
-        // IndexSpec sharing an `upstream` carries the same Arc instance
-        // (it's the upstream operator's output_schema), so excluding it
-        // from the hash key keeps dedup correct.
+        // Discriminant + payload: Node / ParentNode by upstream
+        // NodeIndex. The Arc<Schema> is a side-channel — every
+        // IndexSpec sharing an `upstream` carries the same Arc
+        // instance (it's the upstream operator's output_schema), so
+        // excluding it from the hash key keeps dedup correct.
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Source(name) => name.hash(state),
             Self::Node { upstream, .. } | Self::ParentNode { upstream, .. } => upstream.hash(state),
         }
     }
@@ -241,34 +235,16 @@ pub struct RawIndexRequest {
 }
 
 /// Collect the union of arena_fields across all IndexSpecs rooted at a
-/// given source. Used by source-arena materialization paths
-/// (`pipeline/ingestion.rs`, `executor/mod.rs`'s Phase-0 build).
-pub fn collect_arena_fields_for_source(indices: &[IndexSpec], source: &str) -> Vec<String> {
-    let mut fields = HashSet::new();
-    for spec in indices {
-        if let PlanIndexRoot::Source(name) = &spec.root
-            && name == source
-        {
-            for f in &spec.arena_fields {
-                fields.insert(f.clone());
-            }
-        }
-    }
-    let mut result: Vec<String> = fields.into_iter().collect();
-    result.sort(); // deterministic order
-    result
-}
-
-/// Collect the union of arena_fields across all IndexSpecs rooted at a
 /// given upstream node. Used by node-rooted arena materialization at
-/// the upstream operator's dispatch-arm exit.
+/// the upstream operator's dispatch-arm exit — including Source
+/// dispatch arms, whose emit-time finalize anchors windows that
+/// previously root at `PlanIndexRoot::Source`.
 pub fn collect_arena_fields_for_node(indices: &[IndexSpec], upstream: NodeIndex) -> Vec<String> {
     let mut fields = HashSet::new();
     for spec in indices {
         let matches = match &spec.root {
             PlanIndexRoot::Node { upstream: u, .. } => *u == upstream,
             PlanIndexRoot::ParentNode { upstream: u, .. } => *u == upstream,
-            PlanIndexRoot::Source(_) => false,
         };
         if matches {
             for f in &spec.arena_fields {

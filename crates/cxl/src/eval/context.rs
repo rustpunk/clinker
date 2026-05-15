@@ -203,9 +203,16 @@ pub struct EvalContext<'a> {
     /// Equal to `source_file` today; distinct from a future
     /// `$source.file_label` (shortest-unique-suffix display label).
     pub source_path: &'a Arc<str>,
-    /// `$source.count` — total records ingested from this source. Stable
-    /// across all records from the same source within a run.
-    pub source_count: u64,
+    /// `$source.count` — final per-source record count.
+    ///
+    /// `Some(n)` for records emitted **after** the source's input stream
+    /// closes (terminal aggregate emits, commit-time deferred dispatch,
+    /// post-recompute paths). `None` for records emitted mid-stream — the
+    /// total cannot be known before the upstream `mpsc::Receiver` returns
+    /// `None`, so `$source.count` resolves to `Null` for those records.
+    /// Per-source: the value is the final count for THIS record's
+    /// originating source, not a pipeline-wide total.
+    pub source_count: Option<u64>,
     /// `$source.batch` — per-source-run identifier (UUID v7 by default).
     /// Distinct from `pipeline.batch_id` which is per-pipeline-run.
     pub source_batch: &'a Arc<str>,
@@ -234,7 +241,10 @@ impl<'a> EvalContext<'a> {
             "file" => Some(Value::String(self.source_file.to_string().into())),
             "row" => Some(Value::Integer(self.source_row as i64)),
             "path" => Some(Value::String(self.source_path.to_string().into())),
-            "count" => Some(Value::Integer(self.source_count as i64)),
+            "count" => Some(
+                self.source_count
+                    .map_or(Value::Null, |n| Value::Integer(n as i64)),
+            ),
             "batch" => Some(Value::String(self.source_batch.to_string().into())),
             "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
             "name" => Some(Value::String(self.source_name.to_string().into())),
@@ -254,7 +264,7 @@ impl<'a> EvalContext<'a> {
             source_file: test_default_source_file(),
             source_row: 1,
             source_path: test_default_source_file(),
-            source_count: 0,
+            source_count: None,
             source_batch: test_default_source_batch(),
             ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
                 .unwrap()
@@ -279,7 +289,7 @@ impl<'a> EvalContext<'a> {
             source_file,
             source_row,
             source_path: source_file,
-            source_count: 0,
+            source_count: None,
             source_batch: test_default_source_batch(),
             ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
                 .unwrap()
@@ -432,7 +442,7 @@ mod tests {
             source_file: file,
             source_row: row,
             source_path: file,
-            source_count: 100,
+            source_count: Some(100),
             source_batch: batch,
             ingestion_timestamp: chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
                 .unwrap()
@@ -487,6 +497,18 @@ mod tests {
             other => panic!("expected String, got {:?}", other),
         }
         assert!(ctx.resolve_source("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_source_count_none_resolves_to_null() {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("data/x.csv");
+        let batch: Arc<str> = Arc::from("b");
+        let mut ctx = make_ctx(&stable, &file, &batch, 1);
+        ctx.source_count = None;
+        assert_eq!(ctx.resolve_source("count"), Some(Value::Null));
+        ctx.source_count = Some(42);
+        assert_eq!(ctx.resolve_source("count"), Some(Value::Integer(42)));
     }
 
     #[test]

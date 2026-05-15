@@ -533,6 +533,7 @@ nodes:
     type: csv
     schema:
       - { name: amount, type: float }
+      - { name: dept, type: string }
 
 - type: transform
   name: agg

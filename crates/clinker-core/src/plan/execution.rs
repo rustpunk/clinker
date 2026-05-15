@@ -1982,11 +1982,12 @@ impl ExecutionPlanDag {
 }
 
 /// Render a [`PlanIndexRoot`] for `--explain` output. Source-rooted
-/// indices show as `source(<name>)`, node-rooted as `node(<idx>)`,
-/// parent-node-rooted as `parent_node(<idx>)`.
+/// Node-rooted indices show as `node(<idx>)`, parent-node-rooted as
+/// `parent_node(<idx>)`. Windows whose upstream is a Source render
+/// as `node(<source_node_idx>)` — there is no separate
+/// source-rooted category at runtime.
 fn format_index_root(root: &crate::plan::index::PlanIndexRoot) -> String {
     match root {
-        crate::plan::index::PlanIndexRoot::Source(name) => format!("source({name})"),
         crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
             format!("node({})", upstream.index())
         }
@@ -2874,7 +2875,10 @@ pub(crate) fn resolve_composition_body_windows(
             // Classify the rooting:
             // - Body Source whose name matches a port → ParentNode.
             // - Body Source not a port (declared inside body) →
-            //   Source(name).
+            //   Node{ body_source_idx, .. } anchored at the body's
+            //   own Source NodeIndex (the body's Source dispatch arm
+            //   populates the slot at its emit, the same way every
+            //   top-level Source-anchored window now does).
             // - Other body operator → Node{ body_upstream, .. }.
             let root: PlanIndexRoot = match rooted_node {
                 PlanNode::Source { name, .. } => {
@@ -2903,8 +2907,25 @@ pub(crate) fn resolve_composition_body_windows(
                             anchor_schema,
                         }
                     } else {
-                        // Body-declared Source — rare but legal.
-                        PlanIndexRoot::Source(name.clone())
+                        // Body-declared Source — rare but legal. Anchor
+                        // at the body Source's NodeIndex; its dispatch
+                        // arm finalizes the arena at emit.
+                        let Some(anchor_schema) = rooted_node.stored_output_schema().cloned()
+                        else {
+                            diags.push(Diagnostic::error(
+                                "E003",
+                                format!(
+                                    "composition body windowed transform {transform_name:?} \
+                                     rooted at body Source {name:?} which has no output schema"
+                                ),
+                                LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                            ));
+                            continue;
+                        };
+                        PlanIndexRoot::Node {
+                            upstream: rooted_idx,
+                            anchor_schema,
+                        }
                     }
                 }
                 PlanNode::Merge { .. } => {
@@ -4543,17 +4564,6 @@ pub(crate) fn extract_has_distinct(typed: &TypedProgram) -> bool {
         .statements
         .iter()
         .any(|s| matches!(s, Statement::Distinct { .. }))
-}
-
-/// Check if a source's declared sort_order matches the window's sort_by.
-pub(crate) fn check_already_sorted(
-    _sources: &[SourceConfig],
-    _source: &str,
-    _sort_by: &[SortField],
-) -> bool {
-    // SourceConfig doesn't have sort_order yet (to be added in Task 5.4.1)
-    // For now, always return false — runtime pre-sorted detection is the fallback
-    false
 }
 
 /// Errors from execution plan compilation.

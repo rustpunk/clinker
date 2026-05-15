@@ -402,10 +402,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// (per-source attribution is sub-issue #54). Distinct from
     /// `pipeline.batch_id`.
     pub(crate) source_batch_arc: &'a Arc<str>,
-    /// Backing storage for `$source.count` — the total record count
-    /// ingested across every declared Source. Set after the unified
-    /// ingest pass completes.
-    pub(crate) source_count: u64,
+    /// Per-source finalized record count, keyed by Source node name.
+    /// `Some(n)` once the Source's `mpsc::Receiver` has returned `None`
+    /// — i.e. the upstream ingest task closed its sender and we know
+    /// the total. `None` while the source is still streaming.
+    ///
+    /// The `$source.count` evaluator reads this through
+    /// [`Self::source_count_for`], which resolves the right per-source
+    /// slot from a record's engine-stamped `$source.name`. Mid-stream
+    /// reads resolve to `Value::Null` (defer-emit semantics — see
+    /// `EvalContext.source_count` docs); finalized reads (terminal
+    /// aggregate emits, commit-time deferred dispatch, post-recompute
+    /// paths) resolve to the per-source total.
+    pub(crate) source_count_per_source: HashMap<Arc<str>, Option<u64>>,
     /// Backing storage for `$source.ingestion_timestamp` — wall-clock
     /// time when the pipeline run began.
     pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
@@ -423,6 +432,47 @@ pub(crate) struct ExecutorContext<'a> {
     /// entry at the Source arm surfaces as a defense-in-depth Internal
     /// error.
     pub(crate) source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+    /// Source-node names whose receivers have been moved out of
+    /// `source_records` by a downstream Merge.interleave fusion. The
+    /// Source dispatch arm checks this set at entry and returns
+    /// cleanly without consuming when its name is present — the fused
+    /// Merge arm is now the sole consumer of those records. Empty for
+    /// pipelines whose Merge predecessors are not all Sources, or
+    /// whose Merge mode is concat (concat keeps today's
+    /// declaration-order drain through the Source arms).
+    pub(crate) fused_sources: HashSet<String>,
+    /// Pipeline-wide `$record.<key>` default seed: declared
+    /// `declares: scope: record` defaults plus channel
+    /// `record_vars:` overrides. Borrowed by the Source dispatch
+    /// arm and applied per record via
+    /// [`clinker_record::Record::seed_record_vars`] at canonicalize
+    /// time. Empty when no record-scope variables are declared.
+    pub(crate) record_var_seed: &'a indexmap::IndexMap<String, Value>,
+    /// Source-scope variable defaults from
+    /// `declares: scope: source` Transforms. Seeded into
+    /// [`StableEvalContext::source_vars`] at first observation of
+    /// each `(source, file)` Arc by the Source dispatch arm.
+    pub(crate) declared_source_defaults: &'a indexmap::IndexMap<String, Value>,
+    /// Per-channel source-scope variable overrides. Layered atop
+    /// [`Self::declared_source_defaults`] when the Source arm seeds
+    /// the per-`(source, file)` slot. Outer key is the source-node
+    /// name; inner map is the channel's `$source.<key>` overrides
+    /// for that source.
+    pub(crate) channel_source_vars:
+        &'a indexmap::IndexMap<String, indexmap::IndexMap<String, Value>>,
+    /// Per-source idle-timeout durations derived from
+    /// `SourceConfig.watermark.idle_timeout`. The Source dispatch
+    /// arm wraps its `rx.recv().await` in `tokio::time::timeout`
+    /// when its source name is present; absent entries fall back to
+    /// unbounded `rx.recv().await`.
+    pub(crate) idle_timeouts: &'a HashMap<String, std::time::Duration>,
+    /// Per-source set of `(file_arc)` slots whose source-scope vars
+    /// have already been seeded into `stable.source_vars`. The
+    /// Source dispatch arm consults this map per record; the first
+    /// observation of a new file Arc grabs the stable context's
+    /// write lock and seeds; subsequent records skip the lock. Outer
+    /// key is the source-node name.
+    pub(crate) source_vars_seeded_files: HashMap<String, HashSet<Arc<str>>>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     /// Per-source-file writers for outputs marked `fan_out_per_source_file`
     /// in the plan. Outer key is the output name; inner key is the
@@ -670,6 +720,43 @@ impl ExecutorContext<'_> {
     /// drained.
     pub(crate) fn spill_root(&self) -> &Arc<tempfile::TempDir> {
         &self.spill_root
+    }
+
+    /// Resolve `$source.count` by explicit source name. Used by
+    /// finalize sites that don't have a per-record source attribution
+    /// — they pass [`MERGED_SOURCE_NAME`], whose slot is stamped with
+    /// the pipeline-wide total once every per-source slot is `Some`.
+    pub(crate) fn source_count_by_name(&self, name: &Arc<str>) -> Option<u64> {
+        self.source_count_per_source.get(name).copied().flatten()
+    }
+
+    /// Stamp the per-source finalized count for `source_name` and, if
+    /// every per-source slot is now populated, derive and stamp the
+    /// pipeline-wide total under [`MERGED_SOURCE_NAME`]. Called by the
+    /// Source dispatch arm (and the Merge.interleave fusion arm) when
+    /// a source's `mpsc::Receiver` returns `None`.
+    pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
+        self.source_count_per_source
+            .insert(Arc::clone(source_name), Some(count));
+        // Pre-seeded slots track every declared source. When none
+        // remain `None` (excluding the MERGED slot itself, which we
+        // are about to write), compute the cross-source total.
+        let merged_key: &Arc<str> = &MERGED_SOURCE_NAME;
+        let all_closed = self
+            .source_count_per_source
+            .iter()
+            .filter(|(k, _)| !Arc::ptr_eq(k, merged_key))
+            .all(|(_, v)| v.is_some());
+        if all_closed {
+            let total: u64 = self
+                .source_count_per_source
+                .iter()
+                .filter(|(k, _)| !Arc::ptr_eq(k, merged_key))
+                .map(|(_, v)| v.unwrap_or(0))
+                .sum();
+            self.source_count_per_source
+                .insert(Arc::clone(merged_key), Some(total));
+        }
     }
 }
 
@@ -929,6 +1016,143 @@ pub(crate) fn charge_harvest_admission(
     Ok(())
 }
 
+/// Build the engine-stamped tail mapping for a Source's plan-time
+/// target schema: `(target_index, source_field_name)` per
+/// `$ck.<field>` shadow column. Resolved once per Source so the
+/// per-record canonicalize call does a single name-to-index lookup
+/// against the reader schema instead of re-scanning the target's
+/// `field_metadata` every record.
+///
+/// Aggregate-emitted synthetic CK columns are stamped at aggregate
+/// finalize, not at source ingest. The `$widened` sidecar is filled
+/// by `CoercingReader` from input-record keys, not by name-based
+/// mapping from the reader. `$source.file` and `$source.name` are
+/// stamped at ingest into the record's value vector directly, so
+/// they flow through canonicalize via the per-name copy loop in
+/// `canonicalize_to_source_schema` rather than this engine-stamp
+/// tail.
+pub(crate) fn build_engine_stamped_tail(target: &Arc<Schema>) -> Vec<(usize, Box<str>)> {
+    (0..target.column_count())
+        .filter_map(|i| match target.field_metadata(i) {
+            Some(clinker_record::FieldMetadata::SourceCorrelation { source_field }) => {
+                Some((i, source_field.clone()))
+            }
+            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
+            | Some(clinker_record::FieldMetadata::WidenedSidecar)
+            | Some(clinker_record::FieldMetadata::SourceFile)
+            | Some(clinker_record::FieldMetadata::SourceName)
+            | Some(clinker_record::FieldMetadata::SourceEventTime)
+            | None => None,
+        })
+        .collect()
+}
+
+/// Canonicalize a record produced by an ingest reader (or a body-
+/// port seeded record) onto a Source's plan-time `Arc<Schema>` so
+/// every downstream operator hits the `Arc::ptr_eq` fast path on the
+/// first record. Used by both the legacy Source dispatch arm and the
+/// `Merge.interleave` fusion that consumes Source receivers directly.
+///
+/// Build target-positional values by name lookup from the reader's
+/// record. Admits both narrower readers (extra target slots are
+/// engine-stamped — `$ck.<field>` filled by the snapshot stamp loop;
+/// `$widened` left `Null` when absent on the reader) and wider
+/// readers (e.g. composition-body port-sources whose port schema is
+/// a subset of the parent producer's auto_widen-extended schema —
+/// sidecar columns the body never declared simply do not get copied
+/// through).
+///
+/// The integrity contract: every user-declared column on the target
+/// appears under the same name on the reader, OR the target column
+/// is engine-stamped (filled here) or `$widened` (copied if reader
+/// has it, `Null` otherwise).
+pub(crate) fn canonicalize_to_source_schema(
+    r: &Record,
+    target: &Arc<Schema>,
+    engine_stamped: &[(usize, Box<str>)],
+) -> Record {
+    if Arc::ptr_eq(r.schema(), target) {
+        return r.clone();
+    }
+    let reader = r.schema();
+    let reader_vals = r.values();
+    let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
+    for (target_idx, target_name) in target.columns().iter().enumerate() {
+        if let Some(src_idx) = reader.index(target_name) {
+            values.push(reader_vals[src_idx].clone());
+        } else {
+            debug_assert!(
+                target.field_metadata(target_idx).is_some(),
+                "target column {target_name:?} absent on reader and \
+                 not engine-stamped — reader: {:?}, target: {:?}",
+                reader.columns(),
+                target.columns(),
+            );
+            values.push(Value::Null);
+        }
+    }
+    // Stamp the engine-stamped CK tail at ingest: each
+    // `$ck.<field>` slot captures the user-declared field's value
+    // here, before any downstream Transform can rewrite it. Frozen-
+    // identity semantics flow through the schema column for the
+    // rest of the DAG.
+    for (target_idx, source_field) in engine_stamped {
+        if let Some(src_idx) = reader.index(source_field) {
+            values[*target_idx] = reader_vals[src_idx].clone();
+        }
+    }
+    Record::new(Arc::clone(target), values)
+}
+
+/// Seed declared and channel-supplied `$source.<key>` defaults for
+/// the `(source, file_arc)` slot of this record. First observation
+/// of a new file Arc grabs the stable context's write lock and
+/// seeds; subsequent records skip the lock via the per-source
+/// `source_vars_seeded_files` set.
+///
+/// Errors propagate as `PipelineError::Internal` if the stable
+/// context's `RwLock` is poisoned — non-recoverable.
+pub(crate) fn seed_source_vars_for_record(
+    ctx: &mut ExecutorContext<'_>,
+    source_name: &str,
+    record: &Record,
+) -> Result<(), PipelineError> {
+    if ctx.declared_source_defaults.is_empty() && !ctx.channel_source_vars.contains_key(source_name)
+    {
+        return Ok(());
+    }
+    let Some(file_path) = source_file_path_of(record) else {
+        return Ok(());
+    };
+    let seen = ctx
+        .source_vars_seeded_files
+        .entry(source_name.to_string())
+        .or_default();
+    let file_arc: Arc<str> = Arc::from(file_path);
+    if !seen.insert(Arc::clone(&file_arc)) {
+        return Ok(());
+    }
+    let mut map = ctx
+        .stable
+        .source_vars
+        .write()
+        .map_err(|_| PipelineError::Internal {
+            op: "executor",
+            node: source_name.to_string(),
+            detail: "stable source_vars RwLock poisoned".to_string(),
+        })?;
+    let entry = map.entry(file_arc).or_default();
+    for (k, v) in ctx.declared_source_defaults {
+        entry.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    if let Some(ch) = ctx.channel_source_vars.get(source_name) {
+        for (k, v) in ch {
+            entry.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Build node-rooted window runtimes for every IndexSpec rooted at
 /// `upstream_idx` in the current DAG, after that operator has finalized
 /// its emit buffer. Called from the upstream operator's dispatch arm
@@ -1056,6 +1280,180 @@ pub(crate) fn finalize_node_rooted_windows(
     Ok(())
 }
 
+/// Drive the fused `Merge.mode: interleave` arm when every direct
+/// predecessor is a `PlanNode::Source` whose receiver is parked in
+/// `ctx.source_records`. Takes ownership of each predecessor's
+/// `mpsc::Receiver`, runs a fair `tokio::select!` over them via a
+/// `FuturesUnordered`, applies the same per-record pipeline the
+/// non-fused Source arm runs (canonicalize onto the source's plan-
+/// time schema, seed `$record.<key>` defaults, seed
+/// `$source.<key>` defaults per `(source, file_arc)`, advance the
+/// per-source running counter), and re-canonicalizes each emitted
+/// record onto the Merge's output schema.
+///
+/// Live back-pressure semantic: a slow upstream Source's
+/// `tokio::time::sleep`-gated reader does not delay peer Source
+/// records from being consumed off their bounded `mpsc::channel`.
+/// The select! schedules whichever receiver has a ready record;
+/// the others continue producing into their channels concurrently.
+///
+/// Seeded interleaves (`interleave_seed: Some(n)`) replace the
+/// arrival-driven schedule with a deterministic fastrand-driven
+/// poll order so snapshot tests remain reproducible. Records are
+/// pulled in seed-determined order from whichever receivers have
+/// records available; unseeded variants follow arrival order via
+/// pure `tokio::select!`.
+pub(crate) async fn merge_fused_interleave(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    merge_name: &str,
+    sorted_preds: &[NodeIndex],
+    merge_output_schema: Option<&Arc<Schema>>,
+) -> Result<Vec<(Record, u64)>, PipelineError> {
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    // Per-predecessor state: the source's plan-time schema, its
+    // engine-stamped tail mapping, its `Arc<str>` name (used for
+    // the per-source running counter and the
+    // `source_count_per_source` finalize stamp). Held in
+    // declaration order matching `sorted_preds`.
+    struct PredState {
+        source_name_arc: Arc<str>,
+        source_name_string: String,
+        source_schema: Option<Arc<Schema>>,
+        engine_stamped: Vec<(usize, Box<str>)>,
+    }
+
+    let mut states: Vec<PredState> = Vec::with_capacity(sorted_preds.len());
+    let mut receivers: Vec<Option<tokio::sync::mpsc::Receiver<(Record, u64)>>> =
+        Vec::with_capacity(sorted_preds.len());
+    for pred in sorted_preds {
+        let PlanNode::Source { name, .. } = &current_dag.graph[*pred] else {
+            return Err(PipelineError::Internal {
+                op: "executor",
+                node: merge_name.to_string(),
+                detail: format!(
+                    "fused Merge.interleave reached non-Source predecessor at \
+                     NodeIndex {pred:?} — fusion classifier diverged from runtime",
+                ),
+            });
+        };
+        let rx =
+            ctx.source_records
+                .remove(name.as_str())
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "executor",
+                    node: merge_name.to_string(),
+                    detail: format!(
+                        "fused Merge.interleave: predecessor Source {name:?} has no \
+                     receiver in ctx.source_records — Source arm already consumed it?",
+                    ),
+                })?;
+        let source_schema = current_dag.graph[*pred].stored_output_schema().cloned();
+        let engine_stamped: Vec<(usize, Box<str>)> = source_schema
+            .as_ref()
+            .map(build_engine_stamped_tail)
+            .unwrap_or_default();
+        states.push(PredState {
+            source_name_arc: Arc::from(name.as_str()),
+            source_name_string: name.clone(),
+            source_schema,
+            engine_stamped,
+        });
+        receivers.push(Some(rx));
+    }
+
+    let merge_schema_arc = merge_output_schema.cloned();
+    let has_record_seed = !ctx.record_var_seed.is_empty();
+    let mut merged: Vec<(Record, u64)> = Vec::new();
+    let mut per_source_counts: Vec<u64> = vec![0; receivers.len()];
+    // Round-robin start cursor rotated each iteration so no
+    // predecessor monopolizes the schedule when several are ready.
+    // Seeded interleaves (`interleave_seed: Some(_)`) take the
+    // non-fused path so their fastrand-driven determinism survives;
+    // this fused path runs unseeded only.
+    let mut cursor: usize = 0;
+
+    // Each iteration: poll every active receiver via `poll_recv`,
+    // taking the first ready one. Tokio guarantees `poll_recv`
+    // wakes the task when a sender pushes; combining with
+    // `poll_fn` gives a fair scheduler without dependencies
+    // beyond tokio.
+    loop {
+        let active_count = receivers.iter().filter(|r| r.is_some()).count();
+        if active_count == 0 {
+            break;
+        }
+        let n = receivers.len();
+        let start = {
+            let s = cursor % n;
+            cursor = cursor.wrapping_add(1);
+            s
+        };
+        let polled = poll_fn(|poll_cx| {
+            for offset in 0..n {
+                let i = (start + offset) % n;
+                let Some(rx) = receivers[i].as_mut() else {
+                    continue;
+                };
+                match rx.poll_recv(poll_cx) {
+                    Poll::Ready(item) => return Poll::Ready((i, item)),
+                    Poll::Pending => continue,
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        let (i, item) = polled;
+        match item {
+            Some((record, rn)) => {
+                let state = &states[i];
+                let mut rec = match state.source_schema.as_ref() {
+                    Some(target) => {
+                        canonicalize_to_source_schema(&record, target, &state.engine_stamped)
+                    }
+                    None => record,
+                };
+                if has_record_seed {
+                    rec.seed_record_vars(ctx.record_var_seed);
+                }
+                seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
+                if let Some(slot) = ctx.total_per_source.get_mut(&state.source_name_arc) {
+                    *slot += 1;
+                }
+                per_source_counts[i] += 1;
+                // Re-canonicalize onto the Merge's output schema so
+                // downstream operators hit `Arc::ptr_eq` regardless
+                // of which Source produced the record.
+                if let Some(merge_schema) = merge_schema_arc.as_ref() {
+                    check_input_schema(
+                        merge_schema,
+                        rec.schema(),
+                        merge_name,
+                        "merge",
+                        &state.source_name_string,
+                    )?;
+                    let values = rec.values().to_vec();
+                    rec = Record::new(Arc::clone(merge_schema), values);
+                }
+                merged.push((rec, rn));
+            }
+            None => {
+                // Source closed. Stamp finalized per-source count
+                // and drop the receiver slot so subsequent
+                // iterations skip it.
+                let count = per_source_counts[i];
+                let name_arc = Arc::clone(&states[i].source_name_arc);
+                receivers[i] = None;
+                ctx.finalize_source_count(&name_arc, count);
+            }
+        }
+    }
+
+    Ok(merged)
+}
+
 /// Execute one DAG node by routing it to its arm.
 ///
 /// Reads the node by `node_idx` from `current_dag.graph` and dispatches
@@ -1084,161 +1482,156 @@ pub(crate) async fn dispatch_plan_node(
     let node = current_dag.graph[node_idx].clone();
     match node {
         PlanNode::Source { ref name, .. } => {
-            // Two input paths feed a Source's buffer: (1) records
-            // already seeded into `ctx.node_buffers[node_idx]` by the
-            // body executor at composition entry — composition input
-            // ports surface as synthetic Source nodes in the body
-            // graph, owning the records the parent scope harvested
-            // for that port; (2) the live `mpsc::Receiver` in
-            // `source_records[name]`, drained via `recv().await`
-            // until the paired ingest task drops its sender. A Source
-            // reaching this arm with neither path populated surfaces
-            // as a defense-in-depth `PipelineError::Internal` — silent
-            // fallthrough to a different source's records was the root
-            // cause of #47 and is no longer reachable. Records are
-            // canonicalized onto the Source's plan-time `Arc<Schema>` so every
-            // downstream operator hits the `Arc::ptr_eq` fast path on
-            // the first record. Structural equality holds by
-            // construction: the ingest helper builds its widened
-            // schema from the same declared `schema:` block that
-            // `bind_schema` reads to populate
-            // `PlanNode::Source.output_schema`, and synthetic port
-            // sources adopt their parent source's column list at
-            // bind_composition time so port-bound records canonicalize
-            // cleanly.
+            // Three input paths feed a Source's emit:
+            //
+            // 1. Source name in `ctx.fused_sources` — a downstream
+            //    `Merge.interleave` arm has taken ownership of this
+            //    Source's `mpsc::Receiver` and is consuming records
+            //    directly via `tokio::select!`. This arm returns
+            //    cleanly without emitting; the fused Merge populates
+            //    the merge node's buffer.
+            // 2. Records already seeded into `ctx.node_buffers[node_idx]`
+            //    by the body executor at composition entry —
+            //    composition input ports surface as synthetic Source
+            //    nodes owning the records the parent scope harvested.
+            // 3. The live `mpsc::Receiver` in `source_records[name]`,
+            //    consumed via `recv().await` per record until the
+            //    paired ingest task drops its sender. Per record:
+            //    canonicalize onto the source's plan-time schema,
+            //    seed `$record.<key>` defaults, seed
+            //    `$source.<key>` defaults per `(source, file_arc)`,
+            //    advance the per-source running counter. On
+            //    `recv().await` returning `None`, stamp the
+            //    finalized per-source count and call
+            //    `finalize_node_rooted_windows` so every spec
+            //    rooted at this Source's `NodeIndex` lands its
+            //    arena.
+            //
+            // Records are canonicalized onto the Source's plan-time
+            // `Arc<Schema>` so every downstream operator hits the
+            // `Arc::ptr_eq` fast path on the first record. Structural
+            // equality holds by construction.
+            if ctx.fused_sources.contains(name.as_str()) {
+                return Ok(());
+            }
             let source_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
-            // Precompute the engine-stamped tail mapping for this target:
-            // `(target_index, source_field_name)` per `$ck.<field>` shadow
-            // column. Resolved once per Source so the per-record canonicalize
-            // closure does a single name→index lookup against the reader
-            // schema instead of re-scanning the target's `field_metadata`
-            // every record.
             let engine_stamped: Vec<(usize, Box<str>)> = source_schema
                 .as_ref()
-                .map(|target| {
-                    (0..target.column_count())
-                        .filter_map(|i| match target.field_metadata(i) {
-                            Some(clinker_record::FieldMetadata::SourceCorrelation {
-                                source_field,
-                            }) => Some((i, source_field.clone())),
-                            // Aggregate-emitted synthetic CK columns are
-                            // stamped at aggregate finalize, not at source
-                            // ingest. The `$widened` sidecar is filled by
-                            // CoercingReader from input-record keys, not
-                            // by name-based mapping from the reader.
-                            // `$source.file` and `$source.name` are
-                            // stamped at ingest into the record's value
-                            // vector directly, so they flow through
-                            // canonicalize via the per-name copy loop
-                            // above rather than this engine-stamp tail.
-                            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
-                            | Some(clinker_record::FieldMetadata::WidenedSidecar)
-                            | Some(clinker_record::FieldMetadata::SourceFile)
-                            | Some(clinker_record::FieldMetadata::SourceName)
-                            | Some(clinker_record::FieldMetadata::SourceEventTime)
-                            | None => None,
-                        })
-                        .collect()
-                })
+                .map(build_engine_stamped_tail)
                 .unwrap_or_default();
             let canonicalize = |r: &Record| -> Record {
                 match source_schema.as_ref() {
-                    Some(target) => {
-                        if Arc::ptr_eq(r.schema(), target) {
-                            r.clone()
-                        } else {
-                            // Build target-positional values by name lookup
-                            // from the reader's record. This admits both
-                            // narrower readers (extra target slots are
-                            // engine-stamped — `$ck.<field>` filled by the
-                            // snapshot stamp loop below; `$widened` left
-                            // Null when absent on the reader) and wider
-                            // readers (e.g. composition-body port-sources
-                            // whose port schema is a subset of the parent
-                            // producer's auto_widen-extended schema —
-                            // sidecar columns the body never declared
-                            // simply do not get copied through).
-                            //
-                            // The integrity contract: every user-declared
-                            // column on the target appears under the same
-                            // name on the reader, OR the target column is
-                            // engine-stamped (filled here) or `$widened`
-                            // (copied if reader has it, Null otherwise).
-                            let reader = r.schema();
-                            let reader_vals = r.values();
-                            let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
-                            for (target_idx, target_name) in target.columns().iter().enumerate() {
-                                if let Some(src_idx) = reader.index(target_name) {
-                                    values.push(reader_vals[src_idx].clone());
-                                } else {
-                                    debug_assert!(
-                                        target.field_metadata(target_idx).is_some(),
-                                        "target column {target_name:?} absent on reader and \
-                                         not engine-stamped — reader: {:?}, target: {:?}",
-                                        reader.columns(),
-                                        target.columns(),
-                                    );
-                                    values.push(Value::Null);
-                                }
-                            }
-                            // Stamp the engine-stamped CK tail at ingest:
-                            // each `$ck.<field>` slot captures the user-
-                            // declared field's value here, before any
-                            // downstream Transform can rewrite it. Frozen-
-                            // identity semantics flow through the schema
-                            // column for the rest of the DAG.
-                            for (target_idx, source_field) in &engine_stamped {
-                                if let Some(src_idx) = reader.index(source_field) {
-                                    values[*target_idx] = reader_vals[src_idx].clone();
-                                }
-                            }
-                            Record::new(Arc::clone(target), values)
-                        }
-                    }
+                    Some(target) => canonicalize_to_source_schema(r, target, &engine_stamped),
                     None => r.clone(),
                 }
             };
-            let records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
-                // Body-context port source — records were seeded by
-                // `execute_composition_body` from parent-scope output.
-                // The seeded records still carry the parent producer's
-                // `Arc<Schema>`, so canonicalize them onto this port
-                // source's schema before downstream consumers run.
-                seeded
-                    .into_iter()
-                    .map(|(r, rn)| (canonicalize(&r), rn))
-                    .collect()
-            } else if let Some(rx) = ctx.source_records.get_mut(name.as_str()) {
-                // Drain the live channel synchronously into a local Vec
-                // for the duration of this arm. Streaming consumption
-                // throughout dispatch is the longer-term shape; today's
-                // arms still operate on owned `Vec<(Record, u64)>`
-                // buffers, so we materialize once here.
-                let mut drained: Vec<(Record, u64)> = Vec::new();
-                while let Some((record, rn)) = rx.recv().await {
-                    drained.push((canonicalize(&record), rn));
-                }
-                drained
-            } else {
-                // Defense-in-depth: a Source reaching this arm with
-                // neither a body-port seed nor an entry in
-                // `source_records` means the executor's unified
-                // ingest pass missed it. Now that every declared
-                // Source ingests through the same `source_records`
-                // map (no primary fallthrough), any miss surfaces
-                // here as a loud internal error rather than the
-                // silent-corruption surface at the root of #47.
-                return Err(PipelineError::Internal {
-                    op: "executor",
-                    node: name.clone(),
-                    detail: format!(
-                        "Source '{name}' has no ingested records; \
+
+            let records: Vec<(Record, u64)> =
+                if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
+                    // Body-context port source — records were seeded by
+                    // `execute_composition_body` from parent-scope
+                    // output. The seeded records still carry the parent
+                    // producer's `Arc<Schema>`, so canonicalize them
+                    // onto this port source's schema before downstream
+                    // consumers run. Apply per-record seeding for body-
+                    // declared record_vars (parent's writes survive via
+                    // `seed_record_vars`'s preserve-existing semantics).
+                    let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len());
+                    let has_record_seed = !ctx.record_var_seed.is_empty();
+                    for (r, rn) in seeded {
+                        let mut rec = canonicalize(&r);
+                        if has_record_seed {
+                            rec.seed_record_vars(ctx.record_var_seed);
+                        }
+                        seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                        out.push((rec, rn));
+                    }
+                    out
+                } else if let Some(mut rx) = ctx.source_records.remove(name.as_str()) {
+                    // Live channel: consume per record so back-pressure
+                    // engages — a slow upstream Source no longer blocks
+                    // peers' channels from filling, and watermark
+                    // observations on a different source's records
+                    // flow through the dispatcher in the meantime
+                    // wherever the executor task scheduler interleaves.
+                    let timeout = ctx.idle_timeouts.get(name.as_str()).copied();
+                    let has_record_seed = !ctx.record_var_seed.is_empty();
+                    let source_name_arc: Arc<str> = Arc::from(name.as_str());
+                    let mut drained: Vec<(Record, u64)> = Vec::new();
+                    // Tracked so an idle-timeout flips THAT file's
+                    // partition to `Idle`. Before any record arrives the
+                    // consumer uses the synthetic [`MERGED_SOURCE_FILE`]
+                    // Arc, matching the engine-stamp path for record-
+                    // less source contexts.
+                    let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
+                    let mut count: u64 = 0;
+                    loop {
+                        let item: Option<(Record, u64)> = match timeout {
+                            Some(t) => match tokio::time::timeout(t, rx.recv()).await {
+                                Ok(item) => item,
+                                Err(_elapsed) => {
+                                    // Quiet for longer than
+                                    // `idle_timeout` — flip the
+                                    // partition tracked by `last_file`
+                                    // to `Idle`. The next record un-
+                                    // idles via `observe`. Idempotent on
+                                    // repeat timeouts.
+                                    ctx.watermarks.mark_idle(name.as_str(), &last_file);
+                                    continue;
+                                }
+                            },
+                            None => rx.recv().await,
+                        };
+                        let Some((record, rn)) = item else {
+                            break;
+                        };
+                        last_file = source_file_arc_of(&record);
+                        let mut rec = canonicalize(&record);
+                        if has_record_seed {
+                            rec.seed_record_vars(ctx.record_var_seed);
+                        }
+                        seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                        if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
+                            *slot += 1;
+                        }
+                        count += 1;
+                        drained.push((rec, rn));
+                    }
+                    ctx.finalize_source_count(&source_name_arc, count);
+                    if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
+                        tracing::debug!(
+                            target: "clinker::watermark",
+                            source = %name,
+                            "source consumer ended with all partitions in WatermarkStatus::Idle"
+                        );
+                    }
+                    drained
+                } else {
+                    // Defense-in-depth: a Source reaching this arm with
+                    // neither a body-port seed, nor an entry in
+                    // `source_records`, nor fused-bit set means the
+                    // executor's unified ingest pass missed it. Every
+                    // declared Source ingests through the same
+                    // `source_records` map (no primary fallthrough), so
+                    // any miss surfaces here as a loud internal error
+                    // rather than the silent-corruption surface at the
+                    // root of #47.
+                    return Err(PipelineError::Internal {
+                        op: "executor",
+                        node: name.clone(),
+                        detail: format!(
+                            "Source '{name}' has no ingested records; \
                          the executor's source-ingest pass missed this Source — \
                          likely a planner regression introducing a Source topology \
                          the ingest pass doesn't enumerate.",
-                    ),
-                });
-            };
+                        ),
+                    });
+                };
+            // Build node-rooted arenas anchored at this Source's
+            // `NodeIndex`. Replaces the prologue's Phase-0 build:
+            // every spec previously rooted at `PlanIndexRoot::Source`
+            // now anchors here.
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
             ctx.node_buffers.insert(node_idx, records);
         }
@@ -1349,7 +1742,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_file: &source_file_arc,
                     source_row: rn,
                     source_path: &source_file_arc,
-                    source_count: ctx.source_count,
+                    source_count: ctx.source_count_by_name(&source_name_arc),
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
@@ -1383,22 +1776,13 @@ pub(crate) async fn dispatch_plan_node(
                                          upstream finalize was skipped"
                                     ),
                                 })?;
-                        // record_pos semantics:
-                        // - Source(_)  → rn - 1. Phase-0 materializes
-                        //   records in arena order, source row numbers
-                        //   start at 1, so the position is always `rn - 1`.
-                        // - Node{..} / ParentNode{..} → enumerate index `i`.
-                        //   The node-rooted arena was built from the
-                        //   upstream's emit buffer in iteration order;
-                        //   the per-record dispatch loop iterates the
-                        //   same buffer, so `i` equals the row's arena
-                        //   position by construction.
-                        let record_pos =
-                            if matches!(spec.root, crate::plan::index::PlanIndexRoot::Source(_)) {
-                                rn - 1
-                            } else {
-                                i as u64
-                            };
+                        // record_pos: enumerate index `i`. Every arena
+                        // is node-rooted; it was built from the
+                        // upstream's emit buffer in iteration order,
+                        // and the per-record dispatch loop iterates
+                        // the same buffer, so `i` equals the row's
+                        // arena position by construction.
+                        let record_pos = i as u64;
                         evaluate_single_transform_windowed(
                             &record,
                             name,
@@ -1646,7 +2030,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_file: &source_file_arc,
                         source_row: rn,
                         source_path: &source_file_arc,
-                        source_count: ctx.source_count,
+                        source_count: ctx.source_count_by_name(&source_name_arc),
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
@@ -1771,17 +2155,27 @@ pub(crate) async fn dispatch_plan_node(
         }
 
         PlanNode::Merge { ref name, .. } => {
-            // Predecessors are sorted by Merge `inputs:` declaration
-            // order — the order appearing in the YAML array, which is
-            // stable across compile runs. Under the unified taxonomy a
-            // Merge is a first-class node (no "merge_<transform>"
-            // synthesis) so we read the order straight off
-            // `PipelineNode::Merge.header.inputs`. The mode branch then
-            // picks the cross-source ordering: Concat drains each
-            // predecessor's pre-buffered records sequentially in that
-            // order; Interleave round-robins across them. Per-source
-            // FIFO survives both modes because each predecessor's buffer
-            // is itself in arrival order.
+            // Two architectural modes for a Merge arm:
+            //
+            // 1. **Fused** — every direct predecessor is a Source and
+            //    `mode: interleave`. The pre-pass at executor entry
+            //    marked each predecessor's source name in
+            //    `ctx.fused_sources`, the Source dispatch arms
+            //    returned cleanly without consuming, and the receivers
+            //    are still parked in `ctx.source_records`. This arm
+            //    takes ownership of those receivers and runs a fair
+            //    `tokio::select!` over them so a slow Source no longer
+            //    blocks peers — back-pressure flows end-to-end.
+            //
+            // 2. **Non-fused** — concat mode, or a mix of Source and
+            //    non-Source predecessors. Predecessor arms have
+            //    already populated `ctx.node_buffers`; this arm
+            //    consumes those buffers in declaration order (Concat)
+            //    or round-robins across them (Interleave).
+            //
+            // Per-source FIFO survives both modes; per-record schema
+            // canonicalization runs at consume time so the canonical
+            // `Arc<Schema>` reaches downstream operators uniformly.
             let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
@@ -1826,127 +2220,124 @@ pub(crate) async fn dispatch_plan_node(
                     .unwrap_or(usize::MAX)
             });
 
-            let total: usize = sorted_preds
-                .iter()
-                .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len()))
-                .sum();
             let merge_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
-            let mut merged = Vec::with_capacity(total);
+            // Detect fused mode: every predecessor is a Source whose
+            // name is in `ctx.fused_sources`. The pre-pass at executor
+            // entry already validated mode == Interleave for these,
+            // but we double-check here defensively.
+            let fused_mode = matches!(mode, crate::config::MergeMode::Interleave)
+                && sorted_preds.iter().all(|p| match &current_dag.graph[*p] {
+                    PlanNode::Source { name: src_name, .. } => {
+                        ctx.fused_sources.contains(src_name.as_str())
+                    }
+                    _ => false,
+                });
 
-            // Canonicalize and emit one record from a predecessor buffer
-            // into `merged`. Schema canonicalization runs per-record at
-            // consume time (not as a post-pass) so the canonical
-            // `Arc<Schema>` reaches downstream operators uniformly
-            // regardless of which mode produced the record.
-            let emit = |merged: &mut Vec<(Record, u64)>,
-                        upstream_name: &str,
-                        mut record: Record,
-                        rn: u64|
-             -> Result<(), PipelineError> {
-                if let Some(canonical) = merge_output_schema.as_ref() {
-                    check_input_schema(canonical, record.schema(), name, "merge", upstream_name)?;
-                    // Canonicalize: rebuild record with the Merge's
-                    // `Arc<Schema>` so downstream operators hit the
-                    // ptr_eq fast path regardless of which input the
-                    // record originated from.
-                    let values = record.values().to_vec();
-                    record = Record::new(Arc::clone(canonical), values);
+            let merged: Vec<(Record, u64)> = if fused_mode {
+                merge_fused_interleave(
+                    ctx,
+                    current_dag,
+                    name,
+                    &sorted_preds,
+                    merge_output_schema.as_ref(),
+                )
+                .await?
+            } else {
+                let total: usize = sorted_preds
+                    .iter()
+                    .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len()))
+                    .sum();
+                let mut merged = Vec::with_capacity(total);
+                let emit = |merged: &mut Vec<(Record, u64)>,
+                            upstream_name: &str,
+                            mut record: Record,
+                            rn: u64|
+                 -> Result<(), PipelineError> {
+                    if let Some(canonical) = merge_output_schema.as_ref() {
+                        check_input_schema(
+                            canonical,
+                            record.schema(),
+                            name,
+                            "merge",
+                            upstream_name,
+                        )?;
+                        // Rebuild record with the Merge's
+                        // `Arc<Schema>` so downstream operators hit
+                        // the ptr_eq fast path regardless of which
+                        // input the record originated from.
+                        let values = record.values().to_vec();
+                        record = Record::new(Arc::clone(canonical), values);
+                    }
+                    merged.push((record, rn));
+                    Ok(())
+                };
+
+                match mode {
+                    crate::config::MergeMode::Concat => {
+                        for pred in &sorted_preds {
+                            let upstream_name = current_dag.graph[*pred].name().to_string();
+                            if let Some(buf) = ctx.node_buffers.remove(pred) {
+                                for (record, rn) in buf {
+                                    emit(&mut merged, &upstream_name, record, rn)?;
+                                }
+                            }
+                        }
+                    }
+                    crate::config::MergeMode::Interleave => {
+                        // Round-robin across pre-buffered predecessor
+                        // outputs. Reached only when predecessors are
+                        // not all Sources (the fused path took
+                        // those); the inputs are produced by upstream
+                        // operator arms that wrote to `node_buffers`.
+                        use std::collections::VecDeque;
+                        let upstream_names: Vec<String> = sorted_preds
+                            .iter()
+                            .map(|p| current_dag.graph[*p].name().to_string())
+                            .collect();
+                        let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
+                            .iter()
+                            .map(|pred| {
+                                ctx.node_buffers
+                                    .remove(pred)
+                                    .map(VecDeque::from)
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
+                        let mut cursor = 0usize;
+                        loop {
+                            let ready: Vec<usize> = deques
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, d)| (!d.is_empty()).then_some(i))
+                                .collect();
+                            if ready.is_empty() {
+                                break;
+                            }
+                            let pick_idx = match rng.as_mut() {
+                                Some(r) => ready[r.usize(0..ready.len())],
+                                None => {
+                                    let mut chosen = ready[0];
+                                    for _ in 0..deques.len() {
+                                        let candidate = cursor % deques.len();
+                                        cursor = cursor.wrapping_add(1);
+                                        if !deques[candidate].is_empty() {
+                                            chosen = candidate;
+                                            break;
+                                        }
+                                    }
+                                    chosen
+                                }
+                            };
+                            if let Some((record, rn)) = deques[pick_idx].pop_front() {
+                                emit(&mut merged, &upstream_names[pick_idx], record, rn)?;
+                            }
+                        }
+                    }
                 }
-                merged.push((record, rn));
-                Ok(())
+                merged
             };
 
-            match mode {
-                crate::config::MergeMode::Concat => {
-                    for pred in &sorted_preds {
-                        let upstream_name = current_dag.graph[*pred].name().to_string();
-                        if let Some(buf) = ctx.node_buffers.remove(pred) {
-                            for (record, rn) in buf {
-                                emit(&mut merged, &upstream_name, record, rn)?;
-                            }
-                        }
-                    }
-                }
-                crate::config::MergeMode::Interleave => {
-                    // Take each predecessor's buffer once so per-source
-                    // FIFO can be preserved by draining from the head.
-                    // `VecDeque` gives O(1) `pop_front` for the round-
-                    // robin pick. Empty buffers become empty deques and
-                    // drop out of the active pool on first inspection.
-                    use std::collections::VecDeque;
-                    let upstream_names: Vec<String> = sorted_preds
-                        .iter()
-                        .map(|p| current_dag.graph[*p].name().to_string())
-                        .collect();
-                    let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
-                        .iter()
-                        .map(|pred| {
-                            ctx.node_buffers
-                                .remove(pred)
-                                .map(VecDeque::from)
-                                .unwrap_or_default()
-                        })
-                        .collect();
-
-                    // `interleave_seed: Some(seed)` runs a fastrand
-                    // schedule for reproducibility across runs. The Rng
-                    // lives locally — its state is one-shot per Merge
-                    // fold (the executor's prologue pre-drains every
-                    // source into a Vec before dispatch, so this arm
-                    // runs to completion in a single call), so the plan
-                    // doc's `ctx.merge_rng_state` HashMap shape would be
-                    // dead state. If a future change splits the fold
-                    // across executor re-entries the Rng can move onto
-                    // `ExecutorContext` then.
-                    //
-                    // Unseeded → deterministic round-robin by
-                    // declaration-order index. Today's arbitration
-                    // drains the per-input deques the executor
-                    // prologue materializes; live-channel back-pressure
-                    // ("a slow upstream doesn't starve a fast one")
-                    // requires the prologue to stop pre-buffering and
-                    // route `mpsc::Receiver`s directly into the
-                    // interleave loop's `tokio::select!`. Tracked
-                    // separately from the runtime migration so the
-                    // YAML surface ships ahead of the dynamics.
-                    let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
-                    let mut cursor = 0usize; // unseeded round-robin head
-                    loop {
-                        // Collect indices of predecessors with records
-                        // still queued. Done when none remain.
-                        let ready: Vec<usize> = deques
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, d)| (!d.is_empty()).then_some(i))
-                            .collect();
-                        if ready.is_empty() {
-                            break;
-                        }
-                        let pick_idx = match rng.as_mut() {
-                            Some(r) => ready[r.usize(0..ready.len())],
-                            None => {
-                                // Advance the cursor through declaration
-                                // order, skipping exhausted slots.
-                                let mut chosen = ready[0];
-                                for _ in 0..deques.len() {
-                                    let candidate = cursor % deques.len();
-                                    cursor = cursor.wrapping_add(1);
-                                    if !deques[candidate].is_empty() {
-                                        chosen = candidate;
-                                        break;
-                                    }
-                                }
-                                chosen
-                            }
-                        };
-                        // `pop_front` preserves per-source FIFO — each
-                        // source's records leave in arrival order.
-                        if let Some((record, rn)) = deques[pick_idx].pop_front() {
-                            emit(&mut merged, &upstream_names[pick_idx], record, rn)?;
-                        }
-                    }
-                }
-            }
             // Merge is rejected as a window root at compile time
             // (E150d) because the multi-producer concatenation has no
             // single producer identity for record_pos to anchor
@@ -2207,7 +2598,7 @@ pub(crate) async fn dispatch_plan_node(
                             source_file: &source_file_arc,
                             source_row: *row_num,
                             source_path: &source_file_arc,
-                            source_count: ctx.source_count,
+                            source_count: ctx.source_count_by_name(&source_name_arc),
                             source_batch: ctx.source_batch_arc,
                             ingestion_timestamp: ctx.source_ingestion_timestamp,
                             source_name: &source_name_arc,
@@ -2276,7 +2667,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_file: &MERGED_SOURCE_FILE,
                     source_row: 0,
                     source_path: &MERGED_SOURCE_FILE,
-                    source_count: ctx.source_count,
+                    source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &MERGED_SOURCE_NAME,
@@ -3108,7 +3499,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
                         source_path: &MERGED_SOURCE_FILE,
-                        source_count: ctx.source_count,
+                        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
@@ -3188,7 +3579,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
                         source_path: &MERGED_SOURCE_FILE,
-                        source_count: ctx.source_count,
+                        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
@@ -3273,7 +3664,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_file: &MERGED_SOURCE_FILE,
                         source_row: 0,
                         source_path: &MERGED_SOURCE_FILE,
-                        source_count: ctx.source_count,
+                        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
@@ -3343,7 +3734,7 @@ pub(crate) async fn dispatch_plan_node(
                 source_file: &MERGED_SOURCE_FILE,
                 source_row: 0,
                 source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count,
+                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
@@ -3398,7 +3789,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_file: &source_file_arc,
                     source_row: rn,
                     source_path: &source_file_arc,
-                    source_count: ctx.source_count,
+                    source_count: ctx.source_count_by_name(&source_name_arc),
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
@@ -4791,7 +5182,7 @@ fn run_time_windowed_aggregate(
                         source_file: &source_file_arc,
                         source_row: *rn,
                         source_path: &source_file_arc,
-                        source_count: ctx.source_count,
+                        source_count: ctx.source_count_by_name(&source_name_arc),
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
@@ -4825,7 +5216,7 @@ fn run_time_windowed_aggregate(
                 source_file: &MERGED_SOURCE_FILE,
                 source_row: 0,
                 source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count,
+                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
@@ -4890,7 +5281,7 @@ where
         source_file: &source_file_arc,
         source_row: row_num,
         source_path: &source_file_arc,
-        source_count: ctx.source_count,
+        source_count: ctx.source_count_by_name(&source_name_arc),
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &source_name_arc,
@@ -4978,7 +5369,7 @@ fn finalize_windows(
         source_file: &MERGED_SOURCE_FILE,
         source_row: 0,
         source_path: &MERGED_SOURCE_FILE,
-        source_count: ctx.source_count,
+        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &MERGED_SOURCE_NAME,

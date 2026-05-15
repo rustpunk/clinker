@@ -2,9 +2,11 @@
 //!
 //! The lowering pass at `config/mod.rs` walks each window-bearing
 //! Transform's incoming edge through `first_non_passthrough_ancestor`
-//! and classifies the rooting:
-//!   - `Source` ancestor + no cross-source `wc.source` → `Source(name)`
-//!   - any other operator ancestor → `Node { upstream, anchor_schema }`
+//! and emits a `PlanIndexRoot::Node { upstream, anchor_schema }`
+//! anchored at that operator's `NodeIndex` — Source ancestors and
+//! non-Source ancestors share the same node-rooted geometry, with
+//! arena materialization happening at each operator's dispatch-arm
+//! emit through `finalize_node_rooted_windows`.
 //!
 //! These tests pin the rooting decision on the two canonical shapes
 //! (Source→Transform-window and Source→Aggregate→Transform-window).
@@ -63,13 +65,34 @@ nodes:
             _ => None,
         })
         .expect("windowed has window_index");
+    let src_idx = dag
+        .graph
+        .node_indices()
+        .find(|i| dag.graph[*i].name() == "src")
+        .expect("src present");
     let spec = &dag.indices_to_build[window_idx_num];
     match &spec.root {
-        PlanIndexRoot::Source(name) => assert_eq!(
-            name, "src",
-            "Source-rooted spec must carry the source's declared name"
-        ),
-        other => panic!("expected PlanIndexRoot::Source, got {other:?}"),
+        PlanIndexRoot::Node {
+            upstream,
+            anchor_schema,
+        } => {
+            assert_eq!(
+                *upstream, src_idx,
+                "Source-anchored window must root at the Source's NodeIndex"
+            );
+            // The anchor schema is the source's plan-time
+            // output_schema; it must contain the user-declared
+            // columns the window reads.
+            assert!(
+                anchor_schema.contains("department"),
+                "anchor schema must carry the source's department column"
+            );
+            assert!(
+                anchor_schema.contains("amount"),
+                "anchor schema must carry the source's amount column"
+            );
+        }
+        other => panic!("expected PlanIndexRoot::Node at the Source, got {other:?}"),
     }
 }
 
