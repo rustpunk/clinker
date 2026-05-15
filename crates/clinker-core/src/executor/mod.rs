@@ -1253,7 +1253,18 @@ impl PipelineExecutor {
         // peer Sources' channels from filling — back-pressure flows
         // end-to-end. Per-Source arms detect membership in
         // `fused_sources` and return cleanly.
-        let fused_sources: HashSet<String> = compute_merge_interleave_fused_sources(plan, config);
+        let init_phase_set = compute_init_phase_node_set(plan);
+        let mut fused_sources: HashSet<String> =
+            compute_merge_interleave_fused_sources(plan, config);
+        // Extend `fused_sources` with Source names whose receivers are
+        // claimed by a downstream `PlanNode::Transform` running in
+        // streaming mode (issue #74). `fused_transforms` carries the
+        // matching Transform `NodeIndex`es so the Transform arm can
+        // dispatch into the streaming branch instead of consuming a
+        // pre-drained Vec from `node_buffers`.
+        let (extra_fused_sources, fused_transforms) =
+            compute_transform_fused_sources(plan, &fused_sources, &init_phase_set);
+        fused_sources.extend(extra_fused_sources);
 
         let mut ctx = dispatch::ExecutorContext {
             config,
@@ -1271,6 +1282,7 @@ impl PipelineExecutor {
             node_buffers: HashMap::new(),
             source_records,
             fused_sources,
+            fused_transforms,
             record_var_seed: &record_var_seed,
             declared_source_defaults: &declared_source_defaults,
             channel_source_vars: &params.source_vars,
@@ -1328,7 +1340,6 @@ impl PipelineExecutor {
         // a Source feeding both an init branch and a runtime branch
         // correctly clones its buffer for Pass 1's first consumer
         // and removes it for Pass 2's last consumer.
-        let init_phase_set = compute_init_phase_node_set(plan);
         if !init_phase_set.is_empty() {
             for node_idx in plan.topo_order.clone() {
                 if init_phase_set.contains(&node_idx) {
@@ -2388,6 +2399,83 @@ fn compute_merge_interleave_fused_sources(
         }
     }
     fused
+}
+
+/// Identify `PlanNode::Transform` nodes whose sole upstream is a
+/// `PlanNode::Source` with a parked receiver in `ctx.source_records`,
+/// and whose evaluation can stream directly off that receiver instead
+/// of a pre-drained Vec. Returns the set of fused Transform
+/// `NodeIndex`es plus the set of Source names whose receivers move
+/// into the fused Transform's hands (those names extend
+/// [`compute_merge_interleave_fused_sources`]'s output so the Source
+/// dispatch arm short-circuits via the same membership check).
+///
+/// Eligibility (all must hold):
+///
+/// - Exactly one incoming edge.
+/// - That predecessor is a `PlanNode::Source`.
+/// - The upstream Source has exactly one outgoing edge (no Merge or
+///   sibling fan-out — fanning would require cloning the live channel).
+/// - `window_index` is `None`. Windowed Transforms drive
+///   `evaluate_single_transform_windowed`, which indexes records into
+///   the upstream operator's arena via the row's enumerate position;
+///   that arena is built upstream and must already be materialized.
+/// - The Transform is not in the init-phase ancestor closure.
+/// - The upstream Source's name is not already claimed by
+///   `merge_fused`. Merge.interleave fusion wins because the Merge
+///   needs every predecessor's receiver concurrently.
+///
+/// See https://github.com/rustpunk/clinker/issues/74 for the rationale
+/// (extending #67's pattern from Merge to Transform unblocks
+/// `[slow Source → Transform → out]` topologies from sitting idle on
+/// the upstream Source's drain).
+fn compute_transform_fused_sources(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    merge_fused: &HashSet<String>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> (HashSet<String>, HashSet<petgraph::graph::NodeIndex>) {
+    use crate::plan::execution::PlanNode;
+    let mut extra_fused_sources: HashSet<String> = HashSet::new();
+    let mut fused_transforms: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+    for node_idx in plan.graph.node_indices() {
+        let PlanNode::Transform { window_index, .. } = &plan.graph[node_idx] else {
+            continue;
+        };
+        if window_index.is_some() {
+            continue;
+        }
+        if init_phase_set.contains(&node_idx) {
+            continue;
+        }
+        let mut incoming = plan
+            .graph
+            .neighbors_directed(node_idx, petgraph::Direction::Incoming);
+        let Some(pred_idx) = incoming.next() else {
+            continue;
+        };
+        if incoming.next().is_some() {
+            continue;
+        }
+        let PlanNode::Source {
+            name: source_name, ..
+        } = &plan.graph[pred_idx]
+        else {
+            continue;
+        };
+        if merge_fused.contains(source_name) {
+            continue;
+        }
+        let downstream_count = plan
+            .graph
+            .neighbors_directed(pred_idx, petgraph::Direction::Outgoing)
+            .count();
+        if downstream_count != 1 {
+            continue;
+        }
+        extra_fused_sources.insert(source_name.clone());
+        fused_transforms.insert(node_idx);
+    }
+    (extra_fused_sources, fused_transforms)
 }
 
 fn compute_init_phase_node_set(
