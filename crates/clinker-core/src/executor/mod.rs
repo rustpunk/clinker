@@ -21,9 +21,8 @@ use indexmap::IndexMap;
 use crate::config::{OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
-use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
+use crate::pipeline::index::{GroupByKey, value_to_group_key};
 use crate::pipeline::memory::rss_bytes;
-use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
 use crate::plan::execution::ExecutionPlanDag;
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
@@ -1043,7 +1042,7 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag(
         config: &PipelineConfig,
-        mut source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1056,208 +1055,40 @@ impl PipelineExecutor {
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
-        mut watermarks: crate::executor::watermark::PerSourceWatermarks,
+        watermarks: crate::executor::watermark::PerSourceWatermarks,
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
-        // Per-source idle-timeout map, derived from each
-        // `SourceConfig.watermark.idle_timeout`. Sources without a
-        // configured timeout poll receivers without a deadline (today's
-        // behavior). The window-close consumer at
-        // https://github.com/rustpunk/clinker/issues/61 reads
-        // `PerSourceWatermarks::is_idle` populated by the timeout path.
-        let idle_timeouts: HashMap<&str, std::time::Duration> = source_configs
-            .iter()
-            .filter_map(|s| {
-                s.watermark
-                    .as_ref()
-                    .and_then(|w| w.idle_timeout.map(|d| (s.name.as_str(), d)))
-            })
-            .collect();
-
         // Pipeline-scoped MemoryBudget. One declared `memory_limit`
-        // envelopes the source-rooted Phase-0 arena AND every node-
-        // rooted arena finalize. Promoted to ctx-owned so a relaxed
-        // pipeline cannot multiply its declared limit across N upstream
-        // operators by accident.
-        let mut memory_budget = crate::pipeline::memory::MemoryBudget::from_config(
+        // envelopes every node-rooted arena finalize — including the
+        // arenas built at Source dispatch-arm exits. Promoted to
+        // ctx-owned so a relaxed pipeline cannot multiply its declared
+        // limit across N upstream operators by accident.
+        let memory_budget = crate::pipeline::memory::MemoryBudget::from_config(
             config.pipeline.memory_limit.as_deref(),
         );
 
-        // Drain every per-source receiver into a local Vec so the
-        // arena-build, record-var seed, and `$source.count` pre-passes
-        // below can operate on the full per-source record set. After
-        // the pre-passes complete we re-channel the records into a
-        // fresh `(Sender, Receiver)` pair per source so the dispatch
-        // loop's Source arm sees the same `mpsc::Receiver` interface
-        // it would see under live streaming. The migration to true
-        // live consumption (Source arm reads as ingest tasks push)
-        // moves these pre-passes into per-record evaluation in a
-        // follow-up commit — for today the architecture lands without
-        // disrupting source-rooted window builds or `$source.count`.
-        let mut drained_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
-        for (name, rx) in source_records.iter_mut() {
-            let mut buf: Vec<(Record, u64)> = Vec::new();
-            // Track the file Arc of the most-recent record so an
-            // idle-timeout can flip THAT file's partition to `Idle`.
-            // Before any record has arrived the consumer doesn't know
-            // which file is producing — use the synthetic
-            // [`crate::executor::dispatch::MERGED_SOURCE_FILE`] Arc as
-            // the partition key, matching the same convention the
-            // engine-stamp path uses for record-less source contexts.
-            let mut last_file: Arc<str> =
-                Arc::clone(&crate::executor::dispatch::MERGED_SOURCE_FILE);
-            let timeout = idle_timeouts.get(name.as_str()).copied();
-            loop {
-                match timeout {
-                    Some(t) => match tokio::time::timeout(t, rx.recv()).await {
-                        Ok(Some(item)) => {
-                            last_file = crate::executor::dispatch::source_file_arc_of(&item.0);
-                            buf.push(item);
-                        }
-                        Ok(None) => break,
-                        Err(_elapsed) => {
-                            // Quiet for longer than `idle_timeout` —
-                            // flip the partition tracked by `last_file`
-                            // to `Idle`. The next record un-idles via
-                            // `observe`. Idempotent on repeat timeouts.
-                            watermarks.mark_idle(name, &last_file);
-                            continue;
-                        }
-                    },
-                    None => match rx.recv().await {
-                        Some(item) => {
-                            last_file = crate::executor::dispatch::source_file_arc_of(&item.0);
-                            buf.push(item);
-                        }
-                        None => break,
-                    },
-                }
-            }
-            drained_records.insert(name.clone(), buf);
-        }
-
-        // Emit an observability trace for any source whose consumer
-        // loop tripped at least one idle timeout AND ended with every
-        // partition still idle. The load-bearing consumer of
-        // `is_idle` is the time-window operator at
-        // https://github.com/rustpunk/clinker/issues/61; this trace
-        // keeps the rollup visible at runtime so operators can see
-        // when an idle_timeout is firing.
-        for name in idle_timeouts.keys() {
-            if watermarks.is_idle(name) {
-                tracing::debug!(
-                    target: "clinker::watermark",
-                    source = name,
-                    "source consumer ended with all partitions in WatermarkStatus::Idle"
-                );
-            }
-        }
-
-        // Build per-window arena+index runtimes for every source-rooted
-        // IndexSpec — each spec's `root: Source(name)` resolves against
-        // the drained record set. Source-rooted arenas are built up-
-        // front here because their input is the Source's full ingested
-        // record set, available once each source's receiver has
-        // returned `None`. Node-rooted (`Node`/`ParentNode`) slots still
-        // populate at their upstream operator's dispatch-arm exit
-        // through `finalize_node_rooted_windows`.
-        let mut window_runtime =
+        // No prologue drain or arena build. The dispatch Source arm
+        // is the first consumer of every `mpsc::Receiver`:
+        // - canonicalize per record onto the source's plan-time schema,
+        // - seed `$record.<key>` defaults per record,
+        // - seed `$source.<key>` defaults per `(source, file)` Arc on
+        //   first observation,
+        // - on `recv().await` returning `None`, stamp the finalized
+        //   per-source count and call `finalize_node_rooted_windows`
+        //   to populate every spec rooted at this source's NodeIndex.
+        //
+        // The D12 global-fold-over-empty-input case fires from the
+        // Aggregate arm's own empty-input emit — the topo walk
+        // dispatches the Aggregate node even when its upstream Source
+        // produced zero records, so the special case still emits the
+        // single global-fold row.
+        let window_runtime =
             crate::executor::window_runtime::WindowRuntimeRegistry::new(&plan.indices_to_build);
-        let schema_overrides_by_name: HashMap<
-            &str,
-            HashMap<String, clinker_record::schema_def::FieldDef>,
-        > = source_configs
-            .iter()
-            .map(|s| {
-                let overrides = s
-                    .schema_overrides
-                    .as_ref()
-                    .map(|overrides| {
-                        overrides
-                            .iter()
-                            .map(|o| (o.name.clone(), o.clone()))
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .unwrap_or_default();
-                (s.name.as_str(), overrides)
-            })
-            .collect();
-        let empty_schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> =
-            HashMap::new();
-        for (idx, spec) in plan.indices_to_build.iter().enumerate() {
-            let crate::plan::index::PlanIndexRoot::Source(source_name) = &spec.root else {
-                continue;
-            };
-            let Some(records) = drained_records.get(source_name.as_str()) else {
-                continue;
-            };
-            if records.is_empty() {
-                continue;
-            }
-            let source_schema = Arc::clone(records[0].0.schema());
-            let schema_pins = schema_overrides_by_name
-                .get(source_name.as_str())
-                .unwrap_or(&empty_schema_pins);
-
-            let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-            let arena = Arena::from_records(
-                records,
-                &spec.arena_fields,
-                &source_schema,
-                &mut memory_budget,
-            )
-            .map_err(|e| PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![format!("E310 source-arena build: {e}")],
-            })?;
-            let arena_len = arena.record_count();
-            collector.record(arena_timer.finish(arena_len, arena_len));
-
-            let index_name = format!("{}:{}", source_name, spec.group_by.join(","));
-            let index_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
-                    name: index_name,
-                });
-            let mut secondary_index = SecondaryIndex::build(&arena, &spec.group_by, schema_pins)
-                .map_err(|e| PipelineError::Compilation {
-                    transform_name: String::new(),
-                    messages: vec![e.to_string()],
-                })?;
-            collector.record(index_timer.finish(arena_len, arena_len));
-
-            if !spec.already_sorted {
-                for partition in secondary_index.groups.values_mut() {
-                    if !sort::is_sorted(&arena, partition, &spec.sort_by) {
-                        sort::sort_partition(&arena, partition, &spec.sort_by);
-                    }
-                }
-            }
-
-            window_runtime.top[idx] = Some(crate::executor::window_runtime::WindowRuntime {
-                arena: Arc::new(arena),
-                index: Arc::new(secondary_index),
-            });
-        }
-
-        // D12: a global-fold aggregate (group_by: []) must still emit
-        // one row over empty input, so we cannot early-return when the
-        // plan contains an Aggregation node — the DAG walk needs to
-        // fire the aggregator's empty-input special case. Generalized
-        // from primary-only to "every source ingested zero records".
-        if drained_records.values().all(|v| v.is_empty()) && !plan.has_branching() {
-            return Ok((
-                counters,
-                dlq_entries,
-                rss_bytes(),
-                watermarks,
-                BTreeMap::new(),
-            ));
-        }
 
         Self::execute_dag_branching(
             config,
-            drained_records,
+            source_records,
             source_configs,
             writers,
             transforms,
@@ -1293,7 +1124,7 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag_branching(
         config: &PipelineConfig,
-        mut source_records: HashMap<String, Vec<(Record, u64)>>,
+        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1325,49 +1156,12 @@ impl PipelineExecutor {
             &params.static_vars,
         );
 
-        // Seed source-scope vars on every distinct per-record file Arc
-        // across every declared source. Channel overrides (per source-
-        // node name) layer atop Transform-`declares: scope: source`
-        // defaults; the per-file inner map uses `or_insert` for
-        // declared defaults (so any source-scope writer that planted
-        // earlier wins) and `insert` for channel values (channel
-        // always wins). The per-record file path is read off the
-        // `$source.file` engine-stamped column on each record.
-        let declared_source_defaults = crate::config::collect_source_var_defaults(&config.nodes);
-        if (!declared_source_defaults.is_empty() || !params.source_vars.is_empty())
-            && let Ok(mut map) = stable.source_vars.write()
-        {
-            for src_cfg in source_configs {
-                let Some(records) = source_records.get(&src_cfg.name) else {
-                    continue;
-                };
-                let channel = params.source_vars.get(&src_cfg.name);
-                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for (record, _) in records {
-                    let Some(file_path) = dispatch::source_file_path_of(record) else {
-                        continue;
-                    };
-                    if !seen.insert(file_path) {
-                        continue;
-                    }
-                    let entry = map.entry(Arc::from(file_path)).or_default();
-                    for (k, v) in &declared_source_defaults {
-                        entry.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                    if let Some(ch) = channel {
-                        for (k, v) in ch {
-                            entry.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Pre-seed `$record.<key>` defaults into every materialized
-        // record so init-phase reads observe the declared/channel
-        // default before any per-record `state` writer fires. Channel
-        // record-vars layer atop Transform-`declares: scope: record`
-        // defaults; existing per-record entries (if any) are preserved.
+        // Per-record `$record.<key>` defaults. The Source dispatch
+        // arm applies these per record at canonicalize time via
+        // `Record::seed_record_vars`; no upfront walk of materialized
+        // records. Channel-supplied record_vars layer atop Transform-
+        // `declares: scope: record` defaults; existing per-record
+        // entries (if any) are preserved by `seed_record_vars`.
         let record_var_seed: IndexMap<String, Value> = {
             let mut seed = crate::config::collect_record_var_defaults(&config.nodes);
             for (k, v) in &params.record_vars {
@@ -1375,23 +1169,34 @@ impl PipelineExecutor {
             }
             seed
         };
-        if !record_var_seed.is_empty() {
-            for recs in source_records.values_mut() {
-                for (record, _) in recs {
-                    record.seed_record_vars(&record_var_seed);
-                }
-            }
-        }
+
+        // Source-scope variable defaults from
+        // `declares: scope: source`. The Source dispatch arm seeds
+        // `stable.source_vars` per `(source, file)` Arc on first
+        // observation; channel overrides from `params.source_vars`
+        // layer atop the declared defaults.
+        let declared_source_defaults = crate::config::collect_source_var_defaults(&config.nodes);
+
+        // Per-source idle-timeout durations derived from each
+        // `SourceConfig.watermark.idle_timeout`. Borrowed by the
+        // Source dispatch arm to wrap its `rx.recv().await` in
+        // `tokio::time::timeout`. Sources without a configured
+        // timeout fall through to unbounded recv.
+        let idle_timeouts: HashMap<String, std::time::Duration> = source_configs
+            .iter()
+            .filter_map(|s| {
+                s.watermark
+                    .as_ref()
+                    .and_then(|w| w.idle_timeout.map(|d| (s.name.clone(), d)))
+            })
+            .collect();
+
         // `$source.batch` is per-pipeline-run scalar today (sub-issue
         // #54 introduces per-source attribution as a separate stamp).
         let source_batch_arc: Arc<str> = Arc::from(uuid::Uuid::now_v7().to_string());
         let source_ingestion_timestamp = pipeline_start_time;
 
         let strategy = config.error_handling.strategy;
-        // `$source.count` is the pipeline-wide total across every
-        // declared source. Per-source attribution is sub-issue #54.
-        let total_records: u64 = source_records.values().map(|v| v.len() as u64).sum();
-        let source_count: u64 = total_records;
 
         // Name → index map for looking up `CompiledTransform` by node
         // name. Borrowed by the dispatcher's Transform / Aggregation
@@ -1420,45 +1225,35 @@ impl PipelineExecutor {
                 (None, 0)
             };
 
-        // Construct the dispatcher context. Mutable per-walk state
-        // (node_buffers, counters, DLQ, timers, output writers,
-        // output errors, the visited-source set backing the
-        // dual-counter semantic) lives on the context; the immutable
-        // plan-time refs are borrowed for the lifetime of the walk.
-        //
-        // `counters` and `dlq_entries` are taken out of their `&mut`
-        // borrows here, mutated through the dispatcher, and written
-        // back at the end of the walk.
-        let total_per_source: HashMap<Arc<str>, u64> = source_records
+        // Pre-seed each declared source's slot at `None` so the Source
+        // dispatch arm can flip to `Some(n)` at receiver close.
+        // [`MERGED_SOURCE_NAME`] gets its own slot; populated when
+        // every per-source slot is `Some` (see
+        // `ExecutorContext::finalize_source_count`).
+        let mut source_count_per_source: HashMap<Arc<str>, Option<u64>> = source_configs
             .iter()
-            .map(|(name, records)| (Arc::from(name.as_str()), records.len() as u64))
+            .map(|s| (Arc::from(s.name.as_str()), None))
+            .collect();
+        source_count_per_source.insert(Arc::clone(&dispatch::MERGED_SOURCE_NAME), None);
+
+        // Per-source running record count, advanced by the Source
+        // dispatch arm as it canonicalizes each record. Used as the
+        // denominator by the DLQ rate-threshold check
+        // (`check_dlq_rate`); the existing `min_records` floor
+        // prevents false positives on the first few records.
+        let total_per_source: HashMap<Arc<str>, u64> = source_configs
+            .iter()
+            .map(|s| (Arc::from(s.name.as_str()), 0u64))
             .collect();
 
-        // Re-channel each source's drained record set into a fresh
-        // bounded `(Sender, Receiver)` pair so the dispatch loop's
-        // Source arm consumes records through the same
-        // `mpsc::Receiver` interface it would see under live
-        // streaming. Capacity is sized to the source's record count
-        // (with a `.max(1)` to satisfy `channel`'s non-zero
-        // requirement), and the sender is fed synchronously then
-        // dropped so `recv().await` returns `None` once the records
-        // drain.
-        let mut source_records_rx: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>> =
-            HashMap::with_capacity(source_records.len());
-        for (name, records) in source_records.drain() {
-            let (tx, rx) = tokio::sync::mpsc::channel(records.len().max(1));
-            for item in records {
-                if tx.try_send(item).is_err() {
-                    return Err(PipelineError::Internal {
-                        op: "executor",
-                        node: name.clone(),
-                        detail: "source re-channel try_send failed unexpectedly".to_string(),
-                    });
-                }
-            }
-            drop(tx);
-            source_records_rx.insert(name, rx);
-        }
+        // Identify Merge.interleave nodes whose predecessors are all
+        // Sources. Those Source receivers move out of
+        // `ctx.source_records` and into the fused Merge arm's
+        // `tokio::select!` so a slow upstream Source no longer blocks
+        // peer Sources' channels from filling — back-pressure flows
+        // end-to-end. Per-Source arms detect membership in
+        // `fused_sources` and return cleanly.
+        let fused_sources: HashSet<String> = compute_merge_interleave_fused_sources(plan, config);
 
         let mut ctx = dispatch::ExecutorContext {
             config,
@@ -1469,12 +1264,18 @@ impl PipelineExecutor {
             transform_by_name,
             stable: &stable,
             source_batch_arc: &source_batch_arc,
-            source_count,
+            source_count_per_source,
             source_ingestion_timestamp,
             strategy,
 
             node_buffers: HashMap::new(),
-            source_records: source_records_rx,
+            source_records,
+            fused_sources,
+            record_var_seed: &record_var_seed,
+            declared_source_defaults: &declared_source_defaults,
+            channel_source_vars: &params.source_vars,
+            idle_timeouts: &idle_timeouts,
+            source_vars_seeded_files: HashMap::new(),
             writers: writers.single,
             fan_out_writers: writers.fan_out,
             compiled_route,
@@ -1553,7 +1354,11 @@ impl PipelineExecutor {
         let pipeline_spill_root = ctx.spill_root().clone();
 
         // Drain mutable per-walk state out of the context for the
-        // post-walk reporting + caller-facing return tuple.
+        // post-walk reporting + caller-facing return tuple. Pipeline-
+        // wide ingest total is reconstructed from the per-source
+        // running counters the Source dispatch arm advanced — the
+        // pre-drain prologue no longer exists, so we derive it at
+        // exit instead of pre-computing it.
         let transform_timer = ctx.transform_timer;
         let route_timer = ctx.route_timer;
         let projection_timer = ctx.projection_timer;
@@ -1561,6 +1366,7 @@ impl PipelineExecutor {
         let records_emitted = ctx.records_emitted;
         let output_errors = ctx.output_errors;
         let collector = ctx.collector;
+        let total_records: u64 = ctx.total_per_source.values().sum();
         *counters = ctx.counters;
         *dlq_entries = ctx.dlq_entries;
 
@@ -2512,6 +2318,78 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
 /// (no runtime descendants), so the closure forms a well-bounded
 /// init sub-DAG that Pass 1 can run to completion before Pass 2
 /// starts.
+/// Identify Source-node names whose receivers are claimed by a
+/// downstream `Merge.mode: interleave` whose every direct predecessor
+/// is a `PlanNode::Source`. The Merge arm consumes those receivers
+/// via `tokio::select!` so a slow Source no longer blocks peer
+/// Sources' channels from filling. Per-Source dispatch arms whose
+/// name is in this set return cleanly without touching
+/// `ctx.source_records`.
+///
+/// Only triggers when ALL predecessors are Sources. Mixed
+/// predecessors (Source + Transform + ...) keep today's per-arm
+/// drain path — the Merge arm reads from `node_buffers` for those.
+/// Concat-mode Merges keep the per-Source drain too: concat drains
+/// predecessors in declaration order, which the per-arm path
+/// already delivers.
+fn compute_merge_interleave_fused_sources(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    config: &PipelineConfig,
+) -> HashSet<String> {
+    use crate::plan::execution::PlanNode;
+    let mut fused: HashSet<String> = HashSet::new();
+    for node_idx in plan.graph.node_indices() {
+        let PlanNode::Merge {
+            name: merge_name, ..
+        } = &plan.graph[node_idx]
+        else {
+            continue;
+        };
+        let predecessors: Vec<_> = plan
+            .graph
+            .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+            .collect();
+        if predecessors.is_empty() {
+            continue;
+        }
+        let all_sources = predecessors
+            .iter()
+            .all(|p| matches!(&plan.graph[*p], PlanNode::Source { .. }));
+        if !all_sources {
+            continue;
+        }
+        // Look up the Merge's mode + seed in the config side-table
+        // by name. Missing entry (defaulted MergeBody) is Concat.
+        // Seeded interleaves (`interleave_seed: Some(_)`) take the
+        // non-fused path so determinism survives — the fastrand
+        // schedule over a pre-buffered Vec yields the same sequence
+        // across runs, whereas a live-channel select! depends on
+        // tokio scheduling. Unseeded interleaves get fusion +
+        // back-pressure.
+        let (mode, seed) = config
+            .nodes
+            .iter()
+            .find_map(|spanned| match &spanned.value {
+                crate::config::PipelineNode::Merge { header, config }
+                    if header.name == *merge_name =>
+                {
+                    Some((config.mode, config.interleave_seed))
+                }
+                _ => None,
+            })
+            .unwrap_or((crate::config::MergeMode::Concat, None));
+        if !matches!(mode, crate::config::MergeMode::Interleave) || seed.is_some() {
+            continue;
+        }
+        for pred in predecessors {
+            if let PlanNode::Source { name, .. } = &plan.graph[pred] {
+                fused.insert(name.clone());
+            }
+        }
+    }
+    fused
+}
+
 fn compute_init_phase_node_set(
     plan: &crate::plan::execution::ExecutionPlanDag,
 ) -> std::collections::HashSet<petgraph::graph::NodeIndex> {

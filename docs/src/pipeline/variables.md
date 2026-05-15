@@ -59,6 +59,29 @@ Built-in members of each scope (`$source.file`, `$source.row`,
 declaring a user variable with one of those names is rejected at
 parse time.
 
+### `$source.count` semantics
+
+`$source.count` is the **finalized per-source record total** for the
+Source that produced the current record. It is observable only after
+that Source's input stream closes:
+
+- **Mid-stream reads** (records emitted before the Source's input
+  closes — typical of Transform / Route / Window / Merge per-record
+  evaluation) resolve to `Null`. The final count cannot be known
+  before every record has been observed; the engine does not
+  speculate or block.
+- **Post-close reads** (terminal aggregate emits, commit-time
+  deferred dispatch, post-recompute paths, any record emitted after
+  the originating Source's `mpsc::Receiver` returned `None`) resolve
+  to the per-source total.
+
+Pipelines that previously used `$source.count` as a streaming
+denominator (e.g. `value / $source.count`) will now see `Null` from
+that division on mid-stream records. If you need a streaming row
+counter, declare a `scope: source` variable and increment it from a
+`state` writer — that gives you a running count instead of waiting
+for the final.
+
 ## Reading variables
 
 CXL access is identical for declared and built-in keys:

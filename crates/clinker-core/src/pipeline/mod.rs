@@ -5,7 +5,6 @@ pub mod grace_hash;
 pub(crate) mod grace_spill;
 pub mod iejoin;
 pub mod index;
-pub mod ingestion;
 pub mod loser_tree;
 pub mod memory;
 pub mod schema_coerce;

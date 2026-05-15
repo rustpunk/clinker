@@ -4,15 +4,14 @@
 //! per-source FIFO is preserved; cross-source order follows the
 //! seeded fastrand schedule (or a deterministic round-robin when
 //! `interleave_seed` is absent). Live-channel back-pressure ("a slow
-//! upstream doesn't starve a fast one") is not exercised here: the
-//! executor's prologue currently materializes each Source's mpsc
-//! receiver into a per-input deque before the Merge arm runs, so the
-//! Interleave loop reads pre-buffered inputs. Lifting the prologue's
-//! pre-pass is tracked separately from the runtime migration.
+//! upstream doesn't starve a fast one") is exercised by
+//! [`interleave_does_not_block_peer_on_slow_source`] — see that test
+//! for the topology and assertion.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::config::{CompileContext, parse_config};
@@ -213,6 +212,152 @@ async fn seeded_interleave_is_reproducible() {
     );
     assert_per_source_fifo(&first);
     assert_eq!(first.len(), 10);
+}
+
+/// `std::io::Read` adapter that sleeps for `delay` after each CSV
+/// row boundary (newline byte). Lives in `spawn_blocking` alongside
+/// the format reader, so `std::thread::sleep` does not block the
+/// tokio reactor. Used to gate `src_a` so the CSV format reader
+/// yields one row every `delay` while `src_b`'s reader pushes all
+/// rows immediately.
+struct DelayedRowReader {
+    bytes: Vec<u8>,
+    pos: usize,
+    delay: Duration,
+    rows_read: usize,
+}
+
+impl DelayedRowReader {
+    fn new(csv: &str, delay: Duration) -> Self {
+        Self {
+            bytes: csv.as_bytes().to_vec(),
+            pos: 0,
+            delay,
+            rows_read: 0,
+        }
+    }
+}
+
+impl Read for DelayedRowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.bytes.len() {
+            return Ok(0);
+        }
+        // Read up to the next newline (or buffer end), one row at a
+        // time. The CSV format reader buffers internally, but
+        // returning row-bounded chunks keeps the sleep aligned with
+        // record boundaries.
+        let remaining = &self.bytes[self.pos..];
+        let chunk_end = remaining
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(remaining.len());
+        let n = chunk_end.min(buf.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        self.pos += n;
+        // After the buffer ends with a newline, the next read starts
+        // a new row. Sleep before yielding the next row's bytes —
+        // skip the first sleep (header row needs no delay).
+        if n > 0 && remaining[..n].ends_with(b"\n") {
+            self.rows_read += 1;
+            if self.rows_read >= 1 && self.pos < self.bytes.len() {
+                std::thread::sleep(self.delay);
+            }
+        }
+        Ok(n)
+    }
+}
+
+fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
+    FileSlot::new(
+        PathBuf::from(format!("{name}.csv")),
+        Box::new(DelayedRowReader::new(csv, delay)),
+    )
+}
+
+/// Live-channel back-pressure: a slow `src_a` (50 ms sleep at the
+/// reader between every record) does not block `src_b` from
+/// flowing through the Merge.interleave arm.
+///
+/// Pre-rip behavior (sequential per-Source drain): the executor
+/// drains `src_a` fully before reading `src_b`'s channel, so the
+/// Merge round-robin sees both inputs as pre-buffered Vecs and
+/// emits them interleaved (`a-1, b-1, a-2, b-2, …`). Half of
+/// `src_b`'s records appear in the back half of the output stream.
+///
+/// Post-rip (fused `tokio::select!` over both source receivers):
+/// `src_b`'s records arrive into the Merge fold immediately while
+/// `src_a` is still sleeping between rows. The fused arm pulls
+/// every `src_b` record in the first ~5 ms, then waits 50 ms for
+/// each `src_a` record. Result: every `src_b` record sits in the
+/// first half of the output stream.
+///
+/// Discriminator: the position of the last `b-` tag in the output
+/// must be `<= 5` (first half of 10 total records). Sequential
+/// drain places the last `b-` at position 9; fused select! places
+/// it at position 4.
+#[tokio::test(flavor = "multi_thread")]
+async fn interleave_does_not_block_peer_on_slow_source() {
+    use std::time::Instant;
+
+    let yaml = pipeline_yaml("mode: interleave");
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            // 5 records, each preceded by 50 ms — total ~250 ms.
+            vec![slow_slot("a", &src_a_csv(5), Duration::from_millis(50))],
+        ),
+        (
+            "src_b".to_string(),
+            // 5 records, produced as fast as the channel admits.
+            vec![slot("b", &src_b_csv(5))],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let start = Instant::now();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
+            .expect("pipeline executes");
+    let elapsed = start.elapsed();
+
+    assert_eq!(report.counters.dlq_count, 0);
+    let output = buf.as_string();
+    let body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    assert_eq!(body.len(), 10, "expected 10 records, got {body:?}");
+    assert_per_source_fifo(&body);
+
+    // Discriminator assertion: the LAST b-tag must appear in the
+    // first half of the output. Sequential-drain regimes place it
+    // at the back; fused select! places it at the front.
+    let last_b_pos = body
+        .iter()
+        .rposition(|row| tag_of(row).starts_with("b-"))
+        .expect("at least one b-tag in output");
+    assert!(
+        last_b_pos < 5,
+        "Merge.interleave failed to back-pressure: last src_b record \
+         landed at position {last_b_pos} (>=5) in {body:?}. \
+         Pre-rip pre-buffered round-robin places b records throughout \
+         the output; the fused select! path concentrates them at the \
+         front because src_a is still sleeping when src_b finishes \
+         producing."
+    );
+
+    // Sanity: pipeline finished within a reasonable window. 5 ×
+    // 50 ms slow-side delays + overhead should fit well under 2 s
+    // even under CI jitter; failure here suggests something
+    // hangs.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pipeline took {elapsed:?}, expected < 2s",
+    );
 }
 
 /// Two different seeds produce different interleavings. With 8+8

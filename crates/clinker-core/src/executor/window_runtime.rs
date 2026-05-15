@@ -70,36 +70,18 @@ pub(crate) struct WindowRuntimeRegistry {
     /// walks this stack from top to bottom for `ParentNode` lookups
     /// before falling back to `top`.
     pub(crate) active_stack: Vec<CompositionBodyId>,
-    /// Source name → top-level slot index, populated at executor
-    /// start by walking `plan.indices_to_build` and extracting every
-    /// `PlanIndexRoot::Source(name)` slot. `resolve` consults this
-    /// map for source-rooted lookups so a multi-source pipeline can
-    /// materialize each source's arena into its own slot independent
-    /// of declaration order.
-    pub(crate) source_name_to_top_idx: HashMap<String, Vec<usize>>,
 }
 
 impl WindowRuntimeRegistry {
     /// Create a registry sized to the top-level plan's index count.
     /// `top` slots start `None`; operators populate them at their
-    /// dispatch-arm finalize. `source_name_to_top_idx` is populated
-    /// from the spec list so source-rooted lookups never miss a slot
-    /// because of multi-source declaration order.
+    /// dispatch-arm finalize, including Source arms (which anchor
+    /// their windows at the Source's own `NodeIndex`).
     pub(crate) fn new(specs: &[crate::plan::index::IndexSpec]) -> Self {
-        let mut source_name_to_top_idx: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, spec) in specs.iter().enumerate() {
-            if let PlanIndexRoot::Source(name) = &spec.root {
-                source_name_to_top_idx
-                    .entry(name.clone())
-                    .or_default()
-                    .push(i);
-            }
-        }
         Self {
             top: (0..specs.len()).map(|_| None).collect(),
             bodies: HashMap::new(),
             active_stack: Vec::new(),
-            source_name_to_top_idx,
         }
     }
 
@@ -108,10 +90,6 @@ impl WindowRuntimeRegistry {
     /// the body's spec position for body-internal lookups.
     ///
     /// Resolution rules:
-    /// - `Source(name)`: consult `source_name_to_top_idx` for the
-    ///   slot list, return the first populated slot. Falls through
-    ///   to direct `top[idx]` if the side map miss is silent (e.g.
-    ///   stale `idx` from a body context).
     /// - `Node { .. }`: prefer the active body's vec[idx] if
     ///   present and populated; otherwise `top[idx]`.
     /// - `ParentNode { .. }`: walk `active_stack` for any body
@@ -120,16 +98,6 @@ impl WindowRuntimeRegistry {
     ///   ParentNode rooting points at).
     pub(crate) fn resolve(&self, root: &PlanIndexRoot, idx: usize) -> Option<&WindowRuntime> {
         match root {
-            PlanIndexRoot::Source(name) => {
-                if let Some(slot_idxs) = self.source_name_to_top_idx.get(name)
-                    && let Some(&slot) = slot_idxs
-                        .iter()
-                        .find(|&&s| self.top.get(s).map(|o| o.is_some()).unwrap_or(false))
-                {
-                    return self.top.get(slot).and_then(|o| o.as_ref());
-                }
-                self.top.get(idx).and_then(|o| o.as_ref())
-            }
             PlanIndexRoot::Node { .. } => {
                 if let Some(&body_id) = self.active_stack.last()
                     && let Some(body_vec) = self.bodies.get(&body_id)

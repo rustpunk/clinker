@@ -2291,7 +2291,40 @@ impl PipelineConfig {
             }
 
             let root = if let Some(other) = cross_source {
-                crate::plan::index::PlanIndexRoot::Source(other)
+                // Cross-source window: resolve the referenced source's
+                // `NodeIndex` in the same DAG. E150c (above) has already
+                // guaranteed the referenced source is at an earlier
+                // ingestion tier, so by topo order its node-rooted
+                // arena is populated by its Source dispatch arm before
+                // this window-bearing transform runs.
+                let Some(&other_idx) = name_to_idx.get(other.as_str()) else {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "windowed transform '{}' references cross-source '{}' \
+                             which is not a known node in the plan",
+                            transform_name, other
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                };
+                let Some(anchor_schema) = graph[other_idx].stored_output_schema().cloned() else {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "windowed transform '{}' references cross-source '{}' \
+                             whose Source node has no output schema",
+                            transform_name, other
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                };
+                crate::plan::index::PlanIndexRoot::Node {
+                    upstream: other_idx,
+                    anchor_schema,
+                }
             } else {
                 let pred_idx = match graph
                     .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
@@ -2326,15 +2359,6 @@ impl PipelineConfig {
                             LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                         ));
                         return Err(diags);
-                    }
-                    crate::plan::execution::PlanNode::Source { name, .. } => {
-                        // Source-rooted: `wc.source` is `None` (or matches
-                        // the primary) and the immediate non-pass-through
-                        // ancestor is a `Source`. The arena builds at
-                        // Phase-0 from that source's stream — source-rooted
-                        // lookups go through the source name in
-                        // `pipeline/ingestion.rs`.
-                        crate::plan::index::PlanIndexRoot::Source(name.clone())
                     }
                     other => {
                         let Some(anchor_schema) = other.stored_output_schema().cloned() else {
@@ -2425,18 +2449,15 @@ impl PipelineConfig {
                 }
             };
 
-            let already_sorted = match &root {
-                crate::plan::index::PlanIndexRoot::Source(name) => {
-                    crate::plan::execution::check_already_sorted(&source_configs, name, &wc.sort_by)
-                }
-                // Node-rooted / parent-node-rooted arenas have no
-                // declared source ordering — partitions are sorted
-                // post-build at the upstream-arm exit. Treat as
-                // unsorted; the executor's per-partition `sort_partition`
-                // call normalizes the slice before window evaluation.
-                crate::plan::index::PlanIndexRoot::Node { .. }
-                | crate::plan::index::PlanIndexRoot::ParentNode { .. } => false,
-            };
+            // Node-rooted / parent-node-rooted arenas have no
+            // declared source ordering — partitions are sorted
+            // post-build at the upstream-arm exit. The executor's
+            // per-partition `sort_partition` call normalizes the
+            // slice before window evaluation; declared
+            // `sort_order:` on a Source no longer skips it because
+            // Source-rooted arenas no longer exist as a runtime
+            // category.
+            let already_sorted = false;
 
             raw_index_requests.push(crate::plan::index::RawIndexRequest {
                 root,
@@ -2475,7 +2496,16 @@ impl PipelineConfig {
                 .filter(|s| s.as_str() != primary_source_str)
                 .cloned();
             let root = if let Some(other) = cross_source {
-                crate::plan::index::PlanIndexRoot::Source(other)
+                let Some(&other_idx) = name_to_idx.get(other.as_str()) else {
+                    continue;
+                };
+                let Some(anchor_schema) = graph[other_idx].stored_output_schema().cloned() else {
+                    continue;
+                };
+                crate::plan::index::PlanIndexRoot::Node {
+                    upstream: other_idx,
+                    anchor_schema,
+                }
             } else {
                 let pred_idx = match graph
                     .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
@@ -2486,19 +2516,12 @@ impl PipelineConfig {
                 };
                 let rooted_idx =
                     crate::plan::execution::first_non_passthrough_ancestor(&graph, pred_idx);
-                match &graph[rooted_idx] {
-                    crate::plan::execution::PlanNode::Source { name, .. } => {
-                        crate::plan::index::PlanIndexRoot::Source(name.clone())
-                    }
-                    other => {
-                        let Some(anchor_schema) = other.stored_output_schema().cloned() else {
-                            continue;
-                        };
-                        crate::plan::index::PlanIndexRoot::Node {
-                            upstream: rooted_idx,
-                            anchor_schema,
-                        }
-                    }
+                let Some(anchor_schema) = graph[rooted_idx].stored_output_schema().cloned() else {
+                    continue;
+                };
+                crate::plan::index::PlanIndexRoot::Node {
+                    upstream: rooted_idx,
+                    anchor_schema,
                 }
             };
             let new_window_index =
@@ -2895,23 +2918,52 @@ impl PipelineConfig {
                 {
                     // Two disjoint reasons E150 lifts:
                     //
-                    // 1. Node-rooted / ParentNode-rooted spec: the
-                    //    arena materializes from the upstream operator's
-                    //    emit buffer, not from per-CK-group source rows,
-                    //    so the original "per-group arena construction"
-                    //    concern does not apply. CK-aligned partitions
-                    //    fall under this case.
-                    // 2. Source-rooted spec in buffer-recompute mode:
-                    //    the orchestrator's commit phase reruns the
-                    //    window over surviving partition rows after a
-                    //    CK group is retracted, so the source-rooted
-                    //    arena is safe to materialize.
+                    // 1. Window anchored at a non-Source upstream
+                    //    (Aggregate, Combine, Transform, etc.) — the
+                    //    arena materializes from that operator's emit
+                    //    buffer, not from per-CK-group source rows,
+                    //    so the per-group arena concern does not
+                    //    apply. CK-aligned partitions fall here.
+                    // 2. Window anchored at a Source in buffer-
+                    //    recompute mode — the orchestrator's commit
+                    //    phase reruns the window over surviving
+                    //    partition rows after a CK group is
+                    //    retracted, so anchoring at a CK-bearing
+                    //    Source is still safe.
+                    //
+                    // The unsafe case is a window whose
+                    // `PlanIndexRoot::Node { upstream, .. }` points
+                    // at a Source whose `correlation_key:` is
+                    // declared, without buffer-recompute.
                     let safe = dag
                         .indices_to_build
                         .get(*idx_num)
                         .map(|s| {
-                            !matches!(s.root, crate::plan::index::PlanIndexRoot::Source(_))
-                                || s.requires_buffer_recompute
+                            let upstream_is_correlated_source = match &s.root {
+                                crate::plan::index::PlanIndexRoot::Node { upstream, .. }
+                                | crate::plan::index::PlanIndexRoot::ParentNode {
+                                    upstream, ..
+                                } => {
+                                    let upstream_node = &dag.graph[*upstream];
+                                    if let crate::plan::execution::PlanNode::Source {
+                                        name: source_name,
+                                        ..
+                                    } = upstream_node
+                                    {
+                                        self.nodes.iter().any(|spanned| {
+                                            matches!(
+                                                &spanned.value,
+                                                PipelineNode::Source { header, config }
+                                                if header.name == *source_name
+                                                    && config.correlation_key.is_some()
+                                            )
+                                        })
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
+                            !upstream_is_correlated_source || s.requires_buffer_recompute
                         })
                         .unwrap_or(false);
                     if safe {
