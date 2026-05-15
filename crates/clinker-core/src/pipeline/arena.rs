@@ -154,6 +154,8 @@ impl Arena {
             fields.iter().map(|f| anchor_schema.index(f)).collect();
         let records =
             project_records_into_minimal(rows.iter().map(|(r, _)| r), &field_indices, budget)?;
+        #[cfg(debug_assertions)]
+        debug_assert_uniform_column_variants(&schema, &records);
         Ok(Arena { schema, records })
     }
 
@@ -242,6 +244,48 @@ pub(crate) fn estimated_size(record: &MinimalRecord) -> usize {
         })
         .sum();
     base + fields
+}
+
+/// Guards the assumption that upstream operators emit `Record`s whose
+/// `Value` variants are uniform per column before they reach a
+/// node-rooted `Arena::from_records`. Coercion lives at the source
+/// boundary (`wrap_with_schema_coercion`); operators in between
+/// preserve the variant by construction. A partial-coercion regression
+/// surfaces here as a per-column variant mismatch between rows. Null
+/// is exempted because it is the unit element for every type.
+#[cfg(debug_assertions)]
+fn debug_assert_uniform_column_variants(schema: &Arc<Schema>, records: &[MinimalRecord]) {
+    let column_count = schema.column_count();
+    let mut expected: Vec<Option<&'static str>> = vec![None; column_count];
+    for (row, rec) in records.iter().enumerate() {
+        for (col, slot) in expected.iter_mut().enumerate() {
+            let Some(v) = rec.get(col) else { continue };
+            let tag = match v {
+                Value::Null => continue,
+                Value::Bool(_) => "Bool",
+                Value::Integer(_) => "Integer",
+                Value::Float(_) => "Float",
+                Value::String(_) => "String",
+                Value::Date(_) => "Date",
+                Value::DateTime(_) => "DateTime",
+                Value::Array(_) => "Array",
+                Value::Map(_) => "Map",
+            };
+            match *slot {
+                None => *slot = Some(tag),
+                Some(prev) if prev == tag => {}
+                Some(prev) => {
+                    let column_name = schema.column_name(col).unwrap_or("?");
+                    panic!(
+                        "Arena::from_records: column `{column_name}` variant drift at row {row}: \
+                         saw {prev} earlier, now {tag}. \
+                         Upstream coercion (wrap_with_schema_coercion or operator emit) \
+                         must produce a uniform Value variant per column."
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Errors from Arena construction.
@@ -634,5 +678,25 @@ mod tests {
             }
             other => panic!("expected MemoryBudgetExceeded from shared budget; got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_records_passes_uniform_column_variants() {
+        use clinker_record::Record;
+        let schema = Arc::new(Schema::new(vec!["id".into(), "name".into()]));
+        let rows: Vec<(Record, u64)> = (0..50)
+            .map(|i| {
+                let v = if i % 5 == 0 {
+                    vec![Value::Integer(i), Value::Null]
+                } else {
+                    vec![Value::Integer(i), Value::String(format!("r{i}").into())]
+                };
+                (Record::new(Arc::clone(&schema), v), i as u64)
+            })
+            .collect();
+        let mut budget = MemoryBudget::new(u64::MAX, 1.0);
+        let arena = Arena::from_records(&rows, &["id".into(), "name".into()], &schema, &mut budget)
+            .expect("uniform-variant arena builds");
+        assert_eq!(arena.record_count(), 50);
     }
 }
