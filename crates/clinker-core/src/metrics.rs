@@ -14,6 +14,7 @@
 //! The `collect_spool` function provides the sweep-and-append logic used by
 //! `clinker metrics collect`.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -29,9 +30,11 @@ use serde::{Deserialize, Serialize};
 pub struct ExecutionMetrics {
     /// UUID v7 identifying this execution. Reuses `RecordProvenance.source_batch`.
     pub execution_id: String,
-    /// Schema version for forward/backward compatibility. Currently `2`:
-    /// `records_written` was split out from `records_ok` to separate
-    /// source-record success from total sink writes.
+    /// Schema version for forward/backward compatibility. Currently `3`:
+    /// added per-source breakdowns (`per_source_record_counts`,
+    /// `per_source_dlq_counts`). Version `2` split `records_written`
+    /// out from `records_ok`; older spool files are now rejected by
+    /// `collect_spool`.
     pub schema_version: u32,
     /// Pipeline name from `pipeline.name` in the YAML config.
     pub pipeline_name: String,
@@ -84,6 +87,16 @@ pub struct ExecutionMetrics {
     /// counters landed; old files round-trip with every field zero.
     #[serde(default)]
     pub retraction: RetractionMetrics,
+    /// Finalized per-source ingest record counts at run completion,
+    /// keyed by Source-node name. Mirrors
+    /// `ExecutionReport.per_source_record_counts` field-for-field;
+    /// see that doc for absent-key semantics.
+    pub per_source_record_counts: BTreeMap<String, u64>,
+    /// Per-source DLQ entry counts at run completion, keyed by
+    /// Source-node name. Mirrors
+    /// `ExecutionReport.per_source_dlq_counts` field-for-field;
+    /// sources with zero DLQ entries are absent.
+    pub per_source_dlq_counts: BTreeMap<String, u64>,
 }
 
 /// Cross-pipeline shape of the retraction-phase counters surfaced via
@@ -217,7 +230,7 @@ pub fn collect_spool(spool_dir: &Path) -> io::Result<impl Iterator<Item = SpoolE
             }
         };
 
-        if metrics.schema_version != 2 {
+        if metrics.schema_version != 3 {
             tracing::warn!(
                 path = %path.display(),
                 schema_version = metrics.schema_version,
@@ -277,7 +290,7 @@ mod tests {
         let now = Utc::now();
         ExecutionMetrics {
             execution_id: id.to_string(),
-            schema_version: 2,
+            schema_version: 3,
             pipeline_name: "test-pipeline".into(),
             config_path: "/tmp/pipeline.yaml".into(),
             hostname: "test-host".into(),
@@ -297,6 +310,8 @@ mod tests {
             dlq_path: Some("dlq.csv".into()),
             error: None,
             retraction: RetractionMetrics::default(),
+            per_source_record_counts: BTreeMap::new(),
+            per_source_dlq_counts: BTreeMap::new(),
         }
     }
 
@@ -333,7 +348,7 @@ mod tests {
         let parsed: ExecutionMetrics = serde_json::from_reader(file).unwrap();
 
         assert_eq!(parsed.execution_id, id);
-        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.schema_version, 3);
         assert_eq!(parsed.pipeline_name, "test-pipeline");
         assert_eq!(parsed.records_total, 100);
         assert_eq!(parsed.records_ok, 99);
