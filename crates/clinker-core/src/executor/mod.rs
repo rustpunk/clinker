@@ -2391,6 +2391,22 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
     parent.join(filename).to_string_lossy().into_owned()
 }
 
+/// Reports whether `idx` has exactly one outgoing edge in `plan`. The
+/// streaming-fusion classifiers reject fan-out at the upstream side —
+/// a Source feeding two consumers cannot move its live receiver into
+/// one of them, and a Merge whose merged stream is read by siblings
+/// must stay on the buffered path so those siblings see the records
+/// via `node_buffers`.
+fn has_single_outgoing(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    idx: petgraph::graph::NodeIndex,
+) -> bool {
+    plan.graph
+        .neighbors_directed(idx, petgraph::Direction::Outgoing)
+        .count()
+        == 1
+}
+
 /// Build the pipeline-stable evaluation context.
 ///
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
@@ -2546,11 +2562,7 @@ fn compute_transform_fused_sources(
         if merge_fused.contains(source_name) {
             continue;
         }
-        let downstream_count = plan
-            .graph
-            .neighbors_directed(pred_idx, petgraph::Direction::Outgoing)
-            .count();
-        if downstream_count != 1 {
+        if !has_single_outgoing(plan, pred_idx) {
             continue;
         }
         extra_fused_sources.insert(source_name.clone());
@@ -2664,11 +2676,7 @@ fn compute_streaming_output_specs(
         // The Merge has exactly one outgoing edge (this Output). Anything
         // else and the buffered path is needed so siblings still see the
         // merged records via `node_buffers`.
-        let merge_downstream_count = plan
-            .graph
-            .neighbors_directed(merge_idx, petgraph::Direction::Outgoing)
-            .count();
-        if merge_downstream_count != 1 {
+        if !has_single_outgoing(plan, merge_idx) {
             continue;
         }
 
