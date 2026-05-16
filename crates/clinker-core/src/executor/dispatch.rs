@@ -339,6 +339,61 @@ fn record_error_to_buffer_if_grouped(
     });
     true
 }
+
+/// Dispatch a Transform CXL evaluation failure through the shared
+/// error path used by every Transform call site.
+///
+/// Both the fused and buffered Transform arms route eval errors through
+/// the same three-way decision: under [`ErrorStrategy::FailFast`] the
+/// error propagates immediately; with correlation buffering active the
+/// row is parked under its group cell so the group's success/failure
+/// stays atomic; otherwise the row is pushed to the run-scoped DLQ with
+/// the offending field/value attached. Folding the duplicated arm body
+/// here keeps the three-way precedence honored in one place — any
+/// future change to how Transform eval errors are routed lands here
+/// rather than having to be mirrored across arms.
+fn dispatch_transform_eval_error(
+    ctx: &mut ExecutorContext<'_>,
+    record: Record,
+    row_num: u64,
+    transform_name: String,
+    eval_err: cxl::eval::EvalError,
+) -> Result<(), PipelineError> {
+    if ctx.strategy == ErrorStrategy::FailFast {
+        return Err(eval_err.into());
+    }
+    let stage = Some(DlqEntry::stage_transform(&transform_name));
+    let routed = record_error_to_buffer_if_grouped(
+        ctx,
+        &record,
+        row_num,
+        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        eval_err.to_string(),
+        stage.clone(),
+        None,
+    );
+    if routed {
+        return Ok(());
+    }
+    let source_name = source_name_arc_of(&record);
+    let triggering_field = eval_err.triggering_field.clone();
+    let triggering_value = eval_err.triggering_value();
+    push_dlq(
+        ctx,
+        DlqEntry {
+            source_row: row_num,
+            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+            error_message: eval_err.to_string(),
+            original_record: record,
+            stage,
+            route: None,
+            trigger: true,
+            source_name,
+            triggering_field,
+            triggering_value,
+        },
+    )
+}
 use crate::aggregation::AggregateStrategy;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
@@ -1708,39 +1763,7 @@ pub(crate) async fn transform_fused_consume(
                     advance_cursor(ctx, &source_name_arc_of(&rec), rn);
                 }
                 Err((transform_name, eval_err)) => {
-                    if ctx.strategy == ErrorStrategy::FailFast {
-                        return Err(eval_err.into());
-                    }
-                    let stage = Some(DlqEntry::stage_transform(&transform_name));
-                    let routed = record_error_to_buffer_if_grouped(
-                        ctx,
-                        &rec,
-                        rn,
-                        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                        eval_err.to_string(),
-                        stage.clone(),
-                        None,
-                    );
-                    if !routed {
-                        let dlq_source_name = source_name_arc_of(&rec);
-                        let triggering_field = eval_err.triggering_field.clone();
-                        let triggering_value = eval_err.triggering_value();
-                        push_dlq(
-                            ctx,
-                            DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: eval_err.to_string(),
-                                original_record: rec,
-                                stage,
-                                route: None,
-                                trigger: true,
-                                source_name: dlq_source_name,
-                                triggering_field,
-                                triggering_value,
-                            },
-                        )?;
-                    }
+                    dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
                 }
             }
         } else {
@@ -2142,39 +2165,7 @@ pub(crate) async fn dispatch_plan_node(
                         advance_cursor(ctx, &source_name_arc_of(&record), rn);
                     }
                     Err((transform_name, eval_err)) => {
-                        if ctx.strategy == ErrorStrategy::FailFast {
-                            return Err(eval_err.into());
-                        }
-                        let stage = Some(DlqEntry::stage_transform(&transform_name));
-                        let routed = record_error_to_buffer_if_grouped(
-                            ctx,
-                            &record,
-                            rn,
-                            crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            eval_err.to_string(),
-                            stage.clone(),
-                            None,
-                        );
-                        if !routed {
-                            let source_name = source_name_arc_of(&record);
-                            let triggering_field = eval_err.triggering_field.clone();
-                            let triggering_value = eval_err.triggering_value();
-                            push_dlq(
-                                ctx,
-                                DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record,
-                                    stage,
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                    triggering_field,
-                                    triggering_value,
-                                },
-                            )?;
-                        }
+                        dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
                     }
                 }
             }
