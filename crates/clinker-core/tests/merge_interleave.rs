@@ -9,19 +9,22 @@
 //! for the topology and assertion.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clinker_bench_support::io::SharedBuffer;
+use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
+    FileSlot::new(PathBuf::from(format!("{name}.csv")), fast_reader(csv))
+}
+
+fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
     FileSlot::new(
         PathBuf::from(format!("{name}.csv")),
-        Box::new(Cursor::new(csv.as_bytes().to_vec())),
+        slow_reader(csv, delay),
     )
 }
 
@@ -212,68 +215,6 @@ async fn seeded_interleave_is_reproducible() {
     );
     assert_per_source_fifo(&first);
     assert_eq!(first.len(), 10);
-}
-
-/// `std::io::Read` adapter that sleeps for `delay` after each CSV
-/// row boundary (newline byte). Lives in `spawn_blocking` alongside
-/// the format reader, so `std::thread::sleep` does not block the
-/// tokio reactor. Used to gate `src_a` so the CSV format reader
-/// yields one row every `delay` while `src_b`'s reader pushes all
-/// rows immediately.
-struct DelayedRowReader {
-    bytes: Vec<u8>,
-    pos: usize,
-    delay: Duration,
-    rows_read: usize,
-}
-
-impl DelayedRowReader {
-    fn new(csv: &str, delay: Duration) -> Self {
-        Self {
-            bytes: csv.as_bytes().to_vec(),
-            pos: 0,
-            delay,
-            rows_read: 0,
-        }
-    }
-}
-
-impl Read for DelayedRowReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.bytes.len() {
-            return Ok(0);
-        }
-        // Read up to the next newline (or buffer end), one row at a
-        // time. The CSV format reader buffers internally, but
-        // returning row-bounded chunks keeps the sleep aligned with
-        // record boundaries.
-        let remaining = &self.bytes[self.pos..];
-        let chunk_end = remaining
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(remaining.len());
-        let n = chunk_end.min(buf.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        self.pos += n;
-        // After the buffer ends with a newline, the next read starts
-        // a new row. Sleep before yielding the next row's bytes —
-        // skip the first sleep (header row needs no delay).
-        if n > 0 && remaining[..n].ends_with(b"\n") {
-            self.rows_read += 1;
-            if self.rows_read >= 1 && self.pos < self.bytes.len() {
-                std::thread::sleep(self.delay);
-            }
-        }
-        Ok(n)
-    }
-}
-
-fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
-    FileSlot::new(
-        PathBuf::from(format!("{name}.csv")),
-        Box::new(DelayedRowReader::new(csv, delay)),
-    )
 }
 
 /// Live-channel back-pressure: a slow `src_a` (50 ms sleep at the

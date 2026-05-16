@@ -27,20 +27,17 @@
 //!    scheduler is non-deterministic.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use clinker_bench_support::io::SharedBuffer;
+use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
-    FileSlot::new(
-        PathBuf::from(format!("{name}.csv")),
-        Box::new(Cursor::new(csv.as_bytes().to_vec())),
-    )
+    FileSlot::new(PathBuf::from(format!("{name}.csv")), fast_reader(csv))
 }
 
 fn writer(buf: &SharedBuffer) -> Box<dyn Write + Send> {
@@ -116,55 +113,10 @@ fn src_b_csv(count: u32) -> String {
     s
 }
 
-/// `std::io::Read` adapter that sleeps for `delay` after each CSV row
-/// boundary. Same shape as `merge_interleave.rs::DelayedRowReader`;
-/// copied here to keep tests independent.
-struct DelayedRowReader {
-    bytes: Vec<u8>,
-    pos: usize,
-    delay: Duration,
-    rows_read: usize,
-}
-
-impl DelayedRowReader {
-    fn new(csv: &str, delay: Duration) -> Self {
-        Self {
-            bytes: csv.as_bytes().to_vec(),
-            pos: 0,
-            delay,
-            rows_read: 0,
-        }
-    }
-}
-
-impl Read for DelayedRowReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.bytes.len() {
-            return Ok(0);
-        }
-        let remaining = &self.bytes[self.pos..];
-        let chunk_end = remaining
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(remaining.len());
-        let n = chunk_end.min(buf.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        self.pos += n;
-        if n > 0 && remaining[..n].ends_with(b"\n") {
-            self.rows_read += 1;
-            if self.rows_read >= 1 && self.pos < self.bytes.len() {
-                std::thread::sleep(self.delay);
-            }
-        }
-        Ok(n)
-    }
-}
-
 fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
     FileSlot::new(
         PathBuf::from(format!("{name}.csv")),
-        Box::new(DelayedRowReader::new(csv, delay)),
+        slow_reader(csv, delay),
     )
 }
 
