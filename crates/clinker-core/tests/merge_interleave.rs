@@ -9,19 +9,22 @@
 //! for the topology and assertion.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clinker_bench_support::io::SharedBuffer;
+use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
+    FileSlot::new(PathBuf::from(format!("{name}.csv")), fast_reader(csv))
+}
+
+fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
     FileSlot::new(
         PathBuf::from(format!("{name}.csv")),
-        Box::new(Cursor::new(csv.as_bytes().to_vec())),
+        slow_reader(csv, delay),
     )
 }
 
@@ -214,68 +217,6 @@ async fn seeded_interleave_is_reproducible() {
     assert_eq!(first.len(), 10);
 }
 
-/// `std::io::Read` adapter that sleeps for `delay` after each CSV
-/// row boundary (newline byte). Lives in `spawn_blocking` alongside
-/// the format reader, so `std::thread::sleep` does not block the
-/// tokio reactor. Used to gate `src_a` so the CSV format reader
-/// yields one row every `delay` while `src_b`'s reader pushes all
-/// rows immediately.
-struct DelayedRowReader {
-    bytes: Vec<u8>,
-    pos: usize,
-    delay: Duration,
-    rows_read: usize,
-}
-
-impl DelayedRowReader {
-    fn new(csv: &str, delay: Duration) -> Self {
-        Self {
-            bytes: csv.as_bytes().to_vec(),
-            pos: 0,
-            delay,
-            rows_read: 0,
-        }
-    }
-}
-
-impl Read for DelayedRowReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.bytes.len() {
-            return Ok(0);
-        }
-        // Read up to the next newline (or buffer end), one row at a
-        // time. The CSV format reader buffers internally, but
-        // returning row-bounded chunks keeps the sleep aligned with
-        // record boundaries.
-        let remaining = &self.bytes[self.pos..];
-        let chunk_end = remaining
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(remaining.len());
-        let n = chunk_end.min(buf.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        self.pos += n;
-        // After the buffer ends with a newline, the next read starts
-        // a new row. Sleep before yielding the next row's bytes —
-        // skip the first sleep (header row needs no delay).
-        if n > 0 && remaining[..n].ends_with(b"\n") {
-            self.rows_read += 1;
-            if self.rows_read >= 1 && self.pos < self.bytes.len() {
-                std::thread::sleep(self.delay);
-            }
-        }
-        Ok(n)
-    }
-}
-
-fn slow_slot(name: &str, csv: &str, delay: Duration) -> FileSlot {
-    FileSlot::new(
-        PathBuf::from(format!("{name}.csv")),
-        Box::new(DelayedRowReader::new(csv, delay)),
-    )
-}
-
 /// Live-channel back-pressure: a slow `src_a` (50 ms sleep at the
 /// reader between every record) does not block `src_b` from
 /// flowing through the Merge.interleave arm.
@@ -357,6 +298,268 @@ async fn interleave_does_not_block_peer_on_slow_source() {
     assert!(
         elapsed < Duration::from_secs(2),
         "pipeline took {elapsed:?}, expected < 2s",
+    );
+}
+
+/// Four-Source `mode: interleave` pipeline YAML. Each Source emits
+/// the same two-column schema (`id, tag`) so they share an
+/// `output_schema` at the Merge boundary. Output sinks to `out`.
+fn pipeline_yaml_four_sources() -> String {
+    r#"
+pipeline:
+  name: merge_interleave_fairness_four
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: src_c
+    config:
+      name: src_c
+      type: csv
+      path: c.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: src_d
+    config:
+      name: src_d
+      type: csv
+      path: d.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: merge
+    name: merged
+    inputs: [src_a, src_b, src_c, src_d]
+    config:
+      mode: interleave
+  - type: output
+    name: out
+    input: merged
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    .to_string()
+}
+
+/// CSV body for a tag-prefixed source: `id` is the row number,
+/// `tag` is `"{prefix}-{N}"`. Mirrors `src_a_csv` / `src_b_csv` but
+/// parametric over the prefix so the four-source fairness test can
+/// build `a-*`, `b-*`, `c-*`, `d-*` streams from the same routine.
+fn tagged_csv(prefix: char, count: u32) -> String {
+    let mut s = String::from("id,tag\n");
+    for i in 1..=count {
+        s.push_str(&format!("{i},{prefix}-{i}\n"));
+    }
+    s
+}
+
+/// Generalized per-source FIFO check for an arbitrary set of tag
+/// prefixes. Each source's subsequence in `body` (rows whose tag
+/// begins `{prefix}-`) must be strictly increasing in the numeric
+/// suffix. Cross-source order is unconstrained.
+fn assert_per_source_fifo_n(body: &[String], prefixes: &[char]) {
+    let mut last: HashMap<char, u32> = prefixes.iter().map(|p| (*p, 0u32)).collect();
+    for row in body {
+        let tag = tag_of(row);
+        let prefix = tag.chars().next().expect("tag has at least one char");
+        assert!(
+            prefixes.contains(&prefix),
+            "unexpected tag prefix `{prefix}` in row {row:?}; \
+             allowed: {prefixes:?}"
+        );
+        let n: u32 = tag
+            .strip_prefix(&format!("{prefix}-"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("tag does not match `{prefix}-N`: {tag:?}"));
+        let prev = *last.get(&prefix).unwrap();
+        assert!(
+            n > prev,
+            "src_{prefix} subsequence not FIFO: saw {tag} after {prefix}-{prev}",
+        );
+        last.insert(prefix, n);
+    }
+}
+
+/// Multi-source fairness under live `Merge.interleave` with four
+/// Source predecessors at mixed produce rates.
+///
+/// Topology: src_a (0 ms / row), src_b (10 ms), src_c (25 ms),
+/// src_d (50 ms), 10 rows each, all feeding one `merge.interleave`
+/// into a CSV sink.
+///
+/// Surfaces any fairness regression in the fused arm's round-robin
+/// poll cursor (`dispatch.rs::merge_fused_interleave`) before #74
+/// extends the same pattern to Transform-arm predecessors. The
+/// invariants below are what the live-channel design promises:
+///
+/// 1. **Per-source FIFO** survives for every source (each source's
+///    records appear in `1, 2, …, 10` order — cross-source order is
+///    unconstrained).
+/// 2. **No starvation:** every source's final record (`{prefix}-10`)
+///    reaches output. If the merge dropped a closed receiver early,
+///    a source's tail would go missing.
+/// 3. **Parallel ingest, not serialized:** total wall-clock runtime
+///    is bounded by the slowest source's runtime plus modest
+///    overhead — `concat`-style serialization across the four would
+///    sum to ~850 ms; live interleave should land well under that.
+/// 4. **No single source monopolizes a contiguous tail:** in
+///    particular, the slowest source's records spread across the
+///    second half of the output. (The fastest source's records
+///    necessarily cluster early — `0 ms / row` means src_a fully
+///    drains within microseconds while peers are still on their
+///    first inter-row sleep. Asserting it lands in both quartiles
+///    would require artificial pacing antagonistic to live ingest;
+///    the slowest-source spread is the spec-meaningful direction.)
+#[tokio::test(flavor = "multi_thread")]
+async fn interleave_fairness_under_four_predecessors() {
+    use std::time::Instant;
+
+    let yaml = pipeline_yaml_four_sources();
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            vec![slow_slot(
+                "a",
+                &tagged_csv('a', 10),
+                Duration::from_millis(0),
+            )],
+        ),
+        (
+            "src_b".to_string(),
+            vec![slow_slot(
+                "b",
+                &tagged_csv('b', 10),
+                Duration::from_millis(10),
+            )],
+        ),
+        (
+            "src_c".to_string(),
+            vec![slow_slot(
+                "c",
+                &tagged_csv('c', 10),
+                Duration::from_millis(25),
+            )],
+        ),
+        (
+            "src_d".to_string(),
+            vec![slow_slot(
+                "d",
+                &tagged_csv('d', 10),
+                Duration::from_millis(50),
+            )],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let start = Instant::now();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .await
+            .expect("pipeline executes");
+    let elapsed = start.elapsed();
+
+    assert_eq!(report.counters.dlq_count, 0);
+    let output = buf.as_string();
+    let body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    assert_eq!(body.len(), 40, "expected 40 records (10 × 4), got {body:?}");
+
+    // Invariant 1 — per-source FIFO for all four sources.
+    assert_per_source_fifo_n(&body, &['a', 'b', 'c', 'd']);
+
+    // Invariant 2 — no starvation: every source's last record appears.
+    for prefix in ['a', 'b', 'c', 'd'] {
+        let last_tag = format!("{prefix}-10");
+        assert!(
+            body.iter().any(|r| tag_of(r) == last_tag),
+            "src_{prefix}'s tail record `{last_tag}` missing from output {body:?}",
+        );
+        let count = body
+            .iter()
+            .filter(|r| tag_of(r).starts_with(&format!("{prefix}-")))
+            .count();
+        assert_eq!(
+            count, 10,
+            "src_{prefix} contributed {count} records, expected 10"
+        );
+    }
+
+    // Invariant 3 — parallel ingest. Slowest source alone runs
+    // 10 × 50 ms = ~500 ms; `concat`-style serialization across
+    // all four would sum to ~850 ms. Allow generous headroom for
+    // CI jitter while still proving the inputs run in parallel.
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "pipeline took {elapsed:?}, expected < 800 ms — \
+         predecessors appear to be serialized rather than ingested in parallel"
+    );
+
+    // Invariant 4 — the slowest source's records span the second
+    // half of the output. With src_d producing one record every
+    // 50 ms over a ~500 ms run and faster peers fully drained
+    // earlier, at least one src_d record must land in the back
+    // half of the merged stream (positions 20..40). If the merge
+    // ever decided to buffer src_d to completion before emitting
+    // a peer-finished signal, src_d's records would land at the
+    // tail; if it ever pre-buffered all sources, they'd land
+    // wherever the round-robin cursor places them. Either
+    // regression breaks live back-pressure.
+    let half = body.len() / 2;
+    let d_in_back_half = body[half..].iter().any(|r| tag_of(r).starts_with("d-"));
+    assert!(
+        d_in_back_half,
+        "slowest source src_d has no record in the back half of output {body:?} — \
+         live interleave should spread the slow source across the full run",
+    );
+
+    // Invariant 4b — no source's records form one giant
+    // contiguous block. The fairness regression of concern is
+    // "merge greedily drains one channel before turning to the
+    // next." Reject any run of more than 12 same-prefix rows
+    // (more than 30% of the output is one source) — that's a
+    // generous margin over the natural 10-record bound per
+    // source, allowing for the early src_a cluster.
+    let mut run_prefix: Option<char> = None;
+    let mut run_len = 0usize;
+    let mut max_run = 0usize;
+    for row in &body {
+        let p = tag_of(row).chars().next().expect("non-empty tag");
+        if Some(p) == run_prefix {
+            run_len += 1;
+        } else {
+            run_prefix = Some(p);
+            run_len = 1;
+        }
+        max_run = max_run.max(run_len);
+    }
+    assert!(
+        max_run <= 12,
+        "longest contiguous same-source run is {max_run} (>12 of 40); \
+         the merge arm is draining one source before any other gets a turn. \
+         output: {body:?}",
     );
 }
 

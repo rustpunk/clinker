@@ -1126,7 +1126,7 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
         source_configs: &[crate::config::SourceConfig],
-        writers: WriterRegistry,
+        mut writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         compiled_routes_by_name: HashMap<String, CompiledRoute>,
@@ -1253,7 +1253,64 @@ impl PipelineExecutor {
         // peer Sources' channels from filling — back-pressure flows
         // end-to-end. Per-Source arms detect membership in
         // `fused_sources` and return cleanly.
-        let fused_sources: HashSet<String> = compute_merge_interleave_fused_sources(plan, config);
+        let init_phase_set = compute_init_phase_node_set(plan);
+        let mut fused_sources: HashSet<String> =
+            compute_merge_interleave_fused_sources(plan, config);
+        // Extend `fused_sources` with Source names whose receivers are
+        // claimed by a downstream `PlanNode::Transform` running in
+        // streaming mode (issue #74). `fused_transforms` carries the
+        // matching Transform `NodeIndex`es so the Transform arm can
+        // dispatch into the streaming branch instead of consuming a
+        // pre-drained Vec from `node_buffers`.
+        let (extra_fused_sources, fused_transforms) =
+            compute_transform_fused_sources(plan, &fused_sources, &init_phase_set);
+        fused_sources.extend(extra_fused_sources);
+
+        // Streaming-Output setup (issue #72). For every fused
+        // `Merge.interleave → single Output` chain that satisfies the
+        // eligibility predicate, take the writer out of `writers.single`
+        // and spawn a `tokio::spawn`-ed task that drains a bounded
+        // `mpsc::channel`. The Merge arm streams records into the
+        // channel as it produces them; the Output arm's topo turn
+        // becomes a no-op because its writer has already moved into the
+        // streaming task. `JoinHandle`s are stored on the context so
+        // the dispatcher can await them at end-of-DAG and fold the
+        // per-task counter / timer / error accounting back into the
+        // context.
+        let streaming_specs = compute_streaming_output_specs(
+            plan,
+            config,
+            &fused_sources,
+            &init_phase_set,
+            &output_configs,
+            &writers,
+        );
+        let mut streaming_output_senders: HashMap<
+            petgraph::graph::NodeIndex,
+            tokio::sync::mpsc::Sender<(Record, u64)>,
+        > = HashMap::new();
+        let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+        let mut streaming_output_tasks: Vec<tokio::task::JoinHandle<StreamingOutputTaskOutput>> =
+            Vec::new();
+        for spec in streaming_specs {
+            let raw_writer = writers
+                .single
+                .remove(&spec.output_name)
+                .expect("compute_streaming_output_specs verified writers.single contains output");
+            // 256 is the bounded channel capacity. The writer task
+            // typically clears each record in microseconds; capacity
+            // above ~256 buys no measured throughput but burns memory
+            // on the slow-writer / fast-merge end of the back-pressure
+            // curve. Mirrors the Source ingest channel sizing (issue
+            // #67) — the same bound paces both ends of the pipeline.
+            let (tx, rx) = tokio::sync::mpsc::channel::<(Record, u64)>(256);
+            let merge_idx = spec.merge_idx;
+            let output_idx = spec.output_idx;
+            let handle = tokio::spawn(streaming_output_task(rx, raw_writer, spec));
+            streaming_output_senders.insert(merge_idx, tx);
+            streaming_output_nodes.insert(output_idx);
+            streaming_output_tasks.push(handle);
+        }
 
         let mut ctx = dispatch::ExecutorContext {
             config,
@@ -1271,6 +1328,7 @@ impl PipelineExecutor {
             node_buffers: HashMap::new(),
             source_records,
             fused_sources,
+            fused_transforms,
             record_var_seed: &record_var_seed,
             declared_source_defaults: &declared_source_defaults,
             channel_source_vars: &params.source_vars,
@@ -1308,6 +1366,9 @@ impl PipelineExecutor {
             commit_step_path: dispatch::CommitStepPath::NotSelected,
             region_input_buffers: HashMap::new(),
             in_deferred_dispatch: false,
+            streaming_output_senders,
+            streaming_output_nodes,
+            streaming_output_tasks,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -1328,23 +1389,54 @@ impl PipelineExecutor {
         // a Source feeding both an init branch and a runtime branch
         // correctly clones its buffer for Pass 1's first consumer
         // and removes it for Pass 2's last consumer.
-        let init_phase_set = compute_init_phase_node_set(plan);
-        if !init_phase_set.is_empty() {
-            for node_idx in plan.topo_order.clone() {
-                if init_phase_set.contains(&node_idx) {
+        // Topo walk. Wrapped so a `?` error inside doesn't short-circuit
+        // past the streaming-output task join below — the spawned tasks
+        // own writers we still need to flush (or drop) before the
+        // function returns, and dropping `ctx.streaming_output_senders`
+        // on the error path is what signals the tasks to close their
+        // channel and run their flush.
+        let walk_result: Result<(), PipelineError> = async {
+            if !init_phase_set.is_empty() {
+                for node_idx in plan.topo_order.clone() {
+                    if init_phase_set.contains(&node_idx) {
+                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+                    }
+                }
+                for node_idx in plan.topo_order.clone() {
+                    if !init_phase_set.contains(&node_idx) {
+                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+                    }
+                }
+            } else {
+                for node_idx in plan.topo_order.clone() {
                     dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
                 }
             }
-            for node_idx in plan.topo_order.clone() {
-                if !init_phase_set.contains(&node_idx) {
-                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+            Ok(())
+        }
+        .await;
+
+        // Streaming-output drain. Drop every remaining sender so the
+        // tasks' `rx.recv().await` returns `None` and they fall through
+        // to their flush path. The fused Merge arm normally removes its
+        // sender at clean exit; remaining entries here are the error-
+        // path leftovers (Merge arm never ran) or pipelines where no
+        // streaming chain was eligible (the map is empty).
+        ctx.streaming_output_senders.clear();
+        for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
+            match handle.await {
+                Ok(out) => out.fold_into(&mut ctx),
+                Err(join_err) => {
+                    ctx.output_errors.push(PipelineError::Internal {
+                        op: "streaming_output",
+                        node: String::from("<unknown>"),
+                        detail: format!("streaming output task panicked: {join_err}"),
+                    });
                 }
-            }
-        } else {
-            for node_idx in plan.topo_order.clone() {
-                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
             }
         }
+
+        walk_result?;
 
         // Take the pipeline-scoped TempDir out of the context. Held
         // until the very end of the walk so any operator-side spill
@@ -2299,6 +2391,22 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
     parent.join(filename).to_string_lossy().into_owned()
 }
 
+/// Reports whether `idx` has exactly one outgoing edge in `plan`. The
+/// streaming-fusion classifiers reject fan-out at the upstream side —
+/// a Source feeding two consumers cannot move its live receiver into
+/// one of them, and a Merge whose merged stream is read by siblings
+/// must stay on the buffered path so those siblings see the records
+/// via `node_buffers`.
+fn has_single_outgoing(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    idx: petgraph::graph::NodeIndex,
+) -> bool {
+    plan.graph
+        .neighbors_directed(idx, petgraph::Direction::Outgoing)
+        .count()
+        == 1
+}
+
 /// Build the pipeline-stable evaluation context.
 ///
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
@@ -2388,6 +2496,426 @@ fn compute_merge_interleave_fused_sources(
         }
     }
     fused
+}
+
+/// Identify `PlanNode::Transform` nodes whose sole upstream is a
+/// `PlanNode::Source` with a parked receiver in `ctx.source_records`,
+/// and whose evaluation can stream directly off that receiver instead
+/// of a pre-drained Vec. Returns the set of fused Transform
+/// `NodeIndex`es plus the set of Source names whose receivers move
+/// into the fused Transform's hands (those names extend
+/// [`compute_merge_interleave_fused_sources`]'s output so the Source
+/// dispatch arm short-circuits via the same membership check).
+///
+/// Eligibility (all must hold):
+///
+/// - Exactly one incoming edge.
+/// - That predecessor is a `PlanNode::Source`.
+/// - The upstream Source has exactly one outgoing edge (no Merge or
+///   sibling fan-out — fanning would require cloning the live channel).
+/// - `window_index` is `None`. Windowed Transforms drive
+///   `evaluate_single_transform_windowed`, which indexes records into
+///   the upstream operator's arena via the row's enumerate position;
+///   that arena is built upstream and must already be materialized.
+/// - The Transform is not in the init-phase ancestor closure.
+/// - The upstream Source's name is not already claimed by
+///   `merge_fused`. Merge.interleave fusion wins because the Merge
+///   needs every predecessor's receiver concurrently.
+///
+/// See https://github.com/rustpunk/clinker/issues/74 for the rationale
+/// (extending #67's pattern from Merge to Transform unblocks
+/// `[slow Source → Transform → out]` topologies from sitting idle on
+/// the upstream Source's drain).
+fn compute_transform_fused_sources(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    merge_fused: &HashSet<String>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> (HashSet<String>, HashSet<petgraph::graph::NodeIndex>) {
+    use crate::plan::execution::PlanNode;
+    let mut extra_fused_sources: HashSet<String> = HashSet::new();
+    let mut fused_transforms: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+    for node_idx in plan.graph.node_indices() {
+        let PlanNode::Transform { window_index, .. } = &plan.graph[node_idx] else {
+            continue;
+        };
+        if window_index.is_some() {
+            continue;
+        }
+        if init_phase_set.contains(&node_idx) {
+            continue;
+        }
+        let mut incoming = plan
+            .graph
+            .neighbors_directed(node_idx, petgraph::Direction::Incoming);
+        let Some(pred_idx) = incoming.next() else {
+            continue;
+        };
+        if incoming.next().is_some() {
+            continue;
+        }
+        let PlanNode::Source {
+            name: source_name, ..
+        } = &plan.graph[pred_idx]
+        else {
+            continue;
+        };
+        if merge_fused.contains(source_name) {
+            continue;
+        }
+        if !has_single_outgoing(plan, pred_idx) {
+            continue;
+        }
+        extra_fused_sources.insert(source_name.clone());
+        fused_transforms.insert(node_idx);
+    }
+    (extra_fused_sources, fused_transforms)
+}
+
+/// Identify fused `Merge.interleave` → single `Output` chains eligible for
+/// per-record streaming writes (issue #72). The buffered Output arm waits
+/// until the Merge arm has produced every record before invoking the
+/// writer; under a slow upstream Source this defeats the live back-
+/// pressure #67 delivered, because every record sits in
+/// `ctx.node_buffers[merge_idx]` until the Merge finishes.
+///
+/// The streaming path moves the Output's writer into a `tokio::spawn`-ed
+/// task that consumes from a bounded `mpsc::channel` populated by the
+/// fused Merge arm. The Output arm becomes a no-op at its topo turn;
+/// per-record `Writer::write_record` fires concurrently with Merge
+/// production, and back-pressure flows writer → Merge → Source.
+///
+/// Eligibility (every predicate must hold; otherwise the buffered path
+/// runs):
+///
+/// - The Output node has exactly one incoming edge, and that predecessor
+///   is a `PlanNode::Merge`.
+/// - The Merge is `mode: interleave` with every direct predecessor a
+///   `PlanNode::Source` (the [`compute_merge_interleave_fused_sources`]
+///   predicate — same membership the fused arm relies on).
+/// - The Merge has no other downstream consumer besides this one Output
+///   (no fan-out from the Merge).
+/// - The Output is not in the init-phase ancestor closure.
+/// - The Output's writer entry lives in `writers.single` (not
+///   `fan_out_writers` — splitting / per-source-file writers handle
+///   their own buffering).
+/// - The OutputConfig has no `split:` block — `SplittingWriter` owns its
+///   file rotation lifecycle and is incompatible with the streaming
+///   writer task.
+/// - Correlation buffering is inactive pipeline-wide
+///   (`!any_source_has_correlation_key`). The correlation path defers
+///   writes to [`PlanNode::CorrelationCommit`] which is incompatible
+///   with per-record write at Merge-arm time.
+///
+/// Returns the list of streaming specs (one per qualifying Output). Empty
+/// for pipelines that don't match the topology, leaving every Output on
+/// the existing buffered path. See
+/// https://github.com/rustpunk/clinker/issues/72 for the rationale.
+fn compute_streaming_output_specs(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    config: &PipelineConfig,
+    fused_merge_sources: &HashSet<String>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+    output_configs: &[OutputConfig],
+    writers: &WriterRegistry,
+) -> Vec<StreamingOutputSpec> {
+    use crate::plan::execution::PlanNode;
+
+    // Pipeline-wide correlation buffering disables streaming for every
+    // Output — the CorrelationCommit terminal owns the actual writes.
+    if config.any_source_has_correlation_key() {
+        return Vec::new();
+    }
+
+    let mut specs: Vec<StreamingOutputSpec> = Vec::new();
+    for output_idx in plan.graph.node_indices() {
+        let PlanNode::Output {
+            name: output_name, ..
+        } = &plan.graph[output_idx]
+        else {
+            continue;
+        };
+        if init_phase_set.contains(&output_idx) {
+            continue;
+        }
+
+        // Exactly one incoming edge, and that predecessor is a Merge.
+        let mut incoming = plan
+            .graph
+            .neighbors_directed(output_idx, petgraph::Direction::Incoming);
+        let Some(merge_idx) = incoming.next() else {
+            continue;
+        };
+        if incoming.next().is_some() {
+            continue;
+        }
+        let PlanNode::Merge {
+            name: merge_name, ..
+        } = &plan.graph[merge_idx]
+        else {
+            continue;
+        };
+
+        // The Merge must be fused — every predecessor is a Source whose
+        // name appears in the fused-source set the Merge arm uses to
+        // run a live `tokio::select!`.
+        let merge_predecessors: Vec<_> = plan
+            .graph
+            .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
+            .collect();
+        if merge_predecessors.is_empty() {
+            continue;
+        }
+        let all_fused_sources = merge_predecessors.iter().all(|p| match &plan.graph[*p] {
+            PlanNode::Source { name, .. } => fused_merge_sources.contains(name),
+            _ => false,
+        });
+        if !all_fused_sources {
+            continue;
+        }
+
+        // The Merge has exactly one outgoing edge (this Output). Anything
+        // else and the buffered path is needed so siblings still see the
+        // merged records via `node_buffers`.
+        if !has_single_outgoing(plan, merge_idx) {
+            continue;
+        }
+
+        // Output writer registry checks: must be a single writer, not a
+        // fan-out, and the OutputConfig must not declare a split block.
+        if !writers.single.contains_key(output_name) {
+            continue;
+        }
+        if writers.fan_out.contains_key(output_name) {
+            continue;
+        }
+        let Some(out_cfg) = output_configs.iter().find(|o| &o.name == output_name) else {
+            continue;
+        };
+        if out_cfg.split.is_some() {
+            continue;
+        }
+
+        // Pre-compute the schema-check + projection metadata so the
+        // spawned task carries owned `Arc<Schema>` / `Vec<String>` / the
+        // upstream node name for E314 diagnostics, with no borrow back
+        // into the plan.
+        let expected_input_schema = plan.graph[output_idx]
+            .expected_input_schema_in(plan)
+            .cloned();
+        let cxl_emit_names: Vec<String> = plan.graph[output_idx].cxl_emit_names_in(plan);
+
+        specs.push(StreamingOutputSpec {
+            merge_idx,
+            output_idx,
+            output_name: output_name.clone(),
+            merge_name: merge_name.clone(),
+            out_cfg: out_cfg.clone(),
+            expected_input_schema,
+            cxl_emit_names,
+        });
+    }
+    specs
+}
+
+/// Plan-time metadata for a streaming `Output` task spawned at executor
+/// entry. Carries every field the task needs in owned form so it can run
+/// independently of the borrowed `&PipelineConfig` / `&ExecutionPlanDag`
+/// references that anchor the dispatcher's `ExecutorContext`.
+pub(crate) struct StreamingOutputSpec {
+    /// `NodeIndex` of the upstream `Merge` node. The Merge arm looks up
+    /// its sender in [`dispatch::ExecutorContext::streaming_output_senders`]
+    /// keyed by this index.
+    pub(crate) merge_idx: petgraph::graph::NodeIndex,
+    /// `NodeIndex` of the downstream `Output` node. The Output arm
+    /// short-circuits when its index appears in
+    /// [`dispatch::ExecutorContext::streaming_output_nodes`].
+    pub(crate) output_idx: petgraph::graph::NodeIndex,
+    pub(crate) output_name: String,
+    pub(crate) merge_name: String,
+    pub(crate) out_cfg: OutputConfig,
+    /// Compile-time input schema for the Output; used by the streaming
+    /// task to run the same `check_input_schema` invariant the buffered
+    /// path enforces (E314 SchemaMismatch diagnostics).
+    pub(crate) expected_input_schema: Option<Arc<Schema>>,
+    /// Upstream `cxl_emit_names_in` result — passed to
+    /// `project_output_from_record` so the streaming projection drops
+    /// passthroughs the user didn't explicitly emit (matching the
+    /// buffered path's `include_widened: false` semantic).
+    pub(crate) cxl_emit_names: Vec<String>,
+}
+
+/// Per-task return shape merged into the dispatcher's
+/// [`dispatch::ExecutorContext`] after `JoinHandle::await`. Mirrors the
+/// counter / timer / error accounting the buffered Output arm performs
+/// inline; the streaming task accumulates these locally and the
+/// dispatcher folds them back into `ctx.counters`, `ctx.records_emitted`,
+/// `ctx.write_timer`, `ctx.projection_timer`, `ctx.ok_source_rows`, and
+/// `ctx.output_errors`.
+pub(crate) struct StreamingOutputTaskOutput {
+    pub(crate) records_written: u64,
+    pub(crate) records_emitted: u64,
+    pub(crate) seen_row_nums: HashSet<u64>,
+    pub(crate) write_timer: stage_metrics::CumulativeTimer,
+    pub(crate) projection_timer: stage_metrics::CumulativeTimer,
+    pub(crate) errors: Vec<PipelineError>,
+    pub(crate) stage_metrics: Vec<stage_metrics::StageMetrics>,
+}
+
+impl StreamingOutputTaskOutput {
+    /// Fold the task-local counters / timers / errors / stage metrics
+    /// back into the dispatcher's [`dispatch::ExecutorContext`] after
+    /// `JoinHandle::await`. Mirrors the buffered Output arm's inline
+    /// counter accounting: `ok_count` counts distinct source rows
+    /// (deduplicated against `ctx.ok_source_rows`), `records_written`
+    /// counts every write, and the per-task timers accumulate via
+    /// [`stage_metrics::CumulativeTimer::add`].
+    fn fold_into(self, ctx: &mut dispatch::ExecutorContext<'_>) {
+        let mut newly_ok: u64 = 0;
+        for rn in self.seen_row_nums {
+            if ctx.ok_source_rows.insert(rn) {
+                newly_ok += 1;
+            }
+        }
+        ctx.counters.ok_count += newly_ok;
+        ctx.counters.records_written += self.records_written;
+        ctx.records_emitted += self.records_emitted;
+        ctx.write_timer.add(self.write_timer);
+        ctx.projection_timer.add(self.projection_timer);
+        ctx.output_errors.extend(self.errors);
+        for sm in self.stage_metrics {
+            ctx.collector.record(sm);
+        }
+    }
+}
+
+/// Streaming-output writer task body. Drains the `mpsc::Receiver`
+/// populated by the fused `Merge.interleave` arm, projects each record
+/// through `project_output_from_record`, lazily constructs the writer on
+/// the first record, calls `Writer::write_record` per record, and
+/// flushes at channel close. Errors are accumulated rather than aborting
+/// the loop so the dispatcher can surface them alongside any sibling
+/// `output_errors`. See [`StreamingOutputSpec`] for the eligibility
+/// predicate and https://github.com/rustpunk/clinker/issues/72 for the
+/// rationale.
+async fn streaming_output_task(
+    mut rx: tokio::sync::mpsc::Receiver<(Record, u64)>,
+    raw_writer: Box<dyn Write + Send>,
+    spec: StreamingOutputSpec,
+) -> StreamingOutputTaskOutput {
+    use crate::projection::project_output_from_record;
+
+    let mut out = StreamingOutputTaskOutput {
+        records_written: 0,
+        records_emitted: 0,
+        seen_row_nums: HashSet::new(),
+        write_timer: stage_metrics::CumulativeTimer::new(),
+        projection_timer: stage_metrics::CumulativeTimer::new(),
+        errors: Vec::new(),
+        stage_metrics: Vec::new(),
+    };
+    let cxl_emit_names_opt: Option<&[String]> = if spec.cxl_emit_names.is_empty() {
+        None
+    } else {
+        Some(&spec.cxl_emit_names)
+    };
+
+    let mut scan_timer_slot: Option<stage_metrics::StageTimer> = Some(
+        stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan),
+    );
+    let mut writer: Option<Box<dyn FormatWriter>> = None;
+    let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
+
+    while let Some((record, rn)) = rx.recv().await {
+        if let Some(expected) = spec.expected_input_schema.as_ref()
+            && let Err(err) = crate::executor::schema_check::check_input_schema(
+                expected,
+                record.schema(),
+                &spec.output_name,
+                "output",
+                &spec.merge_name,
+            )
+        {
+            out.errors.push(err);
+            continue;
+        }
+
+        let projected = {
+            let _guard = out.projection_timer.guard();
+            project_output_from_record(&record, &spec.out_cfg, cxl_emit_names_opt)
+        };
+
+        // Lazy writer construction: defer until we have the first
+        // record's projected schema so the writer's column list matches
+        // what `project_output_from_record` actually emits (same source
+        // of truth as the buffered Output arm at dispatch.rs's
+        // `output_schema = Arc::clone(projected.schema())`).
+        if writer.is_none() {
+            let raw = raw_writer_slot
+                .take()
+                .expect("raw_writer_slot is Some until first record arrives");
+            let schema = Arc::clone(projected.schema());
+            match build_format_writer(&spec.out_cfg, raw, schema) {
+                Ok(w) => {
+                    writer = Some(w);
+                    if let Some(timer) = scan_timer_slot.take() {
+                        out.stage_metrics.push(timer.finish(1, 1));
+                    }
+                }
+                Err(e) => {
+                    out.errors.push(e);
+                    if let Some(timer) = scan_timer_slot.take() {
+                        out.stage_metrics.push(timer.finish(0, 0));
+                    }
+                    // Drain the rest of the channel so the Merge arm's
+                    // bounded send doesn't deadlock — the streaming
+                    // task must keep consuming even when the writer is
+                    // dead, otherwise back-pressure stalls the whole
+                    // pipeline.
+                    while rx.recv().await.is_some() {}
+                    return out;
+                }
+            }
+        }
+
+        let write_result = {
+            let _guard = out.write_timer.guard();
+            writer
+                .as_mut()
+                .expect("writer is Some after lazy construction")
+                .write_record(&projected)
+        };
+        match write_result {
+            Ok(()) => {
+                out.records_written += 1;
+                out.records_emitted += 1;
+                out.seen_row_nums.insert(rn);
+            }
+            Err(e) => {
+                out.errors.push(PipelineError::from(e));
+                while rx.recv().await.is_some() {}
+                return out;
+            }
+        }
+    }
+
+    // Channel closed — every Merge predecessor's receiver returned None,
+    // so no more records will arrive. Flush whatever the writer has
+    // buffered. `writer.is_none()` is the empty-stream case (zero
+    // records arrived); matches the buffered path's
+    // `if unbuffered.is_empty() { return Ok(()); }` short-circuit.
+    if let Some(timer) = scan_timer_slot.take() {
+        out.stage_metrics.push(timer.finish(0, 0));
+    }
+    if let Some(mut w) = writer {
+        let flush_result = {
+            let _guard = out.write_timer.guard();
+            w.flush()
+        };
+        if let Err(e) = flush_result {
+            out.errors.push(PipelineError::from(e));
+        }
+    }
+    out
 }
 
 fn compute_init_phase_node_set(

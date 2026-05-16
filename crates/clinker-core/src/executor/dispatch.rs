@@ -339,6 +339,61 @@ fn record_error_to_buffer_if_grouped(
     });
     true
 }
+
+/// Dispatch a Transform CXL evaluation failure through the shared
+/// error path used by every Transform call site.
+///
+/// Both the fused and buffered Transform arms route eval errors through
+/// the same three-way decision: under [`ErrorStrategy::FailFast`] the
+/// error propagates immediately; with correlation buffering active the
+/// row is parked under its group cell so the group's success/failure
+/// stays atomic; otherwise the row is pushed to the run-scoped DLQ with
+/// the offending field/value attached. Folding the duplicated arm body
+/// here keeps the three-way precedence honored in one place — any
+/// future change to how Transform eval errors are routed lands here
+/// rather than having to be mirrored across arms.
+fn dispatch_transform_eval_error(
+    ctx: &mut ExecutorContext<'_>,
+    record: Record,
+    row_num: u64,
+    transform_name: String,
+    eval_err: cxl::eval::EvalError,
+) -> Result<(), PipelineError> {
+    if ctx.strategy == ErrorStrategy::FailFast {
+        return Err(eval_err.into());
+    }
+    let stage = Some(DlqEntry::stage_transform(&transform_name));
+    let routed = record_error_to_buffer_if_grouped(
+        ctx,
+        &record,
+        row_num,
+        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        eval_err.to_string(),
+        stage.clone(),
+        None,
+    );
+    if routed {
+        return Ok(());
+    }
+    let source_name = source_name_arc_of(&record);
+    let triggering_field = eval_err.triggering_field.clone();
+    let triggering_value = eval_err.triggering_value();
+    push_dlq(
+        ctx,
+        DlqEntry {
+            source_row: row_num,
+            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+            error_message: eval_err.to_string(),
+            original_record: record,
+            stage,
+            route: None,
+            trigger: true,
+            source_name,
+            triggering_field,
+            triggering_value,
+        },
+    )
+}
 use crate::aggregation::AggregateStrategy;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
@@ -441,6 +496,18 @@ pub(crate) struct ExecutorContext<'a> {
     /// whose Merge mode is concat (concat keeps today's
     /// declaration-order drain through the Source arms).
     pub(crate) fused_sources: HashSet<String>,
+
+    /// Transforms whose sole upstream is a `PlanNode::Source` and that
+    /// have taken ownership of the Source's
+    /// [`tokio::sync::mpsc::Receiver`] out of [`Self::source_records`].
+    /// The Transform arm drives `recv().await` per record and runs CXL
+    /// evaluation inline; the upstream Source's dispatch arm short-
+    /// circuits via [`Self::fused_sources`] (the same set membership
+    /// the Merge.interleave fusion relies on). Populated at executor
+    /// entry by the same pre-pass that fills `fused_sources`. See
+    /// https://github.com/rustpunk/clinker/issues/74 for the
+    /// eligibility predicate and the windowed-Transform fallback.
+    pub(crate) fused_transforms: HashSet<NodeIndex>,
     /// Pipeline-wide `$record.<key>` default seed: declared
     /// `declares: scope: record` defaults plus channel
     /// `record_vars:` overrides. Borrowed by the Source dispatch
@@ -665,6 +732,37 @@ pub(crate) struct ExecutorContext<'a> {
     /// design — one set of operator arms, two pass modes — is the whole
     /// architectural value of the deferred-region landing.
     pub(crate) in_deferred_dispatch: bool,
+
+    /// Streaming-Output channel senders keyed by the upstream fused
+    /// `Merge` node's `NodeIndex`. Present when the executor entry has
+    /// matched a `Merge.interleave → single Output` chain against
+    /// the streaming eligibility predicate (issue #72) and spawned the
+    /// writer task. The fused Merge arm checks the map for its index;
+    /// if present, it streams each canonicalized record through the
+    /// bounded `tokio::sync::mpsc::channel` instead of accumulating
+    /// into a `Vec`, and drops its sender at clean exit so the writer
+    /// task's `recv()` returns `None`. Empty for pipelines that don't
+    /// match the topology — every other Output stays on the buffered
+    /// path. See
+    /// https://github.com/rustpunk/clinker/issues/72.
+    pub(crate) streaming_output_senders:
+        HashMap<NodeIndex, tokio::sync::mpsc::Sender<(Record, u64)>>,
+    /// `Output` `NodeIndex`es whose writes are streamed by a task
+    /// spawned at executor entry. The `Output` dispatch arm short-
+    /// circuits at the top when its index is in this set — the writer
+    /// has already been moved into the streaming task and there is no
+    /// buffered batch to drain. Empty when no streaming chain
+    /// qualified.
+    pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
+    /// `JoinHandle`s for spawned streaming-output writer tasks. Owned
+    /// by the dispatcher so the end-of-DAG join surface (in
+    /// `execute_dag_branching`) folds per-task counter / timer /
+    /// error accounting back into the dispatcher's
+    /// `counters` / `records_emitted` / `write_timer` /
+    /// `projection_timer` / `ok_source_rows` / `output_errors`.
+    /// Drained via `std::mem::take` at the join surface.
+    pub(crate) streaming_output_tasks:
+        Vec<tokio::task::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -728,6 +826,16 @@ impl ExecutorContext<'_> {
     /// the pipeline-wide total once every per-source slot is `Some`.
     pub(crate) fn source_count_by_name(&self, name: &Arc<str>) -> Option<u64> {
         self.source_count_per_source.get(name).copied().flatten()
+    }
+
+    /// True when the Transform at `node_idx` should run via the
+    /// fused streaming arm. Composition bodies share `NodeIndex`
+    /// numeric space with the top-level plan, so the membership check
+    /// is gated by `current_body_node_input_refs.is_none()` —
+    /// `fused_transforms` was populated against the top-level plan
+    /// only.
+    pub(crate) fn should_fuse_transform(&self, node_idx: NodeIndex) -> bool {
+        self.current_body_node_input_refs.is_none() && self.fused_transforms.contains(&node_idx)
     }
 
     /// Stamp the per-source finalized count for `source_name` and, if
@@ -1303,12 +1411,23 @@ pub(crate) fn finalize_node_rooted_windows(
 /// pulled in seed-determined order from whichever receivers have
 /// records available; unseeded variants follow arrival order via
 /// pure `tokio::select!`.
+///
+/// `streaming_sender` is `Some` iff the executor matched a fused
+/// `Merge.interleave → single Output` chain against the streaming
+/// eligibility predicate (issue #72). In streaming mode this function
+/// pushes each canonicalized record through the bounded
+/// `mpsc::channel` instead of accumulating into a Vec, applies live
+/// back-pressure end-to-end (writer slow → Merge yields → Sources
+/// yield), and returns an empty Vec at close. In non-streaming mode
+/// (`None`) it returns the accumulated `Vec<(Record, u64)>` that the
+/// Merge arm then teed into `node_buffers` for downstream consumers.
 pub(crate) async fn merge_fused_interleave(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     merge_name: &str,
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
+    streaming_sender: Option<tokio::sync::mpsc::Sender<(Record, u64)>>,
 ) -> Result<Vec<(Record, u64)>, PipelineError> {
     use std::future::poll_fn;
     use std::task::Poll;
@@ -1437,7 +1556,30 @@ pub(crate) async fn merge_fused_interleave(
                     let values = rec.values().to_vec();
                     rec = Record::new(Arc::clone(merge_schema), values);
                 }
-                merged.push((rec, rn));
+                match streaming_sender.as_ref() {
+                    Some(tx) => {
+                        // Bounded `send().await` is the back-pressure
+                        // pivot — if the writer task is slow, the Merge
+                        // arm yields here, which in turn slows the
+                        // `poll_recv` loop above and lets the Source
+                        // channels fill up. Send errors mean the
+                        // receiver was dropped (writer task panicked or
+                        // an error path raced); surface as Internal so
+                        // the caller knows the streaming chain is
+                        // broken rather than silently dropping records.
+                        if tx.send((rec, rn)).await.is_err() {
+                            return Err(PipelineError::Internal {
+                                op: "executor",
+                                node: merge_name.to_string(),
+                                detail: String::from(
+                                    "streaming Output writer task dropped its \
+                                     receiver before the Merge arm finished",
+                                ),
+                            });
+                        }
+                    }
+                    None => merged.push((rec, rn)),
+                }
             }
             None => {
                 // Source closed. Stamp finalized per-source count
@@ -1452,6 +1594,200 @@ pub(crate) async fn merge_fused_interleave(
     }
 
     Ok(merged)
+}
+
+/// Drive a `PlanNode::Transform` whose sole upstream is a
+/// `PlanNode::Source` directly off the Source's `mpsc::Receiver`,
+/// running per-record CXL evaluation inline instead of consuming a
+/// pre-drained `Vec` from `node_buffers`. The Source dispatch arm
+/// short-circuits via [`ExecutorContext::fused_sources`]; this helper
+/// takes ownership of the receiver, applies the same per-record
+/// pipeline the non-fused Source arm runs (canonicalize onto the
+/// Source's plan-time schema, seed `$record.<key>` defaults, seed
+/// `$source.<key>` defaults per `(source, file)`, advance the per-
+/// source running counter), runs the Transform's `evaluate_single_transform`
+/// per record, and emits records into `ctx.node_buffers[transform_idx]`
+/// at the close. See https://github.com/rustpunk/clinker/issues/74.
+///
+/// Eligibility (windowed Transforms, multi-input Transforms, body-
+/// context Transforms, init-phase Transforms, fanned-out Sources) is
+/// enforced upstream by `compute_transform_fused_sources` in
+/// `executor/mod.rs`; this helper trusts the predicate and panics on
+/// shape violations.
+pub(crate) async fn transform_fused_consume(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+) -> Result<(), PipelineError> {
+    let pred_idx = current_dag
+        .graph
+        .neighbors_directed(node_idx, Direction::Incoming)
+        .next()
+        .ok_or_else(|| PipelineError::Internal {
+            op: "executor",
+            node: name.to_string(),
+            detail: format!(
+                "fused Transform {name:?} has no incoming edge — \
+                 fusion classifier accepted a node the predicate rejects"
+            ),
+        })?;
+    let PlanNode::Source {
+        name: source_name, ..
+    } = &current_dag.graph[pred_idx]
+    else {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: name.to_string(),
+            detail: format!(
+                "fused Transform {name:?} predecessor at NodeIndex {pred_idx:?} \
+                 is not a PlanNode::Source — fusion classifier diverged from runtime"
+            ),
+        });
+    };
+    let source_name_owned = source_name.clone();
+
+    let source_schema = current_dag.graph[pred_idx].stored_output_schema().cloned();
+    let engine_stamped: Vec<(usize, Box<str>)> = source_schema
+        .as_ref()
+        .map(build_engine_stamped_tail)
+        .unwrap_or_default();
+    let canonicalize = |r: &Record| -> Record {
+        match source_schema.as_ref() {
+            Some(target) => canonicalize_to_source_schema(r, target, &engine_stamped),
+            None => r.clone(),
+        }
+    };
+
+    let transform_idx_opt = ctx.transform_by_name.get(name).copied();
+    let expected_input = current_dag.graph[node_idx]
+        .expected_input_schema_in(current_dag)
+        .cloned();
+    let output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
+    let upstream_name = source_name_owned.clone();
+
+    let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
+        ProgramEvaluator::new(
+            Arc::clone(&ctx.compiled_transforms[idx].typed),
+            ctx.compiled_transforms[idx].has_distinct(),
+        )
+    });
+
+    let mut rx = ctx
+        .source_records
+        .remove(source_name_owned.as_str())
+        .ok_or_else(|| PipelineError::Internal {
+            op: "executor",
+            node: name.to_string(),
+            detail: format!(
+                "fused Transform {name:?}: upstream Source {source_name_owned:?} \
+                 has no receiver in ctx.source_records — Source arm already consumed it?"
+            ),
+        })?;
+    let timeout = ctx.idle_timeouts.get(source_name_owned.as_str()).copied();
+    let has_record_seed = !ctx.record_var_seed.is_empty();
+    let source_name_arc: Arc<str> = Arc::from(source_name_owned.as_str());
+
+    let mut output_records: Vec<(Record, u64)> = Vec::new();
+    let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
+    let mut count: u64 = 0;
+    let mut yields_since_last: u32 = 0;
+    loop {
+        let item: Option<(Record, u64)> = match timeout {
+            Some(t) => match tokio::time::timeout(t, rx.recv()).await {
+                Ok(item) => item,
+                Err(_elapsed) => {
+                    ctx.watermarks
+                        .mark_idle(source_name_owned.as_str(), &last_file);
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+        let Some((record, rn)) = item else {
+            break;
+        };
+        last_file = source_file_arc_of(&record);
+        let mut rec = canonicalize(&record);
+        if has_record_seed {
+            rec.seed_record_vars(ctx.record_var_seed);
+        }
+        seed_source_vars_for_record(ctx, source_name_owned.as_str(), &rec)?;
+        if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
+            *slot += 1;
+        }
+        count += 1;
+        yields_since_last += 1;
+        if yields_since_last >= 1024 {
+            yields_since_last = 0;
+            tokio::task::yield_now().await;
+        }
+
+        if let Some(exp) = expected_input.as_ref() {
+            check_input_schema(exp, rec.schema(), name, "transform", &upstream_name)?;
+        }
+
+        if let Some(evaluator) = evaluator_opt.as_mut() {
+            let source_file_arc = Arc::clone(&last_file);
+            let rec_source_name_arc = source_name_arc_of(&rec);
+            let eval_ctx = EvalContext {
+                stable: ctx.stable,
+                source_file: &source_file_arc,
+                source_row: rn,
+                source_path: &source_file_arc,
+                source_count: ctx.source_count_by_name(&rec_source_name_arc),
+                source_batch: ctx.source_batch_arc,
+                ingestion_timestamp: ctx.source_ingestion_timestamp,
+                source_name: &rec_source_name_arc,
+            };
+            let target_schema = output_schema
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Arc::clone(rec.schema()));
+            let eval_result = {
+                let _guard = ctx.transform_timer.guard();
+                evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
+            };
+            match eval_result {
+                Ok((modified_record, Ok(()))) => {
+                    let advance_source = source_name_arc_of(&modified_record);
+                    output_records.push((modified_record, rn));
+                    advance_cursor(ctx, &advance_source, rn);
+                }
+                Ok((_record, Err(SkipReason::Filtered))) => {
+                    ctx.counters.filtered_count += 1;
+                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                }
+                Ok((_record, Err(SkipReason::Duplicate))) => {
+                    ctx.counters.distinct_count += 1;
+                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                }
+                Err((transform_name, eval_err)) => {
+                    dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
+                }
+            }
+        } else {
+            // Transform has no compiled CXL — passthrough behavior
+            // mirrors the buffered arm's `transform_by_name.get` miss
+            // at the top of the existing path.
+            let advance_source = source_name_arc_of(&rec);
+            output_records.push((rec, rn));
+            advance_cursor(ctx, &advance_source, rn);
+        }
+    }
+    ctx.finalize_source_count(&source_name_arc, count);
+    if timeout.is_some() && ctx.watermarks.is_idle(source_name_owned.as_str()) {
+        tracing::debug!(
+            target: "clinker::watermark",
+            source = %source_name_owned,
+            "fused transform consumer ended with all partitions in WatermarkStatus::Idle"
+        );
+    }
+
+    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+    ctx.node_buffers.insert(node_idx, output_records);
+    Ok(())
 }
 
 /// Execute one DAG node by routing it to its arm.
@@ -1641,6 +1977,17 @@ pub(crate) async fn dispatch_plan_node(
             window_index,
             ..
         } => {
+            // Streaming-fused path: when the pre-pass has flagged this
+            // Transform as eligible (sole upstream is a Source whose
+            // receiver lives in `ctx.source_records`, non-windowed,
+            // non-init-phase, no upstream fan-out, and the Source is
+            // not already claimed by Merge.interleave fusion), drive
+            // per-record evaluation directly off the receiver instead
+            // of consuming a Vec from `node_buffers`. See
+            // https://github.com/rustpunk/clinker/issues/74.
+            if ctx.should_fuse_transform(node_idx) {
+                return transform_fused_consume(ctx, current_dag, node_idx, name).await;
+            }
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
@@ -1818,39 +2165,7 @@ pub(crate) async fn dispatch_plan_node(
                         advance_cursor(ctx, &source_name_arc_of(&record), rn);
                     }
                     Err((transform_name, eval_err)) => {
-                        if ctx.strategy == ErrorStrategy::FailFast {
-                            return Err(eval_err.into());
-                        }
-                        let stage = Some(DlqEntry::stage_transform(&transform_name));
-                        let routed = record_error_to_buffer_if_grouped(
-                            ctx,
-                            &record,
-                            rn,
-                            crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            eval_err.to_string(),
-                            stage.clone(),
-                            None,
-                        );
-                        if !routed {
-                            let source_name = source_name_arc_of(&record);
-                            let triggering_field = eval_err.triggering_field.clone();
-                            let triggering_value = eval_err.triggering_value();
-                            push_dlq(
-                                ctx,
-                                DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record,
-                                    stage,
-                                    route: None,
-                                    trigger: true,
-                                    source_name,
-                                    triggering_field,
-                                    triggering_value,
-                                },
-                            )?;
-                        }
+                        dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
                     }
                 }
             }
@@ -2234,12 +2549,22 @@ pub(crate) async fn dispatch_plan_node(
                 });
 
             let merged: Vec<(Record, u64)> = if fused_mode {
+                // Streaming-Output handoff (issue #72): if a single
+                // Output downstream of this Merge passed the
+                // eligibility predicate at executor entry, its
+                // `mpsc::Sender` was installed under our `node_idx`.
+                // Take it here so the Merge arm streams every record
+                // through the channel instead of accumulating, and so
+                // dropping the sender at clean exit closes the
+                // streaming task's `recv()` loop.
+                let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
                 merge_fused_interleave(
                     ctx,
                     current_dag,
                     name,
                     &sorted_preds,
                     merge_output_schema.as_ref(),
+                    streaming_sender,
                 )
                 .await?
             } else {
@@ -2855,6 +3180,18 @@ pub(crate) async fn dispatch_plan_node(
         }
 
         PlanNode::Output { ref name, .. } => {
+            // Streaming-Output short-circuit (issue #72). The executor
+            // entry already moved this Output's writer into a
+            // `tokio::spawn`-ed task that drained records from a
+            // bounded `mpsc::channel` populated by the fused Merge
+            // arm. Per-record `write_record` already fired concurrently
+            // with Merge production; the dispatcher's end-of-DAG join
+            // surface awaits the task and folds its counters / timers /
+            // errors into the context. The Output's topo turn here is
+            // a no-op.
+            if ctx.streaming_output_nodes.contains(&node_idx) {
+                return Ok(());
+            }
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
