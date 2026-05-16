@@ -239,6 +239,66 @@ At least one of `max_records` or `max_bytes` should be specified for splitting t
 
 When `group_key` is set, the split point is the first group boundary after the threshold is reached (greedy). Without `group_key`, files are split at the exact limit.
 
+## Streaming writes under fused `Merge.interleave`
+
+When a single Output sits directly downstream of a `Merge` whose mode is `interleave` and whose every direct predecessor is a `Source`, the executor takes a streaming path: a bounded `tokio::sync::mpsc::channel` connects the Merge arm to the writer task, and `Writer::write_record` fires per record as Merge emits, concurrent with Merge production.
+
+The buffered alternative — which still runs for every other Output topology — waits until the Merge arm has accumulated every record before invoking the writer. With a slow upstream Source that defeats the live back-pressure the `Merge.interleave` fusion provides at the Source-channel layer: each record sits in `node_buffers[merge]` until the slow Source finishes.
+
+### Topology
+
+```yaml
+- type: source
+  name: src_a
+  config: { type: csv, path: a.csv, schema: ... }
+- type: source
+  name: src_b
+  config: { type: csv, path: b.csv, schema: ... }
+- type: merge
+  name: merged
+  inputs: [src_a, src_b]
+  config:
+    mode: interleave        # required
+- type: output
+  name: out
+  input: merged
+  config:
+    name: out
+    type: csv
+    path: out.csv
+```
+
+The streaming path is selected automatically — there is no opt-in setting. Pipelines that don't match the topology keep the buffered path.
+
+### Eligibility
+
+Every condition must hold for the streaming path to engage; if any fails, the buffered path runs:
+
+- The Output has exactly one incoming edge, and that predecessor is a `Merge` with `mode: interleave`.
+- Every direct predecessor of that Merge is a `Source` (same predicate the fused `Merge.interleave` arm uses for its live `tokio::select!`).
+- The Merge has no other downstream consumer besides this one Output (no fan-out).
+- The Output is not in the init-phase ancestor closure.
+- The OutputConfig has no `split:` block — splitting writers manage their own file rotation lifecycle.
+- The writer is registered in the single-file writer registry (not `fan_out_per_source_file`).
+- No `Source` in the pipeline declares a correlation key — the correlation-buffered output path defers writes to `CorrelationCommit` and is incompatible with per-record write.
+
+### Back-pressure flow
+
+Under the streaming path, back-pressure flows end-to-end:
+
+```
+writer slow → mpsc::Sender::send().await yields
+             → Merge arm yields
+             → Source mpsc::Receiver fills
+             → Source ingest task blocks on send
+```
+
+The bounded handoff channel between Merge and Output (256 slots) and the existing per-Source ingest channels (issue #67) form a single pace-bound chain from the underlying `Write` sink back to the source reader. A slow file system, a saturated network sink, or a deliberately-paced writer no longer accumulates records in pipeline-internal `Vec`s; the upstream readers slow down to match.
+
+### Counter semantics
+
+Counter behavior under the streaming path matches the buffered Output arm exactly: `records_written` increments once per `Writer::write_record` call, `ok_count` counts distinct source `row_num`s reaching the Output, and `dlq_count` is unaffected (DLQ entries originate upstream). Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses; the dispatcher folds the streaming task's per-task accounting back into the run-wide totals at end of DAG.
+
 ## Complete example
 
 ```yaml

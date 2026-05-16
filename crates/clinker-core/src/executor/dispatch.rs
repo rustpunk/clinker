@@ -677,6 +677,37 @@ pub(crate) struct ExecutorContext<'a> {
     /// design — one set of operator arms, two pass modes — is the whole
     /// architectural value of the deferred-region landing.
     pub(crate) in_deferred_dispatch: bool,
+
+    /// Streaming-Output channel senders keyed by the upstream fused
+    /// `Merge` node's `NodeIndex`. Present when the executor entry has
+    /// matched a `Merge.interleave → single Output` chain against
+    /// the streaming eligibility predicate (issue #72) and spawned the
+    /// writer task. The fused Merge arm checks the map for its index;
+    /// if present, it streams each canonicalized record through the
+    /// bounded `tokio::sync::mpsc::channel` instead of accumulating
+    /// into a `Vec`, and drops its sender at clean exit so the writer
+    /// task's `recv()` returns `None`. Empty for pipelines that don't
+    /// match the topology — every other Output stays on the buffered
+    /// path. See
+    /// https://github.com/rustpunk/clinker/issues/72.
+    pub(crate) streaming_output_senders:
+        HashMap<NodeIndex, tokio::sync::mpsc::Sender<(Record, u64)>>,
+    /// `Output` `NodeIndex`es whose writes are streamed by a task
+    /// spawned at executor entry. The `Output` dispatch arm short-
+    /// circuits at the top when its index is in this set — the writer
+    /// has already been moved into the streaming task and there is no
+    /// buffered batch to drain. Empty when no streaming chain
+    /// qualified.
+    pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
+    /// `JoinHandle`s for spawned streaming-output writer tasks. Owned
+    /// by the dispatcher so the end-of-DAG join surface (in
+    /// `execute_dag_branching`) folds per-task counter / timer /
+    /// error accounting back into the dispatcher's
+    /// `counters` / `records_emitted` / `write_timer` /
+    /// `projection_timer` / `ok_source_rows` / `output_errors`.
+    /// Drained via `std::mem::take` at the join surface.
+    pub(crate) streaming_output_tasks:
+        Vec<tokio::task::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -1315,12 +1346,23 @@ pub(crate) fn finalize_node_rooted_windows(
 /// pulled in seed-determined order from whichever receivers have
 /// records available; unseeded variants follow arrival order via
 /// pure `tokio::select!`.
+///
+/// `streaming_sender` is `Some` iff the executor matched a fused
+/// `Merge.interleave → single Output` chain against the streaming
+/// eligibility predicate (issue #72). In streaming mode this function
+/// pushes each canonicalized record through the bounded
+/// `mpsc::channel` instead of accumulating into a Vec, applies live
+/// back-pressure end-to-end (writer slow → Merge yields → Sources
+/// yield), and returns an empty Vec at close. In non-streaming mode
+/// (`None`) it returns the accumulated `Vec<(Record, u64)>` that the
+/// Merge arm then teed into `node_buffers` for downstream consumers.
 pub(crate) async fn merge_fused_interleave(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     merge_name: &str,
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
+    streaming_sender: Option<tokio::sync::mpsc::Sender<(Record, u64)>>,
 ) -> Result<Vec<(Record, u64)>, PipelineError> {
     use std::future::poll_fn;
     use std::task::Poll;
@@ -1449,7 +1491,30 @@ pub(crate) async fn merge_fused_interleave(
                     let values = rec.values().to_vec();
                     rec = Record::new(Arc::clone(merge_schema), values);
                 }
-                merged.push((rec, rn));
+                match streaming_sender.as_ref() {
+                    Some(tx) => {
+                        // Bounded `send().await` is the back-pressure
+                        // pivot — if the writer task is slow, the Merge
+                        // arm yields here, which in turn slows the
+                        // `poll_recv` loop above and lets the Source
+                        // channels fill up. Send errors mean the
+                        // receiver was dropped (writer task panicked or
+                        // an error path raced); surface as Internal so
+                        // the caller knows the streaming chain is
+                        // broken rather than silently dropping records.
+                        if tx.send((rec, rn)).await.is_err() {
+                            return Err(PipelineError::Internal {
+                                op: "executor",
+                                node: merge_name.to_string(),
+                                detail: String::from(
+                                    "streaming Output writer task dropped its \
+                                     receiver before the Merge arm finished",
+                                ),
+                            });
+                        }
+                    }
+                    None => merged.push((rec, rn)),
+                }
             }
             None => {
                 // Source closed. Stamp finalized per-source count
@@ -2491,12 +2556,22 @@ pub(crate) async fn dispatch_plan_node(
                 });
 
             let merged: Vec<(Record, u64)> = if fused_mode {
+                // Streaming-Output handoff (issue #72): if a single
+                // Output downstream of this Merge passed the
+                // eligibility predicate at executor entry, its
+                // `mpsc::Sender` was installed under our `node_idx`.
+                // Take it here so the Merge arm streams every record
+                // through the channel instead of accumulating, and so
+                // dropping the sender at clean exit closes the
+                // streaming task's `recv()` loop.
+                let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
                 merge_fused_interleave(
                     ctx,
                     current_dag,
                     name,
                     &sorted_preds,
                     merge_output_schema.as_ref(),
+                    streaming_sender,
                 )
                 .await?
             } else {
@@ -3112,6 +3187,18 @@ pub(crate) async fn dispatch_plan_node(
         }
 
         PlanNode::Output { ref name, .. } => {
+            // Streaming-Output short-circuit (issue #72). The executor
+            // entry already moved this Output's writer into a
+            // `tokio::spawn`-ed task that drained records from a
+            // bounded `mpsc::channel` populated by the fused Merge
+            // arm. Per-record `write_record` already fired concurrently
+            // with Merge production; the dispatcher's end-of-DAG join
+            // surface awaits the task and folds its counters / timers /
+            // errors into the context. The Output's topo turn here is
+            // a no-op.
+            if ctx.streaming_output_nodes.contains(&node_idx) {
+                return Ok(());
+            }
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
