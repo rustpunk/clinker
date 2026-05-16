@@ -773,6 +773,16 @@ impl ExecutorContext<'_> {
         self.source_count_per_source.get(name).copied().flatten()
     }
 
+    /// True when the Transform at `node_idx` should run via the
+    /// fused streaming arm. Composition bodies share `NodeIndex`
+    /// numeric space with the top-level plan, so the membership check
+    /// is gated by `current_body_node_input_refs.is_none()` —
+    /// `fused_transforms` was populated against the top-level plan
+    /// only.
+    pub(crate) fn should_fuse_transform(&self, node_idx: NodeIndex) -> bool {
+        self.current_body_node_input_refs.is_none() && self.fused_transforms.contains(&node_idx)
+    }
+
     /// Stamp the per-source finalized count for `source_name` and, if
     /// every per-source slot is now populated, derive and stamp the
     /// pipeline-wide total under [`MERGED_SOURCE_NAME`]. Called by the
@@ -1663,7 +1673,7 @@ pub(crate) async fn transform_fused_consume(
         }
 
         if let Some(evaluator) = evaluator_opt.as_mut() {
-            let source_file_arc = source_file_arc_of(&rec);
+            let source_file_arc = Arc::clone(&last_file);
             let rec_source_name_arc = source_name_arc_of(&rec);
             let eval_ctx = EvalContext {
                 stable: ctx.stable,
@@ -1950,17 +1960,9 @@ pub(crate) async fn dispatch_plan_node(
             // non-init-phase, no upstream fan-out, and the Source is
             // not already claimed by Merge.interleave fusion), drive
             // per-record evaluation directly off the receiver instead
-            // of consuming a Vec from `node_buffers`. Composition body
-            // walks reuse the dispatcher with a body-local
-            // `ExecutionPlanDag` whose `NodeIndex` numbering is
-            // independent of the top-level plan; `fused_transforms`
-            // was populated against the top-level plan, so the check
-            // is gated by `current_body_node_input_refs.is_none()` to
-            // avoid spurious matches inside a body. See
+            // of consuming a Vec from `node_buffers`. See
             // https://github.com/rustpunk/clinker/issues/74.
-            if ctx.current_body_node_input_refs.is_none()
-                && ctx.fused_transforms.contains(&node_idx)
-            {
+            if ctx.should_fuse_transform(node_idx) {
                 return transform_fused_consume(ctx, current_dag, node_idx, name).await;
             }
             // Get input records: first check own buffer (set by Route

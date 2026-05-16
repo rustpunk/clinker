@@ -260,17 +260,10 @@ fn debug_assert_uniform_column_variants(schema: &Arc<Schema>, records: &[Minimal
     for (row, rec) in records.iter().enumerate() {
         for (col, slot) in expected.iter_mut().enumerate() {
             let Some(v) = rec.get(col) else { continue };
-            let tag = match v {
-                Value::Null => continue,
-                Value::Bool(_) => "Bool",
-                Value::Integer(_) => "Integer",
-                Value::Float(_) => "Float",
-                Value::String(_) => "String",
-                Value::Date(_) => "Date",
-                Value::DateTime(_) => "DateTime",
-                Value::Array(_) => "Array",
-                Value::Map(_) => "Map",
-            };
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let tag = v.type_name();
             match *slot {
                 None => *slot = Some(tag),
                 Some(prev) if prev == tag => {}

@@ -1425,32 +1425,7 @@ impl PipelineExecutor {
         ctx.streaming_output_senders.clear();
         for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
             match handle.await {
-                Ok(out) => {
-                    let StreamingOutputTaskOutput {
-                        records_written,
-                        records_emitted: task_records_emitted,
-                        seen_row_nums,
-                        write_timer: task_write_timer,
-                        projection_timer: task_projection_timer,
-                        errors,
-                        stage_metrics: task_stage_metrics,
-                    } = out;
-                    let mut newly_ok: u64 = 0;
-                    for rn in seen_row_nums {
-                        if ctx.ok_source_rows.insert(rn) {
-                            newly_ok += 1;
-                        }
-                    }
-                    ctx.counters.ok_count += newly_ok;
-                    ctx.counters.records_written += records_written;
-                    ctx.records_emitted += task_records_emitted;
-                    ctx.write_timer.add(task_write_timer);
-                    ctx.projection_timer.add(task_projection_timer);
-                    ctx.output_errors.extend(errors);
-                    for sm in task_stage_metrics {
-                        ctx.collector.record(sm);
-                    }
-                }
+                Ok(out) => out.fold_into(&mut ctx),
                 Err(join_err) => {
                     ctx.output_errors.push(PipelineError::Internal {
                         op: "streaming_output",
@@ -2778,6 +2753,33 @@ pub(crate) struct StreamingOutputTaskOutput {
     pub(crate) stage_metrics: Vec<stage_metrics::StageMetrics>,
 }
 
+impl StreamingOutputTaskOutput {
+    /// Fold the task-local counters / timers / errors / stage metrics
+    /// back into the dispatcher's [`dispatch::ExecutorContext`] after
+    /// `JoinHandle::await`. Mirrors the buffered Output arm's inline
+    /// counter accounting: `ok_count` counts distinct source rows
+    /// (deduplicated against `ctx.ok_source_rows`), `records_written`
+    /// counts every write, and the per-task timers accumulate via
+    /// [`stage_metrics::CumulativeTimer::add`].
+    fn fold_into(self, ctx: &mut dispatch::ExecutorContext<'_>) {
+        let mut newly_ok: u64 = 0;
+        for rn in self.seen_row_nums {
+            if ctx.ok_source_rows.insert(rn) {
+                newly_ok += 1;
+            }
+        }
+        ctx.counters.ok_count += newly_ok;
+        ctx.counters.records_written += self.records_written;
+        ctx.records_emitted += self.records_emitted;
+        ctx.write_timer.add(self.write_timer);
+        ctx.projection_timer.add(self.projection_timer);
+        ctx.output_errors.extend(self.errors);
+        for sm in self.stage_metrics {
+            ctx.collector.record(sm);
+        }
+    }
+}
+
 /// Streaming-output writer task body. Drains the `mpsc::Receiver`
 /// populated by the fused `Merge.interleave` arm, projects each record
 /// through `project_output_from_record`, lazily constructs the writer on
@@ -2816,22 +2818,16 @@ async fn streaming_output_task(
     let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
 
     while let Some((record, rn)) = rx.recv().await {
-        // E314 invariant — every record arriving at the Output must
-        // match the compile-time input schema. Matches the buffered
-        // Output arm's pre-loop check, hoisted to per-record under
-        // streaming because the channel can interleave records across
-        // multiple Source predecessors.
         if let Some(expected) = spec.expected_input_schema.as_ref()
-            && !Arc::ptr_eq(expected, record.schema())
-            && expected.columns() != record.schema().columns()
+            && let Err(err) = crate::executor::schema_check::check_input_schema(
+                expected,
+                record.schema(),
+                &spec.output_name,
+                "output",
+                &spec.merge_name,
+            )
         {
-            out.errors.push(PipelineError::SchemaMismatch {
-                expected: Arc::clone(expected),
-                actual: Arc::clone(record.schema()),
-                operator_name: spec.output_name.clone(),
-                operator_kind: "output",
-                upstream_name: spec.merge_name.clone(),
-            });
+            out.errors.push(err);
             continue;
         }
 
