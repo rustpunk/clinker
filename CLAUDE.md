@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Pre-commit checks
 
-Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.yml`):
+The CI gauntlet — exactly what GitHub CI runs (`.github/workflows/ci.yml`):
 
 1. `cargo fmt --all` (CI runs `--check`; locally fix first)
 2. `cargo clippy --workspace -- -D warnings`
@@ -14,7 +14,29 @@ Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.y
 6. `cargo test --benches -p clinker-benchmarks`
 7. `cargo deny check`
 
-Fix any issues before committing. All seven must pass — these are the exact checks CI enforces on every PR. (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` for `clinker-core`; cross-compile setup is optional locally.)
+**The gauntlet is a sprint-closing gate, not a per-commit gate.** Only the
+sprint's closing commit (the commit that gets pushed / merged) must pass
+all seven. Intermediate commits within a multi-commit sprint may carry
+transitional CI-failing state — compile errors, dead-code warnings,
+fmt/clippy noise, transient `#[allow]` / `#[ignore]`, unused imports —
+provided subsequent commits in the same sprint eliminate every such
+signal before the closing commit. This matches the sprint-boundary
+principle in § Refactoring policy below: atomicity is per sprint, not
+per commit, so a multi-step rip can split a type from its consumer
+across two commits without forcing a single load-bearing diff.
+
+Run the gauntlet before declaring the sprint done; pair it with
+`/audit-shortcuts --range <base>..HEAD` to verify no forbidden
+signatures survived (Legacy*/Internal*/*Block renames,
+`#[serde(default)]` on mandatory-post-rename fields, `#[ignore]` on
+cutover-verifying tests, parallel new+old-path coexistence). One-commit
+sprints are the common case and remain effectively per-commit gated —
+the policy only changes behavior when a sprint genuinely needs more
+than one commit to land cleanly.
+
+(CI also runs `cargo check` against `x86_64-pc-windows-msvc` and
+`aarch64-apple-darwin` for `clinker-core`; cross-compile setup is
+optional locally.)
 
 ## Build & test commands
 
