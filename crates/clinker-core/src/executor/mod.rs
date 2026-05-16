@@ -197,16 +197,29 @@ pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot
 
 /// Dispatch result threaded out of `execute_dag` and
 /// `execute_dag_branching` and folded into the [`ExecutionReport`].
-/// Holds the final pipeline counters, the DLQ vector built across
-/// every dispatcher arm, the peak RSS observation, the per-source
-/// watermark bookkeeping, and the per-source rollback-cursor map.
-pub(crate) type DispatchOutcome = (
-    PipelineCounters,
-    Vec<DlqEntry>,
-    Option<u64>,
-    crate::executor::watermark::PerSourceWatermarks,
-    BTreeMap<String, u64>,
-);
+/// Per-run summary fed up from `execute_dag_branching` into
+/// [`ExecutionReport`] construction. Each field is the final, post-walk
+/// state of an executor counter or bookkeeping table; the consumer
+/// (`run_with_readers_writers`) folds them into the user-facing report
+/// and may layer derived stages on top.
+pub(crate) struct DispatchOutcome {
+    /// Aggregate pipeline counters: total / ok / dlq / records-written.
+    pub(crate) counters: PipelineCounters,
+    /// Every DLQ entry produced across every dispatcher arm, in
+    /// observation order. Empty when the run had no failures.
+    pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Peak process RSS observed across chunk boundaries. `None` on
+    /// platforms where RSS measurement is unavailable.
+    pub(crate) peak_rss_bytes: Option<u64>,
+    /// Per-source / per-file event-time watermarks accumulated by the
+    /// ingest tasks. Carried through so the report can roll them up to
+    /// source-level and effective-watermark granularities.
+    pub(crate) watermarks: crate::executor::watermark::PerSourceWatermarks,
+    /// Per-source forward-progress rollback cursors at run completion,
+    /// keyed by Source-node name. Sources that never emitted a clean
+    /// record are absent.
+    pub(crate) per_source_rollback_cursors: BTreeMap<String, u64>,
+}
 
 /// Output writer registry. Holds two parallel maps:
 ///
@@ -931,8 +944,13 @@ impl PipelineExecutor {
             }));
         }
 
-        let (counters, dlq_entries, peak_rss_bytes, mut watermarks, per_source_rollback_cursors) =
-            Self::execute_dag(
+        let DispatchOutcome {
+            counters,
+            dlq_entries,
+            peak_rss_bytes,
+            mut watermarks,
+            per_source_rollback_cursors,
+        } = Self::execute_dag(
                 config,
                 source_records,
                 &source_configs,
@@ -1507,13 +1525,13 @@ impl PipelineExecutor {
             .map(|(k, &v)| (k.as_ref().to_string(), v))
             .collect();
 
-        Ok((
-            std::mem::take(counters),
-            std::mem::take(dlq_entries),
-            rss_bytes(),
-            ctx.watermarks,
-            rollback_cursors,
-        ))
+        Ok(DispatchOutcome {
+            counters: std::mem::take(counters),
+            dlq_entries: std::mem::take(dlq_entries),
+            peak_rss_bytes: rss_bytes(),
+            watermarks: ctx.watermarks,
+            per_source_rollback_cursors: rollback_cursors,
+        })
     }
 
     /// Compile route conditions from the last transform's RouteConfig.
