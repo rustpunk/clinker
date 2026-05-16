@@ -984,23 +984,23 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
         } = Self::execute_dag(
-                config,
-                source_records,
-                &source_configs,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                compiled_routes_by_name,
-                plan,
-                validated_plan.artifacts(),
-                params,
-                &mut collector,
-                spill_root,
-                spill_root_path,
-                counters,
-                watermarks,
-            )
-            .await?;
+            config,
+            source_records,
+            &source_configs,
+            writers,
+            &compiled_transforms,
+            compiled_route,
+            compiled_routes_by_name,
+            plan,
+            validated_plan.artifacts(),
+            params,
+            &mut collector,
+            spill_root,
+            spill_root_path,
+            counters,
+            watermarks,
+        )
+        .await?;
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
