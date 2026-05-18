@@ -625,6 +625,64 @@ pub fn dispatch_method(
             format!("{}", ValueDisplay(receiver)).into(),
         ))),
 
+        // ── Array (non-closure) ─────────────────────────────────
+        "remove" => Ok(Some(match (receiver, args.first()) {
+            (Value::Array(arr), Some(Value::Integer(i))) => {
+                if *i < 0 || *i as usize >= arr.len() {
+                    // Out-of-bounds returns the original array
+                    // unchanged — mirrors the policy in the array
+                    // index access (return Null) when the caller
+                    // can't usefully act on the miss.
+                    Value::Array(arr.clone())
+                } else {
+                    let mut out = arr.clone();
+                    out.remove(*i as usize);
+                    Value::Array(out)
+                }
+            }
+            _ => Value::Null,
+        })),
+
+        // ── Map ─────────────────────────────────────────────────
+        "keys" => Ok(Some(match receiver {
+            Value::Map(m) => Value::Array(
+                m.keys()
+                    .map(|k| Value::String(k.clone()))
+                    .collect(),
+            ),
+            _ => Value::Null,
+        })),
+        "values" => Ok(Some(match receiver {
+            Value::Map(m) => Value::Array(m.values().cloned().collect()),
+            _ => Value::Null,
+        })),
+        "merge" => Ok(Some(match (receiver, args.first()) {
+            (Value::Map(a), Some(Value::Map(b))) => {
+                let mut out = (**a).clone();
+                for (k, v) in b.iter() {
+                    out.insert(k.clone(), v.clone());
+                }
+                Value::Map(Box::new(out))
+            }
+            _ => Value::Null,
+        })),
+        "set" => Ok(Some(match (receiver, args.first(), args.get(1)) {
+            (Value::Map(m), Some(Value::String(key)), Some(val)) => {
+                let mut out = (**m).clone();
+                out.insert(key.clone(), val.clone());
+                Value::Map(Box::new(out))
+            }
+            _ => Value::Null,
+        })),
+        "remove_field" => Ok(Some(match (receiver, args.first()) {
+            (Value::Map(m), Some(Value::String(key))) => {
+                let mut out = (**m).clone();
+                out.shift_remove(key.as_ref());
+                Value::Map(Box::new(out))
+            }
+            _ => Value::Null,
+        })),
+
         _ => Ok(None), // Unknown method
     }
 }

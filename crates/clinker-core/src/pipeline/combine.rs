@@ -441,9 +441,9 @@ impl KeyExtractor {
         resolver: &dyn FieldResolver,
         out: &mut Vec<Value>,
     ) -> Result<(), EvalError> {
-        let env: HashMap<String, Value> = HashMap::new();
+        let mut env: HashMap<String, Value> = HashMap::new();
         for kp in &self.programs {
-            let v = eval_expr::<NullStorage>(&kp.expr, &kp.typed, ctx, resolver, None, &env)?;
+            let v = eval_expr::<NullStorage>(&kp.expr, &kp.typed, ctx, resolver, None, &mut env)?;
             out.push(v);
         }
         Ok(())

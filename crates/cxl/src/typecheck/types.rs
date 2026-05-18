@@ -19,6 +19,10 @@ pub enum Type {
     Date,
     DateTime,
     Array,
+    /// Nested key-value map (`Value::Map`). Distinct from `Array` so
+    /// the typecheck pass can reject a map where an array is required
+    /// (e.g. `.filter(it => ...)`).
+    Map,
     /// Union of Int | Float. Resolved during unification.
     Numeric,
     /// Unknown type — field used only in type-agnostic contexts.
@@ -62,6 +66,7 @@ impl Type {
             TypeTag::Null => Type::Null,
             TypeTag::Any => Type::Any,
             TypeTag::Array => Type::Array,
+            TypeTag::Map => Type::Map,
             TypeTag::Numeric => Type::Numeric,
         }
     }
@@ -107,6 +112,7 @@ impl Type {
             Type::Date => "Date",
             Type::DateTime => "DateTime",
             Type::Array => "Array",
+            Type::Map => "Map",
             Type::Numeric => "Numeric",
             Type::Any => "Any",
             Type::Nullable(_) => "Nullable",

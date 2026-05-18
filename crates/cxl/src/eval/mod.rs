@@ -234,7 +234,7 @@ impl ProgramEvaluator {
         for stmt in &typed.program.statements {
             match stmt {
                 Statement::Filter { predicate, .. } => {
-                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &mut env)?;
                     if val != Value::Bool(true) {
                         return Ok(EvalResult::Skip(SkipReason::Filtered));
                     }
@@ -250,13 +250,13 @@ impl ProgramEvaluator {
                     }
                 }
                 Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
                     env.insert(name.to_string(), val);
                 }
                 Statement::Emit {
                     name, expr, target, ..
                 } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env).map_err(
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env).map_err(
                         |mut e| {
                             if e.triggering_field.is_none() {
                                 e.triggering_field = Some(Arc::from(&**name));
@@ -287,14 +287,14 @@ impl ProgramEvaluator {
                 } => {
                     let should_trace = if let Some(g) = guard {
                         matches!(
-                            eval_expr(g, &self.typed, ctx, resolver, window, &env)?,
+                            eval_expr(g, &self.typed, ctx, resolver, window, &mut env)?,
                             Value::Bool(true)
                         )
                     } else {
                         true
                     };
                     if should_trace {
-                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &env)?;
+                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &mut env)?;
                         let msg_str = match &msg {
                             Value::String(s) => s.to_string(),
                             other => format!("{:?}", other),
@@ -330,7 +330,7 @@ impl ProgramEvaluator {
                 }
                 Statement::UseStmt { .. } => {}
                 Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
                 }
                 Statement::EmitEach { .. } => {
                     // Statement borrow into self.typed.program would conflict
@@ -348,7 +348,7 @@ impl ProgramEvaluator {
                         _ => unreachable!(),
                     };
                     let source_val =
-                        eval_expr(&source_expr, &self.typed, ctx, resolver, window, &env)?;
+                        eval_expr(&source_expr, &self.typed, ctx, resolver, window, &mut env)?;
                     let elements = match source_val {
                         Value::Array(arr) => arr,
                         Value::Null => continue,
@@ -526,6 +526,104 @@ impl ProgramEvaluator {
     }
 }
 
+/// Dispatch a closure-bearing array method (`filter`/`map`/`find`/
+/// `any`/`flat_map`). The closure argument's body is evaluated once
+/// per array element with the closure parameter inserted into `env`
+/// (and removed after each iteration so the env is left undisturbed
+/// for the caller). Non-array receivers fall through to `Null`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_closure_method<'w, S: RecordStorage + 'w>(
+    receiver: &Value,
+    method: &str,
+    args: &[Expr],
+    span: Span,
+    typed: &TypedProgram,
+    ctx: &EvalContext<'_>,
+    resolver: &dyn FieldResolver,
+    window: Option<&dyn WindowContext<'w, S>>,
+    env: &mut HashMap<String, Value>,
+) -> Result<Value, EvalError> {
+    // Null receivers short-circuit to Null for every closure-bearing
+    // builtin — mirrors the null-propagation policy in
+    // `dispatch_method`.
+    if receiver.is_null() {
+        return Ok(Value::Null);
+    }
+    let elements = match receiver {
+        Value::Array(arr) => arr,
+        _ => return Ok(Value::Null),
+    };
+    let closure = match args.first() {
+        Some(Expr::Closure { param, body, .. }) => (param.clone(), body.as_ref()),
+        _ => {
+            return Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "closure argument (`it => ...`)",
+                    got: "non-closure argument",
+                },
+                span,
+            ));
+        }
+    };
+    let (param_name, body) = closure;
+
+    // Per-iteration insert+remove on the SHARED `env` keeps the
+    // closure-body eval allocation-free on the closure side — the
+    // body's own subexpressions still allocate their results as
+    // before.
+    let previous = env.remove(param_name.as_ref());
+    let mut output: Vec<Value> = Vec::new();
+    let mut found: Option<Value> = None;
+    let mut found_any: bool = false;
+
+    for element in elements {
+        env.insert(param_name.to_string(), element.clone());
+        let body_val = eval_expr(body, typed, ctx, resolver, window, env);
+        // Always remove the binding to keep env clean even on error.
+        env.remove(param_name.as_ref());
+        let body_val = body_val?;
+        match method {
+            "filter" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    output.push(element.clone());
+                }
+            }
+            "map" => {
+                output.push(body_val);
+            }
+            "find" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    found = Some(element.clone());
+                    break;
+                }
+            }
+            "any" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    found_any = true;
+                    break;
+                }
+            }
+            "flat_map" => match body_val {
+                Value::Array(inner) => output.extend(inner),
+                Value::Null => {}
+                other => output.push(other),
+            },
+            _ => unreachable!("dispatch_closure_method gated by method name"),
+        }
+    }
+
+    if let Some(prev) = previous {
+        env.insert(param_name.to_string(), prev);
+    }
+
+    Ok(match method {
+        "filter" | "map" | "flat_map" => Value::Array(output),
+        "find" => found.unwrap_or(Value::Null),
+        "any" => Value::Bool(found_any),
+        _ => unreachable!(),
+    })
+}
+
 /// Recover the span of a [`Statement`] variant. Used inside
 /// `emit each` body validation to anchor a runtime error on the
 /// offending body statement when its variant is forbidden inside the
@@ -572,11 +670,11 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
     for stmt in &typed.program.statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
                 env.insert(name.to_string(), val);
             }
             Statement::Emit { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
                 output.insert(name.to_string(), val);
             }
             Statement::Trace {
@@ -587,14 +685,14 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             } => {
                 let should_trace = if let Some(g) = guard {
                     matches!(
-                        eval_expr(g, typed, ctx, resolver, window, &env)?,
+                        eval_expr(g, typed, ctx, resolver, window, &mut env)?,
                         Value::Bool(true)
                     )
                 } else {
                     true
                 };
                 if should_trace {
-                    let msg = eval_expr(message, typed, ctx, resolver, window, &env)?;
+                    let msg = eval_expr(message, typed, ctx, resolver, window, &mut env)?;
                     let msg_str = match &msg {
                         Value::String(s) => s.to_string(),
                         other => format!("{:?}", other),
@@ -630,7 +728,7 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             }
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
             Statement::ExprStmt { expr, .. } => {
-                eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
             }
             Statement::Filter { .. } | Statement::Distinct { .. } => {
                 // Handled by ProgramEvaluator::eval_record(). eval_program()
@@ -650,13 +748,19 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
 }
 
 /// Evaluate a single expression.
+///
+/// `env` is `&mut HashMap<String, Value>` so the closure-bearing
+/// builtin dispatcher can insert the closure parameter for the body
+/// walk and remove it afterward — the design's no-clone invariant
+/// requires direct mutation rather than per-iteration env copies.
+/// Non-closure call sites pass the same env unchanged.
 pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
     typed: &TypedProgram,
     ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
-    env: &HashMap<String, Value>,
+    env: &mut HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
@@ -890,6 +994,36 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
 
             let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env)?;
+
+            // Closure-bearing array builtins: dispatch with the raw
+            // argument exprs so the closure body can re-evaluate per
+            // iteration with the closure parameter bound. Per-iteration
+            // binding goes through the shared env via insert+remove —
+            // no per-iteration env clone. `find` overloads with the
+            // string-regex variant: dispatch by receiver-Closure-arg
+            // shape so a `.find("pattern")` on a string still routes
+            // through the regex form below.
+            if matches!(
+                method.as_ref(),
+                "filter" | "map" | "find" | "any" | "flat_map"
+            ) && args
+                .first()
+                .map(|a| matches!(a, Expr::Closure { .. }))
+                .unwrap_or(false)
+            {
+                return dispatch_closure_method(
+                    &recv_val,
+                    method,
+                    args,
+                    *span,
+                    typed,
+                    ctx,
+                    resolver,
+                    window,
+                    env,
+                );
+            }
+
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
                 arg_vals.push(eval_expr(arg, typed, ctx, resolver, window, env)?);
@@ -1169,7 +1303,7 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
     ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
-    env: &HashMap<String, Value>,
+    env: &mut HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     // Three-valued AND/OR: short-circuit before evaluating RHS
     match op {

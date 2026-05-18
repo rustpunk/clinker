@@ -10,6 +10,10 @@ pub enum TypeTag {
     Null,
     Any,
     Array,
+    /// Nested key-value map (`Value::Map`). Distinct from `Array` so
+    /// builtin signatures can require a map shape (e.g. `.keys`,
+    /// `.values`, `.merge`) and reject array receivers at typecheck.
+    Map,
     Numeric,
 }
 
@@ -277,6 +281,124 @@ impl BuiltinRegistry {
         ] {
             methods.insert(n, d);
         }
+
+        // ── Array closure-bearing (5) ──
+        // Each takes a single closure-typed argument `it => <body>` —
+        // typecheck and the runtime body walker route the closure
+        // arg through dedicated arms (no `TypeTag` encodes "closure"
+        // because the arg is structurally rejected if it's not an
+        // `Expr::Closure` at the call site).
+        let ac = |name: &'static str, ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Array,
+                    args: vec![TypeTag::Any],
+                    min_args: 1,
+                    max_args: Some(1),
+                    return_type: ret,
+                    category: Category::Array,
+                },
+            )
+        };
+        // `find` deliberately reuses the existing string-regex
+        // registration (above). Receiver-type-based dispatch routes
+        // `Value::Array` receivers to the closure-bearing
+        // implementation in `dispatch_closure_method`; the string
+        // form continues to take a regex pattern. The typecheck
+        // pass treats both shapes as compatible because the string
+        // form returns Bool and the array form returns Any
+        // (typing the array variant precisely would require
+        // overload resolution by receiver type, which the existing
+        // `join` / `length` overloads also defer).
+        for (n, d) in [
+            ac("filter", TypeTag::Array),
+            ac("map", TypeTag::Array),
+            ac("any", TypeTag::Bool),
+            ac("flat_map", TypeTag::Array),
+        ] {
+            methods.insert(n, d);
+        }
+
+        // ── Array non-closure (1) — `.remove(index: int)`.
+        methods.insert(
+            "remove",
+            BuiltinDef {
+                name: "remove",
+                receiver: TypeTag::Array,
+                args: vec![TypeTag::Int],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::Array,
+                category: Category::Array,
+            },
+        );
+
+        // ── Map (5) ── — `.keys`, `.values`, `.merge(map)`,
+        // `.set(key: string, value: any)`, `.remove_field(key: string)`.
+        // `keys` and `values` are zero-arg; `merge` / `set` /
+        // `remove_field` take a single argument plus an optional value.
+        methods.insert(
+            "keys",
+            BuiltinDef {
+                name: "keys",
+                receiver: TypeTag::Map,
+                args: vec![],
+                min_args: 0,
+                max_args: Some(0),
+                return_type: TypeTag::Array,
+                category: Category::Array,
+            },
+        );
+        methods.insert(
+            "values",
+            BuiltinDef {
+                name: "values",
+                receiver: TypeTag::Map,
+                args: vec![],
+                min_args: 0,
+                max_args: Some(0),
+                return_type: TypeTag::Array,
+                category: Category::Array,
+            },
+        );
+        methods.insert(
+            "merge",
+            BuiltinDef {
+                name: "merge",
+                receiver: TypeTag::Map,
+                args: vec![TypeTag::Map],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::Map,
+                category: Category::Array,
+            },
+        );
+        methods.insert(
+            "set",
+            BuiltinDef {
+                name: "set",
+                receiver: TypeTag::Map,
+                args: vec![TypeTag::String, TypeTag::Any],
+                min_args: 2,
+                max_args: Some(2),
+                return_type: TypeTag::Map,
+                category: Category::Array,
+            },
+        );
+        methods.insert(
+            "remove_field",
+            BuiltinDef {
+                name: "remove_field",
+                receiver: TypeTag::Map,
+                args: vec![TypeTag::String],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::Map,
+                category: Category::Array,
+            },
+        );
 
         // ── Conversion strict (6) ──
         let cs = |name: &'static str,
