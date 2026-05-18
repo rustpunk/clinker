@@ -126,12 +126,6 @@ pub struct AnalyticWindowSpec {
     pub sort_by: Vec<SortField>,
     /// Expression to evaluate against the primary record for cross-source lookup.
     pub on: Option<String>,
-    /// Optional row-frame attached to the window. `None` means "entire
-    /// partition" and matches the historical default semantics. Range /
-    /// Groups modes land in a later sprint; only `FrameMode::Rows` is
-    /// accepted today.
-    #[serde(default)]
-    pub frame: Option<WindowFrame>,
     /// Window sits downstream of a relaxed-CK aggregate whose dropped CK
     /// fields overlap this window's `partition_by`. Set to `true` by the
     /// plan-time derivation walk in
@@ -142,49 +136,6 @@ pub struct AnalyticWindowSpec {
     /// because YAML never sets this — it is a derived plan-time property.
     #[serde(default)]
     pub requires_buffer_recompute: bool,
-}
-
-/// Row-frame attached to an [`AnalyticWindowSpec`]. Mirrors SQL window
-/// frames (`ROWS BETWEEN <start> AND <end>`). `Range` / `Groups` modes
-/// land in a later sprint.
-///
-/// Currently the frame deserializes and round-trips through the plan but
-/// does **not** alter evaluation — every `$window.*` call evaluates over
-/// the entire partition. Frame-aware semantics are a future change.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WindowFrame {
-    pub mode: FrameMode,
-    pub start: FrameBound,
-    pub end: FrameBound,
-}
-
-/// Frame mode. Only `Rows` (positional offsets) is supported today.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FrameMode {
-    Rows,
-}
-
-/// One bound of a [`WindowFrame`]. YAML form is externally tagged for
-/// the offset-carrying variants and a bare string for the parameterless
-/// ones. `Preceding`/`Following` carry a non-negative row offset.
-///
-/// ```yaml
-/// start: unbounded_preceding
-/// end:   current_row
-/// # or
-/// start: { preceding: 3 }
-/// end:   { following: 0 }
-/// ```
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub enum FrameBound {
-    UnboundedPreceding,
-    Preceding(u32),
-    CurrentRow,
-    Following(u32),
-    UnboundedFollowing,
 }
 
 /// Specification for one secondary index to build during Phase 1.
