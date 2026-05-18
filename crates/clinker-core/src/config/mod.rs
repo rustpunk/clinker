@@ -3,6 +3,7 @@ pub mod composition;
 pub mod node_header;
 pub mod pipeline_node;
 
+pub use crate::plan::index::AnalyticWindowSpec;
 pub use compile_context::CompileContext;
 pub use composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,
@@ -12,8 +13,8 @@ pub use composition::{
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
-    AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, Phase, PipelineNode, RouteBody,
-    SourceBody, TransformBody, VarScope,
+    AggregateBody, MergeBody, OutputBody, Phase, PipelineNode, RouteBody, SourceBody,
+    TransformBody, VarScope,
 };
 
 use crate::yaml::Spanned;
@@ -1969,7 +1970,7 @@ impl PipelineConfig {
         // programs the analyzer pass would consume).
         struct PlannerEntry {
             name: String,
-            analytic_window: Option<serde_json::Value>,
+            analytic_window: Option<AnalyticWindowSpec>,
         }
         let entries: Vec<PlannerEntry> = self
             .nodes
@@ -2018,18 +2019,9 @@ impl PipelineConfig {
         for a in &report.transforms {
             analysis_by_name.insert(a.name.clone(), a);
         }
-        let window_configs: Vec<Option<crate::plan::index::LocalWindowConfig>> = entries
-            .iter()
-            .map(|e| crate::plan::index::parse_analytic_window_value(&e.analytic_window, &e.name))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                vec![Diagnostic::error(
-                    "E003",
-                    format!("analytic_window parse error: {e}"),
-                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-                )]
-            })?;
-        // Validate: if a transform uses window.* but has no local_window, error.
+        let window_configs: Vec<Option<AnalyticWindowSpec>> =
+            entries.iter().map(|e| e.analytic_window.clone()).collect();
+        // Validate: if a transform uses window.* but has no analytic_window, error.
         for (i, analysis) in report.transforms.iter().enumerate() {
             if !analysis.window_calls.is_empty() {
                 let entry_idx = entries_by_name.get(&analysis.name).copied().unwrap_or(i);
@@ -2041,7 +2033,7 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "transform '{}' uses window.* functions but declares no local_window",
+                            "transform '{}' uses window.* functions but declares no analytic_window",
                             analysis.name
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
@@ -2063,7 +2055,7 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "transform '{}' references unknown source '{}' in local_window",
+                            "transform '{}' references unknown source '{}' in analytic_window",
                             entries[i].name, source
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
@@ -2336,7 +2328,7 @@ impl PipelineConfig {
                             "E003",
                             format!(
                                 "windowed transform '{}' has no upstream input; \
-                                 local_window requires a predecessor in the DAG",
+                                 analytic_window requires a predecessor in the DAG",
                                 transform_name
                             ),
                             LabeledSpan::primary(Span::SYNTHETIC, String::new()),
@@ -3161,7 +3153,7 @@ fn resolve_all_input_references(
 #[derive(Default)]
 pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
-    pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
+    pub window_config: Option<&'a AnalyticWindowSpec>,
     pub primary_source: &'a str,
 }
 

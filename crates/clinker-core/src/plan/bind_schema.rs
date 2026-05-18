@@ -1996,31 +1996,13 @@ fn bind_composition(
     // `window_index` on the PlanNode::Transform — that backfill is
     // owned by the body-window pass once parent NodeIndex space is
     // allocated.
-    let mut body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig> =
+    let mut body_window_configs: HashMap<String, crate::plan::index::AnalyticWindowSpec> =
         HashMap::new();
     for spanned in &body_file.nodes {
         if let PipelineNode::Transform { header, config } = &spanned.value
-            && let Some(raw) = config.analytic_window.as_ref()
+            && let Some(spec) = config.analytic_window.as_ref()
         {
-            match crate::plan::index::parse_analytic_window_value(&Some(raw.clone()), &header.name)
-            {
-                Ok(Some(wc)) => {
-                    body_window_configs.insert(header.name.clone(), wc);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    diags.push(Diagnostic::error(
-                        "E003",
-                        format!(
-                            "composition body for {node_name:?} carries an \
-                             invalid analytic_window on transform {:?}: {e}",
-                            header.name
-                        ),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
-                    return;
-                }
-            }
+            body_window_configs.insert(header.name.clone(), spec.clone());
         }
     }
 

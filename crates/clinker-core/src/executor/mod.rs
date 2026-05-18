@@ -59,7 +59,6 @@ pub struct TransformSpec {
     pub name: String,
     pub cxl: Option<String>,
     pub aggregate: Option<crate::config::AggregateConfig>,
-    pub local_window: Option<serde_json::Value>,
     pub route: Option<crate::config::RouteConfig>,
     pub input: Option<crate::config::TransformInput>,
 }
@@ -129,7 +128,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     name: header.name.clone(),
                     cxl: Some(body.cxl.as_ref().to_string()),
                     aggregate: None,
-                    local_window: body.analytic_window.clone(),
                     route: None,
                     input: project_input(&header.input.value),
                 });
@@ -148,7 +146,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         time_window: body.time_window.clone(),
                         allowed_lateness: body.allowed_lateness,
                     }),
-                    local_window: None,
                     route: None,
                     input: project_input(&header.input.value),
                 });
@@ -169,7 +166,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     name: header.name.clone(),
                     cxl: Some(String::new()),
                     aggregate: None,
-                    local_window: None,
                     route: Some(RouteConfig {
                         mode: body.mode,
                         branches,
@@ -3257,10 +3253,12 @@ pub(crate) fn evaluate_single_transform_windowed(
         })
         .collect();
 
+    let sort_fields: Vec<&str> = spec.sort_by.iter().map(|s| s.field.as_str()).collect();
     let result = if let Some(key) = key {
         if let Some(partition) = index.get(&key) {
             let pos_in_partition = partition.iter().position(|&p| p == record_pos).unwrap_or(0);
-            let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
+            let wctx =
+                PartitionWindowContext::new(arena, partition, pos_in_partition, &sort_fields);
             evaluator
                 .eval_record(ctx, record, Some(&wctx))
                 .map_err(|e| (transform_name.to_string(), e))?
@@ -3576,6 +3574,7 @@ mod tests {
     mod post_aggregate_lag_lead;
     mod post_aggregate_recompute_determinism;
     mod post_aggregate_window;
+    mod post_aggregate_window_ranking;
     mod post_aggregate_window_spilled;
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;

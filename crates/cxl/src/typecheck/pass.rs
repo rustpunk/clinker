@@ -762,12 +762,13 @@ impl<'a> TypeChecker<'a> {
                 args,
                 span,
             } => {
-                let is_predicate_fn = &**function == "any" || &**function == "all";
+                let is_predicate_fn =
+                    matches!(&**function, "any" | "every" | "exists" | "not_exists");
 
                 // Check for nested window calls inside predicate_expr
                 if in_predicate {
                     self.error(*span,
-                        format!("$window.{}() cannot be called inside a $window.any() or $window.all() predicate", function),
+                        format!("$window.{}() cannot be called inside a $window.any/every/exists/not_exists predicate", function),
                         Some("Move the window call outside the predicate expression".into()));
                 }
 
@@ -797,8 +798,9 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // any/all: enforce arity 1 and Bool-typed predicate so
-                // the eval-time three-valued fold has a well-typed input.
+                // Predicate-fold builtins: enforce arity 1 and Bool-typed
+                // predicate so the eval-time three-valued fold has a
+                // well-typed input.
                 if is_predicate_fn {
                     match args.len() {
                         1 => {
@@ -823,10 +825,24 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                let ty = if let Some(def) = self.registry.lookup_window(function) {
-                    Type::from_type_tag(def.return_type)
-                } else {
-                    Type::Any
+                // Unregistered window names are a typecheck error.
+                // Letting them fall through to `Type::Any` lets a
+                // misspelled `$window.row_numbr()` reach eval-time and
+                // silently return `Value::Null` from the catch-all arm —
+                // a class of silent-Null bug this pass exists to catch.
+                let ty = match self.registry.lookup_window(function) {
+                    Some(def) => Type::from_type_tag(def.return_type),
+                    None => {
+                        self.error(
+                            *span,
+                            format!("unknown window function $window.{}()", function),
+                            Some(
+                                "Use one of the registered window functions: row_number, rank, dense_rank, count, sum, cumulative_sum, avg, min, max, first, last, first_value, last_value, lag, lead, any, every, exists, not_exists, collect, distinct"
+                                    .into(),
+                            ),
+                        );
+                        Type::Any
+                    }
                 };
 
                 self.set_type(*node_id, ty.clone());
@@ -1474,11 +1490,11 @@ mod tests {
     }
 
     #[test]
-    fn test_typecheck_all_requires_bool_arg() {
+    fn test_typecheck_every_requires_bool_arg() {
         let mut cols = IndexMap::new();
         cols.insert("amount".into(), Type::Int);
         let schema = Row::closed(cols, Span::new(0, 0));
-        let diags = typecheck_err("emit val = $window.all(amount)", &["amount"], &schema);
+        let diags = typecheck_err("emit val = $window.every(amount)", &["amount"], &schema);
         assert!(
             diags.iter().any(|d| d.message.contains("Bool")),
             "Expected Bool requirement diagnostic, got: {:?}",

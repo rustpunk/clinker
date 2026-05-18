@@ -532,15 +532,15 @@ fn test_log_level4_guard_short_circuits() {
 }
 
 // ---------------------------------------------------------------------------
-// $window.any / $window.all — three-valued logic
+// $window.any / $window.every — three-valued logic
 //
-// Mirrors BinOp::And/Or in eval/mod.rs:801–829 by construction. Tests use a
+// Mirrors BinOp::And/Or in eval/mod.rs by construction. Tests use a
 // minimal in-memory `RowsStorage` + `RowsWindow` so each test row can hold
 // explicit `Value::Bool` / `Value::Null` predicate inputs without going
 // through CSV/coercion.
 // ---------------------------------------------------------------------------
 
-mod any_all {
+mod any_every {
     use super::*;
     use crate::typecheck::row::QualifiedField;
     use clinker_record::{RecordView, WindowContext};
@@ -621,6 +621,21 @@ mod any_all {
         fn distinct(&self, _: &str) -> Value {
             Value::Null
         }
+        fn row_number(&self) -> i64 {
+            1
+        }
+        fn rank(&self) -> i64 {
+            1
+        }
+        fn dense_rank(&self) -> i64 {
+            1
+        }
+        fn first_value(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn last_value(&self, _: &str) -> Value {
+            Value::Null
+        }
     }
 
     fn eval_window(src: &str, partition: Vec<Value>) -> Value {
@@ -672,7 +687,7 @@ mod any_all {
     }
 
     #[test]
-    fn any_all_false_returns_false() {
+    fn any_every_false_returns_false() {
         assert_eq!(
             eval_window(
                 "emit r = $window.any(flag)",
@@ -695,26 +710,26 @@ mod any_all {
     }
 
     #[test]
-    fn all_short_circuits_on_false() {
+    fn every_short_circuits_on_false() {
         assert_eq!(
             eval_window(
-                "emit r = $window.all(flag)",
+                "emit r = $window.every(flag)",
                 vec![b(true), b(false), b(true)]
             ),
             Value::Bool(false)
         );
         // False before null → still false (short-circuit fires before null is seen).
         assert_eq!(
-            eval_window("emit r = $window.all(flag)", vec![b(false), n(), b(true)]),
+            eval_window("emit r = $window.every(flag)", vec![b(false), n(), b(true)]),
             Value::Bool(false)
         );
     }
 
     #[test]
-    fn all_all_true_returns_true() {
+    fn every_all_true_returns_true() {
         assert_eq!(
             eval_window(
-                "emit r = $window.all(flag)",
+                "emit r = $window.every(flag)",
                 vec![b(true), b(true), b(true)]
             ),
             Value::Bool(true)
@@ -722,13 +737,13 @@ mod any_all {
     }
 
     #[test]
-    fn all_null_with_no_false_returns_null() {
+    fn every_null_with_no_false_returns_null() {
         assert_eq!(
-            eval_window("emit r = $window.all(flag)", vec![n(), b(true), b(true)]),
+            eval_window("emit r = $window.every(flag)", vec![n(), b(true), b(true)]),
             Value::Null
         );
         assert_eq!(
-            eval_window("emit r = $window.all(flag)", vec![b(true), n(), b(true)]),
+            eval_window("emit r = $window.every(flag)", vec![b(true), n(), b(true)]),
             Value::Null
         );
     }
@@ -737,22 +752,22 @@ mod any_all {
     fn empty_partition_returns_identity() {
         // Defensive — unreachable in practice (current row is always in
         // partition), but identity for iterated or/and:
-        // any → false, all → true.
+        // any → false, every → true.
         assert_eq!(
             eval_window("emit r = $window.any(flag)", vec![]),
             Value::Bool(false)
         );
         assert_eq!(
-            eval_window("emit r = $window.all(flag)", vec![]),
+            eval_window("emit r = $window.every(flag)", vec![]),
             Value::Bool(true)
         );
     }
 
     #[test]
     fn agrees_with_iterated_or_and_two_rows() {
-        // Algebraic identity: any([a, b]) ≡ a or b; all([a, b]) ≡ a and b.
-        // BinOp::And/Or in eval/mod.rs:801–829 are the source of truth;
-        // any/all over the same inputs must produce the same Value.
+        // Algebraic identity: any([a, b]) ≡ a or b; every([a, b]) ≡ a and b.
+        // BinOp::And/Or in eval/mod.rs are the source of truth;
+        // any/every over the same inputs must produce the same Value.
         let pairs = [
             (b(true), b(true)),
             (b(true), b(false)),
@@ -777,17 +792,351 @@ mod any_all {
                 "any({a:?}, {b_val:?}) must match iterated or"
             );
 
-            let from_all =
-                eval_window("emit r = $window.all(flag)", vec![a.clone(), b_val.clone()]);
-            let expected_all = match (&a, &b_val) {
+            let from_every = eval_window(
+                "emit r = $window.every(flag)",
+                vec![a.clone(), b_val.clone()],
+            );
+            let expected_every = match (&a, &b_val) {
                 (Value::Bool(false), _) | (_, Value::Bool(false)) => Value::Bool(false),
                 (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
                 _ => Value::Null,
             };
             assert_eq!(
-                from_all, expected_all,
-                "all({a:?}, {b_val:?}) must match iterated and"
+                from_every, expected_every,
+                "every({a:?}, {b_val:?}) must match iterated and"
             );
         }
+    }
+
+    #[test]
+    fn exists_aliases_any() {
+        // exists(p) and any(p) collapse to iterated OR over identical
+        // inputs and must match Value-for-Value.
+        assert_eq!(
+            eval_window(
+                "emit r = $window.exists(flag)",
+                vec![b(false), b(true), b(false)]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_window(
+                "emit r = $window.exists(flag)",
+                vec![b(false), b(false), b(false)]
+            ),
+            Value::Bool(false)
+        );
+        // Empty partition: same identity as any.
+        assert_eq!(
+            eval_window("emit r = $window.exists(flag)", vec![]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn not_exists_inverts_predicate() {
+        // not_exists(p) ≡ every(not p): true iff no row satisfies p.
+        assert_eq!(
+            eval_window(
+                "emit r = $window.not_exists(flag)",
+                vec![b(false), b(false), b(false)]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_window(
+                "emit r = $window.not_exists(flag)",
+                vec![b(false), b(true), b(false)]
+            ),
+            Value::Bool(false)
+        );
+        // Empty partition: vacuously true (matches every's identity).
+        assert_eq!(
+            eval_window("emit r = $window.not_exists(flag)", vec![]),
+            Value::Bool(true)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typecheck: unknown $window.* functions are an error.
+// Catches the silent-Null bug where $window.row_numbr() previously
+// fell through the registry's None branch and inherited Type::Any.
+// ---------------------------------------------------------------------------
+
+mod window_typecheck {
+    use super::*;
+
+    fn typecheck_errors(src: &str) -> Vec<String> {
+        let parsed = Parser::parse(src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &[], parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve: {:?}", d));
+        let row = empty_row();
+        match type_check(resolved, &row) {
+            Ok(_) => vec![],
+            Err(diags) => diags.into_iter().map(|d| d.message).collect(),
+        }
+    }
+
+    #[test]
+    fn unknown_window_function_errors() {
+        let errs = typecheck_errors("emit r = $window.row_numbr()");
+        assert!(
+            errs.iter().any(|m| m.contains("unknown window function")),
+            "expected unknown-window-function diagnostic, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn registered_window_function_typechecks() {
+        // row_number is registered with return type Int; should not error.
+        let errs = typecheck_errors("emit r = $window.row_number()");
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// $window.row_number / rank / dense_rank / first_value / last_value.
+//
+// Unit-level shape tests against a minimal in-memory implementation that
+// keys ranks off a synthetic `k` column. End-to-end coverage with an
+// Arena partition lives in
+// `clinker_core::executor::tests::post_aggregate_window_ranking`.
+// ---------------------------------------------------------------------------
+
+mod ranking_and_value {
+    use super::*;
+    use crate::typecheck::row::QualifiedField;
+    use clinker_record::{RecordView, WindowContext};
+
+    /// Storage with two columns: `k` (sort key) and `v` (value).
+    struct KeyedRows {
+        keys: Vec<Value>,
+        values: Vec<Value>,
+    }
+
+    impl RecordStorage for KeyedRows {
+        fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
+            match name {
+                "k" => self.keys.get(index as usize),
+                "v" => self.values.get(index as usize),
+                _ => None,
+            }
+        }
+        fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
+            None
+        }
+        fn available_fields(&self, _: u64) -> Vec<&str> {
+            vec!["k", "v"]
+        }
+        fn record_count(&self) -> u64 {
+            self.keys.len() as u64
+        }
+    }
+
+    /// Window over the full storage. `current_pos` selects which row the
+    /// ranking functions report; rank/dense_rank consult the `k` column
+    /// for tie detection.
+    struct RankWindow<'a> {
+        storage: &'a KeyedRows,
+        current_pos: usize,
+    }
+
+    impl<'a> WindowContext<'a, KeyedRows> for RankWindow<'a> {
+        fn first(&self) -> Option<RecordView<'a, KeyedRows>> {
+            (!self.storage.keys.is_empty()).then(|| RecordView::new(self.storage, 0))
+        }
+        fn last(&self) -> Option<RecordView<'a, KeyedRows>> {
+            self.storage
+                .keys
+                .len()
+                .checked_sub(1)
+                .map(|i| RecordView::new(self.storage, i as u64))
+        }
+        fn lag(&self, _: usize) -> Option<RecordView<'a, KeyedRows>> {
+            None
+        }
+        fn lead(&self, _: usize) -> Option<RecordView<'a, KeyedRows>> {
+            None
+        }
+        fn count(&self) -> i64 {
+            self.storage.keys.len() as i64
+        }
+        fn sum(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn cumulative_sum(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn avg(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn min(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn max(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn partition_len(&self) -> usize {
+            self.storage.keys.len()
+        }
+        fn partition_record(&self, index: usize) -> RecordView<'a, KeyedRows> {
+            RecordView::new(self.storage, index as u64)
+        }
+        fn collect(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn distinct(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn row_number(&self) -> i64 {
+            self.current_pos as i64 + 1
+        }
+        fn rank(&self) -> i64 {
+            if self.storage.keys.is_empty() {
+                return 1;
+            }
+            let mut rank = 1i64;
+            for i in 1..=self.current_pos {
+                if self.storage.keys[i] != self.storage.keys[i - 1] {
+                    rank = (i as i64) + 1;
+                }
+            }
+            rank
+        }
+        fn dense_rank(&self) -> i64 {
+            if self.storage.keys.is_empty() {
+                return 1;
+            }
+            let mut rank = 1i64;
+            for i in 1..=self.current_pos {
+                if self.storage.keys[i] != self.storage.keys[i - 1] {
+                    rank += 1;
+                }
+            }
+            rank
+        }
+        fn first_value(&self, field: &str) -> Value {
+            match field {
+                "k" => self.storage.keys.first().cloned().unwrap_or(Value::Null),
+                "v" => self.storage.values.first().cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+        fn last_value(&self, field: &str) -> Value {
+            match field {
+                "k" => self.storage.keys.last().cloned().unwrap_or(Value::Null),
+                "v" => self.storage.values.last().cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+    }
+
+    fn eval_with(
+        src: &str,
+        keys: Vec<Value>,
+        values: Vec<Value>,
+        current_pos: usize,
+    ) -> indexmap::IndexMap<String, Value> {
+        let parsed = Parser::parse(src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &["k", "v"], parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve: {:?}", d));
+        let mut cols = indexmap::IndexMap::new();
+        cols.insert(
+            QualifiedField::bare("k"),
+            crate::typecheck::types::Type::Int,
+        );
+        cols.insert(
+            QualifiedField::bare("v"),
+            crate::typecheck::types::Type::Int,
+        );
+        let row = Row::closed(cols, Span::new(0, 0));
+        let typed = type_check(resolved, &row).unwrap_or_else(|d| panic!("type: {:?}", d));
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let storage = KeyedRows { keys, values };
+        let resolver = HashMapResolver::new(HashMap::new());
+        let window = RankWindow {
+            storage: &storage,
+            current_pos,
+        };
+        eval_program::<KeyedRows>(&typed, &ctx, &resolver, Some(&window))
+            .unwrap_or_else(|e| panic!("eval: {}", e))
+    }
+
+    fn i(n: i64) -> Value {
+        Value::Integer(n)
+    }
+
+    #[test]
+    fn row_number_is_1_indexed() {
+        let out = eval_with(
+            "emit n = $window.row_number()",
+            vec![i(1), i(1), i(2), i(3)],
+            vec![i(10), i(20), i(30), i(40)],
+            0,
+        );
+        assert_eq!(out.get("n"), Some(&Value::Integer(1)));
+        let out = eval_with(
+            "emit n = $window.row_number()",
+            vec![i(1), i(1), i(2), i(3)],
+            vec![i(10), i(20), i(30), i(40)],
+            3,
+        );
+        assert_eq!(out.get("n"), Some(&Value::Integer(4)));
+    }
+
+    #[test]
+    fn rank_ties_share_value_then_gap() {
+        // Keys: 1 1 2 2 2 5 → rank: 1 1 3 3 3 6 (gap of two after the
+        // first tie pair, gap of two after the second tie triple).
+        let keys = vec![i(1), i(1), i(2), i(2), i(2), i(5)];
+        let vals = vec![i(0); 6];
+        let expected = [1, 1, 3, 3, 3, 6];
+        for (pos, exp) in expected.iter().enumerate() {
+            let out = eval_with("emit r = $window.rank()", keys.clone(), vals.clone(), pos);
+            assert_eq!(
+                out.get("r"),
+                Some(&Value::Integer(*exp)),
+                "rank at pos {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_rank_no_gaps() {
+        // Keys: 1 1 2 2 2 5 → dense_rank: 1 1 2 2 2 3 (each distinct
+        // key bumps the rank by exactly one).
+        let keys = vec![i(1), i(1), i(2), i(2), i(2), i(5)];
+        let vals = vec![i(0); 6];
+        let expected = [1, 1, 2, 2, 2, 3];
+        for (pos, exp) in expected.iter().enumerate() {
+            let out = eval_with(
+                "emit r = $window.dense_rank()",
+                keys.clone(),
+                vals.clone(),
+                pos,
+            );
+            assert_eq!(
+                out.get("r"),
+                Some(&Value::Integer(*exp)),
+                "dense_rank at pos {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_value_last_value_project_field() {
+        let out = eval_with(
+            "emit fv = $window.first_value(v)\nemit lv = $window.last_value(v)",
+            vec![i(1), i(2), i(3)],
+            vec![i(100), i(200), i(300)],
+            1,
+        );
+        assert_eq!(out.get("fv"), Some(&Value::Integer(100)));
+        assert_eq!(out.get("lv"), Some(&Value::Integer(300)));
     }
 }

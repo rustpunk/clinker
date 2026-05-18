@@ -20,7 +20,7 @@ use crate::config::{
 use crate::error::PipelineError;
 use crate::executor::combine::JoinSide;
 use crate::plan::composition_body::CompositionBodyId;
-use crate::plan::index::{IndexSpec, LocalWindowConfig, PlanIndexError};
+use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
@@ -499,7 +499,7 @@ pub struct PlanSourcePayload {
 /// downstream wiring, and the compile-time CXL `TypedProgram`.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
-    pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
+    pub analytic_window: Option<AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,
     pub validations: Vec<crate::config::ValidationEntry>,
     pub dlq_node: Option<NodeIndex>,
@@ -2518,7 +2518,7 @@ pub(crate) fn assign_tiers(graph: &mut DiGraph<PlanNode, PlanEdge>, topo_order: 
 /// Derive ParallelismClass from analyzer output and window config.
 pub(crate) fn derive_parallelism_class(
     analysis: &cxl::analyzer::TransformAnalysis,
-    wc: &Option<LocalWindowConfig>,
+    wc: &Option<AnalyticWindowSpec>,
     primary_source: &str,
 ) -> ParallelismClass {
     match analysis.parallelism_hint {
@@ -2593,7 +2593,7 @@ pub struct ParallelismProfile {
 /// earlier tiers than the transforms that depend on them.
 pub(crate) fn build_source_dag(
     sources: &[SourceConfig],
-    window_configs: &[Option<LocalWindowConfig>],
+    window_configs: &[Option<AnalyticWindowSpec>],
     primary_source: &str,
 ) -> Result<Vec<SourceTier>, PlanError> {
     let all_sources: Vec<String> = sources.iter().map(|i| i.name.clone()).collect();
@@ -4569,8 +4569,9 @@ pub(crate) fn extract_has_distinct(typed: &TypedProgram) -> bool {
 /// Errors from execution plan compilation.
 #[derive(Debug)]
 pub enum PlanError {
-    IndexPlanning(PlanIndexError),
-    MissingLocalWindow {
+    /// A Transform's CXL invokes `$window.*` but the YAML body declares
+    /// no `analytic_window:` block.
+    MissingAnalyticWindow {
         transform: String,
     },
     UnknownSource {
@@ -4636,11 +4637,10 @@ pub enum PlanError {
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanError::IndexPlanning(e) => write!(f, "index planning error: {}", e),
-            PlanError::MissingLocalWindow { transform } => {
+            PlanError::MissingAnalyticWindow { transform } => {
                 write!(
                     f,
-                    "transform '{}' uses window.* but has no local_window config",
+                    "transform '{}' uses window.* but has no analytic_window config",
                     transform
                 )
             }

@@ -617,10 +617,11 @@ impl<'a> Resolver<'a> {
             } else {
                 self.diagnostics.push(ResolveDiagnostic {
                     span,
-                    message: "'it' is only valid inside $window.any() or $window.all() predicates"
-                        .into(),
+                    message:
+                        "'it' is only valid inside a $window predicate (any / every / exists / not_exists)"
+                            .into(),
                     help: Some(
-                        "Move this expression inside a $window.any() or $window.all() call".into(),
+                        "Move this expression inside a $window.any() / .every() / .exists() / .not_exists() call".into(),
                     ),
                 });
                 return;
@@ -906,7 +907,7 @@ mod tests {
         assert!(
             diags[0]
                 .message
-                .contains("'it' is only valid inside $window.any() or $window.all()")
+                .contains("'it' is only valid inside a $window predicate")
         );
     }
 

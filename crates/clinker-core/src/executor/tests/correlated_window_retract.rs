@@ -15,8 +15,8 @@
 //!
 //! Coverage. The full design matrix is 13 `$window.*` builtins ×
 //! {rows, range} × 3 frame-bound shapes × {single-row retract,
-//! full-partition retract} = 156 cells. Today's `LocalWindowConfig`
-//! does not expose the `frame:` configuration to the runtime, so the
+//! full-partition retract} = 156 cells. Today's `AnalyticWindowSpec`
+//! does not thread the `frame:` configuration into the runtime, so the
 //! frame variant collapses to "implicit unbounded over partition" for
 //! every builtin. Removing the frame axis reduces the matrix to 13 ×
 //! {single, full} = 26 representative cells, which the parameterized
@@ -516,10 +516,10 @@ async fn window_lag2_and_lead2_boundary_retract() {
     );
 }
 
-// `$window.distinct(...)` and `$window.any(...)` / `$window.all(...)`
+// `$window.distinct(...)` and `$window.any(...)` / `$window.every(...)`
 // are listed in the windows.md docs but the CXL parser today rejects
 // `distinct` (it is a top-level keyword) and the iterable-predicate
-// shape (any/all over a predicate expression) does not flow cleanly
+// shape (any/every over a predicate expression) does not flow cleanly
 // through the same analytic_window plumbing as the value-emitting
 // builtins. The buffer-recompute path is uniform across builtins so
 // the iterable cells are structurally covered by `collect` (the only

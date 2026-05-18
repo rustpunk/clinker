@@ -9,20 +9,47 @@ use crate::pipeline::arena::Arena;
 /// Concrete WindowContext over a sorted Arena partition.
 ///
 /// Holds a reference to the Arena and a slice of sorted record positions.
-/// `current_pos` is the index *within the partition* of the record being evaluated.
+/// `current_pos` is the index *within the partition* of the record being
+/// evaluated. `sort_fields` names the columns that define the partition's
+/// ordering — `rank()` / `dense_rank()` consult them to detect ties, and
+/// an empty slice degenerates both to "every row tied at 1".
 pub struct PartitionWindowContext<'a> {
     arena: &'a Arena,
     partition: &'a [u64],
     current_pos: usize,
+    sort_fields: &'a [&'a str],
 }
 
 impl<'a> PartitionWindowContext<'a> {
-    pub fn new(arena: &'a Arena, partition: &'a [u64], current_pos: usize) -> Self {
+    /// Construct a context against the given arena partition.
+    ///
+    /// `sort_fields` should be the same sequence of field names that the
+    /// secondary index used to order the partition. Pass an empty slice
+    /// when the index has no declared `sort_by` — `rank` / `dense_rank`
+    /// then report every row as tied.
+    pub fn new(
+        arena: &'a Arena,
+        partition: &'a [u64],
+        current_pos: usize,
+        sort_fields: &'a [&'a str],
+    ) -> Self {
         Self {
             arena,
             partition,
             current_pos,
+            sort_fields,
         }
+    }
+
+    /// Compare two partition rows by their sort-key tuple. Returns `true`
+    /// when every configured sort field resolves to the same `Value` on
+    /// both rows. With no sort fields configured all rows are equal.
+    fn sort_keys_equal(&self, lhs: u64, rhs: u64) -> bool {
+        self.sort_fields.iter().all(|field| {
+            let l = self.arena.resolve_field(lhs, field);
+            let r = self.arena.resolve_field(rhs, field);
+            l == r
+        })
     }
 
     /// Sum a named field across the supplied partition positions.
@@ -208,6 +235,59 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
         }
         Value::Array(values)
     }
+
+    fn row_number(&self) -> i64 {
+        (self.current_pos as i64) + 1
+    }
+
+    fn rank(&self) -> i64 {
+        // Walk forward from the partition's start, bumping the rank
+        // whenever the sort-key tuple changes. Tie groups share the
+        // rank of their first row; the next distinct key jumps to its
+        // own positional index + 1, leaving a gap equal to the tie
+        // group size. Stops as soon as we reach `current_pos`.
+        if self.partition.is_empty() || self.current_pos == 0 {
+            return 1;
+        }
+        let mut rank: i64 = 1;
+        for i in 1..=self.current_pos.min(self.partition.len() - 1) {
+            if !self.sort_keys_equal(self.partition[i - 1], self.partition[i]) {
+                rank = (i as i64) + 1;
+            }
+        }
+        rank
+    }
+
+    fn dense_rank(&self) -> i64 {
+        // Same fold as `rank` but each distinct sort key increments by
+        // exactly one — no gaps after a tie group.
+        if self.partition.is_empty() || self.current_pos == 0 {
+            return 1;
+        }
+        let mut rank: i64 = 1;
+        for i in 1..=self.current_pos.min(self.partition.len() - 1) {
+            if !self.sort_keys_equal(self.partition[i - 1], self.partition[i]) {
+                rank += 1;
+            }
+        }
+        rank
+    }
+
+    fn first_value(&self, field: &str) -> Value {
+        self.partition
+            .first()
+            .and_then(|&pos| self.arena.resolve_field(pos, field))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn last_value(&self, field: &str) -> Value {
+        self.partition
+            .last()
+            .and_then(|&pos| self.arena.resolve_field(pos, field))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
 }
 
 /// Simple less-than comparison for Value (used by min/max).
@@ -272,7 +352,7 @@ mod tests {
             &["name", "amount"],
         );
         let partition: Vec<u64> = vec![0, 1, 2];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 1);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 1, &[]);
 
         let first = ctx.first().unwrap();
         assert_eq!(first.resolve("name"), Some(&Value::String("Alice".into())));
@@ -287,7 +367,7 @@ mod tests {
             &["name", "amount"],
         );
         let partition: Vec<u64> = vec![0, 1, 2, 3, 4];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 3);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 3, &[]);
 
         let lag = ctx.lag(1).unwrap();
         assert_eq!(lag.resolve("name"), Some(&Value::String("C".into())));
@@ -299,7 +379,7 @@ mod tests {
     fn test_window_lag_out_of_bounds() {
         let arena = make_arena("name\nA\nB\n", &["name"]);
         let partition: Vec<u64> = vec![0, 1];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         assert!(ctx.lag(1).is_none());
     }
@@ -308,7 +388,7 @@ mod tests {
     fn test_window_count() {
         let arena = make_arena("x\na\nb\nc\nd\ne\n", &["x"]);
         let partition: Vec<u64> = vec![0, 1, 2, 3, 4];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
         assert_eq!(ctx.count(), 5);
     }
 
@@ -322,7 +402,7 @@ mod tests {
         // Let's test the "non-numeric returns null" case and a String-numeric coercion case.
         let arena = make_arena("amount\n10\n20\n30\n", &["amount"]);
         let partition: Vec<u64> = vec![0, 1, 2];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         // CSV reads as strings, so sum/avg return Null for string fields
         assert_eq!(ctx.sum("amount"), Value::Null);
@@ -338,7 +418,7 @@ mod tests {
         // String comparison for CSV-sourced data
         let arena = make_arena("name\nBob\nAlice\nCarol\n", &["name"]);
         let partition: Vec<u64> = vec![0, 1, 2];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         assert_eq!(ctx.min("name"), Value::String("Alice".into()));
         assert_eq!(ctx.max("name"), Value::String("Carol".into()));
@@ -348,7 +428,7 @@ mod tests {
     fn test_window_sum_non_numeric() {
         let arena = make_arena("name\nAlice\nBob\n", &["name"]);
         let partition: Vec<u64> = vec![0, 1];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
         assert_eq!(ctx.sum("name"), Value::Null);
     }
 
@@ -357,7 +437,7 @@ mod tests {
         // any/all are evaluator-driven (not on this trait), but we test partition_len/partition_record
         let arena = make_arena("amount\n50\n150\n200\n", &["amount"]);
         let partition: Vec<u64> = vec![0, 1, 2];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         assert_eq!(ctx.partition_len(), 3);
         let rec = ctx.partition_record(1);
@@ -368,7 +448,7 @@ mod tests {
     fn test_window_collect() {
         let arena = make_arena("name\nAlice\nBob\nCarol\n", &["name"]);
         let partition: Vec<u64> = vec![0, 1, 2];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         match ctx.collect("name") {
             Value::Array(vals) => {
@@ -385,7 +465,7 @@ mod tests {
     fn test_window_distinct() {
         let arena = make_arena("dept\nA\nB\nA\nC\n", &["dept"]);
         let partition: Vec<u64> = vec![0, 1, 2, 3];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         match ctx.distinct("dept") {
             Value::Array(vals) => {
@@ -403,7 +483,7 @@ mod tests {
     fn test_window_single_record_partition() {
         let arena = make_arena("name\nAlice\n", &["name"]);
         let partition: Vec<u64> = vec![0];
-        let ctx = PartitionWindowContext::new(&arena, &partition, 0);
+        let ctx = PartitionWindowContext::new(&arena, &partition, 0, &[]);
 
         // first == last for single record
         assert_eq!(
