@@ -807,6 +807,12 @@ fn collect_scope_reads_in_statement(
             collect_scope_reads_in_expr(message, out);
         }
         Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+        Statement::EmitEach { source, body, .. } => {
+            collect_scope_reads_in_expr(source, out);
+            for inner in body {
+                collect_scope_reads_in_statement(inner, out);
+            }
+        }
     }
 }
 
@@ -852,6 +858,13 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
             for a in args {
                 collect_scope_reads_in_expr(a, out);
             }
+        }
+        Expr::IndexAccess { receiver, index, .. } => {
+            collect_scope_reads_in_expr(receiver, out);
+            collect_scope_reads_in_expr(index, out);
+        }
+        Expr::Closure { body, .. } => {
+            collect_scope_reads_in_expr(body, out);
         }
         Expr::Literal { .. }
         | Expr::FieldRef { .. }
@@ -3308,6 +3321,16 @@ fn statement_exprs(stmt: &Statement) -> Vec<&Expr> {
             v
         }
         Statement::Distinct { .. } | Statement::UseStmt { .. } => Vec::new(),
+        Statement::EmitEach { source, body, .. } => {
+            // Surface the source expression plus the expressions from
+            // each body statement so qualified-ref walking covers the
+            // entire fan-out block, not just the outer driver.
+            let mut v = vec![source];
+            for inner in body {
+                v.extend(statement_exprs(inner));
+            }
+            v
+        }
     }
 }
 
@@ -3707,6 +3730,37 @@ fn walk_for_unknown_refs(
                 );
             }
         }
+        Expr::IndexAccess { receiver, index, .. } => {
+            walk_for_unknown_refs(
+                receiver,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                index,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Expr::Closure { body, .. } => {
+            walk_for_unknown_refs(
+                body,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
@@ -3782,6 +3836,28 @@ fn walk_statement_exprs(
             );
         }
         Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+        Statement::EmitEach { source, body, .. } => {
+            walk_for_unknown_refs(
+                source,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            for inner in body {
+                walk_statement_exprs(
+                    inner,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
     }
 }
 

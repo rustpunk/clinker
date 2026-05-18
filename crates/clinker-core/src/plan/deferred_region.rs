@@ -1061,6 +1061,17 @@ fn accumulate_program_support(program: &cxl::ast::Program, set: &mut HashSet<Str
             }
             Statement::ExprStmt { expr, .. } => expr.support_into(set),
             Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+            Statement::EmitEach { source, body, .. } => {
+                source.support_into(set);
+                // Recurse via a fresh Program-shaped wrapper so the
+                // same statement walker covers body statements
+                // without duplicating the per-statement match.
+                let inner = cxl::ast::Program {
+                    statements: body.clone(),
+                    span: cxl::lexer::Span::new(0, 0),
+                };
+                accumulate_program_support(&inner, set);
+            }
         }
     }
 }

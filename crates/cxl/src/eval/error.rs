@@ -64,6 +64,13 @@ pub enum EvalErrorKind {
         size: usize,
         limit: usize,
     },
+    /// `emit each` produced more records from a single input than the
+    /// transform's `max_expansion` ceiling allows. The originating
+    /// record is routed to DLQ; the fan-out is aborted at the
+    /// limit-crossing iteration.
+    ExpansionLimitExceeded {
+        limit: u64,
+    },
 }
 
 impl std::fmt::Display for EvalErrorKind {
@@ -98,6 +105,10 @@ impl std::fmt::Display for EvalErrorKind {
                 f,
                 "string output exceeds maximum size ({} bytes, limit {})",
                 size, limit
+            ),
+            Self::ExpansionLimitExceeded { limit } => write!(
+                f,
+                "emit_each fan-out exceeded max_expansion (limit {limit})"
             ),
         }
     }
@@ -202,7 +213,8 @@ pub fn extract_triggering_value(kind: &EvalErrorKind) -> Option<Value> {
         | EvalErrorKind::DivisionByZero
         | EvalErrorKind::RegexCompile { .. }
         | EvalErrorKind::IntegerOverflow { .. }
-        | EvalErrorKind::StringTooLarge { .. } => None,
+        | EvalErrorKind::StringTooLarge { .. }
+        | EvalErrorKind::ExpansionLimitExceeded { .. } => None,
     }
 }
 
@@ -217,6 +229,7 @@ impl miette::Diagnostic for EvalError {
             EvalErrorKind::ArityMismatch { .. } => "cxl::eval::arity_mismatch",
             EvalErrorKind::IntegerOverflow { .. } => "cxl::eval::integer_overflow",
             EvalErrorKind::StringTooLarge { .. } => "cxl::eval::string_too_large",
+            EvalErrorKind::ExpansionLimitExceeded { .. } => "cxl::eval::expansion_limit_exceeded",
         };
         Some(Box::new(s))
     }

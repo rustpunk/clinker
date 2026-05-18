@@ -738,6 +738,13 @@ pub(crate) fn execute_combine_iejoin(
                     match residual.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Skip(_)) => continue,
                         Ok(EvalResult::Emit { .. }) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "iejoin residual",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }
@@ -828,6 +835,13 @@ pub(crate) fn execute_combine_iejoin(
                                     }
                                 }
                                 Ok(EvalResult::Skip(_)) => {}
+                                Ok(EvalResult::EmitMany { .. }) => {
+                                    return Err(PipelineError::Internal {
+                                        op: "iejoin body",
+                                        node: name.to_string(),
+                                        detail: "emit_each fan-out is not supported in a combine body".into(),
+                                    });
+                                }
                                 Err(e) => return Err(PipelineError::from(e)),
                             }
                         } else {
@@ -978,6 +992,13 @@ pub(crate) fn execute_combine_iejoin(
                         }
                     }
                     Ok(EvalResult::Skip(_)) => {}
+                    Ok(EvalResult::EmitMany { .. }) => {
+                        return Err(PipelineError::Internal {
+                            op: "iejoin on_miss body",
+                            node: name.to_string(),
+                            detail: "emit_each fan-out is not supported in a combine body".into(),
+                        });
+                    }
                     Err(e) => return Err(PipelineError::from(e)),
                 }
             }

@@ -50,6 +50,11 @@ pub struct Parser {
     errors: Vec<ParseError>,
     depth: u32,
     next_id: u32,
+    /// Tracks whether parser is currently inside the body of an
+    /// `emit each` block. Nested `emit each` is forbidden so the
+    /// per-record fan-out remains a single flat expansion; the
+    /// `max_expansion` ceiling is the only gate on output cardinality.
+    in_emit_each: bool,
 }
 
 // Binding power pairs (left_bp, right_bp).
@@ -68,6 +73,9 @@ fn infix_bp(tok: &Token) -> Option<(u8, u8)> {
         Token::Plus | Token::Minus => Some((13, 14)),
         Token::Star | Token::Slash | Token::Percent => Some((15, 16)),
         Token::Dot => Some((19, 20)), // postfix field/method, tightest
+        // Bracket-index access mirrors postfix-dot precedence so chains
+        // like `record.field[0]` and `arr[0].name` parse without parens.
+        Token::LBracket => Some((19, 20)),
         _ => None,
     }
 }
@@ -115,6 +123,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
+            in_emit_each: false,
         };
         let start_span = parser.current_span();
         let mut statements = Vec::new();
@@ -171,6 +180,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
+            in_emit_each: false,
         };
         let start_span = parser.current_span();
         let mut functions = Vec::new();
@@ -343,6 +353,15 @@ impl Parser {
         let start = self.current_span();
         self.advance(); // consume 'emit'
 
+        // Detect `emit each <binding> in <source> { <body> }` — fan-out
+        // form. Matches identifier "each" via lookahead because `each`
+        // is not a reserved keyword (it is only meaningful after `emit`).
+        if let Token::Ident(name) = self.peek()
+            && name.as_ref() == "each"
+        {
+            return self.parse_emit_each(nid, start);
+        }
+
         // Detect `emit $<ns>.field = expr`. Allowed namespaces:
         // - `meta`: per-record metadata sidecar (deleted in Stage 6).
         // - `pipeline` / `source` / `record`: producer-declared scoped
@@ -403,6 +422,66 @@ impl Parser {
             expr,
             target,
             span: Span::new(start.start as usize, end.end as usize),
+        })
+    }
+
+    /// Parse `emit each <binding> in <source> { <body> }`. Called from
+    /// [`Self::parse_emit`] after the `each` keyword has been peeked
+    /// (but not consumed). `nid` and `start` are taken from the parent's
+    /// allocator so the resulting `Statement::EmitEach` carries the
+    /// same NodeId/Span origin as a plain `emit`.
+    fn parse_emit_each(&mut self, nid: NodeId, start: Span) -> Result<Statement, ParseError> {
+        if self.in_emit_each {
+            return Err(self.error(
+                "emit_each cannot be nested inside another emit_each",
+                "Nested fan-out would compound expansion ratios without a clear cardinality bound — the per-record max_expansion limit governs flat fan-out only",
+                "Flatten the producer (e.g. precompute the cross product into a single array) and emit once",
+            ));
+        }
+
+        self.advance(); // consume 'each' ident
+        let binding = self.expect_ident("emit_each binding name")?;
+        // The `in` separator is an identifier (CXL has no `in` keyword);
+        // accept the literal text "in" to keep the grammar surface from
+        // adding another reserved word.
+        match self.peek().clone() {
+            Token::Ident(name) if name.as_ref() == "in" => {
+                self.advance();
+            }
+            other => {
+                return Err(self.error(
+                    &format!("expected 'in' between binding and source, got {:?}", other),
+                    "emit_each grammar is `emit each <binding> in <source> { <body> }`",
+                    "Insert 'in' between the binding identifier and the source expression",
+                ));
+            }
+        }
+        let source = self.parse_expr(0)?;
+        self.expect_token(&Token::LBrace, "'{'")?;
+
+        self.in_emit_each = true;
+        let mut body = Vec::new();
+        self.skip_newlines();
+        while *self.peek() != Token::RBrace && !self.at_eof() {
+            match self.parse_statement() {
+                Ok(stmt) => body.push(stmt),
+                Err(e) => {
+                    self.in_emit_each = false;
+                    return Err(e);
+                }
+            }
+            self.skip_newlines();
+        }
+        self.in_emit_each = false;
+        let end_span = self.current_span();
+        self.expect_token(&Token::RBrace, "'}'")?;
+
+        Ok(Statement::EmitEach {
+            node_id: nid,
+            binding: binding.into(),
+            source,
+            body,
+            span: Span::new(start.start as usize, end_span.end as usize),
         })
     }
 
@@ -666,6 +745,27 @@ impl Parser {
                         "CXL comparisons are non-associative — a == b == c is ambiguous",
                         "use (a == b) and (b == c) instead",
                     ));
+                }
+
+                // LBracket: postfix bracket-index access for arrays and
+                // maps. Mirrors Dot's precedence so `arr[0].name` and
+                // `record.field[0]` parse without parens. The receiver
+                // is the existing `lhs`; the index expression is parsed
+                // at BP 0 (full expression), then `]` closes it.
+                if tok == Token::LBracket {
+                    self.advance(); // consume '['
+                    let lhs_span = lhs.span();
+                    let index = self.parse_expr(0)?;
+                    self.expect_token(&Token::RBracket, "']'")?;
+                    let end = self.prev_span();
+                    let nid = self.alloc_id();
+                    lhs = Expr::IndexAccess {
+                        node_id: nid,
+                        receiver: Box::new(lhs),
+                        index: Box::new(index),
+                        span: Span::new(lhs_span.start as usize, end.end as usize),
+                    };
+                    continue;
                 }
 
                 // Dot: postfix field access or method call
@@ -1127,14 +1227,40 @@ impl Parser {
     fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         if *self.peek() != Token::RParen {
-            args.push(self.parse_expr(0)?);
+            args.push(self.parse_arg_or_closure()?);
             while *self.peek() == Token::Comma {
                 self.advance();
-                args.push(self.parse_expr(0)?);
+                args.push(self.parse_arg_or_closure()?);
             }
         }
         self.expect_token(&Token::RParen, "')'")?;
         Ok(args)
+    }
+
+    /// Parse a single argument inside a method call's argument list.
+    /// Detects the `it => body` closure shape via two-token lookahead;
+    /// otherwise falls back to a regular expression. The closure body
+    /// is a single expression at full BP — block-bodied closures are
+    /// not part of the surface map.
+    fn parse_arg_or_closure(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), Token::It)
+            && matches!(self.peek_ahead(1), Token::FatArrow)
+        {
+            let nid = self.alloc_id();
+            let start = self.current_span();
+            self.advance(); // consume `it`
+            self.advance(); // consume `=>`
+            let body = self.parse_expr(0)?;
+            let end = body.span();
+            Ok(Expr::Closure {
+                node_id: nid,
+                param: "it".into(),
+                body: Box::new(body),
+                span: Span::new(start.start as usize, end.end as usize),
+            })
+        } else {
+            self.parse_expr(0)
+        }
     }
 
     /// Parse a free-standing aggregate function call: `name(args...)`.

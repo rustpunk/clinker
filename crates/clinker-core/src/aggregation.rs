@@ -295,6 +295,12 @@ pub fn eval_expr_in_agg_scope(
         Expr::Wildcard { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "wildcard outside count(*)",
         }),
+        Expr::IndexAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
+            what: "bracket-index access",
+        }),
+        Expr::Closure { .. } => Err(AggregateEvalError::UnsupportedResidual {
+            what: "closure",
+        }),
     }
 }
 

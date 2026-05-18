@@ -1749,18 +1749,33 @@ pub(crate) async fn transform_fused_consume(
                 evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
             };
             match eval_result {
-                Ok((modified_record, Ok(()))) => {
-                    let advance_source = source_name_arc_of(&modified_record);
-                    output_records.push((modified_record, rn));
-                    advance_cursor(ctx, &advance_source, rn);
-                }
-                Ok((_record, Err(SkipReason::Filtered))) => {
-                    ctx.counters.filtered_count += 1;
-                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
-                }
-                Ok((_record, Err(SkipReason::Duplicate))) => {
-                    ctx.counters.distinct_count += 1;
-                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                Ok(records) => {
+                    if records.is_empty() {
+                        // No-record outcome (e.g. emit_each on Null source);
+                        // still advance the cursor to keep watermarks live.
+                        advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                    } else {
+                        let mut emitted_any = false;
+                        for (modified_record, status) in records {
+                            match status {
+                                Ok(()) => {
+                                    let advance_source = source_name_arc_of(&modified_record);
+                                    output_records.push((modified_record, rn));
+                                    advance_cursor(ctx, &advance_source, rn);
+                                    emitted_any = true;
+                                }
+                                Err(SkipReason::Filtered) => {
+                                    ctx.counters.filtered_count += 1;
+                                }
+                                Err(SkipReason::Duplicate) => {
+                                    ctx.counters.distinct_count += 1;
+                                }
+                            }
+                        }
+                        if !emitted_any {
+                            advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                        }
+                    }
                 }
                 Err((transform_name, eval_err)) => {
                     dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
@@ -2151,18 +2166,31 @@ pub(crate) async fn dispatch_plan_node(
                     }
                 };
                 match eval_result {
-                    Ok((modified_record, Ok(()))) => {
-                        let advance_source = source_name_arc_of(&modified_record);
-                        output_records.push((modified_record, rn));
-                        advance_cursor(ctx, &advance_source, rn);
-                    }
-                    Ok((_record, Err(SkipReason::Filtered))) => {
-                        ctx.counters.filtered_count += 1;
-                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
-                    }
-                    Ok((_record, Err(SkipReason::Duplicate))) => {
-                        ctx.counters.distinct_count += 1;
-                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                    Ok(records) => {
+                        if records.is_empty() {
+                            advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                        } else {
+                            let mut emitted_any = false;
+                            for (modified_record, status) in records {
+                                match status {
+                                    Ok(()) => {
+                                        let advance_source = source_name_arc_of(&modified_record);
+                                        output_records.push((modified_record, rn));
+                                        advance_cursor(ctx, &advance_source, rn);
+                                        emitted_any = true;
+                                    }
+                                    Err(SkipReason::Filtered) => {
+                                        ctx.counters.filtered_count += 1;
+                                    }
+                                    Err(SkipReason::Duplicate) => {
+                                        ctx.counters.distinct_count += 1;
+                                    }
+                                }
+                            }
+                            if !emitted_any {
+                                advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                            }
+                        }
                     }
                     Err((transform_name, eval_err)) => {
                         dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
@@ -4181,6 +4209,13 @@ pub(crate) async fn dispatch_plan_node(
                                         continue;
                                     }
                                     Ok(EvalResult::Emit { .. }) => {}
+                                    Ok(EvalResult::EmitMany { .. }) => {
+                                        return Err(PipelineError::Internal {
+                                            op: "combine residual",
+                                            node: name.clone(),
+                                            detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                                        });
+                                    }
                                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                         continue;
                                     }
@@ -4280,6 +4315,13 @@ pub(crate) async fn dispatch_plan_node(
                                     {
                                         Ok(EvalResult::Skip(_)) => continue,
                                         Ok(EvalResult::Emit { .. }) => {}
+                                        Ok(EvalResult::EmitMany { .. }) => {
+                                            return Err(PipelineError::Internal {
+                                                op: "combine residual",
+                                                node: name.clone(),
+                                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                                            });
+                                        }
                                         Err(e) => {
                                             return Err(PipelineError::from(e));
                                         }
@@ -4355,6 +4397,13 @@ pub(crate) async fn dispatch_plan_node(
                                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                             ctx.counters.distinct_count += 1;
                                         }
+                                        Ok(EvalResult::EmitMany { .. }) => {
+                                            return Err(PipelineError::Internal {
+                                                op: "combine on_miss body",
+                                                node: name.clone(),
+                                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                                            });
+                                        }
                                         Err(e) => {
                                             return Err(PipelineError::from(e));
                                         }
@@ -4405,6 +4454,13 @@ pub(crate) async fn dispatch_plan_node(
                                     }
                                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                         ctx.counters.distinct_count += 1;
+                                    }
+                                    Ok(EvalResult::EmitMany { .. }) => {
+                                        return Err(PipelineError::Internal {
+                                            op: "combine matched body",
+                                            node: name.clone(),
+                                            detail: "emit_each fan-out is not supported in a combine body".into(),
+                                        });
                                     }
                                     Err(e) => {
                                         return Err(PipelineError::from(e));

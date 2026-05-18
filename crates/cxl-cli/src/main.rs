@@ -531,6 +531,24 @@ fn format_statement(stmt: &cxl::ast::Statement) -> String {
             Some(f) => format!("distinct by {}", f),
             None => "distinct".to_string(),
         },
+        cxl::ast::Statement::EmitEach {
+            binding,
+            source,
+            body,
+            ..
+        } => {
+            let body_str = body
+                .iter()
+                .map(format_statement)
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            format!(
+                "emit each {} in {} {{\n  {}\n}}",
+                binding,
+                format_expr(source),
+                body_str,
+            )
+        }
     }
 }
 
@@ -639,6 +657,12 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         }
         cxl::ast::Expr::AggSlot { slot, .. } => format!("__agg_slot_{}", slot),
         cxl::ast::Expr::GroupKey { slot, .. } => format!("__group_key_{}", slot),
+        cxl::ast::Expr::IndexAccess {
+            receiver, index, ..
+        } => format!("{}[{}]", format_expr(receiver), format_expr(index)),
+        cxl::ast::Expr::Closure { param, body, .. } => {
+            format!("{} => {}", param, format_expr(body))
+        }
     }
 }
 

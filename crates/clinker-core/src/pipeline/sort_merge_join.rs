@@ -692,6 +692,13 @@ fn execute_combine_sort_merge_with_stats(
                             output_records.push((rec, driver_order));
                         }
                         Ok(EvalResult::Skip(_)) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "sort_merge_join on_miss body",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }
@@ -1102,6 +1109,13 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Skip(_)) => continue,
                         Ok(EvalResult::Emit { .. }) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "sort_merge_join residual",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }
@@ -1169,6 +1183,13 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Skip(_)) => continue,
                         Ok(EvalResult::Emit { .. }) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "sort_merge_join residual",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }
@@ -1219,6 +1240,13 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                         }
                         Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "sort_merge_join body",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 } else if let Some(target_schema) = output_schema {

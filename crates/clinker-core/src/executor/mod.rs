@@ -476,7 +476,9 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, record, None)?
                     {
-                        EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
+                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
+                            return Ok(vec![branch.name.clone()]);
+                        }
                         EvalResult::Skip(_) => continue,
                     }
                 }
@@ -489,7 +491,9 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, record, None)?
                     {
-                        EvalResult::Emit { .. } => matched.push(branch.name.clone()),
+                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
+                            matched.push(branch.name.clone());
+                        }
                         EvalResult::Skip(_) => {}
                     }
                 }
@@ -3170,9 +3174,9 @@ fn arcs_reachable_from(
 /// `group_by_indices`) rely on the upstream layout, so the widened
 /// schema preserves every upstream column at its original index.
 ///
-/// Returns `Ok((modified_record, Ok(())))` on emit,
-/// `Ok((record, Err(SkipReason)))` on skip. On error, returns
-/// `(transform_name, EvalError)`.
+/// Returns a `Vec` of `(record, Ok | Skip)` entries — typically one
+/// entry per call, but `emit each` fan-out produces N entries from a
+/// single input record. On error, returns `(transform_name, EvalError)`.
 #[allow(clippy::result_large_err)]
 pub(crate) fn evaluate_single_transform(
     record: &Record,
@@ -3180,12 +3184,26 @@ pub(crate) fn evaluate_single_transform(
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
     _output_schema: &Arc<Schema>,
-) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+) -> Result<Vec<(Record, Result<(), SkipReason>)>, (String, cxl::eval::EvalError)> {
     let input = record;
-    match evaluator
+    let result = evaluator
         .eval_record::<NullStorage>(ctx, input, None)
-        .map_err(|e| (transform_name.to_string(), e))?
-    {
+        .map_err(|e| (transform_name.to_string(), e))?;
+    Ok(materialize_eval_result(input, result))
+}
+
+/// Convert an [`EvalResult`] into the per-record dispatch shape used
+/// by the executor: one `(Record, Ok)` per emitted body record, or a
+/// single `(Record, Skip)` entry on Filtered/Duplicate. The fan-out
+/// case applies emitted fields and record-var writes on a fresh
+/// `record_with_emitted_fields` projection of `input` once per
+/// `EmitOne`; downstream cursor advancement happens once per emitted
+/// record at the call site.
+fn materialize_eval_result(
+    input: &Record,
+    result: EvalResult,
+) -> Vec<(Record, Result<(), SkipReason>)> {
+    match result {
         EvalResult::Emit {
             fields: emitted,
             record_vars,
@@ -3198,9 +3216,27 @@ pub(crate) fn evaluate_single_transform(
             for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
             }
-            Ok((out, Ok(())))
+            vec![(out, Ok(()))]
         }
-        EvalResult::Skip(reason) => Ok((input.clone(), Err(reason))),
+        EvalResult::EmitMany { records } => {
+            let mut acc = Vec::with_capacity(records.len());
+            for rec in records {
+                let cxl::eval::EmitOne {
+                    fields: emitted,
+                    record_vars,
+                } = rec;
+                let mut out = record_with_emitted_fields(input, &emitted);
+                for (name, value) in &emitted {
+                    out.set(name, value.clone());
+                }
+                for (key, value) in *record_vars {
+                    let _ = out.set_record_var(&key, value);
+                }
+                acc.push((out, Ok(())));
+            }
+            acc
+        }
+        EvalResult::Skip(reason) => vec![(input.clone(), Err(reason))],
     }
 }
 
@@ -3237,7 +3273,7 @@ pub(crate) fn evaluate_single_transform_windowed(
     window_index: usize,
     runtime: &crate::executor::window_runtime::WindowRuntime,
     record_pos: u64,
-) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+) -> Result<Vec<(Record, Result<(), SkipReason>)>, (String, cxl::eval::EvalError)> {
     let spec = &plan.indices_to_build[window_index];
     let arena = runtime.arena.as_ref();
     let index = runtime.index.as_ref();
@@ -3273,23 +3309,7 @@ pub(crate) fn evaluate_single_transform_windowed(
             .map_err(|e| (transform_name.to_string(), e))?
     };
 
-    match result {
-        EvalResult::Emit {
-            fields: emitted,
-            record_vars,
-            ..
-        } => {
-            let mut out = record_with_emitted_fields(record, &emitted);
-            for (name, value) in &emitted {
-                out.set(name, value.clone());
-            }
-            for (key, value) in *record_vars {
-                let _ = out.set_record_var(&key, value);
-            }
-            Ok((out, Ok(())))
-        }
-        EvalResult::Skip(reason) => Ok((record.clone(), Err(reason))),
-    }
+    Ok(materialize_eval_result(record, result))
 }
 
 /// Re-project `input` onto `target`: allocate a fresh `Record` whose

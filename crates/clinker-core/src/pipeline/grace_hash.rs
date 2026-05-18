@@ -1687,6 +1687,13 @@ fn emit_for_probe<'a>(
                     match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Skip(_)) => continue,
                         Ok(EvalResult::Emit { .. }) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "grace_hash residual",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }
@@ -1743,6 +1750,13 @@ fn emit_for_probe<'a>(
                         match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
                             Ok(EvalResult::Skip(_)) => continue,
                             Ok(EvalResult::Emit { .. }) => {}
+                            Ok(EvalResult::EmitMany { .. }) => {
+                                return Err(PipelineError::Internal {
+                                    op: "grace_hash residual",
+                                    node: name.to_string(),
+                                    detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                                });
+                            }
                             Err(e) => return Err(PipelineError::from(e)),
                         }
                     }
@@ -1792,6 +1806,13 @@ fn emit_for_probe<'a>(
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
                             Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
+                            Ok(EvalResult::EmitMany { .. }) => {
+                                return Err(PipelineError::Internal {
+                                    op: "grace_hash on_miss body",
+                                    node: name.to_string(),
+                                    detail: "emit_each fan-out is not supported in a combine body".into(),
+                                });
+                            }
                             Err(e) => return Err(PipelineError::from(e)),
                         }
                     }
@@ -1819,6 +1840,13 @@ fn emit_for_probe<'a>(
                             output.push((rec, rn));
                         }
                         Ok(EvalResult::Skip(_)) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "grace_hash body",
+                                node: name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                            });
+                        }
                         Err(e) => return Err(PipelineError::from(e)),
                     }
                 }

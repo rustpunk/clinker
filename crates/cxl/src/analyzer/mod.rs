@@ -144,6 +144,12 @@ fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mu
         Statement::UseStmt { .. } => {}
         Statement::Filter { predicate, .. } => walk_expr(predicate, calls, fields, None),
         Statement::Distinct { .. } => {}
+        Statement::EmitEach { source, body, .. } => {
+            walk_expr(source, calls, fields, None);
+            for inner in body {
+                walk_statement(inner, calls, fields);
+            }
+        }
     }
 }
 
@@ -286,6 +292,13 @@ fn walk_expr(
             for arg in args {
                 walk_expr(arg, calls, fields, None);
             }
+        }
+        Expr::IndexAccess { receiver, index, .. } => {
+            walk_expr(receiver, calls, fields, None);
+            walk_expr(index, calls, fields, None);
+        }
+        Expr::Closure { body, .. } => {
+            walk_expr(body, calls, fields, None);
         }
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
