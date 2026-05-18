@@ -197,16 +197,43 @@ pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot
 
 /// Dispatch result threaded out of `execute_dag` and
 /// `execute_dag_branching` and folded into the [`ExecutionReport`].
-/// Holds the final pipeline counters, the DLQ vector built across
-/// every dispatcher arm, the peak RSS observation, the per-source
-/// watermark bookkeeping, and the per-source rollback-cursor map.
-pub(crate) type DispatchOutcome = (
-    PipelineCounters,
-    Vec<DlqEntry>,
-    Option<u64>,
-    crate::executor::watermark::PerSourceWatermarks,
-    BTreeMap<String, u64>,
-);
+/// Per-run summary fed up from `execute_dag_branching` into
+/// [`ExecutionReport`] construction. Each field is the final, post-walk
+/// state of an executor counter or bookkeeping table; the consumer
+/// (`run_with_readers_writers`) folds them into the user-facing report
+/// and may layer derived stages on top.
+pub(crate) struct DispatchOutcome {
+    /// Aggregate pipeline counters: total / ok / dlq / records-written.
+    pub(crate) counters: PipelineCounters,
+    /// Every DLQ entry produced across every dispatcher arm, in
+    /// observation order. Empty when the run had no failures.
+    pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Peak process RSS observed across chunk boundaries. `None` on
+    /// platforms where RSS measurement is unavailable.
+    pub(crate) peak_rss_bytes: Option<u64>,
+    /// Per-source / per-file event-time watermarks accumulated by the
+    /// ingest tasks. Carried through so the report can roll them up to
+    /// source-level and effective-watermark granularities.
+    pub(crate) watermarks: crate::executor::watermark::PerSourceWatermarks,
+    /// Per-source forward-progress rollback cursors at run completion,
+    /// keyed by Source-node name. Sources that never emitted a clean
+    /// record are absent.
+    pub(crate) per_source_rollback_cursors: BTreeMap<String, u64>,
+    /// Finalized per-source ingest record counts, keyed by Source-node
+    /// name. Built from the executor's per-source count map at run
+    /// close; sources whose finalize slot is still unstamped (`None`)
+    /// are omitted rather than fabricated as zero. The synthetic
+    /// pipeline-wide rollup slot stamped under
+    /// `dispatch::MERGED_SOURCE_NAME` is excluded — this map exposes
+    /// declared sources only.
+    pub(crate) per_source_record_counts: BTreeMap<String, u64>,
+    /// Per-source DLQ entry counts, keyed by Source-node name. Sources
+    /// with zero DLQ entries are absent (matching the
+    /// `per_source_rollback_cursors` precedent of "absent = none
+    /// landed"). The synthetic `MERGED_SOURCE_NAME` slot is filtered
+    /// out on the way through.
+    pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
+}
 
 /// Output writer registry. Holds two parallel maps:
 ///
@@ -340,6 +367,23 @@ pub struct ExecutionReport {
     /// for the live mpsc-channel executor and the diagnostic counter
     /// that per-source-rollback tests assert against.
     pub per_source_rollback_cursors: BTreeMap<String, u64>,
+    /// Finalized per-source ingest record counts, keyed by
+    /// Source-node name. Equals each source's `total_count`
+    /// contribution to the aggregate `counters.total_count`. Sources
+    /// whose ingest task never finalized (e.g. fatal abort before
+    /// `mpsc::Receiver` close) are absent rather than reported as
+    /// zero — distinguishes "stream closed with zero records" from
+    /// "never finished". The synthetic pipeline-wide rollup slot
+    /// stamped internally under `<merged>` is filtered out before
+    /// surfacing here.
+    pub per_source_record_counts: BTreeMap<String, u64>,
+    /// Per-source DLQ entry counts, keyed by Source-node name. A
+    /// source with no DLQ entries is absent from the map, matching
+    /// the "absent = none landed" precedent on
+    /// `per_source_rollback_cursors`. Sums across this map equal
+    /// `counters.dlq_count` minus any entries the executor failed to
+    /// attribute to a declared source.
+    pub per_source_dlq_counts: BTreeMap<String, u64>,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
@@ -931,25 +975,32 @@ impl PipelineExecutor {
             }));
         }
 
-        let (counters, dlq_entries, peak_rss_bytes, mut watermarks, per_source_rollback_cursors) =
-            Self::execute_dag(
-                config,
-                source_records,
-                &source_configs,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                compiled_routes_by_name,
-                plan,
-                validated_plan.artifacts(),
-                params,
-                &mut collector,
-                spill_root,
-                spill_root_path,
-                counters,
-                watermarks,
-            )
-            .await?;
+        let DispatchOutcome {
+            counters,
+            dlq_entries,
+            peak_rss_bytes,
+            mut watermarks,
+            per_source_rollback_cursors,
+            per_source_record_counts,
+            per_source_dlq_counts,
+        } = Self::execute_dag(
+            config,
+            source_records,
+            &source_configs,
+            writers,
+            &compiled_transforms,
+            compiled_route,
+            compiled_routes_by_name,
+            plan,
+            validated_plan.artifacts(),
+            params,
+            &mut collector,
+            spill_root,
+            spill_root_path,
+            counters,
+            watermarks,
+        )
+        .await?;
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
@@ -1018,6 +1069,8 @@ impl PipelineExecutor {
             per_source_watermarks,
             effective_watermark,
             per_source_rollback_cursors,
+            per_source_record_counts,
+            per_source_dlq_counts,
         })
     }
 
@@ -1506,14 +1559,29 @@ impl PipelineExecutor {
             .iter()
             .map(|(k, &v)| (k.as_ref().to_string(), v))
             .collect();
+        let merged_key: &Arc<str> = &crate::executor::dispatch::MERGED_SOURCE_NAME;
+        let per_source_record_counts: BTreeMap<String, u64> = ctx
+            .source_count_per_source
+            .iter()
+            .filter(|(k, _)| !Arc::ptr_eq(k, merged_key))
+            .filter_map(|(k, v)| v.map(|n| (k.as_ref().to_string(), n)))
+            .collect();
+        let per_source_dlq_counts: BTreeMap<String, u64> = ctx
+            .dlq_per_source
+            .iter()
+            .filter(|(k, v)| !Arc::ptr_eq(k, merged_key) && **v > 0)
+            .map(|(k, v)| (k.as_ref().to_string(), *v))
+            .collect();
 
-        Ok((
-            std::mem::take(counters),
-            std::mem::take(dlq_entries),
-            rss_bytes(),
-            ctx.watermarks,
-            rollback_cursors,
-        ))
+        Ok(DispatchOutcome {
+            counters: std::mem::take(counters),
+            dlq_entries: std::mem::take(dlq_entries),
+            peak_rss_bytes: rss_bytes(),
+            watermarks: ctx.watermarks,
+            per_source_rollback_cursors: rollback_cursors,
+            per_source_record_counts,
+            per_source_dlq_counts,
+        })
     }
 
     /// Compile route conditions from the last transform's RouteConfig.

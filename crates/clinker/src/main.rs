@@ -1074,7 +1074,7 @@ async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
         let execution_metrics = ExecutionMetrics {
             execution_id: execution_id.clone(),
-            schema_version: 2,
+            schema_version: 3,
             pipeline_name: pipeline_config.pipeline.name.clone(),
             config_path: args.config.to_string_lossy().into_owned(),
             hostname,
@@ -1100,6 +1100,8 @@ async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             dlq_path,
             error: None,
             retraction: clinker_core::metrics::RetractionMetrics::from(&counters.retraction),
+            per_source_record_counts: report.per_source_record_counts.clone(),
+            per_source_dlq_counts: report.per_source_dlq_counts.clone(),
         };
 
         if let Err(e) = metrics::write_spool(&execution_metrics, dir) {
