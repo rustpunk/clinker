@@ -28,6 +28,11 @@ pub enum Category {
     WindowAggregate,
     WindowPositional,
     WindowIterable,
+    /// Zero-argument ranking functions (`row_number`, `rank`, `dense_rank`).
+    /// Distinct from `WindowAggregate` because they take no field
+    /// argument and from `WindowPositional` because they return an
+    /// integer rather than a record reference.
+    WindowRanking,
 }
 
 /// Definition of a single built-in method or window function.
@@ -386,7 +391,13 @@ impl BuiltinRegistry {
             },
         );
 
-        // ── Window aggregate (5) ──
+        // ── Window aggregate ──
+        // first_value / last_value take a field-ref argument and return
+        // its value at the partition's first / last row, mirroring SQL's
+        // `FIRST_VALUE` / `LAST_VALUE` shape. They sit in this category
+        // because they collapse to a field projection over a
+        // single-row "frame" — the same as how sum/avg collapse a
+        // numeric column over the partition.
         let wa = |name: &'static str, args: Vec<TypeTag>, min: usize, ret: TypeTag| {
             (
                 name,
@@ -408,6 +419,8 @@ impl BuiltinRegistry {
             wa("min", vec![TypeTag::Any], 1, TypeTag::Any),
             wa("max", vec![TypeTag::Any], 1, TypeTag::Any),
             wa("count", vec![], 0, TypeTag::Int),
+            wa("first_value", vec![TypeTag::Any], 1, TypeTag::Any),
+            wa("last_value", vec![TypeTag::Any], 1, TypeTag::Any),
         ] {
             window_fns.insert(n, d);
         }
@@ -436,7 +449,27 @@ impl BuiltinRegistry {
             window_fns.insert(n, d);
         }
 
-        // ── Window iterable (4) ──  — any/all take predicate exprs, collect/distinct take field exprs
+        // ── Window ranking (3) ── — zero-argument integer functions.
+        let wr = |name: &'static str| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args: vec![],
+                    min_args: 0,
+                    max_args: Some(0),
+                    return_type: TypeTag::Int,
+                    category: Category::WindowRanking,
+                },
+            )
+        };
+        for (n, d) in [wr("row_number"), wr("rank"), wr("dense_rank")] {
+            window_fns.insert(n, d);
+        }
+
+        // ── Window iterable ──  — any/every/exists/not_exists take a
+        // predicate expr; collect/distinct take a field expr.
         let wi = |name: &'static str, ret: TypeTag| {
             (
                 name,
@@ -453,7 +486,9 @@ impl BuiltinRegistry {
         };
         for (n, d) in [
             wi("any", TypeTag::Bool),
-            wi("all", TypeTag::Bool),
+            wi("every", TypeTag::Bool),
+            wi("exists", TypeTag::Bool),
+            wi("not_exists", TypeTag::Bool),
             wi("collect", TypeTag::Array),
             wi("distinct", TypeTag::Array),
         ] {
@@ -660,7 +695,15 @@ mod tests {
     #[test]
     fn test_registry_all_window_aggregate() {
         let r = registry();
-        for name in ["sum", "avg", "min", "max", "count"] {
+        for name in [
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "count",
+            "first_value",
+            "last_value",
+        ] {
             let def = r
                 .lookup_window(name)
                 .unwrap_or_else(|| panic!("missing window agg: {}", name));
@@ -680,9 +723,30 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_all_window_ranking() {
+        let r = registry();
+        for name in ["row_number", "rank", "dense_rank"] {
+            let def = r
+                .lookup_window(name)
+                .unwrap_or_else(|| panic!("missing window ranking: {}", name));
+            assert_eq!(def.category, Category::WindowRanking);
+            assert_eq!(def.return_type, TypeTag::Int);
+            assert_eq!(def.min_args, 0);
+            assert_eq!(def.max_args, Some(0));
+        }
+    }
+
+    #[test]
     fn test_registry_all_window_iterable() {
         let r = registry();
-        for name in ["any", "all", "collect", "distinct"] {
+        for name in [
+            "any",
+            "every",
+            "exists",
+            "not_exists",
+            "collect",
+            "distinct",
+        ] {
             let def = r
                 .lookup_window(name)
                 .unwrap_or_else(|| panic!("missing window iter: {}", name));
@@ -691,14 +755,24 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_no_legacy_all() {
+        let r = registry();
+        assert!(
+            r.lookup_window("all").is_none(),
+            "$window.all renamed to $window.every — no compatibility alias"
+        );
+    }
+
+    #[test]
     fn test_registry_total_count() {
         let r = registry();
         // Due to overloaded names (join/length), scalar map has fewer unique entries.
-        // Total = scalar unique + window unique
+        // Total = scalar unique + window unique. Range covers the scalar
+        // population plus the current window-fn set (aggregate + positional
+        // + ranking + iterable) without pinning the exact count, since new
+        // builtins land here regularly.
         let total = r.total_count();
-        // We expect ~81 but join overwrites, so actual scalar = 68 unique keys + 13 window = 81
-        // Actually let's just check it's in a reasonable range since overloads affect count
-        assert!(total >= 75 && total <= 85, "expected ~81, got {}", total);
+        assert!(total >= 80 && total <= 100, "expected ~88, got {}", total);
     }
 
     #[test]

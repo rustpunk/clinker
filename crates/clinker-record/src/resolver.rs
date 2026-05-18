@@ -94,6 +94,28 @@ pub trait WindowContext<'a, S: RecordStorage> {
 
     /// Collect unique field values from all partition records into an Array.
     fn distinct(&self, field: &str) -> Value;
+
+    /// 1-indexed position of the current record within its partition.
+    /// Returns `1` for the first row, `partition_len()` for the last.
+    fn row_number(&self) -> i64;
+
+    /// SQL `RANK()`: ties (equal sort-key tuples) share a rank, and the
+    /// next distinct sort key skips ahead by the size of the tie group.
+    /// With no `sort_by` declared every row is tied — `rank()` collapses
+    /// to `1` for every record, mirroring SQL's degenerate-frame behavior.
+    fn rank(&self) -> i64;
+
+    /// SQL `DENSE_RANK()`: ties share a rank with no gaps to the next
+    /// distinct sort key. Without `sort_by` every row is tied at `1`.
+    fn dense_rank(&self) -> i64;
+
+    /// Value of `field` at the first record of the partition (ordered by
+    /// the configured `sort_by`). Empty partitions return `Value::Null`.
+    fn first_value(&self, field: &str) -> Value;
+
+    /// Value of `field` at the last record of the partition (ordered by
+    /// the configured `sort_by`). Empty partitions return `Value::Null`.
+    fn last_value(&self, field: &str) -> Value;
 }
 
 // Compile-time object safety assertion for FieldResolver

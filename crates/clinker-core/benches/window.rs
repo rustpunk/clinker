@@ -38,7 +38,7 @@ fn bench_window_sum(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.sum("amount"));
                 });
             },
@@ -60,7 +60,7 @@ fn bench_window_avg(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.avg("amount"));
                 });
             },
@@ -82,7 +82,7 @@ fn bench_window_min_max(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.min("amount"));
                 });
             },
@@ -93,7 +93,7 @@ fn bench_window_min_max(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.max("amount"));
                 });
             },
@@ -115,7 +115,7 @@ fn bench_window_count(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.count());
                 });
             },
@@ -137,7 +137,7 @@ fn bench_window_first_last(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.first());
                 });
             },
@@ -148,7 +148,7 @@ fn bench_window_first_last(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.last());
                 });
             },
@@ -170,7 +170,7 @@ fn bench_window_lag_lead(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.lag(1));
                 });
             },
@@ -181,7 +181,7 @@ fn bench_window_lag_lead(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.lead(1));
                 });
             },
@@ -203,7 +203,7 @@ fn bench_window_collect_set(c: &mut Criterion) {
             &partition_size,
             |b, _| {
                 b.iter(|| {
-                    let ctx = PartitionWindowContext::new(&arena, &positions, mid);
+                    let ctx = PartitionWindowContext::new(&arena, &positions, mid, &[]);
                     black_box(ctx.collect("category"));
                 });
             },

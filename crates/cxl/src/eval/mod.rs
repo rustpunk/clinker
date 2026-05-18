@@ -752,18 +752,44 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Ok(Value::Null)
                     }
                 }
-                // `any` is iterated `or`; `all` is iterated `and`. The
-                // fold must agree with BinOp::And/Or above (lines
-                // 801–829), which are Kleene three-valued and silently
-                // treat non-Bool/non-Null operands as Null. Mirroring
-                // both properties keeps the algebraic identity
-                // `any([a, b, c]) ≡ a or b or c` correctness-preserving
-                // under rewrites.
+                "row_number" => Ok(Value::Integer(w.row_number())),
+                "rank" => Ok(Value::Integer(w.rank())),
+                "dense_rank" => Ok(Value::Integer(w.dense_rank())),
+                "first_value" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.first_value(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "last_value" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.last_value(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                // Predicate-fold builtins share a three-valued Kleene
+                // shape: `any` and `exists` collapse to iterated OR;
+                // `every` and `not_exists` collapse to iterated AND
+                // (with `not_exists` inverting the predicate result).
+                // The fold must agree with BinOp::And/Or, which are
+                // Kleene three-valued and silently treat non-Bool /
+                // non-Null operands as Null. Mirroring both properties
+                // keeps the identity `any([a, b, c]) ≡ a or b or c`
+                // correctness-preserving under rewrites.
+                //
+                // `exists(p)` is a semantic alias of `any(p)` — they
+                // produce the same value over the same partition.
+                // `not_exists(p)` is `every(not p)` and is implemented
+                // as a primitive (`every` fold over an inverted Bool)
+                // for clarity and to share short-circuit semantics with
+                // the other folds.
                 //
                 // Typecheck (typecheck/pass.rs) rejects non-Bool argument
                 // types and nested $window.* inside the predicate before
                 // we reach this arm.
-                "any" | "all" => {
+                "any" | "every" | "exists" | "not_exists" => {
                     let predicate = args.first().ok_or_else(|| {
                         EvalError::new(
                             EvalErrorKind::ArityMismatch {
@@ -774,11 +800,17 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                             *span,
                         )
                     })?;
-                    let want_any = &**function == "any";
+                    let invert = &**function == "not_exists";
+                    let want_any = matches!(&**function, "any" | "exists");
                     let mut found_null = false;
                     for i in 0..w.partition_len() {
                         let row = w.partition_record(i);
-                        match eval_expr(predicate, typed, ctx, &row, window, env)? {
+                        let raw = eval_expr(predicate, typed, ctx, &row, window, env)?;
+                        let v = match (invert, raw) {
+                            (true, Value::Bool(b)) => Value::Bool(!b),
+                            (_, other) => other,
+                        };
+                        match v {
                             Value::Bool(true) if want_any => return Ok(Value::Bool(true)),
                             Value::Bool(false) if !want_any => return Ok(Value::Bool(false)),
                             Value::Bool(_) => {}
@@ -792,12 +824,23 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Value::Null
                     } else {
                         // Identity for the iterated operator:
-                        //   any (iterated or) → false
-                        //   all (iterated and) → true
+                        //   any/exists (iterated or) → false
+                        //   every/not_exists (iterated and) → true
                         Value::Bool(!want_any)
                     })
                 }
-                _ => Ok(Value::Null),
+                // Unregistered names cannot reach here: the typecheck
+                // pass rejects unknown $window.* identifiers before
+                // evaluation. Reaching this arm means a registered name
+                // has no evaluator implementation — surface a typed
+                // error rather than silently emitting Null.
+                _ => Err(EvalError::new(
+                    EvalErrorKind::TypeMismatch {
+                        expected: "registered $window function",
+                        got: "unimplemented evaluator arm",
+                    },
+                    *span,
+                )),
             }
         }
 

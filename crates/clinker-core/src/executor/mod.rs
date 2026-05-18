@@ -3253,10 +3253,12 @@ pub(crate) fn evaluate_single_transform_windowed(
         })
         .collect();
 
+    let sort_fields: Vec<&str> = spec.sort_by.iter().map(|s| s.field.as_str()).collect();
     let result = if let Some(key) = key {
         if let Some(partition) = index.get(&key) {
             let pos_in_partition = partition.iter().position(|&p| p == record_pos).unwrap_or(0);
-            let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
+            let wctx =
+                PartitionWindowContext::new(arena, partition, pos_in_partition, &sort_fields);
             evaluator
                 .eval_record(ctx, record, Some(&wctx))
                 .map_err(|e| (transform_name.to_string(), e))?
@@ -3572,6 +3574,7 @@ mod tests {
     mod post_aggregate_lag_lead;
     mod post_aggregate_recompute_determinism;
     mod post_aggregate_window;
+    mod post_aggregate_window_ranking;
     mod post_aggregate_window_spilled;
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;

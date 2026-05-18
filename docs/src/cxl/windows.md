@@ -80,6 +80,55 @@ Count of records in the window frame. Takes no arguments.
 emit window_size = $window.count()
 ```
 
+### $window.first_value(field)
+
+Returns the value of `field` at the first record of the window frame
+(ordered by `sort_by`). Equivalent to SQL `FIRST_VALUE(field)`.
+
+```
+emit opening_amount = $window.first_value(amount)
+```
+
+### $window.last_value(field)
+
+Returns the value of `field` at the last record of the window frame
+(ordered by `sort_by`). Equivalent to SQL `LAST_VALUE(field)`.
+
+```
+emit closing_amount = $window.last_value(amount)
+```
+
+## Ranking window functions
+
+Zero-argument integer functions that return the current row's rank
+within its partition.
+
+### $window.row_number()
+
+1-indexed position of the current record within its partition.
+
+```
+emit row_idx = $window.row_number()
+```
+
+### $window.rank()
+
+SQL `RANK()`: rows that share the same `sort_by` tuple receive the same
+rank, and the next distinct row jumps by the size of the tie group.
+
+```
+emit sales_rank = $window.rank()
+```
+
+### $window.dense_rank()
+
+SQL `DENSE_RANK()`: ties share a rank with no gaps between distinct
+ranks.
+
+```
+emit sales_dense_rank = $window.dense_rank()
+```
+
 ## Positional window functions
 
 These access specific records by position within the window frame.
@@ -129,12 +178,31 @@ Returns `true` if the predicate is true for any record in the window.
 emit has_high = $window.any(amount > 1000)
 ```
 
-### $window.all(predicate)
+### $window.every(predicate)
 
-Returns `true` if the predicate is true for all records in the window.
+Returns `true` if the predicate is true for every record in the window.
 
 ```
-emit all_positive = $window.all(amount > 0)
+emit all_positive = $window.every(amount > 0)
+```
+
+### $window.exists(predicate)
+
+Returns `true` if the predicate is true for at least one record in the
+window — a SQL-fluency alias of `$window.any`.
+
+```
+emit any_high = $window.exists(amount > 1000)
+```
+
+### $window.not_exists(predicate)
+
+Returns `true` if no record in the window satisfies the predicate.
+Equivalent to `not $window.exists(predicate)` and to
+`$window.every(not predicate)`.
+
+```
+emit none_negative = $window.not_exists(amount < 0)
 ```
 
 ### $window.collect(field)

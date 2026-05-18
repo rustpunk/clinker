@@ -147,6 +147,10 @@ pub struct AnalyticWindowSpec {
 /// Row-frame attached to an [`AnalyticWindowSpec`]. Mirrors SQL window
 /// frames (`ROWS BETWEEN <start> AND <end>`). `Range` / `Groups` modes
 /// land in a later sprint.
+///
+/// Currently the frame deserializes and round-trips through the plan but
+/// does **not** alter evaluation — every `$window.*` call evaluates over
+/// the entire partition. Frame-aware semantics are a future change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WindowFrame {

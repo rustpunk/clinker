@@ -1,13 +1,13 @@
-//! End-to-end pipeline coverage for `$window.any` / `$window.all`.
+//! End-to-end pipeline coverage for `$window.any` / `$window.every`.
 //!
 //! Pins two properties:
 //!   1. The predicate iterates over partition rows, not the current row —
-//!      every row in a partition emits the same any/all value.
+//!      every row in a partition emits the same any/every value.
 //!   2. Short-circuit evaluation produces the right Bool over a real
 //!      Arena partition produced by the executor.
 //!
 //! Three-valued / Null semantics are pinned exhaustively in
-//! `cxl::eval::tests::any_all` (mod-level unit tests) where Value::Null
+//! `cxl::eval::tests::any_every` (mod-level unit tests) where Value::Null
 //! can be injected directly without depending on CSV coercion.
 
 use super::*;
@@ -39,9 +39,9 @@ nodes:
       emit region = region
       emit score = score
       emit any_high = $window.any(score > 25)
-      emit all_high = $window.all(score > 25)
+      emit all_high = $window.every(score > 25)
       emit any_low = $window.any(score < 25)
-      emit all_low = $window.all(score < 25)
+      emit all_low = $window.every(score < 25)
     analytic_window:
       group_by: [department]
       sort_by:

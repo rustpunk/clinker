@@ -516,10 +516,10 @@ async fn window_lag2_and_lead2_boundary_retract() {
     );
 }
 
-// `$window.distinct(...)` and `$window.any(...)` / `$window.all(...)`
+// `$window.distinct(...)` and `$window.any(...)` / `$window.every(...)`
 // are listed in the windows.md docs but the CXL parser today rejects
 // `distinct` (it is a top-level keyword) and the iterable-predicate
-// shape (any/all over a predicate expression) does not flow cleanly
+// shape (any/every over a predicate expression) does not flow cleanly
 // through the same analytic_window plumbing as the value-emitting
 // builtins. The buffer-recompute path is uniform across builtins so
 // the iterable cells are structurally covered by `collect` (the only
