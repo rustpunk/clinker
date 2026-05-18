@@ -15,8 +15,8 @@
 //!
 //! Coverage. The full design matrix is 13 `$window.*` builtins ×
 //! {rows, range} × 3 frame-bound shapes × {single-row retract,
-//! full-partition retract} = 156 cells. Today's `LocalWindowConfig`
-//! does not expose the `frame:` configuration to the runtime, so the
+//! full-partition retract} = 156 cells. Today's `AnalyticWindowSpec`
+//! does not thread the `frame:` configuration into the runtime, so the
 //! frame variant collapses to "implicit unbounded over partition" for
 //! every builtin. Removing the frame axis reduces the matrix to 13 ×
 //! {single, full} = 26 representative cells, which the parameterized

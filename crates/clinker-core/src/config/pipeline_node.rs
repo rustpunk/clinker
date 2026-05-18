@@ -42,6 +42,7 @@ use serde::de::{self, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::node_header::{CombineHeader, MergeHeader, NodeHeader, SourceHeader};
+use crate::plan::index::AnalyticWindowSpec;
 use crate::yaml::CxlSource;
 
 /// Unified pipeline node taxonomy. Every node in the YAML `nodes:` list
@@ -897,11 +898,6 @@ pub enum MatchMode {
     /// Per-group limit of 10K entries.
     Collect,
 }
-
-/// The analytic-window spec attached to a `Transform`. Currently held
-/// as a structurally opaque JSON value; a typed shape is a future
-/// refactor.
-pub type AnalyticWindowSpec = serde_json::Value;
 
 /// Event-time window declaration attached to an `Aggregate`. Distinct
 /// from the positional analytic window on `Transform`: that one slices

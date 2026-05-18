@@ -295,14 +295,9 @@ fn test_two_pass_configs_have_analytic_window_group_by() {
 
         let has_window = config.nodes.iter().any(|n| {
             if let PipelineNode::Transform { config: body, .. } = &n.value {
-                if let Some(window) = &body.analytic_window {
-                    window
-                        .get("group_by")
-                        .and_then(|v| v.as_array())
-                        .map_or(false, |a| !a.is_empty())
-                } else {
-                    false
-                }
+                body.analytic_window
+                    .as_ref()
+                    .is_some_and(|spec| !spec.group_by.is_empty())
             } else {
                 false
             }

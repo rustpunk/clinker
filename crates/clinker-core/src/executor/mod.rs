@@ -59,7 +59,6 @@ pub struct TransformSpec {
     pub name: String,
     pub cxl: Option<String>,
     pub aggregate: Option<crate::config::AggregateConfig>,
-    pub local_window: Option<serde_json::Value>,
     pub route: Option<crate::config::RouteConfig>,
     pub input: Option<crate::config::TransformInput>,
 }
@@ -129,7 +128,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     name: header.name.clone(),
                     cxl: Some(body.cxl.as_ref().to_string()),
                     aggregate: None,
-                    local_window: body.analytic_window.clone(),
                     route: None,
                     input: project_input(&header.input.value),
                 });
@@ -148,7 +146,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         time_window: body.time_window.clone(),
                         allowed_lateness: body.allowed_lateness,
                     }),
-                    local_window: None,
                     route: None,
                     input: project_input(&header.input.value),
                 });
@@ -169,7 +166,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     name: header.name.clone(),
                     cxl: Some(String::new()),
                     aggregate: None,
-                    local_window: None,
                     route: Some(RouteConfig {
                         mode: body.mode,
                         branches,

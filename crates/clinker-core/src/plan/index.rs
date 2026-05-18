@@ -1,7 +1,8 @@
-//! Phase E: Index planning.
+//! Window-index planning.
 //!
-//! Extracts `analytic_window` configs from pipeline nodes, combines with
-//! `AnalysisReport` field sets, deduplicates into `Vec<IndexSpec>`.
+//! Carries the typed [`AnalyticWindowSpec`] off pipeline nodes through
+//! the deduplication step that produces `Vec<IndexSpec>`, combined with
+//! `AnalysisReport` field sets harvested from each transform's CXL.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -9,7 +10,7 @@ use std::sync::Arc;
 
 use clinker_record::Schema;
 use petgraph::graph::NodeIndex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::SortField;
 
@@ -107,8 +108,15 @@ impl Hash for PlanIndexRoot {
 }
 
 /// Typed representation of the `analytic_window` YAML block on a transform.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LocalWindowConfig {
+///
+/// Deserialized directly by serde-saphyr off the YAML config; the same
+/// struct is then carried forward through plan lowering. The
+/// `requires_buffer_recompute` field is the lone exception — it is a
+/// derived plan-time property, not a YAML-authored field; see its doc
+/// comment for why `#[serde(default)]` is the correct shape there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyticWindowSpec {
     /// Reference source name. If None or same as primary input, it's a same-source window.
     pub source: Option<String>,
     /// Fields to group the partition by.
@@ -118,6 +126,12 @@ pub struct LocalWindowConfig {
     pub sort_by: Vec<SortField>,
     /// Expression to evaluate against the primary record for cross-source lookup.
     pub on: Option<String>,
+    /// Optional row-frame attached to the window. `None` means "entire
+    /// partition" and matches the historical default semantics. Range /
+    /// Groups modes land in a later sprint; only `FrameMode::Rows` is
+    /// accepted today.
+    #[serde(default)]
+    pub frame: Option<WindowFrame>,
     /// Window sits downstream of a relaxed-CK aggregate whose dropped CK
     /// fields overlap this window's `partition_by`. Set to `true` by the
     /// plan-time derivation walk in
@@ -130,26 +144,43 @@ pub struct LocalWindowConfig {
     pub requires_buffer_recompute: bool,
 }
 
-/// Parse a transform's `analytic_window` JSON value into a typed
-/// [`LocalWindowConfig`]. `None` raw value yields `Ok(None)`. Used by
-/// `PipelineConfig::compile_with_diagnostics` while building per-node
-/// window configs in declaration order.
-pub(crate) fn parse_analytic_window_value(
-    raw: &Option<serde_json::Value>,
-    transform_name: &str,
-) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
-    match raw {
-        None => Ok(None),
-        Some(value) => {
-            let config: LocalWindowConfig = serde_json::from_value(value.clone()).map_err(|e| {
-                PlanIndexError::InvalidLocalWindow {
-                    transform: transform_name.to_string(),
-                    message: e.to_string(),
-                }
-            })?;
-            Ok(Some(config))
-        }
-    }
+/// Row-frame attached to an [`AnalyticWindowSpec`]. Mirrors SQL window
+/// frames (`ROWS BETWEEN <start> AND <end>`). `Range` / `Groups` modes
+/// land in a later sprint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WindowFrame {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// Frame mode. Only `Rows` (positional offsets) is supported today.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameMode {
+    Rows,
+}
+
+/// One bound of a [`WindowFrame`]. YAML form is externally tagged for
+/// the offset-carrying variants and a bare string for the parameterless
+/// ones. `Preceding`/`Following` carry a non-negative row offset.
+///
+/// ```yaml
+/// start: unbounded_preceding
+/// end:   current_row
+/// # or
+/// start: { preceding: 3 }
+/// end:   { following: 0 }
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u32),
+    CurrentRow,
+    Following(u32),
+    UnboundedFollowing,
 }
 
 /// Specification for one secondary index to build during Phase 1.
@@ -165,7 +196,7 @@ pub struct IndexSpec {
     pub arena_fields: Vec<String>,
     /// True if the source config declares a sort_order matching this index's sort_by.
     pub already_sorted: bool,
-    /// Mirror of `LocalWindowConfig.requires_buffer_recompute`. Set during
+    /// Mirror of `AnalyticWindowSpec.requires_buffer_recompute`. Set during
     /// `deduplicate_indices` from the input `RawIndexRequest`s; the
     /// executor's window arm consults this to decide between streaming
     /// emit and buffered emit. When two transforms share a deduplicated
@@ -218,7 +249,7 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
     deduped
 }
 
-/// Raw index request before deduplication. One per (transform, local_window) pair.
+/// Raw index request before deduplication. One per (transform, analytic_window) pair.
 #[derive(Debug, Clone)]
 pub struct RawIndexRequest {
     pub root: PlanIndexRoot,
@@ -228,7 +259,7 @@ pub struct RawIndexRequest {
     pub already_sorted: bool,
     /// Index of the transform that requested this index.
     pub transform_index: usize,
-    /// Mirror of `LocalWindowConfig.requires_buffer_recompute` for this
+    /// Mirror of `AnalyticWindowSpec.requires_buffer_recompute` for this
     /// transform. Carried through dedup so the merged `IndexSpec` lifts
     /// the flag when any contributing transform needs buffer recompute.
     pub requires_buffer_recompute: bool,
@@ -279,25 +310,3 @@ fn sort_fields_equal(a: &[SortField], b: &[SortField]) -> bool {
         .zip(b.iter())
         .all(|(x, y)| x.field == y.field && x.order == y.order)
 }
-
-/// Errors from index planning.
-#[derive(Debug)]
-pub enum PlanIndexError {
-    InvalidLocalWindow { transform: String, message: String },
-}
-
-impl std::fmt::Display for PlanIndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlanIndexError::InvalidLocalWindow { transform, message } => {
-                write!(
-                    f,
-                    "invalid local_window on transform '{}': {}",
-                    transform, message
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for PlanIndexError {}

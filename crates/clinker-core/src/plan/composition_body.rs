@@ -143,12 +143,12 @@ pub struct BoundBody {
 
     /// Per-Transform analytic-window configs captured at
     /// `bind_composition` time. Keyed by the body Transform's name;
-    /// values are the typed `LocalWindowConfig` parsed from the
+    /// values are the typed `AnalyticWindowSpec` deserialized from the
     /// body file's `analytic_window:` block. Empty entries are
     /// omitted. Consumed by the post-parent-DAG-build body-window
     /// pass to construct `body_indices_to_build` and backfill
     /// `window_index` onto each body Transform.
-    pub body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig>,
+    pub body_window_configs: HashMap<String, crate::plan::index::AnalyticWindowSpec>,
 
     /// Deferred-region metadata for relaxed-CK Aggregates that live
     /// inside this body. Keys are NodeIndex values in this body's
