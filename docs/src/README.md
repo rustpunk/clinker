@@ -1,13 +1,33 @@
 # Clinker
 
-Clinker is a pure-Rust, memory-bounded CLI ETL engine for streaming
-transformation of CSV, JSON, XML, and fixed-width data. It ships as a single
-static binary with no interpreter, no runtime, and no install dependencies.
+Clinker is a pure-Rust, bounded-memory **batch DAG executor** for CSV, JSON,
+XML, and fixed-width data. It reads finite inputs, drives them through a
+directed acyclic graph of transformation nodes one record at a time, and exits
+when the inputs are drained. It ships as a single static binary with no
+interpreter, no runtime, and no install dependencies.
 
 Pipelines are declared in YAML. Data transformation logic is written in CXL, a
 custom expression language purpose-built for ETL. Together they replace legacy
 tools like Informatica, SSIS, Talend, and NiFi with something deterministic,
 lightweight, and easy to reason about.
+
+## What Clinker is, plainly
+
+**A finite batch executor with per-record streaming evaluation, not a
+long-running stream processor.** A pipeline run is a job: Sources read until
+EOF, the DAG drains, the process exits. Within a run, records flow through
+Transform, Route, Merge, Combine, and Output nodes one at a time -- no full
+input is ever materialized in memory. Blocking operators (Aggregate, sort,
+grace-hash Combine) accumulate state inside the configured RSS budget and
+**spill to disk** when soft and hard memory thresholds trip, rather than
+OOM-killing the process.
+
+If you have used Flink, Kafka Streams, or Beam in unbounded mode: Clinker is
+not that. There are no watermarks against wall-clock time, no infinite-source
+semantics, no exactly-once delivery across restarts. The closest prior art is
+Pentaho Kettle / Apache Hop, Embulk, Singer, Benthos in batch mode, and Vector
+running file-to-file -- finite ETL jobs with per-record evaluation and a hard
+memory ceiling.
 
 ## Why Clinker?
 

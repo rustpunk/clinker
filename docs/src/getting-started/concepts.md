@@ -2,8 +2,21 @@
 
 This page covers the mental model behind Clinker pipelines. If you have
 experience with other ETL tools, most of this will feel familiar -- but pay
-attention to where Clinker diverges, especially around CXL and streaming
-execution.
+attention to where Clinker diverges, especially around CXL, per-record
+evaluation, and the memory budget.
+
+## Batch jobs, not unbounded streams
+
+A Clinker run is a **finite batch job**. Source nodes read their files until
+EOF, the DAG drains, and the process exits. There are no watermarks against
+wall-clock time, no infinite-source semantics, no exactly-once delivery across
+restarts. If you have used Flink, Kafka Streams, or Beam in unbounded mode:
+Clinker is not that.
+
+The word "streaming" in Clinker's documentation always refers to **per-record
+evaluation within a single batch run** -- records flow through the graph one
+at a time rather than being materialized as a whole table -- not to
+long-running stream-processor semantics.
 
 ## Pipelines are DAGs
 
@@ -61,20 +74,36 @@ System namespaces use a `$` prefix: `$pipeline.*`, `$window.*`, `$meta.*`.
 These provide access to pipeline metadata, window function state, and record
 metadata respectively.
 
-## Streaming execution
+## Per-record evaluation and the memory budget
 
-Records flow through the pipeline one at a time. Clinker does not load an
-entire file into memory before processing it. A source reads one record,
-pushes it through the downstream nodes, and then reads the next.
+Within a run, records flow through the pipeline **one at a time**. Clinker
+does not load an entire file into memory before processing it. A source reads
+one record, pushes it through the downstream nodes, and then reads the next.
+This is what "streaming" means in Clinker -- row-by-row evaluation inside a
+finite batch job, not Flink-style unbounded stream processing.
 
-This design keeps memory usage bounded regardless of file size. A 100 GB CSV
-is processed with the same memory footprint as a 100 KB CSV.
+Per-record evaluation keeps memory usage bounded for the **stateless** parts
+of the graph (Transform, Route, Merge, most Combine probe-side work, Output).
+A 100 GB CSV passing through a Transform is processed with the same memory
+footprint as a 100 KB CSV.
 
-The exception is aggregation. Aggregate nodes must accumulate state across
-records (to compute sums, counts, averages, etc.). Clinker uses hash
-aggregation by default and spills to disk when memory pressure exceeds
-configured limits. When the input is already sorted by the group key, Clinker
-can use streaming aggregation, which requires only constant memory.
+**Stateful operators must accumulate.** Aggregate, sort, and grace-hash
+Combine cannot emit until they have seen enough input -- sums need every
+addend, a full sort needs the last row, a hash join needs the build side
+complete. These operators run inside a configured RSS budget (default 256 MB)
+and **degrade gracefully** under pressure rather than OOM:
+
+- **Aggregate** uses hash aggregation by default and spills partitions to
+  disk when soft/hard memory thresholds trip. When the input is already
+  sorted by the group key, the planner picks streaming aggregation, which
+  requires only constant memory.
+- **Sort** spills runs to disk and merges them.
+- **Combine** picks among in-memory hash join, grace hash join (spilled), and
+  IEJoin / sort-merge depending on predicates and memory pressure.
+
+The memory ceiling is a first-class promise. Clinker is designed to share a
+server with JVM applications, databases, and other services without competing
+for RAM.
 
 ## Input wiring
 
