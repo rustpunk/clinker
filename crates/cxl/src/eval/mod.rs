@@ -92,6 +92,21 @@ pub enum SkipReason {
 
 /// Stateful CXL evaluator wrapping a compiled program.
 ///
+/// Bundle of the immutable references the evaluator threads through
+/// every recursive descent: the typed program (for node-id-keyed type
+/// and regex tables), the per-record `EvalContext` (source/row/vars),
+/// the field resolver (record-field lookup), and the optional window
+/// context (analytic-window-scoped reads). The mutable `env`
+/// (let-binding scratch) stays separate so the mutation contract is
+/// explicit at every call site.
+#[derive(Copy, Clone)]
+struct EvalEnv<'a, 'w, S: RecordStorage + 'w> {
+    typed: &'a TypedProgram,
+    ctx: &'a EvalContext<'a>,
+    resolver: &'a dyn FieldResolver,
+    window: Option<&'a dyn WindowContext<'w, S>>,
+}
+
 /// Owns the `TypedProgram` and optional distinct dedup state. One evaluator
 /// per transform per partition/thread — never Clone, use factory construction.
 /// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
@@ -383,11 +398,15 @@ impl ProgramEvaluator {
                         for (k, v) in &record_var_writes {
                             iter_record_vars.insert(k.clone(), v.clone());
                         }
-                        self.eval_emit_each_body(
-                            &body_stmts,
+                        let eval_env = EvalEnv {
+                            typed: &self.typed,
                             ctx,
                             resolver,
                             window,
+                        };
+                        Self::eval_emit_each_body(
+                            &body_stmts,
+                            eval_env,
                             &mut env,
                             &mut iter_fields,
                             &mut iter_record_vars,
@@ -420,34 +439,35 @@ impl ProgramEvaluator {
     /// body filter/distinct would silently divide work between
     /// branches the engine can't represent; reject at runtime as a
     /// type-mismatch surfaced through the boundary `map_err`).
-    #[allow(clippy::too_many_arguments)]
     fn eval_emit_each_body<'w, S: RecordStorage + 'w>(
-        &mut self,
         body: &[Statement],
-        ctx: &EvalContext<'_>,
-        resolver: &dyn FieldResolver,
-        window: Option<&dyn WindowContext<'w, S>>,
+        eval_env: EvalEnv<'_, 'w, S>,
         env: &mut HashMap<String, Value>,
         fields: &mut indexmap::IndexMap<String, Value>,
         record_vars: &mut indexmap::IndexMap<String, Value>,
     ) -> Result<(), EvalError> {
+        let EvalEnv {
+            typed,
+            ctx,
+            resolver,
+            window,
+        } = eval_env;
         for stmt in body {
             match stmt {
                 Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, env)?;
+                    let val = eval_expr(expr, typed, ctx, resolver, window, env)?;
                     env.insert(name.to_string(), val);
                 }
                 Statement::Emit {
                     name, expr, target, ..
                 } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, env).map_err(
-                        |mut e| {
+                    let val =
+                        eval_expr(expr, typed, ctx, resolver, window, env).map_err(|mut e| {
                             if e.triggering_field.is_none() {
                                 e.triggering_field = Some(Arc::from(&**name));
                             }
                             e
-                        },
-                    )?;
+                        })?;
                     match target {
                         EmitTarget::Field => {
                             fields.insert(name.to_string(), val);
@@ -465,7 +485,7 @@ impl ProgramEvaluator {
                 }
                 Statement::Trace { .. } | Statement::UseStmt { .. } => {}
                 Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, &self.typed, ctx, resolver, window, env)?;
+                    eval_expr(expr, typed, ctx, resolver, window, env)?;
                 }
                 Statement::Filter { .. }
                 | Statement::Distinct { .. }
@@ -528,18 +548,20 @@ impl ProgramEvaluator {
 /// per array element with the closure parameter inserted into `env`
 /// (and removed after each iteration so the env is left undisturbed
 /// for the caller). Non-array receivers fall through to `Null`.
-#[allow(clippy::too_many_arguments)]
 fn dispatch_closure_method<'w, S: RecordStorage + 'w>(
     receiver: &Value,
     method: &str,
     args: &[Expr],
     span: Span,
-    typed: &TypedProgram,
-    ctx: &EvalContext<'_>,
-    resolver: &dyn FieldResolver,
-    window: Option<&dyn WindowContext<'w, S>>,
+    eval_env: EvalEnv<'_, 'w, S>,
     env: &mut HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
+    let EvalEnv {
+        typed,
+        ctx,
+        resolver,
+        window,
+    } = eval_env;
     // Null receivers short-circuit to Null for every closure-bearing
     // builtin — mirrors the null-propagation policy in
     // `dispatch_method`.
@@ -1008,9 +1030,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 .map(|a| matches!(a, Expr::Closure { .. }))
                 .unwrap_or(false)
             {
-                return dispatch_closure_method(
-                    &recv_val, method, args, *span, typed, ctx, resolver, window, env,
-                );
+                let eval_env = EvalEnv {
+                    typed,
+                    ctx,
+                    resolver,
+                    window,
+                };
+                return dispatch_closure_method(&recv_val, method, args, *span, eval_env, env);
             }
 
             let mut arg_vals = Vec::with_capacity(args.len());
