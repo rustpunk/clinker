@@ -45,6 +45,7 @@ use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node};
+use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::CompositionBodyId;
 use crate::plan::deferred_region::{DeferredRegion, ParentContinuation};
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -326,10 +327,13 @@ fn seed_cross_region_inputs_for(
         };
         // Append onto the source node's buffer so the consumer's
         // existing predecessor-walk logic resolves them.
-        ctx.node_buffers
+        let slot = ctx
+            .node_buffers
             .entry(source_idx)
-            .or_default()
-            .extend(parked);
+            .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
+        for (record, rn) in parked {
+            slot.push(record, rn);
+        }
     }
 
     Ok(())
@@ -381,7 +385,7 @@ async fn recurse_into_body(
     // Swap to body-scope buffers so body NodeIndices index a fresh
     // namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
     // collide numerically). Restore on every exit.
-    let body_buffers: HashMap<NodeIndex, Vec<(Record, u64)>> = HashMap::new();
+    let body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_combine = std::mem::take(&mut ctx.source_records);
     let saved_body_refs = ctx
@@ -471,8 +475,10 @@ async fn recurse_into_body(
         // body covered without an extra code path.
         let mut harvested: Vec<(Record, u64)> = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
-            if let Some(rows) = ctx.node_buffers.remove(body_out_idx) {
-                harvested.extend(rows);
+            if let Some(nb) = ctx.node_buffers.remove(body_out_idx) {
+                for pair in nb.drain() {
+                    harvested.push(pair?);
+                }
             }
         }
         Ok::<Vec<(Record, u64)>, PipelineError>(harvested)
@@ -501,10 +507,13 @@ async fn recurse_into_body(
             &harvested,
             parent_dag.graph[composition_idx].name(),
         )?;
-        ctx.node_buffers
+        let slot = ctx
+            .node_buffers
             .entry(composition_idx)
-            .or_default()
-            .extend(harvested);
+            .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
+        for (record, rn) in harvested {
+            slot.push(record, rn);
+        }
     }
 
     if let Some(continuation) = parent_dag

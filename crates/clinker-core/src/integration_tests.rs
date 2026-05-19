@@ -80,6 +80,7 @@ mod tests {
             ) => 3,
             Err(
                 PipelineError::Io(_)
+                | PipelineError::Spill(_)
                 | PipelineError::Format(_)
                 | PipelineError::ThreadPool(_)
                 | PipelineError::Multiple(_)

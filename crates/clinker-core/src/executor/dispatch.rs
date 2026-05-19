@@ -405,6 +405,7 @@ fn dispatch_transform_eval_error(
     )
 }
 use crate::aggregation::AggregateStrategy;
+use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     CompiledRoute, CompiledTransform, DlqEntry, NullStorage, build_format_writer,
@@ -486,7 +487,7 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) strategy: ErrorStrategy,
 
     // Owned mutable per-walk state.
-    pub(crate) node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>>,
+    pub(crate) node_buffers: HashMap<NodeIndex, NodeBuffer>,
     /// Per-source live ingest channels keyed by Source node name. Each
     /// declared Source has one `tokio::spawn`-ed task pushing records
     /// through a `TokioSourceStream`; this map holds the paired
@@ -1817,7 +1818,8 @@ pub(crate) async fn transform_fused_consume(
 
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-    ctx.node_buffers.insert(node_idx, output_records);
+    ctx.node_buffers
+        .insert(node_idx, NodeBuffer::Memory(output_records));
     Ok(())
 }
 
@@ -1903,9 +1905,10 @@ pub(crate) async fn dispatch_plan_node(
                     // consumers run. Apply per-record seeding for body-
                     // declared record_vars (parent's writes survive via
                     // `seed_record_vars`'s preserve-existing semantics).
-                    let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len());
+                    let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
                     let has_record_seed = !ctx.record_var_seed.is_empty();
-                    for (r, rn) in seeded {
+                    for pair in seeded.drain() {
+                        let (r, rn) = pair?;
                         let mut rec = canonicalize(&r);
                         if has_record_seed {
                             rec.seed_record_vars(ctx.record_var_seed);
@@ -2000,7 +2003,8 @@ pub(crate) async fn dispatch_plan_node(
             // now anchors here.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
-            ctx.node_buffers.insert(node_idx, records);
+            ctx.node_buffers
+                .insert(node_idx, NodeBuffer::Memory(records));
         }
 
         PlanNode::Transform {
@@ -2021,24 +2025,24 @@ pub(crate) async fn dispatch_plan_node(
             }
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
-            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
-                own_buf
-            } else {
-                let predecessors: Vec<NodeIndex> = current_dag
-                    .graph
-                    .neighbors_directed(node_idx, Direction::Incoming)
-                    .collect();
-                if predecessors.len() == 1 {
-                    ctx.node_buffers
-                        .remove(&predecessors[0])
-                        .unwrap_or_default()
+            let input_records: Vec<(Record, u64)> =
+                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
-                    predecessors
-                        .iter()
-                        .find_map(|p| ctx.node_buffers.remove(p))
-                        .unwrap_or_default()
-                }
-            };
+                    let predecessors: Vec<NodeIndex> = current_dag
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let pred_buf = if predecessors.len() == 1 {
+                        ctx.node_buffers.remove(&predecessors[0])
+                    } else {
+                        predecessors.iter().find_map(|p| ctx.node_buffers.remove(p))
+                    };
+                    match pred_buf {
+                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                        None => Vec::new(),
+                    }
+                };
 
             // Find the CompiledTransform for this node
             let transform_idx = match ctx.transform_by_name.get(name.as_str()) {
@@ -2046,7 +2050,8 @@ pub(crate) async fn dispatch_plan_node(
                 None => {
                     // No transform found — pass through
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
-                    ctx.node_buffers.insert(node_idx, input_records);
+                    ctx.node_buffers
+                        .insert(node_idx, NodeBuffer::Memory(input_records));
                     return Ok(());
                 }
             };
@@ -2226,7 +2231,8 @@ pub(crate) async fn dispatch_plan_node(
             // matching runtime; otherwise the helper is a no-op.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            ctx.node_buffers.insert(node_idx, output_records);
+            ctx.node_buffers
+                .insert(node_idx, NodeBuffer::Memory(output_records));
         }
 
         PlanNode::Route {
@@ -2244,14 +2250,15 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
-                own_buf
-            } else {
-                predecessors
-                    .iter()
-                    .find_map(|p| ctx.node_buffers.remove(p))
-                    .unwrap_or_default()
-            };
+            let input_records: Vec<(Record, u64)> =
+                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
+                } else {
+                    match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
+                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                        None => Vec::new(),
+                    }
+                };
 
             if let Some(expected) = current_dag.graph[node_idx]
                 .expected_input_schema_in(current_dag)
@@ -2509,7 +2516,7 @@ pub(crate) async fn dispatch_plan_node(
                             .push((record.clone(), *rn));
                     }
                 }
-                ctx.node_buffers.insert(succ_idx, buf);
+                ctx.node_buffers.insert(succ_idx, NodeBuffer::Memory(buf));
             }
         }
 
@@ -2614,7 +2621,7 @@ pub(crate) async fn dispatch_plan_node(
             } else {
                 let total: usize = sorted_preds
                     .iter()
-                    .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len()))
+                    .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len_hint()))
                     .sum();
                 let mut merged = Vec::with_capacity(total);
                 let emit = |merged: &mut Vec<(Record, u64)>,
@@ -2646,7 +2653,8 @@ pub(crate) async fn dispatch_plan_node(
                         for pred in &sorted_preds {
                             let upstream_name = current_dag.graph[*pred].name().to_string();
                             if let Some(buf) = ctx.node_buffers.remove(pred) {
-                                for (record, rn) in buf {
+                                for pair in buf.drain() {
+                                    let (record, rn) = pair?;
                                     emit(&mut merged, &upstream_name, record, rn)?;
                                 }
                             }
@@ -2665,13 +2673,17 @@ pub(crate) async fn dispatch_plan_node(
                             .collect();
                         let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
                             .iter()
-                            .map(|pred| {
-                                ctx.node_buffers
-                                    .remove(pred)
-                                    .map(VecDeque::from)
-                                    .unwrap_or_default()
+                            .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
+                                match ctx.node_buffers.remove(pred) {
+                                    Some(nb) => {
+                                        let v: Vec<_> =
+                                            nb.drain().collect::<Result<Vec<_>, _>>()?;
+                                        Ok(VecDeque::from(v))
+                                    }
+                                    None => Ok(VecDeque::new()),
+                                }
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, _>>()?;
                         let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
                         let mut cursor = 0usize;
                         loop {
@@ -2715,7 +2727,8 @@ pub(crate) async fn dispatch_plan_node(
             // nothing because no spec roots at a Merge NodeIndex.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
-            ctx.node_buffers.insert(node_idx, merged);
+            ctx.node_buffers
+                .insert(node_idx, NodeBuffer::Memory(merged));
         }
 
         PlanNode::Sort {
@@ -2734,14 +2747,16 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<_> = predecessors
-                .iter()
-                .find_map(|p| ctx.node_buffers.remove(p))
-                .unwrap_or_default();
+            let input_records: Vec<(Record, u64)> =
+                match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
+                    Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                    None => Vec::new(),
+                };
 
             if input_records.is_empty() {
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
-                ctx.node_buffers.insert(node_idx, Vec::new());
+                ctx.node_buffers
+                    .insert(node_idx, NodeBuffer::Memory(Vec::new()));
                 return Ok(());
             }
 
@@ -2821,7 +2836,7 @@ pub(crate) async fn dispatch_plan_node(
             ctx.collector
                 .record(sort_timer.finish(sort_count, sort_count));
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
-            ctx.node_buffers.insert(node_idx, out);
+            ctx.node_buffers.insert(node_idx, NodeBuffer::Memory(out));
         }
 
         PlanNode::Aggregation {
@@ -2858,7 +2873,10 @@ pub(crate) async fn dispatch_plan_node(
 
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
-            let input = ctx.node_buffers.remove(&pred).unwrap_or_default();
+            let input: Vec<(Record, u64)> = match ctx.node_buffers.remove(&pred) {
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
 
             if let Some(expected) = current_dag.graph[node_idx]
                 .expected_input_schema_in(current_dag)
@@ -3209,7 +3227,8 @@ pub(crate) async fn dispatch_plan_node(
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
-                ctx.node_buffers.insert(node_idx, projected);
+                ctx.node_buffers
+                    .insert(node_idx, NodeBuffer::Memory(projected));
             } else {
                 // Materialize node-rooted window runtimes for any IndexSpec
                 // rooted at this aggregate. The aggregate emits columns the
@@ -3220,7 +3239,8 @@ pub(crate) async fn dispatch_plan_node(
                 // `out_rows` here, not from the source stream.
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out_rows)?;
-                ctx.node_buffers.insert(node_idx, out_rows);
+                ctx.node_buffers
+                    .insert(node_idx, NodeBuffer::Memory(out_rows));
             }
         }
 
@@ -3240,16 +3260,16 @@ pub(crate) async fn dispatch_plan_node(
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
-            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
-                own_buf
-            } else {
-                let predecessors: Vec<NodeIndex> = current_dag
-                    .graph
-                    .neighbors_directed(node_idx, Direction::Incoming)
-                    .collect();
-                predecessors
-                    .iter()
-                    .find_map(|&p| {
+            let input_records: Vec<(Record, u64)> =
+                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
+                } else {
+                    let predecessors: Vec<NodeIndex> = current_dag
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let mut found: Option<Vec<(Record, u64)>> = None;
+                    for &p in &predecessors {
                         // When multiple outputs share a predecessor,
                         // clone the buffer for all but the last
                         // consumer to avoid starving siblings.
@@ -3259,13 +3279,19 @@ pub(crate) async fn dispatch_plan_node(
                             .filter(|&succ| succ > node_idx)
                             .count();
                         if remaining_consumers == 0 {
-                            ctx.node_buffers.remove(&p)
-                        } else {
-                            ctx.node_buffers.get(&p).cloned()
+                            if let Some(nb) = ctx.node_buffers.remove(&p) {
+                                found = Some(nb.drain().collect::<Result<Vec<_>, _>>()?);
+                                break;
+                            }
+                        } else if let Some(nb) = ctx.node_buffers.get(&p) {
+                            // Multi-consumer fanout: keep the producer's
+                            // buffer alive for remaining siblings.
+                            found = Some(nb.clone_memory_only());
+                            break;
                         }
-                    })
-                    .unwrap_or_default()
-            };
+                    }
+                    found.unwrap_or_default()
+                };
 
             if let Some(expected) = current_dag.graph[node_idx]
                 .expected_input_schema_in(current_dag)
@@ -3509,7 +3535,7 @@ pub(crate) async fn dispatch_plan_node(
                 if let Some(&first_pred) = predecessors.first()
                     && let Some(records) = ctx.node_buffers.get(&first_pred)
                 {
-                    for (record, _) in records {
+                    for (record, _) in records.peek_mem() {
                         check_input_schema(
                             &expected,
                             record.schema(),
@@ -3546,7 +3572,8 @@ pub(crate) async fn dispatch_plan_node(
             // popped, so the install lands on `top` (parent scope).
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            ctx.node_buffers.insert(node_idx, output_records);
+            ctx.node_buffers
+                .insert(node_idx, NodeBuffer::Memory(output_records));
         }
 
         PlanNode::Combine {
@@ -3723,8 +3750,14 @@ pub(crate) async fn dispatch_plan_node(
                     ),
                 })?;
 
-            let driver_buf = ctx.node_buffers.remove(&driver_pred).unwrap_or_default();
-            let build_buf = ctx.node_buffers.remove(&build_pred).unwrap_or_default();
+            let driver_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&driver_pred) {
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
+            let build_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&build_pred) {
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
 
             // Operator-entry schema check per D4: every record
             // arriving on the probe and build channels is
@@ -3916,7 +3949,8 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    ctx.node_buffers.insert(node_idx, output_records);
+                    ctx.node_buffers
+                        .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Every emitted record has cleared into
                     // `node_buffers` without rewind, so the snapshot is
@@ -3994,7 +4028,8 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    ctx.node_buffers.insert(node_idx, output_records);
+                    ctx.node_buffers
+                        .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Mirrors the inline arm's post-emit
                     // clear so non-inline strategies do not leak
@@ -4078,7 +4113,8 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    ctx.node_buffers.insert(node_idx, output_records);
+                    ctx.node_buffers
+                        .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Mirrors the inline arm's post-emit
                     // clear.
@@ -4566,7 +4602,8 @@ pub(crate) async fn dispatch_plan_node(
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            ctx.node_buffers.insert(node_idx, output_records);
+            ctx.node_buffers
+                .insert(node_idx, NodeBuffer::Memory(output_records));
             // Drop the per-fold cursor snapshot: every emitted record
             // has cleared into `node_buffers` without rewind, so the
             // snapshot is no longer needed. The rewind path on a
@@ -5055,10 +5092,10 @@ fn collect_port_records(
                 ),
             });
         };
-        let records = ctx
+        let records: Vec<(Record, u64)> = ctx
             .node_buffers
             .get(&edge.source())
-            .cloned()
+            .map(|nb| nb.clone_memory_only())
             .unwrap_or_default();
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
@@ -5119,13 +5156,13 @@ async fn execute_composition_body(
     }
 
     // Seed body-scope buffers from parent records keyed by port.
-    let mut body_buffers: HashMap<NodeIndex, Vec<(clinker_record::Record, u64)>> = HashMap::new();
+    let mut body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
     for (port_name, records) in port_records {
         let body_idx = bound_body
             .port_name_to_node_idx
             .get(port_name.as_str())
             .ok_or_else(|| PipelineError::compose_unknown_port(composition_name, &port_name))?;
-        body_buffers.insert(*body_idx, records);
+        body_buffers.insert(*body_idx, NodeBuffer::Memory(records));
     }
 
     // Pick the body's terminal output node. The bind-time alias
@@ -5198,9 +5235,12 @@ async fn execute_composition_body(
     // again when `recurse_into_body` extends the slot with the
     // commit-pass harvest. Drop the forward emit so the commit pass
     // is the single source of records for that slot.
-    let output_records = match (&walk_result, output_idx) {
+    let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
-            let drained = ctx.node_buffers.remove(&idx).unwrap_or_default();
+            let drained: Vec<(Record, u64)> = match ctx.node_buffers.remove(&idx) {
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
+            };
             if body_dag.deferred_region_at_producer(idx).is_some() {
                 Vec::new()
             } else {

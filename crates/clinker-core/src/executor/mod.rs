@@ -3,6 +3,7 @@ pub mod stage_metrics;
 pub mod combine;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
+pub(crate) mod node_buffer;
 mod schema_check;
 pub(crate) mod source_stream;
 pub(crate) mod time_window;

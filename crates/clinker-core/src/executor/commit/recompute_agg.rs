@@ -20,6 +20,7 @@ use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, finalize_node_rooted_windows, project_rows_to_buffer_schema,
 };
+use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::execution::ExecutionPlanDag;
 
 /// Drive each affected aggregate through retract + refinalize, then
@@ -203,6 +204,7 @@ pub(crate) fn emit_post_recompute(
             "node-rooted window rebuild during commit-pass recompute: {e}"
         )));
     }
-    ctx.node_buffers.insert(agg_idx, projected);
+    ctx.node_buffers
+        .insert(agg_idx, NodeBuffer::Memory(projected));
     Ok(emitted)
 }
