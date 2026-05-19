@@ -79,7 +79,7 @@ Subcommands: `run`, `metrics`, `explain`. There is no `guess` subcommand yet —
 
 Clinker is a **bounded-memory batch DAG executor**. A pipeline run is a finite job over finite input — Source nodes read until EOF, the DAG drains, the process exits. It pairs a custom expression language (CXL) with YAML pipeline orchestration.
 
-Within a run, records flow through Transform / Route / Merge / Combine / Output **one at a time** without materializing the full input in memory. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget and spill to disk when thresholds trip rather than OOM the process.
+Within a run, stateless operators (Transform, Route, most Combine probe-side work, Output) evaluate records **one at a time** without per-record state accumulation. The DAG executor materializes intermediate `node_buffers` between non-fused stages, so memory scales with the largest live intermediate stage's output, not total input size; fused Source → Transform → Output paths skip materialization entirely. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget (default 512 MB) and spill to disk when soft/hard thresholds trip rather than OOM the process.
 
 ### Crate dependency layers (bottom → top)
 

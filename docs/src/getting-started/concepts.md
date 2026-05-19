@@ -16,7 +16,11 @@ Clinker is not that.
 The word "streaming" in Clinker's documentation always refers to **per-record
 evaluation within a single batch run** -- records flow through the graph one
 at a time rather than being materialized as a whole table -- not to
-long-running stream-processor semantics.
+long-running stream-processor semantics. Internal identifiers in the codebase
+(function names like `streaming_output_task`, config fields like
+`strategy: streaming`, error messages, log lines) use the word in the same
+row-by-row sense; if you see it in a stack trace, it is not Flink leaking
+through.
 
 ## Pipelines are DAGs
 
@@ -82,15 +86,22 @@ one record, pushes it through the downstream nodes, and then reads the next.
 This is what "streaming" means in Clinker -- row-by-row evaluation inside a
 finite batch job, not Flink-style unbounded stream processing.
 
-Per-record evaluation keeps memory usage bounded for the **stateless** parts
-of the graph (Transform, Route, Merge, most Combine probe-side work, Output).
-A 100 GB CSV passing through a Transform is processed with the same memory
-footprint as a 100 KB CSV.
+Per-record evaluation keeps **per-row** memory usage bounded for the
+stateless parts of the graph (Transform, Route, Merge, most Combine
+probe-side work, Output). The DAG executor itself materializes intermediate
+buffers between non-fused stages, so the overall memory footprint scales with
+the largest live intermediate stage's output -- not with total input size.
+For a fused streaming path (Source → Transform → Output, no branching, no
+fan-out), no intermediate buffer materializes and a 100 GB CSV passes through
+with the same footprint as a 100 KB CSV. For general DAG shapes (diamonds,
+Route fan-out, Merge fan-in, Composition bodies), the predecessor's output
+stays in `node_buffers` until every consumer has read it -- and that buffer
+size grows with input size unless an upstream blocking operator caps it.
 
 **Stateful operators must accumulate.** Aggregate, sort, and grace-hash
 Combine cannot emit until they have seen enough input -- sums need every
 addend, a full sort needs the last row, a hash join needs the build side
-complete. These operators run inside a configured RSS budget (default 256 MB)
+complete. These operators run inside a configured RSS budget (default 512 MB)
 and **degrade gracefully** under pressure rather than OOM:
 
 - **Aggregate** uses hash aggregation by default and spills partitions to

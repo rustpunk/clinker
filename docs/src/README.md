@@ -15,11 +15,15 @@ lightweight, and easy to reason about.
 
 **A finite batch executor with per-record streaming evaluation, not a
 long-running stream processor.** A pipeline run is a job: Sources read until
-EOF, the DAG drains, the process exits. Within a run, records flow through
-Transform, Route, Merge, Combine, and Output nodes one at a time -- no full
-input is ever materialized in memory. Blocking operators (Aggregate, sort,
-grace-hash Combine) accumulate state inside the configured RSS budget and
-**spill to disk** when soft and hard memory thresholds trip, rather than
+EOF, the DAG drains, the process exits. Within a run, stateless operators
+(Transform, Route, most Combine probe-side work, Output) evaluate records one
+at a time without accumulating per-record state. The DAG executor does
+materialize intermediate buffers between non-fused stages, so memory footprint
+scales with the largest intermediate stage's output rather than total input
+size; fused streaming paths (Source → Transform → Output without fan-out)
+avoid intermediate materialization entirely. Blocking operators (Aggregate,
+sort, grace-hash Combine) accumulate state inside the configured RSS budget
+and **spill to disk** when soft and hard memory thresholds trip, rather than
 OOM-killing the process.
 
 If you have used Flink, Kafka Streams, or Beam in unbounded mode: Clinker is
@@ -35,7 +39,7 @@ memory ceiling.
 no package manager. Works on any Linux server out of the box.
 
 **Good neighbor on busy servers.** Clinker enforces a strict memory ceiling
-(default 256 MB) so it can run alongside JVM applications, databases, and other
+(default 512 MB) so it can run alongside JVM applications, databases, and other
 services without competing for RAM. Aggregation spills to disk when memory
 pressure rises.
 
