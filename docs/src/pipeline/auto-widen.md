@@ -28,10 +28,10 @@ diagnostics.
   absorbed into a `Value::Map` payload carried by an
   engine-stamped `$widened` sidecar column appended to the
   source's schema. The sidecar's payload propagates through
-  downstream nodes and can be expanded back to top-level columns
-  at any Output sink via `include_widened: true`. Pattern
-  precedent: Databricks Auto Loader's `_rescued_data` sidecar and
-  ClickHouse's `JSON` column type.
+  downstream nodes and the sink expands it back to top-level
+  columns whenever `include_unmapped: true` is set on the Output
+  node (the default). Pattern precedent: Databricks Auto Loader's
+  `_rescued_data` sidecar and ClickHouse's `JSON` column type.
 
 - **`drop`** — undeclared input fields are silently stripped at
   read time. No sidecar; the source's plan-time schema equals the
@@ -78,7 +78,7 @@ nodes:
 | Combine       | Driver's sidecar rides through; build-side sidecars are dropped (mirrors `propagate_ck: Driver`). Build-side `iter_user_fields()` filters every engine-stamped column from `match: collect` array payloads, so build `$widened` cannot leak into the collect array. Users can lift a build-side unmapped field via `<build_qualifier>.<field>` in the combine body's CXL. |
 | Route / Merge | Row-preserving — sidecar passes through. `Merge` requires every input source to share the same `on_unmapped` policy; mixing fails compile with **E315** (see below). |
 | Composition   | Body inherits the parent's sidecar via the synthetic input port; whatever the body's terminal node carries flows back to the parent. The body's terminal-node propagation rule applies (e.g. an Aggregate terminal yields `Value::Null` at the parent boundary, a `match: first` Combine terminal carries the driver's payload). |
-| Output        | Sidecar is stripped by default. Set `include_widened: true` to expand the map's keys back to top-level columns at the sink. |
+| Output        | Sidecar expands to top-level columns when `include_unmapped: true` (the default). Set `include_unmapped: false` to strip the sidecar (and every other unmapped input field) so only explicitly-emitted columns reach the writer. |
 
 ## Output controls
 
@@ -90,16 +90,18 @@ nodes:
     name: out
     type: json
     path: out.json
-    include_widened: true    # default: false
+    include_unmapped: true    # default: true
 ```
 
-When `true`, fields the source absorbed into `$widened` are
-expanded back to top-level columns at the sink. Useful for
-pass-through pipelines where every original input field should
-reach the output regardless of whether it was declared in
-`schema:`.
+When `true` (the default), fields the source absorbed into
+`$widened` are expanded back to top-level columns at the sink.
+Useful for pass-through pipelines where every original input
+field should reach the output regardless of whether it was
+declared in `schema:`. Set `include_unmapped: false` to strip
+the sidecar (and every other input field not explicitly emitted
+upstream) so the writer sees only user-declared columns.
 
-`include_widened` composes independently with
+`include_unmapped` composes independently with
 `include_correlation_keys: true` — each, both, or neither can be
 set. `include_correlation_keys` does **not** surface
 `$widened`; the two flags are orthogonal.
@@ -108,7 +110,7 @@ set. `include_correlation_keys` does **not** surface
 
 The expansion happens at the projection layer, before the
 writer sees the record. So a CSV source with `auto_widen` plus
-a JSON output with `include_widened: true` produces JSON
+a JSON output with `include_unmapped: true` produces JSON
 objects whose top-level keys include both declared columns and
 absorbed input columns:
 
@@ -132,11 +134,11 @@ single point of truth, no defensive prechecks. JSON serializes
 `Value::Map` natively as a nested object and does not raise.
 
 The most common cause: the `$widened` sidecar reaches the
-writer because the Output node forgot to set `include_widened:
-true`. Remediation is either to set the flag (so the projection
-layer expands the map to top-level columns before write) or to
-coerce the map to a scalar in CXL before the emit. The error
-message lists both routes.
+writer because the Output node set `include_unmapped: false`.
+Remediation is either to leave `include_unmapped` at its default
+of `true` (so the projection layer expands the map to top-level
+columns before write) or to coerce the map to a scalar in CXL
+before the emit. The error message lists both routes.
 
 The DLQ writer applies the same filter at its own layer:
 `dlq::dlq_user_columns` strips any column tagged

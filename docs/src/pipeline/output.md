@@ -18,17 +18,38 @@ The `type:` field selects the output format: `csv`, `json`, `xml`, or `fixed_wid
 
 ## Field control
 
-By default, output nodes write only the fields explicitly emitted by upstream transforms. Several options control which fields appear and how they are named.
+Output nodes can either pass every upstream field through to the writer or restrict output to the fields the upstream transform explicitly emitted. Several options control which fields appear and how they are named.
 
-### Include widened (auto_widen) fields
+### Unmapped input field passthrough
 
 ```yaml
-    include_widened: true    # Default: false
+    include_unmapped: false    # Default: true
 ```
 
-When `true`, fields the source's `on_unmapped: auto_widen` policy absorbed into the per-record `$widened` sidecar map are expanded back to top-level columns at the sink. With `include_widened: false` (the default), the sidecar slot is stripped and only user-declared / explicitly-emitted columns reach the writer.
+When `true` (the default), every field on an input record that the upstream transform did not explicitly emit still passes through to the output unchanged. This includes fields the source's `on_unmapped: auto_widen` policy absorbed into the per-record `$widened` sidecar map -- their contents expand back to top-level columns at the sink.
 
-The flag composes independently with `include_correlation_keys: true` — see below. See [Auto-Widen & Schema Drift → Output controls](auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
+When `false`, only fields named by an `emit` statement in the upstream transform appear in the output. The `$widened` sidecar slot is stripped and undeclared input fields are dropped.
+
+#### Migration notice
+
+The default flipped from `false` to `true` in a recent release (see [issue #90](https://github.com/rustpunk/clinker/issues/90)). Pipelines that relied on the previous behavior -- where output records contained only the fields explicitly emitted upstream -- must now set `include_unmapped: false` explicitly to restore that shape.
+
+The flag composes independently with `include_correlation_keys: true` -- see below. See [Auto-Widen & Schema Drift -> Output controls](auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
+
+#### Worked example
+
+Suppose the upstream source emits records with `order_id`, `customer_id`, `amount`, and `region`, and a transform that emits only one derived field:
+
+```yaml
+- type: transform
+  name: classify
+  input: orders
+  config:
+    cxl: |
+      emit amount_bucket = if amount >= 1000 then "high" else "low"
+```
+
+With `include_unmapped: true` (the default), each output record carries `order_id`, `customer_id`, `amount`, `region`, and `amount_bucket`. With `include_unmapped: false`, each output record carries only `amount_bucket`. The transform's CXL is unchanged in both cases -- the Output node decides the field set.
 
 ### Include correlation-key shadow columns
 
@@ -40,13 +61,13 @@ When the pipeline declares `error_handling.correlation_key: <field>`, the engine
 
 Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](correlation-keys.md) for the full lifecycle.
 
-`include_correlation_keys` does **not** surface the `$widened` sidecar — `include_widened` is the separate flag for that. The two are independent: each, both, or neither can be set.
+`include_correlation_keys` does **not** surface the `$widened` sidecar -- `include_unmapped` is the separate flag for that. The two are independent: each, both, or neither can be set.
 
 ### Writer rejection of `Value::Map` payloads
 
 CSV, XML, and fixed-width writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
 
-The typical cause is a `$widened` sidecar reaching the writer because the Output node forgot `include_widened: true`. See [Auto-Widen & Schema Drift → Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
+The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
 
 ### Field mapping
 
