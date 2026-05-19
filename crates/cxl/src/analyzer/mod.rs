@@ -293,7 +293,9 @@ fn walk_expr(
                 walk_expr(arg, calls, fields, None);
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             walk_expr(receiver, calls, fields, None);
             walk_expr(index, calls, fields, None);
         }

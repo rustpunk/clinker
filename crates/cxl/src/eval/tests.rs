@@ -1140,3 +1140,369 @@ mod ranking_and_value {
         assert_eq!(out.get("lv"), Some(&Value::Integer(300)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Intra-record document support: closures, bracket-index, emit_each
+// ---------------------------------------------------------------------------
+
+mod intra_record {
+    use super::*;
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+
+    /// Compile `src` against the given input fields and run a single
+    /// record through the stateful `ProgramEvaluator`. Returns the
+    /// `EvalResult` so tests can inspect fan-out vs single-emit.
+    fn run(
+        src: &str,
+        fields: &[&str],
+        record: HashMap<String, Value>,
+    ) -> Result<EvalResult, crate::eval::EvalError> {
+        run_with_max_expansion(src, fields, record, DEFAULT_MAX_EXPANSION)
+    }
+
+    fn run_with_max_expansion(
+        src: &str,
+        fields: &[&str],
+        record: HashMap<String, Value>,
+        max_expansion: u64,
+    ) -> Result<EvalResult, crate::eval::EvalError> {
+        let parsed = Parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap_or_else(|d| {
+            panic!(
+                "Resolve errors: {:?}",
+                d.iter().map(|e| &e.message).collect::<Vec<_>>()
+            )
+        });
+        let typed = type_check(resolved, &empty_row()).unwrap_or_else(|d| {
+            panic!(
+                "Type errors: {:?}",
+                d.iter().map(|e| &e.message).collect::<Vec<_>>()
+            )
+        });
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = HashMapResolver::new(record);
+        let has_distinct = typed
+            .program
+            .statements
+            .iter()
+            .any(|s| matches!(s, crate::ast::Statement::Distinct { .. }));
+        let mut evaluator = crate::eval::ProgramEvaluator::with_max_expansion(
+            Arc::new(typed),
+            has_distinct,
+            max_expansion,
+        );
+        evaluator.eval_record::<NullStorage>(&ctx, &resolver, None)
+    }
+
+    fn arr(values: Vec<Value>) -> Value {
+        Value::Array(values)
+    }
+
+    fn map(entries: Vec<(&str, Value)>) -> Value {
+        let mut m = IndexMap::new();
+        for (k, v) in entries {
+            m.insert(k.into(), v);
+        }
+        Value::Map(Box::new(m))
+    }
+
+    #[test]
+    fn closure_filter_returns_matching_elements() {
+        let out = run(
+            "emit val = nums.filter(it => it > 1)",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("val"),
+                    Some(&arr(vec![Value::Integer(2), Value::Integer(3)]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closure_map_transforms_elements() {
+        let out = run(
+            "emit val = nums.map(it => it + 10)",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![Value::Integer(1), Value::Integer(2)]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("val"),
+                    Some(&arr(vec![Value::Integer(11), Value::Integer(12)]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closure_any_returns_bool() {
+        let out = run(
+            "emit val = nums.any(it => it > 5)",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![Value::Integer(1), Value::Integer(7)]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("val"), Some(&Value::Bool(true)));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bracket_index_array() {
+        let out = run(
+            "emit val = nums[1]",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![
+                    Value::Integer(10),
+                    Value::Integer(20),
+                    Value::Integer(30),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("val"), Some(&Value::Integer(20)));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bracket_index_map_string_key() {
+        let out = run(
+            "emit val = m[\"k1\"]",
+            &["m"],
+            HashMap::from([("m".into(), map(vec![("k1", Value::Integer(42))]))]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("val"), Some(&Value::Integer(42)));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_keys_and_values() {
+        let out = run(
+            "emit ks = m.keys()\nemit vs = m.values()",
+            &["m"],
+            HashMap::from([(
+                "m".into(),
+                map(vec![("a", Value::Integer(1)), ("b", Value::Integer(2))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("ks"),
+                    Some(&arr(vec![
+                        Value::String("a".into()),
+                        Value::String("b".into()),
+                    ]))
+                );
+                assert_eq!(
+                    fields.get("vs"),
+                    Some(&arr(vec![Value::Integer(1), Value::Integer(2)]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_merge_and_set_and_remove_field() {
+        let out = run(
+            "emit merged = a.merge(b)\nemit with_x = a.set(\"x\", 99)\nemit without_a = a.remove_field(\"a\")",
+            &["a", "b"],
+            HashMap::from([
+                ("a".into(), map(vec![("a", Value::Integer(1))])),
+                ("b".into(), map(vec![("b", Value::Integer(2))])),
+            ]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("merged"),
+                    Some(&map(vec![
+                        ("a", Value::Integer(1)),
+                        ("b", Value::Integer(2))
+                    ]))
+                );
+                assert_eq!(
+                    fields.get("with_x"),
+                    Some(&map(vec![
+                        ("a", Value::Integer(1)),
+                        ("x", Value::Integer(99))
+                    ]))
+                );
+                assert_eq!(fields.get("without_a"), Some(&map(vec![])));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_remove_returns_new_array_without_index() {
+        let out = run(
+            "emit val = nums.remove(1)",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![
+                    Value::Integer(10),
+                    Value::Integer(20),
+                    Value::Integer(30),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("val"),
+                    Some(&arr(vec![Value::Integer(10), Value::Integer(30)]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_each_fans_out_one_per_element() {
+        let out = run(
+            "emit each it in nums {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 3);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Integer(2)));
+                assert_eq!(records[2].fields.get("val"), Some(&Value::Integer(3)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_each_null_source_emits_nothing() {
+        let out = run(
+            "emit each it in nums {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), Value::Null)]),
+        )
+        .unwrap();
+        // Null source produces no fan-out and no single Emit either —
+        // the evaluator falls through to an empty Emit (output map is
+        // empty).
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert!(fields.is_empty(), "expected empty Emit, got {fields:?}");
+            }
+            other => panic!("expected empty Emit on null source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_each_max_expansion_overflow_dlqs() {
+        let big: Vec<Value> = (0..20).map(Value::Integer).collect();
+        let err = run_with_max_expansion(
+            "emit each it in nums {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), arr(big))]),
+            5,
+        )
+        .expect_err("expected ExpansionLimitExceeded");
+        match err.kind {
+            crate::eval::EvalErrorKind::ExpansionLimitExceeded { limit } => {
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected ExpansionLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_rejected_by_parser() {
+        let result =
+            Parser::parse("emit each it in nums {\n  emit each x in others { emit val = x }\n}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("emit_each cannot be nested")),
+            "expected nested emit_each parse error, got: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn free_standing_closure_rejected_at_parse() {
+        // The parser only accepts a closure inside a method-call
+        // argument list, so a let-binding to a closure does not parse:
+        // the lhs (`it`) parses as a FieldRef, then the `=>` token is
+        // unexpected because no led handler consumes it outside a
+        // closure context.
+        let parsed = Parser::parse("let f = it => it + 1\nemit val = 1");
+        assert!(
+            !parsed.errors.is_empty(),
+            "expected parse error for free-standing closure"
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|e| e.message.contains("FatArrow") || e.message.contains("unexpected")),
+            "expected FatArrow / unexpected-token diagnostic, got: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+}

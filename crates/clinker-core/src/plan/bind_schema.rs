@@ -859,7 +859,9 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
                 collect_scope_reads_in_expr(a, out);
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             collect_scope_reads_in_expr(receiver, out);
             collect_scope_reads_in_expr(index, out);
         }
@@ -3730,7 +3732,9 @@ fn walk_for_unknown_refs(
                 );
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             walk_for_unknown_refs(
                 receiver,
                 merged_row,

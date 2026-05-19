@@ -440,7 +440,30 @@ impl Parser {
         }
 
         self.advance(); // consume 'each' ident
-        let binding = self.expect_ident("emit_each binding name")?;
+        // Accept either a plain identifier or the `it` keyword token as
+        // the binding name — the closure surface uses `it` for the
+        // closure parameter and the emit_each binding convention is the
+        // same.
+        let binding = match self.peek().clone() {
+            Token::Ident(name) => {
+                self.advance();
+                name.to_string()
+            }
+            Token::It => {
+                self.advance();
+                "it".to_string()
+            }
+            other => {
+                return Err(self.error(
+                    &format!(
+                        "expected emit_each binding name (identifier), got {:?}",
+                        other
+                    ),
+                    "emit_each binds an iterator variable; `it` is the conventional name",
+                    "Use an identifier (or `it`) as the binding name",
+                ));
+            }
+        };
         // The `in` separator is an identifier (CXL has no `in` keyword);
         // accept the literal text "in" to keep the grammar surface from
         // adding another reserved word.
@@ -771,7 +794,13 @@ impl Parser {
                 // Dot: postfix field access or method call
                 if tok == Token::Dot {
                     self.advance(); // consume '.'
-                    let method_name = self.expect_ident("field or method name")?;
+                    // Accept identifiers AND keyword tokens that double
+                    // as method names (`filter`, `distinct`, `match`,
+                    // `not`, `it`, etc.) — the lexer eagerly produces
+                    // keyword tokens for those reserved words, but in
+                    // method-call position any of them should bind as
+                    // the method name string.
+                    let method_name = self.expect_ident_or_keyword("field or method name")?;
                     let lhs_span = lhs.span();
 
                     if *self.peek() == Token::LParen {
@@ -1243,9 +1272,7 @@ impl Parser {
     /// is a single expression at full BP — block-bodied closures are
     /// not part of the surface map.
     fn parse_arg_or_closure(&mut self) -> Result<Expr, ParseError> {
-        if matches!(self.peek(), Token::It)
-            && matches!(self.peek_ahead(1), Token::FatArrow)
-        {
+        if matches!(self.peek(), Token::It) && matches!(self.peek_ahead(1), Token::FatArrow) {
             let nid = self.alloc_id();
             let start = self.current_span();
             self.advance(); // consume `it`
@@ -1397,6 +1424,108 @@ impl Parser {
                 &format!("A {} must be an identifier", context),
                 &format!("Provide a valid identifier for the {}", context),
             ))
+        }
+    }
+
+    /// Like [`Self::expect_ident`] but additionally accepts keyword
+    /// tokens whose lexeme overlaps with a method name (`filter`,
+    /// `distinct`, `match`, `it`, etc.). Used in method-call position
+    /// so user-visible methods named after reserved words still parse.
+    fn expect_ident_or_keyword(&mut self, context: &str) -> Result<String, ParseError> {
+        let tok = self.peek().clone();
+        match tok {
+            Token::Ident(name) => {
+                self.advance();
+                Ok(name.to_string())
+            }
+            // Map reserved-word tokens back to their lexeme. The lexer's
+            // keyword table is the source of truth; this list mirrors
+            // it for tokens that double as method names in source.
+            Token::Let => {
+                self.advance();
+                Ok("let".to_string())
+            }
+            Token::Emit => {
+                self.advance();
+                Ok("emit".to_string())
+            }
+            Token::If => {
+                self.advance();
+                Ok("if".to_string())
+            }
+            Token::Then => {
+                self.advance();
+                Ok("then".to_string())
+            }
+            Token::Else => {
+                self.advance();
+                Ok("else".to_string())
+            }
+            Token::And => {
+                self.advance();
+                Ok("and".to_string())
+            }
+            Token::Or => {
+                self.advance();
+                Ok("or".to_string())
+            }
+            Token::Not => {
+                self.advance();
+                Ok("not".to_string())
+            }
+            Token::Match => {
+                self.advance();
+                Ok("match".to_string())
+            }
+            Token::Use => {
+                self.advance();
+                Ok("use".to_string())
+            }
+            Token::As => {
+                self.advance();
+                Ok("as".to_string())
+            }
+            Token::Fn => {
+                self.advance();
+                Ok("fn".to_string())
+            }
+            Token::Trace => {
+                self.advance();
+                Ok("trace".to_string())
+            }
+            Token::Null => {
+                self.advance();
+                Ok("null".to_string())
+            }
+            Token::True => {
+                self.advance();
+                Ok("true".to_string())
+            }
+            Token::False => {
+                self.advance();
+                Ok("false".to_string())
+            }
+            Token::Now => {
+                self.advance();
+                Ok("now".to_string())
+            }
+            Token::It => {
+                self.advance();
+                Ok("it".to_string())
+            }
+            Token::Filter => {
+                self.advance();
+                Ok("filter".to_string())
+            }
+            Token::Distinct => {
+                self.advance();
+                Ok("distinct".to_string())
+            }
+            Token::By => {
+                self.advance();
+                Ok("by".to_string())
+            }
+            _ => self.expect_ident(context),
         }
     }
 

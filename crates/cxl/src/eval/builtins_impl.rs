@@ -645,11 +645,7 @@ pub fn dispatch_method(
 
         // ── Map ─────────────────────────────────────────────────
         "keys" => Ok(Some(match receiver {
-            Value::Map(m) => Value::Array(
-                m.keys()
-                    .map(|k| Value::String(k.clone()))
-                    .collect(),
-            ),
+            Value::Map(m) => Value::Array(m.keys().map(|k| Value::String(k.clone())).collect()),
             _ => Value::Null,
         })),
         "values" => Ok(Some(match receiver {

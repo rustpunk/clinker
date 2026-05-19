@@ -612,8 +612,7 @@ impl<'a> Resolver<'a> {
             } => {
                 // Predicate-fold builtins receive their argument as a
                 // predicate_expr (an `it`-bound boolean expression).
-                let is_predicate =
-                    matches!(&**function, "any" | "every" | "exists" | "not_exists");
+                let is_predicate = matches!(&**function, "any" | "every" | "exists" | "not_exists");
                 if is_predicate {
                     let prev_context = self.context;
                     self.context = ResolveContext::PredicateExpr;
@@ -633,7 +632,9 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(arg);
                 }
             }
-            Expr::IndexAccess { receiver, index, .. } => {
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
                 self.resolve_expr(receiver);
                 self.resolve_expr(index);
             }
@@ -673,7 +674,21 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_field_ref(&mut self, node_id: NodeId, name: &str, span: Span) {
-        // Check for `it` binding
+        // Check let-bound variables (search most recent first for
+        // shadowing). The closure-arg walker pushes `it` into
+        // `let_vars` for the duration of the body walk, so a closure
+        // parameter resolves here before the window-predicate special
+        // case below — `it` inside `arr.filter(it => ...)` becomes a
+        // LetVar binding, not an IteratorBinding.
+        for (i, var) in self.let_vars.iter().enumerate().rev() {
+            if var == name {
+                self.bind(node_id, ResolvedBinding::LetVar(i));
+                return;
+            }
+        }
+
+        // `it` outside a closure body: only valid inside a window
+        // predicate (any / every / exists / not_exists).
         if name == "it" {
             if self.context == ResolveContext::PredicateExpr {
                 self.bind(node_id, ResolvedBinding::IteratorBinding);
@@ -688,14 +703,6 @@ impl<'a> Resolver<'a> {
                         "Move this expression inside a $window.any() / .every() / .exists() / .not_exists() call".into(),
                     ),
                 });
-                return;
-            }
-        }
-
-        // Check let-bound variables (search most recent first for shadowing)
-        for (i, var) in self.let_vars.iter().enumerate().rev() {
-            if var == name {
-                self.bind(node_id, ResolvedBinding::LetVar(i));
                 return;
             }
         }

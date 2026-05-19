@@ -1151,7 +1151,9 @@ impl<'a> TypeChecker<'a> {
                     self.walk_agg_ctx(arg, let_exprs);
                 }
             }
-            Expr::IndexAccess { receiver, index, .. } => {
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
                 self.walk_agg_ctx(receiver, let_exprs);
                 self.walk_agg_ctx(index, let_exprs);
             }
@@ -1227,7 +1229,9 @@ impl<'a> TypeChecker<'a> {
                     self.walk_agg_ctx_row_only(arg);
                 }
             }
-            Expr::IndexAccess { receiver, index, .. } => {
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
                 self.walk_agg_ctx_row_only(receiver);
                 self.walk_agg_ctx_row_only(index);
             }

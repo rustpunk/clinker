@@ -1810,7 +1810,8 @@ fn emit_for_probe<'a>(
                                 return Err(PipelineError::Internal {
                                     op: "grace_hash on_miss body",
                                     node: name.to_string(),
-                                    detail: "emit_each fan-out is not supported in a combine body".into(),
+                                    detail: "emit_each fan-out is not supported in a combine body"
+                                        .into(),
                                 });
                             }
                             Err(e) => return Err(PipelineError::from(e)),
@@ -1844,7 +1845,8 @@ fn emit_for_probe<'a>(
                             return Err(PipelineError::Internal {
                                 op: "grace_hash body",
                                 node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                                detail: "emit_each fan-out is not supported in a combine body"
+                                    .into(),
                             });
                         }
                         Err(e) => return Err(PipelineError::from(e)),

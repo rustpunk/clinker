@@ -166,7 +166,9 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
                 walk_expr(arg, refs);
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             walk_expr(receiver, refs);
             walk_expr(index, refs);
         }
@@ -270,9 +272,9 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         }
         Expr::WindowCall { args, .. } => args.iter().any(|a| contains_self_call(fn_name, a)),
         Expr::AggCall { args, .. } => args.iter().any(|a| contains_self_call(fn_name, a)),
-        Expr::IndexAccess { receiver, index, .. } => {
-            contains_self_call(fn_name, receiver) || contains_self_call(fn_name, index)
-        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => contains_self_call(fn_name, receiver) || contains_self_call(fn_name, index),
         Expr::Closure { body, .. } => contains_self_call(fn_name, body),
         Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }

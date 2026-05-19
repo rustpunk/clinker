@@ -46,9 +46,7 @@ pub enum EvalResult {
     /// fan-out. Each record carries its own field map and record-var
     /// writes, mirroring `Emit`'s per-record shape. Consumers iterate
     /// over `records` and push each onto their output buffer.
-    EmitMany {
-        records: Vec<EmitOne>,
-    },
+    EmitMany { records: Vec<EmitOne> },
     /// Record should be excluded from output.
     Skip(SkipReason),
 }
@@ -256,14 +254,13 @@ impl ProgramEvaluator {
                 Statement::Emit {
                     name, expr, target, ..
                 } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env).map_err(
-                        |mut e| {
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)
+                        .map_err(|mut e| {
                             if e.triggering_field.is_none() {
                                 e.triggering_field = Some(Arc::from(&**name));
                             }
                             e
-                        },
-                    )?;
+                        })?;
                     match target {
                         EmitTarget::Field => {
                             output.insert(name.to_string(), val);
@@ -1012,15 +1009,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 .unwrap_or(false)
             {
                 return dispatch_closure_method(
-                    &recv_val,
-                    method,
-                    args,
-                    *span,
-                    typed,
-                    ctx,
-                    resolver,
-                    window,
-                    env,
+                    &recv_val, method, args, *span, typed, ctx, resolver, window, env,
                 );
             }
 

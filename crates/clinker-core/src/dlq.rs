@@ -40,6 +40,11 @@ pub enum DlqErrorCategory {
     /// is set. Mirrors Flink sideOutputLateData / Beam late-drop /
     /// Spark window late-drop.
     LateRecord,
+    /// Per-record `emit each` fan-out produced more output records
+    /// than the transform's `max_expansion` ceiling allows. The
+    /// originating record is routed to DLQ before the fan-out can
+    /// emit any of its truncated body records.
+    ExpansionLimitExceeded,
 }
 
 impl DlqErrorCategory {
@@ -55,6 +60,7 @@ impl DlqErrorCategory {
             Self::Correlated => "correlated",
             Self::GroupSizeExceeded => "group_size_exceeded",
             Self::LateRecord => "late_record",
+            Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
         }
     }
 }

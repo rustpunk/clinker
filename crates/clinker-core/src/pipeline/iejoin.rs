@@ -839,7 +839,9 @@ pub(crate) fn execute_combine_iejoin(
                                     return Err(PipelineError::Internal {
                                         op: "iejoin body",
                                         node: name.to_string(),
-                                        detail: "emit_each fan-out is not supported in a combine body".into(),
+                                        detail:
+                                            "emit_each fan-out is not supported in a combine body"
+                                                .into(),
                                     });
                                 }
                                 Err(e) => return Err(PipelineError::from(e)),

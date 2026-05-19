@@ -696,7 +696,8 @@ fn execute_combine_sort_merge_with_stats(
                             return Err(PipelineError::Internal {
                                 op: "sort_merge_join on_miss body",
                                 node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                                detail: "emit_each fan-out is not supported in a combine body"
+                                    .into(),
                             });
                         }
                         Err(e) => return Err(PipelineError::from(e)),
@@ -1244,7 +1245,8 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             return Err(PipelineError::Internal {
                                 op: "sort_merge_join body",
                                 node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                                detail: "emit_each fan-out is not supported in a combine body"
+                                    .into(),
                             });
                         }
                         Err(e) => return Err(PipelineError::from(e)),

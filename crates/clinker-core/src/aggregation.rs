@@ -298,9 +298,7 @@ pub fn eval_expr_in_agg_scope(
         Expr::IndexAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "bracket-index access",
         }),
-        Expr::Closure { .. } => Err(AggregateEvalError::UnsupportedResidual {
-            what: "closure",
-        }),
+        Expr::Closure { .. } => Err(AggregateEvalError::UnsupportedResidual { what: "closure" }),
     }
 }
 
@@ -979,9 +977,16 @@ impl HashAggregator {
         }
         // 1. Pre-aggregation filter (D9).
         if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let v =
-                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &mut env)?;
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            let v = eval_expr::<NullStorage>(
+                filter,
+                self.evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &mut env,
+            )?;
             if v != Value::Bool(true) {
                 return Ok(());
             }
@@ -1210,9 +1215,16 @@ impl HashAggregator {
     ) -> Result<(), HashAggError> {
         // 1. Pre-aggregation filter (same as fold-mode).
         if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let v =
-                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &mut env)?;
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            let v = eval_expr::<NullStorage>(
+                filter,
+                self.evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &mut env,
+            )?;
             if v != Value::Bool(true) {
                 return Ok(());
             }
@@ -2117,7 +2129,8 @@ fn dispatch_binding(
         }
         BindingArg::Wildcard => Ok(acc.add(&Value::Null)),
         BindingArg::Expr(e) => {
-            let mut env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
             let v = eval_expr::<NullStorage>(e, evaluator.typed(), ctx, record, None, &mut env)?;
             Ok(acc.add(&v))
         }
@@ -2144,7 +2157,8 @@ fn eval_binding_arg_value(
             .unwrap_or(Value::Null)),
         BindingArg::Wildcard => Ok(Value::Null),
         BindingArg::Expr(e) => {
-            let mut env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
             Ok(eval_expr::<NullStorage>(
                 e,
                 evaluator.typed(),
@@ -2466,9 +2480,16 @@ impl StreamingAggregator<AddRaw> {
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
         if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-            let v =
-                eval_expr::<NullStorage>(filter, self.evaluator.typed(), ctx, record, None, &mut env)?;
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            let v = eval_expr::<NullStorage>(
+                filter,
+                self.evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &mut env,
+            )?;
             if v != Value::Bool(true) {
                 return Ok(());
             }

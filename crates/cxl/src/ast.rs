@@ -410,7 +410,9 @@ impl Expr {
                     a.support_into(fields);
                 }
             }
-            Expr::IndexAccess { receiver, index, .. } => {
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
                 receiver.support_into(fields);
                 index.support_into(fields);
             }

@@ -850,6 +850,17 @@ pub struct TransformBody {
     /// values from a config source. Default is `Runtime`.
     #[serde(default)]
     pub phase: Phase,
+    /// Cap on records produced per input by `emit each` fan-out blocks
+    /// inside this transform's CXL body. When a per-record evaluation
+    /// would exceed this count, the originating record is routed to
+    /// DLQ with category `ExpansionLimitExceeded` rather than emit a
+    /// truncated or unbounded fan-out. Default 10_000.
+    #[serde(default = "default_max_expansion")]
+    pub max_expansion: u64,
+}
+
+fn default_max_expansion() -> u64 {
+    10_000
 }
 
 /// One declaration of a producer-written scoped variable.

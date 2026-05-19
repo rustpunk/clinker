@@ -61,6 +61,10 @@ pub struct TransformSpec {
     pub aggregate: Option<crate::config::AggregateConfig>,
     pub route: Option<crate::config::RouteConfig>,
     pub input: Option<crate::config::TransformInput>,
+    /// Per-record fan-out ceiling for `emit each` blocks inside this
+    /// transform. Threaded to the evaluator at construction time and
+    /// surfaces as a typed DLQ entry on overflow.
+    pub max_expansion: u64,
 }
 
 impl TransformSpec {
@@ -130,6 +134,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     aggregate: None,
                     route: None,
                     input: project_input(&header.input.value),
+                    max_expansion: body.max_expansion,
                 });
             }
             PipelineNode::Aggregate {
@@ -148,6 +153,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     }),
                     route: None,
                     input: project_input(&header.input.value),
+                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                 });
             }
             PipelineNode::Route {
@@ -172,6 +178,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         default: body.default.clone(),
                     }),
                     input: project_input(&header.input.value),
+                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                 });
             }
             _ => {}
@@ -429,6 +436,7 @@ impl RecordStorage for NullStorage {
 pub struct CompiledTransform {
     pub(crate) name: String,
     pub(crate) typed: Arc<TypedProgram>,
+    pub(crate) max_expansion: u64,
 }
 
 impl CompiledTransform {
@@ -731,6 +739,7 @@ impl PipelineExecutor {
                 Ok::<CompiledTransform, PipelineError>(CompiledTransform {
                     name: t.name.clone(),
                     typed,
+                    max_expansion: t.max_expansion,
                 })
             })
             .collect::<Result<_, _>>()?;
@@ -758,6 +767,7 @@ impl PipelineExecutor {
                     compiled_transforms.push(CompiledTransform {
                         name: n.to_string(),
                         typed: typed.clone(),
+                        max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                     });
                     existing_names.insert(n.to_string());
                 }
@@ -3174,6 +3184,18 @@ fn arcs_reachable_from(
 /// `group_by_indices`) rely on the upstream layout, so the widened
 /// schema preserves every upstream column at its original index.
 ///
+/// Single emitted (or skipped) output of a per-record transform
+/// evaluation. The `Result<(), SkipReason>` distinguishes a real emit
+/// (`Ok(())`) from a `filter`/`distinct` skip; the leading `Record` is
+/// the output record (or the original record on Skip). One entry per
+/// emitted record under `emit each` fan-out.
+pub(crate) type TransformOutput = (Record, Result<(), SkipReason>);
+
+/// Error shape returned by [`evaluate_single_transform`] and
+/// [`evaluate_single_transform_windowed`] — pairs the transform name
+/// with the underlying [`cxl::eval::EvalError`] for DLQ classification.
+pub(crate) type TransformEvalError = (String, cxl::eval::EvalError);
+
 /// Returns a `Vec` of `(record, Ok | Skip)` entries — typically one
 /// entry per call, but `emit each` fan-out produces N entries from a
 /// single input record. On error, returns `(transform_name, EvalError)`.
@@ -3184,7 +3206,7 @@ pub(crate) fn evaluate_single_transform(
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
     _output_schema: &Arc<Schema>,
-) -> Result<Vec<(Record, Result<(), SkipReason>)>, (String, cxl::eval::EvalError)> {
+) -> Result<Vec<TransformOutput>, TransformEvalError> {
     let input = record;
     let result = evaluator
         .eval_record::<NullStorage>(ctx, input, None)
@@ -3199,10 +3221,7 @@ pub(crate) fn evaluate_single_transform(
 /// `record_with_emitted_fields` projection of `input` once per
 /// `EmitOne`; downstream cursor advancement happens once per emitted
 /// record at the call site.
-fn materialize_eval_result(
-    input: &Record,
-    result: EvalResult,
-) -> Vec<(Record, Result<(), SkipReason>)> {
+fn materialize_eval_result(input: &Record, result: EvalResult) -> Vec<TransformOutput> {
     match result {
         EvalResult::Emit {
             fields: emitted,
@@ -3273,7 +3292,7 @@ pub(crate) fn evaluate_single_transform_windowed(
     window_index: usize,
     runtime: &crate::executor::window_runtime::WindowRuntime,
     record_pos: u64,
-) -> Result<Vec<(Record, Result<(), SkipReason>)>, (String, cxl::eval::EvalError)> {
+) -> Result<Vec<TransformOutput>, TransformEvalError> {
     let spec = &plan.indices_to_build[window_index];
     let arena = runtime.arena.as_ref();
     let index = runtime.index.as_ref();

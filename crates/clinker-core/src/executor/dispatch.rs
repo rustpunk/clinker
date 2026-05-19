@@ -362,12 +362,22 @@ fn dispatch_transform_eval_error(
     if ctx.strategy == ErrorStrategy::FailFast {
         return Err(eval_err.into());
     }
+    // emit_each fan-out overflow is its own DLQ category so users can
+    // distinguish "I asked for too much fan-out" from "a coercion
+    // failed". Every other eval-path failure stays under
+    // TypeCoercionFailure, matching the pre-existing classification.
+    let category = match &eval_err.kind {
+        cxl::eval::EvalErrorKind::ExpansionLimitExceeded { .. } => {
+            crate::dlq::DlqErrorCategory::ExpansionLimitExceeded
+        }
+        _ => crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+    };
     let stage = Some(DlqEntry::stage_transform(&transform_name));
     let routed = record_error_to_buffer_if_grouped(
         ctx,
         &record,
         row_num,
-        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        category,
         eval_err.to_string(),
         stage.clone(),
         None,
@@ -382,7 +392,7 @@ fn dispatch_transform_eval_error(
         ctx,
         DlqEntry {
             source_row: row_num,
-            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+            category,
             error_message: eval_err.to_string(),
             original_record: record,
             stage,
@@ -1667,9 +1677,10 @@ pub(crate) async fn transform_fused_consume(
     let upstream_name = source_name_owned.clone();
 
     let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
-        ProgramEvaluator::new(
+        ProgramEvaluator::with_max_expansion(
             Arc::clone(&ctx.compiled_transforms[idx].typed),
             ctx.compiled_transforms[idx].has_distinct(),
+            ctx.compiled_transforms[idx].max_expansion,
         )
     });
 
@@ -2035,9 +2046,10 @@ pub(crate) async fn dispatch_plan_node(
                 }
             };
 
-            let mut evaluator = ProgramEvaluator::new(
+            let mut evaluator = ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[transform_idx].typed),
                 ctx.compiled_transforms[transform_idx].has_distinct(),
+                ctx.compiled_transforms[transform_idx].max_expansion,
             );
 
             let expected_input = current_dag.graph[node_idx]
@@ -2865,9 +2877,10 @@ pub(crate) async fn dispatch_plan_node(
             // wrapper enum owns the engine.
             let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
             let evaluator = match transform_idx {
-                Some(idx) => ProgramEvaluator::new(
+                Some(idx) => ProgramEvaluator::with_max_expansion(
                     Arc::clone(&ctx.compiled_transforms[idx].typed),
                     ctx.compiled_transforms[idx].has_distinct(),
+                    ctx.compiled_transforms[idx].max_expansion,
                 ),
                 None => {
                     return Err(PipelineError::Internal {
@@ -5286,9 +5299,10 @@ fn run_time_windowed_aggregate(
     // `compiled_transforms`.
     let make_stream = |ctx: &ExecutorContext<'_>| -> Result<AggregateStream, PipelineError> {
         let evaluator = match transform_idx {
-            Some(idx) => ProgramEvaluator::new(
+            Some(idx) => ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[idx].typed),
                 ctx.compiled_transforms[idx].has_distinct(),
+                ctx.compiled_transforms[idx].max_expansion,
             ),
             None => {
                 return Err(PipelineError::Internal {

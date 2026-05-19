@@ -203,7 +203,9 @@ fn extract_aggs_from_expr(
                 extract_aggs_from_expr(a, bindings, dedup, input_schema)?;
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             extract_aggs_from_expr(receiver, bindings, dedup, input_schema)?;
             extract_aggs_from_expr(index, bindings, dedup, input_schema)?;
         }
@@ -354,7 +356,9 @@ fn rewrite_group_key_refs(
                 rewrite_group_key_refs(a, group_by_set, group_by_fields);
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             rewrite_group_key_refs(receiver, group_by_set, group_by_fields);
             rewrite_group_key_refs(index, group_by_set, group_by_fields);
         }
@@ -447,7 +451,9 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
                 *expr = replacement.clone();
             }
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             substitute_let_bindings(receiver, let_bindings);
             substitute_let_bindings(index, let_bindings);
         }
@@ -502,9 +508,9 @@ fn contains_agg_call(expr: &Expr) -> bool {
                     .unwrap_or(false)
         }
         Expr::WindowCall { args, .. } => args.iter().any(contains_agg_call),
-        Expr::IndexAccess { receiver, index, .. } => {
-            contains_agg_call(receiver) || contains_agg_call(index)
-        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => contains_agg_call(receiver) || contains_agg_call(index),
         Expr::Closure { body, .. } => contains_agg_call(body),
         Expr::Literal { .. }
         | Expr::FieldRef { .. }
@@ -685,7 +691,9 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
         Expr::GroupKey { slot, .. } => {
             let _ = write!(buf, "k:{slot}");
         }
-        Expr::IndexAccess { receiver, index, .. } => {
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
             buf.push_str("idx[");
             write_struct_form(buf, receiver);
             buf.push(',');
