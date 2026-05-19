@@ -1137,6 +1137,46 @@ pub(crate) fn charge_harvest_admission(
     Ok(())
 }
 
+/// Per-row charge against `ctx.memory_budget.charge_node_buffer_bytes`
+/// for a `Vec<(Record, u64)>` about to be inserted, extended into, or
+/// cloned out of `ctx.node_buffers`. Returns the total bytes charged
+/// so the discharge site (consumer's `node_buffers.remove` or local
+/// `Drop`) can release the same amount; on hard-limit breach, returns
+/// a `MemoryBudgetExceeded` tagged `BudgetCategory::NodeBuffer` so
+/// diagnostics distinguish the inter-stage handoff layer from the
+/// arena-tracked surfaces.
+///
+/// The per-row formula matches `NodeBuffer::estimated_memory_bytes` and
+/// `charge_harvest_admission`: each row contributes `size_of::<Value>()
+/// * column_count + size_of::<(Record, u64)>()` bytes. The two budget
+/// surfaces share the `MemoryBudget::hard_limit` envelope via
+/// `total_charged`, so a runaway producer trips on the combined sum.
+pub(crate) fn charge_node_buffer_admit(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    rows: &[(Record, u64)],
+) -> Result<u64, PipelineError> {
+    let Some((first, _)) = rows.first() else {
+        return Ok(0);
+    };
+    let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
+        + std::mem::size_of::<(Record, u64)>();
+    let bytes = (row_bytes as u64).saturating_mul(rows.len() as u64);
+    if bytes == 0 {
+        return Ok(0);
+    }
+    if ctx.memory_budget.charge_node_buffer_bytes(bytes) {
+        return Err(PipelineError::MemoryBudgetExceeded {
+            node: node_name.to_string(),
+            used: ctx.memory_budget.total_charged(),
+            limit: ctx.memory_budget.hard_limit(),
+            source: BudgetCategory::NodeBuffer,
+            detail: Some("node_buffer admission".to_string()),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Build the engine-stamped tail mapping for a Source's plan-time
 /// target schema: `(target_index, source_field_name)` per
 /// `$ck.<field>` shadow column. Resolved once per Source so the
@@ -1818,6 +1858,7 @@ pub(crate) async fn transform_fused_consume(
 
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+    charge_node_buffer_admit(ctx, name, &output_records)?;
     ctx.node_buffers
         .insert(node_idx, NodeBuffer::Memory(output_records));
     Ok(())
@@ -1905,6 +1946,8 @@ pub(crate) async fn dispatch_plan_node(
                     // consumers run. Apply per-record seeding for body-
                     // declared record_vars (parent's writes survive via
                     // `seed_record_vars`'s preserve-existing semantics).
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(seeded.estimated_memory_bytes());
                     let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
                     let has_record_seed = !ctx.record_var_seed.is_empty();
                     for pair in seeded.drain() {
@@ -2003,6 +2046,7 @@ pub(crate) async fn dispatch_plan_node(
             // now anchors here.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
+            charge_node_buffer_admit(ctx, name, &records)?;
             ctx.node_buffers
                 .insert(node_idx, NodeBuffer::Memory(records));
         }
@@ -2027,6 +2071,8 @@ pub(crate) async fn dispatch_plan_node(
             // node for branch dispatch), then fall back to predecessor.
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
@@ -2039,7 +2085,11 @@ pub(crate) async fn dispatch_plan_node(
                         predecessors.iter().find_map(|p| ctx.node_buffers.remove(p))
                     };
                     match pred_buf {
-                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                        Some(nb) => {
+                            ctx.memory_budget
+                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                            nb.drain().collect::<Result<Vec<_>, _>>()?
+                        }
                         None => Vec::new(),
                     }
                 };
@@ -2050,6 +2100,7 @@ pub(crate) async fn dispatch_plan_node(
                 None => {
                     // No transform found — pass through
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
+                    charge_node_buffer_admit(ctx, name.as_str(), &input_records)?;
                     ctx.node_buffers
                         .insert(node_idx, NodeBuffer::Memory(input_records));
                     return Ok(());
@@ -2231,6 +2282,7 @@ pub(crate) async fn dispatch_plan_node(
             // matching runtime; otherwise the helper is a no-op.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+            charge_node_buffer_admit(ctx, name, &output_records)?;
             ctx.node_buffers
                 .insert(node_idx, NodeBuffer::Memory(output_records));
         }
@@ -2252,10 +2304,16 @@ pub(crate) async fn dispatch_plan_node(
                 .collect();
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
-                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                        Some(nb) => {
+                            ctx.memory_budget
+                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                            nb.drain().collect::<Result<Vec<_>, _>>()?
+                        }
                         None => Vec::new(),
                     }
                 };
@@ -2516,6 +2574,7 @@ pub(crate) async fn dispatch_plan_node(
                             .push((record.clone(), *rn));
                     }
                 }
+                charge_node_buffer_admit(ctx, name, &buf)?;
                 ctx.node_buffers.insert(succ_idx, NodeBuffer::Memory(buf));
             }
         }
@@ -2653,6 +2712,8 @@ pub(crate) async fn dispatch_plan_node(
                         for pred in &sorted_preds {
                             let upstream_name = current_dag.graph[*pred].name().to_string();
                             if let Some(buf) = ctx.node_buffers.remove(pred) {
+                                ctx.memory_budget
+                                    .discharge_node_buffer_bytes(buf.estimated_memory_bytes());
                                 for pair in buf.drain() {
                                     let (record, rn) = pair?;
                                     emit(&mut merged, &upstream_name, record, rn)?;
@@ -2676,6 +2737,9 @@ pub(crate) async fn dispatch_plan_node(
                             .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
                                 match ctx.node_buffers.remove(pred) {
                                     Some(nb) => {
+                                        ctx.memory_budget.discharge_node_buffer_bytes(
+                                            nb.estimated_memory_bytes(),
+                                        );
                                         let v: Vec<_> =
                                             nb.drain().collect::<Result<Vec<_>, _>>()?;
                                         Ok(VecDeque::from(v))
@@ -2727,6 +2791,7 @@ pub(crate) async fn dispatch_plan_node(
             // nothing because no spec roots at a Merge NodeIndex.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
+            charge_node_buffer_admit(ctx, name, &merged)?;
             ctx.node_buffers
                 .insert(node_idx, NodeBuffer::Memory(merged));
         }
@@ -2749,12 +2814,20 @@ pub(crate) async fn dispatch_plan_node(
                 .collect();
             let input_records: Vec<(Record, u64)> =
                 match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
-                    Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                    Some(nb) => {
+                        ctx.memory_budget
+                            .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                        nb.drain().collect::<Result<Vec<_>, _>>()?
+                    }
                     None => Vec::new(),
                 };
 
             if input_records.is_empty() {
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
+                // Empty Vec heuristic charges zero bytes — admit helper
+                // is still called for symmetry with the non-empty path,
+                // so the ledger surface treats every Sort insert uniformly.
+                charge_node_buffer_admit(ctx, name, &[])?;
                 ctx.node_buffers
                     .insert(node_idx, NodeBuffer::Memory(Vec::new()));
                 return Ok(());
@@ -2836,6 +2909,7 @@ pub(crate) async fn dispatch_plan_node(
             ctx.collector
                 .record(sort_timer.finish(sort_count, sort_count));
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
+            charge_node_buffer_admit(ctx, name, &out)?;
             ctx.node_buffers.insert(node_idx, NodeBuffer::Memory(out));
         }
 
@@ -2874,7 +2948,11 @@ pub(crate) async fn dispatch_plan_node(
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
             let input: Vec<(Record, u64)> = match ctx.node_buffers.remove(&pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain().collect::<Result<Vec<_>, _>>()?
+                }
                 None => Vec::new(),
             };
 
@@ -3227,6 +3305,7 @@ pub(crate) async fn dispatch_plan_node(
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
+                charge_node_buffer_admit(ctx, name, &projected)?;
                 ctx.node_buffers
                     .insert(node_idx, NodeBuffer::Memory(projected));
             } else {
@@ -3239,6 +3318,7 @@ pub(crate) async fn dispatch_plan_node(
                 // `out_rows` here, not from the source stream.
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out_rows)?;
+                charge_node_buffer_admit(ctx, name, &out_rows)?;
                 ctx.node_buffers
                     .insert(node_idx, NodeBuffer::Memory(out_rows));
             }
@@ -3260,8 +3340,17 @@ pub(crate) async fn dispatch_plan_node(
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
+            //
+            // `multi_consumer_clone_bytes` tracks the NodeBuffer-category
+            // charge admitted on the get-and-clone fan-out path so the
+            // discharge fires once the clone is consumed below. The own-
+            // buffer and last-consumer-remove paths discharge inline
+            // since those bytes were already charged by the producer.
+            let mut multi_consumer_clone_bytes: u64 = 0;
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
@@ -3280,14 +3369,43 @@ pub(crate) async fn dispatch_plan_node(
                             .count();
                         if remaining_consumers == 0 {
                             if let Some(nb) = ctx.node_buffers.remove(&p) {
+                                ctx.memory_budget
+                                    .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                                 found = Some(nb.drain().collect::<Result<Vec<_>, _>>()?);
                                 break;
                             }
-                        } else if let Some(nb) = ctx.node_buffers.get(&p) {
+                        } else {
                             // Multi-consumer fanout: keep the producer's
-                            // buffer alive for remaining siblings.
-                            found = Some(nb.clone_memory_only());
-                            break;
+                            // buffer alive for remaining siblings. The
+                            // clone is a heap copy and a transient RSS
+                            // bump under this Output's identity; the
+                            // discharge fires after `input_records` is
+                            // split into the writer-side buffered /
+                            // unbuffered locals below.
+                            //
+                            // Borrow shape: read the bytes estimate and
+                            // perform the heap clone while only the
+                            // immutable `node_buffers.get` borrow is
+                            // live, then drop it so the charge path can
+                            // take `&mut ctx.memory_budget`.
+                            let cloned_with_bytes = ctx
+                                .node_buffers
+                                .get(&p)
+                                .map(|nb| (nb.clone_memory_only(), nb.estimated_memory_bytes()));
+                            if let Some((cloned, bytes)) = cloned_with_bytes {
+                                if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
+                                    return Err(PipelineError::MemoryBudgetExceeded {
+                                        node: name.to_string(),
+                                        used: ctx.memory_budget.total_charged(),
+                                        limit: ctx.memory_budget.hard_limit(),
+                                        source: BudgetCategory::NodeBuffer,
+                                        detail: Some("Output fan-out clone admission".to_string()),
+                                    });
+                                }
+                                multi_consumer_clone_bytes = bytes;
+                                found = Some(cloned);
+                                break;
+                            }
                         }
                     }
                     found.unwrap_or_default()
@@ -3329,6 +3447,14 @@ pub(crate) async fn dispatch_plan_node(
             } else {
                 buffered = Vec::new();
                 unbuffered = input_records;
+            }
+            // input_records has been destructured into buffered /
+            // unbuffered; the fan-out clone's transient bytes are no
+            // longer in scope as a node_buffers-shaped Vec, so release
+            // the NodeBuffer counter charge admitted at clone time.
+            if multi_consumer_clone_bytes > 0 {
+                ctx.memory_budget
+                    .discharge_node_buffer_bytes(multi_consumer_clone_bytes);
             }
 
             // Counter semantics:
@@ -3572,6 +3698,11 @@ pub(crate) async fn dispatch_plan_node(
             // popped, so the install lands on `top` (parent scope).
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+            // Attribution rule: the body harvest's bytes are charged
+            // under the parent composition's name so a budget-exceeded
+            // diagnostic points the user at the user-visible operator,
+            // not at the body's internal output port node name.
+            charge_node_buffer_admit(ctx, &composition_name, &output_records)?;
             ctx.node_buffers
                 .insert(node_idx, NodeBuffer::Memory(output_records));
         }
@@ -3751,11 +3882,19 @@ pub(crate) async fn dispatch_plan_node(
                 })?;
 
             let driver_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&driver_pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain().collect::<Result<Vec<_>, _>>()?
+                }
                 None => Vec::new(),
             };
             let build_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&build_pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain().collect::<Result<Vec<_>, _>>()?
+                }
                 None => Vec::new(),
             };
 
@@ -3949,6 +4088,7 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                    charge_node_buffer_admit(ctx, name, &output_records)?;
                     ctx.node_buffers
                         .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
@@ -4028,6 +4168,7 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                    charge_node_buffer_admit(ctx, name, &output_records)?;
                     ctx.node_buffers
                         .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
@@ -4113,6 +4254,7 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                    charge_node_buffer_admit(ctx, name, &output_records)?;
                     ctx.node_buffers
                         .insert(node_idx, NodeBuffer::Memory(output_records));
                     // Combine arm clean-exit: drop the per-fold cursor
@@ -4602,6 +4744,7 @@ pub(crate) async fn dispatch_plan_node(
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+            charge_node_buffer_admit(ctx, name, &output_records)?;
             ctx.node_buffers
                 .insert(node_idx, NodeBuffer::Memory(output_records));
             // Drop the per-fold cursor snapshot: every emitted record
@@ -5065,7 +5208,7 @@ fn flush_clean_records_to_writers(
 /// intact for any sibling consumer the parent walk has not yet reached;
 /// fan-out from a single producer to multiple ports is a normal case.
 fn collect_port_records(
-    ctx: &ExecutorContext<'_>,
+    ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     composition_node_idx: NodeIndex,
     composition_name: &str,
@@ -5092,11 +5235,33 @@ fn collect_port_records(
                 ),
             });
         };
-        let records: Vec<(Record, u64)> = ctx
+        // Compute the heap-clone footprint while the immutable borrow
+        // of `node_buffers` is live, then release it so the charge
+        // path can take `&mut ctx.memory_budget`. The cloned records
+        // are about to be seeded into the body-local `node_buffers`
+        // namespace inside `execute_composition_body`; the body's
+        // port-source Source arm discharges the slot when it claims
+        // the seeded buffer, and the body-exit leak-discharge cleans
+        // up any unconsumed remainder if a body operator errored.
+        let cloned_with_bytes = ctx
             .node_buffers
             .get(&edge.source())
-            .map(|nb| nb.clone_memory_only())
-            .unwrap_or_default();
+            .map(|nb| (nb.clone_memory_only(), nb.estimated_memory_bytes()));
+        let records: Vec<(Record, u64)> = match cloned_with_bytes {
+            Some((cloned, bytes)) => {
+                if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
+                    return Err(PipelineError::MemoryBudgetExceeded {
+                        node: composition_name.to_string(),
+                        used: ctx.memory_budget.total_charged(),
+                        limit: ctx.memory_budget.hard_limit(),
+                        source: BudgetCategory::NodeBuffer,
+                        detail: Some("composition port-records clone admission".to_string()),
+                    });
+                }
+                cloned
+            }
+            None => Vec::new(),
+        };
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
@@ -5238,7 +5403,11 @@ async fn execute_composition_body(
     let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
             let drained: Vec<(Record, u64)> = match ctx.node_buffers.remove(&idx) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain().collect::<Result<Vec<_>, _>>()?
+                }
                 None => Vec::new(),
             };
             if body_dag.deferred_region_at_producer(idx).is_some() {
@@ -5249,6 +5418,23 @@ async fn execute_composition_body(
         }
         _ => Vec::new(),
     };
+
+    // Body exit cleanup: any slots still alive in the body-local
+    // `node_buffers` map are about to be dropped when `saved_buffers`
+    // overwrites the field below. Discharge their NodeBuffer-category
+    // charges so the ledger does not leak across the body / parent
+    // boundary — both the early-error path (a body operator returned
+    // `Err`, leaving partially-consumed intermediates) and the
+    // sink-only body case (no output port, seeded inputs never
+    // claimed) hit this path.
+    let leaked_bytes: u64 = ctx
+        .node_buffers
+        .values()
+        .map(NodeBuffer::estimated_memory_bytes)
+        .sum();
+    if leaked_bytes > 0 {
+        ctx.memory_budget.discharge_node_buffer_bytes(leaked_bytes);
+    }
 
     // Decrement depth and restore parent scope. `saturating_sub`
     // is defensive over the invariant; the inc/dec pairs are kept in
