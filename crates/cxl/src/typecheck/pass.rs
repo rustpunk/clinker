@@ -1378,12 +1378,11 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Check that the program has at least one emit statement.
+    /// Check that the program has at least one emit statement. Recurses
+    /// through `Statement::EmitEach.body` so a program whose only emits
+    /// live inside a fan-out block still counts as having emits.
     fn check_emit_count(&mut self, program: &Program) {
-        let has_emit = program
-            .statements
-            .iter()
-            .any(|s| matches!(s, Statement::Emit { .. }));
+        let has_emit = crate::ast::contains_emit(&program.statements);
         if !has_emit {
             self.warning(
                 program.span,

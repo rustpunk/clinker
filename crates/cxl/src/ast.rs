@@ -109,6 +109,44 @@ pub enum Statement {
     },
 }
 
+/// Visit every `Statement::Emit { target: Field, .. }` reachable from
+/// `stmts`, descending through `Statement::EmitEach.body`. The visitor
+/// receives `(name, expr)` for each field-targeted emit.
+///
+/// Use anywhere downstream code collects the bare field names a CXL
+/// program writes to the record stream. A non-recursive walker is
+/// silently wrong for programs whose only output emits live inside
+/// `emit each` — bind-schema, executor route resolution, and the
+/// transform write-set all diverge from runtime behavior, surfacing as
+/// schema mismatches at the first downstream operator. The parser
+/// rejects nesting, so a single level of recursion suffices.
+pub fn for_each_field_emit<'a>(stmts: &'a [Statement], visit: &mut dyn FnMut(&'a str, &'a Expr)) {
+    for stmt in stmts {
+        match stmt {
+            Statement::Emit {
+                name,
+                expr,
+                target: EmitTarget::Field,
+                ..
+            } => visit(name.as_ref(), expr),
+            Statement::EmitEach { body, .. } => for_each_field_emit(body, visit),
+            _ => {}
+        }
+    }
+}
+
+/// True when `stmts` contains at least one `Statement::Emit` (any
+/// target), recursing through `Statement::EmitEach.body`. Mirrors the
+/// "does this program emit anything" check while staying coherent in
+/// the presence of fan-out.
+pub fn contains_emit(stmts: &[Statement]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Statement::Emit { .. } => true,
+        Statement::EmitEach { body, .. } => contains_emit(body),
+        _ => false,
+    })
+}
+
 /// CXL expression — the core of the language. All variants carry a NodeId and Span.
 #[derive(Debug, Clone)]
 pub enum Expr {

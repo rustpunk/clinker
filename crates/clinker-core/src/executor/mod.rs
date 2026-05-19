@@ -806,13 +806,14 @@ impl PipelineExecutor {
                         }
                     }
                     for ct in &compiled_transforms {
-                        for stmt in &ct.typed.program.statements {
-                            if let Statement::Emit { name, .. } = stmt
-                                && !emitted_fields.contains(&name.to_string())
-                            {
-                                emitted_fields.push(name.to_string());
-                            }
-                        }
+                        cxl::ast::for_each_field_emit(
+                            &ct.typed.program.statements,
+                            &mut |name, _| {
+                                if !emitted_fields.iter().any(|s| s == name) {
+                                    emitted_fields.push(name.to_string());
+                                }
+                            },
+                        );
                     }
                     // Combine nodes also emit fields via their `cxl:` body;
                     // those typed programs live in `artifacts.typed` keyed
@@ -829,13 +830,11 @@ impl PipelineExecutor {
                         if transform_names.contains(node_name.as_str()) {
                             continue;
                         }
-                        for stmt in &typed.program.statements {
-                            if let Statement::Emit { name, .. } = stmt
-                                && !emitted_fields.contains(&name.to_string())
-                            {
+                        cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+                            if !emitted_fields.iter().any(|s| s == name) {
                                 emitted_fields.push(name.to_string());
                             }
-                        }
+                        });
                     }
                     Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
                 }
@@ -889,14 +888,11 @@ impl PipelineExecutor {
                     if !body.name_to_idx.contains_key(n.as_str()) {
                         continue;
                     }
-                    for stmt in &typed.program.statements {
-                        if let Statement::Emit { name: en, .. } = stmt {
-                            let s = en.to_string();
-                            if !emitted_fields.contains(&s) {
-                                emitted_fields.push(s);
-                            }
+                    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+                        if !emitted_fields.iter().any(|s| s == name) {
+                            emitted_fields.push(name.to_string());
                         }
-                    }
+                    });
                 }
                 let cr = Self::compile_route(&route_config, &emitted_fields, &scoped_vars)?;
                 compiled_routes_by_name.insert(route_name.clone(), cr);

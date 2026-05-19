@@ -2779,22 +2779,14 @@ fn typecheck_cxl(
 /// Transform boundaries.
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
-    for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit {
-            name, expr, target, ..
-        } = stmt
-        {
-            if !matches!(target, cxl::ast::EmitTarget::Field) {
-                continue;
-            }
-            let emit_type = typed
-                .types
-                .get(expr.node_id().0 as usize)
-                .and_then(|t| t.clone())
-                .unwrap_or(Type::Any);
-            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
-        }
-    }
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
+        let emit_type = typed
+            .types
+            .get(expr.node_id().0 as usize)
+            .and_then(|t| t.clone())
+            .unwrap_or(Type::Any);
+        out.insert(QualifiedField::bare(name), emit_type);
+    });
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }
 
@@ -2824,22 +2816,20 @@ fn propagate_aggregate(
         };
         out.insert(QualifiedField::bare(gb.as_str()), t);
     }
-    for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit {
-            name, expr, target, ..
-        } = stmt
-        {
-            if !matches!(target, cxl::ast::EmitTarget::Field) {
-                continue;
-            }
-            let emit_type = typed
-                .types
-                .get(expr.node_id().0 as usize)
-                .and_then(|t| t.clone())
-                .unwrap_or(Type::Any);
-            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
-        }
-    }
+    // `extract_aggregates` rejects `emit each` inside an aggregate body
+    // because finalize emits one record per group and a fan-out's
+    // cardinality cannot collapse onto a single group key. The walker
+    // here still recurses so the typed `output_row` stays coherent with
+    // every other emit-name collector — the rejection diagnostic
+    // supersedes whatever schema this produces.
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
+        let emit_type = typed
+            .types
+            .get(expr.node_id().0 as usize)
+            .and_then(|t| t.clone())
+            .unwrap_or(Type::Any);
+        out.insert(QualifiedField::bare(name), emit_type);
+    });
     // Detect relaxed mode by walking the upstream row for `$ck.<field>`
     // shadow columns whose source field is missing from `group_by`.
     // Mirror the lattice rule the planner applies post-bind in
@@ -3212,14 +3202,9 @@ fn bind_combine(
     // Transform (which has pass-through semantics), combine's output
     // row is defined entirely by its emits — zero emits means zero
     // output fields.
-    let has_emit = body_typed.program.statements.iter().any(|s| {
-        matches!(
-            s,
-            Statement::Emit {
-                target: cxl::ast::EmitTarget::Field,
-                ..
-            }
-        )
+    let mut has_emit = false;
+    cxl::ast::for_each_field_emit(&body_typed.program.statements, &mut |_, _| {
+        has_emit = true;
     });
     if !has_emit {
         diags.push(combine_e309(name, span));
@@ -3904,22 +3889,19 @@ fn combine_output_row(
     span: cxl::lexer::Span,
 ) -> Row {
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
-    for stmt in &typed.program.statements {
-        if let Statement::Emit {
-            name, expr, target, ..
-        } = stmt
-        {
-            if !matches!(target, cxl::ast::EmitTarget::Field) {
-                continue;
-            }
-            let emit_type = typed
-                .types
-                .get(expr.node_id().0 as usize)
-                .and_then(|t| t.clone())
-                .unwrap_or(Type::Any);
-            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
-        }
-    }
+    // The executor's combine residual-filter eval rejects `EvalResult::EmitMany`
+    // with `PipelineError::Internal` — `emit each` fan-out in a combine
+    // body has no well-defined join semantic. The walker still recurses
+    // so this typed output row stays coherent with every other
+    // emit-name collector.
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
+        let emit_type = typed
+            .types
+            .get(expr.node_id().0 as usize)
+            .and_then(|t| t.clone())
+            .unwrap_or(Type::Any);
+        out.insert(QualifiedField::bare(name), emit_type);
+    });
     // Driver's engine-stamped tail always rides through. `widen_record_to_schema`
     // picks up the values from the driver record by name at runtime.
     //

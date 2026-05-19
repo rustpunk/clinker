@@ -4288,16 +4288,9 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// has to reach into executor-private types.
 pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
-    for stmt in &typed.program.statements {
-        if let Statement::Emit {
-            name,
-            target: cxl::ast::EmitTarget::Field,
-            ..
-        } = stmt
-        {
-            set.insert(name.to_string());
-        }
-    }
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+        set.insert(name.to_string());
+    });
     set
 }
 

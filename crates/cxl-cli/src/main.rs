@@ -393,6 +393,12 @@ fn collect_field_refs_stmt(stmt: &cxl::ast::Statement, names: &mut Vec<String>) 
             }
             collect_field_refs_expr(message, names);
         }
+        cxl::ast::Statement::EmitEach { source, body, .. } => {
+            collect_field_refs_expr(source, names);
+            for inner in body {
+                collect_field_refs_stmt(inner, names);
+            }
+        }
         _ => {}
     }
 }
