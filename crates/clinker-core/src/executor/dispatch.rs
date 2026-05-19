@@ -1151,17 +1151,19 @@ pub(crate) fn charge_harvest_admission(
 /// * column_count + size_of::<(Record, u64)>()` bytes. The two budget
 /// surfaces share the `MemoryBudget::hard_limit` envelope via
 /// `total_charged`, so a runaway producer trips on the combined sum.
+///
+/// Used today only by the commit-pass body-harvest re-charge in
+/// `executor/commit/dispatch.rs`, where records flow into an existing
+/// `node_buffers` slot via `NodeBuffer::push` rather than a bulk
+/// insert. Bulk insertion at every operator-arm emit goes through
+/// [`admit_node_buffer`] instead, which combines this charge with the
+/// soft-threshold spill decision.
 pub(crate) fn charge_node_buffer_admit(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     rows: &[(Record, u64)],
 ) -> Result<u64, PipelineError> {
-    let Some((first, _)) = rows.first() else {
-        return Ok(0);
-    };
-    let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
-        + std::mem::size_of::<(Record, u64)>();
-    let bytes = (row_bytes as u64).saturating_mul(rows.len() as u64);
+    let bytes = estimate_node_buffer_bytes(rows);
     if bytes == 0 {
         return Ok(0);
     }
@@ -1175,6 +1177,125 @@ pub(crate) fn charge_node_buffer_admit(
         });
     }
     Ok(bytes)
+}
+
+/// Per-row heuristic byte cost. Returns `0` for an empty slice. The
+/// formula matches `NodeBuffer::estimated_memory_bytes` and
+/// `charge_harvest_admission` so the three admission surfaces agree on
+/// the same per-row size.
+fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
+    let Some((first, _)) = rows.first() else {
+        return 0;
+    };
+    let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
+        + std::mem::size_of::<(Record, u64)>();
+    (row_bytes as u64).saturating_mul(rows.len() as u64)
+}
+
+/// Predicate: does the topology at `slot_key` permit a soft-threshold
+/// spill at admission time?
+///
+/// Returns `false` when the slot will be cloned by a downstream
+/// consumer rather than drained — multi-consumer fan-out
+/// (`Output` arms with more than one Output sharing a producer) and
+/// composition input-port edges both reach
+/// `NodeBuffer::clone_memory_only`, which panics on `Spilled`/`Mixed`
+/// because spill chunks cannot be cheap-cloned for parallel readers.
+/// Lifting that constraint requires sharing `Arc<SpillFile<u64>>` across
+/// readers and is tracked as a sibling sub-issue of #108 (back-pressure
+/// for fan-out spilling). Until that lands, producer-side spill is
+/// gated to slots with a single drain consumer.
+///
+/// Route's per-successor admission already pre-forks into per-branch
+/// slots keyed by the successor's `NodeIndex`; each such slot has
+/// exactly one outgoing consumer (the successor itself drives one
+/// chain), so this predicate returns `true` and spill applies — the
+/// canonical Route-fan-out scenario the issue body calls out.
+pub(crate) fn node_buffer_spill_allowed(
+    current_dag: &ExecutionPlanDag,
+    slot_key: NodeIndex,
+) -> bool {
+    let mut outgoing = 0usize;
+    for edge in current_dag
+        .graph
+        .edges_directed(slot_key, Direction::Outgoing)
+    {
+        outgoing += 1;
+        if outgoing > 1 {
+            return false;
+        }
+        if edge.weight().port.is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Admit `rows` into a `ctx.node_buffers` slot, choosing between the
+/// in-memory and on-disk variants based on the live RSS reading.
+///
+/// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
+/// 2. The per-row byte cost is charged against `MemoryBudget` via
+///    [`charge_node_buffer_admit`]'s shared formula. A hard-limit
+///    breach surfaces as
+///    `MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer, .. }`.
+/// 3. When `spill_allowed` is `true` and `MemoryBudget::should_spill()`
+///    reports the RSS soft threshold tripped, the rows flush to a
+///    `SpillFile<u64>` via [`node_buffer_spill::spill_node_buffer`].
+///    The in-memory charge is discharged immediately and the file size
+///    is added to `cumulative_spill_bytes`; an over-quota disk total
+///    surfaces the same structured `MemoryBudgetExceeded` shape with
+///    `detail: "spill quota exceeded"` so existing diagnostics tooling
+///    handles both surfaces uniformly.
+/// 4. Otherwise rows stay in memory as `NodeBuffer::Memory(rows)`.
+///
+/// `spill_allowed` should be computed via [`node_buffer_spill_allowed`]
+/// for the slot's `NodeIndex` so multi-consumer fan-out and
+/// composition input-port slots stay memory-bound (their consumers
+/// reach `NodeBuffer::clone_memory_only`, which panics on spill
+/// variants).
+pub(crate) fn admit_node_buffer(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    rows: Vec<(Record, u64)>,
+    spill_allowed: bool,
+) -> Result<NodeBuffer, PipelineError> {
+    if rows.is_empty() {
+        return Ok(NodeBuffer::Memory(Vec::new()));
+    }
+    let bytes = estimate_node_buffer_bytes(&rows);
+    if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
+        return Err(PipelineError::MemoryBudgetExceeded {
+            node: node_name.to_string(),
+            used: ctx.memory_budget.total_charged(),
+            limit: ctx.memory_budget.hard_limit(),
+            source: BudgetCategory::NodeBuffer,
+            detail: Some("node_buffer admission".to_string()),
+        });
+    }
+    if !spill_allowed || !ctx.memory_budget.should_spill() {
+        return Ok(NodeBuffer::Memory(rows));
+    }
+    match crate::executor::node_buffer_spill::spill_node_buffer(
+        rows,
+        Some(ctx.spill_root_path.as_ref()),
+    )? {
+        Some((file, count)) => {
+            ctx.memory_budget.discharge_node_buffer_bytes(bytes);
+            let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
+            if ctx.memory_budget.record_spill_bytes(file_bytes) {
+                return Err(PipelineError::MemoryBudgetExceeded {
+                    node: node_name.to_string(),
+                    used: ctx.memory_budget.cumulative_spill_bytes(),
+                    limit: ctx.memory_budget.max_spill_bytes,
+                    source: BudgetCategory::NodeBuffer,
+                    detail: Some("spill quota exceeded".to_string()),
+                });
+            }
+            Ok(NodeBuffer::Spilled(vec![(file, count)]))
+        }
+        None => Ok(NodeBuffer::Memory(Vec::new())),
+    }
 }
 
 /// Build the engine-stamped tail mapping for a Source's plan-time
@@ -1858,9 +1979,13 @@ pub(crate) async fn transform_fused_consume(
 
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-    charge_node_buffer_admit(ctx, name, &output_records)?;
-    ctx.node_buffers
-        .insert(node_idx, NodeBuffer::Memory(output_records));
+    let nb = admit_node_buffer(
+        ctx,
+        name,
+        output_records,
+        node_buffer_spill_allowed(current_dag, node_idx),
+    )?;
+    ctx.node_buffers.insert(node_idx, nb);
     Ok(())
 }
 
@@ -2046,9 +2171,13 @@ pub(crate) async fn dispatch_plan_node(
             // now anchors here.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
-            charge_node_buffer_admit(ctx, name, &records)?;
-            ctx.node_buffers
-                .insert(node_idx, NodeBuffer::Memory(records));
+            let nb = admit_node_buffer(
+                ctx,
+                name,
+                records,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
         }
 
         PlanNode::Transform {
@@ -2100,9 +2229,13 @@ pub(crate) async fn dispatch_plan_node(
                 None => {
                     // No transform found — pass through
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
-                    charge_node_buffer_admit(ctx, name.as_str(), &input_records)?;
-                    ctx.node_buffers
-                        .insert(node_idx, NodeBuffer::Memory(input_records));
+                    let nb = admit_node_buffer(
+                        ctx,
+                        name.as_str(),
+                        input_records,
+                        node_buffer_spill_allowed(current_dag, node_idx),
+                    )?;
+                    ctx.node_buffers.insert(node_idx, nb);
                     return Ok(());
                 }
             };
@@ -2282,9 +2415,13 @@ pub(crate) async fn dispatch_plan_node(
             // matching runtime; otherwise the helper is a no-op.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            charge_node_buffer_admit(ctx, name, &output_records)?;
-            ctx.node_buffers
-                .insert(node_idx, NodeBuffer::Memory(output_records));
+            let nb = admit_node_buffer(
+                ctx,
+                name,
+                output_records,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
         }
 
         PlanNode::Route {
@@ -2574,8 +2711,13 @@ pub(crate) async fn dispatch_plan_node(
                             .push((record.clone(), *rn));
                     }
                 }
-                charge_node_buffer_admit(ctx, name, &buf)?;
-                ctx.node_buffers.insert(succ_idx, NodeBuffer::Memory(buf));
+                let nb = admit_node_buffer(
+                    ctx,
+                    name,
+                    buf,
+                    node_buffer_spill_allowed(current_dag, succ_idx),
+                )?;
+                ctx.node_buffers.insert(succ_idx, nb);
             }
         }
 
@@ -2791,9 +2933,13 @@ pub(crate) async fn dispatch_plan_node(
             // nothing because no spec roots at a Merge NodeIndex.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
-            charge_node_buffer_admit(ctx, name, &merged)?;
-            ctx.node_buffers
-                .insert(node_idx, NodeBuffer::Memory(merged));
+            let nb = admit_node_buffer(
+                ctx,
+                name,
+                merged,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
         }
 
         PlanNode::Sort {
@@ -2827,9 +2973,13 @@ pub(crate) async fn dispatch_plan_node(
                 // Empty Vec heuristic charges zero bytes — admit helper
                 // is still called for symmetry with the non-empty path,
                 // so the ledger surface treats every Sort insert uniformly.
-                charge_node_buffer_admit(ctx, name, &[])?;
-                ctx.node_buffers
-                    .insert(node_idx, NodeBuffer::Memory(Vec::new()));
+                let nb = admit_node_buffer(
+                    ctx,
+                    name,
+                    Vec::new(),
+                    node_buffer_spill_allowed(current_dag, node_idx),
+                )?;
+                ctx.node_buffers.insert(node_idx, nb);
                 return Ok(());
             }
 
@@ -2909,8 +3059,13 @@ pub(crate) async fn dispatch_plan_node(
             ctx.collector
                 .record(sort_timer.finish(sort_count, sort_count));
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
-            charge_node_buffer_admit(ctx, name, &out)?;
-            ctx.node_buffers.insert(node_idx, NodeBuffer::Memory(out));
+            let nb = admit_node_buffer(
+                ctx,
+                name,
+                out,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
         }
 
         PlanNode::Aggregation {
@@ -3305,9 +3460,13 @@ pub(crate) async fn dispatch_plan_node(
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
-                charge_node_buffer_admit(ctx, name, &projected)?;
-                ctx.node_buffers
-                    .insert(node_idx, NodeBuffer::Memory(projected));
+                let nb = admit_node_buffer(
+                    ctx,
+                    name,
+                    projected,
+                    node_buffer_spill_allowed(current_dag, node_idx),
+                )?;
+                ctx.node_buffers.insert(node_idx, nb);
             } else {
                 // Materialize node-rooted window runtimes for any IndexSpec
                 // rooted at this aggregate. The aggregate emits columns the
@@ -3318,9 +3477,13 @@ pub(crate) async fn dispatch_plan_node(
                 // `out_rows` here, not from the source stream.
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out_rows)?;
-                charge_node_buffer_admit(ctx, name, &out_rows)?;
-                ctx.node_buffers
-                    .insert(node_idx, NodeBuffer::Memory(out_rows));
+                let nb = admit_node_buffer(
+                    ctx,
+                    name,
+                    out_rows,
+                    node_buffer_spill_allowed(current_dag, node_idx),
+                )?;
+                ctx.node_buffers.insert(node_idx, nb);
             }
         }
 
@@ -3702,9 +3865,13 @@ pub(crate) async fn dispatch_plan_node(
             // under the parent composition's name so a budget-exceeded
             // diagnostic points the user at the user-visible operator,
             // not at the body's internal output port node name.
-            charge_node_buffer_admit(ctx, &composition_name, &output_records)?;
-            ctx.node_buffers
-                .insert(node_idx, NodeBuffer::Memory(output_records));
+            let nb = admit_node_buffer(
+                ctx,
+                &composition_name,
+                output_records,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
         }
 
         PlanNode::Combine {
@@ -4088,9 +4255,13 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    charge_node_buffer_admit(ctx, name, &output_records)?;
-                    ctx.node_buffers
-                        .insert(node_idx, NodeBuffer::Memory(output_records));
+                    let nb = admit_node_buffer(
+                        ctx,
+                        name,
+                        output_records,
+                        node_buffer_spill_allowed(current_dag, node_idx),
+                    )?;
+                    ctx.node_buffers.insert(node_idx, nb);
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Every emitted record has cleared into
                     // `node_buffers` without rewind, so the snapshot is
@@ -4168,9 +4339,13 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    charge_node_buffer_admit(ctx, name, &output_records)?;
-                    ctx.node_buffers
-                        .insert(node_idx, NodeBuffer::Memory(output_records));
+                    let nb = admit_node_buffer(
+                        ctx,
+                        name,
+                        output_records,
+                        node_buffer_spill_allowed(current_dag, node_idx),
+                    )?;
+                    ctx.node_buffers.insert(node_idx, nb);
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Mirrors the inline arm's post-emit
                     // clear so non-inline strategies do not leak
@@ -4254,9 +4429,13 @@ pub(crate) async fn dispatch_plan_node(
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                    charge_node_buffer_admit(ctx, name, &output_records)?;
-                    ctx.node_buffers
-                        .insert(node_idx, NodeBuffer::Memory(output_records));
+                    let nb = admit_node_buffer(
+                        ctx,
+                        name,
+                        output_records,
+                        node_buffer_spill_allowed(current_dag, node_idx),
+                    )?;
+                    ctx.node_buffers.insert(node_idx, nb);
                     // Combine arm clean-exit: drop the per-fold cursor
                     // snapshot. Mirrors the inline arm's post-emit
                     // clear.
@@ -4744,9 +4923,13 @@ pub(crate) async fn dispatch_plan_node(
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            charge_node_buffer_admit(ctx, name, &output_records)?;
-            ctx.node_buffers
-                .insert(node_idx, NodeBuffer::Memory(output_records));
+            let nb = admit_node_buffer(
+                ctx,
+                name,
+                output_records,
+                node_buffer_spill_allowed(current_dag, node_idx),
+            )?;
+            ctx.node_buffers.insert(node_idx, nb);
             // Drop the per-fold cursor snapshot: every emitted record
             // has cleared into `node_buffers` without rewind, so the
             // snapshot is no longer needed. The rewind path on a

@@ -18,10 +18,9 @@ use super::detect::RetractScope;
 use crate::aggregation::HashAggError;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, charge_node_buffer_admit, finalize_node_rooted_windows,
+    ExecutorContext, admit_node_buffer, finalize_node_rooted_windows, node_buffer_spill_allowed,
     project_rows_to_buffer_schema,
 };
-use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::execution::ExecutionPlanDag;
 
 /// Drive each affected aggregate through retract + refinalize, then
@@ -223,7 +222,13 @@ pub(crate) fn emit_post_recompute(
         ctx.memory_budget.discharge_node_buffer_bytes(prev_bytes);
     }
     let agg_name = current_dag.graph[agg_idx].name().to_string();
-    charge_node_buffer_admit(ctx, &agg_name, &projected).map_err(|e| {
+    let nb = admit_node_buffer(
+        ctx,
+        &agg_name,
+        projected,
+        node_buffer_spill_allowed(current_dag, agg_idx),
+    )
+    .map_err(|e| {
         // Mapping budget exceeded into `HashAggError::Spill` lets the
         // caller's degrade-fallback handle commit-pass admission
         // overflow consistently with the rest of the post-retract
@@ -233,7 +238,6 @@ pub(crate) fn emit_post_recompute(
         // aggregate output.
         HashAggError::Spill(format!("post-recompute node-buffer admission: {e}"))
     })?;
-    ctx.node_buffers
-        .insert(agg_idx, NodeBuffer::Memory(projected));
+    ctx.node_buffers.insert(agg_idx, nb);
     Ok(emitted)
 }
