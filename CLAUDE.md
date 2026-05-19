@@ -77,9 +77,9 @@ Subcommands: `run`, `metrics`, `explain`. There is no `guess` subcommand yet —
 
 ## Architecture
 
-Clinker is a **bounded-memory batch DAG executor** with streaming per-record evaluation and disk-spill degradation under memory pressure. It pairs a custom expression language (CXL) with YAML pipeline orchestration and a desktop IDE (Kiln).
+Clinker is a **bounded-memory batch DAG executor**. A pipeline run is a finite job over finite input — Source nodes read until EOF, the DAG drains, the process exits. It pairs a custom expression language (CXL) with YAML pipeline orchestration.
 
-Not Flink. A pipeline run is a finite job over finite input — Source nodes read until EOF, the DAG drains, the process exits. Per-record evaluation is "streaming" only in the row-by-row sense: records flow through Transform / Route / Merge / Combine / Output one at a time without ever materializing the full input in memory. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget and spill to disk when soft/hard thresholds trip rather than OOM the process.
+Within a run, records flow through Transform / Route / Merge / Combine / Output **one at a time** without materializing the full input in memory. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget and spill to disk when thresholds trip rather than OOM the process.
 
 ### Crate dependency layers (bottom → top)
 
