@@ -144,19 +144,17 @@ pub struct MemoryBudget {
     /// cumulative spill bytes exceed this value, the operator emits
     /// E310 with a partition + spill-bytes diagnostic.
     pub max_spill_bytes: u64,
-    /// Cumulative bytes written across all spill operators in this
-    /// pipeline run. Updated by callers via `record_spill_bytes()`.
-    /// Stays at zero until the first spill writer commits a file.
-    pub cumulative_spill_bytes: u64,
-    /// Cumulative bytes charged across every Arena build site sharing
-    /// this budget — the source-rooted Phase-0 arena plus every
-    /// node-rooted arena materialized at an upstream operator's
-    /// dispatch-arm exit. Source arena + N node-rooted arenas share
-    /// one cumulative budget so a pipeline declaring a 512MB limit
-    /// cannot multiply that limit across N operators by accident.
-    /// Updated by `Arena::from_records` and `Arena::build` via
-    /// `charge_arena_bytes`.
-    pub arena_bytes_charged: u64,
+    cumulative_spill_bytes: u64,
+    /// Cumulative bytes charged across every Arena build site sharing this
+    /// budget. Source arena + N node-rooted arenas share one cumulative
+    /// counter so a pipeline declaring a 512MB limit cannot multiply that
+    /// limit across operators.
+    arena_bytes_charged: u64,
+    /// Cumulative bytes alive in the inter-stage handoff layer between
+    /// non-fused DAG operators. Counted toward the same `limit` envelope
+    /// as `arena_bytes_charged` via `total_charged()` — the declared
+    /// memory limit is a pipeline-wide ceiling, not per-surface.
+    node_buffer_bytes_charged: u64,
 }
 
 impl MemoryBudget {
@@ -168,6 +166,7 @@ impl MemoryBudget {
             max_spill_bytes: u64::MAX,
             cumulative_spill_bytes: 0,
             arena_bytes_charged: 0,
+            node_buffer_bytes_charged: 0,
         }
     }
 
@@ -269,6 +268,45 @@ impl MemoryBudget {
     /// site polling this budget.
     pub fn arena_bytes_charged(&self) -> u64 {
         self.arena_bytes_charged
+    }
+
+    /// Add `n` bytes to the node-buffer counter when a producer hands
+    /// a buffer to a `ctx.node_buffers` slot. Returns `true` when the
+    /// running total of (arena + node_buffer) has exceeded `limit` —
+    /// the executor's signal to surface
+    /// `MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer, .. }`
+    /// instead of admitting the next stage's output. Saturating-add
+    /// keeps an overflowing accumulation from wrapping below the limit
+    /// and silently disabling the gate.
+    pub fn charge_node_buffer_bytes(&mut self, n: u64) -> bool {
+        self.node_buffer_bytes_charged = self.node_buffer_bytes_charged.saturating_add(n);
+        self.total_charged() > self.limit
+    }
+
+    /// Subtract `n` bytes from the node-buffer counter when a consumer
+    /// drains the corresponding `ctx.node_buffers` slot. Saturating-sub
+    /// guards against over-discharge from estimate drift between the
+    /// producer's charge and the consumer's discharge.
+    pub fn discharge_node_buffer_bytes(&mut self, n: u64) {
+        self.node_buffer_bytes_charged = self.node_buffer_bytes_charged.saturating_sub(n);
+    }
+
+    /// Cumulative node-buffer bytes currently alive across every
+    /// `ctx.node_buffers` slot polling this budget.
+    pub fn node_buffer_bytes_charged(&self) -> u64 {
+        self.node_buffer_bytes_charged
+    }
+
+    /// Sum of every accounted live-byte counter. Compared against
+    /// `limit` for the hard-fail counter-based gate, complementary to
+    /// the RSS-based `should_abort()`. `cumulative_spill_bytes` is
+    /// *not* included — disk spill is governed by its own
+    /// `max_spill_bytes` quota, not the in-memory `limit` envelope.
+    /// Saturating-add prevents two near-`u64::MAX` counters from
+    /// wrapping the sum and silently passing the gate.
+    pub fn total_charged(&self) -> u64 {
+        self.arena_bytes_charged
+            .saturating_add(self.node_buffer_bytes_charged)
     }
 }
 
@@ -418,5 +456,111 @@ mod tests {
         assert_eq!(parse_memory_limit_bytes(Some("1024")), 1024);
         assert_eq!(parse_memory_limit_bytes(None), 512 * 1024 * 1024);
         assert_eq!(parse_memory_limit_bytes(Some("garbage")), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_increases_counter() {
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        assert!(!budget.charge_node_buffer_bytes(256));
+        assert_eq!(budget.node_buffer_bytes_charged(), 256);
+        assert!(!budget.charge_node_buffer_bytes(512));
+        assert_eq!(budget.node_buffer_bytes_charged(), 768);
+    }
+
+    #[test]
+    fn test_discharge_node_buffer_bytes_decreases_counter() {
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        budget.charge_node_buffer_bytes(1024);
+        budget.discharge_node_buffer_bytes(256);
+        assert_eq!(budget.node_buffer_bytes_charged(), 768);
+    }
+
+    #[test]
+    fn test_discharge_saturates_on_over_discharge() {
+        // Estimate drift between producer's charge and consumer's
+        // discharge must not wrap the counter to a huge positive
+        // value and silently disable the gate downstream.
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        budget.charge_node_buffer_bytes(100);
+        budget.discharge_node_buffer_bytes(200);
+        assert_eq!(budget.node_buffer_bytes_charged(), 0);
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_under_limit_returns_false() {
+        let mut budget = MemoryBudget::new(1024, 0.80);
+        assert!(!budget.charge_node_buffer_bytes(256));
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_at_limit_returns_false() {
+        // Strict `>` semantics: exactly at the limit is NOT an
+        // overflow, matching `record_spill_bytes` and
+        // `charge_arena_bytes`. Only the byte that crosses trips.
+        let mut budget = MemoryBudget::new(1024, 0.80);
+        assert!(!budget.charge_node_buffer_bytes(1024));
+        assert_eq!(budget.node_buffer_bytes_charged(), 1024);
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_over_limit_returns_true() {
+        let mut budget = MemoryBudget::new(1024, 0.80);
+        assert!(!budget.charge_node_buffer_bytes(1024));
+        assert!(budget.charge_node_buffer_bytes(1));
+        assert_eq!(budget.node_buffer_bytes_charged(), 1025);
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_trips_via_arena_contribution() {
+        // Load-bearing test: the new counter shares the `limit`
+        // envelope with the arena counter. Neither one alone exceeds
+        // the limit, but their sum does — and the node-buffer charge
+        // must surface that.
+        let mut budget = MemoryBudget::new(1024, 0.80);
+        assert!(!budget.charge_arena_bytes(800));
+        assert!(!budget.charge_node_buffer_bytes(100));
+        assert!(budget.charge_node_buffer_bytes(200));
+        assert_eq!(budget.total_charged(), 1100);
+    }
+
+    #[test]
+    fn test_charge_node_buffer_bytes_saturates_on_overflow() {
+        // Saturating-add on a u64 counter: even an absurdly large
+        // accumulation cannot wrap below the configured limit and
+        // silently disable the gate.
+        let mut budget = MemoryBudget::new(1024, 0.80);
+        budget.node_buffer_bytes_charged = u64::MAX - 10;
+        assert!(budget.charge_node_buffer_bytes(100));
+        assert_eq!(budget.node_buffer_bytes_charged(), u64::MAX);
+    }
+
+    #[test]
+    fn test_total_charged_sums_arena_and_node_buffer() {
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        budget.charge_arena_bytes(400);
+        budget.charge_node_buffer_bytes(600);
+        assert_eq!(budget.total_charged(), 1000);
+    }
+
+    #[test]
+    fn test_total_charged_excludes_cumulative_spill_bytes() {
+        // Disk spill is governed by `max_spill_bytes`, not the
+        // in-memory `limit` envelope. Including spill bytes in
+        // `total_charged()` would double-count the spilled work
+        // against the RAM budget and force premature aborts.
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        budget.cumulative_spill_bytes = 9999;
+        budget.charge_arena_bytes(100);
+        assert_eq!(budget.total_charged(), 100);
+    }
+
+    #[test]
+    fn test_total_charged_saturates_on_overflow() {
+        // Two near-`u64::MAX` counters must not wrap the sum and
+        // silently pass the `total_charged() > limit` gate.
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        budget.arena_bytes_charged = u64::MAX - 10;
+        budget.node_buffer_bytes_charged = 1000;
+        assert_eq!(budget.total_charged(), u64::MAX);
     }
 }
