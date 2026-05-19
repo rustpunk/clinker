@@ -18,7 +18,8 @@ use super::detect::RetractScope;
 use crate::aggregation::HashAggError;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, finalize_node_rooted_windows, project_rows_to_buffer_schema,
+    ExecutorContext, charge_node_buffer_admit, finalize_node_rooted_windows,
+    project_rows_to_buffer_schema,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::execution::ExecutionPlanDag;
@@ -67,14 +68,20 @@ pub(crate) fn recompute_aggregates(
                 // (degrade path) or was never instantiated. Mark for
                 // degrade-fallback collateral handling in flush.
                 degraded.push(agg_idx);
-                ctx.node_buffers.remove(&agg_idx);
+                if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                }
                 continue;
             };
             retract_and_refinalize(retained, new_retract_rows).is_ok()
         };
         if !retract_ok {
             degraded.push(agg_idx);
-            ctx.node_buffers.remove(&agg_idx);
+            if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+                ctx.memory_budget
+                    .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+            }
             ctx.relaxed_aggregator_states.remove(&agg_idx);
             continue;
         }
@@ -85,7 +92,10 @@ pub(crate) fn recompute_aggregates(
             }
             Err(_) => {
                 degraded.push(agg_idx);
-                ctx.node_buffers.remove(&agg_idx);
+                if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                }
                 ctx.relaxed_aggregator_states.remove(&agg_idx);
             }
         }
@@ -204,6 +214,25 @@ pub(crate) fn emit_post_recompute(
             "node-rooted window rebuild during commit-pass recompute: {e}"
         )));
     }
+    // The forward-pass Aggregate arm previously charged this slot;
+    // the post-retract emit replaces it with a narrower projection.
+    // Discharge the existing slot's bytes (if any) before the new
+    // charge so the ledger does not double-count across the swap.
+    if let Some(prev) = ctx.node_buffers.get(&agg_idx) {
+        let prev_bytes = prev.estimated_memory_bytes();
+        ctx.memory_budget.discharge_node_buffer_bytes(prev_bytes);
+    }
+    let agg_name = current_dag.graph[agg_idx].name().to_string();
+    charge_node_buffer_admit(ctx, &agg_name, &projected).map_err(|e| {
+        // Mapping budget exceeded into `HashAggError::Spill` lets the
+        // caller's degrade-fallback handle commit-pass admission
+        // overflow consistently with the rest of the post-retract
+        // emit path — the post-retract narrow projection is supplementary
+        // to the forward-pass Aggregate arm's primary charge, and a
+        // run-fatal bail there is the canonical surface for runaway
+        // aggregate output.
+        HashAggError::Spill(format!("post-recompute node-buffer admission: {e}"))
+    })?;
     ctx.node_buffers
         .insert(agg_idx, NodeBuffer::Memory(projected));
     Ok(emitted)

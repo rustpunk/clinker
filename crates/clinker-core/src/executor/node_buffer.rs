@@ -16,7 +16,7 @@
 
 use std::vec::IntoIter as VecIntoIter;
 
-use clinker_record::Record;
+use clinker_record::{Record, Value};
 
 use crate::error::PipelineError;
 use crate::pipeline::spill::{SpillFile, SpillReader};
@@ -120,6 +120,26 @@ impl NodeBuffer {
                 );
             }
         }
+    }
+
+    /// Heuristic in-memory footprint of the slot, paired with the
+    /// `MemoryBudget::charge_node_buffer_bytes` /
+    /// `discharge_node_buffer_bytes` ledger. The estimate matches
+    /// `charge_harvest_admission`'s per-row formula so the executor's
+    /// two budget surfaces (`Arena` for parked region tee, `NodeBuffer`
+    /// for inter-stage handoff) use the same per-row size.
+    ///
+    /// Returns `0` on an empty memory tail. Spill-resident chunks are
+    /// accounted via `MemoryBudget::cumulative_spill_bytes` (the disk
+    /// quota), not this counter, so a `Spilled` slot reports `0` here.
+    pub(crate) fn estimated_memory_bytes(&self) -> u64 {
+        let mem = self.peek_mem();
+        let Some((first, _)) = mem.first() else {
+            return 0;
+        };
+        let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
+            + std::mem::size_of::<(Record, u64)>();
+        (row_bytes as u64).saturating_mul(mem.len() as u64)
     }
 
     /// Consume the buffer, returning an iterator that yields memory
@@ -387,5 +407,44 @@ mod tests {
             0
         );
         assert_eq!(NodeBuffer::Memory(vec![(rec(&s, 1, "a"), 1)]).len_hint(), 1);
+    }
+
+    #[test]
+    fn estimated_memory_bytes_scales_with_row_count_and_columns() {
+        let s = schema();
+        let row_bytes_each = std::mem::size_of::<Value>() * s.column_count()
+            + std::mem::size_of::<(Record, u64)>();
+
+        // Memory: row count × per-row formula.
+        let mem = NodeBuffer::Memory(vec![
+            (rec(&s, 1, "a"), 1),
+            (rec(&s, 2, "b"), 2),
+            (rec(&s, 3, "c"), 3),
+        ]);
+        assert_eq!(mem.estimated_memory_bytes(), (row_bytes_each * 3) as u64);
+
+        // Spilled: zero bytes here — the disk surface tracks them
+        // separately through `MemoryBudget::cumulative_spill_bytes`.
+        let spilled = NodeBuffer::Spilled(vec![spill_chunk(vec![(rec(&s, 1, "a"), 1)])]);
+        assert_eq!(spilled.estimated_memory_bytes(), 0);
+
+        // Mixed: only the in-memory tail counts.
+        let mixed = NodeBuffer::Mixed {
+            mem: vec![(rec(&s, 1, "m"), 1), (rec(&s, 2, "n"), 2)],
+            spills: vec![spill_chunk(vec![(rec(&s, 3, "s"), 3)])],
+        };
+        assert_eq!(mixed.estimated_memory_bytes(), (row_bytes_each * 2) as u64);
+
+        // Empty variants report zero.
+        assert_eq!(NodeBuffer::Memory(Vec::new()).estimated_memory_bytes(), 0);
+        assert_eq!(NodeBuffer::Spilled(Vec::new()).estimated_memory_bytes(), 0);
+        assert_eq!(
+            NodeBuffer::Mixed {
+                mem: Vec::new(),
+                spills: Vec::new(),
+            }
+            .estimated_memory_bytes(),
+            0
+        );
     }
 }
