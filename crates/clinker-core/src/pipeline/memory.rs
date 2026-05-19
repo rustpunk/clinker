@@ -88,6 +88,35 @@ fn rss_bytes_impl() -> Option<u64> {
     None
 }
 
+/// Discriminant tag carried on every `MemoryBudget` charge so a budget
+/// overflow can name which surface tripped the hard limit. Sources are
+/// summed against the single `limit` counter; the tag is for
+/// diagnostics and downstream routing only.
+///
+/// Append-only. Removing a variant is a breaking change for any
+/// `MemoryBudgetExceeded` consumer that destructures `source`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BudgetCategory {
+    /// Source-rooted Phase-0 arena, node-rooted arenas, deferred-region
+    /// admission buffers, grace-hash build/probe accounting, and the
+    /// disk-spill quota counter. Every budget-tracked allocation that
+    /// is not `ctx.node_buffers` falls under this tag.
+    Arena,
+    /// `ctx.node_buffers` — the inter-stage handoff layer between
+    /// non-fused operators. Not wired to the budget today; reserved
+    /// for the upcoming sub-issues that charge node-buffer mutations.
+    NodeBuffer,
+}
+
+impl std::fmt::Display for BudgetCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arena => f.write_str("arena"),
+            Self::NodeBuffer => f.write_str("node_buffer"),
+        }
+    }
+}
+
 /// Memory budget governing spill decisions.
 ///
 /// Polled once per chunk at the start of Phase 2 processing.
@@ -371,6 +400,12 @@ mod tests {
         budget.cumulative_spill_bytes = u64::MAX - 10;
         assert!(budget.record_spill_bytes(100));
         assert_eq!(budget.cumulative_spill_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn test_budget_category_display_shape() {
+        assert_eq!(BudgetCategory::Arena.to_string(), "arena");
+        assert_eq!(BudgetCategory::NodeBuffer.to_string(), "node_buffer");
     }
 
     #[test]

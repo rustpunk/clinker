@@ -22,6 +22,28 @@ long-running stream-processor semantics. Internal identifiers in the codebase
 row-by-row sense; if you see it in a stack trace, it is not Flink leaking
 through.
 
+### Finite inputs only
+
+Clinker reads sources that have an end. Files are the canonical shape, and
+finite-cursor network sources (paginated REST APIs, SQL `SELECT` cursors)
+fit the same model -- they exhaust their cursor and EOF. Unbounded sources
+(Kafka, Kinesis, Server-Sent Events, webhooks, `tail -f`-style file
+followers) are explicitly **out of scope** and will remain so.
+
+### Single process, ever
+
+One `clinker run` invocation is one OS process. Parallelism happens *inside*
+that process via threads. Clinker does not spawn worker processes, does not
+coordinate a cluster, and does not shuffle data between machines. Scale by
+giving the host more cores, more RAM, more disk -- the DuckDB / Polars /
+Kettle model. If a single host genuinely can't fit the work, partition the
+input by file or by key and run multiple `clinker` invocations from a shell
+script; that's a five-line script, not an architectural addition to
+Clinker.
+
+For the full list of what Clinker deliberately does not do, see
+[Non-Goals](../non-goals.md).
+
 ## Pipelines are DAGs
 
 A pipeline is a directed acyclic graph of nodes. Data flows from sources,

@@ -81,6 +81,14 @@ Clinker is a **bounded-memory batch DAG executor**. A pipeline run is a finite j
 
 Within a run, stateless operators (Transform, Route, most Combine probe-side work, Output) evaluate records **one at a time** without per-record state accumulation. The DAG executor materializes intermediate `node_buffers` between non-fused stages, so memory scales with the largest live intermediate stage's output, not total input size; fused Source → Transform → Output paths skip materialization entirely. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget (default 512 MB) and spill to disk when soft/hard thresholds trip rather than OOM the process.
 
+**Three architectural pillars** (committed to permanently — design decisions cascade from these):
+
+1. **Finite inputs only.** Files (CSV / JSON / XML / fixed-width) and finite-cursor network sources (paginated REST, SQL `SELECT` cursors) — both EOF after exhausting their cursor. Unbounded sources (Kafka, Kinesis, SSE, webhooks, `tail -f`) are out of scope permanently.
+2. **Finite jobs.** No daemon mode, no service surface, no infinite event loop. `clinker run` invokes, drains, exits with a status code.
+3. **Single process forever.** One invocation = one OS process. Parallelism happens inside the process via `std::thread` and Rayon. No worker-process pools, no multi-machine sharding, no network shuffle, no cluster manager. Scale by adding cores / RAM / disk to one host (DuckDB / Polars / Kettle model). If a host genuinely can't fit the work, partition the input by file or key and run multiple `clinker` invocations from a shell script.
+
+`docs/src/non-goals.md` is the user-facing version of this list; keep it in sync when these commitments change. Architectural proposals that violate any of the three pillars should be rejected at the design-review stage, not just at the implementation-review stage.
+
 ### Crate dependency layers (bottom → top)
 
 ```

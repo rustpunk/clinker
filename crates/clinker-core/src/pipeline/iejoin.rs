@@ -33,9 +33,10 @@
 //! **Memory model:** the IEJoin scan materializes both partition sides,
 //! the L1/L2 vectors (`signed_idx, op1_key, op2_key` triples), the
 //! permutation P, and the bit array. The caller's [`MemoryBudget`] is
-//! polled every 10K emitted matched pairs; abort returns
-//! `PipelineError::Compilation` with an E310-prefixed message — the
-//! same shape used by the C.2 hash build/probe path.
+//! polled every 10K emitted matched pairs; abort returns a typed
+//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's
+//! name and `BudgetCategory::Arena` — the same shape every other
+//! budget-checked operator surface uses.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,7 +53,7 @@ use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{KeyExtractor, hash_composite_key, keys_equal_canonicalized};
-use crate::pipeline::memory::MemoryBudget;
+use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
@@ -822,13 +823,16 @@ pub(crate) fn execute_combine_iejoin(
                                     emitted_since_check += 1;
                                     if emitted_since_check >= MEMORY_CHECK_INTERVAL {
                                         if budget.should_abort() {
-                                            return Err(PipelineError::Compilation {
-                                                transform_name: name.to_string(),
-                                                messages: vec![format!(
-                                                    "E310 combine probe memory limit exceeded: \
-                                                     hard limit {}",
-                                                    budget.hard_limit()
-                                                )],
+                                            return Err(PipelineError::MemoryBudgetExceeded {
+                                                node: name.to_string(),
+                                                used: budget
+                                                    .peak_rss
+                                                    .unwrap_or(budget.arena_bytes_charged()),
+                                                limit: budget.hard_limit(),
+                                                source: BudgetCategory::Arena,
+                                                detail: Some(
+                                                    "iejoin combine probe RSS abort".to_string(),
+                                                ),
                                             });
                                         }
                                         emitted_since_check = 0;
@@ -886,13 +890,14 @@ pub(crate) fn execute_combine_iejoin(
                             emitted_since_check += 1;
                             if emitted_since_check >= MEMORY_CHECK_INTERVAL {
                                 if budget.should_abort() {
-                                    return Err(PipelineError::Compilation {
-                                        transform_name: name.to_string(),
-                                        messages: vec![format!(
-                                            "E310 combine probe memory limit exceeded: \
-                                             hard limit {}",
-                                            budget.hard_limit()
-                                        )],
+                                    return Err(PipelineError::MemoryBudgetExceeded {
+                                        node: name.to_string(),
+                                        used: budget
+                                            .peak_rss
+                                            .unwrap_or(budget.arena_bytes_charged()),
+                                        limit: budget.hard_limit(),
+                                        source: BudgetCategory::Arena,
+                                        detail: Some("iejoin combine probe RSS abort".to_string()),
                                     });
                                 }
                                 emitted_since_check = 0;
@@ -946,11 +951,9 @@ pub(crate) fn execute_combine_iejoin(
         match on_miss {
             OnMiss::Skip => continue,
             OnMiss::Error => {
-                return Err(PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!(
-                        "E310 combine on_miss: error — no matching build row for driver row {driver_order}"
-                    )],
+                return Err(PipelineError::CombineMissingMatch {
+                    combine: name.to_string(),
+                    driver_row: driver_order,
                 });
             }
             OnMiss::NullFields => {
@@ -981,13 +984,12 @@ pub(crate) fn execute_combine_iejoin(
                         emitted_since_check += 1;
                         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
                             if budget.should_abort() {
-                                return Err(PipelineError::Compilation {
-                                    transform_name: name.to_string(),
-                                    messages: vec![format!(
-                                        "E310 combine probe memory limit exceeded: \
-                                         hard limit {}",
-                                        budget.hard_limit()
-                                    )],
+                                return Err(PipelineError::MemoryBudgetExceeded {
+                                    node: name.to_string(),
+                                    used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                                    limit: budget.hard_limit(),
+                                    source: BudgetCategory::Arena,
+                                    detail: Some("iejoin combine probe RSS abort".to_string()),
                                 });
                             }
                             emitted_since_check = 0;

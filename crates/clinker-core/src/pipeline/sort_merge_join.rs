@@ -49,7 +49,7 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::KeyExtractor;
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
-use crate::pipeline::memory::MemoryBudget;
+use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
 
@@ -656,12 +656,9 @@ fn execute_combine_sort_merge_with_stats(
             match on_miss {
                 OnMiss::Skip => continue,
                 OnMiss::Error => {
-                    return Err(PipelineError::Compilation {
-                        transform_name: name.to_string(),
-                        messages: vec![format!(
-                            "E310 combine on_miss: error — no matching build row for \
-                             driver row {driver_order}"
-                        )],
+                    return Err(PipelineError::CombineMissingMatch {
+                        combine: name.to_string(),
+                        driver_row: driver_order,
                     });
                 }
                 OnMiss::NullFields => {
@@ -1006,13 +1003,14 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     detail: format!("sort-merge matching-run spill failed: {e}"),
                 })?;
                 if written > 0 && budget.record_spill_bytes(written) {
-                    return Err(PipelineError::Compilation {
-                        transform_name: name.to_string(),
-                        messages: vec![format!(
-                            "E310 sort-merge matching-run exceeded disk-spill quota: {} > {}",
-                            budget.cumulative_spill_bytes(),
-                            budget.disk_quota()
-                        )],
+                    return Err(PipelineError::MemoryBudgetExceeded {
+                        node: name.to_string(),
+                        used: budget.cumulative_spill_bytes(),
+                        limit: budget.disk_quota(),
+                        source: BudgetCategory::Arena,
+                        detail: Some(
+                            "sort-merge matching-run exceeded disk-spill quota".to_string(),
+                        ),
                     });
                 }
                 if was_inmemory && matches!(run, MatchingRunBuffer::Spilled { .. }) {
@@ -1224,13 +1222,17 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             *args.emitted_since_check = args.emitted_since_check.saturating_add(1);
                             if *args.emitted_since_check >= MEMORY_CHECK_INTERVAL {
                                 if args.budget.should_abort() {
-                                    return Err(PipelineError::Compilation {
-                                        transform_name: name.to_string(),
-                                        messages: vec![format!(
-                                            "E310 combine probe memory limit exceeded: \
-                                             hard limit {}",
-                                            args.budget.hard_limit()
-                                        )],
+                                    return Err(PipelineError::MemoryBudgetExceeded {
+                                        node: name.to_string(),
+                                        used: args
+                                            .budget
+                                            .peak_rss
+                                            .unwrap_or(args.budget.arena_bytes_charged()),
+                                        limit: args.budget.hard_limit(),
+                                        source: BudgetCategory::Arena,
+                                        detail: Some(
+                                            "sort-merge combine probe RSS abort".to_string(),
+                                        ),
                                     });
                                 }
                                 *args.emitted_since_check = 0;
@@ -1284,13 +1286,15 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     *args.emitted_since_check = args.emitted_since_check.saturating_add(1);
                     if *args.emitted_since_check >= MEMORY_CHECK_INTERVAL {
                         if args.budget.should_abort() {
-                            return Err(PipelineError::Compilation {
-                                transform_name: name.to_string(),
-                                messages: vec![format!(
-                                    "E310 combine probe memory limit exceeded: \
-                                     hard limit {}",
-                                    args.budget.hard_limit()
-                                )],
+                            return Err(PipelineError::MemoryBudgetExceeded {
+                                node: name.to_string(),
+                                used: args
+                                    .budget
+                                    .peak_rss
+                                    .unwrap_or(args.budget.arena_bytes_charged()),
+                                limit: args.budget.hard_limit(),
+                                source: BudgetCategory::Arena,
+                                detail: Some("sort-merge combine probe RSS abort".to_string()),
                             });
                         }
                         *args.emitted_since_check = 0;

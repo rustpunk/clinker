@@ -341,22 +341,32 @@ nodes:
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
     );
-    let rendered = err.to_string();
-    // The deferred-buffer admission path raises E310 directly; an
-    // upstream sort enforcer that spilled past the budget surfaces a
-    // distinct "spill files" message but with the same "memory_limit
-    // too small" semantic. Either is an acceptable observation that
-    // memory accounting fired; the test pins the failure-shape
-    // contract for the deferred buffer specifically by asserting the
-    // E310 / MemoryBudgetExceeded substring when reachable, falling
-    // back to the spill message when the upstream ran out first.
-    assert!(
-        rendered.contains("E310")
-            || rendered.contains("MemoryBudgetExceeded")
-            || rendered.contains("memory_limit too small"),
-        "memory-overflow surface must carry E310 / MemoryBudgetExceeded \
-         or the spill-fallback admission message; got: {rendered}"
-    );
+    // The deferred-buffer admission path raises a typed
+    // MemoryBudgetExceeded directly; an upstream sort enforcer that
+    // spilled past the budget surfaces a distinct "spill files"
+    // Compilation message with the same "memory_limit too small"
+    // semantic. Either is an acceptable observation that memory
+    // accounting fired; the test pins the failure-shape contract for
+    // the deferred buffer by destructuring on MemoryBudgetExceeded
+    // when reachable and on the spill-fallback Compilation arm
+    // otherwise.
+    match &err {
+        crate::error::PipelineError::MemoryBudgetExceeded {
+            source: crate::pipeline::memory::BudgetCategory::Arena,
+            ..
+        } => {}
+        crate::error::PipelineError::Compilation { messages, .. }
+            if messages
+                .iter()
+                .any(|m| m.contains("memory_limit too small")) => {}
+        crate::error::PipelineError::Io(io_err)
+            if io_err.to_string().contains("memory_limit too small") => {}
+        other => panic!(
+            "memory-overflow surface must carry MemoryBudgetExceeded \
+             (BudgetCategory::Arena) or the spill-fallback admission \
+             message; got: {other:?}"
+        ),
+    }
     let _ = BTreeSet::<&str>::new();
 }
 
@@ -2017,20 +2027,21 @@ nodes:
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
 
     // The pipeline either errors at the build-side cross-region tee
-    // (`tee_emit_to_region_input_buffers` raising E310 from
-    // `MemoryBudget::charge_arena_bytes`) or at the source-rooted
-    // arena build for the build-side reader (also E310). Both surfaces
-    // carry the same admission-failure error code; the test pins the
-    // failure-shape contract regardless of which boundary fires first.
+    // (`tee_emit_to_region_input_buffers` raising MemoryBudgetExceeded
+    // from `MemoryBudget::charge_arena_bytes`) or at the source-rooted
+    // arena build for the build-side reader (same shape). Both
+    // surfaces carry the same admission-failure error type; the test
+    // pins the failure-shape contract regardless of which boundary
+    // fires first.
     match result {
-        Err(err) => {
-            let rendered = err.to_string();
-            assert!(
-                rendered.contains("E310") || rendered.contains("MemoryBudgetExceeded"),
-                "memory-overflow on the region-input-buffer admission \
-                 must carry E310 / MemoryBudgetExceeded; got: {rendered}"
-            );
-        }
+        Err(crate::error::PipelineError::MemoryBudgetExceeded {
+            source: crate::pipeline::memory::BudgetCategory::Arena,
+            ..
+        }) => {}
+        Err(other) => panic!(
+            "memory-overflow on the region-input-buffer admission must carry \
+             MemoryBudgetExceeded (BudgetCategory::Arena); got: {other:?}"
+        ),
         Ok(_) => {
             // 1KB is below the per-row charge for a 2KB payload, so
             // admission must overflow somewhere along the build-side
@@ -2038,8 +2049,8 @@ nodes:
             // silently absorbed the overflow — that would be the
             // architectural regression this test catches.
             panic!(
-                "expected E310 admission failure on the region-input-buffer \
-                 cross-region tee; got Ok"
+                "expected MemoryBudgetExceeded admission failure on the \
+                 region-input-buffer cross-region tee; got Ok"
             );
         }
     }

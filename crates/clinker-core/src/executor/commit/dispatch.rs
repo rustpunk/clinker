@@ -496,7 +496,11 @@ async fn recurse_into_body(
         // the forward-pass `tee_emit_to_region_input_buffers` applies,
         // so a runaway body cannot evade the per-pipeline budget by
         // routing its output through the harvest path instead.
-        crate::executor::dispatch::charge_harvest_admission(ctx, &harvested)?;
+        crate::executor::dispatch::charge_harvest_admission(
+            ctx,
+            &harvested,
+            parent_dag.graph[composition_idx].name(),
+        )?;
         ctx.node_buffers
             .entry(composition_idx)
             .or_default()

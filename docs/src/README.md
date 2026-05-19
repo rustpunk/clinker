@@ -33,6 +33,27 @@ Pentaho Kettle / Apache Hop, Embulk, Singer, Benthos in batch mode, and Vector
 running file-to-file -- finite ETL jobs with per-record evaluation and a hard
 memory ceiling.
 
+**Three pillars of what Clinker is:**
+
+1. **Finite inputs.** Files (CSV, JSON, XML, fixed-width) are the canonical
+   shape. Finite-cursor network sources (paginated REST APIs, SQL `SELECT`
+   cursors) fit the same model -- they exhaust their cursor and EOF.
+   Unbounded sources (Kafka topics, Kinesis streams, Server-Sent Events,
+   webhooks, `tail -f`-style file followers) are out of scope and will
+   remain so.
+2. **Finite jobs.** A pipeline run begins when you invoke `clinker run`,
+   drains the DAG, and exits with a status code. No long-running daemon,
+   no service surface, no infinite event loop.
+3. **Single process.** One `clinker` binary invocation is one operating-
+   system process. Parallelism happens *inside* the process via threads
+   (`std::thread`, Rayon). Clinker does not spawn worker processes, does
+   not coordinate a cluster, and does not shuffle data between machines.
+   Scale by giving the host more cores, more RAM, and more disk -- the
+   DuckDB / Polars / Kettle model. If a single host genuinely can't fit
+   the work, partition the input by file or by key and run multiple
+   `clinker` invocations from a shell script; that's a five-line bash
+   script, not an architectural addition.
+
 ## Why Clinker?
 
 **Single binary, zero dependencies.** Download it, run it. No JVM, no Python,
