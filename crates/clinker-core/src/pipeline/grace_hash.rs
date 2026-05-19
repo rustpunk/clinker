@@ -63,7 +63,7 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
-use crate::pipeline::memory::MemoryBudget;
+use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
 use crate::plan::combine::DecomposedPredicate;
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
@@ -583,6 +583,7 @@ impl GraceHashExecutor {
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
         budget: &mut MemoryBudget,
+        combine_name: &str,
     ) -> Result<(), PipelineError> {
         for i in 0..self.partitions.len() {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
@@ -594,18 +595,24 @@ impl GraceHashExecutor {
                         // Ready branch and emit zero matches uniformly.
                         let table =
                             CombineHashTable::build(records, extractor, ctx, budget, Some(0))
-                                .map_err(|e| PipelineError::Compilation {
-                                    transform_name: String::new(),
-                                    messages: vec![format!("E310 grace hash build: {e}")],
+                                .map_err(|e| PipelineError::MemoryBudgetExceeded {
+                                    node: combine_name.to_string(),
+                                    used: budget.arena_bytes_charged(),
+                                    limit: budget.hard_limit(),
+                                    source: BudgetCategory::Arena,
+                                    detail: Some(format!("grace hash build: {e}")),
                                 })?;
                         PartitionState::Ready { hash_table: table }
                     } else {
                         let estimated = Some(records.len());
                         let table =
                             CombineHashTable::build(records, extractor, ctx, budget, estimated)
-                                .map_err(|e| PipelineError::Compilation {
-                                    transform_name: String::new(),
-                                    messages: vec![format!("E310 grace hash build: {e}")],
+                                .map_err(|e| PipelineError::MemoryBudgetExceeded {
+                                    node: combine_name.to_string(),
+                                    used: budget.arena_bytes_charged(),
+                                    limit: budget.hard_limit(),
+                                    source: BudgetCategory::Arena,
+                                    detail: Some(format!("grace hash build: {e}")),
                                 })?;
                         PartitionState::Ready { hash_table: table }
                     }
@@ -872,15 +879,14 @@ pub(crate) fn execute_combine_grace_hash(
                 detail: format!("grace hash build add failed: {e}"),
             })?;
     }
-    executor.finish_build(&build_extractor, ctx, budget)?;
+    executor.finish_build(&build_extractor, ctx, budget, name)?;
     if budget.record_spill_bytes(executor.take_spilled_bytes()) {
-        return Err(PipelineError::Compilation {
-            transform_name: name.to_string(),
-            messages: vec![format!(
-                "E310 grace hash build exceeded disk-spill quota: {} > {}",
-                budget.cumulative_spill_bytes(),
-                budget.disk_quota()
-            )],
+        return Err(PipelineError::MemoryBudgetExceeded {
+            node: name.to_string(),
+            used: budget.cumulative_spill_bytes(),
+            limit: budget.disk_quota(),
+            source: BudgetCategory::Arena,
+            detail: Some("grace hash build exceeded disk-spill quota".to_string()),
         });
     }
 
@@ -954,12 +960,12 @@ pub(crate) fn execute_combine_grace_hash(
         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
             emitted_since_check = 0;
             if budget.should_abort() {
-                return Err(PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!(
-                        "E310 grace hash probe memory limit exceeded: hard limit {}",
-                        budget.hard_limit()
-                    )],
+                return Err(PipelineError::MemoryBudgetExceeded {
+                    node: name.to_string(),
+                    used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                    limit: budget.hard_limit(),
+                    source: BudgetCategory::Arena,
+                    detail: Some("grace hash probe RSS abort".to_string()),
                 });
             }
         }
@@ -973,13 +979,12 @@ pub(crate) fn execute_combine_grace_hash(
             detail: format!("grace hash probe finalize failed: {e}"),
         })?;
     if budget.record_spill_bytes(executor.take_spilled_bytes()) {
-        return Err(PipelineError::Compilation {
-            transform_name: name.to_string(),
-            messages: vec![format!(
-                "E310 grace hash probe exceeded disk-spill quota: {} > {}",
-                budget.cumulative_spill_bytes(),
-                budget.disk_quota()
-            )],
+        return Err(PipelineError::MemoryBudgetExceeded {
+            node: name.to_string(),
+            used: budget.cumulative_spill_bytes(),
+            limit: budget.disk_quota(),
+            source: BudgetCategory::Arena,
+            detail: Some("grace hash probe exceeded disk-spill quota".to_string()),
         });
     }
 
@@ -1235,15 +1240,15 @@ fn process_spilled_partition(
                 detail: format!("grace hash repartition build finalize: {e}"),
             })?;
             if budget.record_spill_bytes(b_written) {
-                return Err(PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!(
-                        "E310 grace hash repartition build exceeded disk-spill quota \
-                         (partition_id={}): {} > {}",
-                        child_id,
-                        budget.cumulative_spill_bytes(),
-                        budget.disk_quota()
-                    )],
+                return Err(PipelineError::MemoryBudgetExceeded {
+                    node: name.to_string(),
+                    used: budget.cumulative_spill_bytes(),
+                    limit: budget.disk_quota(),
+                    source: BudgetCategory::Arena,
+                    detail: Some(format!(
+                        "grace hash repartition build exceeded disk-spill quota \
+                         (partition_id={child_id})"
+                    )),
                 });
             }
             let mut probe_files: Vec<SpillFilePath> = Vec::new();
@@ -1271,15 +1276,15 @@ fn process_spilled_partition(
                     detail: format!("grace hash repartition probe finalize: {e}"),
                 })?;
                 if budget.record_spill_bytes(p_written) {
-                    return Err(PipelineError::Compilation {
-                        transform_name: name.to_string(),
-                        messages: vec![format!(
-                            "E310 grace hash repartition probe exceeded disk-spill quota \
-                             (partition_id={}): {} > {}",
-                            child_id,
-                            budget.cumulative_spill_bytes(),
-                            budget.disk_quota()
-                        )],
+                    return Err(PipelineError::MemoryBudgetExceeded {
+                        node: name.to_string(),
+                        used: budget.cumulative_spill_bytes(),
+                        limit: budget.disk_quota(),
+                        source: BudgetCategory::Arena,
+                        detail: Some(format!(
+                            "grace hash repartition probe exceeded disk-spill quota \
+                             (partition_id={child_id})"
+                        )),
                     });
                 }
                 probe_files.push(p);
@@ -1321,9 +1326,12 @@ fn process_spilled_partition(
         budget,
         Some(sp.build_count as usize),
     )
-    .map_err(|e| PipelineError::Compilation {
-        transform_name: name.to_string(),
-        messages: vec![format!("E310 grace hash reload build: {e}")],
+    .map_err(|e| PipelineError::MemoryBudgetExceeded {
+        node: name.to_string(),
+        used: budget.arena_bytes_charged(),
+        limit: budget.hard_limit(),
+        source: BudgetCategory::Arena,
+        detail: Some(format!("grace hash reload build: {e}")),
     })?;
 
     // Walk every probe-side spill file and emit matches.
@@ -1508,6 +1516,7 @@ fn bnl_fallback(
             name,
             sp.partition_id,
             approx_distinct,
+            budget,
         ));
     }
 
@@ -1519,12 +1528,15 @@ fn bnl_fallback(
         let chunk_len = chunk.len();
         let table =
             CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
-                .map_err(|e| PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!(
-                        "E310 grace hash bnl chunk build (partition {}, ~{} distinct): {e}",
+                .map_err(|e| PipelineError::MemoryBudgetExceeded {
+                    node: name.to_string(),
+                    used: budget.arena_bytes_charged(),
+                    limit: budget.hard_limit(),
+                    source: BudgetCategory::Arena,
+                    detail: Some(format!(
+                        "grace hash bnl chunk build (partition {}, ~{} distinct): {e}",
                         sp.partition_id, approx_distinct
-                    )],
+                    )),
                 })?;
         stats.peak_chunk_table_bytes = stats.peak_chunk_table_bytes.max(table.memory_bytes());
 
@@ -1594,6 +1606,7 @@ fn bnl_fallback(
                             name,
                             sp.partition_id,
                             approx_distinct,
+                            budget,
                         ));
                     }
                 }
@@ -1611,6 +1624,7 @@ fn bnl_fallback(
                 name,
                 sp.partition_id,
                 approx_distinct,
+                budget,
             ));
         }
     }
@@ -1619,20 +1633,24 @@ fn bnl_fallback(
 
 /// E310 — runtime partition aborted because the chunked BNL fallback
 /// could not bring memory under the hard limit. Carries the partition
-/// index and an HLL-approximated distinct-key count so the operator
-/// can size `partition_bits` upstream or reroute the dominant key
-/// before retrying. See `crate::error` for the registry entry.
+/// index and an HLL-approximated distinct-key count in `detail` so the
+/// operator can size `partition_bits` upstream or reroute the dominant
+/// key before retrying.
 fn combine_e310_partition_aborted(
     transform: &str,
     partition_id: u16,
     approx_distinct: u64,
+    budget: &MemoryBudget,
 ) -> PipelineError {
-    PipelineError::Compilation {
-        transform_name: transform.to_string(),
-        messages: vec![format!(
-            "E310 combine grace hash exceeded memory limit on partition {partition_id}; \
+    PipelineError::MemoryBudgetExceeded {
+        node: transform.to_string(),
+        used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+        limit: budget.hard_limit(),
+        source: BudgetCategory::Arena,
+        detail: Some(format!(
+            "combine grace hash exceeded memory limit on partition {partition_id}; \
              approximate distinct key count {approx_distinct}"
-        )],
+        )),
     }
 }
 
@@ -1771,11 +1789,9 @@ fn emit_for_probe<'a>(
                 match on_miss {
                     OnMiss::Skip => {}
                     OnMiss::Error => {
-                        return Err(PipelineError::Compilation {
-                            transform_name: name.to_string(),
-                            messages: vec![format!(
-                                "E310 combine on_miss: error — no matching build row for driver row {rn}"
-                            )],
+                        return Err(PipelineError::CombineMissingMatch {
+                            combine: name.to_string(),
+                            driver_row: rn,
                         });
                     }
                     OnMiss::NullFields => {
@@ -2671,15 +2687,23 @@ mod tests {
         });
 
         let err = result.expect_err("disk quota must abort the combine");
-        let rendered = format!("{err}");
-        assert!(
-            rendered.contains("E310"),
-            "error must surface E310 for disk-quota overflow; got {rendered}"
-        );
-        assert!(
-            rendered.contains("disk-spill quota"),
-            "error must mention disk-spill quota; got {rendered}"
-        );
+        match &err {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                source,
+                detail,
+                ..
+            } => {
+                assert_eq!(node, "grace_quota_test");
+                assert_eq!(*source, BudgetCategory::Arena);
+                let detail = detail.as_deref().unwrap_or("");
+                assert!(
+                    detail.contains("disk-spill quota"),
+                    "detail must mention disk-spill quota; got {detail:?}"
+                );
+            }
+            other => panic!("disk-quota overflow must surface MemoryBudgetExceeded; got {other:?}"),
+        }
         assert!(
             budget.cumulative_spill_bytes() > 64,
             "cumulative_spill_bytes must reflect the overflowing total"
@@ -3384,21 +3408,28 @@ mod tests {
                 &mut output,
                 &mut stats,
             )
-            .expect_err("1-byte hard limit must abort BNL with E310")
+            .expect_err("1-byte hard limit must abort BNL")
         });
 
-        let msg = format!("{err}");
-        assert!(msg.contains("E310"), "abort must surface E310; got: {msg}");
-        assert!(
-            msg.contains("partition 7"),
-            "E310 message must include partition_id; got: {msg}",
-        );
         let est = sp.distinct_sketch.estimate();
         assert!(est > 0, "HLL must report a positive distinct estimate");
-        assert!(
-            msg.contains(&est.to_string()),
-            "E310 message must include approx distinct count {est}; got: {msg}",
-        );
+        match &err {
+            PipelineError::MemoryBudgetExceeded { source, detail, .. } => {
+                assert_eq!(*source, BudgetCategory::Arena);
+                let detail = detail.as_deref().unwrap_or("");
+                assert!(
+                    detail.contains("partition 7"),
+                    "detail must include partition_id; got {detail:?}"
+                );
+                assert!(
+                    detail.contains(&est.to_string()),
+                    "detail must include approx distinct count {est}; got {detail:?}"
+                );
+            }
+            other => {
+                panic!("BNL hard-limit abort must surface MemoryBudgetExceeded; got {other:?}")
+            }
+        }
     }
 
     /// HLL sanity: 200 distinct hashes give an estimate within 50% of

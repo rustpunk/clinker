@@ -321,7 +321,9 @@ fn main() -> ExitCode {
                         | PipelineError::CompositionDepthExceeded { .. }
                         | PipelineError::CompositionBodyMissing { .. }
                         | PipelineError::CompositionUnknownPort { .. }
-                        | PipelineError::CompositionBodyError { .. } => ExitCode::from(1),
+                        | PipelineError::CompositionBodyError { .. }
+                        | PipelineError::MemoryBudgetExceeded { .. }
+                        | PipelineError::CombineMissingMatch { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
                         PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
                             ExitCode::from(3)

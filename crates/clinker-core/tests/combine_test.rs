@@ -3487,7 +3487,7 @@ nodes:
     }
 
     /// on_miss: error — the pipeline fails on the first unmatched row.
-    /// Verify an E310-coded error surfaces.
+    /// Verify a structured CombineMissingMatch error surfaces.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_combine_exec_on_miss_error() {
         let yaml = combine_exec_yaml("first", "error");
@@ -3498,11 +3498,15 @@ nodes:
         )
         .await
         .expect_err("on_miss:error must fail the pipeline on first unmatched row");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("E310"),
-            "on_miss:error must surface E310; got: {msg}",
-        );
+        match &err {
+            CombineFixtureError::Run(clinker_core::error::PipelineError::CombineMissingMatch {
+                combine,
+                ..
+            }) => {
+                assert_eq!(combine, "enriched");
+            }
+            other => panic!("on_miss:error must surface CombineMissingMatch; got: {other:?}"),
+        }
     }
 
     /// MemoryBudget abort — a 1-byte hard limit forces
@@ -3510,14 +3514,13 @@ nodes:
     /// inside `CombineHashTable::build` (process RSS trivially exceeds
     /// 1 byte). The build's safety-net final check fires for the small
     /// build set, the executor wraps `CombineError::MemoryLimitExceeded`
-    /// as `PipelineError::Compilation` with an `E310 combine build:
-    /// ...` message, and that surfaces in the run error string.
+    /// as a typed `MemoryBudgetExceeded` carrying the combine node's
+    /// name and the budget source, and that surfaces in the run error.
     ///
     /// Mirrors the build-side regression test in
     /// `pipeline/combine.rs::test_combine_hash_table_oom_aborts_during_build`,
     /// but exercised end-to-end through the combine executor arm so a
-    /// regression in the arm's error mapping (E310 → generic message)
-    /// is caught here.
+    /// regression in the arm's error mapping is caught here.
     ///
     /// Skipped silently when `rss_bytes()` is unavailable on the host
     /// platform — the same gate the unit test uses, applied via
@@ -3579,16 +3582,29 @@ nodes:
             Some("orders"),
         )
         .await
-        .expect_err("1-byte memory_limit must abort combine with E310");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("E310"),
-            "memory abort must surface E310; got: {msg}",
-        );
-        assert!(
-            msg.contains("memory limit exceeded") || msg.contains("combine build"),
-            "E310 message must mention the combine memory abort; got: {msg}",
-        );
+        .expect_err("1-byte memory_limit must abort combine");
+        match &err {
+            CombineFixtureError::Run(clinker_core::error::PipelineError::MemoryBudgetExceeded {
+                node,
+                source,
+                detail,
+                ..
+            }) => {
+                assert_eq!(node, "enriched");
+                assert_eq!(
+                    *source,
+                    clinker_core::pipeline::memory::BudgetCategory::Arena
+                );
+                let detail = detail.as_deref().unwrap_or("");
+                assert!(
+                    detail.contains("combine build")
+                        || detail.contains("combine probe")
+                        || detail.contains("grace hash"),
+                    "detail must mention the combine memory abort; got {detail:?}"
+                );
+            }
+            other => panic!("memory abort must surface MemoryBudgetExceeded; got: {other:?}"),
+        }
     }
 
     /// Residual predicate — equi predicate + a range residual. The

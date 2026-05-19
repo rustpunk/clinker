@@ -57,10 +57,11 @@
 //! | `E307`      | error    | Combine input references undeclared upstream         |
 //! | `E308`      | error    | Combine cxl body references unknown field            |
 //! | `E309`      | error    | Combine output schema is empty                       |
-//! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
+//! | `E310`      | error    | Memory-budget surface exceeded the configured hard limit |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
 //! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
 //! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
+//! | `E319`      | error    | Combine `on_miss: error` had no matching build row   |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
@@ -351,6 +352,27 @@ pub enum PipelineError {
         group_key: String,
         count: u64,
     },
+    /// E310 — a memory-budget surface (arena state, `node_buffers`,
+    /// or accumulated disk-spill bytes) exceeded the configured RSS
+    /// hard limit. `node` names the producing operator; `source`
+    /// distinguishes which surface tripped. `detail` carries any
+    /// site-specific context the rendered message previously inlined
+    /// (e.g. partition id, distinct-count estimate, disk-spill quota
+    /// figures). Always aborts the run.
+    MemoryBudgetExceeded {
+        node: String,
+        used: u64,
+        limit: u64,
+        source: crate::pipeline::memory::BudgetCategory,
+        detail: Option<String>,
+    },
+    /// E319 — a combine with `on_miss: error` saw a driver row that
+    /// matched no build row. Semantically distinct from E310 (which
+    /// is a memory-budget overflow). Always aborts the run.
+    CombineMissingMatch {
+        combine: String,
+        driver_row: u64,
+    },
     /// E315 (pipeline-wide, `source: None`) or E316 (per-source,
     /// `source: Some(name)`) — the cumulative DLQ fraction crossed
     /// the configured `max_rate` after at least `min_records` rows
@@ -472,6 +494,27 @@ impl fmt::Display for PipelineError {
                 "correlation-key group {group_key:?} exceeded max_group_buffer \
                  after {count} records — remaining records of the group are \
                  DLQ'd as collateral"
+            ),
+            Self::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                detail,
+            } => match detail {
+                Some(d) => write!(
+                    f,
+                    "E310 {node}: {source} exceeded budget ({used}/{limit}) [{d}]"
+                ),
+                None => write!(f, "E310 {node}: {source} exceeded budget ({used}/{limit})"),
+            },
+            Self::CombineMissingMatch {
+                combine,
+                driver_row,
+            } => write!(
+                f,
+                "E319 combine '{combine}': on_miss: error — no matching build row \
+                 for driver row {driver_row}"
             ),
             Self::DlqRateExceeded {
                 source,
@@ -634,7 +677,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E313", "E314", "E315", "E316", "E317", "E318",
+            "E313", "E314", "E315", "E316", "E317", "E318", "E319",
         ] {
             let pattern = format!("`{code}`");
             assert!(

@@ -411,7 +411,7 @@ use crate::executor::{
     evaluate_single_transform, evaluate_single_transform_windowed, parse_memory_limit,
     stage_metrics, widen_record_to_schema,
 };
-use crate::pipeline::memory::MemoryBudget;
+use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 use crate::projection::project_output_from_record;
@@ -1082,8 +1082,9 @@ fn tee_emit_to_region_input_buffers(
     if crossing_edges.is_empty() {
         return Ok(());
     }
+    let producer_name = current_dag.graph[producer_idx].name().to_string();
     for edge_id in crossing_edges {
-        charge_harvest_admission(ctx, emit_rows)?;
+        charge_harvest_admission(ctx, emit_rows, &producer_name)?;
         for (record, rn) in emit_rows {
             ctx.region_input_buffers
                 .entry((active_body, edge_id))
@@ -1097,9 +1098,10 @@ fn tee_emit_to_region_input_buffers(
 /// Per-row arena charge against `ctx.memory_budget` for records about
 /// to be admitted into a deferred-region buffer (cross-region tee on
 /// the forward pass, body→parent harvest on the commit pass). Returns
-/// the same `E310`-shape `PipelineError::Compilation` as the windowed
-/// Transform's buffer-recompute path so every admission site fails
-/// uniformly when the per-pipeline memory limit is exhausted.
+/// a typed `PipelineError::MemoryBudgetExceeded` when the per-pipeline
+/// memory limit is exhausted; the producer node's name is carried in
+/// `node` so downstream diagnostics and DLQ routing can identify the
+/// overflowing operator.
 ///
 /// Per-row size mirrors the per-Value-slot accounting the cross-region
 /// tee uses so a runaway body cannot evade the per-pipeline budget by
@@ -1108,6 +1110,7 @@ fn tee_emit_to_region_input_buffers(
 pub(crate) fn charge_harvest_admission(
     ctx: &mut ExecutorContext<'_>,
     rows: &[(Record, u64)],
+    node_name: &str,
 ) -> Result<(), PipelineError> {
     let row_bytes_each: u64 = rows
         .first()
@@ -1121,13 +1124,12 @@ pub(crate) fn charge_harvest_admission(
     }
     for _ in rows {
         if ctx.memory_budget.charge_arena_bytes(row_bytes_each) {
-            return Err(PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![format!(
-                    "E310 deferred-region buffer admission exceeded \
-                     memory limit: hard limit {}",
-                    ctx.memory_budget.hard_limit()
-                )],
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: node_name.to_string(),
+                used: ctx.memory_budget.arena_bytes_charged(),
+                limit: ctx.memory_budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some("deferred-region buffer admission".to_string()),
             });
         }
     }
@@ -1336,9 +1338,12 @@ pub(crate) fn finalize_node_rooted_windows(
             anchor_schema,
             &mut ctx.memory_budget,
         )
-        .map_err(|e| PipelineError::Compilation {
-            transform_name: String::new(),
-            messages: vec![format!("E310 node-rooted arena build: {e}")],
+        .map_err(|e| PipelineError::MemoryBudgetExceeded {
+            node: current_dag.graph[upstream_idx].name().to_string(),
+            used: ctx.memory_budget.arena_bytes_charged(),
+            limit: ctx.memory_budget.hard_limit(),
+            source: BudgetCategory::Arena,
+            detail: Some(format!("node-rooted arena build: {e}")),
         })?;
         let arena_len = arena.record_count();
         ctx.collector
@@ -2490,13 +2495,12 @@ pub(crate) async fn dispatch_plan_node(
                         if row_bytes_each > 0
                             && ctx.memory_budget.charge_arena_bytes(row_bytes_each)
                         {
-                            return Err(PipelineError::Compilation {
-                                transform_name: String::new(),
-                                messages: vec![format!(
-                                    "E310 deferred-region buffer admission exceeded \
-                                     memory limit: hard limit {}",
-                                    ctx.memory_budget.hard_limit()
-                                )],
+                            return Err(PipelineError::MemoryBudgetExceeded {
+                                node: name.to_string(),
+                                used: ctx.memory_budget.arena_bytes_charged(),
+                                limit: ctx.memory_budget.hard_limit(),
+                                source: BudgetCategory::Arena,
+                                detail: Some("Route cross-region tee admission".to_string()),
                             });
                         }
                         ctx.region_input_buffers
@@ -4128,9 +4132,12 @@ pub(crate) async fn dispatch_plan_node(
                 &mut budget,
                 estimated_rows,
             )
-            .map_err(|e| PipelineError::Compilation {
-                transform_name: name.clone(),
-                messages: vec![format!("E310 combine build: {e}")],
+            .map_err(|e| PipelineError::MemoryBudgetExceeded {
+                node: name.clone(),
+                used: budget.arena_bytes_charged(),
+                limit: budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some(format!("combine build: {e}")),
             })?;
             let build_records_out = hash_table.len() as u64;
             ctx.collector
@@ -4355,12 +4362,9 @@ pub(crate) async fn dispatch_plan_node(
                                     continue;
                                 }
                                 OnMiss::Error => {
-                                    return Err(PipelineError::Compilation {
-                                        transform_name: name.clone(),
-                                        messages: vec![format!(
-                                            "E310 combine on_miss: error — no \
-                                             matching build row for driver row {rn}"
-                                        )],
+                                    return Err(PipelineError::CombineMissingMatch {
+                                        combine: name.clone(),
+                                        driver_row: rn,
                                     });
                                 }
                                 OnMiss::NullFields => {
@@ -4544,13 +4548,12 @@ pub(crate) async fn dispatch_plan_node(
                 // build × large driver fan-out can blow RSS
                 // even though the table itself is bounded.
                 if emitted_since_check >= 10_000 && budget.should_abort() {
-                    return Err(PipelineError::Compilation {
-                        transform_name: name.clone(),
-                        messages: vec![format!(
-                            "E310 combine probe memory limit exceeded: \
-                             hard limit {}",
-                            budget.hard_limit()
-                        )],
+                    return Err(PipelineError::MemoryBudgetExceeded {
+                        node: name.clone(),
+                        used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                        limit: budget.hard_limit(),
+                        source: BudgetCategory::Arena,
+                        detail: Some("combine probe RSS abort".to_string()),
                     });
                 }
                 if emitted_since_check >= 10_000 {

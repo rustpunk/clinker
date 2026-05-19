@@ -69,7 +69,9 @@ mod tests {
                 | PipelineError::CompositionDepthExceeded { .. }
                 | PipelineError::CompositionBodyMissing { .. }
                 | PipelineError::CompositionUnknownPort { .. }
-                | PipelineError::CompositionBodyError { .. },
+                | PipelineError::CompositionBodyError { .. }
+                | PipelineError::MemoryBudgetExceeded { .. }
+                | PipelineError::CombineMissingMatch { .. },
             ) => 1,
             Err(
                 PipelineError::Eval(_)
