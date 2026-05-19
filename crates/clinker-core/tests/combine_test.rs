@@ -3584,12 +3584,14 @@ nodes:
         .await
         .expect_err("1-byte memory_limit must abort combine");
         match &err {
-            CombineFixtureError::Run(clinker_core::error::PipelineError::MemoryBudgetExceeded {
-                node,
-                source,
-                detail,
-                ..
-            }) => {
+            CombineFixtureError::Run(
+                clinker_core::error::PipelineError::MemoryBudgetExceeded {
+                    node,
+                    source,
+                    detail,
+                    ..
+                },
+            ) => {
                 assert_eq!(node, "enriched");
                 assert_eq!(
                     *source,
