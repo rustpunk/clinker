@@ -412,8 +412,8 @@ mod tests {
     #[test]
     fn estimated_memory_bytes_scales_with_row_count_and_columns() {
         let s = schema();
-        let row_bytes_each = std::mem::size_of::<Value>() * s.column_count()
-            + std::mem::size_of::<(Record, u64)>();
+        let row_bytes_each =
+            std::mem::size_of::<Value>() * s.column_count() + std::mem::size_of::<(Record, u64)>();
 
         // Memory: row count × per-row formula.
         let mem = NodeBuffer::Memory(vec![
