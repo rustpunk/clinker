@@ -404,6 +404,13 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
                 collect_qualifiers_inner(a, out);
             }
         }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            collect_qualifiers_inner(receiver, out);
+            collect_qualifiers_inner(index, out);
+        }
+        Expr::Closure { body, .. } => collect_qualifiers_inner(body, out),
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }

@@ -2738,7 +2738,7 @@ nodes:
       name: fulfilled_orders
       type: csv
       path: fulfilled_orders.csv
-      include_widened: true
+      include_unmapped: true
   - type: output
     name: priority_report
     input: priority_split
@@ -2746,7 +2746,7 @@ nodes:
       name: priority_report
       type: csv
       path: priority_report.csv
-      include_widened: true
+      include_unmapped: true
 "#
     }
 
@@ -2813,7 +2813,7 @@ nodes:
       name: high_priority_out
       type: csv
       path: high_priority_out.csv
-      include_widened: true
+      include_unmapped: true
   - type: output
     name: standard_out
     input: priority_split
@@ -2821,7 +2821,7 @@ nodes:
       name: standard_out
       type: csv
       path: standard_out.csv
-      include_widened: true
+      include_unmapped: true
 "#
     }
 
@@ -3269,7 +3269,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected.csv
-      include_widened: true
+      include_unmapped: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
@@ -3343,7 +3343,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_empty.csv
-      include_widened: true
+      include_unmapped: true
 "#;
         // ORD-1's product_id is PROD-X — no matching build row.
         let orders = "order_id,product_id,amount\nORD-1,PROD-X,10\n";
@@ -3416,7 +3416,7 @@ nodes:
       name: collected_out
       type: csv
       path: collected_cap.csv
-      include_widened: true
+      include_unmapped: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let mut products = String::from("product_id,name,category\n");

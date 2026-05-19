@@ -49,7 +49,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 #[test]

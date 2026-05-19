@@ -202,6 +202,26 @@ impl<'a> Resolver<'a> {
                 // Distinct references a field name directly, not an expression.
                 // No expression resolution needed.
             }
+            Statement::EmitEach {
+                binding,
+                source,
+                body,
+                ..
+            } => {
+                // Resolve the source expression in the outer scope; the
+                // binding only becomes visible inside the body. The
+                // binding is registered as a let-var so FieldRef
+                // resolution will find it before falling back to the
+                // input schema; pop it on exit to keep let_vars accurate
+                // for subsequent statements outside the EmitEach block.
+                self.resolve_expr(source);
+                let saved_len = self.let_vars.len();
+                self.let_vars.push(binding.to_string());
+                for inner in body {
+                    self.resolve_statement(inner);
+                }
+                self.let_vars.truncate(saved_len);
+            }
         }
     }
 
@@ -567,10 +587,21 @@ impl<'a> Resolver<'a> {
                         return;
                     }
                 }
-                // Normal method call
+                // Normal method call. Closure arguments are walked
+                // here as a recognized site so the Closure body
+                // resolves with the closure parameter in scope; the
+                // generic `resolve_expr` arm for `Expr::Closure`
+                // diagnoses free-standing closures.
                 self.resolve_expr(receiver);
                 for arg in args {
-                    self.resolve_expr(arg);
+                    if let Expr::Closure { param, body, .. } = arg {
+                        let saved_len = self.let_vars.len();
+                        self.let_vars.push(param.to_string());
+                        self.resolve_expr(body);
+                        self.let_vars.truncate(saved_len);
+                    } else {
+                        self.resolve_expr(arg);
+                    }
                 }
             }
             Expr::WindowCall {
@@ -579,8 +610,9 @@ impl<'a> Resolver<'a> {
                 args,
                 span,
             } => {
-                // Check if this is any/all — their arguments are predicate_expr context
-                let is_predicate = &**function == "any" || &**function == "all";
+                // Predicate-fold builtins receive their argument as a
+                // predicate_expr (an `it`-bound boolean expression).
+                let is_predicate = matches!(&**function, "any" | "every" | "exists" | "not_exists");
                 if is_predicate {
                     let prev_context = self.context;
                     self.context = ResolveContext::PredicateExpr;
@@ -600,6 +632,39 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(arg);
                 }
             }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                self.resolve_expr(receiver);
+                self.resolve_expr(index);
+            }
+            Expr::Closure {
+                param, body, span, ..
+            } => {
+                // Free-standing closures are rejected — closures only
+                // appear as direct arguments to closure-bearing builtins
+                // (`filter`/`map`/`find`/`any`/`flat_map`), which short-
+                // circuit this arm by treating the Closure node
+                // structurally before walking. Reaching this arm means
+                // the parser produced a closure outside any such call
+                // (e.g. `let f = it => x + 1`); diagnose with a fix-up
+                // hint pointing the user at the closure-bearing builtin
+                // forms.
+                self.diagnostics.push(ResolveDiagnostic {
+                    span: *span,
+                    message: "closures are only valid as arguments to closure-bearing methods (.filter, .map, .find, .any, .flat_map)".into(),
+                    help: Some(
+                        "Wrap the closure as an argument to one of those methods, e.g. `arr.filter(it => ...)`"
+                            .into(),
+                    ),
+                });
+                // Walk the body so any downstream errors inside it still
+                // surface; treat the param like a let-binding for scope.
+                let saved_len = self.let_vars.len();
+                self.let_vars.push(param.to_string());
+                self.resolve_expr(body);
+                self.let_vars.truncate(saved_len);
+            }
         }
     }
 
@@ -609,7 +674,21 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_field_ref(&mut self, node_id: NodeId, name: &str, span: Span) {
-        // Check for `it` binding
+        // Check let-bound variables (search most recent first for
+        // shadowing). The closure-arg walker pushes `it` into
+        // `let_vars` for the duration of the body walk, so a closure
+        // parameter resolves here before the window-predicate special
+        // case below — `it` inside `arr.filter(it => ...)` becomes a
+        // LetVar binding, not an IteratorBinding.
+        for (i, var) in self.let_vars.iter().enumerate().rev() {
+            if var == name {
+                self.bind(node_id, ResolvedBinding::LetVar(i));
+                return;
+            }
+        }
+
+        // `it` outside a closure body: only valid inside a window
+        // predicate (any / every / exists / not_exists).
         if name == "it" {
             if self.context == ResolveContext::PredicateExpr {
                 self.bind(node_id, ResolvedBinding::IteratorBinding);
@@ -624,14 +703,6 @@ impl<'a> Resolver<'a> {
                         "Move this expression inside a $window.any() / .every() / .exists() / .not_exists() call".into(),
                     ),
                 });
-                return;
-            }
-        }
-
-        // Check let-bound variables (search most recent first for shadowing)
-        for (i, var) in self.let_vars.iter().enumerate().rev() {
-            if var == name {
-                self.bind(node_id, ResolvedBinding::LetVar(i));
                 return;
             }
         }

@@ -40,6 +40,11 @@ pub enum DlqErrorCategory {
     /// is set. Mirrors Flink sideOutputLateData / Beam late-drop /
     /// Spark window late-drop.
     LateRecord,
+    /// Per-record `emit each` fan-out produced more output records
+    /// than the transform's `max_expansion` ceiling allows. The
+    /// originating record is routed to DLQ before the fan-out can
+    /// emit any of its truncated body records.
+    ExpansionLimitExceeded,
 }
 
 impl DlqErrorCategory {
@@ -55,6 +60,7 @@ impl DlqErrorCategory {
             Self::Correlated => "correlated",
             Self::GroupSizeExceeded => "group_size_exceeded",
             Self::LateRecord => "late_record",
+            Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
         }
     }
 }
@@ -85,7 +91,7 @@ pub fn stage_time_window(transform: &str) -> String {
 ///   CSV cell and hide routing bugs the same way the regular
 ///   non-JSON writers' silent map-degrade did before commit
 ///   `f5ae145`. Users who need the auto_widen sidecar surfaced in
-///   their normal output can opt into `include_widened: true` on
+///   their normal output can opt into `include_unmapped: true` on
 ///   the relevant Output node; the DLQ keeps a stable user-shape
 ///   schema regardless.
 pub fn write_dlq<W: Write>(

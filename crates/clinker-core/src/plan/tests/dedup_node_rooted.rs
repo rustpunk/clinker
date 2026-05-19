@@ -69,7 +69,7 @@ nodes:
     name: out_total
     path: total.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: out_count
   input: count_window
@@ -77,7 +77,7 @@ nodes:
     name: out_count
     path: count.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let plan = config

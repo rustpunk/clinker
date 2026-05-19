@@ -28,7 +28,7 @@ use std::sync::Arc;
 ///   undeclared input fields keyed by their original name. The
 ///   typechecker is blind to its contents (CXL has no Map operators
 ///   in the user surface); the Output node opts the contents back
-///   into top-level columns via `include_widened: true`. Pattern
+///   into top-level columns via `include_unmapped: true`. Pattern
 ///   precedent: Databricks Auto Loader's `_rescued_data` and
 ///   ClickHouse's `JSON` column type.
 /// - [`FieldMetadata::SourceFile`] — per-Source lineage column carrying

@@ -89,6 +89,37 @@ Declarative validation checks can be attached to a transform. They run against e
 | `name` | No | Validation name for DLQ reporting. Auto-derived from field + check if omitted |
 | `args` | No | Additional arguments as key-value pairs |
 
+## Expansion cap (`max_expansion`)
+
+When a transform body contains an [`emit each`](../cxl/emit-each.md) statement, every input record can fan out into multiple output records. The `max_expansion` field caps how many output records a single input record may produce -- a safety bound against unexpectedly large arrays.
+
+```yaml
+- type: transform
+  name: explode_items
+  input: orders
+  config:
+    max_expansion: 5000      # default: 10000
+    cxl: |
+      emit each it in items {
+        emit order_id = order_id
+        emit sku = it["sku"]
+        emit price = it["price"]
+      }
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_expansion` | `u64` | `10000` | Maximum cumulative output records per input record. |
+
+If a single input record's `emit each` block produces more than `max_expansion` output records, the originating record routes to the DLQ with category `expansion_limit_exceeded` instead of producing a truncated or unbounded result. No partial output is emitted for that record -- the cap is enforced eagerly so the writer never sees records from a runaway expansion.
+
+### When to tune
+
+- **Lower** (e.g. `100`, `1000`) when input arrays are bounded by a known business rule and you want hostile or malformed input to surface as a DLQ entry rather than as a flood of downstream records.
+- **Higher** (e.g. `100000`, `1000000`) when legitimate input carries large arrays -- for example, an order with a long line-item list or an event carrying a per-second pricing curve.
+
+The DLQ category `expansion_limit_exceeded` is distinct from generic CXL evaluation failures, so DLQ-side filters and metrics can target expansion runaway specifically. See [Error Handling & DLQ](error-handling.md) for the wider DLQ contract.
+
 ## Log directives
 
 Log directives control diagnostic output during transform execution:

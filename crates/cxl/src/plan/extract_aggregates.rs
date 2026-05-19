@@ -104,6 +104,14 @@ pub fn extract_aggregates(
                 // ExprStmt in aggregate mode is meaningless and
                 // already rejected upstream.
             }
+            Statement::EmitEach { span, .. } => {
+                // emit_each fan-out has no defined meaning at an aggregate
+                // boundary — finalize() emits one record per group, so a
+                // body Emit's fan-out shape cannot collapse onto a single
+                // group key. Reject at extraction time with the same
+                // shape `Distinct` uses.
+                diagnostics.push(diag_distinct_in_aggregate(*span));
+            }
         }
     }
 
@@ -194,6 +202,15 @@ fn extract_aggs_from_expr(
             for a in args {
                 extract_aggs_from_expr(a, bindings, dedup, input_schema)?;
             }
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            extract_aggs_from_expr(receiver, bindings, dedup, input_schema)?;
+            extract_aggs_from_expr(index, bindings, dedup, input_schema)?;
+        }
+        Expr::Closure { body, .. } => {
+            extract_aggs_from_expr(body, bindings, dedup, input_schema)?;
         }
         Expr::AggCall { .. }
         | Expr::Literal { .. }
@@ -339,6 +356,15 @@ fn rewrite_group_key_refs(
                 rewrite_group_key_refs(a, group_by_set, group_by_fields);
             }
         }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            rewrite_group_key_refs(receiver, group_by_set, group_by_fields);
+            rewrite_group_key_refs(index, group_by_set, group_by_fields);
+        }
+        Expr::Closure { body, .. } => {
+            rewrite_group_key_refs(body, group_by_set, group_by_fields);
+        }
         Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::Literal { .. }
@@ -425,6 +451,15 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
                 *expr = replacement.clone();
             }
         }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            substitute_let_bindings(receiver, let_bindings);
+            substitute_let_bindings(index, let_bindings);
+        }
+        Expr::Closure { body, .. } => {
+            substitute_let_bindings(body, let_bindings);
+        }
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
@@ -473,6 +508,10 @@ fn contains_agg_call(expr: &Expr) -> bool {
                     .unwrap_or(false)
         }
         Expr::WindowCall { args, .. } => args.iter().any(contains_agg_call),
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => contains_agg_call(receiver) || contains_agg_call(index),
+        Expr::Closure { body, .. } => contains_agg_call(body),
         Expr::Literal { .. }
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
@@ -651,6 +690,20 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
         }
         Expr::GroupKey { slot, .. } => {
             let _ = write!(buf, "k:{slot}");
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            buf.push_str("idx[");
+            write_struct_form(buf, receiver);
+            buf.push(',');
+            write_struct_form(buf, index);
+            buf.push(']');
+        }
+        Expr::Closure { param, body, .. } => {
+            let _ = write!(buf, "(\\{}=>", param);
+            write_struct_form(buf, body);
+            buf.push(')');
         }
     }
 }

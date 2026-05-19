@@ -1,6 +1,6 @@
 # Built-in Methods
 
-CXL provides 68 built-in scalar methods organized into 8 categories. Methods are called on a receiver value using dot notation: `receiver.method(args)`.
+CXL provides built-in scalar methods organized into categories. Methods are called on a receiver value using dot notation: `receiver.method(args)`.
 
 ## Null propagation
 
@@ -84,3 +84,24 @@ File path component extraction.
 | `extension` | File extension |
 | `parent` | Parent directory path |
 | `parent_name` | Parent directory name |
+
+### [Array Methods](builtins-array.md)
+
+Traversal and transformation over nested arrays. Closure-bearing methods take an arrow-syntax [closure](closures.md) and evaluate it per element.
+
+| Method | Description |
+|--------|-------------|
+| `filter`, `map`, `find`, `any`, `flat_map` | Closure-bearing traversal |
+| `remove` | Drop the element at a given index |
+| `length`, `join` | Cross-listed on arrays (also defined on strings) |
+
+### [Map Methods](builtins-map.md)
+
+Builders and accessors for `Value::Map` payloads. All map methods return new maps -- they never mutate the receiver.
+
+| Method | Description |
+|--------|-------------|
+| `keys`, `values` | List map keys / values as arrays |
+| `merge` | Union of two maps (right wins on conflict) |
+| `set` | Insert / replace a single entry |
+| `remove_field` | Drop a single entry by key |

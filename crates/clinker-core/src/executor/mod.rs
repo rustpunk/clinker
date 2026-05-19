@@ -61,6 +61,10 @@ pub struct TransformSpec {
     pub aggregate: Option<crate::config::AggregateConfig>,
     pub route: Option<crate::config::RouteConfig>,
     pub input: Option<crate::config::TransformInput>,
+    /// Per-record fan-out ceiling for `emit each` blocks inside this
+    /// transform. Threaded to the evaluator at construction time and
+    /// surfaces as a typed DLQ entry on overflow.
+    pub max_expansion: u64,
 }
 
 impl TransformSpec {
@@ -130,6 +134,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     aggregate: None,
                     route: None,
                     input: project_input(&header.input.value),
+                    max_expansion: body.max_expansion,
                 });
             }
             PipelineNode::Aggregate {
@@ -148,6 +153,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     }),
                     route: None,
                     input: project_input(&header.input.value),
+                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                 });
             }
             PipelineNode::Route {
@@ -172,6 +178,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         default: body.default.clone(),
                     }),
                     input: project_input(&header.input.value),
+                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                 });
             }
             _ => {}
@@ -429,6 +436,7 @@ impl RecordStorage for NullStorage {
 pub struct CompiledTransform {
     pub(crate) name: String,
     pub(crate) typed: Arc<TypedProgram>,
+    pub(crate) max_expansion: u64,
 }
 
 impl CompiledTransform {
@@ -476,7 +484,9 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, record, None)?
                     {
-                        EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
+                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
+                            return Ok(vec![branch.name.clone()]);
+                        }
                         EvalResult::Skip(_) => continue,
                     }
                 }
@@ -489,7 +499,9 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, record, None)?
                     {
-                        EvalResult::Emit { .. } => matched.push(branch.name.clone()),
+                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
+                            matched.push(branch.name.clone());
+                        }
                         EvalResult::Skip(_) => {}
                     }
                 }
@@ -727,6 +739,7 @@ impl PipelineExecutor {
                 Ok::<CompiledTransform, PipelineError>(CompiledTransform {
                     name: t.name.clone(),
                     typed,
+                    max_expansion: t.max_expansion,
                 })
             })
             .collect::<Result<_, _>>()?;
@@ -754,6 +767,7 @@ impl PipelineExecutor {
                     compiled_transforms.push(CompiledTransform {
                         name: n.to_string(),
                         typed: typed.clone(),
+                        max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                     });
                     existing_names.insert(n.to_string());
                 }
@@ -792,13 +806,14 @@ impl PipelineExecutor {
                         }
                     }
                     for ct in &compiled_transforms {
-                        for stmt in &ct.typed.program.statements {
-                            if let Statement::Emit { name, .. } = stmt
-                                && !emitted_fields.contains(&name.to_string())
-                            {
-                                emitted_fields.push(name.to_string());
-                            }
-                        }
+                        cxl::ast::for_each_field_emit(
+                            &ct.typed.program.statements,
+                            &mut |name, _| {
+                                if !emitted_fields.iter().any(|s| s == name) {
+                                    emitted_fields.push(name.to_string());
+                                }
+                            },
+                        );
                     }
                     // Combine nodes also emit fields via their `cxl:` body;
                     // those typed programs live in `artifacts.typed` keyed
@@ -815,13 +830,11 @@ impl PipelineExecutor {
                         if transform_names.contains(node_name.as_str()) {
                             continue;
                         }
-                        for stmt in &typed.program.statements {
-                            if let Statement::Emit { name, .. } = stmt
-                                && !emitted_fields.contains(&name.to_string())
-                            {
+                        cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+                            if !emitted_fields.iter().any(|s| s == name) {
                                 emitted_fields.push(name.to_string());
                             }
-                        }
+                        });
                     }
                     Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
                 }
@@ -875,14 +888,11 @@ impl PipelineExecutor {
                     if !body.name_to_idx.contains_key(n.as_str()) {
                         continue;
                     }
-                    for stmt in &typed.program.statements {
-                        if let Statement::Emit { name: en, .. } = stmt {
-                            let s = en.to_string();
-                            if !emitted_fields.contains(&s) {
-                                emitted_fields.push(s);
-                            }
+                    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+                        if !emitted_fields.iter().any(|s| s == name) {
+                            emitted_fields.push(name.to_string());
                         }
-                    }
+                    });
                 }
                 let cr = Self::compile_route(&route_config, &emitted_fields, &scoped_vars)?;
                 compiled_routes_by_name.insert(route_name.clone(), cr);
@@ -2804,7 +2814,7 @@ pub(crate) struct StreamingOutputSpec {
     /// Upstream `cxl_emit_names_in` result — passed to
     /// `project_output_from_record` so the streaming projection drops
     /// passthroughs the user didn't explicitly emit (matching the
-    /// buffered path's `include_widened: false` semantic).
+    /// buffered path's `include_unmapped: false` semantic).
     pub(crate) cxl_emit_names: Vec<String>,
 }
 
@@ -3170,9 +3180,21 @@ fn arcs_reachable_from(
 /// `group_by_indices`) rely on the upstream layout, so the widened
 /// schema preserves every upstream column at its original index.
 ///
-/// Returns `Ok((modified_record, Ok(())))` on emit,
-/// `Ok((record, Err(SkipReason)))` on skip. On error, returns
-/// `(transform_name, EvalError)`.
+/// Single emitted (or skipped) output of a per-record transform
+/// evaluation. The `Result<(), SkipReason>` distinguishes a real emit
+/// (`Ok(())`) from a `filter`/`distinct` skip; the leading `Record` is
+/// the output record (or the original record on Skip). One entry per
+/// emitted record under `emit each` fan-out.
+pub(crate) type TransformOutput = (Record, Result<(), SkipReason>);
+
+/// Error shape returned by [`evaluate_single_transform`] and
+/// [`evaluate_single_transform_windowed`] — pairs the transform name
+/// with the underlying [`cxl::eval::EvalError`] for DLQ classification.
+pub(crate) type TransformEvalError = (String, cxl::eval::EvalError);
+
+/// Returns a `Vec` of `(record, Ok | Skip)` entries — typically one
+/// entry per call, but `emit each` fan-out produces N entries from a
+/// single input record. On error, returns `(transform_name, EvalError)`.
 #[allow(clippy::result_large_err)]
 pub(crate) fn evaluate_single_transform(
     record: &Record,
@@ -3180,12 +3202,23 @@ pub(crate) fn evaluate_single_transform(
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
     _output_schema: &Arc<Schema>,
-) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+) -> Result<Vec<TransformOutput>, TransformEvalError> {
     let input = record;
-    match evaluator
+    let result = evaluator
         .eval_record::<NullStorage>(ctx, input, None)
-        .map_err(|e| (transform_name.to_string(), e))?
-    {
+        .map_err(|e| (transform_name.to_string(), e))?;
+    Ok(materialize_eval_result(input, result))
+}
+
+/// Convert an [`EvalResult`] into the per-record dispatch shape used
+/// by the executor: one `(Record, Ok)` per emitted body record, or a
+/// single `(Record, Skip)` entry on Filtered/Duplicate. The fan-out
+/// case applies emitted fields and record-var writes on a fresh
+/// `record_with_emitted_fields` projection of `input` once per
+/// `EmitOne`; downstream cursor advancement happens once per emitted
+/// record at the call site.
+fn materialize_eval_result(input: &Record, result: EvalResult) -> Vec<TransformOutput> {
+    match result {
         EvalResult::Emit {
             fields: emitted,
             record_vars,
@@ -3198,9 +3231,27 @@ pub(crate) fn evaluate_single_transform(
             for (key, value) in *record_vars {
                 let _ = out.set_record_var(&key, value);
             }
-            Ok((out, Ok(())))
+            vec![(out, Ok(()))]
         }
-        EvalResult::Skip(reason) => Ok((input.clone(), Err(reason))),
+        EvalResult::EmitMany { records } => {
+            let mut acc = Vec::with_capacity(records.len());
+            for rec in records {
+                let cxl::eval::EmitOne {
+                    fields: emitted,
+                    record_vars,
+                } = rec;
+                let mut out = record_with_emitted_fields(input, &emitted);
+                for (name, value) in &emitted {
+                    out.set(name, value.clone());
+                }
+                for (key, value) in *record_vars {
+                    let _ = out.set_record_var(&key, value);
+                }
+                acc.push((out, Ok(())));
+            }
+            acc
+        }
+        EvalResult::Skip(reason) => vec![(input.clone(), Err(reason))],
     }
 }
 
@@ -3237,7 +3288,7 @@ pub(crate) fn evaluate_single_transform_windowed(
     window_index: usize,
     runtime: &crate::executor::window_runtime::WindowRuntime,
     record_pos: u64,
-) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+) -> Result<Vec<TransformOutput>, TransformEvalError> {
     let spec = &plan.indices_to_build[window_index];
     let arena = runtime.arena.as_ref();
     let index = runtime.index.as_ref();
@@ -3273,23 +3324,7 @@ pub(crate) fn evaluate_single_transform_windowed(
             .map_err(|e| (transform_name.to_string(), e))?
     };
 
-    match result {
-        EvalResult::Emit {
-            fields: emitted,
-            record_vars,
-            ..
-        } => {
-            let mut out = record_with_emitted_fields(record, &emitted);
-            for (name, value) in &emitted {
-                out.set(name, value.clone());
-            }
-            for (key, value) in *record_vars {
-                let _ = out.set_record_var(&key, value);
-            }
-            Ok((out, Ok(())))
-        }
-        EvalResult::Skip(reason) => Ok((record.clone(), Err(reason))),
-    }
+    Ok(materialize_eval_result(record, result))
 }
 
 /// Re-project `input` onto `target`: allocate a fresh `Record` whose

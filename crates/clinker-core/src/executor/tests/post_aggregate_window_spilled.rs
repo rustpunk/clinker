@@ -62,7 +62,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // Build a CSV with 50 distinct departments × 4 rows each so the
     // aggregator's group state is non-trivial and emit order is hash-

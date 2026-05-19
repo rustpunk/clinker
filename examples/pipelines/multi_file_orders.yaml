@@ -37,4 +37,4 @@ nodes:
       name: out
       type: csv
       path: out_all.csv
-      include_widened: true
+      include_unmapped: true

@@ -110,7 +110,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let input_data = ndjson_input(&[
         serde_json::json!({"name": "Alice", "age": "30"}),
@@ -154,7 +154,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let input_data = xml_input(
         "records",
@@ -200,7 +200,7 @@ nodes:
     path: output.json
     options:
       format: ndjson
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -249,7 +249,7 @@ nodes:
     options:
       root_element: records
       record_element: record
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -304,7 +304,7 @@ nodes:
     path: output.json
     options:
       format: ndjson
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv_input = "id,value\n1,alpha\n2,beta\n3,gamma\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -347,7 +347,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -399,7 +399,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
     let (counters, dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
@@ -445,7 +445,7 @@ nodes:
       - name: age
         type: integer
         width: 5
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());

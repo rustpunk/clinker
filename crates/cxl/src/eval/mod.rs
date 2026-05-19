@@ -18,6 +18,11 @@ use crate::typecheck::pass::TypedProgram;
 pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
 pub use error::{EvalError, EvalErrorKind, extract_triggering_value};
 
+/// Default per-record fan-out ceiling for `emit each` blocks when the
+/// transform's YAML config does not set one explicitly. Matches the
+/// default in `clinker_core::config::pipeline_node::TransformBody`.
+pub const DEFAULT_MAX_EXPANSION: u64 = 10_000;
+
 /// Row disposition signal from CXL evaluation.
 ///
 /// Returned by `ProgramEvaluator::eval_record()` and consumed by
@@ -37,15 +42,40 @@ pub enum EvalResult {
         fields: indexmap::IndexMap<String, Value>,
         record_vars: Box<indexmap::IndexMap<String, Value>>,
     },
+    /// Multiple records emitted from a single input via `emit each`
+    /// fan-out. Each record carries its own field map and record-var
+    /// writes, mirroring `Emit`'s per-record shape. Consumers iterate
+    /// over `records` and push each onto their output buffer.
+    EmitMany { records: Vec<EmitOne> },
     /// Record should be excluded from output.
     Skip(SkipReason),
 }
 
+/// One emitted record produced by an `emit each` body iteration.
+/// Carries the same field map / record-var slot shape as a plain
+/// `EvalResult::Emit`. Boxed inside `EmitMany` to keep that variant's
+/// stack size small while still allowing the fan-out path to gather
+/// many records before the consumer unpacks.
+#[derive(Debug)]
+pub struct EmitOne {
+    pub fields: indexmap::IndexMap<String, Value>,
+    pub record_vars: Box<indexmap::IndexMap<String, Value>>,
+}
+
 impl EvalResult {
-    /// Convenience: unwrap the emitted fields (panics on Skip).
+    /// Convenience: unwrap the emitted fields (panics on Skip / EmitMany).
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`EvalResult::Skip`] or [`EvalResult::EmitMany`].
+    /// `EmitMany` callers must unpack the multi-record fan-out before
+    /// reducing to a single field map.
     pub fn into_fields(self) -> indexmap::IndexMap<String, Value> {
         match self {
             EvalResult::Emit { fields, .. } => fields,
+            EvalResult::EmitMany { .. } => {
+                panic!("called into_fields on EmitMany; unpack the records first")
+            }
             EvalResult::Skip(_) => panic!("called into_fields on Skip"),
         }
     }
@@ -62,6 +92,21 @@ pub enum SkipReason {
 
 /// Stateful CXL evaluator wrapping a compiled program.
 ///
+/// Bundle of the immutable references the evaluator threads through
+/// every recursive descent: the typed program (for node-id-keyed type
+/// and regex tables), the per-record `EvalContext` (source/row/vars),
+/// the field resolver (record-field lookup), and the optional window
+/// context (analytic-window-scoped reads). The mutable `env`
+/// (let-binding scratch) stays separate so the mutation contract is
+/// explicit at every call site.
+#[derive(Copy, Clone)]
+struct EvalEnv<'a, 'w, S: RecordStorage + 'w> {
+    typed: &'a TypedProgram,
+    ctx: &'a EvalContext<'a>,
+    resolver: &'a dyn FieldResolver,
+    window: Option<&'a dyn WindowContext<'w, S>>,
+}
+
 /// Owns the `TypedProgram` and optional distinct dedup state. One evaluator
 /// per transform per partition/thread — never Clone, use factory construction.
 /// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
@@ -73,12 +118,31 @@ pub struct ProgramEvaluator {
     current_partition_key: Option<Vec<GroupByKey>>,
     /// Whether this program has any distinct statements.
     has_distinct: bool,
+    /// Cap on records produced by a single per-record evaluation via
+    /// `emit each` fan-out. When the running count of body emits
+    /// exceeds this value, the originating record is routed to DLQ
+    /// (`DlqErrorCategory::ExpansionLimitExceeded`). Mirrors the
+    /// transform's YAML `max_expansion` setting (default 10_000).
+    max_expansion: u64,
 }
 
 impl ProgramEvaluator {
     /// Create a new evaluator for the given program.
     /// `has_distinct` controls whether the distinct HashSet is allocated.
     pub fn new(typed: Arc<TypedProgram>, has_distinct: bool) -> Self {
+        Self::with_max_expansion(typed, has_distinct, DEFAULT_MAX_EXPANSION)
+    }
+
+    /// Create a new evaluator with an explicit `max_expansion` ceiling.
+    /// Callers that thread the transform's YAML-configured cap (typically
+    /// `clinker-core::config::pipeline_node::TransformBody::max_expansion`)
+    /// use this constructor; tests and code paths that never use
+    /// `emit each` may keep the default via [`Self::new`].
+    pub fn with_max_expansion(
+        typed: Arc<TypedProgram>,
+        has_distinct: bool,
+        max_expansion: u64,
+    ) -> Self {
         Self {
             typed,
             distinct_seen: if has_distinct {
@@ -88,6 +152,7 @@ impl ProgramEvaluator {
             },
             current_partition_key: None,
             has_distinct,
+            max_expansion,
         }
     }
 
@@ -161,11 +226,28 @@ impl ProgramEvaluator {
         let mut env: HashMap<String, Value> = HashMap::new();
         let mut output = indexmap::IndexMap::new();
         let mut record_var_writes: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        // Fan-out accumulator: populated by `emit each` blocks. When
+        // non-empty at end-of-program, the evaluator returns
+        // `EvalResult::EmitMany` with these records (plus any
+        // trailing top-level `emit name = ...` writes folded into
+        // each emitted record's `fields` map). `expansion_count`
+        // tracks the running fan-out cardinality so the per-record
+        // `max_expansion` ceiling can route oversized expansions to
+        // DLQ before unbounded work happens.
+        let mut fan_out: Vec<EmitOne> = Vec::new();
+        let mut expansion_count: u64 = 0;
 
-        for stmt in &self.typed.program.statements {
+        // Index-loop over statements rather than `for stmt in &...` —
+        // the `emit each` arm needs `&mut self` to call its body
+        // walker, which conflicts with the immutable iterator borrow.
+        // Cloning the Arc<TypedProgram> bumps a refcount once but lets
+        // each arm reborrow from the cloned handle without contending
+        // for the inner borrow on `self.typed`.
+        let typed = Arc::clone(&self.typed);
+        for stmt in &typed.program.statements {
             match stmt {
                 Statement::Filter { predicate, .. } => {
-                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &mut env)?;
                     if val != Value::Bool(true) {
                         return Ok(EvalResult::Skip(SkipReason::Filtered));
                     }
@@ -181,20 +263,19 @@ impl ProgramEvaluator {
                     }
                 }
                 Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
                     env.insert(name.to_string(), val);
                 }
                 Statement::Emit {
                     name, expr, target, ..
                 } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env).map_err(
-                        |mut e| {
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)
+                        .map_err(|mut e| {
                             if e.triggering_field.is_none() {
                                 e.triggering_field = Some(Arc::from(&**name));
                             }
                             e
-                        },
-                    )?;
+                        })?;
                     match target {
                         EmitTarget::Field => {
                             output.insert(name.to_string(), val);
@@ -218,14 +299,14 @@ impl ProgramEvaluator {
                 } => {
                     let should_trace = if let Some(g) = guard {
                         matches!(
-                            eval_expr(g, &self.typed, ctx, resolver, window, &env)?,
+                            eval_expr(g, &self.typed, ctx, resolver, window, &mut env)?,
                             Value::Bool(true)
                         )
                     } else {
                         true
                     };
                     if should_trace {
-                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &env)?;
+                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &mut env)?;
                         let msg_str = match &msg {
                             Value::String(s) => s.to_string(),
                             other => format!("{:?}", other),
@@ -261,14 +342,165 @@ impl ProgramEvaluator {
                 }
                 Statement::UseStmt { .. } => {}
                 Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
+                }
+                Statement::EmitEach { .. } => {
+                    // Statement borrow into self.typed.program would conflict
+                    // with `&mut self` inside the body walker; the body is
+                    // hoisted out by pointer here so the iterator can be
+                    // dropped before the body walker re-borrows self.
+                    let (binding_name, source_expr, body_stmts, span_val) = match stmt {
+                        Statement::EmitEach {
+                            binding,
+                            source,
+                            body,
+                            span,
+                            ..
+                        } => (binding.clone(), source.clone(), body.clone(), *span),
+                        _ => unreachable!(),
+                    };
+                    let source_val =
+                        eval_expr(&source_expr, &self.typed, ctx, resolver, window, &mut env)?;
+                    let elements = match source_val {
+                        Value::Array(arr) => arr,
+                        Value::Null => continue,
+                        other => {
+                            return Err(EvalError::new(
+                                EvalErrorKind::TypeMismatch {
+                                    expected: "Array",
+                                    got: other.type_name(),
+                                },
+                                span_val,
+                            ));
+                        }
+                    };
+                    for element in elements {
+                        if expansion_count >= self.max_expansion {
+                            return Err(EvalError::new(
+                                EvalErrorKind::ExpansionLimitExceeded {
+                                    limit: self.max_expansion,
+                                },
+                                span_val,
+                            ));
+                        }
+                        env.insert(binding_name.to_string(), element);
+                        let mut iter_fields = indexmap::IndexMap::new();
+                        let mut iter_record_vars: indexmap::IndexMap<String, Value> =
+                            indexmap::IndexMap::new();
+                        // Seed each iteration with any field-target
+                        // emits already produced before this fan-out:
+                        // top-level `emit name = ...` writes prior to
+                        // the `emit each` block apply to every emitted
+                        // record.
+                        for (k, v) in &output {
+                            iter_fields.insert(k.clone(), v.clone());
+                        }
+                        for (k, v) in &record_var_writes {
+                            iter_record_vars.insert(k.clone(), v.clone());
+                        }
+                        let eval_env = EvalEnv {
+                            typed: &self.typed,
+                            ctx,
+                            resolver,
+                            window,
+                        };
+                        Self::eval_emit_each_body(
+                            &body_stmts,
+                            eval_env,
+                            &mut env,
+                            &mut iter_fields,
+                            &mut iter_record_vars,
+                        )?;
+                        env.remove(binding_name.as_ref());
+                        fan_out.push(EmitOne {
+                            fields: iter_fields,
+                            record_vars: Box::new(iter_record_vars),
+                        });
+                        expansion_count += 1;
+                    }
                 }
             }
         }
-        Ok(EvalResult::Emit {
-            fields: output,
-            record_vars: Box::new(record_var_writes),
-        })
+        if !fan_out.is_empty() {
+            Ok(EvalResult::EmitMany { records: fan_out })
+        } else {
+            Ok(EvalResult::Emit {
+                fields: output,
+                record_vars: Box::new(record_var_writes),
+            })
+        }
+    }
+
+    /// Evaluate the body statements of an `emit each` block once with
+    /// the binding already inserted into `env`. Mirrors a stripped-down
+    /// version of [`Self::eval_record_inner`] — body statements may
+    /// not be `EmitEach` (parser enforces no nesting) or `Filter` /
+    /// `Distinct` (a fan-out block applies once per outer record, so a
+    /// body filter/distinct would silently divide work between
+    /// branches the engine can't represent; reject at runtime as a
+    /// type-mismatch surfaced through the boundary `map_err`).
+    fn eval_emit_each_body<'w, S: RecordStorage + 'w>(
+        body: &[Statement],
+        eval_env: EvalEnv<'_, 'w, S>,
+        env: &mut HashMap<String, Value>,
+        fields: &mut indexmap::IndexMap<String, Value>,
+        record_vars: &mut indexmap::IndexMap<String, Value>,
+    ) -> Result<(), EvalError> {
+        let EvalEnv {
+            typed,
+            ctx,
+            resolver,
+            window,
+        } = eval_env;
+        for stmt in body {
+            match stmt {
+                Statement::Let { name, expr, .. } => {
+                    let val = eval_expr(expr, typed, ctx, resolver, window, env)?;
+                    env.insert(name.to_string(), val);
+                }
+                Statement::Emit {
+                    name, expr, target, ..
+                } => {
+                    let val =
+                        eval_expr(expr, typed, ctx, resolver, window, env).map_err(|mut e| {
+                            if e.triggering_field.is_none() {
+                                e.triggering_field = Some(Arc::from(&**name));
+                            }
+                            e
+                        })?;
+                    match target {
+                        EmitTarget::Field => {
+                            fields.insert(name.to_string(), val);
+                        }
+                        EmitTarget::Pipeline => {
+                            ctx.stable.set_pipeline_var(name, val);
+                        }
+                        EmitTarget::Source => {
+                            ctx.stable.set_source_var(ctx.source_file, name, val);
+                        }
+                        EmitTarget::Record => {
+                            record_vars.insert(name.to_string(), val);
+                        }
+                    }
+                }
+                Statement::Trace { .. } | Statement::UseStmt { .. } => {}
+                Statement::ExprStmt { expr, .. } => {
+                    eval_expr(expr, typed, ctx, resolver, window, env)?;
+                }
+                Statement::Filter { .. }
+                | Statement::Distinct { .. }
+                | Statement::EmitEach { .. } => {
+                    return Err(EvalError::new(
+                        EvalErrorKind::TypeMismatch {
+                            expected: "let / emit / trace inside emit each body",
+                            got: "filter / distinct / nested emit_each",
+                        },
+                        stmt_span(stmt),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Build the distinct key for a record.
@@ -311,6 +543,123 @@ impl ProgramEvaluator {
     }
 }
 
+/// Dispatch a closure-bearing array method (`filter`/`map`/`find`/
+/// `any`/`flat_map`). The closure argument's body is evaluated once
+/// per array element with the closure parameter inserted into `env`
+/// (and removed after each iteration so the env is left undisturbed
+/// for the caller). Non-array receivers fall through to `Null`.
+fn dispatch_closure_method<'w, S: RecordStorage + 'w>(
+    receiver: &Value,
+    method: &str,
+    args: &[Expr],
+    span: Span,
+    eval_env: EvalEnv<'_, 'w, S>,
+    env: &mut HashMap<String, Value>,
+) -> Result<Value, EvalError> {
+    let EvalEnv {
+        typed,
+        ctx,
+        resolver,
+        window,
+    } = eval_env;
+    // Null receivers short-circuit to Null for every closure-bearing
+    // builtin — mirrors the null-propagation policy in
+    // `dispatch_method`.
+    if receiver.is_null() {
+        return Ok(Value::Null);
+    }
+    let elements = match receiver {
+        Value::Array(arr) => arr,
+        _ => return Ok(Value::Null),
+    };
+    let closure = match args.first() {
+        Some(Expr::Closure { param, body, .. }) => (param.clone(), body.as_ref()),
+        _ => {
+            return Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "closure argument (`it => ...`)",
+                    got: "non-closure argument",
+                },
+                span,
+            ));
+        }
+    };
+    let (param_name, body) = closure;
+
+    // Per-iteration insert+remove on the SHARED `env` keeps the
+    // closure-body eval allocation-free on the closure side — the
+    // body's own subexpressions still allocate their results as
+    // before.
+    let previous = env.remove(param_name.as_ref());
+    let mut output: Vec<Value> = Vec::new();
+    let mut found: Option<Value> = None;
+    let mut found_any: bool = false;
+
+    for element in elements {
+        env.insert(param_name.to_string(), element.clone());
+        let body_val = eval_expr(body, typed, ctx, resolver, window, env);
+        // Always remove the binding to keep env clean even on error.
+        env.remove(param_name.as_ref());
+        let body_val = body_val?;
+        match method {
+            "filter" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    output.push(element.clone());
+                }
+            }
+            "map" => {
+                output.push(body_val);
+            }
+            "find" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    found = Some(element.clone());
+                    break;
+                }
+            }
+            "any" => {
+                if matches!(body_val, Value::Bool(true)) {
+                    found_any = true;
+                    break;
+                }
+            }
+            "flat_map" => match body_val {
+                Value::Array(inner) => output.extend(inner),
+                Value::Null => {}
+                other => output.push(other),
+            },
+            _ => unreachable!("dispatch_closure_method gated by method name"),
+        }
+    }
+
+    if let Some(prev) = previous {
+        env.insert(param_name.to_string(), prev);
+    }
+
+    Ok(match method {
+        "filter" | "map" | "flat_map" => Value::Array(output),
+        "find" => found.unwrap_or(Value::Null),
+        "any" => Value::Bool(found_any),
+        _ => unreachable!(),
+    })
+}
+
+/// Recover the span of a [`Statement`] variant. Used inside
+/// `emit each` body validation to anchor a runtime error on the
+/// offending body statement when its variant is forbidden inside the
+/// block.
+fn stmt_span(stmt: &Statement) -> Span {
+    match stmt {
+        Statement::Let { span, .. }
+        | Statement::Emit { span, .. }
+        | Statement::Trace { span, .. }
+        | Statement::UseStmt { span, .. }
+        | Statement::ExprStmt { span, .. }
+        | Statement::Filter { span, .. }
+        | Statement::Distinct { span, .. }
+        | Statement::EmitEach { span, .. } => *span,
+    }
+}
+
 /// Convert a GroupKeyError to an EvalError.
 fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
     let got = match &e {
@@ -340,11 +689,11 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
     for stmt in &typed.program.statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
                 env.insert(name.to_string(), val);
             }
             Statement::Emit { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
                 output.insert(name.to_string(), val);
             }
             Statement::Trace {
@@ -355,14 +704,14 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             } => {
                 let should_trace = if let Some(g) = guard {
                     matches!(
-                        eval_expr(g, typed, ctx, resolver, window, &env)?,
+                        eval_expr(g, typed, ctx, resolver, window, &mut env)?,
                         Value::Bool(true)
                     )
                 } else {
                     true
                 };
                 if should_trace {
-                    let msg = eval_expr(message, typed, ctx, resolver, window, &env)?;
+                    let msg = eval_expr(message, typed, ctx, resolver, window, &mut env)?;
                     let msg_str = match &msg {
                         Value::String(s) => s.to_string(),
                         other => format!("{:?}", other),
@@ -398,11 +747,18 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             }
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
             Statement::ExprStmt { expr, .. } => {
-                eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                eval_expr(expr, typed, ctx, resolver, window, &mut env)?;
             }
             Statement::Filter { .. } | Statement::Distinct { .. } => {
                 // Handled by ProgramEvaluator::eval_record(). eval_program()
                 // is the legacy path — these statements are no-ops here.
+            }
+            Statement::EmitEach { .. } => {
+                // Fan-out belongs to the stateful row-level path; the
+                // legacy `eval_program` entry point predates this and
+                // is preserved for the aggregate-finalize callsite that
+                // never sees emit_each (the typecheck rejects emit_each
+                // inside aggregate transforms).
             }
         }
     }
@@ -411,13 +767,19 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
 }
 
 /// Evaluate a single expression.
+///
+/// `env` is `&mut HashMap<String, Value>` so the closure-bearing
+/// builtin dispatcher can insert the closure parameter for the body
+/// walk and remove it afterward — the design's no-clone invariant
+/// requires direct mutation rather than per-iteration env copies.
+/// Non-closure call sites pass the same env unchanged.
 pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
     typed: &TypedProgram,
     ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
-    env: &HashMap<String, Value>,
+    env: &mut HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
@@ -651,6 +1013,32 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
 
             let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env)?;
+
+            // Closure-bearing array builtins: dispatch with the raw
+            // argument exprs so the closure body can re-evaluate per
+            // iteration with the closure parameter bound. Per-iteration
+            // binding goes through the shared env via insert+remove —
+            // no per-iteration env clone. `find` overloads with the
+            // string-regex variant: dispatch by receiver-Closure-arg
+            // shape so a `.find("pattern")` on a string still routes
+            // through the regex form below.
+            if matches!(
+                method.as_ref(),
+                "filter" | "map" | "find" | "any" | "flat_map"
+            ) && args
+                .first()
+                .map(|a| matches!(a, Expr::Closure { .. }))
+                .unwrap_or(false)
+            {
+                let eval_env = EvalEnv {
+                    typed,
+                    ctx,
+                    resolver,
+                    window,
+                };
+                return dispatch_closure_method(&recv_val, method, args, *span, eval_env, env);
+            }
+
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
                 arg_vals.push(eval_expr(arg, typed, ctx, resolver, window, env)?);
@@ -875,6 +1263,48 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             },
             *span,
         )),
+
+        // Bracket-index access dispatches by receiver value type:
+        // integer indices apply to `Value::Array`; string indices to
+        // `Value::Map`. Out-of-bounds / type mismatch return Null so
+        // downstream coalesce / filter sees a well-typed nullable.
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            let recv = eval_expr(receiver, typed, ctx, resolver, window, env)?;
+            if recv.is_null() {
+                return Ok(Value::Null);
+            }
+            let idx_val = eval_expr(index, typed, ctx, resolver, window, env)?;
+            Ok(match (&recv, &idx_val) {
+                (Value::Array(arr), Value::Integer(i)) => {
+                    if *i < 0 {
+                        Value::Null
+                    } else {
+                        arr.get(*i as usize).cloned().unwrap_or(Value::Null)
+                    }
+                }
+                (Value::Map(m), Value::String(key)) => {
+                    m.get(key.as_ref()).cloned().unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            })
+        }
+
+        // Closures only evaluate inside method-call dispatch (`filter`,
+        // `map`, etc.) — the call site introduces the closure
+        // parameter into env and recursively evaluates the body. A
+        // closure reaching here means it appeared in a context other
+        // than a closure-bearing builtin, which the resolve pass
+        // rejects upstream; surface a typed error to keep the data
+        // path strict.
+        Expr::Closure { span, .. } => Err(EvalError::new(
+            EvalErrorKind::TypeMismatch {
+                expected: "closure-bearing method argument",
+                got: "free-standing closure",
+            },
+            *span,
+        )),
     }
 }
 
@@ -888,7 +1318,7 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
     ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
-    env: &HashMap<String, Value>,
+    env: &mut HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     // Three-valued AND/OR: short-circuit before evaluating RHS
     match op {

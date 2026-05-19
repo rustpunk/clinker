@@ -1061,6 +1061,17 @@ fn accumulate_program_support(program: &cxl::ast::Program, set: &mut HashSet<Str
             }
             Statement::ExprStmt { expr, .. } => expr.support_into(set),
             Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+            Statement::EmitEach { source, body, .. } => {
+                source.support_into(set);
+                // Recurse via a fresh Program-shaped wrapper so the
+                // same statement walker covers body statements
+                // without duplicating the per-statement match.
+                let inner = cxl::ast::Program {
+                    statements: body.clone(),
+                    span: cxl::lexer::Span::new(0, 0),
+                };
+                accumulate_program_support(&inner, set);
+            }
         }
     }
 }
@@ -1297,7 +1308,7 @@ fn output_consumed_columns(
                 set.insert(src_col.clone());
             }
         }
-        if cfg.include_widened {
+        if cfg.include_unmapped {
             for col in &upstream_cols {
                 set.insert(col.clone());
             }
@@ -1307,7 +1318,7 @@ fn output_consumed_columns(
                 set.remove(ex);
             }
         }
-        if !cfg.include_widened && cfg.mapping.is_none() {
+        if !cfg.include_unmapped && cfg.mapping.is_none() {
             // No mapping declared and unmapped not included — nothing
             // gets written, but the seed must not be empty: the buffer
             // schema invariant requires at least the producer emits to

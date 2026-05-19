@@ -50,6 +50,11 @@ pub struct Parser {
     errors: Vec<ParseError>,
     depth: u32,
     next_id: u32,
+    /// Tracks whether parser is currently inside the body of an
+    /// `emit each` block. Nested `emit each` is forbidden so the
+    /// per-record fan-out remains a single flat expansion; the
+    /// `max_expansion` ceiling is the only gate on output cardinality.
+    in_emit_each: bool,
 }
 
 // Binding power pairs (left_bp, right_bp).
@@ -68,6 +73,9 @@ fn infix_bp(tok: &Token) -> Option<(u8, u8)> {
         Token::Plus | Token::Minus => Some((13, 14)),
         Token::Star | Token::Slash | Token::Percent => Some((15, 16)),
         Token::Dot => Some((19, 20)), // postfix field/method, tightest
+        // Bracket-index access mirrors postfix-dot precedence so chains
+        // like `record.field[0]` and `arr[0].name` parse without parens.
+        Token::LBracket => Some((19, 20)),
         _ => None,
     }
 }
@@ -115,6 +123,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
+            in_emit_each: false,
         };
         let start_span = parser.current_span();
         let mut statements = Vec::new();
@@ -171,6 +180,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
+            in_emit_each: false,
         };
         let start_span = parser.current_span();
         let mut functions = Vec::new();
@@ -343,6 +353,15 @@ impl Parser {
         let start = self.current_span();
         self.advance(); // consume 'emit'
 
+        // Detect `emit each <binding> in <source> { <body> }` — fan-out
+        // form. Matches identifier "each" via lookahead because `each`
+        // is not a reserved keyword (it is only meaningful after `emit`).
+        if let Token::Ident(name) = self.peek()
+            && name.as_ref() == "each"
+        {
+            return self.parse_emit_each(nid, start);
+        }
+
         // Detect `emit $<ns>.field = expr`. Allowed namespaces:
         // - `meta`: per-record metadata sidecar (deleted in Stage 6).
         // - `pipeline` / `source` / `record`: producer-declared scoped
@@ -403,6 +422,89 @@ impl Parser {
             expr,
             target,
             span: Span::new(start.start as usize, end.end as usize),
+        })
+    }
+
+    /// Parse `emit each <binding> in <source> { <body> }`. Called from
+    /// [`Self::parse_emit`] after the `each` keyword has been peeked
+    /// (but not consumed). `nid` and `start` are taken from the parent's
+    /// allocator so the resulting `Statement::EmitEach` carries the
+    /// same NodeId/Span origin as a plain `emit`.
+    fn parse_emit_each(&mut self, nid: NodeId, start: Span) -> Result<Statement, ParseError> {
+        if self.in_emit_each {
+            return Err(self.error(
+                "emit_each cannot be nested inside another emit_each",
+                "Nested fan-out would compound expansion ratios without a clear cardinality bound — the per-record max_expansion limit governs flat fan-out only",
+                "Flatten the producer (e.g. precompute the cross product into a single array) and emit once",
+            ));
+        }
+
+        self.advance(); // consume 'each' ident
+        // Accept either a plain identifier or the `it` keyword token as
+        // the binding name — the closure surface uses `it` for the
+        // closure parameter and the emit_each binding convention is the
+        // same.
+        let binding = match self.peek().clone() {
+            Token::Ident(name) => {
+                self.advance();
+                name.to_string()
+            }
+            Token::It => {
+                self.advance();
+                "it".to_string()
+            }
+            other => {
+                return Err(self.error(
+                    &format!(
+                        "expected emit_each binding name (identifier), got {:?}",
+                        other
+                    ),
+                    "emit_each binds an iterator variable; `it` is the conventional name",
+                    "Use an identifier (or `it`) as the binding name",
+                ));
+            }
+        };
+        // The `in` separator is an identifier (CXL has no `in` keyword);
+        // accept the literal text "in" to keep the grammar surface from
+        // adding another reserved word.
+        match self.peek().clone() {
+            Token::Ident(name) if name.as_ref() == "in" => {
+                self.advance();
+            }
+            other => {
+                return Err(self.error(
+                    &format!("expected 'in' between binding and source, got {:?}", other),
+                    "emit_each grammar is `emit each <binding> in <source> { <body> }`",
+                    "Insert 'in' between the binding identifier and the source expression",
+                ));
+            }
+        }
+        let source = self.parse_expr(0)?;
+        self.expect_token(&Token::LBrace, "'{'")?;
+
+        self.in_emit_each = true;
+        let mut body = Vec::new();
+        self.skip_newlines();
+        while *self.peek() != Token::RBrace && !self.at_eof() {
+            match self.parse_statement() {
+                Ok(stmt) => body.push(stmt),
+                Err(e) => {
+                    self.in_emit_each = false;
+                    return Err(e);
+                }
+            }
+            self.skip_newlines();
+        }
+        self.in_emit_each = false;
+        let end_span = self.current_span();
+        self.expect_token(&Token::RBrace, "'}'")?;
+
+        Ok(Statement::EmitEach {
+            node_id: nid,
+            binding: binding.into(),
+            source,
+            body,
+            span: Span::new(start.start as usize, end_span.end as usize),
         })
     }
 
@@ -668,10 +770,37 @@ impl Parser {
                     ));
                 }
 
+                // LBracket: postfix bracket-index access for arrays and
+                // maps. Mirrors Dot's precedence so `arr[0].name` and
+                // `record.field[0]` parse without parens. The receiver
+                // is the existing `lhs`; the index expression is parsed
+                // at BP 0 (full expression), then `]` closes it.
+                if tok == Token::LBracket {
+                    self.advance(); // consume '['
+                    let lhs_span = lhs.span();
+                    let index = self.parse_expr(0)?;
+                    self.expect_token(&Token::RBracket, "']'")?;
+                    let end = self.prev_span();
+                    let nid = self.alloc_id();
+                    lhs = Expr::IndexAccess {
+                        node_id: nid,
+                        receiver: Box::new(lhs),
+                        index: Box::new(index),
+                        span: Span::new(lhs_span.start as usize, end.end as usize),
+                    };
+                    continue;
+                }
+
                 // Dot: postfix field access or method call
                 if tok == Token::Dot {
                     self.advance(); // consume '.'
-                    let method_name = self.expect_ident("field or method name")?;
+                    // Accept identifiers AND keyword tokens that double
+                    // as method names (`filter`, `distinct`, `match`,
+                    // `not`, `it`, etc.) — the lexer eagerly produces
+                    // keyword tokens for those reserved words, but in
+                    // method-call position any of them should bind as
+                    // the method name string.
+                    let method_name = self.expect_ident_or_keyword("field or method name")?;
                     let lhs_span = lhs.span();
 
                     if *self.peek() == Token::LParen {
@@ -1127,14 +1256,38 @@ impl Parser {
     fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         if *self.peek() != Token::RParen {
-            args.push(self.parse_expr(0)?);
+            args.push(self.parse_arg_or_closure()?);
             while *self.peek() == Token::Comma {
                 self.advance();
-                args.push(self.parse_expr(0)?);
+                args.push(self.parse_arg_or_closure()?);
             }
         }
         self.expect_token(&Token::RParen, "')'")?;
         Ok(args)
+    }
+
+    /// Parse a single argument inside a method call's argument list.
+    /// Detects the `it => body` closure shape via two-token lookahead;
+    /// otherwise falls back to a regular expression. The closure body
+    /// is a single expression at full BP — block-bodied closures are
+    /// not part of the surface map.
+    fn parse_arg_or_closure(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), Token::It) && matches!(self.peek_ahead(1), Token::FatArrow) {
+            let nid = self.alloc_id();
+            let start = self.current_span();
+            self.advance(); // consume `it`
+            self.advance(); // consume `=>`
+            let body = self.parse_expr(0)?;
+            let end = body.span();
+            Ok(Expr::Closure {
+                node_id: nid,
+                param: "it".into(),
+                body: Box::new(body),
+                span: Span::new(start.start as usize, end.end as usize),
+            })
+        } else {
+            self.parse_expr(0)
+        }
     }
 
     /// Parse a free-standing aggregate function call: `name(args...)`.
@@ -1274,6 +1427,108 @@ impl Parser {
         }
     }
 
+    /// Like [`Self::expect_ident`] but additionally accepts keyword
+    /// tokens whose lexeme overlaps with a method name (`filter`,
+    /// `distinct`, `match`, `it`, etc.). Used in method-call position
+    /// so user-visible methods named after reserved words still parse.
+    fn expect_ident_or_keyword(&mut self, context: &str) -> Result<String, ParseError> {
+        let tok = self.peek().clone();
+        match tok {
+            Token::Ident(name) => {
+                self.advance();
+                Ok(name.to_string())
+            }
+            // Map reserved-word tokens back to their lexeme. The lexer's
+            // keyword table is the source of truth; this list mirrors
+            // it for tokens that double as method names in source.
+            Token::Let => {
+                self.advance();
+                Ok("let".to_string())
+            }
+            Token::Emit => {
+                self.advance();
+                Ok("emit".to_string())
+            }
+            Token::If => {
+                self.advance();
+                Ok("if".to_string())
+            }
+            Token::Then => {
+                self.advance();
+                Ok("then".to_string())
+            }
+            Token::Else => {
+                self.advance();
+                Ok("else".to_string())
+            }
+            Token::And => {
+                self.advance();
+                Ok("and".to_string())
+            }
+            Token::Or => {
+                self.advance();
+                Ok("or".to_string())
+            }
+            Token::Not => {
+                self.advance();
+                Ok("not".to_string())
+            }
+            Token::Match => {
+                self.advance();
+                Ok("match".to_string())
+            }
+            Token::Use => {
+                self.advance();
+                Ok("use".to_string())
+            }
+            Token::As => {
+                self.advance();
+                Ok("as".to_string())
+            }
+            Token::Fn => {
+                self.advance();
+                Ok("fn".to_string())
+            }
+            Token::Trace => {
+                self.advance();
+                Ok("trace".to_string())
+            }
+            Token::Null => {
+                self.advance();
+                Ok("null".to_string())
+            }
+            Token::True => {
+                self.advance();
+                Ok("true".to_string())
+            }
+            Token::False => {
+                self.advance();
+                Ok("false".to_string())
+            }
+            Token::Now => {
+                self.advance();
+                Ok("now".to_string())
+            }
+            Token::It => {
+                self.advance();
+                Ok("it".to_string())
+            }
+            Token::Filter => {
+                self.advance();
+                Ok("filter".to_string())
+            }
+            Token::Distinct => {
+                self.advance();
+                Ok("distinct".to_string())
+            }
+            Token::By => {
+                self.advance();
+                Ok("by".to_string())
+            }
+            _ => self.expect_ident(context),
+        }
+    }
+
     fn recover_to_newline(&mut self) {
         while !self.at_eof() && *self.peek() != Token::Newline {
             self.advance();
@@ -1408,7 +1663,7 @@ mod tests {
     /// in expression position via the catch-all "unknown system
     /// namespace" path. The typechecker is blind to the sidecar's
     /// keys; users who need an absorbed input field at output
-    /// time set `include_widened: true` on the Output node and the
+    /// time set `include_unmapped: true` on the Output node and the
     /// projection layer expands the map to top-level columns.
     #[test]
     fn test_parse_rejects_widened_in_read_position() {

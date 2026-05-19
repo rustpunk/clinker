@@ -95,6 +95,56 @@ pub enum Statement {
         field: Option<Box<str>>,
         span: Span,
     },
+    /// Fan-out statement: `emit each <binding> in <source> { <body> }`.
+    /// Evaluates `source` to a `Value::Array`, then for each element runs
+    /// `body` with `binding` bound to the element value. Body emit
+    /// statements produce one output record per iteration. Null source
+    /// emits zero records. Nesting is rejected at parse time.
+    EmitEach {
+        node_id: NodeId,
+        binding: Box<str>,
+        source: Expr,
+        body: Vec<Statement>,
+        span: Span,
+    },
+}
+
+/// Visit every `Statement::Emit { target: Field, .. }` reachable from
+/// `stmts`, descending through `Statement::EmitEach.body`. The visitor
+/// receives `(name, expr)` for each field-targeted emit.
+///
+/// Use anywhere downstream code collects the bare field names a CXL
+/// program writes to the record stream. A non-recursive walker is
+/// silently wrong for programs whose only output emits live inside
+/// `emit each` — bind-schema, executor route resolution, and the
+/// transform write-set all diverge from runtime behavior, surfacing as
+/// schema mismatches at the first downstream operator. The parser
+/// rejects nesting, so a single level of recursion suffices.
+pub fn for_each_field_emit<'a>(stmts: &'a [Statement], visit: &mut dyn FnMut(&'a str, &'a Expr)) {
+    for stmt in stmts {
+        match stmt {
+            Statement::Emit {
+                name,
+                expr,
+                target: EmitTarget::Field,
+                ..
+            } => visit(name.as_ref(), expr),
+            Statement::EmitEach { body, .. } => for_each_field_emit(body, visit),
+            _ => {}
+        }
+    }
+}
+
+/// True when `stmts` contains at least one `Statement::Emit` (any
+/// target), recursing through `Statement::EmitEach.body`. Mirrors the
+/// "does this program emit anything" check while staying coherent in
+/// the presence of fan-out.
+pub fn contains_emit(stmts: &[Statement]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Statement::Emit { .. } => true,
+        Statement::EmitEach { body, .. } => contains_emit(body),
+        _ => false,
+    })
 }
 
 /// CXL expression — the core of the language. All variants carry a NodeId and Span.
@@ -251,6 +301,26 @@ pub enum Expr {
         slot: u32,
         span: Span,
     },
+    /// Bracket-index access: `arr[0]` (array element) or `map["key"]`
+    /// (map field). The runtime dispatches by receiver type — integer
+    /// indices apply to `Value::Array`, string indices to `Value::Map`.
+    /// Out-of-bounds or type mismatch returns `Value::Null`.
+    IndexAccess {
+        node_id: NodeId,
+        receiver: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
+    /// Arrow-syntax closure: `it => body`. The closure parameter name
+    /// is `it` by convention. Free-standing closures are rejected at
+    /// resolve time; closures appear only as arguments to closure-bearing
+    /// builtins (`filter`, `map`, `find`, `any`, `flat_map`).
+    Closure {
+        node_id: NodeId,
+        param: Box<str>,
+        body: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -276,7 +346,9 @@ impl Expr {
             | Expr::Wildcard { span, .. }
             | Expr::AggCall { span, .. }
             | Expr::AggSlot { span, .. }
-            | Expr::GroupKey { span, .. } => *span,
+            | Expr::GroupKey { span, .. }
+            | Expr::IndexAccess { span, .. }
+            | Expr::Closure { span, .. } => *span,
         }
     }
 
@@ -302,7 +374,9 @@ impl Expr {
             | Expr::Wildcard { node_id, .. }
             | Expr::AggCall { node_id, .. }
             | Expr::AggSlot { node_id, .. }
-            | Expr::GroupKey { node_id, .. } => *node_id,
+            | Expr::GroupKey { node_id, .. }
+            | Expr::IndexAccess { node_id, .. }
+            | Expr::Closure { node_id, .. } => *node_id,
         }
     }
 
@@ -374,6 +448,18 @@ impl Expr {
                     a.support_into(fields);
                 }
             }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                receiver.support_into(fields);
+                index.support_into(fields);
+            }
+            // The closure parameter `it` is a local binding rather than
+            // an upstream column reference, so its body's reads are
+            // walked but `it` itself is never injected into the field
+            // set (the FieldRef arm sees it as a name without a
+            // backing column, which is already filtered out elsewhere).
+            Expr::Closure { body, .. } => body.support_into(fields),
             Expr::PipelineAccess { .. }
             | Expr::VarsAccess { .. }
             | Expr::SourceAccess { .. }

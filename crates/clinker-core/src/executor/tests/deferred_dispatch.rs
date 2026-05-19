@@ -54,7 +54,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 /// Plan-side: the planner registers a deferred region whose producer is
@@ -302,7 +302,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // Pad payload values so each record consumes well over 1KB at the
     // arena projection step.
@@ -428,7 +428,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -566,7 +566,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let orders_csv = "\
 order_id,department,amount
@@ -745,7 +745,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -992,7 +992,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1236,7 +1236,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1440,7 +1440,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1626,7 +1626,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount
@@ -1775,7 +1775,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: small
   input: classify
@@ -1783,7 +1783,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // HR sums to 60 → /0 in `validate`. ENG sums to 600 → routes to
     // `out_big`. After cascading retraction excludes HR, only ENG
@@ -1969,7 +1969,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // The cross-region tee charges a per-Value-slot byte cost per row
     // (excluding the payload string contents); a 2-column row charges

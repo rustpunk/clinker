@@ -145,7 +145,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();
@@ -210,7 +210,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let orders_csv = "order_id,product_id,quantity\n1,A,2\n";
     let products_csv = "product_id,name,price\nA,Widget,10.0\n";
@@ -292,7 +292,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let orders_csv = "order_id,product_id,quantity\n7,B,3\n";
     let products_csv = "product_id,name,price\nB,Gadget,5.0\n";
@@ -364,7 +364,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     // Driver row 1 matches two build rows (A → Widget, A → WidgetPro);
     // driver row 2 matches one build row (B → Gadget).
@@ -462,7 +462,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();

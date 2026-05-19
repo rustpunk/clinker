@@ -28,7 +28,7 @@ nodes:
       name: sink
       type: csv
       path: bench://output.csv
-      include_widened: true
+      include_unmapped: true
       split:
         max_records: 10000
         naming: "output_{seq:04}.csv"

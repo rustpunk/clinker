@@ -87,7 +87,7 @@ nodes:
       name: fulfilled_orders
       type: csv
       path: ./output/fulfilled_orders.csv
-      include_widened: false
+      include_unmapped: false
 
   - type: output
     name: priority_report

@@ -109,7 +109,7 @@ async fn run_two_source_merge(
 /// CSV with extra column `notes` flows through an Aggregate
 /// (group_by: dept). The sidecar payload from input rows is reduced
 /// to `Value::Null` at the aggregate output (the per-row map has no
-/// canonical reduction). With `include_widened: true` at the sink,
+/// canonical reduction). With `include_unmapped: true` at the sink,
 /// no extra column appears beyond `dept` and `total` because the
 /// sidecar is empty.
 #[tokio::test(flavor = "multi_thread")]
@@ -144,7 +144,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,300,n3,e3\n";
     let (_report, output) = run_single(yaml, csv).await;
@@ -152,7 +152,7 @@ nodes:
     assert_eq!(
         header, "dept,total",
         "aggregate output header must be exactly [dept,total] — sidecar is Null at \
-         aggregate boundary so include_widened: true expands to nothing. got: {header}"
+         aggregate boundary so include_unmapped: true expands to nothing. got: {header}"
     );
 }
 
@@ -161,7 +161,7 @@ nodes:
 /// CSV combine: orders (driver) ⨝ products (build) on product_id.
 /// Both sources have auto_widen (engine default). Each carries its
 /// own `$widened` map. The combine output retains driver's sidecar
-/// (verified via `include_widened: true` expanding the driver's
+/// (verified via `include_unmapped: true` expanding the driver's
 /// extras to top-level), but build-side extras do NOT appear.
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_combine_carries_driver_widened_drops_build() {
@@ -208,7 +208,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // Driver carries `region` (extra); build carries `category` (extra).
     let orders = "order_id,product_id,region\nO1,P1,US\nO2,P1,EU\n";
@@ -292,7 +292,7 @@ nodes:
     name: out
     type: json
     path: out.json
-    include_widened: true
+    include_unmapped: true
 "#;
     // Build (`products`) carries `extra_meta` as an unmapped column —
     // auto_widen absorbs it into the build's `$widened` payload.
@@ -302,7 +302,7 @@ nodes:
     let products = "product_id,name,extra_meta\nP1,Widget,build-leak-marker\n";
     let (_report, output) =
         run_two_source_merge(yaml, "orders", orders, "products", products).await;
-    // Driver's sidecar key `region` rides through (include_widened
+    // Driver's sidecar key `region` rides through (include_unmapped
     // expansion at the Output projection).
     assert!(
         output.contains("\"region\""),
@@ -377,7 +377,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let plan = PipelineConfig::compile(&config, &CompileContext::default())
@@ -406,15 +406,15 @@ nodes:
     );
 }
 
-// ── H4: include_widened expansion CSV → CSV ───────────────────
+// ── H4: include_unmapped expansion CSV → CSV ───────────────────
 
-/// CSV with extras + auto_widen + Output `include_widened: true` →
+/// CSV with extras + auto_widen + Output `include_unmapped: true` →
 /// the sink CSV header includes the user-declared columns plus the
 /// keys from the sidecar map. Ordering: declared columns first,
 /// sidecar-expanded columns after (matches IndexMap insertion order
 /// in the projection's slow-path expansion).
 #[tokio::test(flavor = "multi_thread")]
-async fn h4_include_widened_expands_csv_to_csv() {
+async fn h4_include_unmapped_expands_csv_to_csv() {
     let yaml = r#"
 pipeline:
   name: h4_expand
@@ -435,7 +435,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "id,name,city,role\n1,Alice,Paris,admin\n2,Bob,Tokyo,user\n";
     let (_report, output) = run_single(yaml, csv).await;
@@ -444,7 +444,7 @@ nodes:
     for required in &["id", "name", "city", "role"] {
         assert!(
             cols.contains(*required),
-            "include_widened: true must expand sidecar key `{required}` to top-level. \
+            "include_unmapped: true must expand sidecar key `{required}` to top-level. \
              got header: {header}"
         );
     }
@@ -460,7 +460,7 @@ nodes:
 // ── H5: Cross-format CSV → JSON with sidecar expansion ─────────
 
 /// CSV input with extras + auto_widen + JSON Output with
-/// `include_widened: true` → each unmapped CSV column becomes a
+/// `include_unmapped: true` → each unmapped CSV column becomes a
 /// top-level key in the JSON output object. The sidecar's
 /// `Value::Map` payload is unpacked at the projection layer so the
 /// writer never sees a stray Map (which would either JSON-encode
@@ -468,7 +468,7 @@ nodes:
 /// `FormatError::UnserializableMapValue` for CSV/XML/fixed-width).
 /// This locks the cross-format flow end-to-end.
 #[tokio::test(flavor = "multi_thread")]
-async fn h5_cross_format_csv_to_json_with_include_widened() {
+async fn h5_cross_format_csv_to_json_with_include_unmapped() {
     let yaml = r#"
 pipeline:
   name: h5_csv_to_json
@@ -488,7 +488,7 @@ nodes:
     name: out
     type: json
     path: out.json
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "id,extra,city\n1,foo,Paris\n2,bar,Tokyo\n";
     let (_report, output) = run_single(yaml, csv).await;
@@ -498,7 +498,7 @@ nodes:
     // must NOT appear — it is stripped during expansion.
     assert!(
         !output.contains("$widened"),
-        "literal `$widened` slot must be stripped after include_widened expansion; got: {output}"
+        "literal `$widened` slot must be stripped after include_unmapped expansion; got: {output}"
     );
     for required in &[
         "\"id\"",
@@ -692,7 +692,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: false
+    include_unmapped: false
 "#;
     let csv = "id,amount,note\n1,100,ok\n2,bad,broken\n";
     let (report, _output) = run_single(yaml, csv).await;
@@ -759,7 +759,7 @@ nodes:
 
 // ── H8: include_correlation_keys does not surface $widened end-to-end ─
 
-/// `include_correlation_keys: true` with `include_widened: false`
+/// `include_correlation_keys: true` with `include_unmapped: false`
 /// (or unset) does NOT leak the `$widened` sidecar to the writer.
 /// The CSV output's header contains the user-declared columns plus
 /// the `$ck.<field>` shadow column (from a correlation_key source),
@@ -791,10 +791,12 @@ nodes:
     type: csv
     path: out.csv
     include_correlation_keys: true
+    include_unmapped: false
 "#;
     // `extra` is an unmapped column — auto_widen absorbs it into
-    // the sidecar; with include_widened: false (the default)
-    // the sidecar is stripped at the sink.
+    // the sidecar; with explicit `include_unmapped: false` the
+    // sidecar is stripped at the sink (independent of the
+    // correlation-key opt-in).
     let csv = "id,name,extra\n1,Alice,foo\n2,Bob,bar\n";
     let (_report, output) = run_single(yaml, csv).await;
     let header = output.lines().next().expect("header");
@@ -806,11 +808,11 @@ nodes:
     assert!(
         !cols.contains(&"$widened"),
         "include_correlation_keys: true must NOT surface $widened — sidecar gates \
-         independently via include_widened. got header: {header}"
+         independently via include_unmapped. got header: {header}"
     );
     assert!(
         !cols.contains(&"extra"),
-        "with include_widened: false, sidecar contents must not be expanded. \
+        "with include_unmapped: false, sidecar contents must not be expanded. \
          got header: {header}"
     );
 }

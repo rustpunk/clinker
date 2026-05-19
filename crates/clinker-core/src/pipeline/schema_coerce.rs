@@ -9,7 +9,7 @@
 //!   fields land in a `Value::Map` carried by a `$widened` engine-
 //!   stamped sidecar column appended to the declared schema. The
 //!   typechecker is blind to its contents (CXL has no Map operators
-//!   in the user surface); `include_widened: true` at an Output node
+//!   in the user surface); `include_unmapped: true` at an Output node
 //!   expands the map back to top-level columns at the sink. Pattern
 //!   precedent: Databricks Auto Loader's `_rescued_data` and
 //!   ClickHouse's `JSON` column type.

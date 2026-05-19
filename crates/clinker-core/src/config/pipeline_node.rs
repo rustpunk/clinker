@@ -734,7 +734,8 @@ pub struct ColumnDecl {
 ///   expressions cannot read or write it). Each input record's keys
 ///   that are not in the declaration land in a `Value::Map` payload
 ///   on that slot. The Output node opts the contents back into
-///   top-level columns via `include_widened: true`. Pattern precedent:
+///   top-level columns via `include_unmapped: true` (the default).
+///   Pattern precedent:
 ///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
 ///   column for unmatched fields) and ClickHouse's `JSON` data type
 ///   (single typed column absorbing arbitrary structure).
@@ -850,6 +851,17 @@ pub struct TransformBody {
     /// values from a config source. Default is `Runtime`.
     #[serde(default)]
     pub phase: Phase,
+    /// Cap on records produced per input by `emit each` fan-out blocks
+    /// inside this transform's CXL body. When a per-record evaluation
+    /// would exceed this count, the originating record is routed to
+    /// DLQ with category `ExpansionLimitExceeded` rather than emit a
+    /// truncated or unbounded fan-out. Default 10_000.
+    #[serde(default = "default_max_expansion")]
+    pub max_expansion: u64,
+}
+
+fn default_max_expansion() -> u64 {
+    10_000
 }
 
 /// One declaration of a producer-written scoped variable.

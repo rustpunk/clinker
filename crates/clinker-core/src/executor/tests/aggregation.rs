@@ -161,7 +161,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
         let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
         let (counters, dlq, output) = run_test(yaml, csv).await.expect("pipeline runs");
@@ -223,7 +223,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
         let config = crate::config::parse_config(yaml).expect("config parses");
         // The canonical compile entry point lowers via `bind_schema` +
@@ -330,7 +330,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
         // Header-only input — zero data rows.
         let csv = "x\n";

@@ -571,7 +571,7 @@ impl PlanNode {
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
-    /// `include_widened: false` projection at the Output boundary.
+    /// `include_unmapped: false` projection at the Output boundary.
     ///
     /// - Source: every column is user-declared in the source schema, so
     ///   the full schema counts as "explicitly emitted".
@@ -2577,7 +2577,7 @@ pub struct OutputSpec {
     pub name: String,
     pub mapping: IndexMap<String, String>,
     pub exclude: Vec<String>,
-    pub include_widened: bool,
+    pub include_unmapped: bool,
 }
 
 /// Pipeline-level parallelism configuration.
@@ -4288,16 +4288,9 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// has to reach into executor-private types.
 pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
-    for stmt in &typed.program.statements {
-        if let Statement::Emit {
-            name,
-            target: cxl::ast::EmitTarget::Field,
-            ..
-        } = stmt
-        {
-            set.insert(name.to_string());
-        }
-    }
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+        set.insert(name.to_string());
+    });
     set
 }
 

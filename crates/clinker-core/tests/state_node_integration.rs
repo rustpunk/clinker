@@ -138,6 +138,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
     let out = run_single(yaml, csv).await;
@@ -199,6 +200,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let csv = "id,label\n1,alpha\n2,beta\n3,gamma\n";
     let out = run_single(yaml, csv).await;
@@ -256,6 +258,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let csv = "id,amount\n1,5\n2,10\n3,15\n";
     let out = run_single(yaml, csv).await;
@@ -315,7 +318,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse_config");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -414,6 +417,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let left = "id,tag_val\n1,L1\n2,L2\n";
     let right = "id,tag_val\n10,R1\n20,R2\n";
@@ -508,6 +512,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let config_csv = "cutoff\n5\n9\n3\n";
     let orders_csv = "id,amount\n1,100\n2,200\n3,300\n";
@@ -574,6 +579,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let config = parse_config(yaml).expect("parse_config");
     let plan = config
@@ -650,6 +656,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let csv = "id,amount\n1,50\n2,150\n3,200\n";
     let config = parse_config(yaml).expect("parse_config");
@@ -721,6 +728,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let csv = "id,amount\n1,50\n2,150\n3,200\n";
     let out = run_single(yaml, csv).await;

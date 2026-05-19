@@ -161,7 +161,7 @@ The per-source `on_unmapped` policy decides what to do with input fields the sou
 
 See [Auto-Widen & Schema Drift](auto-widen.md) for the full
 specification: the `$widened` sidecar absorber design, propagation
-rules per downstream node type, the `include_widened` Output flag,
+rules per downstream node type, the `include_unmapped` Output flag,
 **E315** merge-policy mismatch, and fixed-width inertness.
 
 ## Sort order

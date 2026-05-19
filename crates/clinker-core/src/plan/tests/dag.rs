@@ -69,7 +69,7 @@ nodes:
       name: output
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#
 }
 
@@ -107,7 +107,7 @@ nodes:
       name: output
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#
 }
 
@@ -202,7 +202,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -293,7 +293,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -358,7 +358,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -416,7 +416,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -484,7 +484,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -551,7 +551,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -686,7 +686,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#;
     let config = parse_fixture(yaml);
@@ -768,7 +768,7 @@ nodes:
   config:
     name: output
     path: out.csv
-    include_widened: true
+    include_unmapped: true
     type: csv
 "#
 }

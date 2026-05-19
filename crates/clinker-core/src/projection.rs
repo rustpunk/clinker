@@ -22,7 +22,7 @@ pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<St
 
 /// Apply output projection: gather → exclude → mapping.
 ///
-/// 1. **Gather**: Start with CXL-emitted fields. If `include_widened`,
+/// 1. **Gather**: Start with CXL-emitted fields. If `include_unmapped`,
 ///    add all input record fields not already emitted (the path that
 ///    surfaces `OnUnmapped::AutoWiden`-discovered columns at the sink).
 /// 2. **Exclude**: Remove any field in `exclude` list (by current name).
@@ -55,31 +55,31 @@ pub fn project_output_with_meta(
 
 /// Record-driven projection (Invariant 3 implementation).
 ///
-/// `include_widened: true` surfaces every column on the record. With
-/// `OnUnmapped::AutoWiden` at the source, the record's schema includes
-/// both user-declared columns and probe-discovered columns; this flag
-/// lets the sink choose to emit all of them.
+/// `include_unmapped: true` (the default) surfaces every column on the
+/// record. With `OnUnmapped::AutoWiden` at the source, the record's
+/// schema includes both user-declared columns and probe-discovered
+/// columns; this flag lets the sink emit all of them.
 ///
-/// `include_widened: false`: when `cxl_emit_names` is `Some`, the output
-/// is restricted to those names — upstream passthroughs the user did
-/// NOT explicitly emit are dropped. This matches the documented Output
-/// projection semantic. When `cxl_emit_names` is `None` (caller has no
-/// upstream PlanNode handle), all upstream columns survive — the
+/// `include_unmapped: false`: when `cxl_emit_names` is `Some`, the
+/// output is restricted to those names — upstream passthroughs the user
+/// did NOT explicitly emit are dropped. This matches the documented
+/// Output projection semantic. When `cxl_emit_names` is `None` (caller
+/// has no upstream PlanNode handle), all upstream columns survive — the
 /// permissive fallback used by tests and ad-hoc projections.
 pub fn project_output_from_record(
     input_record: &Record,
     config: &OutputConfig,
     cxl_emit_names: Option<&[String]>,
 ) -> Record {
-    let drop_unmapped = !config.include_widened && cxl_emit_names.is_some();
+    let drop_unmapped = !config.include_unmapped && cxl_emit_names.is_some();
     let needs_rewrite = config.exclude.is_some()
         || config.mapping.is_some()
-        || config.include_widened
+        || config.include_unmapped
         || drop_unmapped;
     // `include_correlation_keys: true` surfaces `$ck.<field>` source-CK
     // shadows and `$ck.aggregate.<name>` synthetic-CK lineage to the
     // sink — but NOT the `$widened` sidecar absorber. Sidecar
-    // expansion is gated independently by `include_widened: true`,
+    // expansion is gated independently by `include_unmapped: true`,
     // which expands the `Value::Map` payload to top-level fields.
     // Routing both through one engine-stamped toggle would surface
     // the raw `$widened` `Value::Map` as a literal column to the
@@ -93,7 +93,7 @@ pub fn project_output_from_record(
         // natural iteration order, no intermediate allocation.
         // Engine-stamped columns are dropped unless the Output node
         // opts in via the appropriate flag (CK → include_correlation_keys;
-        // sidecar → include_widened, handled in the slow path because
+        // sidecar → include_unmapped, handled in the slow path because
         // expansion needs IndexMap-keyed access).
         let field_count = input_record.total_field_count();
         let mut schema_builder = SchemaBuilder::with_capacity(field_count);
@@ -126,14 +126,14 @@ pub fn project_output_from_record(
         }
     }
 
-    // `include_widened: true` expands the `auto_widen` sidecar
+    // `include_unmapped: true` expands the `auto_widen` sidecar
     // absorber column (`$widened`, carrying `Value::Map`) back into
     // top-level fields at the sink. Pattern precedent: Auto Loader's
     // `_rescued_data` JSON column expands to top-level when the
     // destination schema accepts it. The sidecar is engine-stamped so
     // `iter_user_fields` skips it by default; this branch is the
-    // opt-in path.
-    if config.include_widened {
+    // opt-in path (default-on per the new passthrough semantic).
+    if config.include_unmapped {
         let sidecar_payload = input_record
             .get(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
             .cloned();
@@ -148,7 +148,7 @@ pub fn project_output_from_record(
     }
 
     // Restrict to user-emitted columns when the caller supplied the
-    // upstream node's emit-name list and `include_widened: false`.
+    // upstream node's emit-name list and `include_unmapped: false`.
     // Sidecar-expanded fields land in `fields` *before* this filter
     // and survive it because they're not in `cxl_emit_names`; the
     // filter below would drop them. Restrict only when the sidecar
@@ -224,7 +224,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: true,
+            include_unmapped: true,
             include_header: None,
             mapping: None,
             exclude: None,
@@ -264,7 +264,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: true,
+            include_unmapped: true,
             include_header: None,
             mapping: None,
             exclude: Some(vec!["secret".into()]),
@@ -297,7 +297,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: true,
+            include_unmapped: true,
             include_header: None,
             mapping: Some(mapping),
             exclude: None,
@@ -344,7 +344,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: false,
+            include_unmapped: false,
             include_header: None,
             mapping: None,
             exclude: None,
@@ -383,13 +383,13 @@ mod tests {
 
     /// `include_correlation_keys: true` surfaces `$ck.<field>` shadow
     /// columns to the sink but does NOT leak the `$widened` sidecar
-    /// absorber. Sidecar expansion is a separate `include_widened: true`
+    /// absorber. Sidecar expansion is a separate `include_unmapped: true`
     /// concern; routing both through one engine-stamped toggle would
     /// surface the raw `Value::Map` payload as a literal column to
     /// the writer (CSV/XML JSON-encode, fixed-width silently empties),
     /// which is never the user's intent when they opt into CK
     /// visibility. Verified on both the fast path (no rewrite) and
-    /// the slow path (rewrite triggered by `include_widened: true`).
+    /// the slow path (rewrite triggered by `include_unmapped: true`).
     #[test]
     fn test_include_correlation_keys_does_not_leak_widened_sidecar() {
         use clinker_record::FieldMetadata;
@@ -412,7 +412,7 @@ mod tests {
             ],
         );
 
-        // Fast path: include_correlation_keys=true, include_widened=false,
+        // Fast path: include_correlation_keys=true, include_unmapped=false,
         // no rewrite. Output gets [id, name, $ck.id] — `$widened`
         // dropped, sidecar payload not surfaced.
         let config = fast_path_output_config(true);
@@ -429,7 +429,7 @@ mod tests {
         );
         assert!(
             result.get("extra").is_none(),
-            "sidecar payload must not be expanded — that is the include_widened flag"
+            "sidecar payload must not be expanded — that is the include_unmapped flag"
         );
 
         // Slow path: same flags, but force rewrite via mapping.
@@ -437,7 +437,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: false,
+            include_unmapped: false,
             include_header: None,
             mapping: Some({
                 let mut m = IndexMap::new();
@@ -474,11 +474,11 @@ mod tests {
         );
     }
 
-    /// `include_widened: true` expands the sidecar map even when
+    /// `include_unmapped: true` expands the sidecar map even when
     /// `include_correlation_keys: false`. The two flags are
     /// independent: each gates a distinct engine-stamped surface.
     #[test]
-    fn test_include_widened_expands_independently_of_correlation_keys() {
+    fn test_include_unmapped_expands_independently_of_correlation_keys() {
         use clinker_record::FieldMetadata;
         use clinker_record::SchemaBuilder;
         let schema = SchemaBuilder::new()
@@ -500,7 +500,7 @@ mod tests {
             name: "out".into(),
             format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
-            include_widened: true,
+            include_unmapped: true,
             include_header: None,
             mapping: None,
             exclude: None,
@@ -528,7 +528,7 @@ mod tests {
         );
         assert!(
             result.get("$ck.id").is_none(),
-            "include_correlation_keys: false must drop $ck.* even when include_widened: true"
+            "include_correlation_keys: false must drop $ck.* even when include_unmapped: true"
         );
         assert!(
             result.get("$widened").is_none(),

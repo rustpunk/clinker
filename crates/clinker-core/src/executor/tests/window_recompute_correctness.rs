@@ -166,7 +166,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 const CSV: &str = "\

@@ -225,7 +225,7 @@ impl Record {
     /// would surface as a JSON-encoded blob in CSV/XML writers and
     /// silently drop in fixed-width).
     ///
-    /// `include_widened: true` is the **separate** opt-in for sidecar
+    /// `include_unmapped: true` is the **separate** opt-in for sidecar
     /// expansion at the Output projection layer; it routes through
     /// `Record::get(\"$widened\")` directly and expands the
     /// `Value::Map` payload to top-level columns.

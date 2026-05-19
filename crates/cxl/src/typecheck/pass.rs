@@ -345,6 +345,22 @@ impl<'a> TypeChecker<'a> {
             Statement::Distinct { .. } => {
                 // Distinct field validation deferred — schema pin needed for full check.
             }
+            Statement::EmitEach { source, body, .. } => {
+                let source_ty = self.check_expr(source, false);
+                let inner = source_ty.unwrap_nullable();
+                if !matches!(inner, Type::Array | Type::Any) {
+                    self.error(
+                        source.span(),
+                        format!(
+                            "emit_each requires an Array source, got {source_ty}"
+                        ),
+                        Some("Use an Array-valued expression (e.g. `arr.filter(...)`, `str.split(\",\")`, or a Map-derived `.keys` / `.values`)".into()),
+                    );
+                }
+                for stmt in body {
+                    self.check_statement(stmt);
+                }
+            }
         }
     }
 
@@ -900,6 +916,33 @@ impl<'a> TypeChecker<'a> {
                 self.set_type(*node_id, ty.clone());
                 ty
             }
+
+            Expr::IndexAccess {
+                node_id,
+                receiver,
+                index,
+                ..
+            } => {
+                // Typecheck the children; downstream dispatch decides
+                // array-vs-map by receiver value type. The result type
+                // is Any because the index target's element type is
+                // not statically known here (Array element type is not
+                // tracked, and Map values are untyped at this layer).
+                self.check_expr(receiver, in_predicate);
+                self.check_expr(index, in_predicate);
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
+            Expr::Closure { node_id, body, .. } => {
+                // Standalone closure typecheck happens here only for
+                // diagnostics — `MethodCall` callsites typecheck the
+                // body with the closure parameter introduced into
+                // scope. The closure as a value has no runtime type.
+                self.check_expr(body, in_predicate);
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
         }
     }
 
@@ -938,6 +981,29 @@ impl<'a> TypeChecker<'a> {
                     // belong in HAVING (not supported), matching PostgreSQL.
                     self.agg_function_depth = 0;
                     self.walk_agg_ctx_row_only(predicate);
+                }
+                Statement::EmitEach { source, body, .. } => {
+                    // emit_each is a row-level fan-out: the source must
+                    // not contain aggregates, and body statements obey
+                    // the same context rules as the surrounding block.
+                    self.agg_function_depth = 0;
+                    self.walk_agg_ctx_row_only(source);
+                    // Recurse the body via the existing dispatch by
+                    // wrapping each body statement through the same
+                    // pattern.
+                    for stmt in body {
+                        match stmt {
+                            Statement::Emit { expr, .. } => {
+                                self.agg_function_depth = 0;
+                                self.walk_agg_ctx(expr, &let_exprs);
+                            }
+                            Statement::Filter { predicate, .. } => {
+                                self.agg_function_depth = 0;
+                                self.walk_agg_ctx_row_only(predicate);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1085,6 +1151,15 @@ impl<'a> TypeChecker<'a> {
                     self.walk_agg_ctx(arg, let_exprs);
                 }
             }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                self.walk_agg_ctx(receiver, let_exprs);
+                self.walk_agg_ctx(index, let_exprs);
+            }
+            Expr::Closure { body, .. } => {
+                self.walk_agg_ctx(body, let_exprs);
+            }
             Expr::Literal { .. }
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
@@ -1153,6 +1228,15 @@ impl<'a> TypeChecker<'a> {
                 for arg in args {
                     self.walk_agg_ctx_row_only(arg);
                 }
+            }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                self.walk_agg_ctx_row_only(receiver);
+                self.walk_agg_ctx_row_only(index);
+            }
+            Expr::Closure { body, .. } => {
+                self.walk_agg_ctx_row_only(body);
             }
             _ => {}
         }
@@ -1294,12 +1378,11 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Check that the program has at least one emit statement.
+    /// Check that the program has at least one emit statement. Recurses
+    /// through `Statement::EmitEach.body` so a program whose only emits
+    /// live inside a fan-out block still counts as having emits.
     fn check_emit_count(&mut self, program: &Program) {
-        let has_emit = program
-            .statements
-            .iter()
-            .any(|s| matches!(s, Statement::Emit { .. }));
+        let has_emit = crate::ast::contains_emit(&program.statements);
         if !has_emit {
             self.warning(
                 program.span,

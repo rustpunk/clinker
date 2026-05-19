@@ -276,7 +276,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("bench yaml parses");
     let plan = config
@@ -390,7 +390,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("bench yaml parses");
     let plan = config

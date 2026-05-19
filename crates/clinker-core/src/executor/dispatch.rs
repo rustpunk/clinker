@@ -362,12 +362,22 @@ fn dispatch_transform_eval_error(
     if ctx.strategy == ErrorStrategy::FailFast {
         return Err(eval_err.into());
     }
+    // emit_each fan-out overflow is its own DLQ category so users can
+    // distinguish "I asked for too much fan-out" from "a coercion
+    // failed". Every other eval-path failure stays under
+    // TypeCoercionFailure, matching the pre-existing classification.
+    let category = match &eval_err.kind {
+        cxl::eval::EvalErrorKind::ExpansionLimitExceeded { .. } => {
+            crate::dlq::DlqErrorCategory::ExpansionLimitExceeded
+        }
+        _ => crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+    };
     let stage = Some(DlqEntry::stage_transform(&transform_name));
     let routed = record_error_to_buffer_if_grouped(
         ctx,
         &record,
         row_num,
-        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        category,
         eval_err.to_string(),
         stage.clone(),
         None,
@@ -382,7 +392,7 @@ fn dispatch_transform_eval_error(
         ctx,
         DlqEntry {
             source_row: row_num,
-            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+            category,
             error_message: eval_err.to_string(),
             original_record: record,
             stage,
@@ -1667,9 +1677,10 @@ pub(crate) async fn transform_fused_consume(
     let upstream_name = source_name_owned.clone();
 
     let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
-        ProgramEvaluator::new(
+        ProgramEvaluator::with_max_expansion(
             Arc::clone(&ctx.compiled_transforms[idx].typed),
             ctx.compiled_transforms[idx].has_distinct(),
+            ctx.compiled_transforms[idx].max_expansion,
         )
     });
 
@@ -1749,18 +1760,33 @@ pub(crate) async fn transform_fused_consume(
                 evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
             };
             match eval_result {
-                Ok((modified_record, Ok(()))) => {
-                    let advance_source = source_name_arc_of(&modified_record);
-                    output_records.push((modified_record, rn));
-                    advance_cursor(ctx, &advance_source, rn);
-                }
-                Ok((_record, Err(SkipReason::Filtered))) => {
-                    ctx.counters.filtered_count += 1;
-                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
-                }
-                Ok((_record, Err(SkipReason::Duplicate))) => {
-                    ctx.counters.distinct_count += 1;
-                    advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                Ok(records) => {
+                    if records.is_empty() {
+                        // No-record outcome (e.g. emit_each on Null source);
+                        // still advance the cursor to keep watermarks live.
+                        advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                    } else {
+                        let mut emitted_any = false;
+                        for (modified_record, status) in records {
+                            match status {
+                                Ok(()) => {
+                                    let advance_source = source_name_arc_of(&modified_record);
+                                    output_records.push((modified_record, rn));
+                                    advance_cursor(ctx, &advance_source, rn);
+                                    emitted_any = true;
+                                }
+                                Err(SkipReason::Filtered) => {
+                                    ctx.counters.filtered_count += 1;
+                                }
+                                Err(SkipReason::Duplicate) => {
+                                    ctx.counters.distinct_count += 1;
+                                }
+                            }
+                        }
+                        if !emitted_any {
+                            advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                        }
+                    }
                 }
                 Err((transform_name, eval_err)) => {
                     dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
@@ -2020,9 +2046,10 @@ pub(crate) async fn dispatch_plan_node(
                 }
             };
 
-            let mut evaluator = ProgramEvaluator::new(
+            let mut evaluator = ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[transform_idx].typed),
                 ctx.compiled_transforms[transform_idx].has_distinct(),
+                ctx.compiled_transforms[transform_idx].max_expansion,
             );
 
             let expected_input = current_dag.graph[node_idx]
@@ -2151,18 +2178,31 @@ pub(crate) async fn dispatch_plan_node(
                     }
                 };
                 match eval_result {
-                    Ok((modified_record, Ok(()))) => {
-                        let advance_source = source_name_arc_of(&modified_record);
-                        output_records.push((modified_record, rn));
-                        advance_cursor(ctx, &advance_source, rn);
-                    }
-                    Ok((_record, Err(SkipReason::Filtered))) => {
-                        ctx.counters.filtered_count += 1;
-                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
-                    }
-                    Ok((_record, Err(SkipReason::Duplicate))) => {
-                        ctx.counters.distinct_count += 1;
-                        advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                    Ok(records) => {
+                        if records.is_empty() {
+                            advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                        } else {
+                            let mut emitted_any = false;
+                            for (modified_record, status) in records {
+                                match status {
+                                    Ok(()) => {
+                                        let advance_source = source_name_arc_of(&modified_record);
+                                        output_records.push((modified_record, rn));
+                                        advance_cursor(ctx, &advance_source, rn);
+                                        emitted_any = true;
+                                    }
+                                    Err(SkipReason::Filtered) => {
+                                        ctx.counters.filtered_count += 1;
+                                    }
+                                    Err(SkipReason::Duplicate) => {
+                                        ctx.counters.distinct_count += 1;
+                                    }
+                                }
+                            }
+                            if !emitted_any {
+                                advance_cursor(ctx, &source_name_arc_of(&record), rn);
+                            }
+                        }
                     }
                     Err((transform_name, eval_err)) => {
                         dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
@@ -2837,9 +2877,10 @@ pub(crate) async fn dispatch_plan_node(
             // wrapper enum owns the engine.
             let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
             let evaluator = match transform_idx {
-                Some(idx) => ProgramEvaluator::new(
+                Some(idx) => ProgramEvaluator::with_max_expansion(
                     Arc::clone(&ctx.compiled_transforms[idx].typed),
                     ctx.compiled_transforms[idx].has_distinct(),
+                    ctx.compiled_transforms[idx].max_expansion,
                 ),
                 None => {
                     return Err(PipelineError::Internal {
@@ -3307,7 +3348,7 @@ pub(crate) async fn dispatch_plan_node(
                 .unwrap_or(ctx.primary_output);
 
             // Compute the upstream node's CXL emit names once.
-            // `include_widened: false` consults this to drop upstream
+            // `include_unmapped: false` consults this to drop upstream
             // passthroughs the user did not explicitly emit.
             let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
             let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
@@ -4181,6 +4222,13 @@ pub(crate) async fn dispatch_plan_node(
                                         continue;
                                     }
                                     Ok(EvalResult::Emit { .. }) => {}
+                                    Ok(EvalResult::EmitMany { .. }) => {
+                                        return Err(PipelineError::Internal {
+                                            op: "combine residual",
+                                            node: name.clone(),
+                                            detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                                        });
+                                    }
                                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                         continue;
                                     }
@@ -4280,6 +4328,13 @@ pub(crate) async fn dispatch_plan_node(
                                     {
                                         Ok(EvalResult::Skip(_)) => continue,
                                         Ok(EvalResult::Emit { .. }) => {}
+                                        Ok(EvalResult::EmitMany { .. }) => {
+                                            return Err(PipelineError::Internal {
+                                                op: "combine residual",
+                                                node: name.clone(),
+                                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
+                                            });
+                                        }
                                         Err(e) => {
                                             return Err(PipelineError::from(e));
                                         }
@@ -4355,6 +4410,13 @@ pub(crate) async fn dispatch_plan_node(
                                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                             ctx.counters.distinct_count += 1;
                                         }
+                                        Ok(EvalResult::EmitMany { .. }) => {
+                                            return Err(PipelineError::Internal {
+                                                op: "combine on_miss body",
+                                                node: name.clone(),
+                                                detail: "emit_each fan-out is not supported in a combine body".into(),
+                                            });
+                                        }
                                         Err(e) => {
                                             return Err(PipelineError::from(e));
                                         }
@@ -4405,6 +4467,13 @@ pub(crate) async fn dispatch_plan_node(
                                     }
                                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                         ctx.counters.distinct_count += 1;
+                                    }
+                                    Ok(EvalResult::EmitMany { .. }) => {
+                                        return Err(PipelineError::Internal {
+                                            op: "combine matched body",
+                                            node: name.clone(),
+                                            detail: "emit_each fan-out is not supported in a combine body".into(),
+                                        });
                                     }
                                     Err(e) => {
                                         return Err(PipelineError::from(e));
@@ -5230,9 +5299,10 @@ fn run_time_windowed_aggregate(
     // `compiled_transforms`.
     let make_stream = |ctx: &ExecutorContext<'_>| -> Result<AggregateStream, PipelineError> {
         let evaluator = match transform_idx {
-            Some(idx) => ProgramEvaluator::new(
+            Some(idx) => ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[idx].typed),
                 ctx.compiled_transforms[idx].has_distinct(),
+                ctx.compiled_transforms[idx].max_expansion,
             ),
             None => {
                 return Err(PipelineError::Internal {

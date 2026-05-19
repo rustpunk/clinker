@@ -34,8 +34,8 @@ This means:
 | Workload | Recommended limit | Notes |
 |----------|-------------------|-------|
 | Small files (<10 MB) | 128M | Minimal memory pressure |
-| Medium files (10-50 MB) | 256M (default) | Covers most ETL jobs |
-| Large files or complex aggregations | 512M-1G | Multiple group-by keys, large cardinality |
+| Medium files (10-50 MB) | 256M | Covers most ETL jobs |
+| Large files or complex aggregations | 512M (default) -- 1G | Multiple group-by keys, large cardinality |
 | Multiple large group-by keys | 1G+ | High-cardinality distinct values |
 
 **Target workload:** Clinker is optimized for 1-5 input files of up to 100 MB each, processing 10K-2M records per run.
