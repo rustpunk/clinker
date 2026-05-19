@@ -324,7 +324,7 @@ fn main() -> ExitCode {
                         | PipelineError::CompositionBodyError { .. }
                         | PipelineError::MemoryBudgetExceeded { .. }
                         | PipelineError::CombineMissingMatch { .. } => ExitCode::from(1),
-                        PipelineError::Io(_) => ExitCode::from(4),
+                        PipelineError::Io(_) | PipelineError::Spill(_) => ExitCode::from(4),
                         PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
                             ExitCode::from(3)
                         }

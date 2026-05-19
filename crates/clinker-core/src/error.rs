@@ -262,6 +262,11 @@ pub enum PipelineError {
         messages: Vec<String>,
     },
     Io(std::io::Error),
+    /// Spill-format I/O or decode failure surfaced by
+    /// `crate::pipeline::spill::SpillReader`. Distinct from `Io` so the
+    /// rendered diagnostic preserves postcard and JSON-schema decode
+    /// context that bare `std::io::Error` would lose.
+    Spill(crate::pipeline::spill::SpillError),
     ThreadPool(String),
     /// Multiple errors collected from parallel writer threads.
     /// DataFusion `Collection` pattern (PR #14439).
@@ -409,6 +414,7 @@ impl fmt::Display for PipelineError {
                 Ok(())
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Spill(e) => write!(f, "{e}"),
             Self::ThreadPool(e) => write!(f, "thread pool error: {e}"),
             Self::Multiple(errors) => {
                 write!(f, "{} errors:", errors.len())?;
@@ -606,6 +612,12 @@ impl From<crate::schema::SchemaError> for PipelineError {
 impl From<std::io::Error> for PipelineError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<crate::pipeline::spill::SpillError> for PipelineError {
+    fn from(e: crate::pipeline::spill::SpillError) -> Self {
+        Self::Spill(e)
     }
 }
 
