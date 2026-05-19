@@ -10,9 +10,9 @@
 //! Every consumer drains a slot through [`NodeBuffer::drain`], which
 //! returns an iterator that streams memory rows first, then per-spill
 //! rows via `SpillReader` without materializing the spill into RAM.
-//! Spill construction is gated behind a future sub-issue of #108; at
-//! present no runtime producer emits `Spilled` or `Mixed`, but the
-//! type's shape is already the one the spill-trigger logic will use.
+//! Producer-side spill is wired in `executor/node_buffer_spill.rs` and
+//! gated on `MemoryBudget::should_spill()` at every bulk admission site
+//! via `admit_node_buffer`.
 
 use std::vec::IntoIter as VecIntoIter;
 
@@ -26,11 +26,9 @@ pub(crate) enum NodeBuffer {
     /// All rows live in memory.
     Memory(Vec<(Record, u64)>),
     /// Every row lives on disk. Each chunk pairs a spill file with the
-    /// number of rows that producer wrote to it (used by `len_hint`
-    /// and by the memory-charge accounting layer that the spill-wiring
-    /// sub-issue introduces). No runtime path constructs this variant
-    /// yet; tests cover the drain, promotion, and Drop semantics.
-    #[allow(dead_code)]
+    /// number of rows that producer wrote to it; the row count drives
+    /// `len_hint`'s O(1) total and the per-chunk discharge logic in the
+    /// drain iterator.
     Spilled(Vec<(SpillFile<u64>, u64)>),
     /// A mem tail accumulated after a partial spill. Drain order is
     /// memory rows first, then spill chunks in vector order.
@@ -104,11 +102,14 @@ impl NodeBuffer {
     ///
     /// Panics on `Spilled` and `Mixed`. Spill chunks cannot be
     /// cheap-cloned; the only legitimate multi-consumer access for a
-    /// spilled buffer is to drain it. The producer-side fan-out arm
-    /// in `dispatch.rs` uses this when there is at least one
-    /// remaining downstream consumer; today every reachable
-    /// `NodeBuffer` is `Memory`, so the panic path is unreachable at
-    /// runtime.
+    /// spilled buffer is to drain it. The producer-side admission
+    /// helper `dispatch::node_buffer_spill_allowed` returns `false`
+    /// for any slot whose outgoing topology will route through this
+    /// method (multi-consumer fan-out or a composition input-port
+    /// edge), so a `Spilled`/`Mixed` slot never reaches a caller of
+    /// this method. Lifting that constraint requires sharing
+    /// `Arc<SpillFile<u64>>` across readers and is a separate
+    /// follow-up under #108.
     pub(crate) fn clone_memory_only(&self) -> Vec<(Record, u64)> {
         match self {
             Self::Memory(v) => v.clone(),
