@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use indexmap::IndexMap;
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -482,7 +483,13 @@ fn json_to_value(v: &serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::String(s.clone().into()),
         serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(_) => Value::String(v.to_string().into()),
+        serde_json::Value::Object(obj) => {
+            let mut map: IndexMap<Box<str>, Value> = IndexMap::with_capacity(obj.len());
+            for (k, val) in obj {
+                map.insert(k.as_str().into(), json_to_value(val));
+            }
+            Value::Map(Box::new(map))
+        }
     }
 }
 
