@@ -186,7 +186,7 @@ fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -
 /// `Value::Map` has no canonical scalar serialization for a CSV cell
 /// (silently JSON-encoding hides routing bugs — e.g. a `$widened`
 /// sidecar reaching the writer without the projection layer's
-/// `include_widened: true` expansion), so this returns
+/// `include_unmapped: true` expansion), so this returns
 /// `FormatError::UnserializableMapValue` carrying the offending
 /// column. CSV is the single point of truth for map rejection on
 /// this path; there is no upstream pre-walk.
@@ -415,7 +415,7 @@ mod tests {
     /// CSV writer rejects `Value::Map` payloads with
     /// `FormatError::UnserializableMapValue`. The pre-walk in
     /// `write_record` catches the misroute (e.g. a `$widened`
-    /// sidecar reaching the writer without `include_widened: true`
+    /// sidecar reaching the writer without `include_unmapped: true`
     /// expansion) before the value-to-cell function silently
     /// JSON-encodes the map into a single CSV cell.
     #[test]

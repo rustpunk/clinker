@@ -2818,7 +2818,7 @@ pub(crate) struct StreamingOutputSpec {
     /// Upstream `cxl_emit_names_in` result — passed to
     /// `project_output_from_record` so the streaming projection drops
     /// passthroughs the user didn't explicitly emit (matching the
-    /// buffered path's `include_widened: false` semantic).
+    /// buffered path's `include_unmapped: false` semantic).
     pub(crate) cxl_emit_names: Vec<String>,
 }
 

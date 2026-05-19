@@ -151,7 +151,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -213,7 +213,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\neng,300\nsales,50\nsales,150\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -274,7 +274,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -349,7 +349,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary,hours\neng,100,40\neng,200,20\nsales,50,40\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -423,7 +423,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "amount\n10\n20\n30\n40\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -487,7 +487,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,\nsales,50\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -558,7 +558,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv).await;
@@ -625,7 +625,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     // Streaming variant — declare sort_order on dept. Input is already
     // dept-sorted (eng, eng, eng, sales, sales) so the streaming aggregator
@@ -680,7 +680,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let (hash_report, hash_out) = run_single(yaml_hash, csv).await;
     let (stream_report, stream_out) = run_single(yaml_streaming, csv).await;
@@ -752,7 +752,7 @@ nodes:
     name: sink
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // Two partitions on f0 (window group-by):

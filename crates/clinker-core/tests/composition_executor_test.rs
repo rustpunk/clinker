@@ -118,7 +118,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv_input = "a\n5\n7\n";
     let (_report, output) = run_with_composition(yaml, csv_input).await;
@@ -169,7 +169,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv_input = "a\n3\n";
     let (_report, output) = run_with_composition(yaml, csv_input).await;
@@ -225,7 +225,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv_input = "a\n3\n5\n12\n42\n";
     let (_report, output) = run_with_composition(yaml, csv_input).await;
@@ -276,7 +276,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv_input = "a\nnot-an-integer\n";
     let config = parse_config(yaml).expect("parse pipeline yaml");

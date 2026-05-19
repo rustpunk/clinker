@@ -571,7 +571,7 @@ impl PlanNode {
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
-    /// `include_widened: false` projection at the Output boundary.
+    /// `include_unmapped: false` projection at the Output boundary.
     ///
     /// - Source: every column is user-declared in the source schema, so
     ///   the full schema counts as "explicitly emitted".
@@ -2577,7 +2577,7 @@ pub struct OutputSpec {
     pub name: String,
     pub mapping: IndexMap<String, String>,
     pub exclude: Vec<String>,
-    pub include_widened: bool,
+    pub include_unmapped: bool,
 }
 
 /// Pipeline-level parallelism configuration.

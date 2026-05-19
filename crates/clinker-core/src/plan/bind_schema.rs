@@ -2873,7 +2873,7 @@ fn propagate_aggregate(
     // unmapped field at the aggregate output should add it to
     // `group_by` or emit it explicitly via an aggregate function.
     // The slot itself stays on the schema (engine-stamped) so
-    // downstream `include_widened: true` projections, dispatch
+    // downstream `include_unmapped: true` projections, dispatch
     // canonicalize invariants, and composition body propagation all
     // see a stable column shape across the aggregate boundary.
     if upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN) {

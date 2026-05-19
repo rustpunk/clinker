@@ -734,7 +734,8 @@ pub struct ColumnDecl {
 ///   expressions cannot read or write it). Each input record's keys
 ///   that are not in the declaration land in a `Value::Map` payload
 ///   on that slot. The Output node opts the contents back into
-///   top-level columns via `include_widened: true`. Pattern precedent:
+///   top-level columns via `include_unmapped: true` (the default).
+///   Pattern precedent:
 ///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
 ///   column for unmatched fields) and ClickHouse's `JSON` data type
 ///   (single typed column absorbing arbitrary structure).

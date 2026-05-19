@@ -143,7 +143,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
     let (report, output) = run_with_composition(yaml, csv).await;
@@ -231,7 +231,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
     let (report, _output) = run_with_composition(yaml, csv).await;

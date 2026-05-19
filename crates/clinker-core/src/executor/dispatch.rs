@@ -3348,7 +3348,7 @@ pub(crate) async fn dispatch_plan_node(
                 .unwrap_or(ctx.primary_output);
 
             // Compute the upstream node's CXL emit names once.
-            // `include_widened: false` consults this to drop upstream
+            // `include_unmapped: false` consults this to drop upstream
             // passthroughs the user did not explicitly emit.
             let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
             let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {

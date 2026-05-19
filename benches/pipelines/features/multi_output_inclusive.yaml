@@ -39,7 +39,7 @@ nodes:
       name: high_value
       type: csv
       path: bench://output_high_value.csv
-      include_widened: true
+      include_unmapped: true
 
   - type: output
     name: long_string
@@ -48,7 +48,7 @@ nodes:
       name: long_string
       type: csv
       path: bench://output_long_string.csv
-      include_widened: true
+      include_unmapped: true
 
   - type: output
     name: remainder
@@ -57,4 +57,4 @@ nodes:
       name: remainder
       type: csv
       path: bench://output_remainder.csv
-      include_widened: true
+      include_unmapped: true

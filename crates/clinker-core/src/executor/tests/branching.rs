@@ -107,7 +107,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -192,7 +192,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
@@ -279,7 +279,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
@@ -365,7 +365,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
@@ -459,7 +459,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -545,7 +545,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
@@ -631,7 +631,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
@@ -707,7 +707,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
@@ -761,7 +761,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
@@ -819,7 +819,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "dept,amount\nA,10\nB,20\nA,30\n";
@@ -910,7 +910,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
@@ -990,7 +990,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,100\n";

@@ -110,7 +110,7 @@ impl<W: Write> FixedWidthWriter<W> {
     /// fixed-width column (the prior behavior of returning an empty
     /// string silently dropped the payload, hiding routing bugs —
     /// e.g. a `$widened` sidecar reaching the writer without
-    /// `include_widened: true` expansion), so this returns
+    /// `include_unmapped: true` expansion), so this returns
     /// `FormatError::UnserializableMapValue` carrying the offending
     /// column. The fixed-width writer is the single point of truth
     /// for map rejection on this path; there is no upstream pre-walk.
@@ -472,7 +472,7 @@ mod tests {
     /// silently emitted an empty fixed-width field for any map
     /// in `format_value`; the explicit precheck in `write_record`
     /// surfaces the misroute (typically a `$widened` sidecar
-    /// reaching the writer without `include_widened: true`
+    /// reaching the writer without `include_unmapped: true`
     /// expansion).
     #[test]
     fn test_fixed_width_writer_rejects_map_value() {

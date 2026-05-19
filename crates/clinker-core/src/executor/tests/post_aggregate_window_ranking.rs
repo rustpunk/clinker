@@ -52,7 +52,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 async fn run(csv: &str) -> String {
@@ -232,7 +232,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 #[tokio::test(flavor = "multi_thread")]

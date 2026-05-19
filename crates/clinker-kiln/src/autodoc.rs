@@ -585,7 +585,7 @@ fn generate_output_doc(
     entries.push(ConfigEntry {
         category: ConfigCategory::Format,
         key: "INCLUDE UNMAPPED".to_string(),
-        value: if output.include_widened { "yes" } else { "no" }.to_string(),
+        value: if output.include_unmapped { "yes" } else { "no" }.to_string(),
     });
     if let Some(h) = output.include_header {
         entries.push(ConfigEntry {

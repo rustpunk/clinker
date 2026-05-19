@@ -727,13 +727,14 @@ impl SourceConfig {
 pub struct OutputConfig {
     pub name: String,
     pub path: String,
-    /// Pass through every column on the upstream record, not just the
-    /// names the upstream node explicitly emitted. This is the path
+    /// When `true` (default), every input field not explicitly emitted
+    /// passes through to the output unchanged. When `false`, only
+    /// explicitly emitted fields appear in the output. Also the path
     /// that surfaces `OnUnmapped::AutoWiden`-discovered columns at the
-    /// sink. Default `false` — only user-emitted columns reach the
-    /// sink.
-    #[serde(default)]
-    pub include_widened: bool,
+    /// sink by expanding the `$widened` sidecar payload back to
+    /// top-level fields.
+    #[serde(default = "default_include_unmapped")]
+    pub include_unmapped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_header: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -848,6 +849,10 @@ fn default_split_naming() -> String {
 }
 
 fn default_true() -> bool {
+    true
+}
+
+fn default_include_unmapped() -> bool {
     true
 }
 
@@ -2083,7 +2088,7 @@ impl PipelineConfig {
                 name: o.name.clone(),
                 mapping: o.mapping.clone().unwrap_or_default(),
                 exclude: o.exclude.clone().unwrap_or_default(),
-                include_widened: o.include_widened,
+                include_unmapped: o.include_unmapped,
             })
             .collect();
 

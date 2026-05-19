@@ -84,7 +84,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let orders = "\
 order_id,department,matched_amount
@@ -209,7 +209,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let orders = "\
 order_id,department,matched_amount

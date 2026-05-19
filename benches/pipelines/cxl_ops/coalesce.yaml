@@ -31,4 +31,4 @@ nodes:
       name: sink
       type: csv
       path: bench://output.csv
-      include_widened: true
+      include_unmapped: true

@@ -93,7 +93,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let plan = compile(yaml);
     let agg_idx = node_idx_for(&plan, "dept_totals");
@@ -184,6 +184,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
       mapping:
         out_dept: dept_keep
         out_total: running_total
@@ -198,7 +199,10 @@ nodes:
     // Downstream Transform reads `dept` and `total` from the producer
     // (transitively via `dept_keep` / `running_total`). `other` is
     // emitted by the producer but NEVER consumed downstream; pruning
-    // must drop it.
+    // must drop it. The Output node sets `include_unmapped: false` so
+    // the prune analysis can isolate unconsumed producer emits — with
+    // the default `include_unmapped: true`, the Output node would
+    // request every upstream column and `other` would survive.
     assert!(region.buffer_schema.contains(&"dept".to_string()));
     assert!(region.buffer_schema.contains(&"total".to_string()));
     assert!(
@@ -282,7 +286,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let plan = compile(yaml);
     let agg1_idx = node_idx_for(&plan, "agg1");
@@ -392,7 +396,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let plan = compile(yaml);
     let agg_idx = node_idx_for(&plan, "agg");
@@ -513,7 +517,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let plan = compiled.dag();
@@ -682,7 +686,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let plan = compiled.dag();
@@ -841,7 +845,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let plan = compiled.dag();
@@ -1008,7 +1012,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let plan = compiled.dag();
@@ -1115,7 +1119,7 @@ nodes:
       name: out_big
       type: csv
       path: big.csv
-      include_widened: true
+      include_unmapped: true
   - type: output
     name: out_medium
     input: classify.medium
@@ -1123,7 +1127,7 @@ nodes:
       name: out_medium
       type: csv
       path: medium.csv
-      include_widened: true
+      include_unmapped: true
   - type: output
     name: out_small
     input: classify.small
@@ -1131,7 +1135,7 @@ nodes:
       name: out_small
       type: csv
       path: small.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let plan = compile(yaml);
     let agg_idx = node_idx_for(&plan, "agg");
@@ -1240,7 +1244,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();
@@ -1356,7 +1360,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();
@@ -1500,7 +1504,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();
@@ -1627,7 +1631,7 @@ nodes:
       name: out_a
       type: csv
       path: out_a.csv
-      include_widened: true
+      include_unmapped: true
   - type: composition
     name: body_b
     input: src
@@ -1647,7 +1651,7 @@ nodes:
       name: out_b
       type: csv
       path: out_b.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let plan = compiled.dag();
@@ -1863,7 +1867,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();

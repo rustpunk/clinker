@@ -99,7 +99,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
 /// Compile-time D-7 unblock: `Source (CK) → Aggregate (relaxed) →
@@ -297,7 +297,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "\
 order_id,department,amount

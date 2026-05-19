@@ -362,7 +362,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: low
   input: classify
@@ -370,7 +370,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -432,7 +432,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: medium
   input: classify
@@ -440,7 +440,7 @@ nodes:
     name: medium
     path: medium.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: low
   input: classify
@@ -448,7 +448,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,5000\n2,500\n3,50\n";
@@ -497,7 +497,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: small
   input: classify
@@ -505,7 +505,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n5,300\n";
@@ -559,7 +559,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: small
   input: classify
@@ -567,7 +567,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // All go to "big" — order must match input order
@@ -659,7 +659,7 @@ nodes:
     name: good
     path: good.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: bad
   input: classify
@@ -667,7 +667,7 @@ nodes:
     name: bad
     path: bad.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
@@ -738,7 +738,7 @@ nodes:
     name: audit
     path: audit.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: report
   input: classify
@@ -746,7 +746,7 @@ nodes:
     name: report
     path: report.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: standard
   input: classify
@@ -754,7 +754,7 @@ nodes:
     name: standard
     path: standard.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // amount=500 matches both audit (>100) and report (>50)
@@ -811,7 +811,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id\n1\n2\n3\n";
@@ -860,7 +860,7 @@ nodes:
     name: special
     path: special.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: normal
   input: classify
@@ -868,7 +868,7 @@ nodes:
     name: normal
     path: normal.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // No records match "special" (all < 99999)
@@ -953,7 +953,7 @@ nodes:
     name: good
     path: good.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: bad
   input: classify
@@ -961,7 +961,7 @@ nodes:
     name: bad
     path: bad.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
@@ -1049,7 +1049,7 @@ nodes:
     name: big
     path: big.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: small
   input: classify
@@ -1057,7 +1057,7 @@ nodes:
     name: small
     path: small.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // "bad" will fail to_int → DLQ, but other records should still be written
@@ -1133,7 +1133,7 @@ nodes:
     name: a
     path: a.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: b
   input: classify
@@ -1141,7 +1141,7 @@ nodes:
     name: b
     path: b.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
@@ -1229,7 +1229,7 @@ nodes:
     name: a
     path: a.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: b
   input: classify
@@ -1237,7 +1237,7 @@ nodes:
     name: b
     path: b.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let config = crate::config::parse_config(yaml).unwrap();
@@ -1346,7 +1346,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: low
   input: classify
@@ -1354,7 +1354,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // "bad_value" cannot be converted to int → transform eval error
@@ -1417,7 +1417,7 @@ nodes:
     name: special
     path: special.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: normal
   input: calc
@@ -1425,7 +1425,7 @@ nodes:
     name: normal
     path: normal.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     let csv = "id,amount,zero\n1,100,0\n";
@@ -1506,7 +1506,7 @@ nodes:
     name: high
     path: high.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 - type: output
   name: low
   input: classify
@@ -1514,7 +1514,7 @@ nodes:
     name: low
     path: low.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // Two records fail, one succeeds
@@ -1606,7 +1606,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
 
     // "bad" fails to_int → DLQ
@@ -1668,7 +1668,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params();
@@ -1735,7 +1735,7 @@ nodes:
     name: dest
     type: csv
     path: output.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params();

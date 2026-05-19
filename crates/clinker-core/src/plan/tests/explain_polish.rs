@@ -66,7 +66,7 @@ nodes:
       name: output
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#
 }
 
@@ -183,7 +183,7 @@ nodes:
       name: output
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let config: PipelineConfig = crate::yaml::from_str(yaml).expect("parse yaml");
     let compiled = config

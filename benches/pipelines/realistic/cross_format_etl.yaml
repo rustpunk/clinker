@@ -42,4 +42,4 @@ nodes:
       name: sink
       type: json
       path: bench://output.json
-      include_widened: true
+      include_unmapped: true

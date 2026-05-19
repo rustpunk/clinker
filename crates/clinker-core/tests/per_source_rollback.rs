@@ -190,6 +190,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
+      include_unmapped: false
 "#;
     let config = parse_config(yaml).unwrap();
     let readers: SourceReaders = HashMap::from([(

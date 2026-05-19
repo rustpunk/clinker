@@ -223,7 +223,7 @@ fn insert_field(nodes: &mut Vec<FieldNode>, path: &str, text: &str) {
 /// `Value::Map` has no canonical scalar serialization for an XML
 /// element body (silently JSON-encoding hides routing bugs — e.g. a
 /// `$widened` sidecar reaching the writer without
-/// `include_widened: true` expansion), so this returns
+/// `include_unmapped: true` expansion), so this returns
 /// `FormatError::UnserializableMapValue` carrying the offending
 /// column. XML is the single point of truth for map rejection on
 /// this path; there is no upstream pre-walk.

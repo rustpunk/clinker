@@ -93,7 +93,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();
@@ -169,7 +169,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();
@@ -232,7 +232,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "\
 department,amount
@@ -330,7 +330,7 @@ nodes:
     name: out
     type: csv
     path: out.csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let root = fixture_workspace_root();

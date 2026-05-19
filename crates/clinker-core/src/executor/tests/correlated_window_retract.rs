@@ -220,7 +220,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#,
         window_emit = window_emit
     )
@@ -584,7 +584,7 @@ nodes:
     name: out
     path: output.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE5,ENG,100\nE6,ENG,200\n";
     let (counters, dlq, output) = run_pipeline(yaml, csv)

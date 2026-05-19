@@ -91,7 +91,7 @@ pub fn stage_time_window(transform: &str) -> String {
 ///   CSV cell and hide routing bugs the same way the regular
 ///   non-JSON writers' silent map-degrade did before commit
 ///   `f5ae145`. Users who need the auto_widen sidecar surfaced in
-///   their normal output can opt into `include_widened: true` on
+///   their normal output can opt into `include_unmapped: true` on
 ///   the relevant Output node; the DLQ keeps a stable user-shape
 ///   schema regardless.
 pub fn write_dlq<W: Write>(

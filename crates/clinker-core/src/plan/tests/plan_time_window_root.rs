@@ -49,7 +49,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let plan = config.compile(&CompileContext::default()).expect("compile");
@@ -138,7 +138,7 @@ nodes:
     name: out
     path: out.csv
     type: csv
-    include_widened: true
+    include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse");
     let plan = config.compile(&CompileContext::default()).expect("compile");

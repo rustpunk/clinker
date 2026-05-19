@@ -284,7 +284,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let diags = compile_err_with_ctx(yaml);
     insta::assert_snapshot!(render_diags(&diags));
@@ -325,7 +325,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-      include_widened: true
+      include_unmapped: true
 "#;
     let diags = compile_err_with_ctx(yaml);
     insta::assert_snapshot!(render_diags(&diags));
