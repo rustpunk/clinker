@@ -1,0 +1,107 @@
+# Body for the nested-composition hard-fail integration test.
+#
+# Mirrors the top-level diamond_hard_fail topology inside a body:
+# a Transform that widens the schema from 3 to 8 columns and fans
+# out to two pass-through branches, then merges. With a tight
+# memory_limit on the parent pipeline, `stage_split`'s admit
+# charges past the hard limit and surfaces a body-interior
+# `MemoryBudgetExceeded`, which the executor wraps as
+# `CompositionBodyError { composition_name: <call-site>, .. }` so
+# the user-visible failure location is the composition node, not
+# the body interior.
+_compose:
+  name: issue_123_nested_hard_fail
+  inputs:
+    records:
+      schema:
+        - { name: id, type: string }
+        - { name: region, type: string }
+        - { name: value, type: int }
+  outputs:
+    out: merged
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: stage_split
+    input: records
+    config:
+      cxl: |
+        emit id = id
+        emit region = region
+        emit value = value
+        emit derived_a = id
+        emit derived_b = region
+        emit derived_c = id
+        emit derived_d = region
+        emit derived_e = id
+        emit derived_f = id
+        emit derived_g = region
+        emit derived_h = id
+        emit derived_i = region
+        emit derived_j = id
+        emit derived_k = region
+        emit derived_l = id
+        emit derived_m = region
+        emit derived_n = id
+        emit derived_o = region
+        emit derived_p = id
+        emit derived_q = region
+        emit derived_r = id
+  - type: transform
+    name: branch_a
+    input: stage_split
+    config:
+      cxl: |
+        emit id = id
+        emit region = region
+        emit value = value
+        emit derived_a = derived_a
+        emit derived_b = derived_b
+        emit derived_c = derived_c
+        emit derived_d = derived_d
+        emit derived_e = derived_e
+        emit derived_f = derived_f
+        emit derived_g = derived_g
+        emit derived_h = derived_h
+        emit derived_i = derived_i
+        emit derived_j = derived_j
+        emit derived_k = derived_k
+        emit derived_l = derived_l
+        emit derived_m = derived_m
+        emit derived_n = derived_n
+        emit derived_o = derived_o
+        emit derived_p = derived_p
+        emit derived_q = derived_q
+        emit derived_r = derived_r
+  - type: transform
+    name: branch_b
+    input: stage_split
+    config:
+      cxl: |
+        emit id = id
+        emit region = region
+        emit value = value
+        emit derived_a = derived_a
+        emit derived_b = derived_b
+        emit derived_c = derived_c
+        emit derived_d = derived_d
+        emit derived_e = derived_e
+        emit derived_f = derived_f
+        emit derived_g = derived_g
+        emit derived_h = derived_h
+        emit derived_i = derived_i
+        emit derived_j = derived_j
+        emit derived_k = derived_k
+        emit derived_l = derived_l
+        emit derived_m = derived_m
+        emit derived_n = derived_n
+        emit derived_o = derived_o
+        emit derived_p = derived_p
+        emit derived_q = derived_q
+        emit derived_r = derived_r
+  - type: merge
+    name: merged
+    inputs:
+      - branch_a
+      - branch_b
