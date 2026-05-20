@@ -238,6 +238,12 @@ pub(crate) struct DispatchOutcome {
     /// landed"). The synthetic `MERGED_SOURCE_NAME` slot is filtered
     /// out on the way through.
     pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
+    /// Saturating sum of bytes the run committed to spill files across
+    /// every spill site (node_buffer admission, grace-hash partition
+    /// flush, sort-merge external sort). Read from `MemoryBudget`'s
+    /// running total at dispatch close so an aborted run still
+    /// reports the last committed value.
+    pub(crate) cumulative_spill_bytes: u64,
 }
 
 /// Output writer registry. Holds two parallel maps:
@@ -389,6 +395,12 @@ pub struct ExecutionReport {
     /// `counters.dlq_count` minus any entries the executor failed to
     /// attribute to a declared source.
     pub per_source_dlq_counts: BTreeMap<String, u64>,
+    /// Saturating sum of bytes committed to spill files across every
+    /// spill site (`node_buffers` admission, grace-hash partition
+    /// flush, sort-merge external sort). Sourced from
+    /// `MemoryBudget`'s running total at dispatch close; an aborted
+    /// run still surfaces the last committed value.
+    pub cumulative_spill_bytes: u64,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
@@ -991,6 +1003,7 @@ impl PipelineExecutor {
             per_source_rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
+            cumulative_spill_bytes,
         } = Self::execute_dag(
             config,
             source_records,
@@ -1079,6 +1092,7 @@ impl PipelineExecutor {
             per_source_rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
+            cumulative_spill_bytes,
         })
     }
 
@@ -1581,6 +1595,7 @@ impl PipelineExecutor {
             .map(|(k, v)| (k.as_ref().to_string(), *v))
             .collect();
 
+        let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -1589,6 +1604,7 @@ impl PipelineExecutor {
             per_source_rollback_cursors: rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
+            cumulative_spill_bytes,
         })
     }
 

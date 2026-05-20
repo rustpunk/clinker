@@ -28,9 +28,11 @@ fn fixture_workspace_root() -> PathBuf {
 /// fixtures (transform / nested / route+merge / runtime-error),
 /// five combine-in-composition fixtures (combine_enrich,
 /// nested_combine, combine_after_transform, combine_collect,
-/// combine_bad_predicate), and three body-window fixtures
+/// combine_bad_predicate), three body-window fixtures
 /// (body_post_aggregate_window, body_parent_node_window, body_e150b)
-/// covering each `PlanIndexRoot` variant inside a composition body.
+/// covering each `PlanIndexRoot` variant inside a composition body,
+/// and one node-buffer hard-fail fixture
+/// (issue_123_nested_hard_fail).
 #[test]
 fn test_phase1_scanner_loads_all_fixtures() {
     let root = fixture_workspace_root();
@@ -39,8 +41,8 @@ fn test_phase1_scanner_loads_all_fixtures() {
 
     assert_eq!(
         table.len(),
-        22,
-        "expected 22 composition signatures, got {}: {:?}",
+        23,
+        "expected 23 composition signatures, got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );
