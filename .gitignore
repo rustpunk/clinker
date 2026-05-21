@@ -1,4 +1,7 @@
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/post-impl-followup/
 lancedb/
 docs/internal/
 docs/book/
