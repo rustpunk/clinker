@@ -11,11 +11,15 @@
 //! grace-hash, sort-merge join, IEJoin, inter-stage `node_buffers`) polls
 //! the same arbitrator instance and trusts its `should_spill` /
 //! `should_abort` answer. The trait surface (`MemoryConsumer`,
-//! `ArbitrationPolicy`) lets later work plug in policies that pick a
-//! victim across operators instead of reacting independently. Until a
-//! real policy is installed, the arbitrator ships with `NoOpPolicy`,
-//! which preserves the pre-existing react-only behavior byte-for-byte.
+//! `ArbitrationPolicy`) lets policies pick a victim across operators
+//! instead of reacting independently. Production paths install a policy
+//! chosen by the pipeline-level `memory.backpressure` knob:
+//! `pause` (default) installs `BackPressurePreferred -> Priority`,
+//! `spill` installs bare `Priority`, `both` installs
+//! `BackPressurePreferred -> LargestFirst`. Tests that want the older
+//! react-only behavior pass `Box::new(NoOpPolicy)` explicitly.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Cross-platform RSS measurement. Returns `None` on unsupported platforms.
@@ -228,14 +232,21 @@ pub trait ArbitrationPolicy: Send + Sync {
         consumers: &[(ConsumerId, &dyn MemoryConsumer)],
         pressure_bytes: u64,
     ) -> Option<ConsumerId>;
+
+    /// Short identifier for diagnostics surfaces (`--explain`).
+    /// Composing wrappers (`BackPressurePreferred`) recurse to spell
+    /// out their inner policy, e.g. `BackPressurePreferred -> Priority`.
+    fn policy_name(&self) -> Cow<'static, str>;
 }
 
 /// Policy that selects no victim under any pressure.
 ///
-/// Default policy on every freshly constructed arbitrator. Preserves
-/// pre-arbitrator react-only behavior: every operator continues to
-/// poll `should_spill` / `should_abort` and decides for itself.
-/// Replaced at runtime once a real `ArbitrationPolicy` is installed.
+/// Used by tests that want to exercise the RSS-driven react-only
+/// path without arbitration interference. Production paths always
+/// install a real policy via `MemoryArbitrator::default_policy()`
+/// or the `memory.backpressure` knob; this type exists so that
+/// pre-policy behavior is reachable as an explicit choice rather
+/// than a hidden default.
 pub struct NoOpPolicy;
 
 impl ArbitrationPolicy for NoOpPolicy {
@@ -245,6 +256,116 @@ impl ArbitrationPolicy for NoOpPolicy {
         _pressure_bytes: u64,
     ) -> Option<ConsumerId> {
         None
+    }
+
+    fn policy_name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("NoOp")
+    }
+}
+
+/// Policy that elects whichever consumer is currently holding the
+/// most bytes. On a tie, the last equally-maximum entry in the
+/// snapshot wins (per `std`'s `max_by_key` contract); the snapshot
+/// itself comes from `HashMap` iteration, so insertion order is
+/// not load-bearing — what is load-bearing is that selection is
+/// deterministic within a single arbitrator instance for a given
+/// `consumers` membership.
+///
+/// Mirrors Spark's `TaskMemoryManager` largest-acquired-first
+/// strategy: freeing the biggest holder yields the most headroom
+/// per spill call.
+pub struct LargestFirst;
+
+impl ArbitrationPolicy for LargestFirst {
+    fn select_victim(
+        &self,
+        consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+        _pressure_bytes: u64,
+    ) -> Option<ConsumerId> {
+        consumers
+            .iter()
+            .max_by_key(|(_, c)| c.current_usage())
+            .map(|(id, _)| *id)
+    }
+
+    fn policy_name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("LargestFirst")
+    }
+}
+
+/// Policy that elects the consumer with the lowest
+/// `spill_priority()` value (lower = spill first). Ties broken by
+/// `current_usage()` (largest first) so that two equally-priority
+/// consumers still produce deterministic, headroom-maximizing
+/// selection.
+///
+/// Suits the cheapest-to-spill-first heuristic: `node_buffers` (0)
+/// before `grace-hash` (10) before sort (20) before Aggregate (30).
+/// Per-consumer priorities are set in each operator's
+/// `MemoryConsumer` impl (lands in 117c).
+pub struct Priority;
+
+impl ArbitrationPolicy for Priority {
+    fn select_victim(
+        &self,
+        consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+        _pressure_bytes: u64,
+    ) -> Option<ConsumerId> {
+        consumers
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                a.spill_priority()
+                    .cmp(&b.spill_priority())
+                    .then_with(|| b.current_usage().cmp(&a.current_usage()))
+            })
+            .map(|(id, _)| *id)
+    }
+
+    fn policy_name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("Priority")
+    }
+}
+
+/// Policy wrapper that prefers pausing a back-pressureable consumer
+/// over forcing anyone to spill. Falls back to the wrapped policy
+/// when no consumer reports `can_back_pressure() == true`.
+///
+/// Spill incurs disk I/O for no benefit when the downstream will
+/// drain in finite time — pausing the producer is strictly cheaper.
+/// This is the runtime default: `BackPressurePreferred::wrapping(
+/// Priority)` (see `MemoryArbitrator::default_policy`).
+pub struct BackPressurePreferred {
+    fallback: Box<dyn ArbitrationPolicy>,
+}
+
+impl BackPressurePreferred {
+    /// Wrap `p` so any back-pressureable consumer is preferred over
+    /// what `p` would have picked.
+    pub fn wrapping<P: ArbitrationPolicy + 'static>(p: P) -> Self {
+        Self {
+            fallback: Box::new(p),
+        }
+    }
+}
+
+impl ArbitrationPolicy for BackPressurePreferred {
+    fn select_victim(
+        &self,
+        consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+        pressure_bytes: u64,
+    ) -> Option<ConsumerId> {
+        consumers
+            .iter()
+            .find(|(_, c)| c.can_back_pressure())
+            .map(|(id, _)| *id)
+            .or_else(|| self.fallback.select_victim(consumers, pressure_bytes))
+    }
+
+    fn policy_name(&self) -> Cow<'static, str> {
+        Cow::Owned(format!(
+            "BackPressurePreferred -> {}",
+            self.fallback.policy_name()
+        ))
     }
 }
 
@@ -296,10 +417,21 @@ pub struct MemoryArbitrator {
 }
 
 impl MemoryArbitrator {
-    /// Build an arbitrator with `limit` bytes hard ceiling and
-    /// `spill_threshold_pct` soft-limit fraction. Ships with
-    /// `NoOpPolicy` and no registered consumers.
-    pub fn new(limit: u64, spill_threshold_pct: f64) -> Self {
+    /// Build an arbitrator with `limit` bytes hard ceiling,
+    /// `spill_threshold_pct` soft-limit fraction, and an explicit
+    /// `ArbitrationPolicy`. Ships with no registered consumers.
+    ///
+    /// Production paths construct via this constructor with the
+    /// policy chosen by `memory.backpressure` (see
+    /// `BackpressureKnob::build_policy` in `crate::config`).
+    /// Tests that want pre-policy react-only behavior pass
+    /// `Box::new(NoOpPolicy)`; tests that want the production
+    /// default pass `Self::default_policy()`.
+    pub fn with_policy(
+        limit: u64,
+        spill_threshold_pct: f64,
+        policy: Box<dyn ArbitrationPolicy>,
+    ) -> Self {
         Self {
             limit,
             spill_threshold_pct,
@@ -309,19 +441,23 @@ impl MemoryArbitrator {
             arena_bytes_charged: 0,
             node_buffer_bytes_charged: 0,
             consumers: HashMap::new(),
-            policy: Box::new(NoOpPolicy),
+            policy,
         }
     }
 
-    /// Build from config `memory_limit` string ("512M", "2G", raw
-    /// bytes). Uses the 0.80 default for `spill_threshold_pct`
-    /// (80% soft / 100% hard / 20% spike allowance).
-    /// `max_spill_bytes` defaults to `u64::MAX` (unlimited disk
-    /// quota); callers that want a quota set it directly on the
-    /// constructed arbitrator.
-    pub fn from_config(memory_limit: Option<&str>) -> Self {
-        let limit = parse_memory_limit_bytes(memory_limit);
-        Self::new(limit, 0.80)
+    /// Runtime default policy: prefer pausing a back-pressureable
+    /// consumer over forcing anyone to spill, falling back to
+    /// `Priority` (cheapest-to-spill first) when no consumer can
+    /// be paused. Returned as a fresh `Box` so each arbitrator gets
+    /// its own policy instance.
+    pub fn default_policy() -> Box<dyn ArbitrationPolicy> {
+        Box::new(BackPressurePreferred::wrapping(Priority))
+    }
+
+    /// Read access to the active policy. Used by `--explain` to
+    /// render the `arbitration:` annotation in the plan header.
+    pub fn policy(&self) -> &dyn ArbitrationPolicy {
+        self.policy.as_ref()
     }
 
     /// Poll current RSS and update `peak_rss` if it exceeds the
@@ -532,7 +668,8 @@ mod tests {
 
     #[test]
     fn test_memory_arbitrator_below_threshold() {
-        let mut arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let mut arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         // Test process RSS should be well under 410MB (80% of 512MB)
         if rss_bytes().is_some() {
             assert!(!arbitrator.should_spill());
@@ -542,7 +679,7 @@ mod tests {
     #[test]
     fn test_memory_arbitrator_above_threshold() {
         // Limit of 1MB — any running process exceeds this
-        let mut arbitrator = MemoryArbitrator::new(1024 * 1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
         if rss_bytes().is_some() {
             assert!(arbitrator.should_spill());
         }
@@ -550,7 +687,8 @@ mod tests {
 
     #[test]
     fn test_memory_arbitrator_peak_rss_tracked() {
-        let mut arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let mut arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         if rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
@@ -566,22 +704,25 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_arbitrator_default_values() {
-        let arbitrator = MemoryArbitrator::from_config(None);
+    fn test_parse_memory_limit_default_512mb() {
+        let limit = parse_memory_limit_bytes(None);
+        let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.limit, 512 * 1024 * 1024);
         assert!((arbitrator.spill_threshold_pct - 0.80).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_disk_quota_default_unlimited() {
-        let arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.disk_quota(), u64::MAX);
         assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
     }
 
     #[test]
     fn test_record_spill_bytes_under_quota() {
-        let mut arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let mut arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.max_spill_bytes = 1024;
         assert!(!arbitrator.record_spill_bytes(256));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 256);
@@ -591,7 +732,8 @@ mod tests {
 
     #[test]
     fn test_record_spill_bytes_overflows_quota() {
-        let mut arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let mut arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.max_spill_bytes = 1024;
         assert!(!arbitrator.record_spill_bytes(1024));
         assert!(arbitrator.record_spill_bytes(1));
@@ -603,7 +745,8 @@ mod tests {
         // Saturating-add on a u64 counter: even an absurdly large
         // accumulation cannot wrap below the configured quota and
         // silently disable the gate.
-        let mut arbitrator = MemoryArbitrator::new(512 * 1024 * 1024, 0.80);
+        let mut arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.max_spill_bytes = 1024;
         arbitrator.cumulative_spill_bytes = u64::MAX - 10;
         assert!(arbitrator.record_spill_bytes(100));
@@ -630,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_charge_node_buffer_bytes_increases_counter() {
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(256));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 256);
         assert!(!arbitrator.charge_node_buffer_bytes(512));
@@ -639,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_discharge_node_buffer_bytes_decreases_counter() {
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_node_buffer_bytes(1024);
         arbitrator.discharge_node_buffer_bytes(256);
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 768);
@@ -650,7 +793,7 @@ mod tests {
         // Estimate drift between producer's charge and consumer's
         // discharge must not wrap the counter to a huge positive
         // value and silently disable the gate downstream.
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_node_buffer_bytes(100);
         arbitrator.discharge_node_buffer_bytes(200);
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 0);
@@ -658,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_charge_node_buffer_bytes_under_limit_returns_false() {
-        let mut arbitrator = MemoryArbitrator::new(1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(256));
     }
 
@@ -667,14 +810,14 @@ mod tests {
         // Strict `>` semantics: exactly at the limit is NOT an
         // overflow, matching `record_spill_bytes` and
         // `charge_arena_bytes`. Only the byte that crosses trips.
-        let mut arbitrator = MemoryArbitrator::new(1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(1024));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 1024);
     }
 
     #[test]
     fn test_charge_node_buffer_bytes_over_limit_returns_true() {
-        let mut arbitrator = MemoryArbitrator::new(1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(1024));
         assert!(arbitrator.charge_node_buffer_bytes(1));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 1025);
@@ -686,7 +829,7 @@ mod tests {
         // envelope with the arena counter. Neither one alone exceeds
         // the limit, but their sum does — and the node-buffer charge
         // must surface that.
-        let mut arbitrator = MemoryArbitrator::new(1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_arena_bytes(800));
         assert!(!arbitrator.charge_node_buffer_bytes(100));
         assert!(arbitrator.charge_node_buffer_bytes(200));
@@ -698,7 +841,7 @@ mod tests {
         // Saturating-add on a u64 counter: even an absurdly large
         // accumulation cannot wrap below the configured limit and
         // silently disable the gate.
-        let mut arbitrator = MemoryArbitrator::new(1024, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.node_buffer_bytes_charged = u64::MAX - 10;
         assert!(arbitrator.charge_node_buffer_bytes(100));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), u64::MAX);
@@ -706,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_total_charged_sums_arena_and_node_buffer() {
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_arena_bytes(400);
         arbitrator.charge_node_buffer_bytes(600);
         assert_eq!(arbitrator.total_charged(), 1000);
@@ -718,7 +861,7 @@ mod tests {
         // in-memory `limit` envelope. Including spill bytes in
         // `total_charged()` would double-count the spilled work
         // against the RAM budget and force premature aborts.
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.cumulative_spill_bytes = 9999;
         arbitrator.charge_arena_bytes(100);
         assert_eq!(arbitrator.total_charged(), 100);
@@ -728,7 +871,7 @@ mod tests {
     fn test_total_charged_saturates_on_overflow() {
         // Two near-`u64::MAX` counters must not wrap the sum and
         // silently pass the `total_charged() > limit` gate.
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.arena_bytes_charged = u64::MAX - 10;
         arbitrator.node_buffer_bytes_charged = 1000;
         assert_eq!(arbitrator.total_charged(), u64::MAX);
@@ -820,8 +963,8 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_arbitrator_new_installs_noop_policy() {
-        let mut arbitrator = MemoryArbitrator::new(u64::MAX, 0.80);
+    fn test_with_policy_installs_chosen_policy() {
+        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         // poll_arbitration is private — exercise it through the
         // public `should_spill` path with a deliberately tiny
         // limit so the soft-threshold gate trips.
@@ -831,6 +974,206 @@ mod tests {
         // true (RSS-based) and no consumer state changes.
         assert!(arbitrator.should_spill());
         assert!(arbitrator.consumers.is_empty());
+        assert_eq!(arbitrator.policy().policy_name(), "NoOp");
+    }
+
+    #[test]
+    fn test_largest_first_picks_largest() {
+        let small = MockConsumer {
+            usage: 10,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        };
+        let big = MockConsumer {
+            usage: 50,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        };
+        let mid = MockConsumer {
+            usage: 30,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> = vec![
+            (ConsumerId(0), &small),
+            (ConsumerId(1), &big),
+            (ConsumerId(2), &mid),
+        ];
+        let policy = LargestFirst;
+        assert_eq!(policy.select_victim(&consumers, 100), Some(ConsumerId(1)));
+        assert_eq!(policy.policy_name(), "LargestFirst");
+    }
+
+    #[test]
+    fn test_largest_first_ties_broken_by_slice_order() {
+        let a = MockConsumer {
+            usage: 100,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        };
+        let b = MockConsumer {
+            usage: 100,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            vec![(ConsumerId(0), &a), (ConsumerId(1), &b)];
+        // `max_by_key` returns the last equally-maximum element; the
+        // policy inherits that contract. The arbitrator's snapshot is
+        // `HashMap`-ordered so insertion order isn't load-bearing —
+        // what matters is the selection is deterministic given a
+        // fixed input slice.
+        assert_eq!(
+            LargestFirst.select_victim(&consumers, 0),
+            Some(ConsumerId(1))
+        );
+    }
+
+    #[test]
+    fn test_largest_first_empty_returns_none() {
+        assert!(LargestFirst.select_victim(&[], 1024).is_none());
+    }
+
+    #[test]
+    fn test_priority_picks_lowest_priority_value() {
+        let high = MockConsumer {
+            usage: 100,
+            priority: 10,
+            paused: false,
+            spill_response: 0,
+        };
+        let low = MockConsumer {
+            usage: 100,
+            priority: 1,
+            paused: false,
+            spill_response: 0,
+        };
+        let mid = MockConsumer {
+            usage: 100,
+            priority: 5,
+            paused: false,
+            spill_response: 0,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> = vec![
+            (ConsumerId(0), &high),
+            (ConsumerId(1), &low),
+            (ConsumerId(2), &mid),
+        ];
+        assert_eq!(Priority.select_victim(&consumers, 0), Some(ConsumerId(1)));
+        assert_eq!(Priority.policy_name(), "Priority");
+    }
+
+    #[test]
+    fn test_priority_ties_broken_by_usage_largest_first() {
+        let small = MockConsumer {
+            usage: 10,
+            priority: 5,
+            paused: false,
+            spill_response: 0,
+        };
+        let big = MockConsumer {
+            usage: 90,
+            priority: 5,
+            paused: false,
+            spill_response: 0,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            vec![(ConsumerId(0), &small), (ConsumerId(1), &big)];
+        assert_eq!(Priority.select_victim(&consumers, 0), Some(ConsumerId(1)));
+    }
+
+    #[test]
+    fn test_priority_empty_returns_none() {
+        assert!(Priority.select_victim(&[], 1024).is_none());
+    }
+
+    /// Consumer whose `can_back_pressure()` returns false. Used to
+    /// confirm `BackPressurePreferred` falls back to the wrapped
+    /// policy when no consumer can be paused.
+    struct UnpausableConsumer {
+        usage: u64,
+        priority: i32,
+    }
+    impl MemoryConsumer for UnpausableConsumer {
+        fn current_usage(&self) -> u64 {
+            self.usage
+        }
+        fn spill_priority(&self) -> i32 {
+            self.priority
+        }
+        fn try_spill(&mut self, _: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+        fn pause(&mut self) {}
+        fn resume(&mut self) {}
+    }
+
+    #[test]
+    fn test_back_pressure_preferred_picks_back_pressureable() {
+        let unpausable = UnpausableConsumer {
+            usage: 1000,
+            priority: 0,
+        };
+        // MockConsumer.can_back_pressure() returns true.
+        let pausable = MockConsumer {
+            usage: 10,
+            priority: 99,
+            paused: false,
+            spill_response: 0,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            vec![(ConsumerId(0), &unpausable), (ConsumerId(1), &pausable)];
+        let policy = BackPressurePreferred::wrapping(Priority);
+        // Even though `unpausable` would win on Priority (priority 0 < 99),
+        // the back-pressureable consumer is preferred.
+        assert_eq!(policy.select_victim(&consumers, 0), Some(ConsumerId(1)));
+    }
+
+    #[test]
+    fn test_back_pressure_preferred_falls_back_when_none() {
+        let a = UnpausableConsumer {
+            usage: 100,
+            priority: 10,
+        };
+        let b = UnpausableConsumer {
+            usage: 100,
+            priority: 1,
+        };
+        let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            vec![(ConsumerId(0), &a), (ConsumerId(1), &b)];
+        let policy = BackPressurePreferred::wrapping(Priority);
+        // No back-pressureable consumer → delegate to Priority, which
+        // picks the lower priority value (b, id 1).
+        assert_eq!(policy.select_victim(&consumers, 0), Some(ConsumerId(1)));
+    }
+
+    #[test]
+    fn test_back_pressure_preferred_empty_returns_none() {
+        let policy = BackPressurePreferred::wrapping(Priority);
+        assert!(policy.select_victim(&[], 0).is_none());
+    }
+
+    #[test]
+    fn test_default_policy_name_is_composed() {
+        let policy = MemoryArbitrator::default_policy();
+        assert_eq!(policy.policy_name(), "BackPressurePreferred -> Priority");
+    }
+
+    #[test]
+    fn test_back_pressure_preferred_wrapping_largest_first_name() {
+        let policy = BackPressurePreferred::wrapping(LargestFirst);
+        assert_eq!(
+            policy.policy_name(),
+            "BackPressurePreferred -> LargestFirst"
+        );
     }
 
     #[test]

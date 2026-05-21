@@ -1217,7 +1217,7 @@ O5,ENG,200
 
 /// Degrade-fallback when a single record's buffer-mode contribution
 /// exceeds the entire memory budget. The aggregate runs in buffer-mode
-/// (a `BufferRequired` binding like `min`) with a memory_limit so
+/// (a `BufferRequired` binding like `min`) with a memory.limit so
 /// small that any single row's per-binding charge breaches it. Today's
 /// runtime guard panics with a documented message describing the
 /// scenario; the orchestrator's degrade-fallback path is supposed to
@@ -1238,7 +1238,7 @@ async fn degrade_fallback_runtime_protection_or_documented_panic() {
     let yaml = r#"
 pipeline:
   name: degrade_fallback
-  memory_limit: "1"
+  memory: { limit: "1" }
 error_handling:
   strategy: continue
 nodes:

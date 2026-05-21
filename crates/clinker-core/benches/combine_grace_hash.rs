@@ -26,18 +26,18 @@
 //! spill timing comparison.
 //!
 //! Two paths are measured:
-//!   - **In-memory baseline**: pipeline `memory_limit: 16G`. Process
+//!   - **In-memory baseline**: pipeline `memory.limit: 16G`. Process
 //!     RSS stays well below 0.8 × 16G = 12.8G on every conceivable CI
 //!     host, so [`MemoryArbitrator::should_spill`] never returns true and
 //!     the grace executor stays in its no-spill fast path.
-//!   - **Forced spill**: pipeline `memory_limit: 1G`. Soft limit is
+//!   - **Forced spill**: pipeline `memory.limit: 1G`. Soft limit is
 //!     ~820M; the bench process's RSS during probe runs ~800M-1G after
 //!     all driver records and build hash tables are materialized, so
 //!     `should_spill` fires periodically and the largest Building
 //!     partition transitions to OnDisk. The 1G hard limit gives a 200M
 //!     headroom band over the 820M soft limit so `should_abort` does
 //!     not trigger before the spill kernel can drop residency.
-//!     `MemoryArbitrator::from_config` hardcodes `spill_threshold_pct = 0.80`
+//!     `build_arbitrator_from_config` hardcodes `spill_threshold_pct = 0.80`
 //!     — the YAML knob does not let the bench tune the soft/hard
 //!     ratio independently, so the limit is sized to the natural band.
 //!
@@ -70,14 +70,14 @@ use indexmap::IndexMap;
 //
 // `strategy: grace_hash` on a pure-equi combine forces the planner to
 // pick `CombineStrategy::GraceHash` regardless of cardinality
-// estimates. The two `memory_limit:` knobs (`SPILL` vs `IN_MEMORY`)
+// estimates. The two `memory.limit:` knobs (`SPILL` vs `IN_MEMORY`)
 // drive the [`MemoryArbitrator::should_spill`] threshold; the YAML body is
 // otherwise identical so any timing delta is attributable to the
 // spill-vs-no-spill execution mode.
 const COMBINE_GRACE_HASH_SPILL_YAML: &str = r#"
 pipeline:
   name: bench_combine_grace_hash_spill
-  memory_limit: "1G"
+  memory: { limit: "1G" }
 nodes:
 - type: source
   name: build
@@ -130,7 +130,7 @@ nodes:
 const COMBINE_GRACE_HASH_IN_MEMORY_YAML: &str = r#"
 pipeline:
   name: bench_combine_grace_hash_in_memory
-  memory_limit: "16G"
+  memory: { limit: "16G" }
 nodes:
 - type: source
   name: build

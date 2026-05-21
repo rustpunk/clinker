@@ -3,7 +3,7 @@
 # Mirrors the top-level diamond_hard_fail topology inside a body:
 # a Transform that widens the schema from 3 to 8 columns and fans
 # out to two pass-through branches, then merges. With a tight
-# memory_limit on the parent pipeline, `stage_split`'s admit
+# memory.limit on the parent pipeline, `stage_split`'s admit
 # charges past the hard limit and surfaces a body-interior
 # `MemoryBudgetExceeded`, which the executor wraps as
 # `CompositionBodyError { composition_name: <call-site>, .. }` so

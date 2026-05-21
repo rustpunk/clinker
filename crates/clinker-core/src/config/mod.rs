@@ -59,8 +59,11 @@ pub struct PipelineConfig {
 #[serde(deny_unknown_fields)]
 pub struct PipelineMeta {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_limit: Option<String>,
+    /// Memory-arbitrator tuning. Whole block is optional; when omitted
+    /// each field falls back to its default (512 MiB limit, `pause`
+    /// backpressure policy).
+    #[serde(default, skip_serializing_if = "MemoryConfig::is_default")]
+    pub memory: MemoryConfig,
     /// Static configuration knobs read via `$vars.<key>`. Flat top-level
     /// shape: `vars: { fuzzy_threshold: { type: float, default: 0.85 } }`.
     /// Channel-overridable, frozen at pipeline start. No producer; no
@@ -84,6 +87,93 @@ pub struct PipelineMeta {
     /// Execution metrics spool configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsConfig>,
+}
+
+/// Memory-arbitrator tuning, nested under `pipeline.memory`.
+///
+/// `limit` accepts the same suffix grammar as the pre-#157 flat
+/// `memory.limit` field: `"512M"`, `"2G"`, `"1024K"`, or a raw
+/// integer byte count. When omitted, the arbitrator falls back to
+/// a 512 MiB hard ceiling (resolved at construction time through
+/// `crate::pipeline::memory::parse_memory_limit_bytes`).
+///
+/// `backpressure` selects the active arbitration policy. The
+/// default `pause` installs `BackPressurePreferred -> Priority`:
+/// prefer pausing a producer over forcing anyone to spill, falling
+/// back to cheapest-to-spill-first when no consumer can be paused.
+/// `spill` installs bare `Priority` for users who want react-only
+/// behavior keyed on per-operator spill priority. `both` installs
+/// `BackPressurePreferred -> LargestFirst`: pause when possible,
+/// otherwise force the largest holder regardless of priority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Hard memory limit for the arbitrator. `None` (omitted) →
+    /// 512 MiB at construction time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// Arbitration policy selector. Omitted → `pause` (the runtime
+    /// default).
+    #[serde(skip_serializing_if = "BackpressureKnob::is_default")]
+    pub backpressure: BackpressureKnob,
+}
+
+impl MemoryConfig {
+    /// True when every field matches its default. Used as the
+    /// `skip_serializing_if` gate on `PipelineMeta.memory` so a
+    /// pipeline with no memory opinions round-trips through serde
+    /// without emitting an empty `memory: {}` block.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Arbitration policy selector for `pipeline.memory.backpressure`.
+///
+/// Values are user-facing YAML strings: `spill`, `pause`, `both`.
+/// `Pause` is the runtime default.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureKnob {
+    /// `Priority` only — never pause a producer. Equivalent to the
+    /// post-#108 / pre-#157 react-only behavior, but with
+    /// deterministic priority-based victim selection rather than
+    /// "whichever operator polls next."
+    Spill,
+    /// `BackPressurePreferred -> Priority` — pause any
+    /// back-pressureable consumer before forcing a spill; otherwise
+    /// fall back to `Priority`. Default.
+    #[default]
+    Pause,
+    /// `BackPressurePreferred -> LargestFirst` — pause when
+    /// possible, otherwise force the largest holder to spill
+    /// regardless of priority. Useful when one operator dominates
+    /// the budget and a fairness override is wanted.
+    Both,
+}
+
+impl BackpressureKnob {
+    /// True when this knob equals the default (`Pause`). Used as
+    /// the `skip_serializing_if` gate inside `MemoryConfig` so a
+    /// `backpressure: pause` field is dropped from serde output
+    /// rather than re-emitted as redundant noise.
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Pause)
+    }
+
+    /// Construct the boxed `ArbitrationPolicy` this knob selects.
+    /// Called by every production callsite that builds a
+    /// `MemoryArbitrator` from parsed config.
+    pub fn build_policy(self) -> Box<dyn crate::pipeline::memory::ArbitrationPolicy> {
+        use crate::pipeline::memory::{
+            BackPressurePreferred, LargestFirst, MemoryArbitrator, Priority,
+        };
+        match self {
+            Self::Spill => Box::new(Priority),
+            Self::Pause => MemoryArbitrator::default_policy(),
+            Self::Both => Box::new(BackPressurePreferred::wrapping(LargestFirst)),
+        }
+    }
 }
 
 /// Execution metrics reporting configuration.
@@ -2874,7 +2964,7 @@ impl PipelineConfig {
             &mut dag,
             &artifacts,
             &mut diags,
-            self.pipeline.memory_limit.as_deref(),
+            self.pipeline.memory.limit.as_deref(),
         );
         // Companion sweep over composition body mini-DAGs. Body
         // graphs hold their own `PlanNode::Combine` nodes that the
@@ -2884,7 +2974,7 @@ impl PipelineConfig {
         crate::plan::combine::select_combine_strategies_in_bodies(
             &mut artifacts,
             &mut diags,
-            self.pipeline.memory_limit.as_deref(),
+            self.pipeline.memory.limit.as_deref(),
         );
 
         // Correlation-key planner passes. Run AFTER the DAG is fully

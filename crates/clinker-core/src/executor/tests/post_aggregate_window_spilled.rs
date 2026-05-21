@@ -16,7 +16,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-/// Pipeline with a tight `memory_limit` and many distinct group keys —
+/// Pipeline with a tight `memory.limit` and many distinct group keys —
 /// exercises the hash-aggregate path under memory pressure (and the
 /// spill admission path on hosts with `rss_bytes()` available).
 #[tokio::test(flavor = "multi_thread")]
@@ -24,7 +24,7 @@ async fn post_aggregate_window_correct_under_memory_pressure() {
     let yaml = r#"
 pipeline:
   name: post_aggregate_window_spilled
-  memory_limit: "8M"
+  memory: { limit: "8M" }
 error_handling:
   strategy: continue
 nodes:

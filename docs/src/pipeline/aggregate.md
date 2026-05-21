@@ -88,7 +88,7 @@ If your source declares a `sort_order:` that covers the group-by fields, the opt
 
 ### When to use hash
 
-Hash aggregation works on unsorted input and is the safe default. It uses more memory but handles any data ordering. Memory-aware disk spill kicks in when RSS approaches the pipeline's `memory_limit`.
+Hash aggregation works on unsorted input and is the safe default. It uses more memory but handles any data ordering. Memory-aware disk spill kicks in when RSS approaches the pipeline's `memory.limit`.
 
 ## Correlation-key interaction
 

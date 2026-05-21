@@ -14,7 +14,7 @@
 //! lands the full bench around 1-2 minutes per shape, well under the
 //! 5-minute budget the task spec sets.
 //!
-//! `memory_limit: 4G` is set on both pipelines so the 3-input chain's
+//! `memory.limit: 4G` is set on both pipelines so the 3-input chain's
 //! intermediate (1K × 1K = 1M-row first step output × ~100-byte rows
 //! ≈ 100 MB) plus the final fan-out stays inside the soft and hard
 //! limits — the smaller default 512 MB limit aborts the 3-input
@@ -51,7 +51,7 @@ use indexmap::IndexMap;
 const COMBINE_NARY_3INPUT_YAML: &str = r#"
 pipeline:
   name: bench_combine_nary_3input
-  memory_limit: "4G"
+  memory: { limit: "4G" }
 nodes:
 - type: source
   name: a
@@ -120,7 +120,7 @@ nodes:
 const COMBINE_BINARY_BASELINE_YAML: &str = r#"
 pipeline:
   name: bench_combine_binary_baseline
-  memory_limit: "4G"
+  memory: { limit: "4G" }
 nodes:
 - type: source
   name: a

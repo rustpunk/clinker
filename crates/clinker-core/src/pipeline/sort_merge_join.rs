@@ -49,6 +49,8 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::KeyExtractor;
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
+#[cfg(test)]
+use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
@@ -783,12 +785,12 @@ fn sort_driver_pairs_externally(
             // so a true k-way merge over Phase A spill files is the
             // next-iteration improvement. Today we surface the limit
             // explicitly so a future enlargement of the soft limit (or
-            // a user `memory_limit:` increase) lets the workload run.
+            // a user `memory.limit:` increase) lets the workload run.
             if files.len() > 1 {
                 return Err(PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge driver phase A produced {} spill files; multi-file \
                      k-way merge is wired but not yet enabled — increase the \
-                     pipeline `memory_limit:` so the sort fits in a single chunk",
+                     pipeline `memory.limit:` so the sort fits in a single chunk",
                     files.len()
                 ))));
             }
@@ -872,7 +874,7 @@ fn sort_build_pairs_externally(
                 return Err(PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge build phase A produced {} spill files; multi-file \
                      k-way merge is wired but not yet enabled — increase the \
-                     pipeline `memory_limit:` so the sort fits in a single chunk",
+                     pipeline `memory.limit:` so the sort fits in a single chunk",
                     files.len()
                 ))));
             }
@@ -1547,8 +1549,12 @@ mod tests {
         let source_file: Arc<str> = Arc::from("");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut budget = match rk.budget_bytes {
-            Some(b) => MemoryArbitrator::new(b, 0.80),
-            None => MemoryArbitrator::from_config(None),
+            Some(b) => MemoryArbitrator::with_policy(b, 0.80, Box::new(NoOpPolicy)),
+            None => MemoryArbitrator::with_policy(
+                crate::pipeline::memory::parse_memory_limit_bytes(None),
+                0.80,
+                Box::new(NoOpPolicy),
+            ),
         };
         let dir = tempfile::Builder::new()
             .prefix("sm-test-")

@@ -125,8 +125,8 @@ pub struct RunArgs {
     pub config: PathBuf,
 
     /// Memory budget (supports K/M/G suffixes), default 256M
-    #[arg(long, help_heading = "Execution")]
-    pub memory_limit: Option<String>,
+    #[arg(long = "memory-limit", help_heading = "Execution")]
+    pub mem_limit: Option<String>,
 
     /// Thread pool size, default num_cpus
     #[arg(long, help_heading = "Execution")]
@@ -207,7 +207,7 @@ pub struct RunArgs {
 impl RunArgs {
     /// Resolve memory limit from CLI flag or default (256MB).
     pub fn memory_limit_bytes(&self) -> u64 {
-        parse_memory_limit_bytes(self.memory_limit.as_deref().or(Some("256M")))
+        parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("256M")))
     }
 
     /// Resolve batch_id from CLI flag or generate UUID v7.

@@ -48,7 +48,7 @@ use std::collections::HashMap;
 const COMBINE_IEJOIN_YAML: &str = r#"
 pipeline:
   name: bench_combine_iejoin
-  memory_limit: 4G
+  memory: { limit: 4G }
 nodes:
 - type: source
   name: employees

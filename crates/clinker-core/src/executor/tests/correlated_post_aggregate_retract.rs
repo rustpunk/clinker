@@ -322,7 +322,7 @@ async fn aggregator_state_degraded_falls_back_without_panic() {
     let yaml = r#"
 pipeline:
   name: degraded_post_aggregate
-  memory_limit: "1"
+  memory: { limit: "1" }
 error_handling:
   strategy: continue
 nodes:

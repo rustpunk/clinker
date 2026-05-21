@@ -251,7 +251,7 @@ Driver wins on a name collision: if both the driver and a build input declare `$
 
 ## Memory considerations
 
-Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly 1.5-2x the raw CSV size in heap. A 50 MB product catalog typically uses 75-100 MB of hash-table memory. Tune with `memory_limit:` at the pipeline level; see [Memory Tuning](../ops/memory.md) for spill thresholds and strategy overrides.
+Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly 1.5-2x the raw CSV size in heap. A 50 MB product catalog typically uses 75-100 MB of hash-table memory. Tune with `pipeline.memory.limit` at the pipeline level; see [Memory Tuning](../ops/memory.md) for spill thresholds, the backpressure knob, and strategy overrides.
 
 ## Complete example
 

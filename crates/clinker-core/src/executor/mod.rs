@@ -1134,14 +1134,14 @@ impl PipelineExecutor {
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
-        // Pipeline-scoped MemoryArbitrator. One declared `memory_limit`
+        // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
         // envelopes every node-rooted arena finalize — including the
         // arenas built at Source dispatch-arm exits. Promoted to
         // ctx-owned so a relaxed pipeline cannot multiply its declared
-        // limit across N upstream operators by accident.
-        let memory_budget = crate::pipeline::memory::MemoryArbitrator::from_config(
-            config.pipeline.memory_limit.as_deref(),
-        );
+        // limit across N upstream operators by accident. The active
+        // policy is the one `pipeline.memory.backpressure` selects;
+        // default `pause` installs `BackPressurePreferred -> Priority`.
+        let memory_budget = build_arbitrator_from_config(config);
 
         // No prologue drain or arena build. The dispatch Source arm
         // is the first consumer of every `mpsc::Receiver`:
@@ -3541,7 +3541,8 @@ pub(crate) fn single_predecessor(
 pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
     config
         .pipeline
-        .memory_limit
+        .memory
+        .limit
         .as_ref()
         .and_then(|s| {
             let s = s.trim();
@@ -3554,6 +3555,23 @@ pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
             }
         })
         .unwrap_or(512 * 1024 * 1024) // 512MB default
+}
+
+/// Build a `MemoryArbitrator` from the pipeline-level `memory:` block.
+/// Resolves `memory.limit` through `parse_memory_limit_bytes` (defaults
+/// to 512 MiB when omitted) and chooses the active policy via
+/// `BackpressureKnob::build_policy`. Used by both the pipeline-scoped
+/// arbitrator and every per-arm budget the dispatch path constructs.
+pub(crate) fn build_arbitrator_from_config(
+    config: &PipelineConfig,
+) -> crate::pipeline::memory::MemoryArbitrator {
+    let mem = &config.pipeline.memory;
+    let limit = crate::pipeline::memory::parse_memory_limit_bytes(mem.limit.as_deref());
+    crate::pipeline::memory::MemoryArbitrator::with_policy(
+        limit,
+        0.80,
+        mem.backpressure.build_policy(),
+    )
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ use std::io::Write;
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: diamond_hard_fail
-  memory_limit: "512K"
+  memory: { limit: "512K" }
 nodes:
   - type: source
     name: events

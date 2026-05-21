@@ -711,7 +711,7 @@ pub fn select_combine_strategies(
     plan: &mut crate::plan::execution::ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
-    memory_limit: Option<&str>,
+    mem_limit_str: Option<&str>,
 ) {
     // The top-level pass owns the `node_properties` table needed by
     // `pure_range_inputs_presorted`. Snapshot it as a clone so the
@@ -729,7 +729,7 @@ pub fn select_combine_strategies(
         Some(&node_properties_snapshot),
         &tables,
         diags,
-        memory_limit,
+        mem_limit_str,
     );
 }
 
@@ -744,7 +744,7 @@ pub fn select_combine_strategies(
 pub fn select_combine_strategies_in_bodies(
     artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
-    memory_limit: Option<&str>,
+    mem_limit_str: Option<&str>,
 ) {
     // Split the artifacts borrow: the bodies map mutates via
     // `values_mut()`, while the lookup tables (combine_inputs,
@@ -766,7 +766,7 @@ pub fn select_combine_strategies_in_bodies(
         combine_strategy_hints,
     };
     for body in composition_bodies.values_mut() {
-        select_combine_strategies_in_graph(&mut body.graph, None, &tables, diags, memory_limit);
+        select_combine_strategies_in_graph(&mut body.graph, None, &tables, diags, mem_limit_str);
     }
 }
 
@@ -796,7 +796,7 @@ pub(crate) fn select_combine_strategies_in_graph(
     >,
     tables: &CombineSelectionTables<'_>,
     diags: &mut Vec<Diagnostic>,
-    memory_limit: Option<&str>,
+    mem_limit_str: Option<&str>,
 ) {
     use crate::plan::execution::PlanNode;
     use petgraph::graph::NodeIndex;
@@ -879,7 +879,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             } else {
                 CombineStrategy::IEJoin
             }
-        } else if grace_hash_should_fire(inputs, memory_limit)
+        } else if grace_hash_should_fire(inputs, mem_limit_str)
             || matches!(
                 tables.combine_strategy_hints.get(&name),
                 Some(crate::config::CombineStrategyHint::GraceHash)
@@ -919,9 +919,9 @@ pub(crate) fn select_combine_strategies_in_graph(
 /// `HashBuildProbe`. Fires when every input has an estimated
 /// cardinality AND the smaller side multiplied by a conservative
 /// per-record byte estimate would breach the configured 80% soft
-/// limit. The pipeline's `memory_limit:` YAML knob is what binds
-/// the threshold; absent that, we fall back to the same default
-/// `MemoryArbitrator::from_config(None)` uses.
+/// limit. The pipeline's `memory.limit` YAML knob is what binds
+/// the threshold; absent that, we fall back to the 512 MiB default
+/// `parse_memory_limit_bytes(None)` uses.
 ///
 /// When estimates are missing on either side, returns false — there
 /// is no signal to override the default in-memory hash strategy, and
@@ -929,7 +929,7 @@ pub(crate) fn select_combine_strategies_in_graph(
 /// grace dispatch.
 fn grace_hash_should_fire(
     inputs: &IndexMap<String, CombineInput>,
-    memory_limit: Option<&str>,
+    mem_limit_str: Option<&str>,
 ) -> bool {
     use crate::pipeline::grace_hash::GRACE_RECORD_BYTES_ESTIMATE;
     use crate::pipeline::memory::parse_memory_limit_bytes;
@@ -944,7 +944,7 @@ fn grace_hash_should_fire(
     if build_estimate == 0 {
         return false;
     }
-    let limit = parse_memory_limit_bytes(memory_limit);
+    let limit = parse_memory_limit_bytes(mem_limit_str);
     let soft_limit = limit / 100 * 80;
     let estimated_bytes = build_estimate.saturating_mul(GRACE_RECORD_BYTES_ESTIMATE);
     estimated_bytes >= soft_limit

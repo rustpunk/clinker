@@ -143,7 +143,7 @@ fn format_estimated_rows(input: Option<&crate::plan::combine::CombineInput>) -> 
 
 /// Format a byte count with the largest binary-prefix unit that keeps
 /// the magnitude under 1024. `64M` / `2G` style — matches the surface
-/// syntax of `pipeline.memory_limit` so users see the value back in the
+/// syntax of `pipeline.memory.limit` so users see the value back in the
 /// units they wrote.
 fn format_bytes(n: u64) -> String {
     const KIB: u64 = 1024;
@@ -1197,7 +1197,11 @@ impl ExecutionPlanDag {
     /// authors use to see which stages will charge `MemoryArbitrator`.
     /// Build it with [`Self::classify_node_buffers`] when a
     /// `PipelineConfig` is in hand.
-    fn explain(&self, buffer_classes: &HashMap<NodeIndex, BufferClass>) -> String {
+    fn explain(
+        &self,
+        buffer_classes: &HashMap<NodeIndex, BufferClass>,
+        arbitration_policy_name: &str,
+    ) -> String {
         let mut out = String::new();
         out.push_str("=== Execution Plan ===\n\n");
 
@@ -1216,7 +1220,13 @@ impl ExecutionPlanDag {
             "Output projections: {}\n",
             self.output_projections.len()
         ));
-        out.push_str(&format!("DAG nodes: {}\n\n", self.graph.node_count()));
+        out.push_str(&format!("DAG nodes: {}\n", self.graph.node_count()));
+        // Pipeline-level arbitration policy. The active policy is the
+        // one `pipeline.memory.backpressure` selects (default `pause`
+        // → `BackPressurePreferred -> Priority`); rendering it here
+        // lets pipeline authors see the spill/pause posture before
+        // runtime.
+        out.push_str(&format!("arbitration: {}\n\n", arbitration_policy_name));
 
         if !self.source_dag.is_empty() {
             out.push_str("Source DAG:\n");
@@ -1547,7 +1557,9 @@ impl ExecutionPlanDag {
         // every combine node when artifacts are absent — so the output
         // of `explain()` already has no combine block to dedupe.
         let classes = self.classify_node_buffers(config);
-        let mut out = self.explain(&classes);
+        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy_name = policy.policy_name();
+        let mut out = self.explain(&classes, &policy_name);
         self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
         out
     }
@@ -1770,7 +1782,7 @@ impl ExecutionPlanDag {
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
     ) -> String {
         let total_limit = crate::pipeline::memory::parse_memory_limit_bytes(
-            config.pipeline.memory_limit.as_deref(),
+            config.pipeline.memory.limit.as_deref(),
         );
         let mut out = self.explain_with_artifacts(config, artifacts, total_limit);
         // Re-render the retraction section with the pipeline config in
@@ -1830,14 +1842,14 @@ impl ExecutionPlanDag {
 
         // Memory budget
         out.push_str("=== Memory Budget ===\n\n");
-        let memory_limit = config
+        let limit_status = config
             .pipeline
             .concurrency
             .as_ref()
             .and_then(|c| c.threads)
             .map(|_| "configured")
             .unwrap_or("default");
-        out.push_str(&format!("Memory limit: {}\n", memory_limit));
+        out.push_str(&format!("Memory limit: {}\n", limit_status));
         out.push_str(&format!(
             "Worker threads: {}\n",
             self.parallelism.worker_threads
@@ -1910,7 +1922,9 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let classes = self.classify_node_buffers(config);
-        let mut out = self.explain(&classes);
+        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy_name = policy.policy_name();
+        let mut out = self.explain(&classes, &policy_name);
         if let Some(start) = out.find("=== Retraction ===\n") {
             out.truncate(start);
         }
@@ -1942,14 +1956,14 @@ impl ExecutionPlanDag {
 
         // Memory budget
         out.push_str("=== Memory Budget ===\n\n");
-        let memory_limit = config
+        let limit_status = config
             .pipeline
             .concurrency
             .as_ref()
             .and_then(|c| c.threads)
             .map(|_| "configured")
             .unwrap_or("default");
-        out.push_str(&format!("Memory limit: {}\n", memory_limit));
+        out.push_str(&format!("Memory limit: {}\n", limit_status));
         out.push_str(&format!(
             "Worker threads: {}\n",
             self.parallelism.worker_threads
