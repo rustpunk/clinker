@@ -37,6 +37,9 @@ Key information shown:
 - **Node type** -- Source, Transform, Aggregate, Route, Merge, Output, Composition
 - **Parallelism strategy** -- how the optimizer plans to execute the node
 - **Connections** -- downstream nodes, with port labels for route branches
+- **Buffer class** (Physical Properties section) -- `buffer: streaming` for nodes whose output is consumed record-by-record by a fused downstream stage (Source → Transform → Output chains, Merge.interleave + Source pairs, and every sink Output); `buffer: materialized` for nodes whose output sits in an inter-stage buffer between dispatch arms
+
+The buffer class is a pre-runtime signal for memory pressure: every `materialized` node charges its in-flight rows against `pipeline.memory_limit` and may spill to disk once the soft threshold trips. Streaming stages add no inter-stage allocation. Use the annotation alongside `--memory-limit` / `pipeline.memory_limit` to predict which stages dominate the RSS budget before running the pipeline.
 
 ## JSON format
 

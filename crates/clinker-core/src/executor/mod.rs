@@ -2532,7 +2532,7 @@ fn has_single_outgoing(
 /// Concat-mode Merges keep the per-Source drain too: concat drains
 /// predecessors in declaration order, which the per-arm path
 /// already delivers.
-fn compute_merge_interleave_fused_sources(
+pub(crate) fn compute_merge_interleave_fused_sources(
     plan: &crate::plan::execution::ExecutionPlanDag,
     config: &PipelineConfig,
 ) -> HashSet<String> {
@@ -2618,7 +2618,7 @@ fn compute_merge_interleave_fused_sources(
 /// (extending #67's pattern from Merge to Transform unblocks
 /// `[slow Source → Transform → out]` topologies from sitting idle on
 /// the upstream Source's drain).
-fn compute_transform_fused_sources(
+pub(crate) fn compute_transform_fused_sources(
     plan: &crate::plan::execution::ExecutionPlanDag,
     merge_fused: &HashSet<String>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
@@ -3010,7 +3010,7 @@ async fn streaming_output_task(
     out
 }
 
-fn compute_init_phase_node_set(
+pub(crate) fn compute_init_phase_node_set(
     plan: &crate::plan::execution::ExecutionPlanDag,
 ) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
     use crate::config::Phase as ConfPhase;
