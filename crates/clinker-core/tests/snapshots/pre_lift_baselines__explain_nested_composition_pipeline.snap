@@ -1,5 +1,6 @@
 ---
 source: crates/clinker-core/tests/pre_lift_baselines.rs
+assertion_line: 547
 expression: scrubbed
 ---
 === Execution Plan ===
@@ -20,18 +21,21 @@ source.raw_src:
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 composition.nested_process:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 output.final_out:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: streaming
 
 === CXL Expressions ===
 

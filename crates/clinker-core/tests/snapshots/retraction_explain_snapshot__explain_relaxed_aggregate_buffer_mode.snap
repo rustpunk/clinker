@@ -38,30 +38,35 @@ source.orders:
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 sort.__correlation_sort_orders:
   ordering: order_id
   ordering_provenance: Preserved { from_node: "__correlation_sort_orders" }
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 transform.windowed:
   ordering: <none>
   ordering_provenance: DestroyedByTransformWriteSet { at_node: "windowed", fields_written: ["amount", "department", "order_id", "running_total"], sort_fields_lost: ["order_id"], confidence: Proven }
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 aggregation.dept_totals:
   ordering: <none>
   ordering_provenance: DestroyedByHashAggregate { at_node: "dept_totals", confidence: Proven }
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 output.out:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: streaming
 
 === Retraction ===
 

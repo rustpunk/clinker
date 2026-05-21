@@ -851,6 +851,37 @@ pub struct PlanEdge {
     pub port: Option<String>,
 }
 
+/// Per-node materialization class surfaced by `--explain`.
+///
+/// Mirrors the runtime distinction visible in
+/// [`crate::executor::dispatch`]: nodes whose output bypasses
+/// `ctx.node_buffers` (fused Source / Transform chains and sink Outputs)
+/// charge no inter-stage memory against [`crate::pipeline::memory::MemoryBudget`];
+/// every other node materializes an intermediate buffer and is spill-eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferClass {
+    /// No `ctx.node_buffers` slot is admitted for this stage's output —
+    /// no `MemoryBudget` charge for this stage, no spill eligibility.
+    /// Today this covers fused Sources (their receiver is consumed
+    /// directly by the downstream fused arm) and every Output (sinks
+    /// write to their configured writer and never admit a buffer).
+    Streaming,
+    /// Records pass through a `ctx.node_buffers` slot between dispatch
+    /// arms. The producer charges `MemoryBudget` via
+    /// `charge_node_buffer_bytes` on admit, the consumer discharges on
+    /// drain, and a soft-threshold trip spills the slot to disk.
+    Materialized,
+}
+
+impl BufferClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::Materialized => "materialized",
+        }
+    }
+}
+
 /// DAG-based execution plan — replaces ExecutionPlan.
 ///
 /// The single source of truth for pipeline topology and execution strategy.
@@ -1110,8 +1141,63 @@ impl ExecutionPlanDag {
         }
     }
 
+    /// Classify every node by whether its output crosses an inter-stage
+    /// `ctx.node_buffers` slot at runtime.
+    ///
+    /// Two stages render `streaming`:
+    ///
+    /// - **Sources** whose name lands in either fused-source set. The
+    ///   dispatch arm returns cleanly without admitting a buffer; the
+    ///   downstream fused consumer (Merge.interleave arm or
+    ///   `transform_fused_consume`) takes the receiver directly.
+    /// - **Outputs**, unconditionally. Outputs are sinks — they consume
+    ///   records and write to the configured writer; they never admit
+    ///   to `node_buffers`.
+    ///
+    /// Everything else materializes. In particular, a Transform whose
+    /// `NodeIndex` lands in `fused_transforms` is still
+    /// `materialized`: the fusion saves the *source-side* allocation
+    /// (the upstream Source no longer admits to `node_buffers[source]`),
+    /// but `transform_fused_consume` accumulates the per-record
+    /// evaluation output into a `Vec<(Record, u64)>` and admits the
+    /// whole stage to `node_buffers[transform]` at close.
+    /// `fused_transforms` is consulted only to extend `fused_sources`
+    /// with the upstream Source name, not to flip the Transform itself.
+    ///
+    /// The returned map is keyed by `NodeIndex` and covers every node in
+    /// the graph (one entry per `node_indices()` slot).
+    fn classify_node_buffers(&self, config: &PipelineConfig) -> HashMap<NodeIndex, BufferClass> {
+        let init_phase = crate::executor::compute_init_phase_node_set(self);
+        let mut fused_sources =
+            crate::executor::compute_merge_interleave_fused_sources(self, config);
+        let (extra_fused_sources, _fused_transforms) =
+            crate::executor::compute_transform_fused_sources(self, &fused_sources, &init_phase);
+        fused_sources.extend(extra_fused_sources);
+
+        self.graph
+            .node_indices()
+            .map(|idx| {
+                let class = match &self.graph[idx] {
+                    PlanNode::Output { .. } => BufferClass::Streaming,
+                    PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
+                        BufferClass::Streaming
+                    }
+                    _ => BufferClass::Materialized,
+                };
+                (idx, class)
+            })
+            .collect()
+    }
+
     /// Format the execution plan for `--explain` display.
-    pub fn explain(&self) -> String {
+    ///
+    /// `buffer_classes` carries the `streaming` / `materialized`
+    /// verdict per node so the **Physical Properties** section can
+    /// append a `buffer:` line — the pre-runtime signal that pipeline
+    /// authors use to see which stages will charge `MemoryBudget`.
+    /// Build it with [`Self::classify_node_buffers`] when a
+    /// `PipelineConfig` is in hand.
+    fn explain(&self, buffer_classes: &HashMap<NodeIndex, BufferClass>) -> String {
         let mut out = String::new();
         out.push_str("=== Execution Plan ===\n\n");
 
@@ -1219,9 +1305,13 @@ impl ExecutionPlanDag {
                 ));
                 out.push_str(&format!("  partitioning: {:?}\n", props.partitioning.kind));
                 out.push_str(&format!(
-                    "  partitioning_provenance: {:?}\n\n",
+                    "  partitioning_provenance: {:?}\n",
                     props.partitioning.provenance
                 ));
+                if let Some(class) = buffer_classes.get(&idx) {
+                    out.push_str(&format!("  buffer: {}\n", class.label()));
+                }
+                out.push('\n');
             }
         }
 
@@ -1446,6 +1536,7 @@ impl ExecutionPlanDag {
     /// user-declared name with numbered step lines.
     pub fn explain_with_artifacts(
         &self,
+        config: &PipelineConfig,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
         total_memory_limit_bytes: u64,
     ) -> String {
@@ -1455,7 +1546,8 @@ impl ExecutionPlanDag {
         // `render_combine_section(.., None, ..)` which is a no-op for
         // every combine node when artifacts are absent — so the output
         // of `explain()` already has no combine block to dedupe.
-        let mut out = self.explain();
+        let classes = self.classify_node_buffers(config);
+        let mut out = self.explain(&classes);
         self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
         out
     }
@@ -1680,7 +1772,7 @@ impl ExecutionPlanDag {
         let total_limit = crate::pipeline::memory::parse_memory_limit_bytes(
             config.pipeline.memory_limit.as_deref(),
         );
-        let mut out = self.explain_with_artifacts(artifacts, total_limit);
+        let mut out = self.explain_with_artifacts(config, artifacts, total_limit);
         // Re-render the retraction section with the pipeline config in
         // scope so the fanout-policy line resolves to the user-visible
         // setting. `explain()` (called inside `explain_with_artifacts`)
@@ -1817,7 +1909,8 @@ impl ExecutionPlanDag {
 
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
-        let mut out = self.explain();
+        let classes = self.classify_node_buffers(config);
+        let mut out = self.explain(&classes);
         if let Some(start) = out.find("=== Retraction ===\n") {
             out.truncate(start);
         }

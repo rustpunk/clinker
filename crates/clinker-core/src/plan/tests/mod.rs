@@ -3,6 +3,7 @@ mod ck_lattice;
 mod dag;
 mod dedup_node_rooted;
 mod deferred_region;
+mod explain_buffer_class;
 mod explain_polish;
 mod plan_time_window_root;
 mod watermark_validation;

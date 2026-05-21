@@ -26,30 +26,35 @@ source.orders:
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: streaming
 
 transform.classify:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 route.classify_route:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: materialized
 
 output.low:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: streaming
 
 output.high:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
+  buffer: streaming
 
 Route 'classify_route' (mode: exclusive):
   Branch 'high' → output 'high'
