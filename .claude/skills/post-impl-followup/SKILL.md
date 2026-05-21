@@ -1,6 +1,6 @@
 ---
 name: post-impl-followup
-description: "Post-implementation retrospective that surfaces deviations, silent scope changes, ideas, and stray observations that came up during an implementation session but are not yet logged. Compares each landed PR's diff against the closing issue's acceptance criteria, scans architectural-rigor shortcut signatures, and reads the current session's conversation for process-meta items (sizing surprises, pre-existing issues noticed in passing, architectural insights, follow-up ideas). For each finding, decides whether to fix it in-place this session (small code or doc changes) or defer it. Cross-references deferred findings against open GitHub issues and milestones, then proposes a structured action list: in-place fixes to apply now, new issues to file, existing issues to comment on, and milestone mapping (including suggesting a new milestone when a theme emerges). Writes to code only for in-place fixes (with confirmation) and to GitHub via gh after explicit user confirmation. Distinct from /post-impl-validator (which audits code quality via parallel pi agents) — this skill captures the *process-meta* items that a pure code audit would miss. Triggers on: post-impl followup, post-implementation followup, session retrospective, what came up during this session, did anything come up worth logging, surface follow-ups, what should we file, capture session deviations, log silent issues, milestone-1 audit, audit recent PRs."
+description: "Post-implementation retrospective that surfaces deviations, silent scope changes, ideas, and stray observations that came up during an implementation session but are not yet logged. Compares each landed PR's diff against the closing issue's acceptance criteria, scans for architectural-shortcut signatures (suppressed lints, ignored tests, tombstone comments, legacy-rename patterns, parallel old/new path coexistence), and reads the current session's conversation for process-meta items (sizing surprises, pre-existing issues noticed in passing, architectural insights, follow-up ideas). For each finding, decides whether to fix it in-place this session (small code or doc changes) or defer it. Cross-references deferred findings against open GitHub issues and milestones, then proposes a structured action list: in-place fixes to apply now, new issues to file, existing issues to comment on, and milestone mapping (including suggesting a new milestone when a theme emerges). Writes to code only for in-place fixes (with confirmation) and to GitHub via gh after explicit user confirmation. Self-contained — does not depend on any other skill, policy file, or agent. Triggers on: post-impl followup, post-implementation followup, session retrospective, what came up during this session, did anything come up worth logging, surface follow-ups, what should we file, capture session deviations, log silent issues, milestone-1 audit, audit recent PRs."
 argument-hint: "optional: commit range (default: <merge-base>..HEAD), single PR number, or 'milestone N' to scope to all closed PRs in a milestone"
 allowed-tools: Bash, Read, Edit, Write, Glob, Grep, AskUserQuestion, Agent
 ---
@@ -19,25 +19,20 @@ by per-action confirmation.
 
 ## When to invoke
 
-- **At sprint close, before any `git push` or PR opening.** The Clinker
-  refactoring policy treats the sprint's closing commit as the gate —
-  this skill catches the silent deviations and small doc gaps that the
-  gauntlet and `/audit-shortcuts` don't surface, and fixes them in
-  place so the closing commit is genuinely clean. (See the Pre-commit
-  checks section of `CLAUDE.md`.)
+- **At sprint close, before any `git push` or PR opening.** The skill
+  catches silent deviations and small doc gaps that CI checks don't
+  surface, and fixes them in place so the closing commit is genuinely
+  clean.
 - At the end of an implementation session, after a PR is merged or
   about to be merged.
 - Retroactively on a milestone's recently-closed PRs to catch silent
   deviations or untracked deferrals that accumulated.
-- After a multi-commit sprint, paired with `/audit-shortcuts` (which
-  scans architectural-rigor signatures) — this skill is the broader
-  process-meta layer.
 
-**Distinct from `/post-impl-validator`.** That skill is a *code-quality*
-audit (correctness, coverage, coherence, debt) run by parallel pi agents.
 This skill is a *session retrospective + in-place fix + GH bookkeeping*
-layer. They compose: run `/post-impl-validator` for code findings, then
-`/post-impl-followup` for process-meta, small fixes, and GH integration.
+layer. If you also run a separate code-quality audit (correctness,
+coverage, coherence, debt), run it first; this skill captures the
+*process-meta* items — sizing decisions, doc gaps, untracked deferrals,
+convention drift — that a pure code audit misses.
 
 ## Fix-now vs defer: the central judgement
 
@@ -47,20 +42,24 @@ break anything?** If yes, fix it in place. If no, file or comment.
 
 **FIX-NOW candidates** (handle immediately, before any GH writes):
 
-- Typo, wording, or formatting fix in `docs/src/` (mdbook), README,
-  CONVENTIONS, or in-tree `///` / `//!` doc comments.
-- Missing `///` summary on a public item the sprint added.
+- Typo, wording, or formatting fix in user-facing docs (`docs/`,
+  `README`, generated doc-site pages like mdbook / Sphinx / Docusaurus /
+  VitePress) or in-tree doc-comments (`///`, `//!`, `/**`, docstrings).
+- Missing doc-comment summary on a public item the sprint added.
 - Single-file doc update to reflect a small surface change the PR
-  shipped (e.g. mdbook page lists 7 diagnostic codes, sprint added an
-  8th, page needs the new row).
+  shipped (e.g. a docs page lists 7 diagnostic codes, the sprint added
+  an 8th, the page needs the new row).
 - Broken in-tree link, stale path, outdated example snippet.
 - Trivially-dead import or `use` line spotted in passing (the sprint's
   own additions only — do not chase old dead code unless explicitly in
   scope).
-- LD entry that needs a one-line amendment to reflect what actually
-  landed (when the LD-doc is in-tree).
-- Comment that violates the comment policy (phase labels, LD codes,
-  paths into gitignored planning artifacts) — strip or rewrite.
+- A decision-record / ADR / locked-decision entry that needs a
+  one-line amendment to reflect what actually landed (when the doc is
+  in-tree).
+- Comment that violates the repo's comment policy — typically references
+  to ephemeral process artifacts (phase labels, internal task codes,
+  paths into gitignored planning docs) that won't make sense to an
+  external reader on GitHub. Strip or rewrite.
 
 **DEFER candidates** (always file or comment, never fix-now):
 
@@ -84,11 +83,11 @@ Seven categories of finding, each mapped to a disposition:
 | Category | Example | Default disposition |
 |---|---|---|
 | **Silent acceptance gap** | Issue spec required X, PR landed X minus an explain-subcommand wire-up | Comment on closed issue with file:line evidence; consider re-opening or filing follow-up |
-| **Silent scope creep** | PR introduced a new diagnostic code beyond spec, undocumented elsewhere | If the doc gap is the only loose end and the docs live in-tree, FIX-NOW (update mdbook page). Otherwise comment on closed issue |
+| **Silent scope creep** | PR introduced a new diagnostic code beyond spec, undocumented elsewhere | If the doc gap is the only loose end and the docs live in-tree, FIX-NOW (update the docs page). Otherwise comment on closed issue |
 | **Untracked deferral** | PR mentions "we'll do X later" but no follow-up issue exists | New issue, milestone-mapped |
 | **Architectural observation** | Surfaced during testing; not a bug, but worth a comment or follow-up | Comment on related open issue, or new issue |
 | **Pre-existing housekeeping** | Warnings, brittle assertions, naming friction noticed in passing | New chore issue, no milestone or housekeeping milestone (do NOT fold into closing commit) |
-| **Doc / comment hygiene** | Missing `///` summary, comment with banned phase-label reference, mdbook out of sync with shipped surface | FIX-NOW |
+| **Doc / comment hygiene** | Missing doc-comment summary, comment with stale internal-process reference, docs out of sync with shipped surface | FIX-NOW |
 | **New idea / theme** | Multiple findings cluster around a topic not covered by any milestone | Suggest a **new milestone** with proposed scope |
 
 The defaults are starting points; classify per finding in Step 5.
@@ -144,17 +143,19 @@ For each PR in scope, spawn one `Explore` agent with this prompt template:
 >
 > For each acceptance bullet, mark **DELIVERED**, **MISSING**, or **PARTIAL** with file:line evidence.
 >
-> Scan the diff for shortcut signatures per `.claude/policies/architectural-rigor.md` (read it first if present, fall back to the generic list in `/audit-shortcuts`):
-> - `#[allow(...)]` / `#[ignore]` / `#[deprecated]` introduced in this diff
-> - `Legacy*` / `Internal*` / `*Block` naming
-> - `#[serde(default)]` on mandatory-post-rename fields
-> - TODO / FIXME / XXX / tombstone comments
-> - Parallel new+old path coexistence
+> Scan the diff for architectural-shortcut signatures. Use the repo's own policy file if one exists (look for `ARCHITECTURE.md`, `CONTRIBUTING.md`, `CONVENTIONS.md`, or a similarly-named top-level conventions doc); otherwise scan for this generic list:
+> - Suppression attributes introduced in this diff (`#[allow(...)]`, `#[ignore]`, `#[deprecated]`, `// eslint-disable`, `# noqa`, `# type: ignore`, etc.)
+> - Rename-instead-of-delete naming (`Legacy*` / `Internal*` / `*Block` / `*Old` / `*V1` carrying behaviour rather than replacing it)
+> - `#[serde(default)]` (or language-equivalent default-on-missing) attached to fields that are mandatory after a rename
+> - Tombstone comments (TODO / FIXME / XXX / "removed X because Y" left in source instead of in the commit message)
+> - Parallel new+old path coexistence — both code paths surviving the closing commit
+> - Tests reduced to weaker assertions (e.g. `assert!(true)`, `expect(true).toBe(true)`) instead of being deleted or fixed
+> - Ignored / skipped tests that were verifying a cutover
 >
 > Identify:
-> - **Surface widenings not in PR description** — new `pub` items, public fields, type aliases, new enum variants, new trait methods the PR body doesn't mention.
-> - **Deferred work mentioned in PR/commit but not filed as follow-up** — grep for "follow-up", "next sub-issue", "later", "deferred", "for now". For each, check if a tracking issue exists via `gh issue list --search`.
-> - **Doc updates promised in acceptance but not made** (mdbook pages, code comments, LOCKED-DECISIONS entries). For each missing doc update, identify the exact file:line that would need editing — this lets the caller decide whether to FIX-NOW or defer.
+> - **Surface widenings not in PR description** — new public items, exported symbols, fields, type aliases, enum variants, trait/interface methods the PR body doesn't mention.
+> - **Deferred work mentioned in PR/commit but not filed as follow-up** — grep for "follow-up", "next sub-issue", "later", "deferred", "for now", "TODO". For each, check if a tracking issue exists via `gh issue list --search`.
+> - **Doc updates promised in acceptance but not made** (user-facing docs, code comments, decision records). For each missing doc update, identify the exact file:line that would need editing — this lets the caller decide whether to FIX-NOW or defer.
 >
 > Report under 600 words in this structured format:
 > ```
@@ -184,7 +185,7 @@ items that wouldn't appear in any PR diff. Six categories:
 1. **Sizing/spec deviations the session decided on** — anything where the
    acceptance text said X and the work landed Y for a justifiable reason
    (test sizing math, schema-width adjustments, etc.).
-2. **Pre-existing issues noticed in passing** — warnings the gauntlet
+2. **Pre-existing issues noticed in passing** — warnings the CI suite
    surfaced, brittle assertions, naming smells, dead code spotted en
    route. These pre-date the current PR and aren't its responsibility,
    but they're now logged in Claude's context and risk being lost.
@@ -195,9 +196,9 @@ items that wouldn't appear in any PR diff. Six categories:
 4. **Ideas / future work** — "we could also do Z" comments that came up
    but weren't acted on.
 5. **Process learnings** — methodology insights worth preserving in a
-   playbook or CLAUDE.md note (e.g. "always dry-run sizing before
-   committing test fixtures"). These don't always need a GH issue; sometimes
-   they belong in repo docs.
+   playbook, contributing guide, or AI-assistant context file (e.g.
+   "always dry-run sizing before committing test fixtures"). These
+   don't always need a GH issue; sometimes they belong in repo docs.
 6. **Convention drift** — places where the session noticed the codebase
    doesn't follow its own stated conventions.
 
@@ -273,21 +274,21 @@ Produce a single structured proposal with four sections, in this order:
 ## Proposed actions
 
 ### Fix in place this session (J items)
-- **docs/src/diagnostics.md**: add row for E319 — 1-line table entry.
-  Evidence: PR #152 introduced E319 in crates/clinker-core/src/diagnostics.rs:212; mdbook page lists E101–E318.
+- **docs/user-guide/errors.md**: add row for new diagnostic E319 — 1-line table entry.
+  Evidence: PR #152 introduced E319 in src/diagnostics.rs:212; the docs page lists E101–E318.
   Diff preview: `| E319 | explain | new diagnostic ... |`
-- **crates/cxl/src/lib.rs:88**: strip phase-label "Wave 7c" from doc comment per comment policy.
+- **src/lib.rs:88**: strip stale internal-task reference from doc comment.
   Diff preview: `- /// Wave 7c additions: ...` → `- /// Public lexer + parser entry points.`
 - ...
 
 ### Comments to post (M items)
-- **#125**: Source-vs-Route admit clarification for docs. [paragraph]
+- **#125**: clarification on how Source-vs-Route admission works, surfaced during testing. [paragraph]
 - ...
 
 ### New issues to file (N items)
-- **Title**: chore(clinker-core): rip unused 'primary' parameters in test helpers
-  **Milestone**: core: clinker-core decomposition (#3)
-  **Labels**: crate:clinker-core, enhancement, P2
+- **Title**: chore: remove unused 'primary' parameters in test helpers
+  **Milestone**: core: module decomposition (#3)
+  **Labels**: area:core, enhancement, P2
   **Body preview**: [first 200 chars]
 - ...
 
@@ -314,10 +315,11 @@ section so the user can accept/reject each section independently:
    edits. Default: accept all. On accept, apply each edit via `Edit` (or
    `Write` for new files), then run a minimal sanity check appropriate
    to what was touched:
-   - mdbook page edited → no build needed (mdbook tolerates raw edits).
-   - `.rs` file edited → `cargo check -p <crate>` for the touched crate
-     only, not the full gauntlet. If clippy was relevant: `cargo clippy
-     -p <crate> -- -D warnings`.
+   - Markdown / plain-text doc edited → no build needed.
+   - Source code edited → run a fast, narrowly-scoped build / type-check
+     for the touched module only (e.g. `cargo check -p <crate>`,
+     `tsc --noEmit -p <project>`, `pyright <file>`); avoid full-suite
+     reruns inside the skill.
    - Comment-only edits → no check.
    Report each applied edit by path.
 2. **Comments to post** — multi-select. On accept, execute via `gh issue comment`.
@@ -370,10 +372,9 @@ The skill's user-facing output is structured for scan-readability:
 
 **No skill names, no slash-command references, no internal session
 jargon in any GH issue body or comment.** PR comments and issues are
-public — they must read self-contained for external visitors. (The
-clinker-project rule "External-facing writing" memory applies.) Apply
-this to every issue body and comment the skill writes, not just the
-first one.
+public — they must read self-contained for external visitors who arrive
+via a search-engine link with no prior context. Apply this to every
+issue body and comment the skill writes, not just the first one.
 
 ## Edge cases
 
@@ -384,17 +385,18 @@ first one.
   "Proposed change" or "Motivation" sections as the de-facto spec.
 - **Milestone not in numbered format** — `gh api repos/.../milestones`
   returns by title; pass titles to `--milestone`, not numbers.
-- **No `architectural-rigor.md` policy file** — use the generic
-  signature list embedded in `/audit-shortcuts`.
+- **No in-repo shortcut-signature policy file** — use the generic
+  signature list in the Step 2 prompt above.
 - **Conversation transcript unavailable** — skip step 3, note the
   limitation in the report, proceed with steps 2 + 4–7 only. This is
   the cold-invocation mode (retrospective audits with no live session).
 - **User declines all actions** — print the would-be actions as a
   digest the user can paste elsewhere later, then exit cleanly. Don't
   delete the analysis just because no writes happened.
-- **Fix-in-place edit fails sanity check** (`cargo check` errors out) —
-  revert the edit, demote the finding to NEW ISSUE, surface the
-  failure to the user. Do not push past a failing check.
+- **Fix-in-place edit fails its sanity check** (the scoped build /
+  type-check errors out) — revert the edit, demote the finding to NEW
+  ISSUE, surface the failure to the user. Do not push past a failing
+  check.
 - **Working tree has unrelated dirty files at invocation** — proceed,
   but warn the user that fix-in-place edits will land on top of the
   existing dirty state and may need to be committed separately.
@@ -402,8 +404,8 @@ first one.
 ## Anti-patterns
 
 - **Don't fold pre-existing housekeeping into fix-in-place.** A typo in
-  someone else's mdbook page is fair game; a dead module that's been
-  rotting for six months is a chore issue, not a sprint-close edit.
+  a doc page is fair game; a dead module that's been rotting for six
+  months is a chore issue, not a sprint-close edit.
 - **Don't bundle distinct findings into one mega-issue.** Each
   architectural concern, each housekeeping item, each spec deviation
   gets its own issue. Three small chore issues > one omnibus chore.
@@ -437,19 +439,10 @@ actions.
 ```
 
 → Audits a single PR retroactively. Fix-in-place edits are still
-candidates (e.g. a missed mdbook row) even on a merged PR.
+candidates (e.g. a missed doc row) even on a merged PR.
 
 ```
 /post-impl-followup milestone 1
 ```
 
 → Audits every closed PR in milestone 1 (the retrospective sweep mode).
-
-## Reference: companion skills
-
-- `/audit-shortcuts` — the mechanical shortcut-signature scan that this
-  skill incorporates into Step 2. Can be run standalone.
-- `/post-impl-validator` — the code-quality audit. Run *before* this
-  skill if you want bugs/coverage findings in the same retrospective.
-- `/handoff` — write a session-summary doc. Run *after* this skill if
-  the audit surfaced material the next session needs.
