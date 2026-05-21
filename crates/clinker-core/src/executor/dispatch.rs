@@ -412,7 +412,7 @@ use crate::executor::{
     evaluate_single_transform, evaluate_single_transform_windowed, parse_memory_limit,
     stage_metrics, widen_record_to_schema,
 };
-use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
+use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 use crate::projection::project_output_from_record;
@@ -683,7 +683,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// accumulate against this budget so a relaxed pipeline cannot
     /// multiply its declared limit across N upstream operators by
     /// accident.
-    pub(crate) memory_budget: crate::pipeline::memory::MemoryBudget,
+    pub(crate) memory_budget: crate::pipeline::memory::MemoryArbitrator,
 
     /// Per-correlation-group buffer holding deferred output writes
     /// and per-record error events. `Some` iff the plan carries a
@@ -1149,7 +1149,7 @@ pub(crate) fn charge_harvest_admission(
 /// The per-row formula matches `NodeBuffer::estimated_memory_bytes` and
 /// `charge_harvest_admission`: each row contributes `size_of::<Value>()
 /// * column_count + size_of::<(Record, u64)>()` bytes. The two budget
-/// surfaces share the `MemoryBudget::hard_limit` envelope via
+/// surfaces share the `MemoryArbitrator::hard_limit` envelope via
 /// `total_charged`, so a runaway producer trips on the combined sum.
 ///
 /// Used today only by the commit-pass body-harvest re-charge in
@@ -1235,11 +1235,11 @@ pub(crate) fn node_buffer_spill_allowed(
 /// in-memory and on-disk variants based on the live RSS reading.
 ///
 /// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
-/// 2. The per-row byte cost is charged against `MemoryBudget` via
+/// 2. The per-row byte cost is charged against `MemoryArbitrator` via
 ///    [`charge_node_buffer_admit`]'s shared formula. A hard-limit
 ///    breach surfaces as
 ///    `MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer, .. }`.
-/// 3. When `spill_allowed` is `true` and `MemoryBudget::should_spill()`
+/// 3. When `spill_allowed` is `true` and `MemoryArbitrator::should_spill()`
 ///    reports the RSS soft threshold tripped, the rows flush to a
 ///    `SpillFile<u64>` via [`node_buffer_spill::spill_node_buffer`].
 ///    The in-memory charge is discharged immediately and the file size
@@ -4192,7 +4192,7 @@ pub(crate) async fn dispatch_plan_node(
             match dispatch {
                 Dispatch::IEJoin(partition_bits) => {
                     let mut budget =
-                        MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
                     // Advance per-source `rollback_cursors` for every
                     // build-side record before its `row_num` is dropped
                     // in the `(r, _)` map. Source→Combine direct paths
@@ -4281,7 +4281,7 @@ pub(crate) async fn dispatch_plan_node(
                 }
                 Dispatch::Grace(partition_bits) => {
                     let mut budget =
-                        MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
                     // Same per-source cursor advance the IEJoin arm
                     // performs; Source→Combine direct paths on either
                     // side need the explicit walk because the build /
@@ -4371,7 +4371,7 @@ pub(crate) async fn dispatch_plan_node(
                     // the inputs in place via the two-cursor
                     // merge.
                     let mut budget =
-                        MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
                     // Same per-source cursor advance the IEJoin /
                     // Grace arms perform; Source→Combine direct paths
                     // on either side need the explicit walk because
@@ -4455,12 +4455,13 @@ pub(crate) async fn dispatch_plan_node(
             }
 
             // Hash-build phase — drain the build buffer into a
-            // fresh MemoryBudget-governed CombineHashTable. The
+            // fresh MemoryArbitrator-governed CombineHashTable. The
             // stage timer covers the full build walk; on a
             // budget abort the timer is dropped without
             // recording (matches the `StageTimer` "no report on
             // error" contract documented at its definition).
-            let mut budget = MemoryBudget::from_config(ctx.config.pipeline.memory_limit.as_deref());
+            let mut budget =
+                MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
             // Per-source cursor advance for both build and driver.
             // Source→Combine direct paths bypass the Transform /
             // Aggregate advance points so the cursor never moved off

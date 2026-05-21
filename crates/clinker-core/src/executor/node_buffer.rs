@@ -11,7 +11,7 @@
 //! returns an iterator that streams memory rows first, then per-spill
 //! rows via `SpillReader` without materializing the spill into RAM.
 //! Producer-side spill is wired in `executor/node_buffer_spill.rs` and
-//! gated on `MemoryBudget::should_spill()` at every bulk admission site
+//! gated on `MemoryArbitrator::should_spill()` at every bulk admission site
 //! via `admit_node_buffer`.
 
 use std::vec::IntoIter as VecIntoIter;
@@ -124,14 +124,14 @@ impl NodeBuffer {
     }
 
     /// Heuristic in-memory footprint of the slot, paired with the
-    /// `MemoryBudget::charge_node_buffer_bytes` /
+    /// `MemoryArbitrator::charge_node_buffer_bytes` /
     /// `discharge_node_buffer_bytes` ledger. The estimate matches
     /// `charge_harvest_admission`'s per-row formula so the executor's
     /// two budget surfaces (`Arena` for parked region tee, `NodeBuffer`
     /// for inter-stage handoff) use the same per-row size.
     ///
     /// Returns `0` on an empty memory tail. Spill-resident chunks are
-    /// accounted via `MemoryBudget::cumulative_spill_bytes` (the disk
+    /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk
     /// quota), not this counter, so a `Spilled` slot reports `0` here.
     pub(crate) fn estimated_memory_bytes(&self) -> u64 {
         let mem = self.peek_mem();
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(mem.estimated_memory_bytes(), (row_bytes_each * 3) as u64);
 
         // Spilled: zero bytes here — the disk surface tracks them
-        // separately through `MemoryBudget::cumulative_spill_bytes`.
+        // separately through `MemoryArbitrator::cumulative_spill_bytes`.
         let spilled = NodeBuffer::Spilled(vec![spill_chunk(vec![(rec(&s, 1, "a"), 1)])]);
         assert_eq!(spilled.estimated_memory_bytes(), 0);
 

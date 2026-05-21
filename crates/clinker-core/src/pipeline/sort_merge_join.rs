@@ -49,7 +49,7 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::KeyExtractor;
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
-use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
+use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
 
@@ -59,7 +59,7 @@ use crate::plan::combine::{DecomposedPredicate, RangeOp};
 /// threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Period (matched pairs emitted) between [`MemoryBudget::should_abort`]
+/// Period (matched pairs emitted) between [`MemoryArbitrator::should_abort`]
 /// polls during the merge walk.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
@@ -115,7 +115,7 @@ impl MatchingRunBuffer {
 ///
 /// Returns the byte length committed to disk during this call (zero
 /// when the record stayed in memory). Caller folds the result into
-/// [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`] so
+/// [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`] so
 /// the disk-quota gate can fire on overflow.
 fn push_to_buffer(
     buf: &mut MatchingRunBuffer,
@@ -179,7 +179,7 @@ fn push_to_buffer(
 /// [`GraceSpillWriter`]. The returned path lives inside `spill_dir`;
 /// the caller's `TempDir` owns its lifetime. The byte length is
 /// returned alongside the path so the caller can fold it into
-/// [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`].
+/// [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`].
 fn write_spill_segment(
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
@@ -336,7 +336,7 @@ pub(crate) struct SortMergeExec<'a> {
     /// `copy_build_ck_columns` at each emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryBudget,
+    pub budget: &'a mut MemoryArbitrator,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. Matching-run spill segments
     /// land inside it; the surrounding `Arc<TempDir>` Drop is the
@@ -719,7 +719,7 @@ fn sort_driver_pairs_externally(
     pairs: &mut Vec<(Record, RecordOrder, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryBudget,
+    budget: &mut MemoryArbitrator,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -820,7 +820,7 @@ fn sort_build_pairs_externally(
     pairs: &mut Vec<(Record, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryBudget,
+    budget: &mut MemoryArbitrator,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -934,7 +934,7 @@ struct WalkArgs<'a, 'b, 'c> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'c mut MemoryBudget,
+    budget: &'c mut MemoryArbitrator,
 }
 
 /// Walk the two pre-sorted cursors, emitting cross-product matches per
@@ -1068,7 +1068,7 @@ struct EmitForRunArgs<'a, 'b> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'b mut MemoryBudget,
+    budget: &'b mut MemoryArbitrator,
 }
 
 /// Emit cross-product records for one driver row against the buffered
@@ -1547,8 +1547,8 @@ mod tests {
         let source_file: Arc<str> = Arc::from("");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut budget = match rk.budget_bytes {
-            Some(b) => MemoryBudget::new(b, 0.80),
-            None => MemoryBudget::from_config(None),
+            Some(b) => MemoryArbitrator::new(b, 0.80),
+            None => MemoryArbitrator::from_config(None),
         };
         let dir = tempfile::Builder::new()
             .prefix("sm-test-")

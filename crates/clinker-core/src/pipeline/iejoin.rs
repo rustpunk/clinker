@@ -32,7 +32,7 @@
 //!
 //! **Memory model:** the IEJoin scan materializes both partition sides,
 //! the L1/L2 vectors (`signed_idx, op1_key, op2_key` triples), the
-//! permutation P, and the bit array. The caller's [`MemoryBudget`] is
+//! permutation P, and the bit array. The caller's [`MemoryArbitrator`] is
 //! polled every 10K emitted matched pairs; abort returns a typed
 //! `PipelineError::MemoryBudgetExceeded` carrying the combine node's
 //! name and `BudgetCategory::Arena` — the same shape every other
@@ -53,7 +53,7 @@ use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{KeyExtractor, hash_composite_key, keys_equal_canonicalized};
-use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
+use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
@@ -61,7 +61,7 @@ use crate::plan::combine::{DecomposedPredicate, RangeOp};
 /// truncate at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Period (matched pairs emitted) between [`MemoryBudget::should_abort`]
+/// Period (matched pairs emitted) between [`MemoryArbitrator::should_abort`]
 /// polls during the IEJoin scan. Same cadence as the hash probe loop.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
@@ -423,7 +423,7 @@ pub(crate) struct IEJoinExec<'a> {
     /// the shared `copy_build_ck_columns` helper at every emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryBudget,
+    pub budget: &'a mut MemoryArbitrator,
 }
 
 pub(crate) fn execute_combine_iejoin(

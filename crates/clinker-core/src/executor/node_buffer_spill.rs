@@ -1,6 +1,6 @@
 //! Producer-side spill helper for `ctx.node_buffers`.
 //!
-//! When `MemoryBudget::should_spill()` trips at admission time, the
+//! When `MemoryArbitrator::should_spill()` trips at admission time, the
 //! producer flushes the in-memory `Vec<(Record, u64)>` to disk through
 //! `SpillWriter<u64>` and stores the resulting `(SpillFile<u64>, u64)`
 //! pair inside `NodeBuffer::Spilled`. Consumer-side streaming is

@@ -921,7 +921,7 @@ pub(crate) fn select_combine_strategies_in_graph(
 /// per-record byte estimate would breach the configured 80% soft
 /// limit. The pipeline's `memory_limit:` YAML knob is what binds
 /// the threshold; absent that, we fall back to the same default
-/// `MemoryBudget::from_config(None)` uses.
+/// `MemoryArbitrator::from_config(None)` uses.
 ///
 /// When estimates are missing on either side, returns false — there
 /// is no signal to override the default in-memory hash strategy, and

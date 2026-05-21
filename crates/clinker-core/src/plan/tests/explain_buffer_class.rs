@@ -8,7 +8,7 @@
 //!   `ctx.node_buffers` slot at runtime (fused Source/Transform chain
 //!   or a sink Output).
 //! - `materialized` — the node's output is admitted into `node_buffers`
-//!   between dispatch arms and charges `MemoryBudget`.
+//!   between dispatch arms and charges `MemoryArbitrator`.
 //!
 //! These gates pin the annotation contract so it stays stable across
 //! future executor / planner refactors.

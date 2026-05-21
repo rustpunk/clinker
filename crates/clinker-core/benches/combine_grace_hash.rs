@@ -28,7 +28,7 @@
 //! Two paths are measured:
 //!   - **In-memory baseline**: pipeline `memory_limit: 16G`. Process
 //!     RSS stays well below 0.8 × 16G = 12.8G on every conceivable CI
-//!     host, so [`MemoryBudget::should_spill`] never returns true and
+//!     host, so [`MemoryArbitrator::should_spill`] never returns true and
 //!     the grace executor stays in its no-spill fast path.
 //!   - **Forced spill**: pipeline `memory_limit: 1G`. Soft limit is
 //!     ~820M; the bench process's RSS during probe runs ~800M-1G after
@@ -37,7 +37,7 @@
 //!     partition transitions to OnDisk. The 1G hard limit gives a 200M
 //!     headroom band over the 820M soft limit so `should_abort` does
 //!     not trigger before the spill kernel can drop residency.
-//!     `MemoryBudget::from_config` hardcodes `spill_threshold_pct = 0.80`
+//!     `MemoryArbitrator::from_config` hardcodes `spill_threshold_pct = 0.80`
 //!     — the YAML knob does not let the bench tune the soft/hard
 //!     ratio independently, so the limit is sized to the natural band.
 //!
@@ -71,7 +71,7 @@ use indexmap::IndexMap;
 // `strategy: grace_hash` on a pure-equi combine forces the planner to
 // pick `CombineStrategy::GraceHash` regardless of cardinality
 // estimates. The two `memory_limit:` knobs (`SPILL` vs `IN_MEMORY`)
-// drive the [`MemoryBudget::should_spill`] threshold; the YAML body is
+// drive the [`MemoryArbitrator::should_spill`] threshold; the YAML body is
 // otherwise identical so any timing delta is attributable to the
 // spill-vs-no-spill execution mode.
 const COMBINE_GRACE_HASH_SPILL_YAML: &str = r#"

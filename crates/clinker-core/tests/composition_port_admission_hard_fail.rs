@@ -6,7 +6,7 @@
 //! boundary-admit shape: when the engine clones records from the
 //! parent producer's `node_buffers` slot into the composition
 //! body's input port, the clone admission charges the **shared**
-//! `MemoryBudget` (compositions do not get their own budget — body
+//! `MemoryArbitrator` (compositions do not get their own budget — body
 //! operators share the parent pipeline's instance). If the doubled
 //! charge crosses the hard limit, the dispatcher returns a bare
 //! `PipelineError::MemoryBudgetExceeded` whose `node` field carries

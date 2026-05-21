@@ -365,7 +365,7 @@ pub enum PipelineError {
     /// both this variant and the bare inner-variant form.
     ///
     /// The wrapper is purely diagnostic attribution, not a separate
-    /// enforcement path: body operators share the same `MemoryBudget`
+    /// enforcement path: body operators share the same `MemoryArbitrator`
     /// instance as the parent pipeline and admit through the same
     /// site-level primitives.
     CompositionBodyError {
@@ -401,7 +401,7 @@ pub enum PipelineError {
     /// **wrapped** in `CompositionBodyError`, with `node` then
     /// pointing at a body-internal operator. The budget itself is
     /// shared across the whole run — body operators charge the same
-    /// `MemoryBudget` instance the parent pipeline uses.
+    /// `MemoryArbitrator` instance the parent pipeline uses.
     ///
     /// [`CompositionBodyError`]: PipelineError::CompositionBodyError
     MemoryBudgetExceeded {

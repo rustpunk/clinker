@@ -215,7 +215,7 @@ skip its *stats* (not its index).
 
 ### 4.4 Hysteresis on spill thresholds
 
-The existing `MemoryBudget::should_spill()` flips on at the soft threshold
+The existing `MemoryArbitrator::should_spill()` flips on at the soft threshold
 (80% of hard limit). Cross-record operators trigger this much more often
 than per-record transforms; without hysteresis, the pipeline ping-pongs
 in/out of spill at every batch. Generalization adds a sticky 20% raise:

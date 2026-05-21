@@ -167,7 +167,7 @@ fn format_bytes(n: u64) -> String {
 }
 
 /// Per-combine planned share of the pipeline-level memory limit. The
-/// runtime executor uses one shared `MemoryBudget`; the rendering
+/// runtime executor uses one shared `MemoryArbitrator`; the rendering
 /// divides the limit equally across the combine nodes visible in the
 /// DAG so a reader can predict a single combine's working-set
 /// allocation. `combine_count_total.max(1)` (V-8-1) guards against a
@@ -183,7 +183,7 @@ fn memory_budget_per_combine(total_limit_bytes: u64, combine_count_total: usize)
 /// per-operator ceiling — without it, users read the displayed budget
 /// as a hard cap and report it as a bug when one combine's working set
 /// consumes the full pipeline limit. Soft limit follows the dual-
-/// threshold model on `MemoryBudget` (default 80%).
+/// threshold model on `MemoryArbitrator` (default 80%).
 fn format_memory_budget_line(planned_bytes: u64) -> String {
     let soft_pct = 0.80_f64;
     let soft_bytes = (planned_bytes as f64 * soft_pct) as u64;
@@ -856,18 +856,18 @@ pub struct PlanEdge {
 /// Mirrors the runtime distinction visible in
 /// [`crate::executor::dispatch`]: nodes whose output bypasses
 /// `ctx.node_buffers` (fused Source / Transform chains and sink Outputs)
-/// charge no inter-stage memory against [`crate::pipeline::memory::MemoryBudget`];
+/// charge no inter-stage memory against [`crate::pipeline::memory::MemoryArbitrator`];
 /// every other node materializes an intermediate buffer and is spill-eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferClass {
     /// No `ctx.node_buffers` slot is admitted for this stage's output —
-    /// no `MemoryBudget` charge for this stage, no spill eligibility.
+    /// no `MemoryArbitrator` charge for this stage, no spill eligibility.
     /// Today this covers fused Sources (their receiver is consumed
     /// directly by the downstream fused arm) and every Output (sinks
     /// write to their configured writer and never admit a buffer).
     Streaming,
     /// Records pass through a `ctx.node_buffers` slot between dispatch
-    /// arms. The producer charges `MemoryBudget` via
+    /// arms. The producer charges `MemoryArbitrator` via
     /// `charge_node_buffer_bytes` on admit, the consumer discharges on
     /// drain, and a soft-threshold trip spills the slot to disk.
     Materialized,
@@ -1194,7 +1194,7 @@ impl ExecutionPlanDag {
     /// `buffer_classes` carries the `streaming` / `materialized`
     /// verdict per node so the **Physical Properties** section can
     /// append a `buffer:` line — the pre-runtime signal that pipeline
-    /// authors use to see which stages will charge `MemoryBudget`.
+    /// authors use to see which stages will charge `MemoryArbitrator`.
     /// Build it with [`Self::classify_node_buffers`] when a
     /// `PipelineConfig` is in hand.
     fn explain(&self, buffer_classes: &HashMap<NodeIndex, BufferClass>) -> String {

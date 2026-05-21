@@ -3509,8 +3509,8 @@ nodes:
         }
     }
 
-    /// MemoryBudget abort — a 1-byte hard limit forces
-    /// `MemoryBudget::should_abort` to return true on the first poll
+    /// MemoryArbitrator abort — a 1-byte hard limit forces
+    /// `MemoryArbitrator::should_abort` to return true on the first poll
     /// inside `CombineHashTable::build` (process RSS trivially exceeds
     /// 1 byte). The build's safety-net final check fires for the small
     /// build set, the executor wraps `CombineError::MemoryLimitExceeded`
