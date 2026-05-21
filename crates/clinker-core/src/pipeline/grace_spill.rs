@@ -120,7 +120,7 @@ impl GraceSpillWriter {
     /// Finalize the LZ4 frame, append the footer, return the file
     /// path along with the byte length of the finished file.
     ///
-    /// The byte length feeds [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`]
+    /// The byte length feeds [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`]
     /// so the disk-quota poll can tally cumulative on-disk usage
     /// without re-stat'ing each finalized file.
     pub(crate) fn finish(self) -> std::io::Result<(SpillFilePath, u64)> {

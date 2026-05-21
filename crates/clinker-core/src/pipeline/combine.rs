@@ -38,10 +38,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
-use crate::pipeline::memory::MemoryBudget;
+use crate::pipeline::memory::MemoryArbitrator;
 
 /// Period (measured in records processed) between
-/// [`crate::pipeline::memory::MemoryBudget::should_abort`] checks during
+/// [`crate::pipeline::memory::MemoryArbitrator::should_abort`] checks during
 /// `CombineHashTable::build` AND during probe-side fan-out emission.
 ///
 /// Matches ClickHouse per-block cadence and is the same order of
@@ -290,7 +290,7 @@ pub enum CombineError {
     /// Memory budget was exhausted while building or probing. `used` is
     /// the hash table's self-reported footprint at the moment of the
     /// check; `limit` is the configured budget. Emitted after
-    /// `MemoryBudget::should_abort` returns true (checked every
+    /// `MemoryArbitrator::should_abort` returns true (checked every
     /// [`MEMORY_CHECK_INTERVAL`] records to amortize the cost).
     MemoryLimitExceeded { used: u64, limit: u64 },
 
@@ -557,7 +557,7 @@ impl CombineHashTable {
         records: Vec<Record>,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
-        budget: &mut MemoryBudget,
+        budget: &mut MemoryArbitrator,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError> {
         let expected = estimated_rows.unwrap_or(records.len());
@@ -691,7 +691,7 @@ impl CombineHashTable {
     /// Total bytes of owned memory. Sums all four allocation sources —
     /// missing any one was the DataFusion #14222/#5490/#6170 failure class.
     /// Stable pub API: the executor uses this both for the periodic
-    /// `MemoryBudget` check and for the `--explain` RSS reporting.
+    /// `MemoryArbitrator` check and for the `--explain` RSS reporting.
     pub fn memory_bytes(&self) -> usize {
         self.index.allocation_size()
             + self.chain.capacity() * std::mem::size_of::<u32>()
@@ -1269,8 +1269,8 @@ mod tests {
         Record::new(Arc::clone(schema), values)
     }
 
-    fn test_budget(limit_bytes: u64) -> MemoryBudget {
-        MemoryBudget::new(limit_bytes, 0.80)
+    fn test_budget(limit_bytes: u64) -> MemoryArbitrator {
+        MemoryArbitrator::new(limit_bytes, 0.80)
     }
 
     /// Build a single-column integer-key KeyExtractor that extracts field `name`.

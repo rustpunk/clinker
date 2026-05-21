@@ -1906,7 +1906,7 @@ o6,ENG,300
     );
 }
 
-/// MemoryBudget overflow on the region-input-buffer surfaces with the
+/// MemoryArbitrator overflow on the region-input-buffer surfaces with the
 /// E310 admission failure shape. Pipeline: a Combine inside a deferred
 /// region with a non-deferred build-side Source whose forward-pass tee
 /// lands records into `region_input_buffers`. A tight pipeline-level
@@ -2028,7 +2028,7 @@ nodes:
 
     // The pipeline either errors at the build-side cross-region tee
     // (`tee_emit_to_region_input_buffers` raising MemoryBudgetExceeded
-    // from `MemoryBudget::charge_arena_bytes`) or at the source-rooted
+    // from `MemoryArbitrator::charge_arena_bytes`) or at the source-rooted
     // arena build for the build-side reader (same shape). Both
     // surfaces carry the same admission-failure error type; the test
     // pins the failure-shape contract regardless of which boundary

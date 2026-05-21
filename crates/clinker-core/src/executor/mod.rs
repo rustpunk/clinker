@@ -240,7 +240,7 @@ pub(crate) struct DispatchOutcome {
     pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
     /// Saturating sum of bytes the run committed to spill files across
     /// every spill site (node_buffer admission, grace-hash partition
-    /// flush, sort-merge external sort). Read from `MemoryBudget`'s
+    /// flush, sort-merge external sort). Read from `MemoryArbitrator`'s
     /// running total at dispatch close so an aborted run still
     /// reports the last committed value.
     pub(crate) cumulative_spill_bytes: u64,
@@ -398,7 +398,7 @@ pub struct ExecutionReport {
     /// Saturating sum of bytes committed to spill files across every
     /// spill site (`node_buffers` admission, grace-hash partition
     /// flush, sort-merge external sort). Sourced from
-    /// `MemoryBudget`'s running total at dispatch close; an aborted
+    /// `MemoryArbitrator`'s running total at dispatch close; an aborted
     /// run still surfaces the last committed value.
     pub cumulative_spill_bytes: u64,
 }
@@ -1134,12 +1134,12 @@ impl PipelineExecutor {
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
-        // Pipeline-scoped MemoryBudget. One declared `memory_limit`
+        // Pipeline-scoped MemoryArbitrator. One declared `memory_limit`
         // envelopes every node-rooted arena finalize — including the
         // arenas built at Source dispatch-arm exits. Promoted to
         // ctx-owned so a relaxed pipeline cannot multiply its declared
         // limit across N upstream operators by accident.
-        let memory_budget = crate::pipeline::memory::MemoryBudget::from_config(
+        let memory_budget = crate::pipeline::memory::MemoryArbitrator::from_config(
             config.pipeline.memory_limit.as_deref(),
         );
 
@@ -1212,7 +1212,7 @@ impl PipelineExecutor {
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
-        memory_budget: crate::pipeline::memory::MemoryBudget,
+        memory_budget: crate::pipeline::memory::MemoryArbitrator,
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         watermarks: crate::executor::watermark::PerSourceWatermarks,

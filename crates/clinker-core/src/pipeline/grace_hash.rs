@@ -26,7 +26,7 @@
 //!
 //! ## Spill victim policy
 //!
-//! When the [`MemoryBudget`] reports `should_spill`, the largest
+//! When the [`MemoryArbitrator`] reports `should_spill`, the largest
 //! `Building` partition (by accumulated bytes) transitions to `OnDisk`.
 //! AsterixDB's "Largest-Size" policy: maximizes bytes evicted per
 //! spill cycle, minimizes how often we cross the budget threshold.
@@ -63,7 +63,7 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
-use crate::pipeline::memory::{BudgetCategory, MemoryBudget};
+use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::plan::combine::DecomposedPredicate;
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
@@ -71,7 +71,7 @@ use crate::plan::combine::DecomposedPredicate;
 /// every code path truncates at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Period (matches emitted) between [`MemoryBudget::should_abort`] polls
+/// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
@@ -93,7 +93,7 @@ pub(crate) const GRACE_RECORD_BYTES_ESTIMATE: u64 = 1024;
 pub(crate) type RecordOrder = u64;
 
 /// Number of result records the BNL fallback emits per output batch
-/// before polling [`MemoryBudget::should_abort`]. Output amplification
+/// before polling [`MemoryArbitrator::should_abort`]. Output amplification
 /// from a hot key joining against many probe-side records can produce
 /// `M * N` rows for a single equivalence class; periodic polling at the
 /// 10 K boundary keeps the abort signal responsive without paying an
@@ -354,7 +354,7 @@ pub(crate) struct GraceHashExec<'a> {
     /// `copy_build_ck_columns` at each emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryBudget,
+    pub budget: &'a mut MemoryArbitrator,
     /// Pipeline-scoped spill directory. Owned by the executor's
     /// `Arc<TempDir>` on `ExecutorContext`; this borrow lives for one
     /// combine invocation. Cleanup of individual spill files runs on
@@ -381,7 +381,7 @@ pub(crate) struct GraceHashExecutor {
     hash_state: RandomState,
     /// Bytes written across every spill commit this executor has
     /// performed. Drained by [`Self::take_spilled_bytes`] so the
-    /// caller can fold the delta into [`MemoryBudget::record_spill_bytes`]
+    /// caller can fold the delta into [`MemoryArbitrator::record_spill_bytes`]
     /// and surface E310 on disk-quota overflow.
     spilled_bytes: u64,
 }
@@ -420,7 +420,7 @@ impl GraceHashExecutor {
 
     /// Drain the cumulative spill-bytes counter and return it. The
     /// caller folds the result into
-    /// [`MemoryBudget::record_spill_bytes`] after each operation that
+    /// [`MemoryArbitrator::record_spill_bytes`] after each operation that
     /// may have spilled (build, probe finalize, repartition).
     pub(crate) fn take_spilled_bytes(&mut self) -> u64 {
         std::mem::take(&mut self.spilled_bytes)
@@ -446,7 +446,7 @@ impl GraceHashExecutor {
         &mut self,
         record: Record,
         hash: u64,
-        budget: &mut MemoryBudget,
+        budget: &mut MemoryArbitrator,
     ) -> std::io::Result<()> {
         let p = self.assigner.partition_for(hash) as usize;
         let bytes = estimated_record_bytes(&record);
@@ -508,7 +508,7 @@ impl GraceHashExecutor {
 
     /// Force-spill the largest Building partition. Returns Ok(()) when
     /// no Building partition remains (everything is already on disk).
-    fn spill_largest_building(&mut self, budget: &mut MemoryBudget) -> std::io::Result<()> {
+    fn spill_largest_building(&mut self, budget: &mut MemoryArbitrator) -> std::io::Result<()> {
         // Iterate until RSS drops below soft limit OR no Building
         // partition is left to evict. The soft limit is checked through
         // `should_spill` rather than `should_abort`: we want to catch
@@ -582,7 +582,7 @@ impl GraceHashExecutor {
         &mut self,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
-        budget: &mut MemoryBudget,
+        budget: &mut MemoryArbitrator,
         combine_name: &str,
     ) -> Result<(), PipelineError> {
         for i in 0..self.partitions.len() {
@@ -1041,7 +1041,7 @@ fn process_spilled_partition(
     rc: &ReloadContext<'_>,
     sp: SpilledPartition,
     body_evaluator: &mut Option<ProgramEvaluator>,
-    budget: &mut MemoryBudget,
+    budget: &mut MemoryArbitrator,
     output: &mut Vec<(Record, RecordOrder)>,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
@@ -1402,7 +1402,7 @@ pub(crate) struct BnlStats {
     /// [`CombineHashTable::memory_bytes`].
     pub peak_chunk_table_bytes: usize,
     /// Number of times the fallback hit a 10 K-record output batch
-    /// boundary and polled [`MemoryBudget::should_abort`].
+    /// boundary and polled [`MemoryArbitrator::should_abort`].
     pub batches_emitted: usize,
     /// Largest single-chunk record count.
     pub peak_chunk_records: usize,
@@ -1481,7 +1481,7 @@ impl Iterator for BuildChunkIter {
 ///     chunk it's `M * chunk_keys`, so the result-batch poll happens
 ///     between every 10 K matches.
 ///
-/// On [`MemoryBudget::should_abort`] returning true at any tier
+/// On [`MemoryArbitrator::should_abort`] returning true at any tier
 /// (chunk-table construction, between batches), the function returns
 /// an E310 [`PipelineError::Compilation`] carrying the partition_id
 /// and the HLL-derived approximate distinct-key count.
@@ -1490,7 +1490,7 @@ fn bnl_fallback(
     sp: &SpilledPartition,
     build_records: Vec<Record>,
     body_evaluator: &mut Option<ProgramEvaluator>,
-    budget: &mut MemoryBudget,
+    budget: &mut MemoryArbitrator,
     output: &mut Vec<(Record, RecordOrder)>,
     stats: &mut BnlStats,
 ) -> Result<(), PipelineError> {
@@ -1640,7 +1640,7 @@ fn combine_e310_partition_aborted(
     transform: &str,
     partition_id: u16,
     approx_distinct: u64,
-    budget: &MemoryBudget,
+    budget: &MemoryArbitrator,
 ) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: transform.to_string(),
@@ -1977,8 +1977,8 @@ mod tests {
     /// `limit` is 10 GiB so RSS-vs-hard-limit always falls inside;
     /// `spill_threshold_pct` is set so soft limit = 1 KiB, well below
     /// any host's resident set.
-    fn tiny_budget() -> MemoryBudget {
-        MemoryBudget::new(10 * 1024 * 1024 * 1024, 0.000_001)
+    fn tiny_budget() -> MemoryArbitrator {
+        MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001)
     }
 
     #[test]
@@ -2033,7 +2033,7 @@ mod tests {
         let schema = schema_with(&["k"]);
         // Deposit a record and force a spill so a file actually exists.
         let rec = record_for(&schema, vec![Value::Integer(7)]);
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
         exec.add_build_record(rec, 0, &mut budget).unwrap();
         exec.spill_partition(0).unwrap();
         let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
@@ -2065,7 +2065,7 @@ mod tests {
             let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
             let schema = schema_with(&["k"]);
             let rec = record_for(&schema, vec![Value::Integer(99)]);
-            let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+            let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
             exec.add_build_record(rec, 0, &mut budget).unwrap();
             exec.spill_partition(0).unwrap();
             panic!("simulated mid-spill panic");
@@ -2288,7 +2288,7 @@ mod tests {
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
 
         // Drive everything through grace hash. body_program=None so
         // the synthetic-step concatenation path is exercised; that's
@@ -2477,7 +2477,7 @@ mod tests {
         // threshold so should_spill fires immediately (process RSS
         // far exceeds 1 KiB on any host). This decouples spill
         // activation from build abort.
-        let mut budget = MemoryBudget::new(10 * 1024 * 1024 * 1024, 0.000_001);
+        let mut budget = MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001);
 
         let mut combined_schema_builder = clinker_record::SchemaBuilder::new();
         combined_schema_builder = combined_schema_builder.with_field("dk");
@@ -2654,7 +2654,7 @@ mod tests {
         // Memory hard limit huge so should_abort never fires; spill
         // threshold tiny so spills happen; disk quota tight so the
         // first partition flush trips it.
-        let mut budget = MemoryBudget::new(10 * 1024 * 1024 * 1024, 0.000_001);
+        let mut budget = MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001);
         budget.max_spill_bytes = 64;
 
         let combined_schema = clinker_record::SchemaBuilder::new()
@@ -2721,7 +2721,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let mut exec = GraceHashExecutor::new(2, dir.path()).unwrap();
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80); // never spills via budget
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80); // never spills via budget
         let originals: Vec<Record> = (0..16i64)
             .map(|i| {
                 record_for(
@@ -3075,7 +3075,7 @@ mod tests {
         // Now drive BNL directly and confirm it produces the expected
         // 5 driver × 200 build = 1000 join rows.
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
         with_reload_context(&h, |rc| {
@@ -3129,7 +3129,7 @@ mod tests {
 
         // Force a small chunk budget so the chunked path actually
         // splits the build into pieces (not a single chunk).
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3209,7 +3209,7 @@ mod tests {
         // floor kicks in). spill_threshold_pct expresses soft as a
         // fraction of hard.
         let target_soft = (PROBE_BUFFER_RESERVATION as f64) / 2.0; // ~2 MB < reservation
-        let mut budget = MemoryBudget::new(u64::MAX, target_soft / (u64::MAX as f64));
+        let mut budget = MemoryArbitrator::new(u64::MAX, target_soft / (u64::MAX as f64));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3248,7 +3248,7 @@ mod tests {
         // (soft - reservation) / 2 value. hard_limit stays at u64::MAX
         // so should_abort cannot fire on RSS.
         let big_soft = (PROBE_BUFFER_RESERVATION as u64) * 8;
-        let mut big_budget = MemoryBudget::new(u64::MAX, (big_soft as f64) / (u64::MAX as f64));
+        let mut big_budget = MemoryArbitrator::new(u64::MAX, (big_soft as f64) / (u64::MAX as f64));
         let sp2 = spill_for_bnl(
             &h,
             &(0..10i64)
@@ -3332,7 +3332,7 @@ mod tests {
             .collect();
         let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
 
-        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3394,7 +3394,7 @@ mod tests {
         let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
 
         // 1-byte hard limit → should_abort fires immediately.
-        let mut budget = MemoryBudget::new(1, 1.0);
+        let mut budget = MemoryArbitrator::new(1, 1.0);
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;

@@ -334,7 +334,7 @@ mod tests {
                 has_header: true,
             },
         );
-        let mut budget = crate::pipeline::memory::MemoryBudget::new(u64::MAX, 0.80);
+        let mut budget = crate::pipeline::memory::MemoryArbitrator::new(u64::MAX, 0.80);
         Arena::build(
             &mut reader,
             &fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
