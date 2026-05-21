@@ -859,7 +859,7 @@ pub struct PlanEdge {
 /// charge no inter-stage memory against [`crate::pipeline::memory::MemoryBudget`];
 /// every other node materializes an intermediate buffer and is spill-eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BufferClass {
+enum BufferClass {
     /// No `ctx.node_buffers` slot is admitted for this stage's output —
     /// no `MemoryBudget` charge for this stage, no spill eligibility.
     /// Today this covers fused Sources (their receiver is consumed
@@ -874,7 +874,7 @@ pub(crate) enum BufferClass {
 }
 
 impl BufferClass {
-    pub(crate) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Streaming => "streaming",
             Self::Materialized => "materialized",
@@ -1166,10 +1166,7 @@ impl ExecutionPlanDag {
     ///
     /// The returned map is keyed by `NodeIndex` and covers every node in
     /// the graph (one entry per `node_indices()` slot).
-    pub(crate) fn classify_node_buffers(
-        &self,
-        config: &PipelineConfig,
-    ) -> HashMap<NodeIndex, BufferClass> {
+    fn classify_node_buffers(&self, config: &PipelineConfig) -> HashMap<NodeIndex, BufferClass> {
         let init_phase = crate::executor::compute_init_phase_node_set(self);
         let mut fused_sources =
             crate::executor::compute_merge_interleave_fused_sources(self, config);
@@ -1200,7 +1197,7 @@ impl ExecutionPlanDag {
     /// authors use to see which stages will charge `MemoryBudget`.
     /// Build it with [`Self::classify_node_buffers`] when a
     /// `PipelineConfig` is in hand.
-    pub(crate) fn explain(&self, buffer_classes: &HashMap<NodeIndex, BufferClass>) -> String {
+    fn explain(&self, buffer_classes: &HashMap<NodeIndex, BufferClass>) -> String {
         let mut out = String::new();
         out.push_str("=== Execution Plan ===\n\n");
 
