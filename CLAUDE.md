@@ -34,6 +34,13 @@ sprints are the common case and remain effectively per-commit gated —
 the policy only changes behavior when a sprint genuinely needs more
 than one commit to land cleanly.
 
+Then run `/post-impl-followup` before pushing or opening a PR. A
+session generates ephemeral findings — bugs spotted in passing, ideas
+from exploration, scope deviations decided mid-flight, architectural
+a-ha moments — that vanish when context turns over. The skill
+resurfaces them, fixes trivial ones in place, files the rest. Skip it
+and the work is silently lost.
+
 (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and
 `aarch64-apple-darwin` for `clinker-core`; cross-compile setup is
 optional locally.)
