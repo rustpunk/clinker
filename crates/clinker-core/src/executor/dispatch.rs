@@ -3865,6 +3865,15 @@ pub(crate) async fn dispatch_plan_node(
             // under the parent composition's name so a budget-exceeded
             // diagnostic points the user at the user-visible operator,
             // not at the body's internal output port node name.
+            //
+            // Boundary admit (post-body): same two-path model as the
+            // pre-body port-records clone in `collect_port_records`.
+            // If `admit_node_buffer` returns `MemoryBudgetExceeded`
+            // here, it surfaces bare with `node = composition_name` —
+            // not wrapped in `CompositionBodyError`. The wrapper at
+            // `execute_composition_body`'s topo walk has already
+            // returned with `Ok` by the time we reach this admit;
+            // only errors from inside that walk get the wrapper.
             let nb = admit_node_buffer(
                 ctx,
                 &composition_name,
@@ -5426,6 +5435,15 @@ fn collect_port_records(
         // port-source Source arm discharges the slot when it claims
         // the seeded buffer, and the body-exit leak-discharge cleans
         // up any unconsumed remainder if a body operator errored.
+        //
+        // Boundary admit: the budget exceedance surfaces as a bare
+        // `MemoryBudgetExceeded` with `node = composition_name`
+        // (the user-visible call-site identifier). The body has not
+        // executed yet, so there is no body-internal operator name
+        // to disambiguate via `CompositionBodyError` — only inner
+        // errors that bubble out of `execute_composition_body`'s
+        // topo walk get that wrapper. Detail string discriminates
+        // this site from the generic admit in `admit_node_buffer`.
         let cloned_with_bytes = ctx
             .node_buffers
             .get(&edge.source())
@@ -5560,6 +5578,18 @@ async fn execute_composition_body(
     // composition's name for diagnosability — the user sees
     // "in composition '<name>': <inner>" instead of an opaque
     // inner-only message.
+    //
+    // Body-interior path of the two-path admission model: the inner
+    // error's `node` field names a body-internal operator (e.g.
+    // `stage_split`) the user never wrote in their YAML, so the
+    // wrapper supplies the user-visible call-site name on top. The
+    // boundary admits in `collect_port_records` (pre-body input
+    // clone) and the parent's Composition arm (post-body output
+    // harvest) stay unwrapped because their `node` is already the
+    // call-site composition name — wrapping them would duplicate
+    // the same identifier in both layers with no information gain.
+    // Consumers that want to catch every composition-involved
+    // budget exceedance must match both shapes.
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
     let mut walk_result: Result<(), PipelineError> = Ok(());
     for node_idx in topo {
