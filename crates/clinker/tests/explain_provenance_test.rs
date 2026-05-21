@@ -134,6 +134,53 @@ fn test_explain_error_code_e105_outputs_doc_content() {
 }
 
 #[test]
+fn test_explain_error_code_e319_outputs_doc_content() {
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("--code")
+        .arg("E319")
+        .output()
+        .expect("spawn clinker");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "clinker explain --code E319 must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("E319"),
+        "output must contain E319.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("on_miss: error"),
+        "output must describe the on_miss policy.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_explain_help_shows_e319_range() {
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("--help")
+        .output()
+        .expect("spawn clinker");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "clinker explain --help must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("E300-E319"),
+        "help output must advertise the E319 combine range.\nstdout: {stdout}"
+    );
+}
+
+#[test]
 fn test_explain_error_code_e15y_streaming_help() {
     let output = Command::new(clinker_bin())
         .arg("explain")

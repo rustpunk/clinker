@@ -217,6 +217,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E310" => Some(include_str!("../../../../docs/explain/E310.md")),
         "E311" => Some(include_str!("../../../../docs/explain/E311.md")),
         "E313" => Some(include_str!("../../../../docs/explain/E313.md")),
+        "E319" => Some(include_str!("../../../../docs/explain/E319.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
         "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
         "E150d" => Some(include_str!("../../../../docs/explain/E150d.md")),
@@ -309,6 +310,14 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_code_e319() {
+        let doc = explain_code("E319").unwrap();
+        assert!(doc.contains("E319"));
+        assert!(doc.contains("on_miss: error"));
+        assert!(doc.contains("no matching build row"));
+    }
+
+    #[test]
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
@@ -318,7 +327,7 @@ mod tests {
         let codes = [
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E150b", "E150c",
             "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
-            "E309", "E310", "E311", "E313", "E15Y", "W101", "W302", "W305", "W306",
+            "E309", "E310", "E311", "E313", "E319", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",
