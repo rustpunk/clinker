@@ -257,6 +257,27 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 
 Dioxus version is pinned to `=0.7.4` to avoid silent breakage. The `dx` CLI is required — install via `cargo install dioxus-cli`.
 
+## Issue tracking
+
+Umbrella/sub-issue relationships use GitHub's first-class sub-issues API, not the legacy `- [ ] #N` markdown task list in the parent body. The native widget tracks state, surfaces a progress bar on the parent, and renders sub-issues as a structured panel; markdown task lists do none of that and quietly desync as sub-issues close.
+
+`gh` has no native subcommand yet, so call the REST endpoint directly. The `sub_issue_id` is the issue's internal database `id`, not its user-facing number:
+
+```bash
+# Look up the database id for each child issue
+id=$(gh api repos/:owner/:repo/issues/<N> --jq '.id')
+
+# Attach it to the parent
+gh api -X POST repos/:owner/:repo/issues/<PARENT>/sub_issues \
+  -H "Accept: application/vnd.github+json" \
+  -F "sub_issue_id=$id"
+
+# Verify
+gh api repos/:owner/:repo/issues/<PARENT>/sub_issues --jq '[.[] | {number, title, state}]'
+```
+
+A markdown task list in the parent body is still useful for annotation the native widget doesn't carry (priority split, dependency chain notes) — keep it as commentary alongside the API linkage, not as a substitute.
+
 ## Rust edition & toolchain
 
 Edition 2024, Rust 1.91 (pinned in `rust-toolchain.toml`).
