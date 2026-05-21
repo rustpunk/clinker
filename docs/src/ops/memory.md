@@ -65,6 +65,30 @@ To influence strategy selection:
 
 Only force `streaming` when you are certain the input is sorted by the group-by keys. If the data is not sorted, results will be incorrect. Use `auto` when in doubt.
 
+## Compositions
+
+A composition (a reusable sub-pipeline included via `use:`) does
+not get its own memory budget. Body operators charge the same
+budget as the parent pipeline, admit through the same paths, and
+spill to the same temporary directory. The recursion is purely
+structural.
+
+When a budget exceedance involves a composition, the error message
+arrives in one of two shapes:
+
+- **At the composition boundary** (records flowing into the body
+  via an input port, or back out into the parent) — the error
+  names the composition's call-site directly (e.g.
+  `enrich_call`).
+- **Inside the body** — the error is wrapped so the user-visible
+  call-site name surfaces alongside the body-internal operator
+  that tripped. The rendered message reads
+  `in composition 'enrich_call': ...` followed by the inner
+  detail.
+
+See [error E310](../explain/E310.html) for the full diagnostic
+model.
+
 ## Monitoring memory usage
 
 Use the [metrics system](metrics.md) to track `peak_rss_bytes` across runs:

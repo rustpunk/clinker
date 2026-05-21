@@ -344,6 +344,30 @@ pub enum PipelineError {
     /// recursive walk so the rendered diagnostic carries the
     /// composition's name. Lets users see "in composition '<name>'"
     /// in failure messages instead of an opaque inner error.
+    ///
+    /// # Two-path model for composition-involved errors
+    ///
+    /// This wrapper is applied **only** to errors that bubble up
+    /// from a body operator whose `node` field names a body-internal
+    /// identifier the user never wrote (e.g. a body-internal Transform
+    /// named `stage_split`). The outer `composition_name` field
+    /// supplies the user-visible call-site name so the rendered
+    /// diagnostic can attribute the failure to the operator the
+    /// user actually authored.
+    ///
+    /// Errors emitted at the **composition boundary** — when records
+    /// are cloned into a body input port, or when the body's output
+    /// is harvested back into the parent's `node_buffers` slot — are
+    /// **not** wrapped. Their `node` field already carries the
+    /// call-site composition name, so an outer wrapper would just
+    /// duplicate the same identifier in two places. Consumers that
+    /// want to catch every composition-involved failure must match
+    /// both this variant and the bare inner-variant form.
+    ///
+    /// The wrapper is purely diagnostic attribution, not a separate
+    /// enforcement path: body operators share the same `MemoryBudget`
+    /// instance as the parent pipeline and admit through the same
+    /// site-level primitives.
     CompositionBodyError {
         composition_name: String,
         inner: Box<PipelineError>,
@@ -364,6 +388,22 @@ pub enum PipelineError {
     /// site-specific context the rendered message previously inlined
     /// (e.g. partition id, distinct-count estimate, disk-spill quota
     /// figures). Always aborts the run.
+    ///
+    /// # Composition involvement
+    ///
+    /// When a composition is in play, this variant can reach the
+    /// user in two shapes — see [`CompositionBodyError`] for the
+    /// full two-path model. In summary: budget exceedances at a
+    /// composition boundary (records flowing into a body input port
+    /// or back out of the body) surface as a **bare**
+    /// `MemoryBudgetExceeded` with `node` set to the call-site
+    /// composition name; exceedances inside the body surface
+    /// **wrapped** in `CompositionBodyError`, with `node` then
+    /// pointing at a body-internal operator. The budget itself is
+    /// shared across the whole run — body operators charge the same
+    /// `MemoryBudget` instance the parent pipeline uses.
+    ///
+    /// [`CompositionBodyError`]: PipelineError::CompositionBodyError
     MemoryBudgetExceeded {
         node: String,
         used: u64,
@@ -574,7 +614,11 @@ impl PipelineError {
     }
 
     /// Wrap an inner error from a composition body walk so the
-    /// rendered diagnostic carries the composition's name.
+    /// rendered diagnostic carries the composition's name. Apply
+    /// only to body-interior errors whose inner `node` would
+    /// otherwise be opaque to the user; boundary admits already
+    /// carry the call-site composition name and should stay
+    /// unwrapped — see [`PipelineError::CompositionBodyError`].
     pub fn compose_body_error(composition_name: String, inner: Box<PipelineError>) -> Self {
         Self::CompositionBodyError {
             composition_name,
