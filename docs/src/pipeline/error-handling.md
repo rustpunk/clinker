@@ -146,7 +146,7 @@ Exit code 2 is not a failure -- it means the pipeline ran to completion and hand
 ```yaml
 pipeline:
   name: order_processing
-  memory_limit: "512M"
+  memory: { limit: "512M" }
 
 nodes:
   - type: source

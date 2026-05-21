@@ -10,6 +10,7 @@ Indices to build: 0
 Transforms: 0
 Output projections: 1
 DAG nodes: 3
+arbitration: BackPressurePreferred -> Priority
 
 Source DAG:
   Tier 0: ingest_src

@@ -3533,7 +3533,7 @@ nodes:
         let yaml = r#"
 pipeline:
   name: combine_exec_e310
-  memory_limit: "1"
+  memory: { limit: "1" }
 nodes:
   - type: source
     name: orders
@@ -3582,7 +3582,7 @@ nodes:
             Some("orders"),
         )
         .await
-        .expect_err("1-byte memory_limit must abort combine");
+        .expect_err("1-byte mem_limit must abort combine");
         match &err {
             CombineFixtureError::Run(
                 clinker_core::error::PipelineError::MemoryBudgetExceeded { node, source, .. },
@@ -4498,8 +4498,8 @@ nodes:
     }
 
     /// CI-visible mirror of the `combine_grace_hash` correctness gate.
-    /// Runs the same pure-equi combine through both `memory_limit: "1G"`
-    /// and `memory_limit: "16G"` at 1K × 10K and asserts the
+    /// Runs the same pure-equi combine through both `mem_limit: "1G"`
+    /// and `mem_limit: "16G"` at 1K × 10K and asserts the
     /// canonicalized outputs are byte-identical. The small workload
     /// here keeps process RSS under both soft limits so neither path
     /// actually spills — the gate is (a) the strategy hint routes to
@@ -4520,12 +4520,12 @@ nodes:
         let build_csv = String::from_utf8(workload.build_csv()).expect("CombineDataGen emits utf8");
         let probe_csv = String::from_utf8(workload.probe_csv()).expect("CombineDataGen emits utf8");
 
-        let mk_yaml = |memory_limit: &str| -> String {
+        let mk_yaml = |mem_limit: &str| -> String {
             format!(
                 r#"
 pipeline:
   name: test_grace_hash_correctness
-  memory_limit: "{memory_limit}"
+  memory: {{ limit: "{mem_limit}" }}
 nodes:
 - type: source
   name: build

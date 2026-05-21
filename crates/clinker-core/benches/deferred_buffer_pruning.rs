@@ -18,7 +18,7 @@
 //! charge formula surfaces in CI.
 
 use clinker_core::pipeline::arena::Arena;
-use clinker_core::pipeline::memory::MemoryArbitrator;
+use clinker_core::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn build_wide_rows() -> Vec<(Record, u64)> {
 
 fn measure_arena_bytes(rows: &[(Record, u64)], fields: &[String]) -> u64 {
     let schema = rows[0].0.schema().clone();
-    let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+    let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
     let _arena = Arena::from_records(rows, fields, &schema, &mut budget)
         .expect("u64::MAX budget never overflows");
     budget.arena_bytes_charged()

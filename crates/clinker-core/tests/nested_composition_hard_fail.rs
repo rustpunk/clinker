@@ -27,7 +27,7 @@ use std::path::PathBuf;
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: nested_composition_hard_fail
-  memory_limit: "1M"
+  memory: { limit: "1M" }
 nodes:
   - type: source
     name: events

@@ -8,7 +8,7 @@ _template:
 
 pipeline:
   name: full-etl
-  memory_limit: 2GB
+  memory: { limit: 2GB }
 
 nodes:
   - type: source

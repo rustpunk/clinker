@@ -265,7 +265,7 @@ async fn memory_budget_overflow_on_deferred_buffer_raises_e310() {
     let yaml = r#"
 pipeline:
   name: deferred_budget_overflow
-  memory_limit: "500"
+  memory: { limit: "500" }
 error_handling:
   strategy: continue
 nodes:
@@ -344,7 +344,7 @@ nodes:
     // The deferred-buffer admission path raises a typed
     // MemoryBudgetExceeded directly; an upstream sort enforcer that
     // spilled past the budget surfaces a distinct "spill files"
-    // Compilation message with the same "memory_limit too small"
+    // Compilation message with the same "memory.limit too small"
     // semantic. Either is an acceptable observation that memory
     // accounting fired; the test pins the failure-shape contract for
     // the deferred buffer by destructuring on MemoryBudgetExceeded
@@ -358,9 +358,9 @@ nodes:
         crate::error::PipelineError::Compilation { messages, .. }
             if messages
                 .iter()
-                .any(|m| m.contains("memory_limit too small")) => {}
+                .any(|m| m.contains("memory.limit too small")) => {}
         crate::error::PipelineError::Io(io_err)
-            if io_err.to_string().contains("memory_limit too small") => {}
+            if io_err.to_string().contains("memory.limit too small") => {}
         other => panic!(
             "memory-overflow surface must carry MemoryBudgetExceeded \
              (BudgetCategory::Arena) or the spill-fallback admission \
@@ -1910,7 +1910,7 @@ o6,ENG,300
 /// E310 admission failure shape. Pipeline: a Combine inside a deferred
 /// region with a non-deferred build-side Source whose forward-pass tee
 /// lands records into `region_input_buffers`. A tight pipeline-level
-/// `memory_limit` forces the per-row admission charge to overflow on
+/// `memory.limit` forces the per-row admission charge to overflow on
 /// the first build-side row, raising the same E310 the deferred
 /// producer's own buffer admission raises.
 #[tokio::test(flavor = "multi_thread")]
@@ -1918,7 +1918,7 @@ async fn memory_budget_overflow_on_region_input_buffer_raises_e310() {
     let yaml = r#"
 pipeline:
   name: region_input_buffer_overflow
-  memory_limit: "1000"
+  memory: { limit: "1000" }
 error_handling:
   strategy: continue
 nodes:

@@ -39,6 +39,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
 use crate::pipeline::memory::MemoryArbitrator;
+#[cfg(test)]
+use crate::pipeline::memory::NoOpPolicy;
 
 /// Period (measured in records processed) between
 /// [`crate::pipeline::memory::MemoryArbitrator::should_abort`] checks during
@@ -1270,7 +1272,7 @@ mod tests {
     }
 
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {
-        MemoryArbitrator::new(limit_bytes, 0.80)
+        MemoryArbitrator::with_policy(limit_bytes, 0.80, Box::new(NoOpPolicy))
     }
 
     /// Build a single-column integer-key KeyExtractor that extracts field `name`.

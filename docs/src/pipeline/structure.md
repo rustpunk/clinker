@@ -7,7 +7,9 @@ A Clinker pipeline is a single YAML file with three top-level sections: `pipelin
 ```yaml
 pipeline:
   name: my_pipeline            # Required — pipeline identifier
-  memory_limit: "256M"         # Optional (K/M/G suffixes)
+  memory:                      # Optional — see ops/memory.md
+    limit: "256M"              # Optional (K/M/G suffixes), default 512M
+    backpressure: pause        # Optional, default `pause`
   vars:                        # Optional key-value pairs
     threshold: 500
     label: "Monthly Report"
@@ -57,7 +59,7 @@ The `pipeline:` block carries global settings that apply to the entire run.
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Pipeline identifier. Used in logs and metrics. |
-| `memory_limit` | No | Soft RSS budget. Accepts `K`, `M`, `G` suffixes (e.g. `"512M"`). |
+| `memory` | No | Memory-arbitrator tuning. Nested fields: `limit` (RSS budget, `K`/`M`/`G` suffixes, default `512M`) and `backpressure` (`spill`/`pause`/`both`, default `pause`). See [Memory Tuning](../ops/memory.md). |
 | `vars` | No | Scalar constants accessible in CXL via `$vars.*`. |
 | `date_formats` | No | List of `strftime`-style patterns for date parsing. |
 | `rules_path` | No | Directory for CXL `use` module resolution. |

@@ -9,6 +9,8 @@ use clinker_format::traits::FormatReader;
 use clinker_record::{MinimalRecord, RecordStorage, Schema, SchemaBuilder, Value};
 
 use super::memory::MemoryArbitrator;
+#[cfg(test)]
+use super::memory::NoOpPolicy;
 
 /// Columnar-projected record storage for Phase 1 indexing.
 /// Stores only the fields needed by window expressions.
@@ -38,16 +40,16 @@ impl Arena {
     /// Stream records from reader, storing only the named fields.
     ///
     /// `fields`: field names to project into the Arena (from `IndexSpec.arena_fields`).
-    /// `memory_limit`: hard byte limit threaded through this call only — the
+    /// `mem_limit`: hard byte limit threaded through this call only — the
     /// caller's per-arena cap, distinct from the cumulative budget tracked
     /// on `MemoryArbitrator`. Each admitted record's projected size charges
     /// the cumulative `arena_bytes_charged` counter via `budget`. If
-    /// either the per-call `memory_limit` or the cumulative budget tips,
+    /// either the per-call `mem_limit` or the cumulative budget tips,
     /// returns `ArenaError::MemoryBudgetExceeded`.
     pub fn build(
         reader: &mut dyn FormatReader,
         fields: &[String],
-        memory_limit: usize,
+        mem_limit: usize,
         shutdown: Option<&super::shutdown::ShutdownToken>,
         budget: &mut MemoryArbitrator,
     ) -> Result<Self, ArenaError> {
@@ -107,10 +109,10 @@ impl Arena {
             let size = estimated_size(&minimal);
             local_bytes_used += size;
 
-            if local_bytes_used > memory_limit {
+            if local_bytes_used > mem_limit {
                 return Err(ArenaError::MemoryBudgetExceeded {
                     used: local_bytes_used,
-                    limit: memory_limit,
+                    limit: mem_limit,
                 });
             }
             if budget.charge_arena_bytes(size as u64) {
@@ -306,7 +308,7 @@ impl std::fmt::Display for ArenaError {
             ArenaError::MemoryBudgetExceeded { used, limit } => {
                 write!(
                     f,
-                    "Arena requires ~{}MB, exceeds memory_limit of {}MB. \
+                    "Arena requires ~{}MB, exceeds memory.limit of {}MB. \
                      Reduce input size or increase --memory-limit.",
                     used / (1024 * 1024),
                     limit / (1024 * 1024),
@@ -377,7 +379,7 @@ mod tests {
             big_csv.push_str(&format!("D{},{},Name{}\n", i % 3, i * 10, i));
         }
         let mut reader = make_csv_reader(&big_csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -393,7 +395,7 @@ mod tests {
     fn test_arena_field_projection() {
         let csv = "dept,amount,name,extra\nA,100,Alice,X\nB,200,Bob,Y\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -423,7 +425,7 @@ mod tests {
     fn test_arena_record_view_resolve() {
         let csv = "dept,amount\nA,100\nB,200\nC,300\nD,400\nE,500\nF,600\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -442,7 +444,7 @@ mod tests {
     fn test_arena_record_view_missing_field() {
         let csv = "dept,amount\nA,100\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -475,7 +477,7 @@ mod tests {
     fn test_arena_empty_input() {
         let csv = "dept,amount\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -495,7 +497,7 @@ mod tests {
             csv.push_str(&format!("Department_{},{}00\n", i, i));
         }
         let mut reader = make_csv_reader(&csv);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let result = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -574,7 +576,7 @@ mod tests {
             second_schema: Arc::clone(&second_schema),
             emitted: 0,
         };
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let result = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -598,7 +600,7 @@ mod tests {
     /// a downstream `Arena::from_records`: when their combined byte
     /// charge crosses the cumulative limit, the second build raises
     /// `MemoryBudgetExceeded` even though its own per-call
-    /// `memory_limit` is unbounded. This pins the cross-arena
+    /// `mem_limit` is unbounded. This pins the cross-arena
     /// accounting that makes node-rooted post-aggregate windows fit
     /// under the user-declared pipeline budget.
     #[test]
@@ -615,7 +617,8 @@ mod tests {
         // first build admits 100 records and the second build's
         // node-rooted projection trips on the cumulative ceiling.
         let cumulative_limit = 12_000u64;
-        let mut shared_budget = MemoryArbitrator::new(cumulative_limit, 0.80);
+        let mut shared_budget =
+            MemoryArbitrator::with_policy(cumulative_limit, 0.80, Box::new(NoOpPolicy));
         let src_arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
@@ -687,7 +690,7 @@ mod tests {
                 (Record::new(Arc::clone(&schema), v), i as u64)
             })
             .collect();
-        let mut budget = MemoryArbitrator::new(u64::MAX, 1.0);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 1.0, Box::new(NoOpPolicy));
         let arena = Arena::from_records(&rows, &["id".into(), "name".into()], &schema, &mut budget)
             .expect("uniform-variant arena builds");
         assert_eq!(arena.record_count(), 50);

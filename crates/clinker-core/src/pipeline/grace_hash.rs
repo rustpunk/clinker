@@ -63,6 +63,8 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
+#[cfg(test)]
+use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::plan::combine::DecomposedPredicate;
 
@@ -1978,7 +1980,7 @@ mod tests {
     /// `spill_threshold_pct` is set so soft limit = 1 KiB, well below
     /// any host's resident set.
     fn tiny_budget() -> MemoryArbitrator {
-        MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001)
+        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy))
     }
 
     #[test]
@@ -2033,7 +2035,7 @@ mod tests {
         let schema = schema_with(&["k"]);
         // Deposit a record and force a spill so a file actually exists.
         let rec = record_for(&schema, vec![Value::Integer(7)]);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         exec.add_build_record(rec, 0, &mut budget).unwrap();
         exec.spill_partition(0).unwrap();
         let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
@@ -2065,7 +2067,7 @@ mod tests {
             let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
             let schema = schema_with(&["k"]);
             let rec = record_for(&schema, vec![Value::Integer(99)]);
-            let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+            let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
             exec.add_build_record(rec, 0, &mut budget).unwrap();
             exec.spill_partition(0).unwrap();
             panic!("simulated mid-spill panic");
@@ -2288,7 +2290,7 @@ mod tests {
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
 
         // Drive everything through grace hash. body_program=None so
         // the synthetic-step concatenation path is exercised; that's
@@ -2477,7 +2479,8 @@ mod tests {
         // threshold so should_spill fires immediately (process RSS
         // far exceeds 1 KiB on any host). This decouples spill
         // activation from build abort.
-        let mut budget = MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001);
+        let mut budget =
+            MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
 
         let mut combined_schema_builder = clinker_record::SchemaBuilder::new();
         combined_schema_builder = combined_schema_builder.with_field("dk");
@@ -2654,7 +2657,8 @@ mod tests {
         // Memory hard limit huge so should_abort never fires; spill
         // threshold tiny so spills happen; disk quota tight so the
         // first partition flush trips it.
-        let mut budget = MemoryArbitrator::new(10 * 1024 * 1024 * 1024, 0.000_001);
+        let mut budget =
+            MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
         budget.max_spill_bytes = 64;
 
         let combined_schema = clinker_record::SchemaBuilder::new()
@@ -2721,7 +2725,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let mut exec = GraceHashExecutor::new(2, dir.path()).unwrap();
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80); // never spills via budget
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
         let originals: Vec<Record> = (0..16i64)
             .map(|i| {
                 record_for(
@@ -3075,7 +3079,7 @@ mod tests {
         // Now drive BNL directly and confirm it produces the expected
         // 5 driver × 200 build = 1000 join rows.
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
         with_reload_context(&h, |rc| {
@@ -3129,7 +3133,7 @@ mod tests {
 
         // Force a small chunk budget so the chunked path actually
         // splits the build into pieces (not a single chunk).
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3209,7 +3213,11 @@ mod tests {
         // floor kicks in). spill_threshold_pct expresses soft as a
         // fraction of hard.
         let target_soft = (PROBE_BUFFER_RESERVATION as f64) / 2.0; // ~2 MB < reservation
-        let mut budget = MemoryArbitrator::new(u64::MAX, target_soft / (u64::MAX as f64));
+        let mut budget = MemoryArbitrator::with_policy(
+            u64::MAX,
+            target_soft / (u64::MAX as f64),
+            Box::new(NoOpPolicy),
+        );
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3248,7 +3256,11 @@ mod tests {
         // (soft - reservation) / 2 value. hard_limit stays at u64::MAX
         // so should_abort cannot fire on RSS.
         let big_soft = (PROBE_BUFFER_RESERVATION as u64) * 8;
-        let mut big_budget = MemoryArbitrator::new(u64::MAX, (big_soft as f64) / (u64::MAX as f64));
+        let mut big_budget = MemoryArbitrator::with_policy(
+            u64::MAX,
+            (big_soft as f64) / (u64::MAX as f64),
+            Box::new(NoOpPolicy),
+        );
         let sp2 = spill_for_bnl(
             &h,
             &(0..10i64)
@@ -3332,7 +3344,7 @@ mod tests {
             .collect();
         let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
 
-        let mut budget = MemoryArbitrator::new(u64::MAX, 0.80);
+        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3394,7 +3406,7 @@ mod tests {
         let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
 
         // 1-byte hard limit → should_abort fires immediately.
-        let mut budget = MemoryArbitrator::new(1, 1.0);
+        let mut budget = MemoryArbitrator::with_policy(1, 1.0, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;

@@ -412,7 +412,7 @@ use crate::executor::{
     evaluate_single_transform, evaluate_single_transform_windowed, parse_memory_limit,
     stage_metrics, widen_record_to_schema,
 };
-use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
+use crate::pipeline::memory::BudgetCategory;
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 use crate::projection::project_output_from_record;
@@ -679,7 +679,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// Pipeline-scoped memory budget shared across the source-rooted
     /// Phase-0 arena and every node-rooted arena materialized at an
     /// upstream operator's dispatch-arm exit. One declared
-    /// `memory_limit` envelopes the whole pipeline; per-arena charges
+    /// `mem_limit` envelopes the whole pipeline; per-arena charges
     /// accumulate against this budget so a relaxed pipeline cannot
     /// multiply its declared limit across N upstream operators by
     /// accident.
@@ -2984,10 +2984,10 @@ pub(crate) async fn dispatch_plan_node(
             }
 
             let schema = input_records[0].0.schema().clone();
-            let memory_limit = parse_memory_limit(ctx.config);
+            let mem_limit = parse_memory_limit(ctx.config);
             let mut buf: SortBuffer<u64> = SortBuffer::new(
                 sort_fields.clone(),
-                memory_limit,
+                mem_limit,
                 Some(ctx.spill_root_path.to_path_buf()),
                 schema,
             );
@@ -3035,7 +3035,7 @@ pub(crate) async fn dispatch_plan_node(
                         return Err(PipelineError::Io(std::io::Error::other(format!(
                             "sort enforcer '{name}' produced {} spill files; \
                              k-way merge for enforcer sort is not yet implemented \
-                             (memory_limit too small for input)",
+                             (memory.limit too small for input)",
                             files.len()
                         ))));
                     }
@@ -3160,7 +3160,7 @@ pub(crate) async fn dispatch_plan_node(
                 .collect::<SchemaBuilder>()
                 .build();
 
-            let memory_limit = parse_memory_limit(ctx.config);
+            let mem_limit = parse_memory_limit(ctx.config);
 
             let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let input_count = input.len() as u64;
@@ -3184,7 +3184,7 @@ pub(crate) async fn dispatch_plan_node(
                     agg_strategy,
                     Arc::clone(output_schema),
                     spill_schema,
-                    memory_limit,
+                    mem_limit,
                     &input,
                     config
                         .time_window
@@ -3200,7 +3200,7 @@ pub(crate) async fn dispatch_plan_node(
                     agg_strategy,
                     Arc::clone(output_schema),
                     spill_schema,
-                    memory_limit,
+                    mem_limit,
                     Some(ctx.spill_root_path.to_path_buf()),
                     name.clone(),
                 )?;
@@ -4191,8 +4191,7 @@ pub(crate) async fn dispatch_plan_node(
             // strategy-specific.
             match dispatch {
                 Dispatch::IEJoin(partition_bits) => {
-                    let mut budget =
-                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Advance per-source `rollback_cursors` for every
                     // build-side record before its `row_num` is dropped
                     // in the `(r, _)` map. Source→Combine direct paths
@@ -4280,8 +4279,7 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
-                    let mut budget =
-                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Same per-source cursor advance the IEJoin arm
                     // performs; Source→Combine direct paths on either
                     // side need the explicit walk because the build /
@@ -4370,8 +4368,7 @@ pub(crate) async fn dispatch_plan_node(
                     // path skips Phase A external sort and walks
                     // the inputs in place via the two-cursor
                     // merge.
-                    let mut budget =
-                        MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
+                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Same per-source cursor advance the IEJoin /
                     // Grace arms perform; Source→Combine direct paths
                     // on either side need the explicit walk because
@@ -4460,8 +4457,7 @@ pub(crate) async fn dispatch_plan_node(
             // budget abort the timer is dropped without
             // recording (matches the `StageTimer` "no report on
             // error" contract documented at its definition).
-            let mut budget =
-                MemoryArbitrator::from_config(ctx.config.pipeline.memory_limit.as_deref());
+            let mut budget = super::build_arbitrator_from_config(ctx.config);
             // Per-source cursor advance for both build and driver.
             // Source→Combine direct paths bypass the Transform /
             // Aggregate advance points so the cursor never moved off
@@ -5694,7 +5690,7 @@ fn run_time_windowed_aggregate(
     strategy: AggregateStrategy,
     output_schema: Arc<Schema>,
     spill_schema: Arc<Schema>,
-    memory_limit: usize,
+    mem_limit: usize,
     input: &[(Record, u64)],
     spec: &crate::config::pipeline_node::TimeWindowSpec,
     allowed_lateness: Option<std::time::Duration>,
@@ -5762,7 +5758,7 @@ fn run_time_windowed_aggregate(
             strategy,
             Arc::clone(&output_schema),
             Arc::clone(&spill_schema),
-            memory_limit,
+            mem_limit,
             Some(ctx.spill_root_path.to_path_buf()),
             name.to_string(),
         )
