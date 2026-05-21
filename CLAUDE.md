@@ -34,18 +34,12 @@ sprints are the common case and remain effectively per-commit gated —
 the policy only changes behavior when a sprint genuinely needs more
 than one commit to land cleanly.
 
-**Then run `/post-impl-followup` before any `git push` or `gh pr
-create`.** This is a required sprint-close gate, not optional. The skill
-audits each landed PR's diff against its closing issue, scans the
-session conversation for silent deviations and stray observations, and
-splits findings into two buckets: small in-place fixes (typos, missing
-mdbook rows, doc-comment hygiene) that get applied to the working tree
-this session, and deferred items that get filed as GH issues / comments
-with milestone mapping. Apply the in-place fixes first so the sprint's
-closing commit ships clean; only then push or open the PR. Skipping this
-step means small doc gaps and silent scope changes get baked into the
-public history with no follow-up trail. The skill lives at
-`.claude/skills/post-impl-followup/SKILL.md`.
+Then run `/post-impl-followup` before pushing or opening a PR. A
+session generates ephemeral findings — bugs spotted in passing, ideas
+from exploration, scope deviations decided mid-flight, architectural
+a-ha moments — that vanish when context turns over. The skill
+resurfaces them, fixes trivial ones in place, files the rest. Skip it
+and the work is silently lost.
 
 (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and
 `aarch64-apple-darwin` for `clinker-core`; cross-compile setup is
