@@ -17,17 +17,27 @@ pipeline:
 
 The CLI flag overrides the YAML value. Accepted suffixes: `K` (kilobytes), `M` (megabytes), `G` (gigabytes).
 
-**Default:** 256M
+**Default:** 512M
 
 ## How it works
 
-Clinker uses a custom accounting allocator to track memory usage across all pipeline nodes. When memory pressure rises toward the configured limit, aggregation operations spill intermediate state to temporary files on disk. The pipeline continues with degraded throughput rather than crashing with an out-of-memory error.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. In parallel, the engine maintains a byte counter that charges every arena build site and every inter-stage `node_buffers` materialization against the same limit envelope -- so a pipeline declaring a 512 MB budget cannot multiply that limit across many operators. When memory pressure rises toward the configured limit, aggregation operations and inter-stage buffers spill to temporary files on disk. The pipeline continues with degraded throughput rather than crashing with an out-of-memory error.
 
 This means:
 
 - Pipelines always complete if disk space is available, regardless of input size.
 - Performance degrades gracefully under memory pressure -- you will see slower execution, not failures.
 - The memory limit is a soft ceiling, not a hard wall. Momentary spikes may briefly exceed the limit before spill kicks in.
+
+## Bounded-memory contract for non-fused stages
+
+Fused chains (Source → Transform → Output, Merge.interleave fed by Sources) run streaming with no per-stage materialization. Non-fused boundaries -- Route fan-out, Merge fan-in, Composition bodies, diamond DAGs -- materialize records into per-stage `node_buffers` that charge against the budget.
+
+When a buffer crosses the soft threshold (80% of the limit), the engine spills that buffer to disk using the same LZ4 + postcard frame format as grace-hash sort partitions. When a buffer crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded { node }` naming the producer that overran. See [error E310](../explain/E310.html) for the full diagnostic model, including the [composition-involved](../explain/E310.html#composition-involvement) two-shape error model.
+
+Spill fires at the producer side of the first slot whose downstream topology permits it -- single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
+
+Use `clinker run --explain` to predict which stages will dominate the budget before runtime -- each node carries a `buffer: streaming | materialized` annotation, and the materialized nodes are exactly the ones that charge `pipeline.memory_limit` and are spill-eligible.
 
 ## Sizing guidelines
 

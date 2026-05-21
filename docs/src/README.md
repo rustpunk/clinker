@@ -17,14 +17,16 @@ lightweight, and easy to reason about.
 long-running stream processor.** A pipeline run is a job: Sources read until
 EOF, the DAG drains, the process exits. Within a run, stateless operators
 (Transform, Route, most Combine probe-side work, Output) evaluate records one
-at a time without accumulating per-record state. The DAG executor does
-materialize intermediate buffers between non-fused stages, so memory footprint
-scales with the largest intermediate stage's output rather than total input
-size; fused streaming paths (Source → Transform → Output without fan-out)
-avoid intermediate materialization entirely. Blocking operators (Aggregate,
-sort, grace-hash Combine) accumulate state inside the configured RSS budget
-and **spill to disk** when soft and hard memory thresholds trip, rather than
-OOM-killing the process.
+at a time without accumulating per-record state. Every stage is charged
+against the configured RSS budget. Fused Source → Transform → Output paths
+run streaming with no per-stage materialization; non-fused boundaries
+(Route fan-out, Merge fan-in, Composition bodies, diamond DAGs) materialize
+records into per-stage buffers that charge against the same envelope. The
+engine spills buffers to disk at 80% of the limit and fails fast with
+`E310 MemoryBudgetExceeded` at the hard limit, naming the offending
+producer. Blocking operators (Aggregate, sort, grace-hash Combine)
+accumulate state inside that same budget and **spill to disk** when soft
+and hard memory thresholds trip, rather than OOM-killing the process.
 
 If you have used Flink, Kafka Streams, or Beam in unbounded mode: Clinker is
 not that. There are no watermarks against wall-clock time, no infinite-source
