@@ -33,7 +33,7 @@ transform.active_only:
   ordering_provenance: DestroyedByDistinct { at_node: "active_only", confidence: Proven }
   partitioning: Single
   partitioning_provenance: SingleStream
-  buffer: streaming
+  buffer: materialized
 
 aggregation.by_dept:
   ordering: 

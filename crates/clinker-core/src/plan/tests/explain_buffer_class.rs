@@ -61,7 +61,7 @@ fn buffer_class_for(block: &str, id_slug: &str) -> String {
     panic!("`buffer:` line missing inside `{id_slug}` stanza:\n{block}")
 }
 
-// ── Gate 1: fully fused streaming chain ──────────────────────────────
+// ── Gate 1: fused Source + materialized Transform + sink Output ──────
 
 fn linear_streaming_yaml() -> &'static str {
     r#"
@@ -95,19 +95,23 @@ nodes:
 "#
 }
 
-/// Source → Transform → Output: the executor's fused-transform pass
-/// claims the Source's receiver for the Transform's per-record path, so
-/// none of the three stages allocate a `node_buffers` slot. Every
-/// `buffer:` line must read `streaming`.
+/// Source → Transform → Output. The Source's receiver is consumed
+/// directly by the fused Transform's per-record loop (no
+/// `node_buffers[source]` slot, so the Source streams). The fused
+/// Transform still admits its evaluated output to
+/// `node_buffers[transform]` at stage close — fusion saves the
+/// source-side allocation, not the transform-side — so the Transform
+/// renders `materialized`. The Output is a sink and renders
+/// `streaming`.
 #[test]
-fn buffer_class_marks_every_stage_streaming_in_fused_chain() {
+fn buffer_class_marks_fused_source_streaming_transform_materialized() {
     let config = parse_fixture(linear_streaming_yaml());
     let dag = compile(&config);
     let text = dag.explain_text(&config);
     let block = physical_properties_block(&text);
 
     assert_eq!(buffer_class_for(block, "source.primary"), "streaming");
-    assert_eq!(buffer_class_for(block, "transform.scale"), "streaming");
+    assert_eq!(buffer_class_for(block, "transform.scale"), "materialized");
     assert_eq!(buffer_class_for(block, "output.out"), "streaming");
 }
 

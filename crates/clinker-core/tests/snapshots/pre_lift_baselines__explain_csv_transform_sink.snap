@@ -33,7 +33,7 @@ transform.tier_flag:
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
-  buffer: streaming
+  buffer: materialized
 
 output.results:
   ordering: <none>

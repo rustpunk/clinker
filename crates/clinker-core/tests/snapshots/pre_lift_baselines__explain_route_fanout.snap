@@ -33,7 +33,7 @@ transform.classify:
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
-  buffer: streaming
+  buffer: materialized
 
 route.classify_route:
   ordering: <none>

@@ -860,9 +860,11 @@ pub struct PlanEdge {
 /// every other node materializes an intermediate buffer and is spill-eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BufferClass {
-    /// Records stream record-by-record through a fused chain or a sink
-    /// writer — no `node_buffers` slot, no `MemoryBudget` charge for
-    /// this stage.
+    /// No `ctx.node_buffers` slot is admitted for this stage's output —
+    /// no `MemoryBudget` charge for this stage, no spill eligibility.
+    /// Today this covers fused Sources (their receiver is consumed
+    /// directly by the downstream fused arm) and every Output (sinks
+    /// write to their configured writer and never admit a buffer).
     Streaming,
     /// Records pass through a `ctx.node_buffers` slot between dispatch
     /// arms. The producer charges `MemoryBudget` via
@@ -1142,12 +1144,25 @@ impl ExecutionPlanDag {
     /// Classify every node by whether its output crosses an inter-stage
     /// `ctx.node_buffers` slot at runtime.
     ///
-    /// Mirrors the executor's pre-run fusion pass: a Source whose name
-    /// lands in either fused-source set, or a Transform whose `NodeIndex`
-    /// lands in the fused-transform set, streams record-by-record into
-    /// its downstream consumer. Output nodes are always streaming because
-    /// they're sinks — they write to the configured writer and never
-    /// admit records into `node_buffers`. Everything else materializes.
+    /// Two stages render `streaming`:
+    ///
+    /// - **Sources** whose name lands in either fused-source set. The
+    ///   dispatch arm returns cleanly without admitting a buffer; the
+    ///   downstream fused consumer (Merge.interleave arm or
+    ///   `transform_fused_consume`) takes the receiver directly.
+    /// - **Outputs**, unconditionally. Outputs are sinks — they consume
+    ///   records and write to the configured writer; they never admit
+    ///   to `node_buffers`.
+    ///
+    /// Everything else materializes. In particular, a Transform whose
+    /// `NodeIndex` lands in `fused_transforms` is still
+    /// `materialized`: the fusion saves the *source-side* allocation
+    /// (the upstream Source no longer admits to `node_buffers[source]`),
+    /// but `transform_fused_consume` accumulates the per-record
+    /// evaluation output into a `Vec<(Record, u64)>` and admits the
+    /// whole stage to `node_buffers[transform]` at close.
+    /// `fused_transforms` is consulted only to extend `fused_sources`
+    /// with the upstream Source name, not to flip the Transform itself.
     ///
     /// The returned map is keyed by `NodeIndex` and covers every node in
     /// the graph (one entry per `node_indices()` slot).
@@ -1158,7 +1173,7 @@ impl ExecutionPlanDag {
         let init_phase = crate::executor::compute_init_phase_node_set(self);
         let mut fused_sources =
             crate::executor::compute_merge_interleave_fused_sources(self, config);
-        let (extra_fused_sources, fused_transforms) =
+        let (extra_fused_sources, _fused_transforms) =
             crate::executor::compute_transform_fused_sources(self, &fused_sources, &init_phase);
         fused_sources.extend(extra_fused_sources);
 
@@ -1168,9 +1183,6 @@ impl ExecutionPlanDag {
                 let class = match &self.graph[idx] {
                     PlanNode::Output { .. } => BufferClass::Streaming,
                     PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
-                        BufferClass::Streaming
-                    }
-                    PlanNode::Transform { .. } if fused_transforms.contains(&idx) => {
                         BufferClass::Streaming
                     }
                     _ => BufferClass::Materialized,
