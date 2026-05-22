@@ -348,6 +348,14 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<WatermarkConfig>,
 
+    /// Envelope-section configuration for document-aware sources.
+    /// Declared sections are extracted by the reader's one-time
+    /// pre-scan and exposed to CXL via `$doc.<section>.<field>`.
+    /// Section names are user-chosen identifiers; the engine reserves
+    /// none. Absent (`None`) when the source has no envelope to extract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<clinker_format::EnvelopeConfig>,
+
     /// Format-layer schema pointer (e.g. fixed-width field layouts).
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk

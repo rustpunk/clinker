@@ -2064,10 +2064,27 @@ async fn ingest_source_task(
                                 crate::executor::stream_event::Punctuation::document_close(prev),
                             )?;
                         }
+                        // Pre-scan declared envelope sections for the new
+                        // file. Sources without `envelope:` config pass
+                        // an empty section map; the default trait impl
+                        // also returns an empty section map. Sections
+                        // populate before the first body record's
+                        // punctuation emits so every record carries the
+                        // same fully-populated context.
+                        let envelope_sections = match src_cfg.envelope.as_ref() {
+                            Some(cfg) => src_reader.prepare_document(cfg).map_err(|e| {
+                                PipelineError::Internal {
+                                    op: "envelope-pre-scan",
+                                    node: src_cfg.name.clone(),
+                                    detail: e.to_string(),
+                                }
+                            })?,
+                            None => indexmap::IndexMap::new(),
+                        };
                         let new_ctx = Arc::new(clinker_record::DocumentContext::new(
                             clinker_record::DocumentId::next(),
                             Arc::clone(&file_arc),
-                            indexmap::IndexMap::new(),
+                            envelope_sections,
                         ));
                         push_punct(
                             &mut stream,

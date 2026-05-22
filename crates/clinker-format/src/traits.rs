@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema};
+use clinker_record::{Record, Schema, Value};
+use indexmap::IndexMap;
 
+use crate::envelope::EnvelopeConfig;
 use crate::error::FormatError;
 
 /// Streaming record reader. Yields records one at a time.
@@ -23,6 +25,27 @@ pub trait FormatReader: Send {
     /// must delegate to it.
     fn current_source_file(&self) -> Option<&Arc<str>> {
         None
+    }
+
+    /// One-time envelope pre-scan for the current file, run by the
+    /// executor's source ingest before any `next_record` call. Each
+    /// declared section in `config.sections` resolves to a
+    /// [`Value::Map`] of typed field values keyed by the section's
+    /// declared field names; the returned map is then attached to
+    /// every body record's `Arc<DocumentContext>`.
+    ///
+    /// Default impl returns an empty map — readers that don't yet
+    /// support envelope extraction (CSV, fixed-width pending #101) or
+    /// that the config asked nothing of (no declared sections) take
+    /// the no-op path. Format-specific implementations (XML, JSON) are
+    /// added per-reader; if `config.sections` declares an extract rule
+    /// the reader does not support, that reader returns a format
+    /// error surfacing the mismatch at startup rather than mid-stream.
+    fn prepare_document(
+        &mut self,
+        _config: &EnvelopeConfig,
+    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+        Ok(IndexMap::new())
     }
 }
 
