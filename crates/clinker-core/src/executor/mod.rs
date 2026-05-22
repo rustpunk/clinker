@@ -953,6 +953,16 @@ impl PipelineExecutor {
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
+        // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
+        // envelopes every node-rooted arena finalize — including the
+        // arenas built at Source dispatch-arm exits. Constructed
+        // before the source loop so each Source can register a
+        // `SourceConsumer` with the arbitrator at its construction
+        // site instead of after-the-fact discovery. The active
+        // policy is the one `pipeline.memory.backpressure` selects;
+        // default `pause` installs `BackPressurePreferred -> Priority`.
+        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
+
         // ── Unified source ingest pass ───────────────────────────────
         // Every declared Source spawns one `tokio::task` that drives
         // its format reader on a blocking worker and pushes records
@@ -987,6 +997,18 @@ impl PipelineExecutor {
             let (stream, rx) = crate::executor::source_stream::TokioSourceStream::new(
                 crate::executor::source_stream::TokioSourceStream::DEFAULT_CAPACITY,
             );
+            // Register a `SourceConsumer` with the pipeline-scoped
+            // arbitrator at the source's construction site. The
+            // handle's `bytes` counter mirrors the ingest channel's
+            // queued bytes once that wiring lands; until then the
+            // consumer reports zero and serves as a back-pressureable
+            // pause target for `BackPressurePreferred::wrapping(Priority)`.
+            // The arbitrator owns the boxed wrapper for the run; the
+            // arbitrator's Drop releases it on pipeline teardown.
+            let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+            let _source_consumer_id = memory_budget.register_consumer(Box::new(
+                crate::executor::source_stream::SourceConsumer::new(source_consumer_handle.clone()),
+            ));
             source_records.insert(src_cfg.name.clone(), rx);
             let src_cfg_owned = src_cfg.clone();
             let config_clone = config.clone();
@@ -1020,6 +1042,7 @@ impl PipelineExecutor {
             spill_root_path,
             counters,
             watermarks,
+            memory_budget,
         )
         .await?;
 
@@ -1131,17 +1154,9 @@ impl PipelineExecutor {
         spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
         watermarks: crate::executor::watermark::PerSourceWatermarks,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
-
-        // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
-        // envelopes every node-rooted arena finalize — including the
-        // arenas built at Source dispatch-arm exits. Promoted to
-        // ctx-owned so a relaxed pipeline cannot multiply its declared
-        // limit across N upstream operators by accident. The active
-        // policy is the one `pipeline.memory.backpressure` selects;
-        // default `pause` installs `BackPressurePreferred -> Priority`.
-        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
 
         // No prologue drain or arena build. The dispatch Source arm
         // is the first consumer of every `mpsc::Receiver`:
