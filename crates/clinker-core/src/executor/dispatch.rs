@@ -488,6 +488,21 @@ pub(crate) struct ExecutorContext<'a> {
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeIndex, NodeBuffer>,
+    /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
+    /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
+    /// and stores both the returned `ConsumerId` (used to `unregister_consumer`
+    /// at the slot's drain site) and a clone of the `Arc<ConsumerHandle>`
+    /// (used by partial-discharge sites to drive `handle.sub_bytes`). Keyed
+    /// by the slot's `NodeIndex`; body-scope swaps replace this map alongside
+    /// `node_buffers` so a body walk does not pollute the parent scope's
+    /// registry.
+    pub(crate) node_buffer_consumer_ids: HashMap<
+        NodeIndex,
+        (
+            crate::pipeline::memory::ConsumerId,
+            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
     /// Per-source live ingest channels keyed by Source node name. Each
     /// declared Source has one `tokio::spawn`-ed task pushing records
     /// through a `TokioSourceStream`; this map holds the paired
@@ -1260,9 +1275,26 @@ pub(crate) fn node_buffer_spill_allowed(
 /// composition input-port slots stay memory-bound (their consumers
 /// reach `NodeBuffer::clone_memory_only`, which panics on spill
 /// variants).
+/// Remove a `node_buffers` slot and unregister its paired
+/// `NodeBufferConsumer` from the pipeline-scoped arbitrator. Mirrors
+/// `HashMap::remove` shape — returns the buffer if the slot was
+/// occupied, `None` otherwise. Every drain site that previously
+/// called `ctx.node_buffers.remove(&idx)` routes through this helper
+/// so the arbitrator's registry stays aligned with the live slot map.
+pub(crate) fn drain_node_buffer_slot(
+    ctx: &mut ExecutorContext<'_>,
+    node_idx: NodeIndex,
+) -> Option<NodeBuffer> {
+    if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+        ctx.memory_budget.unregister_consumer(id);
+    }
+    ctx.node_buffers.remove(&node_idx)
+}
+
 pub(crate) fn admit_node_buffer(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
+    node_idx: NodeIndex,
     rows: Vec<(Record, u64)>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
@@ -1278,13 +1310,21 @@ pub(crate) fn admit_node_buffer(
     // until the static DAG analysis that classifies upstream pause
     // reachability lands; the Priority policy then ranks node_buffer
     // consumers first among spill candidates (priority 0).
-    {
-        let handle = crate::pipeline::memory::ConsumerHandle::new();
-        handle.set_bytes(bytes);
-        ctx.memory_budget.register_consumer(Box::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle, false),
-        ));
+    //
+    // A prior registration at the same slot (re-admit after partial
+    // discharge — e.g. the post-recompute aggregate emit path)
+    // unregisters first so the arbitrator's registry holds exactly
+    // one wrapper per live slot.
+    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+        ctx.memory_budget.unregister_consumer(prev_id);
     }
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    handle.set_bytes(bytes);
+    let consumer_id = ctx.memory_budget.register_consumer(Box::new(
+        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+    ));
+    ctx.node_buffer_consumer_ids
+        .insert(node_idx, (consumer_id, handle.clone()));
     if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
         return Err(PipelineError::MemoryBudgetExceeded {
             node: node_name.to_string(),
@@ -1303,6 +1343,11 @@ pub(crate) fn admit_node_buffer(
     )? {
         Some((file, count)) => {
             ctx.memory_budget.discharge_node_buffer_bytes(bytes);
+            // Rows are now on disk; the in-memory portion of this slot
+            // is zero. The handle reflects the operator's live state
+            // for the arbitrator's pull-mode `current_usage` —
+            // Velox's "reclaimable ≠ held" point.
+            handle.set_bytes(0);
             let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
             if ctx.memory_budget.record_spill_bytes(file_bytes) {
                 return Err(PipelineError::MemoryBudgetExceeded {
@@ -1999,6 +2044,7 @@ pub(crate) async fn transform_fused_consume(
     let nb = admit_node_buffer(
         ctx,
         name,
+        node_idx,
         output_records,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
@@ -2079,7 +2125,7 @@ pub(crate) async fn dispatch_plan_node(
             };
 
             let records: Vec<(Record, u64)> =
-                if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
+                if let Some(seeded) = drain_node_buffer_slot(ctx, node_idx) {
                     // Body-context port source — records were seeded by
                     // `execute_composition_body` from parent-scope
                     // output. The seeded records still carry the parent
@@ -2191,6 +2237,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 name,
+                node_idx,
                 records,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -2216,7 +2263,7 @@ pub(crate) async fn dispatch_plan_node(
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
             let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
@@ -2226,9 +2273,11 @@ pub(crate) async fn dispatch_plan_node(
                         .neighbors_directed(node_idx, Direction::Incoming)
                         .collect();
                     let pred_buf = if predecessors.len() == 1 {
-                        ctx.node_buffers.remove(&predecessors[0])
+                        drain_node_buffer_slot(ctx, predecessors[0])
                     } else {
-                        predecessors.iter().find_map(|p| ctx.node_buffers.remove(p))
+                        predecessors
+                            .iter()
+                            .find_map(|p| drain_node_buffer_slot(ctx, *p))
                     };
                     match pred_buf {
                         Some(nb) => {
@@ -2249,6 +2298,7 @@ pub(crate) async fn dispatch_plan_node(
                     let nb = admit_node_buffer(
                         ctx,
                         name.as_str(),
+                        node_idx,
                         input_records,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
@@ -2435,6 +2485,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 name,
+                node_idx,
                 output_records,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -2457,12 +2508,15 @@ pub(crate) async fn dispatch_plan_node(
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
             let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
-                    match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
+                    match predecessors
+                        .iter()
+                        .find_map(|p| drain_node_buffer_slot(ctx, *p))
+                    {
                         Some(nb) => {
                             ctx.memory_budget
                                 .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
@@ -2731,6 +2785,7 @@ pub(crate) async fn dispatch_plan_node(
                 let nb = admit_node_buffer(
                     ctx,
                     name,
+                    succ_idx,
                     buf,
                     node_buffer_spill_allowed(current_dag, succ_idx),
                 )?;
@@ -2870,7 +2925,7 @@ pub(crate) async fn dispatch_plan_node(
                     crate::config::MergeMode::Concat => {
                         for pred in &sorted_preds {
                             let upstream_name = current_dag.graph[*pred].name().to_string();
-                            if let Some(buf) = ctx.node_buffers.remove(pred) {
+                            if let Some(buf) = drain_node_buffer_slot(ctx, *pred) {
                                 ctx.memory_budget
                                     .discharge_node_buffer_bytes(buf.estimated_memory_bytes());
                                 for pair in buf.drain() {
@@ -2894,7 +2949,7 @@ pub(crate) async fn dispatch_plan_node(
                         let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
                             .iter()
                             .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
-                                match ctx.node_buffers.remove(pred) {
+                                match drain_node_buffer_slot(ctx, *pred) {
                                     Some(nb) => {
                                         ctx.memory_budget.discharge_node_buffer_bytes(
                                             nb.estimated_memory_bytes(),
@@ -2953,6 +3008,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 name,
+                node_idx,
                 merged,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -2975,15 +3031,17 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<(Record, u64)> =
-                match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
-                    Some(nb) => {
-                        ctx.memory_budget
-                            .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                        nb.drain().collect::<Result<Vec<_>, _>>()?
-                    }
-                    None => Vec::new(),
-                };
+            let input_records: Vec<(Record, u64)> = match predecessors
+                .iter()
+                .find_map(|p| drain_node_buffer_slot(ctx, *p))
+            {
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain().collect::<Result<Vec<_>, _>>()?
+                }
+                None => Vec::new(),
+            };
 
             if input_records.is_empty() {
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
@@ -2993,6 +3051,7 @@ pub(crate) async fn dispatch_plan_node(
                 let nb = admit_node_buffer(
                     ctx,
                     name,
+                    node_idx,
                     Vec::new(),
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
@@ -3079,6 +3138,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 name,
+                node_idx,
                 out,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -3119,7 +3179,7 @@ pub(crate) async fn dispatch_plan_node(
 
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
-            let input: Vec<(Record, u64)> = match ctx.node_buffers.remove(&pred) {
+            let input: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
@@ -3490,6 +3550,7 @@ pub(crate) async fn dispatch_plan_node(
                 let nb = admit_node_buffer(
                     ctx,
                     name,
+                    node_idx,
                     projected,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
@@ -3507,6 +3568,7 @@ pub(crate) async fn dispatch_plan_node(
                 let nb = admit_node_buffer(
                     ctx,
                     name,
+                    node_idx,
                     out_rows,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
@@ -3538,7 +3600,7 @@ pub(crate) async fn dispatch_plan_node(
             // since those bytes were already charged by the producer.
             let mut multi_consumer_clone_bytes: u64 = 0;
             let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
@@ -3558,7 +3620,7 @@ pub(crate) async fn dispatch_plan_node(
                             .filter(|&succ| succ > node_idx)
                             .count();
                         if remaining_consumers == 0 {
-                            if let Some(nb) = ctx.node_buffers.remove(&p) {
+                            if let Some(nb) = drain_node_buffer_slot(ctx, p) {
                                 ctx.memory_budget
                                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                                 found = Some(nb.drain().collect::<Result<Vec<_>, _>>()?);
@@ -3904,6 +3966,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 &composition_name,
+                node_idx,
                 output_records,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -4084,7 +4147,7 @@ pub(crate) async fn dispatch_plan_node(
                     ),
                 })?;
 
-            let driver_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&driver_pred) {
+            let driver_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, driver_pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
@@ -4092,7 +4155,7 @@ pub(crate) async fn dispatch_plan_node(
                 }
                 None => Vec::new(),
             };
-            let build_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&build_pred) {
+            let build_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, build_pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
@@ -4304,6 +4367,7 @@ pub(crate) async fn dispatch_plan_node(
                     let nb = admit_node_buffer(
                         ctx,
                         name,
+                        node_idx,
                         output_records,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
@@ -4399,6 +4463,7 @@ pub(crate) async fn dispatch_plan_node(
                     let nb = admit_node_buffer(
                         ctx,
                         name,
+                        node_idx,
                         output_records,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
@@ -4500,6 +4565,7 @@ pub(crate) async fn dispatch_plan_node(
                     let nb = admit_node_buffer(
                         ctx,
                         name,
+                        node_idx,
                         output_records,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
@@ -4997,6 +5063,7 @@ pub(crate) async fn dispatch_plan_node(
             let nb = admit_node_buffer(
                 ctx,
                 name,
+                node_idx,
                 output_records,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
@@ -5677,7 +5744,7 @@ async fn execute_composition_body(
     // is the single source of records for that slot.
     let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
-            let drained: Vec<(Record, u64)> = match ctx.node_buffers.remove(&idx) {
+            let drained: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, idx) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());

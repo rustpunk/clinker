@@ -1416,6 +1416,7 @@ impl PipelineExecutor {
             strategy,
 
             node_buffers: HashMap::new(),
+            node_buffer_consumer_ids: HashMap::new(),
             source_records,
             fused_sources,
             fused_transforms,

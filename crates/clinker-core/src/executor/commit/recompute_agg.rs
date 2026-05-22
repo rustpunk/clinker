@@ -18,8 +18,8 @@ use super::detect::RetractScope;
 use crate::aggregation::HashAggError;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    project_rows_to_buffer_schema,
+    ExecutorContext, admit_node_buffer, drain_node_buffer_slot, finalize_node_rooted_windows,
+    node_buffer_spill_allowed, project_rows_to_buffer_schema,
 };
 use crate::plan::execution::ExecutionPlanDag;
 
@@ -67,7 +67,7 @@ pub(crate) fn recompute_aggregates(
                 // (degrade path) or was never instantiated. Mark for
                 // degrade-fallback collateral handling in flush.
                 degraded.push(agg_idx);
-                if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+                if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                 }
@@ -77,7 +77,7 @@ pub(crate) fn recompute_aggregates(
         };
         if !retract_ok {
             degraded.push(agg_idx);
-            if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+            if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
                 ctx.memory_budget
                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
             }
@@ -91,7 +91,7 @@ pub(crate) fn recompute_aggregates(
             }
             Err(_) => {
                 degraded.push(agg_idx);
-                if let Some(nb) = ctx.node_buffers.remove(&agg_idx) {
+                if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                 }
@@ -225,6 +225,7 @@ pub(crate) fn emit_post_recompute(
     let nb = admit_node_buffer(
         ctx,
         &agg_name,
+        agg_idx,
         projected,
         node_buffer_spill_allowed(current_dag, agg_idx),
     )

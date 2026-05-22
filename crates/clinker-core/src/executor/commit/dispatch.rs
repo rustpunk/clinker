@@ -44,7 +44,9 @@ use petgraph::visit::{EdgeRef, Topo};
 use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::error::PipelineError;
-use crate::executor::dispatch::{ExecutorContext, charge_node_buffer_admit, dispatch_plan_node};
+use crate::executor::dispatch::{
+    ExecutorContext, charge_node_buffer_admit, dispatch_plan_node, drain_node_buffer_slot,
+};
 use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::CompositionBodyId;
 use crate::plan::deferred_region::{DeferredRegion, ParentContinuation};
@@ -228,13 +230,13 @@ async fn dispatch_one_region(
     // — `recompute_aggregates` populates it with the post-recompute
     // narrow rows.
     for &m in &region.members {
-        if let Some(nb) = ctx.node_buffers.remove(&m) {
+        if let Some(nb) = drain_node_buffer_slot(ctx, m) {
             ctx.memory_budget
                 .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
         }
     }
     for &o in &region.outputs {
-        if let Some(nb) = ctx.node_buffers.remove(&o) {
+        if let Some(nb) = drain_node_buffer_slot(ctx, o) {
             ctx.memory_budget
                 .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
         }
@@ -398,9 +400,12 @@ async fn recurse_into_body(
 
     // Swap to body-scope buffers so body NodeIndices index a fresh
     // namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
-    // collide numerically). Restore on every exit.
+    // collide numerically). Restore on every exit. The paired
+    // consumer-id map swaps alongside so body-scope NodeBufferConsumer
+    // registrations don't survive into the parent scope's arbitrator.
     let body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
+    let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
     let saved_combine = std::mem::take(&mut ctx.source_records);
     let saved_body_refs = ctx
         .current_body_node_input_refs
@@ -489,7 +494,7 @@ async fn recurse_into_body(
         // body covered without an extra code path.
         let mut harvested: Vec<(Record, u64)> = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
-            if let Some(nb) = ctx.node_buffers.remove(body_out_idx) {
+            if let Some(nb) = drain_node_buffer_slot(ctx, *body_out_idx) {
                 ctx.memory_budget
                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                 for pair in nb.drain() {
@@ -515,6 +520,15 @@ async fn recurse_into_body(
     if leaked_bytes > 0 {
         ctx.memory_budget.discharge_node_buffer_bytes(leaked_bytes);
     }
+    // Unregister every body-local NodeBufferConsumer so the
+    // arbitrator's registry stays aligned with the post-swap parent
+    // scope's `node_buffers` map. The body-scope `node_buffer_consumer_ids`
+    // map is replaced below; failing to unregister here would leak
+    // wrappers whose `current_usage` reads zero forever.
+    let body_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
+    for (_, (id, _)) in body_consumer_ids {
+        ctx.memory_budget.unregister_consumer(id);
+    }
 
     // Restore parent scope on every exit. The window-runtime body
     // overlay is popped first so subsequent parent-scope walks route
@@ -525,6 +539,7 @@ async fn recurse_into_body(
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
+    ctx.node_buffer_consumer_ids = saved_consumer_ids;
 
     let harvested = walk_and_harvest?;
 
@@ -605,13 +620,13 @@ async fn dispatch_continuation(
     // not re-read. The Composition seed's slot is preserved — it
     // carries the harvest.
     for &m in &continuation.members {
-        if let Some(nb) = ctx.node_buffers.remove(&m) {
+        if let Some(nb) = drain_node_buffer_slot(ctx, m) {
             ctx.memory_budget
                 .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
         }
     }
     for &o in &continuation.outputs {
-        if let Some(nb) = ctx.node_buffers.remove(&o) {
+        if let Some(nb) = drain_node_buffer_slot(ctx, o) {
             ctx.memory_budget
                 .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
         }
