@@ -1216,9 +1216,10 @@ impl HashAggregator {
         // (60% of budget / estimated_bytes_per_group). Secondary:
         // value_heap_bytes exceeds 40% of budget (catches Collect
         // accumulators that grow unbounded per group).
-        if self.memory_budget > 0
+        if (self.memory_budget > 0
             && (self.groups.len() >= self.max_groups
-                || self.value_heap_bytes > self.memory_budget * 40 / 100)
+                || self.value_heap_bytes > self.memory_budget * 40 / 100))
+            || self.consumer_handle.take_spill_request()
         {
             self.spill()?;
         }
@@ -1392,9 +1393,10 @@ impl HashAggregator {
         // 7. Spill trigger — same dual-threshold check as fold-mode.
         //    `groups.len()` is always 0 in buffer-mode; the buffered
         //    map's group count is the relevant signal.
-        if self.memory_budget > 0
+        if (self.memory_budget > 0
             && (self.buffered_groups.len() >= self.max_groups
-                || self.value_heap_bytes > self.memory_budget * 40 / 100)
+                || self.value_heap_bytes > self.memory_budget * 40 / 100))
+            || self.consumer_handle.take_spill_request()
         {
             self.spill()?;
         }

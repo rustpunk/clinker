@@ -522,7 +522,7 @@ impl GraceHashExecutor {
             }
         }
 
-        if budget.should_spill() {
+        if budget.should_spill() || self.consumer_handle.take_spill_request() {
             self.spill_largest_building(budget)?;
         }
         Ok(())
