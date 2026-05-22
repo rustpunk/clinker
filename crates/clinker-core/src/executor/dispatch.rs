@@ -4317,17 +4317,16 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
-                    // Register a GraceHashConsumer with the pipeline-
-                    // scoped arbitrator. The handle's bytes counter is
-                    // shared with GraceHashExecutor once the executor
-                    // gains its `Arc<ConsumerHandle>` field in a
-                    // follow-up commit; until then current_usage reads
-                    // zero and the consumer is a structural registry
-                    // entry the Priority policy ranks first among
-                    // partition-spillable victims (priority 10).
+                    // Single ConsumerHandle shared between the
+                    // GraceHashConsumer wrapper (Priority policy
+                    // priority 10) and the GraceHashExecutor that
+                    // mirrors its in-memory partition `bytes_estimated`
+                    // sum into the handle's counter on every admit /
+                    // spill_partition transition.
+                    let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                     ctx.memory_budget.register_consumer(Box::new(
                         crate::pipeline::grace_hash::GraceHashConsumer::new(
-                            crate::pipeline::memory::ConsumerHandle::new(),
+                            grace_consumer_handle.clone(),
                         ),
                     ));
                     // Same per-source cursor advance the IEJoin arm
@@ -4389,6 +4388,7 @@ pub(crate) async fn dispatch_plan_node(
                             ctx: &grace_ctx,
                             budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
+                            consumer_handle: grace_consumer_handle,
                         })
                     })?;
                     let probe_records_out = output_records.len() as u64;

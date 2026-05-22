@@ -363,6 +363,11 @@ pub(crate) struct GraceHashExec<'a> {
     /// `tempfile::TempPath` Drop; the pipeline-scoped TempDir Drop
     /// closes the panic-leak hole for files committed mid-combine.
     pub spill_dir: &'a Path,
+    /// Shared with the registered `GraceHashConsumer` wrapper.
+    /// Passed through to `GraceHashExecutor::new` so the operator's
+    /// partition bytes mirror into the arbitrator's pull-mode
+    /// `current_usage` surface.
+    pub consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -386,6 +391,12 @@ pub(crate) struct GraceHashExecutor {
     /// caller can fold the delta into [`MemoryArbitrator::record_spill_bytes`]
     /// and surface E310 on disk-quota overflow.
     spilled_bytes: u64,
+    /// Shared with the arbitrator's `GraceHashConsumer` wrapper.
+    /// `add_build_record` adds the admitted record's bytes;
+    /// `spill_partition` subtracts the evicted partition's
+    /// `bytes_estimated`. On-disk partitions don't count against
+    /// `handle.bytes` — Velox's "reclaimable ≠ held" point.
+    consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 impl GraceHashExecutor {
@@ -394,7 +405,11 @@ impl GraceHashExecutor {
     /// `Arc<TempDir>` from `ExecutorContext::spill_root_path`. Cleanup
     /// of individual files runs on `tempfile::TempPath` Drop; the
     /// pipeline-scoped TempDir provides the secondary panic-safe sweep.
-    pub(crate) fn new(partition_bits: u8, spill_dir: &Path) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        partition_bits: u8,
+        spill_dir: &Path,
+        consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    ) -> std::io::Result<Self> {
         let assigner = PartitionAssigner::new(partition_bits.max(1));
         let n = assigner.num_partitions();
         let mut partitions = Vec::with_capacity(n);
@@ -411,6 +426,7 @@ impl GraceHashExecutor {
             spill_dir: spill_dir.to_path_buf(),
             hash_state: RandomState::new(),
             spilled_bytes: 0,
+            consumer_handle,
         })
     }
 
@@ -481,6 +497,10 @@ impl GraceHashExecutor {
                     records.push(record);
                     *bytes_estimated += bytes;
                     distinct_sketch.add(hash);
+                    // Mirror the admitted bytes into the consumer
+                    // handle so the arbitrator's policy sees this
+                    // partition's contribution at poll time.
+                    self.consumer_handle.add_bytes(bytes as u64);
                 }
             }
             Some(hash_bits) => {
@@ -543,12 +563,12 @@ impl GraceHashExecutor {
         let hash_bits = assigner_bits;
         let partition_id = idx as u16;
         let prev = std::mem::replace(&mut self.partitions[idx], PartitionState::Done);
-        let (records, distinct_sketch) = match prev {
+        let (records, distinct_sketch, bytes_estimated) = match prev {
             PartitionState::Building {
                 records,
                 distinct_sketch,
-                ..
-            } => (records, distinct_sketch),
+                bytes_estimated,
+            } => (records, distinct_sketch, bytes_estimated),
             other => {
                 // Restore and bail.
                 self.partitions[idx] = other;
@@ -571,6 +591,11 @@ impl GraceHashExecutor {
             hash_bits,
             distinct_sketch,
         };
+        // Building → OnDisk: in-memory bytes are now off-process.
+        // Saturating-sub keeps the counter aligned with the
+        // operator's live state without wrapping if estimate drift
+        // ever exceeds the running total.
+        self.consumer_handle.sub_bytes(bytes_estimated as u64);
         Ok(())
     }
 
@@ -791,6 +816,7 @@ pub(crate) fn execute_combine_grace_hash(
         ctx,
         budget,
         spill_dir,
+        consumer_handle,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -857,10 +883,12 @@ pub(crate) fn execute_combine_grace_hash(
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
 
     let mut executor =
-        GraceHashExecutor::new(partition_bits, spill_dir).map_err(|e| PipelineError::Internal {
-            op: "combine",
-            node: name.to_string(),
-            detail: format!("grace hash spill dir bind failed: {e}"),
+        GraceHashExecutor::new(partition_bits, spill_dir, consumer_handle).map_err(|e| {
+            PipelineError::Internal {
+                op: "combine",
+                node: name.to_string(),
+                detail: format!("grace hash spill dir bind failed: {e}"),
+            }
         })?;
 
     // ── Build phase ────────────────────────────────────────────────────
@@ -2087,7 +2115,12 @@ mod tests {
             .tempdir()
             .unwrap();
         let pipeline_path = pipeline_dir.path().to_path_buf();
-        let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
+        let mut exec = GraceHashExecutor::new(
+            4,
+            pipeline_dir.path(),
+            crate::pipeline::memory::ConsumerHandle::new(),
+        )
+        .unwrap();
         let schema = schema_with(&["k"]);
         // Deposit a record and force a spill so a file actually exists.
         let rec = record_for(&schema, vec![Value::Integer(7)]);
@@ -2120,7 +2153,12 @@ mod tests {
                 .tempdir()
                 .unwrap();
             *captured.lock().unwrap() = Some(pipeline_dir.path().to_path_buf());
-            let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
+            let mut exec = GraceHashExecutor::new(
+                4,
+                pipeline_dir.path(),
+                crate::pipeline::memory::ConsumerHandle::new(),
+            )
+            .unwrap();
             let schema = schema_with(&["k"]);
             let rec = record_for(&schema, vec![Value::Integer(99)]);
             let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
@@ -2145,7 +2183,12 @@ mod tests {
             .prefix("gh-test-")
             .tempdir()
             .unwrap();
-        let mut exec = GraceHashExecutor::new(4, dir.path()).unwrap();
+        let mut exec = GraceHashExecutor::new(
+            4,
+            dir.path(),
+            crate::pipeline::memory::ConsumerHandle::new(),
+        )
+        .unwrap();
         let mut budget = tiny_budget();
         for i in 0..256i64 {
             let rec = record_for(
@@ -2177,7 +2220,12 @@ mod tests {
             .prefix("gh-test-")
             .tempdir()
             .unwrap();
-        let mut exec = GraceHashExecutor::new(4, dir.path()).unwrap();
+        let mut exec = GraceHashExecutor::new(
+            4,
+            dir.path(),
+            crate::pipeline::memory::ConsumerHandle::new(),
+        )
+        .unwrap();
         let mut budget = tiny_budget();
 
         // Send 64 records all to partition 0 (top 4 bits = 0). Use a
@@ -2379,6 +2427,7 @@ mod tests {
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })
         .expect("grace hash E2E");
 
@@ -2565,6 +2614,7 @@ mod tests {
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })
         .expect("grace hash spill E2E");
 
@@ -2744,6 +2794,7 @@ mod tests {
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         });
 
         let err = result.expect_err("disk quota must abort the combine");
@@ -2780,7 +2831,12 @@ mod tests {
             .prefix("gh-test-")
             .tempdir()
             .unwrap();
-        let mut exec = GraceHashExecutor::new(2, dir.path()).unwrap();
+        let mut exec = GraceHashExecutor::new(
+            2,
+            dir.path(),
+            crate::pipeline::memory::ConsumerHandle::new(),
+        )
+        .unwrap();
         let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
         let originals: Vec<Record> = (0..16i64)
             .map(|i| {
