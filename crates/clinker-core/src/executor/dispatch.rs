@@ -1270,6 +1270,21 @@ pub(crate) fn admit_node_buffer(
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
     let bytes = estimate_node_buffer_bytes(&rows);
+    // Register a NodeBufferConsumer with the pipeline-scoped
+    // arbitrator for every slot admission. The handle's `bytes`
+    // counter seeds to the admitted byte estimate so the consumer's
+    // current_usage immediately reflects the slot's footprint at
+    // policy-poll time. `can_back_pressure` is conservatively false
+    // until the static DAG analysis that classifies upstream pause
+    // reachability lands; the Priority policy then ranks node_buffer
+    // consumers first among spill candidates (priority 0).
+    {
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        handle.set_bytes(bytes);
+        ctx.memory_budget.register_consumer(Box::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle, false),
+        ));
+    }
     if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
         return Err(PipelineError::MemoryBudgetExceeded {
             node: node_name.to_string(),
