@@ -21,6 +21,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Cross-platform RSS measurement. Returns `None` on unsupported platforms.
 pub fn rss_bytes() -> Option<u64> {
@@ -210,12 +212,17 @@ pub trait MemoryConsumer: Send + Sync {
     /// operators that have no upstream to gate.
     fn can_back_pressure(&self) -> bool;
 
-    /// Pause the consumer's inbound channel. No-op for consumers that
-    /// return `false` from `can_back_pressure`.
-    fn pause(&mut self);
+    /// Pause the consumer's inbound channel. Default body is a no-op:
+    /// blocking operators that return `false` from `can_back_pressure`
+    /// inherit the default and do not need to override. Back-pressureable
+    /// consumers (Sources, `node_buffers` slots whose producer chains to
+    /// a pauseable Source) override with a real `PauseSignal::pause()`
+    /// call.
+    fn pause(&mut self) {}
 
-    /// Resume a previously paused consumer.
-    fn resume(&mut self);
+    /// Resume a previously paused consumer. Default body is a no-op,
+    /// mirroring `pause`.
+    fn resume(&mut self) {}
 }
 
 /// Policy that selects which `MemoryConsumer` gives up memory when
@@ -373,6 +380,14 @@ impl ArbitrationPolicy for BackPressurePreferred {
 /// per-category byte counters (arena, node-buffer, disk spill), and
 /// the policy + consumer registry used to elect spill victims.
 ///
+/// Interior-mutable so a single arbitrator can be shared as
+/// `Arc<MemoryArbitrator>` across every dispatch arm and operator
+/// worker thread without per-arm reconstruction. Counters are
+/// `AtomicU64` (lock-free fetch_update / fetch_max); the consumer
+/// registry is `Mutex<HashMap>` (locked only on register / unregister
+/// / `sum_consumer_usage` / `poll_arbitration`). `policy` is
+/// constructor-set and immutable thereafter.
+///
 /// `should_spill` is the single polling entry used by every spill-
 /// capable operator. It updates `peak_rss`, consults the registered
 /// `ArbitrationPolicy`, and reports whether the soft threshold has
@@ -387,32 +402,50 @@ impl ArbitrationPolicy for BackPressurePreferred {
 /// of continuing to fill the disk.
 pub struct MemoryArbitrator {
     /// Total memory limit in bytes (the hard limit). Default: 512MB.
-    pub limit: u64,
+    /// `AtomicU64` for `&self` access; production sets this once at
+    /// construction. Tests reconfigure via `set_limit`.
+    limit: AtomicU64,
     /// Fraction of limit at which proactive spill triggers (the soft
     /// limit). Default: 0.80. Dual-threshold model: 80% soft / 100%
     /// hard / 20% spike allowance — OTel Memory Limiter consensus.
-    pub spill_threshold_pct: f64,
+    /// Plain `f64`: constructor-set, never reconfigured at runtime;
+    /// `std` has no atomic for it and a `Mutex` would be overkill.
+    spill_threshold_pct: f64,
     /// Peak RSS observed across all `observe()` / `should_spill()`
-    /// calls. `None` on platforms where RSS measurement is
-    /// unavailable.
-    pub peak_rss: Option<u64>,
+    /// calls. Sentinel `0` = never observed; the `peak_rss()` getter
+    /// maps `0` back to `None` to preserve the pre-117c "platform
+    /// without RSS support" branch. RSS is never legitimately 0 on
+    /// Linux / macOS / Windows for a live process so the sentinel is
+    /// unambiguous.
+    peak_rss: AtomicU64,
     /// Optional disk-spill quota in bytes. `u64::MAX` = unlimited.
     /// Polled by spill operators alongside `should_spill()`. When
     /// cumulative spill bytes exceed this value the operator emits
     /// E310 with a partition + spill-bytes diagnostic.
-    pub max_spill_bytes: u64,
-    cumulative_spill_bytes: u64,
+    max_spill_bytes: AtomicU64,
+    cumulative_spill_bytes: AtomicU64,
     /// Cumulative bytes charged across every Arena build site sharing
     /// this arbitrator. The source-rooted arena and every node-rooted
     /// arena share one counter so a pipeline declaring a 512MB limit
     /// cannot multiply that limit across operators.
-    arena_bytes_charged: u64,
+    arena_bytes_charged: AtomicU64,
     /// Cumulative bytes alive in the inter-stage handoff layer between
     /// non-fused DAG operators. Summed with `arena_bytes_charged` via
     /// `total_charged()` — the declared memory limit is a
     /// pipeline-wide ceiling, not per-surface.
-    node_buffer_bytes_charged: u64,
-    consumers: HashMap<ConsumerId, Box<dyn MemoryConsumer>>,
+    node_buffer_bytes_charged: AtomicU64,
+    /// Registry of operator wrappers the arbitrator polls for
+    /// per-operator `current_usage()` and routes `pause` / `resume` /
+    /// `try_spill` callbacks to. Locked only on register / unregister
+    /// and inside `poll_arbitration` (rare — at most once per soft-
+    /// trip per polling operator).
+    consumers: Mutex<HashMap<ConsumerId, Box<dyn MemoryConsumer>>>,
+    /// Source of fresh `ConsumerId` values handed out by
+    /// `register_consumer`. Monotonic; never reused even across
+    /// `unregister_consumer`, so a stale `ConsumerId` cannot collide
+    /// with a later registration.
+    next_consumer_id: AtomicU32,
+    /// Constructor-set; immutable thereafter.
     policy: Box<dyn ArbitrationPolicy>,
 }
 
@@ -433,14 +466,15 @@ impl MemoryArbitrator {
         policy: Box<dyn ArbitrationPolicy>,
     ) -> Self {
         Self {
-            limit,
+            limit: AtomicU64::new(limit),
             spill_threshold_pct,
-            peak_rss: None,
-            max_spill_bytes: u64::MAX,
-            cumulative_spill_bytes: 0,
-            arena_bytes_charged: 0,
-            node_buffer_bytes_charged: 0,
-            consumers: HashMap::new(),
+            peak_rss: AtomicU64::new(0),
+            max_spill_bytes: AtomicU64::new(u64::MAX),
+            cumulative_spill_bytes: AtomicU64::new(0),
+            arena_bytes_charged: AtomicU64::new(0),
+            node_buffer_bytes_charged: AtomicU64::new(0),
+            consumers: Mutex::new(HashMap::new()),
+            next_consumer_id: AtomicU32::new(0),
             policy,
         }
     }
@@ -463,26 +497,25 @@ impl MemoryArbitrator {
     /// Poll current RSS and update `peak_rss` if it exceeds the
     /// recorded peak. Called at chunk boundaries by every spill-
     /// capable operator; also called from `should_spill()` and
-    /// `should_abort()`.
-    pub fn observe(&mut self) {
+    /// `should_abort()`. Lock-free `fetch_max`.
+    pub fn observe(&self) {
         if let Some(rss) = rss_bytes() {
-            self.peak_rss = Some(self.peak_rss.map_or(rss, |prev| prev.max(rss)));
+            self.peak_rss.fetch_max(rss, Ordering::Relaxed);
         }
     }
 
     /// True when current RSS exceeds the soft spill threshold. Also
     /// updates `peak_rss` as a side-effect and runs one arbitration
-    /// round (the round is a no-op under `NoOpPolicy`). False when
-    /// RSS cannot be measured.
-    pub fn should_spill(&mut self) -> bool {
+    /// round; the round is a no-op when no consumers are registered.
+    /// False when RSS cannot be measured (sentinel `0`).
+    pub fn should_spill(&self) -> bool {
         self.observe();
-        let tripped = self.peak_rss.is_some_and(|rss| rss > self.soft_limit());
+        let tripped = self.peak_rss.load(Ordering::Relaxed) > self.soft_limit();
         if tripped {
-            // The result is intentionally discarded: real
-            // victim selection lands once non-trivial policies and
-            // consumer registrations exist. `NoOpPolicy` always
-            // returns `None`, so behavior is byte-for-byte identical
-            // to the pre-arbitrator code path.
+            // Discarded victim id is the right shape until the
+            // arbitrator gains a callback path back into the elected
+            // consumer's `try_spill` / `pause`; the round-trip lands
+            // alongside operator-side `MemoryConsumer` impls.
             let _ = self.poll_arbitration();
         }
         tripped
@@ -496,12 +529,30 @@ impl MemoryArbitrator {
     /// Soft limit: point at which proactive spill begins. Equals
     /// `limit * spill_threshold_pct` (default 0.80).
     pub fn soft_limit(&self) -> u64 {
-        (self.limit as f64 * self.spill_threshold_pct) as u64
+        (self.limit.load(Ordering::Relaxed) as f64 * self.spill_threshold_pct) as u64
     }
 
     /// Hard limit: the absolute budget. RSS above this = abort.
     pub fn hard_limit(&self) -> u64 {
-        self.limit
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// Configured memory limit in bytes (the hard limit).
+    pub fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// Reconfigure the hard limit. Production paths set this only at
+    /// construction; integration tests use this to drive deterministic
+    /// overflow scenarios without spawning processes of the requested
+    /// RSS size.
+    pub fn set_limit(&self, n: u64) {
+        self.limit.store(n, Ordering::Relaxed);
+    }
+
+    /// Soft-limit fraction (constructor-set; default 0.80).
+    pub fn spill_threshold_pct(&self) -> f64 {
+        self.spill_threshold_pct
     }
 
     /// Spike allowance between soft and hard limits (default 20%).
@@ -512,52 +563,90 @@ impl MemoryArbitrator {
     /// True when RSS exceeds the hard limit. Check periodically in
     /// probe loops (every 10K output records) to prevent unbounded
     /// fan-out from blowing the ceiling between spill polls.
-    pub fn should_abort(&mut self) -> bool {
+    pub fn should_abort(&self) -> bool {
         self.observe();
-        self.peak_rss.is_some_and(|rss| rss > self.limit)
+        self.peak_rss.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
+    }
+
+    /// Peak RSS observed so far, or `None` on platforms where
+    /// `rss_bytes()` cannot measure (no `observe()` call has ever
+    /// produced a non-zero sample).
+    pub fn peak_rss(&self) -> Option<u64> {
+        match self.peak_rss.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Seed the peak RSS counter to a deterministic value. Production
+    /// paths never call this; integration tests use it to drive the
+    /// arbitration loop without faking the OS RSS reading.
+    pub fn set_peak_rss_for_test(&self, n: u64) {
+        self.peak_rss.store(n, Ordering::Relaxed);
     }
 
     /// Disk-spill quota in bytes. `u64::MAX` = unlimited.
     pub fn disk_quota(&self) -> u64 {
-        self.max_spill_bytes
+        self.max_spill_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Configured disk-spill quota in bytes.
+    pub fn max_spill_bytes(&self) -> u64 {
+        self.max_spill_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Reconfigure the disk-spill quota. Production sets this at
+    /// construction; integration tests use it to drive E310
+    /// overshoot scenarios.
+    pub fn set_max_spill_bytes(&self, n: u64) {
+        self.max_spill_bytes.store(n, Ordering::Relaxed);
     }
 
     /// Cumulative spill bytes recorded so far across every spill
     /// operator polling this arbitrator.
     pub fn cumulative_spill_bytes(&self) -> u64 {
-        self.cumulative_spill_bytes
+        self.cumulative_spill_bytes.load(Ordering::Relaxed)
     }
 
     /// Add `n` bytes to the cumulative spill counter. Returns `true`
     /// when the running total has exceeded `max_spill_bytes` — the
     /// operator's signal to surface E310 instead of continuing to
-    /// write. Saturating-add keeps an overflowing pipeline from
-    /// wrapping back below the quota silently.
-    pub fn record_spill_bytes(&mut self, n: u64) -> bool {
-        self.cumulative_spill_bytes = self.cumulative_spill_bytes.saturating_add(n);
-        self.cumulative_spill_bytes > self.max_spill_bytes
+    /// write. Saturating-add via `fetch_update` keeps an overflowing
+    /// pipeline from wrapping back below the quota silently.
+    pub fn record_spill_bytes(&self, n: u64) -> bool {
+        let _ = self.cumulative_spill_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_add(n)),
+        );
+        self.cumulative_spill_bytes.load(Ordering::Relaxed)
+            > self.max_spill_bytes.load(Ordering::Relaxed)
     }
 
     /// Add `n` bytes to the cumulative arena-byte counter. Returns
     /// `true` when the running total has exceeded the hard memory
     /// limit — the build site's signal to surface E310 instead of
-    /// admitting the next record. Saturating-add ensures an
-    /// overflowing accumulation cannot wrap below the limit and
-    /// silently disable the gate.
+    /// admitting the next record. Saturating-add via `fetch_update`
+    /// ensures an overflowing accumulation cannot wrap below the
+    /// limit and silently disable the gate.
     ///
     /// One shared counter across the source-rooted arena and every
     /// node-rooted arena built at an upstream operator's dispatch-arm
     /// exit: the pipeline's declared memory limit is a pipeline-wide
     /// envelope, not a per-arena one.
-    pub fn charge_arena_bytes(&mut self, n: u64) -> bool {
-        self.arena_bytes_charged = self.arena_bytes_charged.saturating_add(n);
-        self.arena_bytes_charged > self.limit
+    pub fn charge_arena_bytes(&self, n: u64) -> bool {
+        let _ = self.arena_bytes_charged.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_add(n)),
+        );
+        self.arena_bytes_charged.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
     }
 
     /// Cumulative arena bytes charged so far across every Arena build
     /// site polling this arbitrator.
     pub fn arena_bytes_charged(&self) -> u64 {
-        self.arena_bytes_charged
+        self.arena_bytes_charged.load(Ordering::Relaxed)
     }
 
     /// Add `n` bytes to the node-buffer counter when a producer hands
@@ -568,23 +657,32 @@ impl MemoryArbitrator {
     /// instead of admitting the next stage's output. Saturating-add
     /// keeps an overflowing accumulation from wrapping below the limit
     /// and silently disabling the gate.
-    pub fn charge_node_buffer_bytes(&mut self, n: u64) -> bool {
-        self.node_buffer_bytes_charged = self.node_buffer_bytes_charged.saturating_add(n);
-        self.total_charged() > self.limit
+    pub fn charge_node_buffer_bytes(&self, n: u64) -> bool {
+        let _ = self.node_buffer_bytes_charged.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_add(n)),
+        );
+        self.total_charged() > self.limit.load(Ordering::Relaxed)
     }
 
     /// Subtract `n` bytes from the node-buffer counter when a consumer
     /// drains the corresponding `ctx.node_buffers` slot. Saturating-sub
-    /// guards against over-discharge from estimate drift between the
-    /// producer's charge and the consumer's discharge.
-    pub fn discharge_node_buffer_bytes(&mut self, n: u64) {
-        self.node_buffer_bytes_charged = self.node_buffer_bytes_charged.saturating_sub(n);
+    /// via `fetch_update` guards against over-discharge from estimate
+    /// drift between the producer's charge and the consumer's
+    /// discharge.
+    pub fn discharge_node_buffer_bytes(&self, n: u64) {
+        let _ = self.node_buffer_bytes_charged.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_sub(n)),
+        );
     }
 
     /// Cumulative node-buffer bytes currently alive across every
     /// `ctx.node_buffers` slot polling this arbitrator.
     pub fn node_buffer_bytes_charged(&self) -> u64 {
-        self.node_buffer_bytes_charged
+        self.node_buffer_bytes_charged.load(Ordering::Relaxed)
     }
 
     /// Sum of every accounted live-byte counter. Compared against
@@ -596,21 +694,85 @@ impl MemoryArbitrator {
     /// wrapping the sum and silently passing the gate.
     pub fn total_charged(&self) -> u64 {
         self.arena_bytes_charged
-            .saturating_add(self.node_buffer_bytes_charged)
+            .load(Ordering::Relaxed)
+            .saturating_add(self.node_buffer_bytes_charged.load(Ordering::Relaxed))
+    }
+
+    /// Register a consumer with the arbitrator. Returns a fresh
+    /// `ConsumerId` the operator records for later
+    /// `unregister_consumer` calls. The only path that adds a
+    /// contributor to the arbitrator's policy registry.
+    pub fn register_consumer(&self, consumer: Box<dyn MemoryConsumer>) -> ConsumerId {
+        let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
+        self.consumers.lock().unwrap().insert(id, consumer);
+        id
+    }
+
+    /// Remove a previously-registered consumer from the policy
+    /// registry. Returns the boxed consumer if `id` was registered,
+    /// `None` otherwise. Operators call this at teardown when their
+    /// state has been fully drained and the wrapper is no longer a
+    /// meaningful spill victim.
+    pub fn unregister_consumer(&self, id: ConsumerId) -> Option<Box<dyn MemoryConsumer>> {
+        self.consumers.lock().unwrap().remove(&id)
+    }
+
+    /// Number of consumers currently registered. Diagnostics surface
+    /// for `--explain` and integration tests; per-consumer attribution
+    /// reads `current_usage()` via `sum_consumer_usage`.
+    pub fn consumer_count(&self) -> usize {
+        self.consumers.lock().unwrap().len()
+    }
+
+    /// Sum of `current_usage()` across every registered consumer.
+    /// Pull-mode attribution: only the operator knows which of its
+    /// bytes are reclaimable right now (a grace-hash with on-disk
+    /// partitions has held bytes ≠ reclaimable bytes). The Spark /
+    /// Velox / DataFusion memory pools converged on this shape for
+    /// victim selection because no central counter can represent the
+    /// distinction.
+    pub fn sum_consumer_usage(&self) -> u64 {
+        self.consumers
+            .lock()
+            .unwrap()
+            .values()
+            .map(|c| c.current_usage())
+            .sum()
     }
 
     /// Run one arbitration round and return the elected victim, if
-    /// any. Used internally by `should_spill`; real callers will
-    /// land once policies and consumer registrations exist. With
-    /// `NoOpPolicy` and an empty consumer registry the call is a
-    /// cheap loop over zero entries and always returns `None`.
-    fn poll_arbitration(&mut self) -> Option<ConsumerId> {
-        let pressure = self.peak_rss.unwrap_or(0).saturating_sub(self.soft_limit());
-        let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = self
-            .consumers
+    /// any. Used internally by `should_spill`. Snapshots the consumer
+    /// registry under the registry lock, computes the policy decision,
+    /// and emits a `tracing::warn` when peak RSS and the sum of
+    /// registered consumer usages disagree by more than 10% of the
+    /// configured limit — useful signal that allocator overhead or
+    /// fragmentation is meaningful, never a failure.
+    ///
+    /// Warning is suppressed when the consumer registry is empty: no
+    /// pull-mode attribution means no signal to compare against and
+    /// the disagreement is structurally guaranteed.
+    fn poll_arbitration(&self) -> Option<ConsumerId> {
+        let peak_rss = self.peak_rss.load(Ordering::Relaxed);
+        let pressure = peak_rss.saturating_sub(self.soft_limit());
+        let limit = self.limit.load(Ordering::Relaxed);
+        let consumers = self.consumers.lock().unwrap();
+        if consumers.is_empty() {
+            return self.policy.select_victim(&[], pressure);
+        }
+        let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
             .iter()
             .map(|(id, consumer)| (*id, consumer.as_ref()))
             .collect();
+        let charged_sum: u64 = snapshot.iter().map(|(_, c)| c.current_usage()).sum();
+        let tenth = limit / 10;
+        if tenth > 0 && peak_rss.abs_diff(charged_sum) > tenth {
+            tracing::warn!(
+                peak_rss = peak_rss,
+                charged_sum = charged_sum,
+                limit = limit,
+                "memory arbitrator: RSS and pull-mode charged bytes disagree by more than 10% of limit"
+            );
+        }
         self.policy.select_victim(&snapshot, pressure)
     }
 }
@@ -668,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_memory_arbitrator_below_threshold() {
-        let mut arbitrator =
+        let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         // Test process RSS should be well under 410MB (80% of 512MB)
         if rss_bytes().is_some() {
@@ -679,7 +841,7 @@ mod tests {
     #[test]
     fn test_memory_arbitrator_above_threshold() {
         // Limit of 1MB — any running process exceeds this
-        let mut arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
         if rss_bytes().is_some() {
             assert!(arbitrator.should_spill());
         }
@@ -687,28 +849,28 @@ mod tests {
 
     #[test]
     fn test_memory_arbitrator_peak_rss_tracked() {
-        let mut arbitrator =
+        let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         if rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
         arbitrator.observe();
         assert!(
-            arbitrator.peak_rss.is_some(),
+            arbitrator.peak_rss().is_some(),
             "peak_rss should be set after observe()"
         );
-        let first_peak = arbitrator.peak_rss.unwrap();
+        let first_peak = arbitrator.peak_rss().unwrap();
         arbitrator.observe();
         // Peak must be non-decreasing
-        assert!(arbitrator.peak_rss.unwrap() >= first_peak);
+        assert!(arbitrator.peak_rss().unwrap() >= first_peak);
     }
 
     #[test]
     fn test_parse_memory_limit_default_512mb() {
         let limit = parse_memory_limit_bytes(None);
         let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
-        assert_eq!(arbitrator.limit, 512 * 1024 * 1024);
-        assert!((arbitrator.spill_threshold_pct - 0.80).abs() < f64::EPSILON);
+        assert_eq!(arbitrator.limit(), 512 * 1024 * 1024);
+        assert!((arbitrator.spill_threshold_pct() - 0.80).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -721,9 +883,9 @@ mod tests {
 
     #[test]
     fn test_record_spill_bytes_under_quota() {
-        let mut arbitrator =
+        let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        arbitrator.max_spill_bytes = 1024;
+        arbitrator.set_max_spill_bytes(1024);
         assert!(!arbitrator.record_spill_bytes(256));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 256);
         assert!(!arbitrator.record_spill_bytes(512));
@@ -732,9 +894,9 @@ mod tests {
 
     #[test]
     fn test_record_spill_bytes_overflows_quota() {
-        let mut arbitrator =
+        let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        arbitrator.max_spill_bytes = 1024;
+        arbitrator.set_max_spill_bytes(1024);
         assert!(!arbitrator.record_spill_bytes(1024));
         assert!(arbitrator.record_spill_bytes(1));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 1025);
@@ -745,10 +907,12 @@ mod tests {
         // Saturating-add on a u64 counter: even an absurdly large
         // accumulation cannot wrap below the configured quota and
         // silently disable the gate.
-        let mut arbitrator =
+        let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        arbitrator.max_spill_bytes = 1024;
-        arbitrator.cumulative_spill_bytes = u64::MAX - 10;
+        arbitrator.set_max_spill_bytes(1024);
+        arbitrator
+            .cumulative_spill_bytes
+            .store(u64::MAX - 10, Ordering::Relaxed);
         assert!(arbitrator.record_spill_bytes(100));
         assert_eq!(arbitrator.cumulative_spill_bytes(), u64::MAX);
     }
@@ -773,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_charge_node_buffer_bytes_increases_counter() {
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(256));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 256);
         assert!(!arbitrator.charge_node_buffer_bytes(512));
@@ -782,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_discharge_node_buffer_bytes_decreases_counter() {
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_node_buffer_bytes(1024);
         arbitrator.discharge_node_buffer_bytes(256);
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 768);
@@ -793,7 +957,7 @@ mod tests {
         // Estimate drift between producer's charge and consumer's
         // discharge must not wrap the counter to a huge positive
         // value and silently disable the gate downstream.
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_node_buffer_bytes(100);
         arbitrator.discharge_node_buffer_bytes(200);
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 0);
@@ -801,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_charge_node_buffer_bytes_under_limit_returns_false() {
-        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(256));
     }
 
@@ -810,14 +974,14 @@ mod tests {
         // Strict `>` semantics: exactly at the limit is NOT an
         // overflow, matching `record_spill_bytes` and
         // `charge_arena_bytes`. Only the byte that crosses trips.
-        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(1024));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 1024);
     }
 
     #[test]
     fn test_charge_node_buffer_bytes_over_limit_returns_true() {
-        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_node_buffer_bytes(1024));
         assert!(arbitrator.charge_node_buffer_bytes(1));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), 1025);
@@ -829,7 +993,7 @@ mod tests {
         // envelope with the arena counter. Neither one alone exceeds
         // the limit, but their sum does — and the node-buffer charge
         // must surface that.
-        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
         assert!(!arbitrator.charge_arena_bytes(800));
         assert!(!arbitrator.charge_node_buffer_bytes(100));
         assert!(arbitrator.charge_node_buffer_bytes(200));
@@ -841,15 +1005,17 @@ mod tests {
         // Saturating-add on a u64 counter: even an absurdly large
         // accumulation cannot wrap below the configured limit and
         // silently disable the gate.
-        let mut arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        arbitrator.node_buffer_bytes_charged = u64::MAX - 10;
+        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        arbitrator
+            .node_buffer_bytes_charged
+            .store(u64::MAX - 10, Ordering::Relaxed);
         assert!(arbitrator.charge_node_buffer_bytes(100));
         assert_eq!(arbitrator.node_buffer_bytes_charged(), u64::MAX);
     }
 
     #[test]
     fn test_total_charged_sums_arena_and_node_buffer() {
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         arbitrator.charge_arena_bytes(400);
         arbitrator.charge_node_buffer_bytes(600);
         assert_eq!(arbitrator.total_charged(), 1000);
@@ -861,8 +1027,10 @@ mod tests {
         // in-memory `limit` envelope. Including spill bytes in
         // `total_charged()` would double-count the spilled work
         // against the RAM budget and force premature aborts.
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator.cumulative_spill_bytes = 9999;
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        arbitrator
+            .cumulative_spill_bytes
+            .store(9999, Ordering::Relaxed);
         arbitrator.charge_arena_bytes(100);
         assert_eq!(arbitrator.total_charged(), 100);
     }
@@ -871,9 +1039,13 @@ mod tests {
     fn test_total_charged_saturates_on_overflow() {
         // Two near-`u64::MAX` counters must not wrap the sum and
         // silently pass the `total_charged() > limit` gate.
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator.arena_bytes_charged = u64::MAX - 10;
-        arbitrator.node_buffer_bytes_charged = 1000;
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        arbitrator
+            .arena_bytes_charged
+            .store(u64::MAX - 10, Ordering::Relaxed);
+        arbitrator
+            .node_buffer_bytes_charged
+            .store(1000, Ordering::Relaxed);
         assert_eq!(arbitrator.total_charged(), u64::MAX);
     }
 
@@ -964,17 +1136,147 @@ mod tests {
 
     #[test]
     fn test_with_policy_installs_chosen_policy() {
-        let mut arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         // poll_arbitration is private — exercise it through the
         // public `should_spill` path with a deliberately tiny
         // limit so the soft-threshold gate trips.
-        arbitrator.limit = 1;
-        arbitrator.peak_rss = Some(100);
+        arbitrator.set_limit(1);
+        arbitrator.set_peak_rss_for_test(100);
         // NoOpPolicy yields no victim, so should_spill still returns
         // true (RSS-based) and no consumer state changes.
         assert!(arbitrator.should_spill());
-        assert!(arbitrator.consumers.is_empty());
+        assert_eq!(arbitrator.consumer_count(), 0);
         assert_eq!(arbitrator.policy().policy_name(), "NoOp");
+    }
+
+    #[test]
+    fn test_register_consumer_assigns_monotonic_ids() {
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 10,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        let id_b = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 20,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        let id_c = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 30,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        assert_ne!(id_a, id_b);
+        assert_ne!(id_b, id_c);
+        assert_ne!(id_a, id_c);
+        assert_eq!(arbitrator.consumer_count(), 3);
+    }
+
+    #[test]
+    fn test_unregister_consumer_returns_removed() {
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let id = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 100,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        assert_eq!(arbitrator.consumer_count(), 1);
+        let removed = arbitrator.unregister_consumer(id);
+        assert!(removed.is_some());
+        assert_eq!(arbitrator.consumer_count(), 0);
+        // Second unregister with the same id returns None — stale ids
+        // are not silently re-bound to a later registration.
+        assert!(arbitrator.unregister_consumer(id).is_none());
+    }
+
+    #[test]
+    fn test_sum_consumer_usage_aggregates_registered() {
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+        arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 1024,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 4096,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 100,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        assert_eq!(arbitrator.sum_consumer_usage(), 1024 + 4096 + 100);
+    }
+
+    #[test]
+    fn test_consumer_ids_are_never_reused_after_unregister() {
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 1,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        arbitrator.unregister_consumer(id_a);
+        let id_b = arbitrator.register_consumer(Box::new(MockConsumer {
+            usage: 1,
+            priority: 0,
+            paused: false,
+            spill_response: 0,
+        }));
+        // Monotonic allocator: even after unregister, the next id is
+        // strictly above the previous one — stale ConsumerId references
+        // cannot collide with a later registration.
+        assert_ne!(id_a, id_b);
+    }
+
+    /// Operator that intentionally does NOT override the default
+    /// `pause` / `resume` trait bodies — exercises the default no-op
+    /// implementations added alongside register_consumer.
+    struct DefaultPauseConsumer {
+        usage: u64,
+    }
+    impl MemoryConsumer for DefaultPauseConsumer {
+        fn current_usage(&self) -> u64 {
+            self.usage
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(&mut self, _: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+        // No pause / resume override — defaults must compile and be
+        // callable without panic.
+    }
+
+    #[test]
+    fn test_default_pause_resume_are_callable_noops() {
+        let mut consumer = DefaultPauseConsumer { usage: 42 };
+        // Both default bodies are no-ops; they must not panic and
+        // must leave the consumer's observable state unchanged.
+        consumer.pause();
+        assert_eq!(consumer.current_usage(), 42);
+        consumer.resume();
+        assert_eq!(consumer.current_usage(), 42);
     }
 
     #[test]

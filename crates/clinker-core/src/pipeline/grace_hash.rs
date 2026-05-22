@@ -964,7 +964,7 @@ pub(crate) fn execute_combine_grace_hash(
             if budget.should_abort() {
                 return Err(PipelineError::MemoryBudgetExceeded {
                     node: name.to_string(),
-                    used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                    used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
                     limit: budget.hard_limit(),
                     source: BudgetCategory::Arena,
                     detail: Some("grace hash probe RSS abort".to_string()),
@@ -1646,7 +1646,7 @@ fn combine_e310_partition_aborted(
 ) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: transform.to_string(),
-        used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+        used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
         limit: budget.hard_limit(),
         source: BudgetCategory::Arena,
         detail: Some(format!(
@@ -2659,7 +2659,7 @@ mod tests {
         // first partition flush trips it.
         let mut budget =
             MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
-        budget.max_spill_bytes = 64;
+        budget.set_max_spill_bytes(64);
 
         let combined_schema = clinker_record::SchemaBuilder::new()
             .with_field("dk")

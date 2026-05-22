@@ -826,7 +826,7 @@ pub(crate) fn execute_combine_iejoin(
                                             return Err(PipelineError::MemoryBudgetExceeded {
                                                 node: name.to_string(),
                                                 used: budget
-                                                    .peak_rss
+                                                    .peak_rss()
                                                     .unwrap_or(budget.arena_bytes_charged()),
                                                 limit: budget.hard_limit(),
                                                 source: BudgetCategory::Arena,
@@ -893,7 +893,7 @@ pub(crate) fn execute_combine_iejoin(
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
                                         used: budget
-                                            .peak_rss
+                                            .peak_rss()
                                             .unwrap_or(budget.arena_bytes_charged()),
                                         limit: budget.hard_limit(),
                                         source: BudgetCategory::Arena,
@@ -986,7 +986,7 @@ pub(crate) fn execute_combine_iejoin(
                             if budget.should_abort() {
                                 return Err(PipelineError::MemoryBudgetExceeded {
                                     node: name.to_string(),
-                                    used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                                    used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
                                     limit: budget.hard_limit(),
                                     source: BudgetCategory::Arena,
                                     detail: Some("iejoin combine probe RSS abort".to_string()),

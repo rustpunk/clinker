@@ -625,7 +625,7 @@ impl CombineHashTable {
                 let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
                 return Err(CombineError::MemoryLimitExceeded {
                     used: used as u64,
-                    limit: budget.limit,
+                    limit: budget.limit(),
                 });
             }
         }
@@ -643,7 +643,7 @@ impl CombineHashTable {
         if budget.should_abort() {
             return Err(CombineError::MemoryLimitExceeded {
                 used: table.memory_bytes() as u64,
-                limit: budget.limit,
+                limit: budget.limit(),
             });
         }
 

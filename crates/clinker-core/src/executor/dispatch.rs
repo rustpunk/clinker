@@ -1287,7 +1287,7 @@ pub(crate) fn admit_node_buffer(
                 return Err(PipelineError::MemoryBudgetExceeded {
                     node: node_name.to_string(),
                     used: ctx.memory_budget.cumulative_spill_bytes(),
-                    limit: ctx.memory_budget.max_spill_bytes,
+                    limit: ctx.memory_budget.max_spill_bytes(),
                     source: BudgetCategory::NodeBuffer,
                     detail: Some("spill quota exceeded".to_string()),
                 });
@@ -4913,7 +4913,7 @@ pub(crate) async fn dispatch_plan_node(
                 if emitted_since_check >= 10_000 && budget.should_abort() {
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.clone(),
-                        used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                        used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
                         limit: budget.hard_limit(),
                         source: BudgetCategory::Arena,
                         detail: Some("combine probe RSS abort".to_string()),

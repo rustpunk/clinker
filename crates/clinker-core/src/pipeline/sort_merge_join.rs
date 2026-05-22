@@ -1228,7 +1228,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                         node: name.to_string(),
                                         used: args
                                             .budget
-                                            .peak_rss
+                                            .peak_rss()
                                             .unwrap_or(args.budget.arena_bytes_charged()),
                                         limit: args.budget.hard_limit(),
                                         source: BudgetCategory::Arena,
@@ -1292,7 +1292,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                 node: name.to_string(),
                                 used: args
                                     .budget
-                                    .peak_rss
+                                    .peak_rss()
                                     .unwrap_or(args.budget.arena_bytes_charged()),
                                 limit: args.budget.hard_limit(),
                                 source: BudgetCategory::Arena,
