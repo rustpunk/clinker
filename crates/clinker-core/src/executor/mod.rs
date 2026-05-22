@@ -7,6 +7,7 @@ pub(crate) mod node_buffer;
 pub(crate) mod node_buffer_spill;
 mod schema_check;
 pub(crate) mod source_stream;
+pub(crate) mod stream_event;
 pub(crate) mod time_window;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
@@ -965,8 +966,10 @@ impl PipelineExecutor {
         // the run's accounting once the receivers have drained.
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
         let counters = PipelineCounters::default();
-        let mut source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>> =
-            HashMap::new();
+        let mut source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
         let mut ingest_handles: Vec<
             tokio::task::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
@@ -1117,7 +1120,10 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag(
         config: &PipelineConfig,
-        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+        source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        >,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1199,7 +1205,10 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag_branching(
         config: &PipelineConfig,
-        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+        source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        >,
         source_configs: &[crate::config::SourceConfig],
         mut writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1362,7 +1371,7 @@ impl PipelineExecutor {
         );
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
-            tokio::sync::mpsc::Sender<(Record, u64)>,
+            tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
         let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<tokio::task::JoinHandle<StreamingOutputTaskOutput>> =
@@ -1378,7 +1387,8 @@ impl PipelineExecutor {
             // on the slow-writer / fast-merge end of the back-pressure
             // curve. Mirrors the Source ingest channel sizing (issue
             // #67) — the same bound paces both ends of the pipeline.
-            let (tx, rx) = tokio::sync::mpsc::channel::<(Record, u64)>(256);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<crate::executor::stream_event::StreamEvent>(256);
             let merge_idx = spec.merge_idx;
             let output_idx = spec.output_idx;
             let handle = tokio::spawn(streaming_output_task(rx, raw_writer, spec));
@@ -2890,7 +2900,7 @@ impl StreamingOutputTaskOutput {
 /// predicate and https://github.com/rustpunk/clinker/issues/72 for the
 /// rationale.
 async fn streaming_output_task(
-    mut rx: tokio::sync::mpsc::Receiver<(Record, u64)>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingOutputSpec,
 ) -> StreamingOutputTaskOutput {
@@ -2917,7 +2927,15 @@ async fn streaming_output_task(
     let mut writer: Option<Box<dyn FormatWriter>> = None;
     let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
 
-    while let Some((record, rn)) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
+        // Phase B intermediate: streaming output sink consumes Record
+        // events only; punctuation forwarding to writers (envelope
+        // header/footer reconstruction) lands as a follow-up after the
+        // sprint closes.
+        let (record, rn) = match event {
+            crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
+            crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,
+        };
         if let Some(expected) = spec.expected_input_schema.as_ref()
             && let Err(err) = crate::executor::schema_check::check_input_schema(
                 expected,

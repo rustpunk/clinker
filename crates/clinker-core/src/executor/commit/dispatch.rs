@@ -492,7 +492,7 @@ async fn recurse_into_body(
             if let Some(nb) = ctx.node_buffers.remove(body_out_idx) {
                 ctx.memory_budget
                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                for pair in nb.drain() {
+                for pair in nb.drain_records() {
                     harvested.push(pair?);
                 }
             }
