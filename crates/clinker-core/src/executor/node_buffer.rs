@@ -123,12 +123,10 @@ impl NodeBuffer {
         }
     }
 
-    /// Heuristic in-memory footprint of the slot, paired with the
-    /// `MemoryArbitrator::charge_node_buffer_bytes` /
-    /// `discharge_node_buffer_bytes` ledger. The estimate matches
-    /// `charge_harvest_admission`'s per-row formula so the executor's
-    /// two budget surfaces (`Arena` for parked region tee, `NodeBuffer`
-    /// for inter-stage handoff) use the same per-row size.
+    /// Heuristic in-memory footprint of the slot, read by the
+    /// `NodeBufferConsumer` wrapper's `current_usage` to drive the
+    /// arbitrator's pull-mode attribution and Priority-policy victim
+    /// selection.
     ///
     /// Returns `0` on an empty memory tail. Spill-resident chunks are
     /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk

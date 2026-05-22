@@ -747,9 +747,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// top-level and body graphs maintain disjoint EdgeIndex namespaces
     /// — the body id disambiguates collisions.
     ///
-    /// Charges against `ctx.memory_budget` via `charge_arena_bytes` per
-    /// admission, mirroring the per-row accounting the windowed
-    /// Transform arm uses for buffer-recompute mode.
+    /// Per-pipeline footprint flows through pull-mode attribution: the
+    /// arbitrator's `should_abort` poll at downstream batch boundaries
+    /// guards the hard limit on the cumulative cross-region buffer
+    /// payload, same envelope every other operator uses.
     pub(crate) region_input_buffers: RegionInputBuffers,
 
     /// Inverts the meaning of the per-operator deferred-region guard at
@@ -1063,10 +1064,9 @@ pub(crate) fn project_rows_to_buffer_schema(
 /// is the canonical entry point the commit-time deferred dispatcher
 /// reads from.
 ///
-/// Charges per-row size against `ctx.memory_budget.charge_arena_bytes`;
-/// returns the same `E310`-shape `PipelineError::Compilation` the
-/// windowed Transform's buffer-recompute path raises on overflow so
-/// downstream callers see a uniform admission failure mode.
+/// In-flight bytes flow through pull-mode attribution; the
+/// arbitrator's `should_abort` poll at downstream batch boundaries
+/// guards the pipeline-wide hard limit.
 fn tee_emit_to_region_input_buffers(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -1104,9 +1104,7 @@ fn tee_emit_to_region_input_buffers(
     if crossing_edges.is_empty() {
         return Ok(());
     }
-    let producer_name = current_dag.graph[producer_idx].name().to_string();
     for edge_id in crossing_edges {
-        charge_harvest_admission(ctx, emit_rows, &producer_name)?;
         for (record, rn) in emit_rows {
             ctx.region_input_buffers
                 .entry((active_body, edge_id))
@@ -1117,93 +1115,9 @@ fn tee_emit_to_region_input_buffers(
     Ok(())
 }
 
-/// Per-row arena charge against `ctx.memory_budget` for records about
-/// to be admitted into a deferred-region buffer (cross-region tee on
-/// the forward pass, body→parent harvest on the commit pass). Returns
-/// a typed `PipelineError::MemoryBudgetExceeded` when the per-pipeline
-/// memory limit is exhausted; the producer node's name is carried in
-/// `node` so downstream diagnostics and DLQ routing can identify the
-/// overflowing operator.
-///
-/// Per-row size mirrors the per-Value-slot accounting the cross-region
-/// tee uses so a runaway body cannot evade the per-pipeline budget by
-/// routing its output through the harvest path instead of the
-/// forward-pass tee.
-pub(crate) fn charge_harvest_admission(
-    ctx: &mut ExecutorContext<'_>,
-    rows: &[(Record, u64)],
-    node_name: &str,
-) -> Result<(), PipelineError> {
-    let row_bytes_each: u64 = rows
-        .first()
-        .map(|(rec, _)| {
-            (std::mem::size_of::<Value>() * rec.schema().column_count()
-                + std::mem::size_of::<(Record, u64)>()) as u64
-        })
-        .unwrap_or(0);
-    if row_bytes_each == 0 {
-        return Ok(());
-    }
-    for _ in rows {
-        if ctx.memory_budget.charge_arena_bytes(row_bytes_each) {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node_name.to_string(),
-                used: ctx.memory_budget.arena_bytes_charged(),
-                limit: ctx.memory_budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("deferred-region buffer admission".to_string()),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Per-row charge against `ctx.memory_budget.charge_node_buffer_bytes`
-/// for a `Vec<(Record, u64)>` about to be inserted, extended into, or
-/// cloned out of `ctx.node_buffers`. Returns the total bytes charged
-/// so the discharge site (consumer's `node_buffers.remove` or local
-/// `Drop`) can release the same amount; on hard-limit breach, returns
-/// a `MemoryBudgetExceeded` tagged `BudgetCategory::NodeBuffer` so
-/// diagnostics distinguish the inter-stage handoff layer from the
-/// arena-tracked surfaces.
-///
-/// The per-row formula matches `NodeBuffer::estimated_memory_bytes` and
-/// `charge_harvest_admission`: each row contributes `size_of::<Value>()
-/// * column_count + size_of::<(Record, u64)>()` bytes. The two budget
-/// surfaces share the `MemoryArbitrator::hard_limit` envelope via
-/// `total_charged`, so a runaway producer trips on the combined sum.
-///
-/// Used today only by the commit-pass body-harvest re-charge in
-/// `executor/commit/dispatch.rs`, where records flow into an existing
-/// `node_buffers` slot via `NodeBuffer::push` rather than a bulk
-/// insert. Bulk insertion at every operator-arm emit goes through
-/// [`admit_node_buffer`] instead, which combines this charge with the
-/// soft-threshold spill decision.
-pub(crate) fn charge_node_buffer_admit(
-    ctx: &mut ExecutorContext<'_>,
-    node_name: &str,
-    rows: &[(Record, u64)],
-) -> Result<u64, PipelineError> {
-    let bytes = estimate_node_buffer_bytes(rows);
-    if bytes == 0 {
-        return Ok(0);
-    }
-    if ctx.memory_budget.charge_node_buffer_bytes(bytes) {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: node_name.to_string(),
-            used: ctx.memory_budget.total_charged(),
-            limit: ctx.memory_budget.hard_limit(),
-            source: BudgetCategory::NodeBuffer,
-            detail: Some("node_buffer admission".to_string()),
-        });
-    }
-    Ok(bytes)
-}
-
 /// Per-row heuristic byte cost. Returns `0` for an empty slice. The
-/// formula matches `NodeBuffer::estimated_memory_bytes` and
-/// `charge_harvest_admission` so the three admission surfaces agree on
-/// the same per-row size.
+/// formula matches `NodeBuffer::estimated_memory_bytes` so the
+/// admission surfaces agree on the same per-row size.
 fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
     let Some((first, _)) = rows.first() else {
         return 0;
@@ -1256,10 +1170,10 @@ pub(crate) fn node_buffer_spill_allowed(
 /// in-memory and on-disk variants based on the live RSS reading.
 ///
 /// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
-/// 2. The per-row byte cost is charged against `MemoryArbitrator` via
-///    [`charge_node_buffer_admit`]'s shared formula. A hard-limit
-///    breach surfaces as
-///    `MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer, .. }`.
+/// 2. The slot's byte estimate seeds a fresh `NodeBufferConsumer`
+///    handle and the arbitrator registers the wrapper. Pull-mode
+///    attribution flows through the handle; the arbitrator's
+///    `should_abort` poll guards the pipeline-wide hard limit.
 /// 3. When `spill_allowed` is `true` and `MemoryArbitrator::should_spill()`
 ///    reports the RSS soft threshold tripped, the rows flush to a
 ///    `SpillFile<u64>` via [`node_buffer_spill::spill_node_buffer`].
@@ -1325,15 +1239,6 @@ pub(crate) fn admit_node_buffer(
     ));
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
-    if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: node_name.to_string(),
-            used: ctx.memory_budget.total_charged(),
-            limit: ctx.memory_budget.hard_limit(),
-            source: BudgetCategory::NodeBuffer,
-            detail: Some("node_buffer admission".to_string()),
-        });
-    }
     if !spill_allowed || !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::Memory(rows));
     }
@@ -1342,7 +1247,6 @@ pub(crate) fn admit_node_buffer(
         Some(ctx.spill_root_path.as_ref()),
     )? {
         Some((file, count)) => {
-            ctx.memory_budget.discharge_node_buffer_bytes(bytes);
             // Rows are now on disk; the in-memory portion of this slot
             // is zero. The handle reflects the operator's live state
             // for the arbitrator's pull-mode `current_usage` —
@@ -1564,7 +1468,7 @@ pub(crate) fn finalize_node_rooted_windows(
             Arena::from_records(rows, &spec.arena_fields, anchor_schema, &ctx.memory_budget)
                 .map_err(|e| PipelineError::MemoryBudgetExceeded {
                     node: current_dag.graph[upstream_idx].name().to_string(),
-                    used: ctx.memory_budget.arena_bytes_charged(),
+                    used: ctx.memory_budget.peak_rss().unwrap_or(0),
                     limit: ctx.memory_budget.hard_limit(),
                     source: BudgetCategory::Arena,
                     detail: Some(format!("node-rooted arena build: {e}")),
@@ -2134,8 +2038,6 @@ pub(crate) async fn dispatch_plan_node(
                     // consumers run. Apply per-record seeding for body-
                     // declared record_vars (parent's writes survive via
                     // `seed_record_vars`'s preserve-existing semantics).
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(seeded.estimated_memory_bytes());
                     let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
                     let has_record_seed = !ctx.record_var_seed.is_empty();
                     for pair in seeded.drain() {
@@ -2264,8 +2166,6 @@ pub(crate) async fn dispatch_plan_node(
             // node for branch dispatch), then fall back to predecessor.
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
@@ -2280,11 +2180,7 @@ pub(crate) async fn dispatch_plan_node(
                             .find_map(|p| drain_node_buffer_slot(ctx, *p))
                     };
                     match pred_buf {
-                        Some(nb) => {
-                            ctx.memory_budget
-                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                            nb.drain().collect::<Result<Vec<_>, _>>()?
-                        }
+                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                         None => Vec::new(),
                     }
                 };
@@ -2509,19 +2405,13 @@ pub(crate) async fn dispatch_plan_node(
                 .collect();
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     match predecessors
                         .iter()
                         .find_map(|p| drain_node_buffer_slot(ctx, *p))
                     {
-                        Some(nb) => {
-                            ctx.memory_budget
-                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                            nb.drain().collect::<Result<Vec<_>, _>>()?
-                        }
+                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                         None => Vec::new(),
                     }
                 };
@@ -2765,12 +2655,10 @@ pub(crate) async fn dispatch_plan_node(
                         })
                         .unwrap_or(0);
                     for (record, rn) in &buf {
-                        if row_bytes_each > 0
-                            && ctx.memory_budget.charge_arena_bytes(row_bytes_each)
-                        {
+                        if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
                             return Err(PipelineError::MemoryBudgetExceeded {
                                 node: name.to_string(),
-                                used: ctx.memory_budget.arena_bytes_charged(),
+                                used: ctx.memory_budget.peak_rss().unwrap_or(0),
                                 limit: ctx.memory_budget.hard_limit(),
                                 source: BudgetCategory::Arena,
                                 detail: Some("Route cross-region tee admission".to_string()),
@@ -2926,8 +2814,6 @@ pub(crate) async fn dispatch_plan_node(
                         for pred in &sorted_preds {
                             let upstream_name = current_dag.graph[*pred].name().to_string();
                             if let Some(buf) = drain_node_buffer_slot(ctx, *pred) {
-                                ctx.memory_budget
-                                    .discharge_node_buffer_bytes(buf.estimated_memory_bytes());
                                 for pair in buf.drain() {
                                     let (record, rn) = pair?;
                                     emit(&mut merged, &upstream_name, record, rn)?;
@@ -2951,9 +2837,6 @@ pub(crate) async fn dispatch_plan_node(
                             .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
                                 match drain_node_buffer_slot(ctx, *pred) {
                                     Some(nb) => {
-                                        ctx.memory_budget.discharge_node_buffer_bytes(
-                                            nb.estimated_memory_bytes(),
-                                        );
                                         let v: Vec<_> =
                                             nb.drain().collect::<Result<Vec<_>, _>>()?;
                                         Ok(VecDeque::from(v))
@@ -3035,11 +2918,7 @@ pub(crate) async fn dispatch_plan_node(
                 .iter()
                 .find_map(|p| drain_node_buffer_slot(ctx, *p))
             {
-                Some(nb) => {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain().collect::<Result<Vec<_>, _>>()?
-                }
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                 None => Vec::new(),
             };
 
@@ -3180,11 +3059,7 @@ pub(crate) async fn dispatch_plan_node(
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
             let input: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, pred) {
-                Some(nb) => {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain().collect::<Result<Vec<_>, _>>()?
-                }
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                 None => Vec::new(),
             };
 
@@ -3592,17 +3467,8 @@ pub(crate) async fn dispatch_plan_node(
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
-            //
-            // `multi_consumer_clone_bytes` tracks the NodeBuffer-category
-            // charge admitted on the get-and-clone fan-out path so the
-            // discharge fires once the clone is consumed below. The own-
-            // buffer and last-consumer-remove paths discharge inline
-            // since those bytes were already charged by the producer.
-            let mut multi_consumer_clone_bytes: u64 = 0;
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
                     own_buf.drain().collect::<Result<Vec<_>, _>>()?
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
@@ -3621,40 +3487,17 @@ pub(crate) async fn dispatch_plan_node(
                             .count();
                         if remaining_consumers == 0 {
                             if let Some(nb) = drain_node_buffer_slot(ctx, p) {
-                                ctx.memory_budget
-                                    .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                                 found = Some(nb.drain().collect::<Result<Vec<_>, _>>()?);
                                 break;
                             }
                         } else {
                             // Multi-consumer fanout: keep the producer's
-                            // buffer alive for remaining siblings. The
-                            // clone is a heap copy and a transient RSS
-                            // bump under this Output's identity; the
-                            // discharge fires after `input_records` is
-                            // split into the writer-side buffered /
-                            // unbuffered locals below.
-                            //
-                            // Borrow shape: read the bytes estimate and
-                            // perform the heap clone while only the
-                            // immutable `node_buffers.get` borrow is
-                            // live, then drop it so the charge path can
-                            // take `&mut ctx.memory_budget`.
-                            let cloned_with_bytes = ctx
-                                .node_buffers
-                                .get(&p)
-                                .map(|nb| (nb.clone_memory_only(), nb.estimated_memory_bytes()));
-                            if let Some((cloned, bytes)) = cloned_with_bytes {
-                                if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
-                                    return Err(PipelineError::MemoryBudgetExceeded {
-                                        node: name.to_string(),
-                                        used: ctx.memory_budget.total_charged(),
-                                        limit: ctx.memory_budget.hard_limit(),
-                                        source: BudgetCategory::NodeBuffer,
-                                        detail: Some("Output fan-out clone admission".to_string()),
-                                    });
-                                }
-                                multi_consumer_clone_bytes = bytes;
+                            // buffer alive for remaining siblings via a
+                            // heap clone. The clone's footprint flows
+                            // through pull-mode attribution at the
+                            // arbitrator's next poll.
+                            let cloned = ctx.node_buffers.get(&p).map(|nb| nb.clone_memory_only());
+                            if let Some(cloned) = cloned {
                                 found = Some(cloned);
                                 break;
                             }
@@ -3700,15 +3543,6 @@ pub(crate) async fn dispatch_plan_node(
                 buffered = Vec::new();
                 unbuffered = input_records;
             }
-            // input_records has been destructured into buffered /
-            // unbuffered; the fan-out clone's transient bytes are no
-            // longer in scope as a node_buffers-shaped Vec, so release
-            // the NodeBuffer counter charge admitted at clone time.
-            if multi_consumer_clone_bytes > 0 {
-                ctx.memory_budget
-                    .discharge_node_buffer_bytes(multi_consumer_clone_bytes);
-            }
-
             // Counter semantics:
             //
             // * `records_written` increments per WRITE — under
@@ -4148,19 +3982,11 @@ pub(crate) async fn dispatch_plan_node(
                 })?;
 
             let driver_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, driver_pred) {
-                Some(nb) => {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain().collect::<Result<Vec<_>, _>>()?
-                }
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                 None => Vec::new(),
             };
             let build_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, build_pred) {
-                Some(nb) => {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain().collect::<Result<Vec<_>, _>>()?
-                }
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                 None => Vec::new(),
             };
 
@@ -4640,7 +4466,7 @@ pub(crate) async fn dispatch_plan_node(
             )
             .map_err(|e| PipelineError::MemoryBudgetExceeded {
                 node: name.clone(),
-                used: budget.arena_bytes_charged(),
+                used: budget.peak_rss().unwrap_or(0),
                 limit: budget.hard_limit(),
                 source: BudgetCategory::Arena,
                 detail: Some(format!("combine build: {e}")),
@@ -5063,7 +4889,7 @@ pub(crate) async fn dispatch_plan_node(
                 if emitted_since_check >= 10_000 && budget.should_abort() {
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.clone(),
-                        used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
+                        used: budget.peak_rss().unwrap_or(0),
                         limit: budget.hard_limit(),
                         source: BudgetCategory::Arena,
                         detail: Some("combine probe RSS abort".to_string()),
@@ -5601,18 +5427,7 @@ fn collect_port_records(
             .get(&edge.source())
             .map(|nb| (nb.clone_memory_only(), nb.estimated_memory_bytes()));
         let records: Vec<(Record, u64)> = match cloned_with_bytes {
-            Some((cloned, bytes)) => {
-                if bytes > 0 && ctx.memory_budget.charge_node_buffer_bytes(bytes) {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: composition_name.to_string(),
-                        used: ctx.memory_budget.total_charged(),
-                        limit: ctx.memory_budget.hard_limit(),
-                        source: BudgetCategory::NodeBuffer,
-                        detail: Some("composition port-records clone admission".to_string()),
-                    });
-                }
-                cloned
-            }
+            Some((cloned, _bytes)) => cloned,
             None => Vec::new(),
         };
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
@@ -5768,11 +5583,7 @@ async fn execute_composition_body(
     let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
             let drained: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, idx) {
-                Some(nb) => {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain().collect::<Result<Vec<_>, _>>()?
-                }
+                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
                 None => Vec::new(),
             };
             if body_dag.deferred_region_at_producer(idx).is_some() {
@@ -5783,23 +5594,6 @@ async fn execute_composition_body(
         }
         _ => Vec::new(),
     };
-
-    // Body exit cleanup: any slots still alive in the body-local
-    // `node_buffers` map are about to be dropped when `saved_buffers`
-    // overwrites the field below. Discharge their NodeBuffer-category
-    // charges so the ledger does not leak across the body / parent
-    // boundary — both the early-error path (a body operator returned
-    // `Err`, leaving partially-consumed intermediates) and the
-    // sink-only body case (no output port, seeded inputs never
-    // claimed) hit this path.
-    let leaked_bytes: u64 = ctx
-        .node_buffers
-        .values()
-        .map(NodeBuffer::estimated_memory_bytes)
-        .sum();
-    if leaked_bytes > 0 {
-        ctx.memory_budget.discharge_node_buffer_bytes(leaked_bytes);
-    }
 
     // Decrement depth and restore parent scope. `saturating_sub`
     // is defensive over the invariant; the inc/dec pairs are kept in

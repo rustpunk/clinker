@@ -119,9 +119,9 @@ pub enum BudgetCategory {
     /// is not `ctx.node_buffers` falls under this tag.
     Arena,
     /// `ctx.node_buffers` — the inter-stage handoff layer between
-    /// non-fused operators. Charged at producer admission, discharged
-    /// at consumer drain; shares the same `limit` envelope as
-    /// `BudgetCategory::Arena` through `total_charged()`.
+    /// non-fused operators. Each slot registers a `NodeBufferConsumer`
+    /// wrapper; the arbitrator's pull-mode `current_usage` reads the
+    /// slot's live footprint at every policy poll.
     NodeBuffer,
 }
 
@@ -607,16 +607,6 @@ pub struct MemoryArbitrator {
     /// E310 with a partition + spill-bytes diagnostic.
     max_spill_bytes: AtomicU64,
     cumulative_spill_bytes: AtomicU64,
-    /// Cumulative bytes charged across every Arena build site sharing
-    /// this arbitrator. The source-rooted arena and every node-rooted
-    /// arena share one counter so a pipeline declaring a 512MB limit
-    /// cannot multiply that limit across operators.
-    arena_bytes_charged: AtomicU64,
-    /// Cumulative bytes alive in the inter-stage handoff layer between
-    /// non-fused DAG operators. Summed with `arena_bytes_charged` via
-    /// `total_charged()` — the declared memory limit is a
-    /// pipeline-wide ceiling, not per-surface.
-    node_buffer_bytes_charged: AtomicU64,
     /// Registry of operator wrappers the arbitrator polls for
     /// per-operator `current_usage()` and routes `pause` / `resume` /
     /// `try_spill` callbacks to. Locked only on register / unregister
@@ -654,8 +644,6 @@ impl MemoryArbitrator {
             peak_rss: AtomicU64::new(0),
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
-            arena_bytes_charged: AtomicU64::new(0),
-            node_buffer_bytes_charged: AtomicU64::new(0),
             consumers: Mutex::new(HashMap::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
@@ -807,81 +795,6 @@ impl MemoryArbitrator {
                 });
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
             > self.max_spill_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Add `n` bytes to the cumulative arena-byte counter. Returns
-    /// `true` when the running total has exceeded the hard memory
-    /// limit — the build site's signal to surface E310 instead of
-    /// admitting the next record. Saturating-add via `fetch_update`
-    /// ensures an overflowing accumulation cannot wrap below the
-    /// limit and silently disable the gate.
-    ///
-    /// One shared counter across the source-rooted arena and every
-    /// node-rooted arena built at an upstream operator's dispatch-arm
-    /// exit: the pipeline's declared memory limit is a pipeline-wide
-    /// envelope, not a per-arena one.
-    pub fn charge_arena_bytes(&self, n: u64) -> bool {
-        let _ =
-            self.arena_bytes_charged
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_add(n))
-                });
-        self.arena_bytes_charged.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
-    }
-
-    /// Cumulative arena bytes charged so far across every Arena build
-    /// site polling this arbitrator.
-    pub fn arena_bytes_charged(&self) -> u64 {
-        self.arena_bytes_charged.load(Ordering::Relaxed)
-    }
-
-    /// Add `n` bytes to the node-buffer counter when a producer hands
-    /// a buffer to a `ctx.node_buffers` slot. Returns `true` when the
-    /// running total of (arena + node_buffer) has exceeded `limit` —
-    /// the executor's signal to surface
-    /// `MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer, .. }`
-    /// instead of admitting the next stage's output. Saturating-add
-    /// keeps an overflowing accumulation from wrapping below the limit
-    /// and silently disabling the gate.
-    pub fn charge_node_buffer_bytes(&self, n: u64) -> bool {
-        let _ = self.node_buffer_bytes_charged.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_add(n)),
-        );
-        self.total_charged() > self.limit.load(Ordering::Relaxed)
-    }
-
-    /// Subtract `n` bytes from the node-buffer counter when a consumer
-    /// drains the corresponding `ctx.node_buffers` slot. Saturating-sub
-    /// via `fetch_update` guards against over-discharge from estimate
-    /// drift between the producer's charge and the consumer's
-    /// discharge.
-    pub fn discharge_node_buffer_bytes(&self, n: u64) {
-        let _ = self.node_buffer_bytes_charged.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(n)),
-        );
-    }
-
-    /// Cumulative node-buffer bytes currently alive across every
-    /// `ctx.node_buffers` slot polling this arbitrator.
-    pub fn node_buffer_bytes_charged(&self) -> u64 {
-        self.node_buffer_bytes_charged.load(Ordering::Relaxed)
-    }
-
-    /// Sum of every accounted live-byte counter. Compared against
-    /// `limit` for the hard-fail counter-based gate, complementary to
-    /// the RSS-based `should_abort()`. `cumulative_spill_bytes` is
-    /// *not* included — disk spill is governed by its own
-    /// `max_spill_bytes` quota, not the in-memory `limit` envelope.
-    /// Saturating-add prevents two near-`u64::MAX` counters from
-    /// wrapping the sum and silently passing the gate.
-    pub fn total_charged(&self) -> u64 {
-        self.arena_bytes_charged
-            .load(Ordering::Relaxed)
-            .saturating_add(self.node_buffer_bytes_charged.load(Ordering::Relaxed))
     }
 
     /// Register a consumer with the arbitrator. Returns a fresh
@@ -1175,120 +1088,6 @@ mod tests {
         assert_eq!(parse_memory_limit_bytes(Some("1024")), 1024);
         assert_eq!(parse_memory_limit_bytes(None), 512 * 1024 * 1024);
         assert_eq!(parse_memory_limit_bytes(Some("garbage")), 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_increases_counter() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        assert!(!arbitrator.charge_node_buffer_bytes(256));
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 256);
-        assert!(!arbitrator.charge_node_buffer_bytes(512));
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 768);
-    }
-
-    #[test]
-    fn test_discharge_node_buffer_bytes_decreases_counter() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator.charge_node_buffer_bytes(1024);
-        arbitrator.discharge_node_buffer_bytes(256);
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 768);
-    }
-
-    #[test]
-    fn test_discharge_saturates_on_over_discharge() {
-        // Estimate drift between producer's charge and consumer's
-        // discharge must not wrap the counter to a huge positive
-        // value and silently disable the gate downstream.
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator.charge_node_buffer_bytes(100);
-        arbitrator.discharge_node_buffer_bytes(200);
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 0);
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_under_limit_returns_false() {
-        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        assert!(!arbitrator.charge_node_buffer_bytes(256));
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_at_limit_returns_false() {
-        // Strict `>` semantics: exactly at the limit is NOT an
-        // overflow, matching `record_spill_bytes` and
-        // `charge_arena_bytes`. Only the byte that crosses trips.
-        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        assert!(!arbitrator.charge_node_buffer_bytes(1024));
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 1024);
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_over_limit_returns_true() {
-        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        assert!(!arbitrator.charge_node_buffer_bytes(1024));
-        assert!(arbitrator.charge_node_buffer_bytes(1));
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), 1025);
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_trips_via_arena_contribution() {
-        // Load-bearing test: the new counter shares the `limit`
-        // envelope with the arena counter. Neither one alone exceeds
-        // the limit, but their sum does — and the node-buffer charge
-        // must surface that.
-        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        assert!(!arbitrator.charge_arena_bytes(800));
-        assert!(!arbitrator.charge_node_buffer_bytes(100));
-        assert!(arbitrator.charge_node_buffer_bytes(200));
-        assert_eq!(arbitrator.total_charged(), 1100);
-    }
-
-    #[test]
-    fn test_charge_node_buffer_bytes_saturates_on_overflow() {
-        // Saturating-add on a u64 counter: even an absurdly large
-        // accumulation cannot wrap below the configured limit and
-        // silently disable the gate.
-        let arbitrator = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
-        arbitrator
-            .node_buffer_bytes_charged
-            .store(u64::MAX - 10, Ordering::Relaxed);
-        assert!(arbitrator.charge_node_buffer_bytes(100));
-        assert_eq!(arbitrator.node_buffer_bytes_charged(), u64::MAX);
-    }
-
-    #[test]
-    fn test_total_charged_sums_arena_and_node_buffer() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator.charge_arena_bytes(400);
-        arbitrator.charge_node_buffer_bytes(600);
-        assert_eq!(arbitrator.total_charged(), 1000);
-    }
-
-    #[test]
-    fn test_total_charged_excludes_cumulative_spill_bytes() {
-        // Disk spill is governed by `max_spill_bytes`, not the
-        // in-memory `limit` envelope. Including spill bytes in
-        // `total_charged()` would double-count the spilled work
-        // against the RAM budget and force premature aborts.
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator
-            .cumulative_spill_bytes
-            .store(9999, Ordering::Relaxed);
-        arbitrator.charge_arena_bytes(100);
-        assert_eq!(arbitrator.total_charged(), 100);
-    }
-
-    #[test]
-    fn test_total_charged_saturates_on_overflow() {
-        // Two near-`u64::MAX` counters must not wrap the sum and
-        // silently pass the `total_charged() > limit` gate.
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        arbitrator
-            .arena_bytes_charged
-            .store(u64::MAX - 10, Ordering::Relaxed);
-        arbitrator
-            .node_buffer_bytes_charged
-            .store(1000, Ordering::Relaxed);
-        assert_eq!(arbitrator.total_charged(), u64::MAX);
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface

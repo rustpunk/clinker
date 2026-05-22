@@ -44,9 +44,7 @@ use petgraph::visit::{EdgeRef, Topo};
 use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::error::PipelineError;
-use crate::executor::dispatch::{
-    ExecutorContext, charge_node_buffer_admit, dispatch_plan_node, drain_node_buffer_slot,
-};
+use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node, drain_node_buffer_slot};
 use crate::executor::node_buffer::NodeBuffer;
 use crate::plan::CompositionBodyId;
 use crate::plan::deferred_region::{DeferredRegion, ParentContinuation};
@@ -230,16 +228,10 @@ async fn dispatch_one_region(
     // — `recompute_aggregates` populates it with the post-recompute
     // narrow rows.
     for &m in &region.members {
-        if let Some(nb) = drain_node_buffer_slot(ctx, m) {
-            ctx.memory_budget
-                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-        }
+        drain_node_buffer_slot(ctx, m);
     }
     for &o in &region.outputs {
-        if let Some(nb) = drain_node_buffer_slot(ctx, o) {
-            ctx.memory_budget
-                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-        }
+        drain_node_buffer_slot(ctx, o);
     }
 
     let active_body = ctx.window_runtime.active_stack.last().copied();
@@ -333,16 +325,12 @@ fn seed_cross_region_inputs_for(
         let Some(parked) = ctx.region_input_buffers.remove(&key) else {
             continue;
         };
-        // Charge the NodeBuffer counter for the rows about to enter
-        // `node_buffers[source_idx]`. The same rows were Arena-charged
-        // at forward-pass cross-region tee admission; that ledger
-        // tracks `region_input_buffers` and is independent of this
-        // node-buffer-category surface. The consumer's predecessor-walk
-        // remove discharges this charge once the records leave the slot.
-        let producer_name = current_dag.graph[source_idx].name().to_string();
-        charge_node_buffer_admit(ctx, &producer_name, &parked)?;
         // Append onto the source node's buffer so the consumer's
-        // existing predecessor-walk logic resolves them.
+        // existing predecessor-walk logic resolves them. Per-row
+        // attribution flows through the slot's registered
+        // `NodeBufferConsumer` once `admit_node_buffer` re-keys this
+        // slot at the next bulk admission; the arbitrator's
+        // `should_abort` poll guards the pipeline-wide hard limit.
         let slot = ctx
             .node_buffers
             .entry(source_idx)
@@ -380,8 +368,9 @@ fn seed_cross_region_inputs_for(
 /// drained from `node_buffers` BEFORE the parent-scope swap restores
 /// the parent's buffers (otherwise the body-local entries would be
 /// dropped on the floor). After the swap, the harvested rows are
-/// charged against the per-pipeline memory budget via
-/// `charge_harvest_admission` and seeded into the parent's slot. The
+/// seeded into the parent's slot; pull-mode attribution flows through
+/// the slot's registered `NodeBufferConsumer` and the arbitrator's
+/// `should_abort` poll guards the pipeline-wide hard limit. The
 /// continuation walk then runs against the parent DAG so its members
 /// see the seeded slot via the same predecessor-walk logic the
 /// forward pass uses.
@@ -495,8 +484,6 @@ async fn recurse_into_body(
         let mut harvested: Vec<(Record, u64)> = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
             if let Some(nb) = drain_node_buffer_slot(ctx, *body_out_idx) {
-                ctx.memory_budget
-                    .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
                 for pair in nb.drain() {
                     harvested.push(pair?);
                 }
@@ -506,20 +493,6 @@ async fn recurse_into_body(
     }
     .await;
 
-    // Body exit cleanup mirroring the forward-pass executor: discharge
-    // any body-local `node_buffers` charges that the body walk left
-    // behind (early-return on error, sink-only bodies that never
-    // consume their seeded inputs, etc.) so the NodeBuffer ledger does
-    // not leak across the body / parent boundary when `saved_buffers`
-    // overwrites the field below.
-    let leaked_bytes: u64 = ctx
-        .node_buffers
-        .values()
-        .map(NodeBuffer::estimated_memory_bytes)
-        .sum();
-    if leaked_bytes > 0 {
-        ctx.memory_budget.discharge_node_buffer_bytes(leaked_bytes);
-    }
     // Unregister every body-local NodeBufferConsumer so the
     // arbitrator's registry stays aligned with the post-swap parent
     // scope's `node_buffers` map. The body-scope `node_buffer_consumer_ids`
@@ -544,19 +517,12 @@ async fn recurse_into_body(
     let harvested = walk_and_harvest?;
 
     if !harvested.is_empty() {
-        // Speculative parent-scope admission — same per-row charge
-        // the forward-pass `tee_emit_to_region_input_buffers` applies,
-        // so a runaway body cannot evade the per-pipeline budget by
-        // routing its output through the harvest path instead.
-        let composition_name = parent_dag.graph[composition_idx].name().to_string();
-        crate::executor::dispatch::charge_harvest_admission(ctx, &harvested, &composition_name)?;
-        // NodeBuffer-category charge for the rows about to enter the
-        // parent's `node_buffers[composition_idx]` slot. Attributed to
-        // the parent composition's user-visible name (not the body's
-        // output port) so an overflow diagnostic points at the operator
-        // the user wrote. Discharge fires when the parent's continuation
-        // consumes the slot.
-        charge_node_buffer_admit(ctx, &composition_name, &harvested)?;
+        // Append harvested rows onto the parent composition's slot.
+        // Pull-mode attribution: the slot's registered
+        // `NodeBufferConsumer` carries the live byte count via its
+        // shared handle; the arbitrator's `should_abort` poll guards
+        // the per-pipeline hard limit at the parent dispatcher's
+        // batch boundaries.
         let slot = ctx
             .node_buffers
             .entry(composition_idx)
@@ -620,16 +586,10 @@ async fn dispatch_continuation(
     // not re-read. The Composition seed's slot is preserved — it
     // carries the harvest.
     for &m in &continuation.members {
-        if let Some(nb) = drain_node_buffer_slot(ctx, m) {
-            ctx.memory_budget
-                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-        }
+        drain_node_buffer_slot(ctx, m);
     }
     for &o in &continuation.outputs {
-        if let Some(nb) = drain_node_buffer_slot(ctx, o) {
-            ctx.memory_budget
-                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-        }
+        drain_node_buffer_slot(ctx, o);
     }
 
     for idx in topo {

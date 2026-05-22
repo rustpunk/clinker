@@ -1320,10 +1320,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                 if args.budget.should_abort() {
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
-                                        used: args
-                                            .budget
-                                            .peak_rss()
-                                            .unwrap_or(args.budget.arena_bytes_charged()),
+                                        used: args.budget.peak_rss().unwrap_or(0),
                                         limit: args.budget.hard_limit(),
                                         source: BudgetCategory::Arena,
                                         detail: Some(
@@ -1384,10 +1381,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                         if args.budget.should_abort() {
                             return Err(PipelineError::MemoryBudgetExceeded {
                                 node: name.to_string(),
-                                used: args
-                                    .budget
-                                    .peak_rss()
-                                    .unwrap_or(args.budget.arena_bytes_charged()),
+                                used: args.budget.peak_rss().unwrap_or(0),
                                 limit: args.budget.hard_limit(),
                                 source: BudgetCategory::Arena,
                                 detail: Some("sort-merge combine probe RSS abort".to_string()),

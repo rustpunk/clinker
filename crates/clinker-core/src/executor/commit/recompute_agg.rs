@@ -67,20 +67,14 @@ pub(crate) fn recompute_aggregates(
                 // (degrade path) or was never instantiated. Mark for
                 // degrade-fallback collateral handling in flush.
                 degraded.push(agg_idx);
-                if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                }
+                drain_node_buffer_slot(ctx, agg_idx);
                 continue;
             };
             retract_and_refinalize(retained, new_retract_rows).is_ok()
         };
         if !retract_ok {
             degraded.push(agg_idx);
-            if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
-                ctx.memory_budget
-                    .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-            }
+            drain_node_buffer_slot(ctx, agg_idx);
             ctx.relaxed_aggregator_states.remove(&agg_idx);
             continue;
         }
@@ -91,10 +85,7 @@ pub(crate) fn recompute_aggregates(
             }
             Err(_) => {
                 degraded.push(agg_idx);
-                if let Some(nb) = drain_node_buffer_slot(ctx, agg_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                }
+                drain_node_buffer_slot(ctx, agg_idx);
                 ctx.relaxed_aggregator_states.remove(&agg_idx);
             }
         }
@@ -213,14 +204,10 @@ pub(crate) fn emit_post_recompute(
             "node-rooted window rebuild during commit-pass recompute: {e}"
         )));
     }
-    // The forward-pass Aggregate arm previously charged this slot;
-    // the post-retract emit replaces it with a narrower projection.
-    // Discharge the existing slot's bytes (if any) before the new
-    // charge so the ledger does not double-count across the swap.
-    if let Some(prev) = ctx.node_buffers.get(&agg_idx) {
-        let prev_bytes = prev.estimated_memory_bytes();
-        ctx.memory_budget.discharge_node_buffer_bytes(prev_bytes);
-    }
+    // The forward-pass Aggregate arm registered a NodeBufferConsumer
+    // for this slot; the re-admit below unregisters it before the
+    // new wrapper lands so the arbitrator's registry holds exactly
+    // one entry per live slot.
     let agg_name = current_dag.graph[agg_idx].name().to_string();
     let nb = admit_node_buffer(
         ctx,

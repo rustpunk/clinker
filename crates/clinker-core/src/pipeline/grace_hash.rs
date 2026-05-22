@@ -624,7 +624,7 @@ impl GraceHashExecutor {
                             CombineHashTable::build(records, extractor, ctx, budget, Some(0))
                                 .map_err(|e| PipelineError::MemoryBudgetExceeded {
                                     node: combine_name.to_string(),
-                                    used: budget.arena_bytes_charged(),
+                                    used: budget.peak_rss().unwrap_or(0),
                                     limit: budget.hard_limit(),
                                     source: BudgetCategory::Arena,
                                     detail: Some(format!("grace hash build: {e}")),
@@ -636,7 +636,7 @@ impl GraceHashExecutor {
                             CombineHashTable::build(records, extractor, ctx, budget, estimated)
                                 .map_err(|e| PipelineError::MemoryBudgetExceeded {
                                     node: combine_name.to_string(),
-                                    used: budget.arena_bytes_charged(),
+                                    used: budget.peak_rss().unwrap_or(0),
                                     limit: budget.hard_limit(),
                                     source: BudgetCategory::Arena,
                                     detail: Some(format!("grace hash build: {e}")),
@@ -992,7 +992,7 @@ pub(crate) fn execute_combine_grace_hash(
             if budget.should_abort() {
                 return Err(PipelineError::MemoryBudgetExceeded {
                     node: name.to_string(),
-                    used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
+                    used: budget.peak_rss().unwrap_or(0),
                     limit: budget.hard_limit(),
                     source: BudgetCategory::Arena,
                     detail: Some("grace hash probe RSS abort".to_string()),
@@ -1358,7 +1358,7 @@ fn process_spilled_partition(
     )
     .map_err(|e| PipelineError::MemoryBudgetExceeded {
         node: name.to_string(),
-        used: budget.arena_bytes_charged(),
+        used: budget.peak_rss().unwrap_or(0),
         limit: budget.hard_limit(),
         source: BudgetCategory::Arena,
         detail: Some(format!("grace hash reload build: {e}")),
@@ -1560,7 +1560,7 @@ fn bnl_fallback(
             CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
                 .map_err(|e| PipelineError::MemoryBudgetExceeded {
                     node: name.to_string(),
-                    used: budget.arena_bytes_charged(),
+                    used: budget.peak_rss().unwrap_or(0),
                     limit: budget.hard_limit(),
                     source: BudgetCategory::Arena,
                     detail: Some(format!(
@@ -1674,7 +1674,7 @@ fn combine_e310_partition_aborted(
 ) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: transform.to_string(),
-        used: budget.peak_rss().unwrap_or(budget.arena_bytes_charged()),
+        used: budget.peak_rss().unwrap_or(0),
         limit: budget.hard_limit(),
         source: BudgetCategory::Arena,
         detail: Some(format!(
