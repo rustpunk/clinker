@@ -6,6 +6,8 @@
 //! `.await` (or `blocking_send`) when the consumer falls behind, supplying
 //! back-pressure end-to-end without an intermediate spill tier.
 
+use std::sync::Arc;
+
 use clinker_record::Record;
 
 /// Error surface for [`TokioSourceStream`] sends.
@@ -34,6 +36,12 @@ impl std::error::Error for SourceStreamError {}
 /// via `recv().await` by the dispatch loop's Source arm.
 pub(crate) struct TokioSourceStream {
     tx: tokio::sync::mpsc::Sender<(Record, u64)>,
+    /// Shared with the registered `SourceConsumer` wrapper. Each
+    /// `blocking_push` updates `handle.bytes` from the current channel
+    /// queue depth times the most-recent record's estimated heap size,
+    /// so the arbitrator's pull-mode `current_usage` reads the
+    /// channel's in-flight memory at every policy poll.
+    consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 impl TokioSourceStream {
@@ -44,10 +52,21 @@ impl TokioSourceStream {
     pub(crate) const DEFAULT_CAPACITY: usize = 1024;
 
     /// Create a new stream + paired receiver. The receiver is what the
-    /// dispatch loop's Source arm consumes via `recv().await`.
-    pub(crate) fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<(Record, u64)>) {
+    /// dispatch loop's Source arm consumes via `recv().await`. The
+    /// `consumer_handle` is shared with the pipeline-scoped
+    /// arbitrator's `SourceConsumer` wrapper.
+    pub(crate) fn new(
+        capacity: usize,
+        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+    ) -> (Self, tokio::sync::mpsc::Receiver<(Record, u64)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                consumer_handle,
+            },
+            rx,
+        )
     }
 
     /// Push from a synchronous worker (typically the closure inside
@@ -60,9 +79,27 @@ impl TokioSourceStream {
         record: Record,
         row_num: u64,
     ) -> Result<(), SourceStreamError> {
+        // Sample the record's estimated heap size before moving it
+        // into the channel. The handle byte estimate uses this as a
+        // per-record proxy multiplied by the post-send queue depth —
+        // accurate for steady-state Source flows where records are
+        // roughly uniform, conservative-over-the-channel-lifetime
+        // when sizes drift (the arbitrator polls often enough that
+        // staleness is bounded to a few records).
+        let record_bytes = (std::mem::size_of::<Record>() + record.estimated_heap_size()) as u64;
         self.tx
             .blocking_send((record, row_num))
-            .map_err(|_| SourceStreamError::Closed)
+            .map_err(|_| SourceStreamError::Closed)?;
+        // `max_capacity - capacity` is the number of records sitting
+        // in the channel buffer waiting for the consumer. The product
+        // approximates the channel's in-flight memory footprint and
+        // is what the arbitrator's `current_usage` reports.
+        let max_cap = self.tx.max_capacity() as u64;
+        let remaining = self.tx.capacity() as u64;
+        let queued = max_cap.saturating_sub(remaining);
+        self.consumer_handle
+            .set_bytes(queued.saturating_mul(record_bytes));
+        Ok(())
     }
 }
 

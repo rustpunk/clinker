@@ -994,20 +994,20 @@ impl PipelineExecutor {
                     src_cfg.name
                 )))
             })?;
+            // Single ConsumerHandle shared between the SourceConsumer
+            // wrapper (BackPressurePreferred / Priority pause target)
+            // and the TokioSourceStream that mirrors the mpsc queue
+            // depth × per-record bytes into the handle's counter on
+            // every `blocking_push`. The arbitrator owns the boxed
+            // wrapper for the run; arbitrator Drop releases it on
+            // pipeline teardown.
+            let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let (stream, rx) = crate::executor::source_stream::TokioSourceStream::new(
                 crate::executor::source_stream::TokioSourceStream::DEFAULT_CAPACITY,
+                source_consumer_handle.clone(),
             );
-            // Register a `SourceConsumer` with the pipeline-scoped
-            // arbitrator at the source's construction site. The
-            // handle's `bytes` counter mirrors the ingest channel's
-            // queued bytes once that wiring lands; until then the
-            // consumer reports zero and serves as a back-pressureable
-            // pause target for `BackPressurePreferred::wrapping(Priority)`.
-            // The arbitrator owns the boxed wrapper for the run; the
-            // arbitrator's Drop releases it on pipeline teardown.
-            let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let _source_consumer_id = memory_budget.register_consumer(Box::new(
-                crate::executor::source_stream::SourceConsumer::new(source_consumer_handle.clone()),
+                crate::executor::source_stream::SourceConsumer::new(source_consumer_handle),
             ));
             source_records.insert(src_cfg.name.clone(), rx);
             let src_cfg_owned = src_cfg.clone();
