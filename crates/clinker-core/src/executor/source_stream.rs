@@ -79,6 +79,14 @@ impl TokioSourceStream {
         record: Record,
         row_num: u64,
     ) -> Result<(), SourceStreamError> {
+        // Block here if the arbitrator has paused this consumer (e.g.
+        // `BackPressurePreferred` policy elected this Source as the
+        // pause victim). The fast path is lock-free; the slow path
+        // parks the calling thread on a `Condvar` until `resume()`
+        // notifies. Routed through the shared `ConsumerHandle` so
+        // pause/resume from the arbitrator side and the producer-
+        // side wait participate in the same primitive.
+        self.consumer_handle.wait_while_paused();
         // Sample the record's estimated heap size before moving it
         // into the channel. The handle byte estimate uses this as a
         // per-record proxy multiplied by the post-send queue depth —

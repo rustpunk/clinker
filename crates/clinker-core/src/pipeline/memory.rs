@@ -22,6 +22,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -177,6 +178,72 @@ impl std::error::Error for ConsumerSpillError {
     }
 }
 
+/// Producer / consumer pause coordination primitive.
+///
+/// Pairs an `AtomicBool` pause flag with a `Mutex<()>` + `Condvar` so
+/// producer hot loops can BLOCK until resumed rather than busy-spin.
+/// The atomic flag is the fast path — `is_paused()` is lock-free, so
+/// the common unblocked case stays uncontended.
+///
+/// Concurrency-substrate agnostic: works under tokio + `spawn_blocking`
+/// (the calling OS thread parks on `Condvar::wait`) and under a
+/// future Rayon worker pool (a Rayon worker parks the same way).
+/// No new crate dependencies — `Condvar` and `Mutex` are `std`.
+pub struct PauseSignal {
+    paused: AtomicBool,
+    mu: Mutex<()>,
+    cv: Condvar,
+}
+
+impl PauseSignal {
+    /// Construct an unblocked signal.
+    pub fn new() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Whether the signal is currently in the paused state. Lock-free.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Flip to paused. Subsequent `wait_while_paused()` calls block
+    /// until `resume()` lands.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    /// Flip to resumed and wake every parked waiter. Producers
+    /// re-check the flag inside the `wait` loop so a spurious wake
+    /// stays a no-op.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Block the calling thread until the signal is not paused.
+    /// Returns immediately when the fast path (`is_paused() == false`)
+    /// holds, so the unpaused case never acquires the mutex.
+    pub fn wait_while_paused(&self) {
+        if !self.is_paused() {
+            return;
+        }
+        let mut guard = self.mu.lock().unwrap();
+        while self.is_paused() {
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+}
+
+impl Default for PauseSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state between an operator and the `MemoryConsumer`
 /// wrapper that the arbitrator registers on its behalf.
 ///
@@ -195,15 +262,16 @@ impl std::error::Error for ConsumerSpillError {
 /// reentrant `Mutex` around operator state when the arbitrator polls
 /// from the same thread that holds the operator's live state.
 ///
-/// `paused` mirrors the `MemoryConsumer::pause` / `resume` signal for
-/// back-pressureable consumers (Sources, `node_buffers` slots that
-/// chain to a pauseable Source). The producer hot loop checks
-/// `is_paused()` at batch boundaries; a real blocking wait
-/// (`Condvar::wait`) lands alongside the producer-side wiring.
+/// `pause_signal` mirrors the `MemoryConsumer::pause` / `resume` signal
+/// for back-pressureable consumers (Sources, `node_buffers` slots that
+/// chain to a pauseable Source). Producer hot loops call
+/// `wait_while_paused()` at batch boundaries; the call blocks on a
+/// `Condvar` until the arbitrator's `resume` notifies. The fast path
+/// (not paused) is lock-free.
 pub struct ConsumerHandle {
     bytes: AtomicU64,
     spill_requested: AtomicBool,
-    paused: AtomicBool,
+    pause_signal: PauseSignal,
 }
 
 impl ConsumerHandle {
@@ -213,7 +281,7 @@ impl ConsumerHandle {
         Arc::new(Self {
             bytes: AtomicU64::new(0),
             spill_requested: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
+            pause_signal: PauseSignal::new(),
         })
     }
 
@@ -263,24 +331,31 @@ impl ConsumerHandle {
         self.spill_requested.swap(false, Ordering::Acquire)
     }
 
-    /// Whether the consumer is currently paused. Producers (Source
-    /// ingest tasks, back-pressureable `node_buffer` writers) check
-    /// this at batch boundaries; once a blocking wait is wired into
-    /// the producer loop, `is_paused() == true` triggers the wait.
+    /// Whether the consumer is currently paused. Lock-free; producers
+    /// that want to actually block until resumed use
+    /// `wait_while_paused()` instead.
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.pause_signal.is_paused()
     }
 
     /// Flip the pause flag to `true`. Called by the consumer
     /// wrapper's `pause` for back-pressureable consumers.
     pub fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
+        self.pause_signal.pause();
     }
 
-    /// Flip the pause flag to `false`. Called by the consumer
-    /// wrapper's `resume`.
+    /// Flip the pause flag to `false` and wake every parked
+    /// `wait_while_paused()` caller. Called by the consumer wrapper's
+    /// `resume`.
     pub fn resume(&self) {
-        self.paused.store(false, Ordering::Release);
+        self.pause_signal.resume();
+    }
+
+    /// Block the calling producer thread until the signal is not
+    /// paused. Returns immediately when the fast path holds, so the
+    /// unpaused case stays uncontended.
+    pub fn wait_while_paused(&self) {
+        self.pause_signal.wait_while_paused();
     }
 }
 
@@ -907,6 +982,46 @@ pub fn parse_memory_limit_bytes(s: Option<&str>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_signal_fast_path_when_not_paused() {
+        let signal = PauseSignal::new();
+        assert!(!signal.is_paused());
+        // Should return immediately without acquiring the mutex.
+        signal.wait_while_paused();
+    }
+
+    #[test]
+    fn pause_signal_blocks_until_resume() {
+        let signal = Arc::new(PauseSignal::new());
+        signal.pause();
+        assert!(signal.is_paused());
+
+        let producer = signal.clone();
+        let handle = std::thread::spawn(move || {
+            // Block until the main thread calls resume.
+            producer.wait_while_paused();
+        });
+
+        // Wait briefly to ensure the producer has parked on the Condvar.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!handle.is_finished(), "producer should still be parked");
+
+        signal.resume();
+        // Producer should wake within reasonable time and finish.
+        handle.join().expect("producer thread should join cleanly");
+        assert!(!signal.is_paused());
+    }
+
+    #[test]
+    fn consumer_handle_pause_routes_through_pause_signal() {
+        let handle = ConsumerHandle::new();
+        assert!(!handle.is_paused());
+        handle.pause();
+        assert!(handle.is_paused());
+        handle.resume();
+        assert!(!handle.is_paused());
+    }
 
     #[test]
     fn test_rss_bytes_returns_some() {
