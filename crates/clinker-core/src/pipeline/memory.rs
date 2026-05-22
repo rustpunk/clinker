@@ -695,11 +695,14 @@ impl MemoryArbitrator {
         self.observe();
         let tripped = self.peak_rss.load(Ordering::Relaxed) > self.soft_limit();
         if tripped {
-            // Discarded victim id is the right shape until the
-            // arbitrator gains a callback path back into the elected
-            // consumer's `try_spill` / `pause`; the round-trip lands
-            // alongside operator-side `MemoryConsumer` impls.
-            let _ = self.poll_arbitration();
+            // Drive the round-trip: the elected victim is paused
+            // (back-pressureable) or asked to spill (everything else).
+            // `try_spill` flips the consumer's `spill_requested` flag,
+            // which the operator's hot loop reads via
+            // `take_spill_request` and reacts to in-thread. `pause`
+            // flips the consumer's `PauseSignal`, which the
+            // producer's `wait_while_paused` blocks on.
+            self.poll_arbitration();
         }
         tripped
     }
@@ -938,25 +941,41 @@ impl MemoryArbitrator {
         let peak_rss = self.peak_rss.load(Ordering::Relaxed);
         let pressure = peak_rss.saturating_sub(self.soft_limit());
         let limit = self.limit.load(Ordering::Relaxed);
-        let consumers = self.consumers.lock().unwrap();
+        let mut consumers = self.consumers.lock().unwrap();
         if consumers.is_empty() {
             return self.policy.select_victim(&[], pressure);
         }
-        let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
-            .iter()
-            .map(|(id, consumer)| (*id, consumer.as_ref()))
-            .collect();
-        let charged_sum: u64 = snapshot.iter().map(|(_, c)| c.current_usage()).sum();
-        let tenth = limit / 10;
-        if tenth > 0 && peak_rss.abs_diff(charged_sum) > tenth {
-            tracing::warn!(
-                peak_rss = peak_rss,
-                charged_sum = charged_sum,
-                limit = limit,
-                "memory arbitrator: RSS and pull-mode charged bytes disagree by more than 10% of limit"
-            );
+        let victim = {
+            let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
+                .iter()
+                .map(|(id, consumer)| (*id, consumer.as_ref()))
+                .collect();
+            let charged_sum: u64 = snapshot.iter().map(|(_, c)| c.current_usage()).sum();
+            let tenth = limit / 10;
+            if tenth > 0 && peak_rss.abs_diff(charged_sum) > tenth {
+                tracing::warn!(
+                    peak_rss = peak_rss,
+                    charged_sum = charged_sum,
+                    limit = limit,
+                    "memory arbitrator: RSS and pull-mode charged bytes disagree by more than 10% of limit"
+                );
+            }
+            self.policy.select_victim(&snapshot, pressure)
+        };
+        // Round-trip: invoke the corresponding action on the elected
+        // victim. The same registry lock guards both the policy read
+        // and the action call so a concurrent unregister can't race
+        // a freed wrapper.
+        if let Some(id) = victim
+            && let Some(consumer) = consumers.get_mut(&id)
+        {
+            if consumer.can_back_pressure() {
+                consumer.pause();
+            } else {
+                let _ = consumer.try_spill(pressure);
+            }
         }
-        self.policy.select_victim(&snapshot, pressure)
+        victim
     }
 }
 
