@@ -2021,6 +2021,25 @@ async fn ingest_source_task(
         let mut rn: u64 = 0;
         let mut total_count: u64 = 0;
         let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
+        // Per-file envelope context. Tracks the document currently
+        // being streamed; transitions to a new file emit `DocumentClose`
+        // for the previous context and `DocumentOpen` for the new one.
+        // Envelope sections are empty until reader-side pre-scan lands
+        // — CXL `$doc.<section>.<field>` against this context resolves
+        // to `Value::Null`, which is the streaming-resolver convention
+        // for an absent section.
+        let mut current_doc: Option<Arc<clinker_record::DocumentContext>> = None;
+        let push_punct = |stream: &mut crate::executor::source_stream::TokioSourceStream,
+                          punct: crate::executor::stream_event::Punctuation|
+         -> Result<(), PipelineError> {
+            stream
+                .blocking_push_punctuation(punct)
+                .map_err(|e| PipelineError::Internal {
+                    op: "source-stream-push-punctuation",
+                    node: src_cfg.name.clone(),
+                    detail: e.to_string(),
+                })
+        };
         loop {
             match src_reader.next_record() {
                 Ok(Some(record)) => {
@@ -2030,6 +2049,34 @@ async fn ingest_source_task(
                         .current_source_file()
                         .cloned()
                         .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    // Document boundary detection: on the first record,
+                    // or when the reader transitions to a new file, close
+                    // the previous document (if any) and open a fresh one
+                    // whose Arc is shared across all records of this file.
+                    let need_new_doc = match current_doc.as_ref() {
+                        None => true,
+                        Some(ctx) => !Arc::ptr_eq(ctx.source_file(), &file_arc),
+                    };
+                    if need_new_doc {
+                        if let Some(prev) = current_doc.take() {
+                            push_punct(
+                                &mut stream,
+                                crate::executor::stream_event::Punctuation::document_close(prev),
+                            )?;
+                        }
+                        let new_ctx = Arc::new(clinker_record::DocumentContext::new(
+                            clinker_record::DocumentId::next(),
+                            Arc::clone(&file_arc),
+                            indexmap::IndexMap::new(),
+                        ));
+                        push_punct(
+                            &mut stream,
+                            crate::executor::stream_event::Punctuation::document_open(Arc::clone(
+                                &new_ctx,
+                            )),
+                        )?;
+                        current_doc = Some(new_ctx);
+                    }
                     let mut values: Vec<clinker_record::Value> = record.values().to_vec();
                     let event_time_value: clinker_record::Value = if let Some(idx) =
                         watermark_column_idx
@@ -2049,8 +2096,11 @@ async fn ingest_source_task(
                         source_name_arc.as_ref().to_string().into_boxed_str(),
                     ));
                     values.push(event_time_value);
-                    let widened_record =
+                    let mut widened_record =
                         clinker_record::Record::new(Arc::clone(&widened_schema), values);
+                    if let Some(ctx) = current_doc.as_ref() {
+                        widened_record.set_doc_ctx(Arc::clone(ctx));
+                    }
                     stream.blocking_push(widened_record, rn).map_err(|e| {
                         PipelineError::Internal {
                             op: "source-stream-push",
@@ -2062,6 +2112,13 @@ async fn ingest_source_task(
                 Ok(None) => break,
                 Err(other) => return Err(other.into()),
             }
+        }
+        // Close the last document (if any records were emitted).
+        if let Some(last) = current_doc.take() {
+            push_punct(
+                &mut stream,
+                crate::executor::stream_event::Punctuation::document_close(last),
+            )?;
         }
         // Drop the sender so the dispatch-side `recv().await` returns
         // `None` once the channel drains.
