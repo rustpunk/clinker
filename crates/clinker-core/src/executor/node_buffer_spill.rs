@@ -88,10 +88,7 @@ mod tests {
             chunks: vec![(file, count)],
             pending_puncts: Vec::new(),
         };
-        let drained: Vec<(Record, u64)> = nb
-            .drain_records()
-            .collect::<Result<_, _>>()
-            .expect("drain ok");
+        let (drained, _puncts) = nb.drain_split().expect("drain ok");
         assert_eq!(drained.len(), 3);
         for (i, (orig, d)) in rows.iter().zip(drained.iter()).enumerate() {
             assert_eq!(orig.1, d.1, "row_number mismatch at {i}");
@@ -126,10 +123,7 @@ mod tests {
             chunks: vec![chunk_a, chunk_b, chunk_c],
             pending_puncts: Vec::new(),
         };
-        let drained: Vec<(Record, u64)> = nb
-            .drain_records()
-            .collect::<Result<_, _>>()
-            .expect("drain ok");
+        let (drained, _puncts) = nb.drain_split().expect("drain ok");
 
         assert_eq!(drained.len(), 5);
         let row_numbers: Vec<u64> = drained.iter().map(|(_, rn)| *rn).collect();

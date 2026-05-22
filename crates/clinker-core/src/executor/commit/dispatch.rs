@@ -492,9 +492,11 @@ async fn recurse_into_body(
             if let Some(nb) = ctx.node_buffers.remove(body_out_idx) {
                 ctx.memory_budget
                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                for pair in nb.drain_records() {
-                    harvested.push(pair?);
-                }
+                // Commit-pass body harvest: composition body output
+                // punctuations re-emit at the parent's call site;
+                // here we take records only.
+                let (records, _puncts) = nb.drain_split()?;
+                harvested.extend(records);
             }
         }
         Ok::<Vec<(Record, u64)>, PipelineError>(harvested)

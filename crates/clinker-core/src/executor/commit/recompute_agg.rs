@@ -227,6 +227,7 @@ pub(crate) fn emit_post_recompute(
         ctx,
         &agg_name,
         projected,
+        Vec::new(),
         node_buffer_spill_allowed(current_dag, agg_idx),
     )
     .map_err(|e| {

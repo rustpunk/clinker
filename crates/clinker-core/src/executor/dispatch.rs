@@ -1259,9 +1259,10 @@ pub(crate) fn admit_node_buffer(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
-    if rows.is_empty() {
+    if rows.is_empty() && puncts.is_empty() {
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
     let bytes = estimate_node_buffer_bytes(&rows);
@@ -1275,7 +1276,7 @@ pub(crate) fn admit_node_buffer(
         });
     }
     if !spill_allowed || !ctx.memory_budget.should_spill() {
-        return Ok(NodeBuffer::memory_from_records(rows));
+        return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     match crate::executor::node_buffer_spill::spill_node_buffer(
         rows,
@@ -1295,10 +1296,13 @@ pub(crate) fn admit_node_buffer(
             }
             Ok(NodeBuffer::Spilled {
                 chunks: vec![(file, count)],
-                pending_puncts: Vec::new(),
+                pending_puncts: puncts,
             })
         }
-        None => Ok(NodeBuffer::Memory(Vec::new())),
+        None => Ok(NodeBuffer::memory_from_records_and_puncts(
+            Vec::new(),
+            puncts,
+        )),
     }
 }
 
@@ -1707,9 +1711,13 @@ pub(crate) async fn merge_fused_interleave(
         })
         .await;
         let (i, item) = polled;
-        // Phase B intermediate: dispatch sees only Record events for now;
-        // Source ingest does not yet emit punctuations. Phase E adds
-        // per-operator punctuation handling (Merge dedup, Aggregate flush).
+        // Fused merge path: punctuations from the per-Source live
+        // channels are currently consumed here. Forwarding them
+        // through the streaming-output channel with multi-input dedup
+        // (Merge-style barrier counter) requires per-source state on
+        // this select loop and lands as a follow-up — file under #91
+        // backlog. The non-fused Merge arm already deduplicates
+        // punctuations via the `all_puncts` collect-then-dedup pass.
         let item: Option<(Record, u64)> = match item {
             Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => Some((r, rn)),
             Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
@@ -1899,9 +1907,13 @@ pub(crate) async fn transform_fused_consume(
             },
             None => rx.recv().await,
         };
-        // Phase B intermediate: dispatch unwraps Record events;
-        // punctuations are skipped here and proper per-operator handling
-        // (Merge dedup, Aggregate flush) lands in Phase E.
+        // Transform-fused-with-Source: this path consumes the live
+        // Source channel directly and drives per-record CXL eval
+        // inline. Punctuations from the upstream Source's
+        // `DocumentOpen` / `DocumentClose` emissions are consumed
+        // here for now; forwarding them through the fused-Transform
+        // output to downstream operators is a follow-up filed under
+        // #91 backlog.
         let (record, rn) = match item {
             Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
             Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
@@ -2006,6 +2018,7 @@ pub(crate) async fn transform_fused_consume(
         ctx,
         name,
         output_records,
+        Vec::new(),
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
     ctx.node_buffers.insert(node_idx, nb);
@@ -2084,9 +2097,10 @@ pub(crate) async fn dispatch_plan_node(
                 }
             };
 
-            let records: Vec<(Record, u64)> = if let Some(seeded) =
-                ctx.node_buffers.remove(&node_idx)
-            {
+            let (records, source_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
                 // Body-context port source — records were seeded by
                 // `execute_composition_body` from parent-scope
                 // output. The seeded records still carry the parent
@@ -2095,23 +2109,30 @@ pub(crate) async fn dispatch_plan_node(
                 // consumers run. Apply per-record seeding for body-
                 // declared record_vars (parent's writes survive via
                 // `seed_record_vars`'s preserve-existing semantics).
+                // Punctuations on the seeded port forward through to
+                // the Source's output buffer so downstream operators
+                // see the original document boundaries.
                 ctx.memory_budget
                     .discharge_node_buffer_bytes(seeded.estimated_memory_bytes());
-                let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
+                let mut out_records: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
+                let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
                 let has_record_seed = !ctx.record_var_seed.is_empty();
-                for pair in seeded.drain_records() {
-                    // Phase B intermediate: `drain_records` filters
-                    // punctuations; Phase E switches this site to
-                    // explicit `drain()` + match so puncts forward.
-                    let (r, rn) = pair?;
-                    let mut rec = canonicalize(&r);
-                    if has_record_seed {
-                        rec.seed_record_vars(ctx.record_var_seed);
+                for event in seeded.drain() {
+                    match event? {
+                        crate::executor::stream_event::StreamEvent::Record(r, rn) => {
+                            let mut rec = canonicalize(&r);
+                            if has_record_seed {
+                                rec.seed_record_vars(ctx.record_var_seed);
+                            }
+                            seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                            out_records.push((rec, rn));
+                        }
+                        crate::executor::stream_event::StreamEvent::Punctuation(p) => {
+                            out_puncts.push(p);
+                        }
                     }
-                    seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
-                    out.push((rec, rn));
                 }
-                out
+                (out_records, out_puncts)
             } else if let Some(mut rx) = ctx.source_records.remove(name.as_str()) {
                 // Live channel: consume per record so back-pressure
                 // engages — a slow upstream Source no longer blocks
@@ -2123,6 +2144,8 @@ pub(crate) async fn dispatch_plan_node(
                 let has_record_seed = !ctx.record_var_seed.is_empty();
                 let source_name_arc: Arc<str> = Arc::from(name.as_str());
                 let mut drained: Vec<(Record, u64)> = Vec::new();
+                let mut drained_puncts: Vec<crate::executor::stream_event::Punctuation> =
+                    Vec::new();
                 // Tracked so an idle-timeout flips THAT file's
                 // partition to `Idle`. Before any record arrives the
                 // consumer uses the synthetic [`MERGED_SOURCE_FILE`]
@@ -2147,26 +2170,25 @@ pub(crate) async fn dispatch_plan_node(
                         },
                         None => rx.recv().await,
                     };
-                    // Phase B intermediate: skip punctuations; Phase E
-                    // routes them through per-operator handlers.
-                    let (record, rn) = match item {
-                        Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
-                        Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => {
-                            continue;
+                    match item {
+                        Some(crate::executor::stream_event::StreamEvent::Record(record, rn)) => {
+                            last_file = source_file_arc_of(&record);
+                            let mut rec = canonicalize(&record);
+                            if has_record_seed {
+                                rec.seed_record_vars(ctx.record_var_seed);
+                            }
+                            seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                            if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
+                                *slot += 1;
+                            }
+                            count += 1;
+                            drained.push((rec, rn));
+                        }
+                        Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                            drained_puncts.push(p);
                         }
                         None => break,
-                    };
-                    last_file = source_file_arc_of(&record);
-                    let mut rec = canonicalize(&record);
-                    if has_record_seed {
-                        rec.seed_record_vars(ctx.record_var_seed);
                     }
-                    seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
-                    if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
-                        *slot += 1;
-                    }
-                    count += 1;
-                    drained.push((rec, rn));
                 }
                 ctx.finalize_source_count(&source_name_arc, count);
                 if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
@@ -2176,7 +2198,7 @@ pub(crate) async fn dispatch_plan_node(
                         "source consumer ended with all partitions in WatermarkStatus::Idle"
                     );
                 }
-                drained
+                (drained, drained_puncts)
             } else {
                 // Defense-in-depth: a Source reaching this arm with
                 // neither a body-port seed, nor an entry in
@@ -2208,6 +2230,7 @@ pub(crate) async fn dispatch_plan_node(
                 ctx,
                 name,
                 records,
+                source_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2229,32 +2252,37 @@ pub(crate) async fn dispatch_plan_node(
             if ctx.should_fuse_transform(node_idx) {
                 return transform_fused_consume(ctx, current_dag, node_idx, name).await;
             }
-            // Get input records: first check own buffer (set by Route
+            // Get input events: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
-            let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
-                    own_buf.drain_records().collect::<Result<Vec<_>, _>>()?
+            // Records flow into per-record evaluation; punctuations are
+            // preserved verbatim and forwarded onto the output buffer
+            // alongside the transformed records (Preserving behavior).
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                ctx.memory_budget
+                    .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
+                own_buf.drain_split()?
+            } else {
+                let predecessors: Vec<NodeIndex> = current_dag
+                    .graph
+                    .neighbors_directed(node_idx, Direction::Incoming)
+                    .collect();
+                let pred_buf = if predecessors.len() == 1 {
+                    ctx.node_buffers.remove(&predecessors[0])
                 } else {
-                    let predecessors: Vec<NodeIndex> = current_dag
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let pred_buf = if predecessors.len() == 1 {
-                        ctx.node_buffers.remove(&predecessors[0])
-                    } else {
-                        predecessors.iter().find_map(|p| ctx.node_buffers.remove(p))
-                    };
-                    match pred_buf {
-                        Some(nb) => {
-                            ctx.memory_budget
-                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                            nb.drain_records().collect::<Result<Vec<_>, _>>()?
-                        }
-                        None => Vec::new(),
-                    }
+                    predecessors.iter().find_map(|p| ctx.node_buffers.remove(p))
                 };
+                match pred_buf {
+                    Some(nb) => {
+                        ctx.memory_budget
+                            .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                        nb.drain_split()?
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
 
             // Find the CompiledTransform for this node
             let transform_idx = match ctx.transform_by_name.get(name.as_str()) {
@@ -2266,6 +2294,7 @@ pub(crate) async fn dispatch_plan_node(
                         ctx,
                         name.as_str(),
                         input_records,
+                        input_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -2453,6 +2482,7 @@ pub(crate) async fn dispatch_plan_node(
                 ctx,
                 name,
                 output_records,
+                input_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2473,21 +2503,23 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
-                    ctx.memory_budget
-                        .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
-                    own_buf.drain_records().collect::<Result<Vec<_>, _>>()?
-                } else {
-                    match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
-                        Some(nb) => {
-                            ctx.memory_budget
-                                .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                            nb.drain_records().collect::<Result<Vec<_>, _>>()?
-                        }
-                        None => Vec::new(),
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                ctx.memory_budget
+                    .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
+                own_buf.drain_split()?
+            } else {
+                match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
+                    Some(nb) => {
+                        ctx.memory_budget
+                            .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                        nb.drain_split()?
                     }
-                };
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
 
             if let Some(expected) = current_dag.graph[node_idx]
                 .expected_input_schema_in(current_dag)
@@ -2746,10 +2778,15 @@ pub(crate) async fn dispatch_plan_node(
                             .push((record.clone(), *rn));
                     }
                 }
+                // Route broadcasts punctuations to every branch — each
+                // downstream subgraph needs the same document-boundary
+                // signal to drive its own per-document accumulators
+                // and writers.
                 let nb = admit_node_buffer(
                     ctx,
                     name,
                     buf,
+                    input_puncts.clone(),
                     node_buffer_spill_allowed(current_dag, succ_idx),
                 )?;
                 ctx.node_buffers.insert(succ_idx, nb);
@@ -2835,6 +2872,16 @@ pub(crate) async fn dispatch_plan_node(
                     _ => false,
                 });
 
+            // Punctuation collection state hoisted above the if-else so
+            // the dedup pass below the merge body can read it. The
+            // fused-mode merge_fused_interleave path does not yet
+            // forward punctuations (a follow-up will route them
+            // through merge_fused_interleave's recv loop); the else
+            // branch's drain logic fills `all_puncts` from each input
+            // NodeBuffer.
+            let fan_in_degree = sorted_preds.len();
+            let mut all_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+
             let merged: Vec<(Record, u64)> = if fused_mode {
                 // Streaming-Output handoff (issue #72): if a single
                 // Output downstream of this Merge passed the
@@ -2884,6 +2931,10 @@ pub(crate) async fn dispatch_plan_node(
                     Ok(())
                 };
 
+                // Every input's punctuations accumulate in the outer
+                // `all_puncts`; the post-merge dedup pass collapses
+                // multiple-input duplicates so each `DocumentOpen` and
+                // `DocumentClose` traverses downstream exactly once.
                 match mode {
                     crate::config::MergeMode::Concat => {
                         for pred in &sorted_preds {
@@ -2891,9 +2942,20 @@ pub(crate) async fn dispatch_plan_node(
                             if let Some(buf) = ctx.node_buffers.remove(pred) {
                                 ctx.memory_budget
                                     .discharge_node_buffer_bytes(buf.estimated_memory_bytes());
-                                for pair in buf.drain_records() {
-                                    let (record, rn) = pair?;
-                                    emit(&mut merged, &upstream_name, record, rn)?;
+                                for event in buf.drain() {
+                                    match event? {
+                                        crate::executor::stream_event::StreamEvent::Record(
+                                            record,
+                                            rn,
+                                        ) => {
+                                            emit(&mut merged, &upstream_name, record, rn)?;
+                                        }
+                                        crate::executor::stream_event::StreamEvent::Punctuation(
+                                            p,
+                                        ) => {
+                                            all_puncts.push(p);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2917,9 +2979,9 @@ pub(crate) async fn dispatch_plan_node(
                                         ctx.memory_budget.discharge_node_buffer_bytes(
                                             nb.estimated_memory_bytes(),
                                         );
-                                        let v: Vec<_> =
-                                            nb.drain_records().collect::<Result<Vec<_>, _>>()?;
-                                        Ok(VecDeque::from(v))
+                                        let (records, puncts) = nb.drain_split()?;
+                                        all_puncts.extend(puncts);
+                                        Ok(VecDeque::from(records))
                                     }
                                     None => Ok(VecDeque::new()),
                                 }
@@ -2966,12 +3028,39 @@ pub(crate) async fn dispatch_plan_node(
             // against. The call below is a defense-in-depth no-op:
             // the helper iterates plan.indices_to_build and matches
             // nothing because no spec roots at a Merge NodeIndex.
+            // Punctuation dedup pass: emit `DocumentOpen` once per
+            // document (first sighting wins) and `DocumentClose` only
+            // after every input branch has closed the same document.
+            let mut deduped_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+            let mut open_seen: std::collections::HashSet<clinker_record::DocumentId> =
+                std::collections::HashSet::new();
+            let mut close_counts: std::collections::HashMap<clinker_record::DocumentId, usize> =
+                std::collections::HashMap::new();
+            for p in all_puncts {
+                let id = p.doc_id();
+                match p.kind() {
+                    crate::executor::stream_event::PunctuationKind::DocumentOpen => {
+                        if open_seen.insert(id) {
+                            deduped_puncts.push(p);
+                        }
+                    }
+                    crate::executor::stream_event::PunctuationKind::DocumentClose => {
+                        let count = close_counts.entry(id).or_insert(0);
+                        *count += 1;
+                        if *count == fan_in_degree {
+                            deduped_puncts.push(p);
+                        }
+                    }
+                }
+            }
+
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
             let nb = admit_node_buffer(
                 ctx,
                 name,
                 merged,
+                deduped_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2993,15 +3082,17 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<(Record, u64)> =
-                match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
-                    Some(nb) => {
-                        ctx.memory_budget
-                            .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                        nb.drain_records().collect::<Result<Vec<_>, _>>()?
-                    }
-                    None => Vec::new(),
-                };
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match predecessors.iter().find_map(|p| ctx.node_buffers.remove(p)) {
+                Some(nb) => {
+                    ctx.memory_budget
+                        .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
+                    nb.drain_split()?
+                }
+                None => (Vec::new(), Vec::new()),
+            };
 
             if input_records.is_empty() {
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
@@ -3012,6 +3103,7 @@ pub(crate) async fn dispatch_plan_node(
                     ctx,
                     name,
                     Vec::new(),
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3098,6 +3190,7 @@ pub(crate) async fn dispatch_plan_node(
                 ctx,
                 name,
                 out,
+                input_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -3137,13 +3230,16 @@ pub(crate) async fn dispatch_plan_node(
 
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
-            let input: Vec<(Record, u64)> = match ctx.node_buffers.remove(&pred) {
+            let (input, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match ctx.node_buffers.remove(&pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain_records().collect::<Result<Vec<_>, _>>()?
+                    nb.drain_split()?
                 }
-                None => Vec::new(),
+                None => (Vec::new(), Vec::new()),
             };
 
             if let Some(expected) = current_dag.graph[node_idx]
@@ -3493,6 +3589,16 @@ pub(crate) async fn dispatch_plan_node(
                 // without an extra commit-time materialization for the
                 // no-retraction case. Retraction iterations overwrite
                 // the slot in `recompute_aggregates::emit_post_recompute`.
+                // Aggregate forwards inbound punctuations to its
+                // output buffer (Preserving). Document-scoped flush
+                // semantics — "flush groups on `DocumentClose` before
+                // forwarding the punctuation" — land as a follow-up
+                // commit within this sprint; today the punctuation
+                // travels at the tail of the aggregated output, which
+                // matches the streaming contract for single-document
+                // pipelines but does not yet split per-document
+                // groups when multiple documents enter the same
+                // aggregate.
                 let buffer_schema = region.buffer_schema.clone();
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
@@ -3501,6 +3607,7 @@ pub(crate) async fn dispatch_plan_node(
                     ctx,
                     name,
                     projected,
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3518,6 +3625,7 @@ pub(crate) async fn dispatch_plan_node(
                     ctx,
                     name,
                     out_rows,
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3547,11 +3655,19 @@ pub(crate) async fn dispatch_plan_node(
             // buffer and last-consumer-remove paths discharge inline
             // since those bytes were already charged by the producer.
             let mut multi_consumer_clone_bytes: u64 = 0;
+            // Output is terminal — it writes to disk, so punctuations
+            // are consumed at this stage rather than forwarded. The
+            // input drain still uses `drain_split` for symmetry with
+            // every other operator, but the puncts vector goes unused
+            // for non-streaming outputs. Streaming Outputs (#72) take
+            // the early-return path above and forward puncts through
+            // the streaming channel separately.
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(own_buf.estimated_memory_bytes());
-                    own_buf.drain_records().collect::<Result<Vec<_>, _>>()?
+                    let (records, _puncts) = own_buf.drain_split()?;
+                    records
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
                         .graph
@@ -3571,7 +3687,8 @@ pub(crate) async fn dispatch_plan_node(
                             if let Some(nb) = ctx.node_buffers.remove(&p) {
                                 ctx.memory_budget
                                     .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                                found = Some(nb.drain_records().collect::<Result<Vec<_>, _>>()?);
+                                let (records, _puncts) = nb.drain_split()?;
+                                found = Some(records);
                                 break;
                             }
                         } else {
@@ -3589,9 +3706,15 @@ pub(crate) async fn dispatch_plan_node(
                             // live, then drop it so the charge path can
                             // take `&mut ctx.memory_budget`.
                             let cloned_with_bytes = ctx.node_buffers.get(&p).map(|nb| {
-                                // Phase B intermediate: drop puncts from
-                                // the fan-out clone; Phase E threads
-                                // them through to each consumer branch.
+                                // Output is terminal — it writes to
+                                // disk and has no downstream
+                                // node_buffer to receive forwarded
+                                // punctuations. The fan-out clone
+                                // path takes records only; sibling
+                                // consumers that need the document
+                                // boundary read it from the
+                                // non-cloned (last-consumer) drain
+                                // through their own arm.
                                 let cloned_records: Vec<(Record, u64)> = nb
                                     .clone_memory_only()
                                     .into_iter()
@@ -3922,6 +4045,7 @@ pub(crate) async fn dispatch_plan_node(
                 ctx,
                 &composition_name,
                 output_records,
+                Vec::new(),
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -4101,22 +4225,37 @@ pub(crate) async fn dispatch_plan_node(
                     ),
                 })?;
 
-            let driver_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&driver_pred) {
+            // Combine collects puncts from both inputs and forwards
+            // them to the output buffer. Per-document dedup
+            // (Merge-style barrier counter) for two-input Combine is
+            // out of scope for #91 (deferred to follow-up); the
+            // simple union here may emit `DocumentClose` twice
+            // downstream for documents that span both inputs, which
+            // any downstream Aggregate would handle idempotently.
+            let (driver_buf, driver_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match ctx.node_buffers.remove(&driver_pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain_records().collect::<Result<Vec<_>, _>>()?
+                    nb.drain_split()?
                 }
-                None => Vec::new(),
+                None => (Vec::new(), Vec::new()),
             };
-            let build_buf: Vec<(Record, u64)> = match ctx.node_buffers.remove(&build_pred) {
+            let (build_buf, build_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match ctx.node_buffers.remove(&build_pred) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain_records().collect::<Result<Vec<_>, _>>()?
+                    nb.drain_split()?
                 }
-                None => Vec::new(),
+                None => (Vec::new(), Vec::new()),
             };
+            let combined_puncts: Vec<crate::executor::stream_event::Punctuation> =
+                driver_puncts.into_iter().chain(build_puncts).collect();
 
             // Operator-entry schema check per D4: every record
             // arriving on the probe and build channels is
@@ -4312,6 +4451,7 @@ pub(crate) async fn dispatch_plan_node(
                         ctx,
                         name,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4396,6 +4536,7 @@ pub(crate) async fn dispatch_plan_node(
                         ctx,
                         name,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4486,6 +4627,7 @@ pub(crate) async fn dispatch_plan_node(
                         ctx,
                         name,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4982,6 +5124,7 @@ pub(crate) async fn dispatch_plan_node(
                 ctx,
                 name,
                 output_records,
+                Vec::new(),
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -5491,8 +5634,11 @@ fn collect_port_records(
         // topo walk get that wrapper. Detail string discriminates
         // this site from the generic admit in `admit_node_buffer`.
         let cloned_with_bytes = ctx.node_buffers.get(&edge.source()).map(|nb| {
-            // Phase B intermediate: composition port seeding takes
-            // records only; Phase E threads punctuations through.
+            // Composition port seeding clones records only; the
+            // composition body operates inside its own document-
+            // boundary scope and re-emits punctuations at the call-
+            // site level on body exit, so the parent's puncts do not
+            // forward through the body's port-source boundary.
             let cloned_records: Vec<(Record, u64)> = nb
                 .clone_memory_only()
                 .into_iter()
@@ -5667,11 +5813,17 @@ async fn execute_composition_body(
     // is the single source of records for that slot.
     let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
+            // Composition body output harvest — punctuations on the
+            // body's output port belong to the composition's parent
+            // pipeline scope; they re-emit when the parent's call
+            // site re-introduces document context. The body harvest
+            // takes records only.
             let drained: Vec<(Record, u64)> = match ctx.node_buffers.remove(&idx) {
                 Some(nb) => {
                     ctx.memory_budget
                         .discharge_node_buffer_bytes(nb.estimated_memory_bytes());
-                    nb.drain_records().collect::<Result<Vec<_>, _>>()?
+                    let (records, _puncts) = nb.drain_split()?;
+                    records
                 }
                 None => Vec::new(),
             };

@@ -3001,10 +3001,10 @@ async fn streaming_output_task(
     let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
 
     while let Some(event) = rx.recv().await {
-        // Phase B intermediate: streaming output sink consumes Record
-        // events only; punctuation forwarding to writers (envelope
-        // header/footer reconstruction) lands as a follow-up after the
-        // sprint closes.
+        // Streaming output is terminal — it writes records straight to
+        // disk. Punctuations are consumed here; per-document writer
+        // finalization (envelope header/footer streaming reconstruction
+        // on `DocumentClose`) is a follow-up filed under #91 backlog.
         let (record, rn) = match event {
             crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
             crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,

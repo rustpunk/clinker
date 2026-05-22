@@ -201,19 +201,52 @@ impl NodeBuffer {
         (row_bytes as u64).saturating_mul(mem_records.len() as u64)
     }
 
-    /// Consume the buffer, returning an iterator over body records
-    /// only (punctuations filtered out). Convenience for Phase B
-    /// consumer sites that don't yet route punctuations through
-    /// per-operator handlers; Phase E removes this helper so every
-    /// consumer must explicitly pattern-match `StreamEvent`.
-    pub(crate) fn drain_records(
+    /// Consume the buffer and partition its events into a records
+    /// vector and a punctuations vector. Used by record-processing
+    /// operators (Transform, Route, Sort, Combine) that need to
+    /// reshape records 1:N while passing punctuations through
+    /// unchanged. The caller publishes its output via
+    /// [`Self::memory_from_records_and_puncts`], which appends the
+    /// preserved punctuations at the tail of the output stream — a
+    /// position that preserves the "punctuation trails its document's
+    /// records" invariant for any single-document buffer.
+    ///
+    /// Operators with richer punctuation semantics (Merge dedup,
+    /// Aggregate flush-on-close) drain via [`Self::drain`] directly
+    /// and pattern-match `StreamEvent` to inject per-document logic
+    /// at the boundary.
+    pub(crate) fn drain_split(
         self,
-    ) -> impl Iterator<Item = Result<(Record, u64), PipelineError>> {
-        self.drain().filter_map(|res| match res {
-            Ok(StreamEvent::Record(r, rn)) => Some(Ok((r, rn))),
-            Ok(StreamEvent::Punctuation(_)) => None,
-            Err(e) => Some(Err(e)),
-        })
+    ) -> Result<(Vec<(Record, u64)>, Vec<Punctuation>), PipelineError> {
+        let mut records: Vec<(Record, u64)> = Vec::with_capacity(self.len_hint());
+        let mut puncts: Vec<Punctuation> = Vec::new();
+        for event in self.drain() {
+            match event? {
+                StreamEvent::Record(r, rn) => records.push((r, rn)),
+                StreamEvent::Punctuation(p) => puncts.push(p),
+            }
+        }
+        Ok((records, puncts))
+    }
+
+    /// Build a `Memory` variant from a records vector and the
+    /// punctuations preserved from the input drain. Punctuations are
+    /// appended at the tail of the event stream so that document
+    /// boundaries continue to trail their document's records — the
+    /// streaming-contract invariant that drives Aggregate
+    /// flush-on-close and Merge dedup.
+    pub(crate) fn memory_from_records_and_puncts(
+        records: Vec<(Record, u64)>,
+        puncts: Vec<Punctuation>,
+    ) -> Self {
+        let mut events: Vec<StreamEvent> = Vec::with_capacity(records.len() + puncts.len());
+        for (r, rn) in records {
+            events.push(StreamEvent::record(r, rn));
+        }
+        for p in puncts {
+            events.push(StreamEvent::punctuation(p));
+        }
+        Self::Memory(events)
     }
 
     /// Consume the buffer, returning an iterator that yields memory
