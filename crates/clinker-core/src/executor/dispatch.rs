@@ -3211,18 +3211,14 @@ pub(crate) async fn dispatch_plan_node(
                     transform_idx,
                 )?
             } else {
-                // Register an AggregateConsumer with the pipeline-
-                // scoped arbitrator. The handle's `bytes` counter is
-                // shared with HashAggregator once the operator gains
-                // its `Arc<ConsumerHandle>` field in a follow-up
-                // commit; until then current_usage reads zero and
-                // the consumer is a structural registry entry the
-                // Priority policy ranks behind every reporting
-                // operator.
+                // Single ConsumerHandle shared between the
+                // AggregateConsumer wrapper that the arbitrator's
+                // policy registry holds and the HashAggregator that
+                // mirrors its value_heap_bytes total into the
+                // handle's counter on every admit / spill / reset.
+                let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 ctx.memory_budget.register_consumer(Box::new(
-                    crate::aggregation::AggregateConsumer::new(
-                        crate::pipeline::memory::ConsumerHandle::new(),
-                    ),
+                    crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
                 ));
                 let mut stream = crate::aggregation::AggregateStream::for_node(
                     Arc::clone(compiled),
@@ -3233,6 +3229,7 @@ pub(crate) async fn dispatch_plan_node(
                     mem_limit,
                     Some(ctx.spill_root_path.to_path_buf()),
                     name.clone(),
+                    agg_consumer_handle,
                 )?;
 
                 // CPU-bound: per-record accumulator updates + spill I/O.
@@ -5821,6 +5818,11 @@ fn run_time_windowed_aggregate(
                 });
             }
         };
+        let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+        ctx.memory_budget
+            .register_consumer(Box::new(crate::aggregation::AggregateConsumer::new(
+                agg_consumer_handle.clone(),
+            )));
         AggregateStream::for_node(
             Arc::clone(compiled),
             evaluator,
@@ -5830,6 +5832,7 @@ fn run_time_windowed_aggregate(
             mem_limit,
             Some(ctx.spill_root_path.to_path_buf()),
             name.to_string(),
+            agg_consumer_handle,
         )
     };
 
