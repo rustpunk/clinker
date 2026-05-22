@@ -1338,6 +1338,59 @@ impl clinker_record::RecordStorage for NullStorage {
     }
 }
 
+/// `MemoryConsumer` wrapper for a `SortMergeExec` mid-execution.
+/// Holds an `Arc<ConsumerHandle>` shared with the executor: Phase A
+/// per-side `SortBuffer.bytes_used` plus Phase B matching-run
+/// accumulator size sum into `handle.bytes`. `try_spill` flips the
+/// handle's spill-request flag; the executor reacts at the next
+/// batch boundary by flushing its current run to disk.
+///
+/// `spill_priority = 25`: sort-merge spill is more expensive than
+/// either sort or grace-hash because it involves both per-side sort
+/// flush AND matching-run accumulator flush; only hash-aggregation
+/// (priority 30) is more expensive. `can_back_pressure = false`:
+/// sort-merge holds two cursors that walk inputs monotonically;
+/// pausing either side stalls the match scan.
+pub struct SortMergeConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl SortMergeConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        25
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────

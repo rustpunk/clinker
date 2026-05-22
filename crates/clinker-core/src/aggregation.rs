@@ -1854,6 +1854,60 @@ impl HashAggregator {
     }
 }
 
+/// `MemoryConsumer` wrapper for a `HashAggregator`. Holds an
+/// `Arc<ConsumerHandle>` shared with the aggregator: the aggregator
+/// updates `handle.bytes` as it admits records and drains on spill;
+/// the consumer reads the value when the arbitrator polls. `try_spill`
+/// flips the handle's spill-request flag, which the aggregator's hot
+/// loop reads at the next batch boundary and reacts to by invoking
+/// its existing in-thread spill path.
+///
+/// `spill_priority = 30`: hash-aggregation spill is the most
+/// expensive to drive — sort-by-encoded-key, write every group,
+/// rebuild via `LoserTree` k-way merge on finalize. Last-resort
+/// victim. `can_back_pressure = false`: an in-flight aggregate has
+/// no upstream channel to gate; pausing mid-aggregation would either
+/// lose accumulation or require additional buffering with no payoff.
+pub struct AggregateConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl AggregateConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for AggregateConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        30
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
 /// Finalize one group into an output [`Record`]. Shared by the in-memory
 /// fast path, the spill-recovery path, and `StreamingAggregator<AddRaw>`
 /// so all three produce byte-identical results.

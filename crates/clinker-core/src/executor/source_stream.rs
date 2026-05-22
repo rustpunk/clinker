@@ -65,3 +65,87 @@ impl TokioSourceStream {
             .map_err(|_| SourceStreamError::Closed)
     }
 }
+
+/// `MemoryConsumer` wrapper for a `TokioSourceStream` ingest channel.
+/// Holds an `Arc<ConsumerHandle>` shared with the source ingest task:
+/// the task updates `handle.bytes` from the bounded `mpsc` queue
+/// depth × estimated per-record bytes at each batch boundary.
+///
+/// Sources do not spill: `try_spill` returns `Ok(0)` and the
+/// arbitrator's policy is expected to choose `pause` instead via
+/// `BackPressurePreferred`. `spill_priority = i32::MAX` so the
+/// `Priority` fallback ranks Sources last among the spill candidates
+/// when no back-pressureable consumer is available.
+/// `can_back_pressure = true`; `pause` / `resume` forward to the
+/// handle's pause flag, which the ingest task reads at every
+/// `blocking_send` boundary.
+pub struct SourceConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl SourceConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        i32::MAX
+    }
+
+    fn try_spill(
+        &mut self,
+        _target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        Ok(0)
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        true
+    }
+
+    fn pause(&mut self) {
+        self.handle.pause();
+    }
+
+    fn resume(&mut self) {
+        self.handle.resume();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
+
+    #[test]
+    fn source_consumer_reports_handle_bytes_and_never_spills() {
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(16 * 1024);
+        let mut consumer = SourceConsumer::new(handle.clone());
+        assert_eq!(consumer.current_usage(), 16 * 1024);
+        // Sources don't spill: try_spill always reports zero freed.
+        assert_eq!(consumer.try_spill(u64::MAX).unwrap(), 0);
+        assert!(!handle.take_spill_request());
+    }
+
+    #[test]
+    fn source_consumer_is_back_pressureable_and_routes_pause_to_handle() {
+        let handle = ConsumerHandle::new();
+        let mut consumer = SourceConsumer::new(handle.clone());
+        assert!(consumer.can_back_pressure());
+        // Source spill priority sits above the integer range used by
+        // other consumers; the Priority policy ranks Sources last,
+        // matching BackPressurePreferred's prefer-pause posture.
+        assert_eq!(consumer.spill_priority(), i32::MAX);
+        consumer.pause();
+        assert!(handle.is_paused());
+        consumer.resume();
+        assert!(!handle.is_paused());
+    }
+}

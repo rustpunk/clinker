@@ -21,8 +21,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Cross-platform RSS measurement. Returns `None` on unsupported platforms.
 pub fn rss_bytes() -> Option<u64> {
@@ -173,6 +174,113 @@ impl std::error::Error for ConsumerSpillError {
             Self::Io(e) => Some(e),
             Self::BelowTarget { .. } => None,
         }
+    }
+}
+
+/// Shared state between an operator and the `MemoryConsumer`
+/// wrapper that the arbitrator registers on its behalf.
+///
+/// Pull-mode attribution surface: the operator owns one end of the
+/// `Arc<ConsumerHandle>` and updates `bytes` on every admit / spill
+/// transition; the consumer wrapper owns the other end and reads
+/// `bytes` from inside `MemoryConsumer::current_usage`. Decoupled so
+/// neither side needs a lock on the other's state — both update
+/// lock-free atomics.
+///
+/// `spill_requested` is the arbitrator's nudge to the operator. The
+/// consumer wrapper's `try_spill` flips this flag; the operator's hot
+/// loop reads it at batch boundaries via `take_spill_request()` and
+/// performs the actual spill in-thread (the existing per-operator
+/// spill path). This avoids the deadlock that would arise from a
+/// reentrant `Mutex` around operator state when the arbitrator polls
+/// from the same thread that holds the operator's live state.
+///
+/// `paused` mirrors the `MemoryConsumer::pause` / `resume` signal for
+/// back-pressureable consumers (Sources, `node_buffers` slots that
+/// chain to a pauseable Source). The producer hot loop checks
+/// `is_paused()` at batch boundaries; a real blocking wait
+/// (`Condvar::wait`) lands alongside the producer-side wiring.
+pub struct ConsumerHandle {
+    bytes: AtomicU64,
+    spill_requested: AtomicBool,
+    paused: AtomicBool,
+}
+
+impl ConsumerHandle {
+    /// Construct an empty handle. Operators and consumer wrappers
+    /// share `Arc<ConsumerHandle>` clones of the same instance.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes: AtomicU64::new(0),
+            spill_requested: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+        })
+    }
+
+    /// Current live-byte count the operator has reported.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Absolute set: replaces the counter with `n`. Use when the
+    /// operator already maintains a `usize` byte tally and just
+    /// mirrors it into the atomic at batch boundaries.
+    pub fn set_bytes(&self, n: u64) {
+        self.bytes.store(n, Ordering::Relaxed);
+    }
+
+    /// Saturating add. Use on per-record admissions when the operator
+    /// tracks deltas instead of an absolute total.
+    pub fn add_bytes(&self, n: u64) {
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(n))
+            });
+    }
+
+    /// Saturating subtract. Use on consumer drains to keep the
+    /// counter aligned with what is still live in the operator.
+    pub fn sub_bytes(&self, n: u64) {
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(n))
+            });
+    }
+
+    /// Flip the spill-request flag to `true`. Called by the consumer
+    /// wrapper's `try_spill`; the operator's hot loop reads via
+    /// `take_spill_request` and reacts on its next batch boundary.
+    pub fn request_spill(&self) {
+        self.spill_requested.store(true, Ordering::Release);
+    }
+
+    /// Read-and-clear the spill-request flag. Returns `true` exactly
+    /// once per `request_spill` call (until the next request); the
+    /// operator's hot loop polls this at batch boundaries.
+    pub fn take_spill_request(&self) -> bool {
+        self.spill_requested.swap(false, Ordering::Acquire)
+    }
+
+    /// Whether the consumer is currently paused. Producers (Source
+    /// ingest tasks, back-pressureable `node_buffer` writers) check
+    /// this at batch boundaries; once a blocking wait is wired into
+    /// the producer loop, `is_paused() == true` triggers the wait.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Flip the pause flag to `true`. Called by the consumer
+    /// wrapper's `pause` for back-pressureable consumers.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    /// Flip the pause flag to `false`. Called by the consumer
+    /// wrapper's `resume`.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
     }
 }
 
@@ -1262,6 +1370,53 @@ mod tests {
         }
         // No pause / resume override — defaults must compile and be
         // callable without panic.
+    }
+
+    #[test]
+    fn test_consumer_handle_set_add_sub_bytes_round_trip() {
+        let h = ConsumerHandle::new();
+        assert_eq!(h.bytes(), 0);
+        h.set_bytes(1024);
+        assert_eq!(h.bytes(), 1024);
+        h.add_bytes(512);
+        assert_eq!(h.bytes(), 1536);
+        h.sub_bytes(256);
+        assert_eq!(h.bytes(), 1280);
+        // Saturating-sub: discharge past zero clamps to zero, never
+        // wraps to a huge positive value that would silently disable
+        // downstream pressure gates.
+        h.sub_bytes(9999);
+        assert_eq!(h.bytes(), 0);
+    }
+
+    #[test]
+    fn test_consumer_handle_saturating_add_clamps_at_u64_max() {
+        let h = ConsumerHandle::new();
+        h.set_bytes(u64::MAX - 10);
+        h.add_bytes(100);
+        // Saturates at u64::MAX rather than wrapping below the limit.
+        assert_eq!(h.bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn test_consumer_handle_request_and_take_spill_round_trip() {
+        let h = ConsumerHandle::new();
+        assert!(!h.take_spill_request());
+        h.request_spill();
+        // First `take` after a `request` sees `true`.
+        assert!(h.take_spill_request());
+        // Subsequent `take` calls without a fresh `request` see `false`.
+        assert!(!h.take_spill_request());
+    }
+
+    #[test]
+    fn test_consumer_handle_pause_resume_round_trip() {
+        let h = ConsumerHandle::new();
+        assert!(!h.is_paused());
+        h.pause();
+        assert!(h.is_paused());
+        h.resume();
+        assert!(!h.is_paused());
     }
 
     #[test]

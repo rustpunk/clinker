@@ -1924,6 +1924,62 @@ impl clinker_record::RecordStorage for NullStorage {
     }
 }
 
+/// `MemoryConsumer` wrapper for a `GraceHashExecutor`. Holds an
+/// `Arc<ConsumerHandle>` shared with the executor: live in-memory
+/// `Building` partition `bytes_estimated` is summed into
+/// `handle.bytes`; on-disk partitions are excluded because they're
+/// no longer reclaimable (Velox "reclaimable ≠ held" point).
+/// `try_spill` flips the handle's spill-request flag; the executor's
+/// `add_build_record` polls and elects the largest building partition
+/// to spill via `GraceSpillWriter`.
+///
+/// `spill_priority = 10`: grace-hash partition spill is cheaper than
+/// sort (each partition writes through `GraceSpillWriter` without
+/// run-merge fixup) and far cheaper than hash-aggregation rebuilds.
+/// Preferred early victim alongside `node_buffers`.
+/// `can_back_pressure = false`: the executor reads its driver
+/// stream-to-completion before probing, so there's no upstream channel
+/// to pause once the build phase has started.
+pub struct GraceHashConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl GraceHashConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for GraceHashConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        10
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
