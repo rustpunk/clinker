@@ -3196,6 +3196,19 @@ pub(crate) async fn dispatch_plan_node(
                     transform_idx,
                 )?
             } else {
+                // Register an AggregateConsumer with the pipeline-
+                // scoped arbitrator. The handle's `bytes` counter is
+                // shared with HashAggregator once the operator gains
+                // its `Arc<ConsumerHandle>` field in a follow-up
+                // commit; until then current_usage reads zero and
+                // the consumer is a structural registry entry the
+                // Priority policy ranks behind every reporting
+                // operator.
+                ctx.memory_budget.register_consumer(Box::new(
+                    crate::aggregation::AggregateConsumer::new(
+                        crate::pipeline::memory::ConsumerHandle::new(),
+                    ),
+                ));
                 let mut stream = crate::aggregation::AggregateStream::for_node(
                     Arc::clone(compiled),
                     evaluator,
@@ -4193,6 +4206,18 @@ pub(crate) async fn dispatch_plan_node(
             // strategy-specific.
             match dispatch {
                 Dispatch::IEJoin(partition_bits) => {
+                    // Register an IEJoin consumer with the pipeline-
+                    // scoped arbitrator. IEJoin reuses the sort-buffer
+                    // spill machinery for its build-side bit array and
+                    // sort permutation, so it registers under
+                    // `SortConsumer` (priority 20); the handle's bytes
+                    // start at zero and gain wiring once IEJoin's build
+                    // path is plumbed.
+                    ctx.memory_budget.register_consumer(Box::new(
+                        crate::pipeline::sort_buffer::SortConsumer::new(
+                            crate::pipeline::memory::ConsumerHandle::new(),
+                        ),
+                    ));
                     // Advance per-source `rollback_cursors` for every
                     // build-side record before its `row_num` is dropped
                     // in the `(r, _)` map. Source→Combine direct paths
@@ -4280,6 +4305,19 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
+                    // Register a GraceHashConsumer with the pipeline-
+                    // scoped arbitrator. The handle's bytes counter is
+                    // shared with GraceHashExecutor once the executor
+                    // gains its `Arc<ConsumerHandle>` field in a
+                    // follow-up commit; until then current_usage reads
+                    // zero and the consumer is a structural registry
+                    // entry the Priority policy ranks first among
+                    // partition-spillable victims (priority 10).
+                    ctx.memory_budget.register_consumer(Box::new(
+                        crate::pipeline::grace_hash::GraceHashConsumer::new(
+                            crate::pipeline::memory::ConsumerHandle::new(),
+                        ),
+                    ));
                     // Same per-source cursor advance the IEJoin arm
                     // performs; Source→Combine direct paths on either
                     // side need the explicit walk because the build /
@@ -4361,6 +4399,20 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::SortMerge => {
+                    // Register a SortMergeConsumer with the pipeline-
+                    // scoped arbitrator. The handle's bytes counter
+                    // sums Phase A SortBuffer.bytes_used + Phase B
+                    // matching-run accumulator once SortMergeExec
+                    // gains its handle field; until then
+                    // current_usage reads zero and the consumer is a
+                    // structural registry entry the Priority policy
+                    // ranks behind sort and grace-hash but ahead of
+                    // hash-aggregation.
+                    ctx.memory_budget.register_consumer(Box::new(
+                        crate::pipeline::sort_merge_join::SortMergeConsumer::new(
+                            crate::pipeline::memory::ConsumerHandle::new(),
+                        ),
+                    ));
                     // SortMerge is selected by the planner only
                     // for pure-range predicates whose inputs
                     // already arrive sorted on the range key
