@@ -559,7 +559,7 @@ impl CombineHashTable {
         records: Vec<Record>,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError> {
         let expected = estimated_rows.unwrap_or(records.len());

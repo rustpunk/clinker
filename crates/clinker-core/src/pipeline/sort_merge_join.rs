@@ -338,7 +338,7 @@ pub(crate) struct SortMergeExec<'a> {
     /// `copy_build_ck_columns` at each emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryArbitrator,
+    pub budget: &'a MemoryArbitrator,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. Matching-run spill segments
     /// land inside it; the surrounding `Arc<TempDir>` Drop is the
@@ -721,7 +721,7 @@ fn sort_driver_pairs_externally(
     pairs: &mut Vec<(Record, RecordOrder, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -822,7 +822,7 @@ fn sort_build_pairs_externally(
     pairs: &mut Vec<(Record, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -936,7 +936,7 @@ struct WalkArgs<'a, 'b, 'c> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'c mut MemoryArbitrator,
+    budget: &'c MemoryArbitrator,
 }
 
 /// Walk the two pre-sorted cursors, emitting cross-product matches per
@@ -1070,7 +1070,7 @@ struct EmitForRunArgs<'a, 'b> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'b mut MemoryArbitrator,
+    budget: &'b MemoryArbitrator,
 }
 
 /// Emit cross-product records for one driver row against the buffered

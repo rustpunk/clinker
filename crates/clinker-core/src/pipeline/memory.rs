@@ -614,11 +614,11 @@ impl MemoryArbitrator {
     /// write. Saturating-add via `fetch_update` keeps an overflowing
     /// pipeline from wrapping back below the quota silently.
     pub fn record_spill_bytes(&self, n: u64) -> bool {
-        let _ = self.cumulative_spill_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_add(n)),
-        );
+        let _ =
+            self.cumulative_spill_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_add(n))
+                });
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
             > self.max_spill_bytes.load(Ordering::Relaxed)
     }
@@ -635,11 +635,11 @@ impl MemoryArbitrator {
     /// exit: the pipeline's declared memory limit is a pipeline-wide
     /// envelope, not a per-arena one.
     pub fn charge_arena_bytes(&self, n: u64) -> bool {
-        let _ = self.arena_bytes_charged.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_add(n)),
-        );
+        let _ =
+            self.arena_bytes_charged
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_add(n))
+                });
         self.arena_bytes_charged.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
     }
 
@@ -1151,8 +1151,7 @@ mod tests {
 
     #[test]
     fn test_register_consumer_assigns_monotonic_ids() {
-        let arbitrator =
-            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
             usage: 10,
             priority: 0,
@@ -1179,8 +1178,7 @@ mod tests {
 
     #[test]
     fn test_unregister_consumer_returns_removed() {
-        let arbitrator =
-            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let id = arbitrator.register_consumer(Box::new(MockConsumer {
             usage: 100,
             priority: 0,
@@ -1198,8 +1196,7 @@ mod tests {
 
     #[test]
     fn test_sum_consumer_usage_aggregates_registered() {
-        let arbitrator =
-            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.sum_consumer_usage(), 0);
         arbitrator.register_consumer(Box::new(MockConsumer {
             usage: 1024,
@@ -1224,8 +1221,7 @@ mod tests {
 
     #[test]
     fn test_consumer_ids_are_never_reused_after_unregister() {
-        let arbitrator =
-            MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
             usage: 1,
             priority: 0,

@@ -1141,7 +1141,7 @@ impl PipelineExecutor {
         // limit across N upstream operators by accident. The active
         // policy is the one `pipeline.memory.backpressure` selects;
         // default `pause` installs `BackPressurePreferred -> Priority`.
-        let memory_budget = build_arbitrator_from_config(config);
+        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
 
         // No prologue drain or arena build. The dispatch Source arm
         // is the first consumer of every `mpsc::Receiver`:
@@ -1212,7 +1212,7 @@ impl PipelineExecutor {
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
-        memory_budget: crate::pipeline::memory::MemoryArbitrator,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
         spill_root: Arc<tempfile::TempDir>,
         spill_root_path: Arc<std::path::Path>,
         watermarks: crate::executor::watermark::PerSourceWatermarks,

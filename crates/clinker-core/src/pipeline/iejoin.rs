@@ -423,7 +423,7 @@ pub(crate) struct IEJoinExec<'a> {
     /// the shared `copy_build_ck_columns` helper at every emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryArbitrator,
+    pub budget: &'a MemoryArbitrator,
 }
 
 pub(crate) fn execute_combine_iejoin(

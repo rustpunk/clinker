@@ -356,7 +356,7 @@ pub(crate) struct GraceHashExec<'a> {
     /// `copy_build_ck_columns` at each emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryArbitrator,
+    pub budget: &'a MemoryArbitrator,
     /// Pipeline-scoped spill directory. Owned by the executor's
     /// `Arc<TempDir>` on `ExecutorContext`; this borrow lives for one
     /// combine invocation. Cleanup of individual spill files runs on
@@ -448,7 +448,7 @@ impl GraceHashExecutor {
         &mut self,
         record: Record,
         hash: u64,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
     ) -> std::io::Result<()> {
         let p = self.assigner.partition_for(hash) as usize;
         let bytes = estimated_record_bytes(&record);
@@ -510,7 +510,7 @@ impl GraceHashExecutor {
 
     /// Force-spill the largest Building partition. Returns Ok(()) when
     /// no Building partition remains (everything is already on disk).
-    fn spill_largest_building(&mut self, budget: &mut MemoryArbitrator) -> std::io::Result<()> {
+    fn spill_largest_building(&mut self, budget: &MemoryArbitrator) -> std::io::Result<()> {
         // Iterate until RSS drops below soft limit OR no Building
         // partition is left to evict. The soft limit is checked through
         // `should_spill` rather than `should_abort`: we want to catch
@@ -584,7 +584,7 @@ impl GraceHashExecutor {
         &mut self,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
         combine_name: &str,
     ) -> Result<(), PipelineError> {
         for i in 0..self.partitions.len() {
@@ -1043,7 +1043,7 @@ fn process_spilled_partition(
     rc: &ReloadContext<'_>,
     sp: SpilledPartition,
     body_evaluator: &mut Option<ProgramEvaluator>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
     output: &mut Vec<(Record, RecordOrder)>,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
@@ -1492,7 +1492,7 @@ fn bnl_fallback(
     sp: &SpilledPartition,
     build_records: Vec<Record>,
     body_evaluator: &mut Option<ProgramEvaluator>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
     output: &mut Vec<(Record, RecordOrder)>,
     stats: &mut BnlStats,
 ) -> Result<(), PipelineError> {

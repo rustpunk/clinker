@@ -683,7 +683,13 @@ pub(crate) struct ExecutorContext<'a> {
     /// accumulate against this budget so a relaxed pipeline cannot
     /// multiply its declared limit across N upstream operators by
     /// accident.
-    pub(crate) memory_budget: crate::pipeline::memory::MemoryArbitrator,
+    /// Held as `Arc<MemoryArbitrator>` so the same instance is the
+    /// single seat for every Combine dispatch arm, every per-operator
+    /// `MemoryConsumer`, and any Rayon worker the kernel hands off to.
+    /// One declared `mem_limit` cannot be multiplied across arms when
+    /// every arm clones a handle to the same arbitrator instead of
+    /// constructing its own.
+    pub(crate) memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
 
     /// Per-correlation-group buffer holding deferred output writes
     /// and per-record error events. `Some` iff the plan carries a
@@ -1494,19 +1500,15 @@ pub(crate) fn finalize_node_rooted_windows(
             _ => plan_anchor,
         };
         let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-        let arena = Arena::from_records(
-            rows,
-            &spec.arena_fields,
-            anchor_schema,
-            &mut ctx.memory_budget,
-        )
-        .map_err(|e| PipelineError::MemoryBudgetExceeded {
-            node: current_dag.graph[upstream_idx].name().to_string(),
-            used: ctx.memory_budget.arena_bytes_charged(),
-            limit: ctx.memory_budget.hard_limit(),
-            source: BudgetCategory::Arena,
-            detail: Some(format!("node-rooted arena build: {e}")),
-        })?;
+        let arena =
+            Arena::from_records(rows, &spec.arena_fields, anchor_schema, &ctx.memory_budget)
+                .map_err(|e| PipelineError::MemoryBudgetExceeded {
+                    node: current_dag.graph[upstream_idx].name().to_string(),
+                    used: ctx.memory_budget.arena_bytes_charged(),
+                    limit: ctx.memory_budget.hard_limit(),
+                    source: BudgetCategory::Arena,
+                    detail: Some(format!("node-rooted arena build: {e}")),
+                })?;
         let arena_len = arena.record_count();
         ctx.collector
             .record(arena_timer.finish(arena_len, arena_len));
@@ -4191,7 +4193,6 @@ pub(crate) async fn dispatch_plan_node(
             // strategy-specific.
             match dispatch {
                 Dispatch::IEJoin(partition_bits) => {
-                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Advance per-source `rollback_cursors` for every
                     // build-side record before its `row_num` is dropped
                     // in the `(r, _)` map. Source→Combine direct paths
@@ -4255,7 +4256,7 @@ pub(crate) async fn dispatch_plan_node(
                             partition_bits,
                             propagate_ck,
                             ctx: &iejoin_ctx,
-                            budget: &mut budget,
+                            budget: &ctx.memory_budget,
                         })
                     })?;
                     let probe_records_out = output_records.len() as u64;
@@ -4279,7 +4280,6 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::Grace(partition_bits) => {
-                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Same per-source cursor advance the IEJoin arm
                     // performs; Source→Combine direct paths on either
                     // side need the explicit walk because the build /
@@ -4337,7 +4337,7 @@ pub(crate) async fn dispatch_plan_node(
                             partition_bits,
                             propagate_ck,
                             ctx: &grace_ctx,
-                            budget: &mut budget,
+                            budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
                         })
                     })?;
@@ -4368,7 +4368,6 @@ pub(crate) async fn dispatch_plan_node(
                     // path skips Phase A external sort and walks
                     // the inputs in place via the two-cursor
                     // merge.
-                    let mut budget = super::build_arbitrator_from_config(ctx.config);
                     // Same per-source cursor advance the IEJoin /
                     // Grace arms perform; Source→Combine direct paths
                     // on either side need the explicit walk because
@@ -4426,7 +4425,7 @@ pub(crate) async fn dispatch_plan_node(
                             presorted: true,
                             propagate_ck,
                             ctx: &sm_ctx,
-                            budget: &mut budget,
+                            budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
                         })
                     })?;
@@ -4451,13 +4450,16 @@ pub(crate) async fn dispatch_plan_node(
                 Dispatch::Inline => {}
             }
 
-            // Hash-build phase — drain the build buffer into a
-            // fresh MemoryArbitrator-governed CombineHashTable. The
-            // stage timer covers the full build walk; on a
-            // budget abort the timer is dropped without
-            // recording (matches the `StageTimer` "no report on
-            // error" contract documented at its definition).
-            let mut budget = super::build_arbitrator_from_config(ctx.config);
+            // Hash-build phase — drain the build buffer into the
+            // pipeline-scoped MemoryArbitrator-governed
+            // CombineHashTable. The stage timer covers the full
+            // build walk; on a budget abort the timer is dropped
+            // without recording (matches the `StageTimer` "no
+            // report on error" contract documented at its
+            // definition). Arc-clone the pipeline-scoped handle
+            // so subsequent `&mut ctx` borrows for cursor advance
+            // are not blocked by an immutable borrow of `ctx`.
+            let budget = ctx.memory_budget.clone();
             // Per-source cursor advance for both build and driver.
             // Source→Combine direct paths bypass the Transform /
             // Aggregate advance points so the cursor never moved off
@@ -4492,7 +4494,7 @@ pub(crate) async fn dispatch_plan_node(
                 build_records,
                 &build_extractor,
                 &hash_table_ctx,
-                &mut budget,
+                &budget,
                 estimated_rows,
             )
             .map_err(|e| PipelineError::MemoryBudgetExceeded {

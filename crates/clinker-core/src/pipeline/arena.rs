@@ -51,7 +51,7 @@ impl Arena {
         fields: &[String],
         mem_limit: usize,
         shutdown: Option<&super::shutdown::ShutdownToken>,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
     ) -> Result<Self, ArenaError> {
         let source_schema = reader.schema()?;
 
@@ -145,7 +145,7 @@ impl Arena {
         rows: &[(clinker_record::Record, u64)],
         fields: &[String],
         anchor_schema: &Arc<Schema>,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
     ) -> Result<Self, ArenaError> {
         let schema: Arc<Schema> = fields
             .iter()
@@ -209,7 +209,7 @@ impl RecordStorage for Arena {
 fn project_records_into_minimal<'a, I>(
     records: I,
     field_indices: &[Option<usize>],
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
 ) -> Result<Vec<MinimalRecord>, ArenaError>
 where
     I: IntoIterator<Item = &'a clinker_record::Record>,
