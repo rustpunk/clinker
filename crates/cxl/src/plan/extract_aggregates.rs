@@ -221,6 +221,7 @@ fn extract_aggs_from_expr(
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -373,6 +374,7 @@ fn rewrite_group_key_refs(
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggCall { .. }
@@ -467,6 +469,7 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -520,6 +523,7 @@ fn contains_agg_call(expr: &Expr) -> bool {
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
@@ -592,6 +596,9 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
             input_name, field, ..
         } => {
             let _ = write!(buf, "qs:{input_name}.{field}");
+        }
+        Expr::DocAccess { section, field, .. } => {
+            let _ = write!(buf, "d:{section}.{field}");
         }
         Expr::RecordAccess { field, .. } => {
             let _ = write!(buf, "r:{field}");

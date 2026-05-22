@@ -1,3 +1,4 @@
+use crate::document_context::{DocumentContext, synthetic_document_context};
 use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
@@ -18,6 +19,13 @@ const MAX_RECORD_VARS: usize = 64;
 /// silently dropped (`drop`), or cause the source to fail (`reject`)
 /// — by the time a Record exists, its schema already names every
 /// value it carries.
+///
+/// Every record carries an `Arc<DocumentContext>` exposing
+/// `$doc.<section>.<field>` envelope data. Records emitted from a
+/// source file share that file's `Arc` (one allocation per document,
+/// refcount-bump per record); records synthesized in-pipeline
+/// (Transform projection, test fixtures) share the process-wide
+/// [`synthetic_document_context`] whose section map is empty.
 #[derive(Debug, Clone)]
 pub struct Record {
     schema: Arc<Schema>,
@@ -27,6 +35,13 @@ pub struct Record {
     /// `scope: record`. Lazy-initialized on first `set_record_var()`
     /// call.
     record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
+    /// Envelope context shared per source file. CXL `$doc.*`
+    /// expressions resolve through this Arc. Source ingest replaces
+    /// the default synthetic context via [`Record::set_doc_ctx`]
+    /// after assembly; records that pre-date envelope-aware ingest
+    /// (synthesized in-pipeline, test fixtures) keep the synthetic
+    /// default.
+    doc_ctx: Arc<DocumentContext>,
 }
 
 /// Wire payload for a [`Record`] in binary spill streams.
@@ -93,7 +108,25 @@ impl Record {
             schema,
             values,
             record_vars: None,
+            doc_ctx: synthetic_document_context(),
         }
+    }
+
+    /// Replace the per-document envelope context for this record. Used
+    /// by Source ingest immediately after `Record::new` to attach the
+    /// per-file `Arc<DocumentContext>` produced by the reader's
+    /// envelope pre-scan. Subsequent CXL `$doc.<section>.<field>`
+    /// evaluation resolves through this context.
+    pub fn set_doc_ctx(&mut self, doc_ctx: Arc<DocumentContext>) {
+        self.doc_ctx = doc_ctx;
+    }
+
+    /// Borrow this record's envelope context. Returns a reference to
+    /// the synthetic context for records that don't have a real source
+    /// document (Transform synthesis, test fixtures); section lookups
+    /// against the synthetic context return `None` (CXL maps to `Value::Null`).
+    pub fn doc_ctx(&self) -> &Arc<DocumentContext> {
+        &self.doc_ctx
     }
 
     /// Returns the schema-indexed value for `name`, or `None` when the
@@ -340,8 +373,8 @@ mod tests {
     }
 
     /// Structural assertion: `Record` holds exactly `schema`,
-    /// `values`, and `record_vars`. Adding or renaming a field fails
-    /// compilation.
+    /// `values`, `record_vars`, and `doc_ctx`. Adding or renaming a
+    /// field fails compilation.
     #[test]
     fn test_record_struct_has_exactly_schema_values_record_vars_fields() {
         let schema = test_schema();
@@ -351,6 +384,7 @@ mod tests {
             schema: _,
             values: _,
             record_vars: _,
+            doc_ctx: _,
         } = rec;
     }
 
@@ -471,6 +505,40 @@ mod tests {
         let mut fields = record.available_fields();
         fields.sort();
         assert_eq!(fields, vec!["age", "name"]);
+    }
+
+    #[test]
+    fn test_record_default_doc_ctx_is_synthetic() {
+        use crate::document_context::{DocumentId, synthetic_document_context};
+        let schema = test_schema();
+        let record = Record::new(schema, vec![Value::Null; 5]);
+        assert!(Arc::ptr_eq(record.doc_ctx(), &synthetic_document_context()));
+        assert_eq!(record.doc_ctx().id(), DocumentId::SYNTHETIC);
+    }
+
+    #[test]
+    fn test_record_set_doc_ctx_attaches_real_context() {
+        use crate::document_context::{DocumentContext, DocumentId};
+        let schema = test_schema();
+        let mut record = Record::new(schema, vec![Value::Null; 5]);
+        let id = DocumentId::next();
+        let mut sections = IndexMap::new();
+        sections.insert(
+            Box::from("Head"),
+            Value::Map(Box::new({
+                let mut m = IndexMap::new();
+                m.insert(Box::from("batch"), Value::String("R-1".into()));
+                m
+            })),
+        );
+        let ctx = Arc::new(DocumentContext::new(id, Arc::from("doc.xml"), sections));
+        record.set_doc_ctx(Arc::clone(&ctx));
+        assert!(Arc::ptr_eq(record.doc_ctx(), &ctx));
+        assert_eq!(record.doc_ctx().id(), id);
+        assert_eq!(
+            record.doc_ctx().get_section_field("Head", "batch"),
+            Some(Value::String("R-1".into()))
+        );
     }
 
     #[test]

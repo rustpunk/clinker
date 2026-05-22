@@ -535,6 +535,18 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::DocAccess { node_id, .. } => {
+                // `$doc.<section>.<field>` types as `Any` until envelope
+                // section schemas flow through typecheck context (added
+                // alongside the per-source envelope config wiring).
+                // `Any` unifies with everything so arithmetic and
+                // comparison expressions remain well-typed; runtime
+                // evaluation yields the actual envelope value or
+                // `Value::Null` for an undeclared section / field.
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
             Expr::Now { node_id, .. } => {
                 self.set_type(*node_id, Type::DateTime);
                 Type::DateTime
@@ -1167,6 +1179,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::SourceAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
             | Expr::RecordAccess { .. }
+            | Expr::DocAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::AggSlot { .. }

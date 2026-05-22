@@ -1917,6 +1917,7 @@ pub(crate) async fn transform_fused_consume(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &rec_source_name_arc,
+                doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
             let target_schema = output_schema
                 .as_ref()
@@ -2314,6 +2315,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
+                    doc_ctx: clinker_record::synthetic_document_context_ref(),
                 };
 
                 let target_schema = output_schema
@@ -2596,6 +2598,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
 
                     let route_result = {
@@ -3223,6 +3226,7 @@ pub(crate) async fn dispatch_plan_node(
                             source_batch: ctx.source_batch_arc,
                             ingestion_timestamp: ctx.source_ingestion_timestamp,
                             source_name: &source_name_arc,
+                            doc_ctx: clinker_record::synthetic_document_context_ref(),
                         };
                         let add_result =
                             stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
@@ -3292,6 +3296,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &MERGED_SOURCE_NAME,
+                    doc_ctx: clinker_record::synthetic_document_context_ref(),
                 };
                 if is_relaxed {
                     let mut hash_box = match stream.into_retained_hash() {
@@ -4232,6 +4237,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound IEJoin kernel — partition + range-walk
                     // + materialize; sized to saturate a worker thread.
@@ -4317,6 +4323,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound grace-hash join kernel: partition build
                     // + probe + spill I/O. `block_in_place` keeps the
@@ -4407,6 +4414,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound sort-merge join kernel: two-cursor merge
                     // over pre-sorted inputs. `block_in_place` keeps
@@ -4483,6 +4491,7 @@ pub(crate) async fn dispatch_plan_node(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
+                doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
             let build_timer =
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
@@ -4541,6 +4550,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
+                    doc_ctx: clinker_record::synthetic_document_context_ref(),
                 };
 
                 // Probe-side key extraction routes through the
@@ -6032,6 +6042,7 @@ fn run_time_windowed_aggregate(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
                     if add_result.is_ok() {
@@ -6066,6 +6077,7 @@ fn run_time_windowed_aggregate(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
+                doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
             for (_, stream) in entries {
                 match stream.finalize(&finalize_ctx, &mut out_rows) {
@@ -6131,6 +6143,7 @@ where
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &source_name_arc,
+        doc_ctx: clinker_record::synthetic_document_context_ref(),
     };
     let stream = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -6219,6 +6232,7 @@ fn finalize_windows(
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &MERGED_SOURCE_NAME,
+        doc_ctx: clinker_record::synthetic_document_context_ref(),
     };
     for (_, stream) in entries {
         match stream.finalize(&finalize_ctx, out_rows) {
