@@ -1751,8 +1751,7 @@ fn build_format_reader(
         }
         crate::config::InputFormat::Xml(opts) => {
             let config = build_xml_reader_config(opts.as_ref(), input.array_paths.as_deref());
-            let buf_reader = std::io::BufReader::new(reader);
-            Ok(Box::new(XmlReader::new(buf_reader, config)))
+            Ok(Box::new(XmlReader::new(reader, config)?))
         }
         crate::config::InputFormat::FixedWidth(opts) => {
             let fields = extract_field_defs(input)?;
