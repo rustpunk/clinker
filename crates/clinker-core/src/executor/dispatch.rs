@@ -4579,6 +4579,18 @@ pub(crate) async fn dispatch_plan_node(
                 Dispatch::Inline => {}
             }
 
+            // Single ConsumerHandle shared between the
+            // CombineHashConsumer wrapper (Priority policy
+            // priority 30) and the post-build mirroring step below
+            // that sets the handle's counter to the freshly-built
+            // CombineHashTable's `memory_bytes()`. The wrapper's
+            // ConsumerId is unregistered at arm exit so the
+            // arbitrator's registry tracks live tables only.
+            let inline_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+            let inline_consumer_id = ctx.memory_budget.register_consumer(Box::new(
+                crate::pipeline::combine::CombineHashConsumer::new(inline_consumer_handle.clone()),
+            ));
+
             // Hash-build phase — drain the build buffer into the
             // pipeline-scoped MemoryArbitrator-governed
             // CombineHashTable. The stage timer covers the full
@@ -4634,6 +4646,13 @@ pub(crate) async fn dispatch_plan_node(
                 detail: Some(format!("combine build: {e}")),
             })?;
             let build_records_out = hash_table.len() as u64;
+            // Mirror the freshly-built table's footprint into the
+            // consumer handle so the arbitrator's pull-mode
+            // `current_usage` reads the inline-combine's in-memory
+            // bytes for the duration of the probe loop. The probe
+            // loop is read-only on the table so no further updates
+            // are needed; arm exit below unregisters the consumer.
+            inline_consumer_handle.set_bytes(hash_table.memory_bytes() as u64);
             ctx.collector
                 .record(build_timer.finish(build_records_in, build_records_out));
 
@@ -5074,6 +5093,10 @@ pub(crate) async fn dispatch_plan_node(
             // Combine-output-row failure reads and restores this entry
             // before clearing.
             ctx.combine_input_snapshots.remove(&node_idx);
+            // The hash table goes out of scope when this arm returns;
+            // unregister its consumer so the arbitrator's registry
+            // tracks live tables only.
+            ctx.memory_budget.unregister_consumer(inline_consumer_id);
         }
 
         PlanNode::CorrelationCommit { .. } => {
