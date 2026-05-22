@@ -4411,18 +4411,16 @@ pub(crate) async fn dispatch_plan_node(
                     return Ok(());
                 }
                 Dispatch::SortMerge => {
-                    // Register a SortMergeConsumer with the pipeline-
-                    // scoped arbitrator. The handle's bytes counter
-                    // sums Phase A SortBuffer.bytes_used + Phase B
-                    // matching-run accumulator once SortMergeExec
-                    // gains its handle field; until then
-                    // current_usage reads zero and the consumer is a
-                    // structural registry entry the Priority policy
-                    // ranks behind sort and grace-hash but ahead of
-                    // hash-aggregation.
+                    // Single ConsumerHandle shared between the
+                    // SortMergeConsumer wrapper (Priority policy
+                    // priority 25) and the SortMergeExec kernel that
+                    // mirrors Phase A `SortBuffer.bytes_used` + Phase B
+                    // matching-run accumulator size into the handle's
+                    // counter at every push / spill transition.
+                    let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                     ctx.memory_budget.register_consumer(Box::new(
                         crate::pipeline::sort_merge_join::SortMergeConsumer::new(
-                            crate::pipeline::memory::ConsumerHandle::new(),
+                            sm_consumer_handle.clone(),
                         ),
                     ));
                     // SortMerge is selected by the planner only
@@ -4491,6 +4489,7 @@ pub(crate) async fn dispatch_plan_node(
                             ctx: &sm_ctx,
                             budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
+                            consumer_handle: sm_consumer_handle,
                         })
                     })?;
                     let probe_records_out = output_records.len() as u64;
