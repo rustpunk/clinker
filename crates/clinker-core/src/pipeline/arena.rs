@@ -115,10 +115,18 @@ impl Arena {
                     limit: mem_limit,
                 });
             }
-            if budget.should_abort() {
+            // Single-arena overflow against the pipeline-wide ceiling.
+            // The arena's own projected footprint is the right gate
+            // here — whole-process RSS (the arbitrator's `should_abort`)
+            // includes the criterion harness, input buffers, and
+            // allocator slack, which would false-trip a benchmark whose
+            // arena fits but whose process footprint does not. Cross-
+            // arena attribution comes from registered consumers.
+            let hard_limit = budget.hard_limit() as usize;
+            if hard_limit > 0 && local_bytes_used > hard_limit {
                 return Err(ArenaError::MemoryBudgetExceeded {
-                    used: budget.peak_rss().unwrap_or(0) as usize,
-                    limit: budget.hard_limit() as usize,
+                    used: local_bytes_used,
+                    limit: hard_limit,
                 });
             }
 
@@ -215,6 +223,8 @@ where
     I: IntoIterator<Item = &'a clinker_record::Record>,
 {
     let mut out: Vec<MinimalRecord> = Vec::new();
+    let mut local_bytes_used: usize = 0;
+    let hard_limit = budget.hard_limit() as usize;
     for record in records {
         let projected: Vec<Value> = field_indices
             .iter()
@@ -224,11 +234,16 @@ where
             })
             .collect();
         let minimal = MinimalRecord::new(projected);
-        let _size = estimated_size(&minimal) as u64;
-        if budget.should_abort() {
+        local_bytes_used += estimated_size(&minimal);
+        // Gate on this arena's own projected footprint against the
+        // pipeline ceiling. Whole-process RSS (`should_abort`) is the
+        // wrong signal here — it folds in unrelated resident memory and
+        // would false-trip a node-rooted arena that fits. Cross-arena
+        // attribution comes from registered consumers.
+        if hard_limit > 0 && local_bytes_used > hard_limit {
             return Err(ArenaError::MemoryBudgetExceeded {
-                used: budget.peak_rss().unwrap_or(0) as usize,
-                limit: budget.hard_limit() as usize,
+                used: local_bytes_used,
+                limit: hard_limit,
             });
         }
         out.push(minimal);
