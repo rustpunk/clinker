@@ -20,8 +20,7 @@ pub use coercion::{
 };
 pub use counters::{PipelineCounters, RetractionCounters};
 pub use document_context::{
-    DocumentContext, DocumentContextBlob, DocumentId, synthetic_document_context,
-    synthetic_document_context_ref,
+    DocumentContext, DocumentId, synthetic_document_context, synthetic_document_context_ref,
 };
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};
 pub use minimal::MinimalRecord;

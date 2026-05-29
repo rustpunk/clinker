@@ -14,7 +14,6 @@
 
 use crate::value::Value;
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -22,8 +21,9 @@ use std::sync::{Arc, OnceLock};
 ///
 /// Monotonic per-process. Sources allocate via [`DocumentId::next`] when
 /// constructing a new context per file. Used by `Merge` punctuation dedup
-/// and by document-scoped accumulators to bucket per-document state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// (keys a per-document `HashMap` / `HashSet`) to fold a document's
+/// boundary down to one downstream emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DocumentId(u64);
 
 impl DocumentId {
@@ -32,12 +32,6 @@ impl DocumentId {
     pub fn next() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         Self(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Numeric id, intended for log lines and spill encoding. Not stable
-    /// across runs.
-    pub fn as_u64(self) -> u64 {
-        self.0
     }
 
     /// Sentinel id reserved for the synthetic context returned by
@@ -61,7 +55,6 @@ pub struct DocumentContext {
     id: DocumentId,
     source_file: Arc<str>,
     sections: IndexMap<Box<str>, Value>,
-    record_count: Option<u64>,
 }
 
 impl DocumentContext {
@@ -73,7 +66,6 @@ impl DocumentContext {
             id,
             source_file,
             sections,
-            record_count: None,
         }
     }
 
@@ -83,30 +75,15 @@ impl DocumentContext {
     }
 
     /// Originating source file path. Equal to `$source.file` for records
-    /// from this document.
+    /// from this document; the source ingest path compares it by
+    /// `Arc::ptr_eq` to detect file transitions in a multi-file source.
     pub fn source_file(&self) -> &Arc<str> {
         &self.source_file
     }
 
-    /// Final body-record count if known; populated at document close.
-    pub fn record_count(&self) -> Option<u64> {
-        self.record_count
-    }
-
-    /// All envelope sections in declaration order.
-    pub fn sections(&self) -> &IndexMap<Box<str>, Value> {
-        &self.sections
-    }
-
-    /// Resolve `$doc.<section>` to its envelope payload, typically a
-    /// [`Value::Map`] containing the section's fields.
-    pub fn get_section(&self, section: &str) -> Option<&Value> {
-        self.sections.get(section)
-    }
-
     /// Resolve `$doc.<section>.<field>` by chained lookup. Returns
     /// `None` if either the section is undeclared on this document or
-    /// the field is missing from the section's payload. Callers map
+    /// the field is missing from the section's payload. CXL eval maps
     /// `None` to [`Value::Null`] per the streaming-resolver convention.
     pub fn get_section_field(&self, section: &str, field: &str) -> Option<Value> {
         match self.sections.get(section)? {
@@ -118,12 +95,6 @@ impl DocumentContext {
             _ => None,
         }
     }
-
-    /// Names of every declared section, used for `best_match` spelling
-    /// suggestions at resolve time.
-    pub fn section_names(&self) -> Vec<&str> {
-        self.sections.keys().map(|k| k.as_ref()).collect()
-    }
 }
 
 fn synthetic_storage() -> &'static Arc<DocumentContext> {
@@ -133,7 +104,6 @@ fn synthetic_storage() -> &'static Arc<DocumentContext> {
             id: DocumentId::SYNTHETIC,
             source_file: Arc::from(""),
             sections: IndexMap::new(),
-            record_count: None,
         })
     })
 }
@@ -158,51 +128,6 @@ pub fn synthetic_document_context_ref() -> &'static Arc<DocumentContext> {
     synthetic_storage()
 }
 
-/// Wire-format blob for round-tripping a [`DocumentContext`] through
-/// spill files. The on-disk encoding is by-value (no Arc), so the
-/// decoder reconstructs an `Arc<DocumentContext>` from a blob; identity
-/// across the spill boundary is preserved by interning blobs with the
-/// same `id` to a single Arc per replay.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DocumentContextBlob {
-    pub id: DocumentId,
-    pub source_file: String,
-    pub sections: Vec<(String, Value)>,
-    pub record_count: Option<u64>,
-}
-
-impl DocumentContextBlob {
-    /// Materialize a blob from a context.
-    pub fn from_context(ctx: &DocumentContext) -> Self {
-        Self {
-            id: ctx.id,
-            source_file: ctx.source_file.to_string(),
-            sections: ctx
-                .sections
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect(),
-            record_count: ctx.record_count,
-        }
-    }
-
-    /// Reconstruct an owned [`DocumentContext`]. Callers typically wrap
-    /// the result in an `Arc` and intern by `id` to share identity
-    /// across records that decode from the same spill chunk.
-    pub fn into_context(self) -> DocumentContext {
-        let mut sections = IndexMap::with_capacity(self.sections.len());
-        for (k, v) in self.sections {
-            sections.insert(k.into_boxed_str(), v);
-        }
-        DocumentContext {
-            id: self.id,
-            source_file: Arc::from(self.source_file.as_str()),
-            sections,
-            record_count: self.record_count,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,10 +141,9 @@ mod tests {
     }
 
     #[test]
-    fn document_id_next_is_monotonic() {
+    fn document_id_next_is_monotonic_and_distinct() {
         let a = DocumentId::next();
         let b = DocumentId::next();
-        assert!(a.as_u64() < b.as_u64());
         assert_ne!(a, b);
         assert_ne!(a, DocumentId::SYNTHETIC);
     }
@@ -230,14 +154,14 @@ mod tests {
         let b = synthetic_document_context();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.id(), DocumentId::SYNTHETIC);
-        assert!(a.sections().is_empty());
+        // Synthetic context carries no sections — every $doc.* misses.
+        assert!(a.get_section_field("anything", "x").is_none());
     }
 
     #[test]
-    fn synthetic_get_section_field_returns_none() {
-        let ctx = synthetic_document_context();
-        assert!(ctx.get_section("anything").is_none());
-        assert!(ctx.get_section_field("anything", "x").is_none());
+    fn synthetic_ref_matches_owned_singleton() {
+        let owned = synthetic_document_context();
+        assert!(Arc::ptr_eq(synthetic_document_context_ref(), &owned));
     }
 
     #[test]
@@ -264,20 +188,17 @@ mod tests {
             ctx.get_section_field("Foot", "record_count"),
             Some(Value::Integer(42))
         );
-        // Unknown section
+        // Unknown section.
         assert!(ctx.get_section_field("Middle", "x").is_none());
-        // Known section, unknown field
+        // Known section, unknown field.
         assert!(ctx.get_section_field("Head", "missing").is_none());
     }
 
     #[test]
-    fn section_names_listed_in_declaration_order() {
-        let mut sections = IndexMap::new();
-        sections.insert(Box::from("Head"), make_section(&[]));
-        sections.insert(Box::from("Foot"), make_section(&[]));
-        sections.insert(Box::from("Middle"), make_section(&[]));
-        let ctx = DocumentContext::new(DocumentId::next(), Arc::from("doc.xml"), sections);
-        assert_eq!(ctx.section_names(), vec!["Head", "Foot", "Middle"]);
+    fn source_file_is_borrowable_for_ptr_eq() {
+        let file: Arc<str> = Arc::from("doc.xml");
+        let ctx = DocumentContext::new(DocumentId::next(), Arc::clone(&file), IndexMap::new());
+        assert!(Arc::ptr_eq(ctx.source_file(), &file));
     }
 
     #[test]
@@ -285,26 +206,5 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DocumentContext>();
         assert_send_sync::<Arc<DocumentContext>>();
-    }
-
-    #[test]
-    fn blob_roundtrip_preserves_sections_and_id() {
-        let id = DocumentId::next();
-        let mut sections = IndexMap::new();
-        sections.insert(
-            Box::from("preamble"),
-            make_section(&[("tag", Value::String("X".into()))]),
-        );
-        let ctx = DocumentContext::new(id, Arc::from("file.json"), sections);
-
-        let blob = DocumentContextBlob::from_context(&ctx);
-        let decoded = blob.into_context();
-
-        assert_eq!(decoded.id(), id);
-        assert_eq!(&**decoded.source_file(), "file.json");
-        assert_eq!(
-            decoded.get_section_field("preamble", "tag"),
-            Some(Value::String("X".into()))
-        );
     }
 }
