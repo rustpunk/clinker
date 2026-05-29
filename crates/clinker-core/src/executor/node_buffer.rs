@@ -123,12 +123,10 @@ impl NodeBuffer {
         }
     }
 
-    /// Heuristic in-memory footprint of the slot, paired with the
-    /// `MemoryArbitrator::charge_node_buffer_bytes` /
-    /// `discharge_node_buffer_bytes` ledger. The estimate matches
-    /// `charge_harvest_admission`'s per-row formula so the executor's
-    /// two budget surfaces (`Arena` for parked region tee, `NodeBuffer`
-    /// for inter-stage handoff) use the same per-row size.
+    /// Heuristic in-memory footprint of the slot, read by the
+    /// `NodeBufferConsumer` wrapper's `current_usage` to drive the
+    /// arbitrator's pull-mode attribution and Priority-policy victim
+    /// selection.
     ///
     /// Returns `0` on an empty memory tail. Spill-resident chunks are
     /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk
@@ -207,6 +205,80 @@ impl Iterator for NodeBufferDrain {
                 _file: file,
             });
         }
+    }
+}
+
+/// `MemoryConsumer` wrapper for one `ctx.node_buffers` slot. Holds an
+/// `Arc<ConsumerHandle>` shared with the dispatcher: every producer
+/// push updates `handle.bytes` to track `NodeBuffer::estimated_memory_bytes()`;
+/// every consumer drain decrements it. `try_spill` flips the handle's
+/// spill-request flag; the dispatcher reads it at the next admission
+/// boundary and routes through the existing `spill_node_buffer`
+/// (postcard + LZ4 via `SpillWriter<u64>`) path.
+///
+/// `spill_priority = 0`: cheapest victim. Inter-stage buffers are
+/// already row-oriented and write straight through `SpillWriter<u64>`;
+/// no per-group or per-run reconstruction needed on the consumer
+/// side. Preferred first victim under `Priority` and
+/// `BackPressurePreferred::wrapping(Priority)`.
+///
+/// `can_back_pressure` is dynamic: `true` when the slot's producer
+/// chain terminates at a pauseable Source (no blocking operator
+/// between), `false` otherwise. Stored on construction; the
+/// dispatcher classifies the upstream topology at registration time
+/// since the DAG is static.
+pub struct NodeBufferConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    back_pressureable: bool,
+}
+
+impl NodeBufferConsumer {
+    pub fn new(
+        handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        back_pressureable: bool,
+    ) -> Self {
+        Self {
+            handle,
+            back_pressureable,
+        }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        0
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        self.back_pressureable
+    }
+
+    fn pause(&mut self) {
+        self.handle.pause();
+    }
+
+    fn resume(&mut self) {
+        self.handle.resume();
     }
 }
 
@@ -447,5 +519,51 @@ mod tests {
             .estimated_memory_bytes(),
             0
         );
+    }
+
+    #[test]
+    fn node_buffer_consumer_reports_handle_bytes() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(4096);
+        let consumer = NodeBufferConsumer::new(handle.clone(), false);
+        assert_eq!(consumer.current_usage(), 4096);
+        assert_eq!(consumer.spill_priority(), 0);
+        assert!(!consumer.can_back_pressure());
+    }
+
+    #[test]
+    fn node_buffer_consumer_back_pressureable_routes_pause_to_handle() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
+        let handle = ConsumerHandle::new();
+        let mut consumer = NodeBufferConsumer::new(handle.clone(), true);
+        assert!(consumer.can_back_pressure());
+        assert!(!handle.is_paused());
+        consumer.pause();
+        assert!(handle.is_paused());
+        consumer.resume();
+        assert!(!handle.is_paused());
+    }
+
+    #[test]
+    fn node_buffer_consumer_try_spill_flags_handle_and_returns_freed_or_below_target() {
+        use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer};
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(1024);
+        let mut consumer = NodeBufferConsumer::new(handle.clone(), false);
+        // Below-target: handle has 1024, asked for 4096.
+        match consumer.try_spill(4096) {
+            Err(ConsumerSpillError::BelowTarget { target, freed }) => {
+                assert_eq!(target, 4096);
+                assert_eq!(freed, 1024);
+            }
+            other => panic!("expected BelowTarget; got {other:?}"),
+        }
+        // Spill request flag flips regardless of return value; the
+        // dispatcher reads it at the next admission boundary.
+        assert!(handle.take_spill_request());
+        // Above-target: 4096 ≥ 1024 → Ok.
+        handle.set_bytes(8192);
+        assert_eq!(consumer.try_spill(4096).unwrap(), 8192);
     }
 }

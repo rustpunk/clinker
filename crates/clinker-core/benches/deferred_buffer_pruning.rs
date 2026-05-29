@@ -49,10 +49,32 @@ fn build_wide_rows() -> Vec<(Record, u64)> {
 
 fn measure_arena_bytes(rows: &[(Record, u64)], fields: &[String]) -> u64 {
     let schema = rows[0].0.schema().clone();
-    let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-    let _arena = Arena::from_records(rows, fields, &schema, &mut budget)
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let _arena = Arena::from_records(rows, fields, &schema, &budget)
         .expect("u64::MAX budget never overflows");
-    budget.arena_bytes_charged()
+    // Project per-row size against the requested field set. The cost
+    // matches what `Arena::from_records` materializes: one `Value` per
+    // selected column plus that column's heap payload.
+    let column_indices: Vec<Option<usize>> = fields
+        .iter()
+        .map(|f| {
+            schema
+                .columns()
+                .iter()
+                .position(|name| name.as_ref() == f.as_str())
+        })
+        .collect();
+    let mut total: u64 = 0;
+    for (record, _) in rows {
+        for idx in &column_indices {
+            let v = idx.and_then(|i| record.values().get(i)).cloned();
+            total = total.saturating_add(std::mem::size_of::<Value>() as u64);
+            if let Some(value) = v {
+                total = total.saturating_add(value.heap_size() as u64);
+            }
+        }
+    }
+    total
 }
 
 fn bench_deferred_buffer_pruning(c: &mut Criterion) {

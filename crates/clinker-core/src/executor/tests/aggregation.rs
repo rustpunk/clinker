@@ -97,6 +97,7 @@ mod dispatch {
             memory_budget,
             spill_dir,
             transform_name.to_string(),
+            crate::pipeline::memory::ConsumerHandle::new(),
         )
     }
 
@@ -1471,6 +1472,7 @@ mod two_phase_bytes_spill {
             memory_budget,
             None,
             transform_name.to_string(),
+            crate::pipeline::memory::ConsumerHandle::new(),
         )
     }
 

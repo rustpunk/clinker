@@ -677,6 +677,7 @@ impl AggregateStream {
         memory_budget: usize,
         spill_dir: Option<PathBuf>,
         transform_name: String,
+        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     ) -> Result<Self, PipelineError> {
         let _ = (&spill_schema, memory_budget, &spill_dir);
         match strategy {
@@ -688,6 +689,7 @@ impl AggregateStream {
                 memory_budget,
                 spill_dir,
                 transform_name,
+                consumer_handle,
             )))),
             AggregateStrategy::Streaming => {
                 Ok(Self::Streaming(Box::new(StreamingAggregator::new_for_raw(
@@ -800,6 +802,16 @@ pub struct HashAggregator {
     /// aggregator field so the hot loop dispatches without an
     /// `Arc<CompiledAggregate>` deref on every record.
     buffer_mode: bool,
+    /// Shared `ConsumerHandle` for the pipeline-scoped arbitrator's
+    /// `AggregateConsumer` wrapper. Every `value_heap_bytes` mutation
+    /// goes through `add_value_heap_bytes` / `sub_value_heap_bytes`
+    /// / `reset_value_heap_bytes`, which mirror the running total into
+    /// `handle.bytes`. The arbitrator's pull-mode `current_usage`
+    /// reads this counter and ranks the aggregator in policy
+    /// decisions; the consumer wrapper's `try_spill` flips
+    /// `handle.spill_requested`, which the hot loop is expected to
+    /// read at batch boundaries once that integration lands.
+    consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 impl HashAggregator {
@@ -817,6 +829,7 @@ impl HashAggregator {
         memory_budget: usize,
         spill_dir: Option<PathBuf>,
         transform_name: impl Into<String>,
+        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     ) -> Self {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
@@ -871,7 +884,38 @@ impl HashAggregator {
             lineage,
             buffered_groups: hashbrown::HashMap::new(),
             buffer_mode,
+            consumer_handle,
         }
+    }
+
+    /// Add `n` to `value_heap_bytes` with saturating arithmetic and
+    /// mirror the new total into the pipeline-scoped arbitrator's
+    /// `ConsumerHandle`. Every site that previously inlined
+    /// `self.value_heap_bytes = self.value_heap_bytes.saturating_add(n)`
+    /// routes through this method so the arbitrator's pull-mode
+    /// `current_usage` stays aligned with the operator's internal
+    /// counter at every batch boundary.
+    fn add_value_heap_bytes(&mut self, n: usize) {
+        self.value_heap_bytes = self.value_heap_bytes.saturating_add(n);
+        self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+    }
+
+    /// Subtract `n` from `value_heap_bytes` with saturating arithmetic
+    /// and mirror the new total into the consumer handle. Pairs with
+    /// `add_value_heap_bytes`; saturating-sub prevents the counter
+    /// from wrapping below zero when retraction or buffer-mode
+    /// discharge over-counts.
+    fn sub_value_heap_bytes(&mut self, n: usize) {
+        self.value_heap_bytes = self.value_heap_bytes.saturating_sub(n);
+        self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+    }
+
+    /// Reset `value_heap_bytes` to zero on spill drain and mirror to
+    /// the consumer handle. The arbitrator's `current_usage` drops to
+    /// zero in lockstep with the in-memory drain.
+    fn reset_value_heap_bytes(&mut self) {
+        self.value_heap_bytes = 0;
+        self.consumer_handle.set_bytes(0);
     }
 
     /// Borrow the in-memory group table. Public for finalize and tests.
@@ -1071,9 +1115,15 @@ impl HashAggregator {
             // by the inline tuple bytes; the source-name allocation
             // itself is charged once per distinct source (small,
             // bounded) and folded into the flat-vec accounting below.
+            // Inlined add: a live `group_state` borrow into `self.groups`
+            // prevents going through `add_value_heap_bytes(&mut self)`.
+            // Field-level borrows of `value_heap_bytes` and the
+            // `&self`-method `consumer_handle.set_bytes` are non-
+            // overlapping borrows the borrow checker can split.
             self.value_heap_bytes = self.value_heap_bytes.saturating_add(
                 std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<(u64, Arc<str>)>(),
             );
+            self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
         }
 
         // 5. BindingArg dispatch hot loop (D1).
@@ -1149,23 +1199,27 @@ impl HashAggregator {
             let row_charge = std::mem::size_of::<Value>().saturating_mul(row_values.len())
                 + row_heap_bytes
                 + std::mem::size_of::<Vec<Value>>();
+            // Inlined add — same `group_state` split-borrow as the
+            // lineage path above.
             self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
+            self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
             group_state.retract_values.push(row_values);
         } else {
             for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
                 delta += dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
             }
         }
-        self.value_heap_bytes = self.value_heap_bytes.saturating_add(delta);
+        self.add_value_heap_bytes(delta);
 
         // 7. Dual-threshold spill trigger (PostgreSQL hash_agg_check_limits
         // pattern). Primary: group count exceeds pre-computed max_groups
         // (60% of budget / estimated_bytes_per_group). Secondary:
         // value_heap_bytes exceeds 40% of budget (catches Collect
         // accumulators that grow unbounded per group).
-        if self.memory_budget > 0
+        if (self.memory_budget > 0
             && (self.groups.len() >= self.max_groups
-                || self.value_heap_bytes > self.memory_budget * 40 / 100)
+                || self.value_heap_bytes > self.memory_budget * 40 / 100))
+            || self.consumer_handle.take_spill_request()
         {
             self.spill()?;
         }
@@ -1334,14 +1388,15 @@ impl HashAggregator {
         let source_name = crate::executor::dispatch::source_name_arc_of(record);
         group_state.contributions.push(row_values);
         group_state.input_rows.push((row_u64, source_name));
-        self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
+        self.add_value_heap_bytes(row_charge);
 
         // 7. Spill trigger — same dual-threshold check as fold-mode.
         //    `groups.len()` is always 0 in buffer-mode; the buffered
         //    map's group count is the relevant signal.
-        if self.memory_budget > 0
+        if (self.memory_budget > 0
             && (self.buffered_groups.len() >= self.max_groups
-                || self.value_heap_bytes > self.memory_budget * 40 / 100)
+                || self.value_heap_bytes > self.memory_budget * 40 / 100))
+            || self.consumer_handle.take_spill_request()
         {
             self.spill()?;
         }
@@ -1417,7 +1472,7 @@ impl HashAggregator {
                         + removed.iter().map(Value::heap_size).sum::<usize>()
                         + std::mem::size_of::<Vec<Value>>()
                         + std::mem::size_of::<(u64, Arc<str>)>();
-                    self.value_heap_bytes = self.value_heap_bytes.saturating_sub(row_charge);
+                    self.sub_value_heap_bytes(row_charge);
                     return Ok(());
                 }
             }
@@ -1465,15 +1520,13 @@ impl HashAggregator {
                 + values.iter().map(Value::heap_size).sum::<usize>()
                 + std::mem::size_of::<Vec<Value>>()
                 + std::mem::size_of::<(u64, Arc<str>)>();
-            self.value_heap_bytes = self.value_heap_bytes.saturating_sub(removed_row_charge);
+            self.sub_value_heap_bytes(removed_row_charge);
             // Negative `total_delta` is a shrink; saturating-sub clamps
             // at zero against the running total.
             if total_delta < 0 {
-                self.value_heap_bytes = self
-                    .value_heap_bytes
-                    .saturating_sub((-total_delta) as usize);
+                self.sub_value_heap_bytes((-total_delta) as usize);
             } else {
-                self.value_heap_bytes = self.value_heap_bytes.saturating_add(total_delta as usize);
+                self.add_value_heap_bytes(total_delta as usize);
             }
             return Ok(());
         }
@@ -1625,7 +1678,7 @@ impl HashAggregator {
         self.spill_files.push(spill_file);
 
         // 5. All per-group value heap bytes are now off-process.
-        self.value_heap_bytes = 0;
+        self.reset_value_heap_bytes();
         // The flat lineage vec mirrored the in-memory groups; once the
         // groups have been drained, the per-group `input_rows` vectors
         // (already serialized inside each `AggSpillEntry.state`) are the
@@ -1851,6 +1904,60 @@ impl HashAggregator {
 
         let _ = ctx; // reserved for future per-group eval scope
         Ok(())
+    }
+}
+
+/// `MemoryConsumer` wrapper for a `HashAggregator`. Holds an
+/// `Arc<ConsumerHandle>` shared with the aggregator: the aggregator
+/// updates `handle.bytes` as it admits records and drains on spill;
+/// the consumer reads the value when the arbitrator polls. `try_spill`
+/// flips the handle's spill-request flag, which the aggregator's hot
+/// loop reads at the next batch boundary and reacts to by invoking
+/// its existing in-thread spill path.
+///
+/// `spill_priority = 30`: hash-aggregation spill is the most
+/// expensive to drive — sort-by-encoded-key, write every group,
+/// rebuild via `LoserTree` k-way merge on finalize. Last-resort
+/// victim. `can_back_pressure = false`: an in-flight aggregate has
+/// no upstream channel to gate; pausing mid-aggregation would either
+/// lose accumulation or require additional buffering with no payoff.
+pub struct AggregateConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl AggregateConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for AggregateConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        30
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
     }
 }
 
@@ -3227,6 +3334,7 @@ mod spill_trigger_tests {
             memory_budget,
             spill_dir,
             "test_agg",
+            crate::pipeline::memory::ConsumerHandle::new(),
         )
     }
 
@@ -4495,6 +4603,7 @@ mod spill_trigger_tests {
             memory_budget,
             spill_dir,
             transform_name,
+            crate::pipeline::memory::ConsumerHandle::new(),
         )
     }
 

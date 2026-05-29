@@ -84,7 +84,9 @@ The `arbitration:` line shows the composed policy name. A pipeline with `backpre
 
 ## How it works
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. In parallel, the engine maintains a byte counter that charges every arena build site and every inter-stage `node_buffers` materialization against the same limit envelope — so a pipeline declaring a 512 MB budget cannot multiply that limit across many operators. When memory pressure rises toward the configured limit, the arbitrator runs the selected policy to pick a victim — pause it, spill it, or both.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, and `node_buffers` slots) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion.
+
+When memory pressure crosses the soft threshold (80 % of `limit`), the arbitrator runs the active policy to pick a victim and invokes the corresponding action: `pause()` on a back-pressureable consumer (its producer's hot loop parks on a `Condvar` until `resume`), or `try_spill(target_bytes)` on a spillable consumer (the consumer's wrapper flips a spill-requested flag the operator reads at its next batch boundary). When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded`.
 
 This means:
 
@@ -94,9 +96,9 @@ This means:
 
 ## Bounded-memory contract for non-fused stages
 
-Fused chains (Source → Transform → Output, Merge.interleave fed by Sources) run streaming with no per-stage materialization. Non-fused boundaries — Route fan-out, Merge fan-in, Composition bodies, diamond DAGs — materialize records into per-stage `node_buffers` that charge against the budget.
+Fused chains (Source → Transform → Output, Merge.interleave fed by Sources) run streaming with no per-stage materialization. Non-fused boundaries — Route fan-out, Merge fan-in, Composition bodies, diamond DAGs — materialize records into per-stage `node_buffers`. Each slot registers a `NodeBufferConsumer` with the arbitrator (priority 0 — the cheapest-to-spill victim class), so the active policy's victim selection is fully attributed.
 
-When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs the active policy. Under the default `pause`, the producer feeding the buffer is paused at its inbound channel; under `spill` or when no consumer can be paused, the slot spills to disk using the same LZ4 + postcard frame format as grace-hash sort partitions. When a buffer crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded { node }` naming the producer that overran. See [error E310](../explain/E310.html) for the full diagnostic model, including the composition-involved two-shape error model.
+When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs the active policy. Under the default `pause`, the producer feeding the buffer is paused at its inbound channel; under `spill` or when no consumer can be paused, the slot spills to disk using the same LZ4 + postcard frame format as grace-hash sort partitions. When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded { node }` naming the operator whose hot loop polled the abort gate. See [error E310](../explain/E310.html) for the full diagnostic model, including the composition-involved two-shape error model.
 
 Spill fires at the producer side of the first slot whose downstream topology permits it — single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
 
@@ -140,7 +142,7 @@ Only force `streaming` when you are certain the input is sorted by the group-by 
 
 ## Compositions
 
-A composition (a reusable sub-pipeline included via `use:`) does not get its own memory budget. Body operators charge the same budget as the parent pipeline, admit through the same paths, and spill to the same temporary directory. The recursion is purely structural.
+A composition (a reusable sub-pipeline included via `use:`) does not get its own memory budget. Body operators register with the same arbitrator instance as the parent pipeline, admit through the same paths, and spill to the same temporary directory. The recursion is purely structural. Body-scope consumer registrations are unregistered automatically when the body exits, so a body's `NodeBufferConsumer` wrappers do not leak into the parent scope's policy registry.
 
 When a budget exceedance involves a composition, the error message arrives in one of two shapes:
 

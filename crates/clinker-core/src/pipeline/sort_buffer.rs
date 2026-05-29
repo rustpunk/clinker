@@ -121,6 +121,59 @@ impl<P: Serialize + DeserializeOwned> SortBuffer<P> {
     }
 }
 
+/// `MemoryConsumer` wrapper for a `SortBuffer<P>`. Holds an
+/// `Arc<ConsumerHandle>` shared with the buffer: the buffer mirrors
+/// its `bytes_used` into `handle.bytes` on every `push` / `sort_and_spill`
+/// transition. `try_spill` flips the handle's spill-request flag; the
+/// buffer's owning operator reads it at the next batch boundary and
+/// calls `sort_and_spill` in-thread.
+///
+/// `spill_priority = 20`: sort runs are cheaper to flush than hash-
+/// aggregation rebuilds — every run is already sequentially ordered
+/// and writes straight through `SpillWriter<P>` with no per-group
+/// fixup. `can_back_pressure = false`: an in-flight sort buffer
+/// cannot be paused without losing run continuity; sort consumers
+/// expect inputs to arrive monotonically.
+pub struct SortConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl SortConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for SortConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        20
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

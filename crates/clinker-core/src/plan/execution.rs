@@ -867,9 +867,9 @@ enum BufferClass {
     /// write to their configured writer and never admit a buffer).
     Streaming,
     /// Records pass through a `ctx.node_buffers` slot between dispatch
-    /// arms. The producer charges `MemoryArbitrator` via
-    /// `charge_node_buffer_bytes` on admit, the consumer discharges on
-    /// drain, and a soft-threshold trip spills the slot to disk.
+    /// arms. Each admission registers a `NodeBufferConsumer` whose
+    /// pull-mode `current_usage` reflects the slot's live footprint;
+    /// a soft-threshold trip spills the slot to disk.
     Materialized,
 }
 
