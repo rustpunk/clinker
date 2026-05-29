@@ -25,6 +25,12 @@ use crate::error::PipelineError;
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 use crate::pipeline::spill::{SpillFile, SpillReader};
 
+/// Body records paired with the punctuations preserved from a buffer
+/// drain. Returned by [`NodeBuffer::drain_split`] and threaded through
+/// the per-operator dispatch sites that reshape records while forwarding
+/// document boundaries unchanged.
+pub(crate) type DrainedEvents = (Vec<(Record, u64)>, Vec<Punctuation>);
+
 /// One slot inside `ExecutorContext::node_buffers`.
 pub(crate) enum NodeBuffer {
     /// All events live in memory — records and punctuations interleaved
@@ -50,12 +56,6 @@ pub(crate) enum NodeBuffer {
 }
 
 impl NodeBuffer {
-    /// Empty `Memory` variant. Convenience for callers that start
-    /// accumulating from scratch.
-    pub(crate) fn empty_memory() -> Self {
-        Self::Memory(Vec::new())
-    }
-
     /// Promote a `Vec<(Record, u64)>` into a `Memory` variant, wrapping
     /// each pair as a [`StreamEvent::Record`]. The dominant existing
     /// pattern at admission sites: producer accumulates records in a
@@ -215,9 +215,7 @@ impl NodeBuffer {
     /// Aggregate flush-on-close) drain via [`Self::drain`] directly
     /// and pattern-match `StreamEvent` to inject per-document logic
     /// at the boundary.
-    pub(crate) fn drain_split(
-        self,
-    ) -> Result<(Vec<(Record, u64)>, Vec<Punctuation>), PipelineError> {
+    pub(crate) fn drain_split(self) -> Result<DrainedEvents, PipelineError> {
         let mut records: Vec<(Record, u64)> = Vec::with_capacity(self.len_hint());
         let mut puncts: Vec<Punctuation> = Vec::new();
         for event in self.drain() {
@@ -382,7 +380,7 @@ mod tests {
     #[test]
     fn memory_push_drain_round_trip() {
         let s = schema();
-        let mut nb = NodeBuffer::empty_memory();
+        let mut nb = NodeBuffer::Memory(Vec::new());
         nb.push(rec(&s, 1, "a"), 10);
         nb.push(rec(&s, 2, "b"), 11);
 
@@ -412,7 +410,7 @@ mod tests {
         assert_eq!(rec_row_num(&drained[0]), 1);
         assert_eq!(rec_row_num(&drained[1]), 2);
         assert_eq!(rec_row_num(&drained[2]), 3);
-        assert!(drained[3].is_punctuation());
+        assert!(matches!(drained[3], StreamEvent::Punctuation(_)));
     }
 
     #[test]
@@ -433,14 +431,14 @@ mod tests {
         assert_eq!(rec_row_num(&drained[0]), 1);
         assert_eq!(rec_row_num(&drained[1]), 2);
         assert_eq!(rec_row_num(&drained[2]), 100);
-        assert!(drained[3].is_punctuation());
+        assert!(matches!(drained[3], StreamEvent::Punctuation(_)));
     }
 
     #[test]
     fn punctuation_in_mem_interleaves_with_records() {
         let s = schema();
         let ctx = synthetic_document_context();
-        let mut nb = NodeBuffer::empty_memory();
+        let mut nb = NodeBuffer::Memory(Vec::new());
         nb.push(rec(&s, 1, "a"), 1);
         nb.push_event(StreamEvent::punctuation(Punctuation::document_close(ctx)));
         nb.push(rec(&s, 2, "b"), 2);
@@ -450,9 +448,9 @@ mod tests {
 
         let drained: Vec<_> = nb.drain().collect::<Result<_, _>>().unwrap();
         assert_eq!(drained.len(), 3);
-        assert!(drained[0].is_record());
-        assert!(drained[1].is_punctuation());
-        assert!(drained[2].is_record());
+        assert!(matches!(drained[0], StreamEvent::Record(..)));
+        assert!(matches!(drained[1], StreamEvent::Punctuation(_)));
+        assert!(matches!(drained[2], StreamEvent::Record(..)));
     }
 
     #[test]
@@ -473,13 +471,13 @@ mod tests {
         // then puncts.
         assert_eq!(rec_row_num(&drained[0]), 200);
         assert_eq!(rec_row_num(&drained[1]), 100);
-        assert!(drained[2].is_punctuation());
+        assert!(matches!(drained[2], StreamEvent::Punctuation(_)));
     }
 
     #[test]
     fn empty_variants_have_zero_len_hint() {
         let s = schema();
-        assert_eq!(NodeBuffer::empty_memory().len_hint(), 0);
+        assert_eq!(NodeBuffer::Memory(Vec::new()).len_hint(), 0);
         assert_eq!(
             NodeBuffer::Spilled {
                 chunks: Vec::new(),
@@ -528,7 +526,7 @@ mod tests {
         assert_eq!(spilled.estimated_memory_bytes(), 0);
 
         // Empty mem reports zero.
-        assert_eq!(NodeBuffer::empty_memory().estimated_memory_bytes(), 0);
+        assert_eq!(NodeBuffer::Memory(Vec::new()).estimated_memory_bytes(), 0);
     }
 
     #[test]

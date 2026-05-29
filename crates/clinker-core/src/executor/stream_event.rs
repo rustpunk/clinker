@@ -69,11 +69,6 @@ impl Punctuation {
         Self::new(doc_ctx, PunctuationKind::DocumentClose)
     }
 
-    /// Borrow the underlying document context.
-    pub fn doc_ctx(&self) -> &Arc<DocumentContext> {
-        &self.doc_ctx
-    }
-
     /// Identity of the document this punctuation marks. Equality on
     /// this value is the Merge-dedup discriminator.
     pub fn doc_id(&self) -> DocumentId {
@@ -113,37 +108,19 @@ impl StreamEvent {
     }
 
     /// `true` if this event is a record; `false` for any punctuation.
+    /// Drives `NodeBuffer::len_hint`'s record-only count.
     pub fn is_record(&self) -> bool {
         matches!(self, Self::Record(..))
     }
 
-    /// `true` if this event is a punctuation.
-    pub fn is_punctuation(&self) -> bool {
-        matches!(self, Self::Punctuation(_))
-    }
-
-    /// Borrow the contained record, if this event is a `Record`.
-    pub fn as_record(&self) -> Option<(&Record, u64)> {
-        match self {
-            Self::Record(r, rn) => Some((r, *rn)),
-            Self::Punctuation(_) => None,
-        }
-    }
-
     /// Consume into the `(Record, u64)` pair if this event is a record,
-    /// otherwise discard the punctuation and return `None`.
+    /// otherwise discard the punctuation and return `None`. Used by the
+    /// Output fan-out clone path and composition port seeding, which
+    /// take records only.
     pub fn into_record(self) -> Option<(Record, u64)> {
         match self {
             Self::Record(r, rn) => Some((r, rn)),
             Self::Punctuation(_) => None,
-        }
-    }
-
-    /// Borrow the contained punctuation, if any.
-    pub fn as_punctuation(&self) -> Option<&Punctuation> {
-        match self {
-            Self::Punctuation(p) => Some(p),
-            Self::Record(..) => None,
         }
     }
 }
@@ -164,8 +141,10 @@ mod tests {
     fn record_event_carries_row_number() {
         let ev = StreamEvent::record(rec(1), 42);
         assert!(ev.is_record());
-        assert!(!ev.is_punctuation());
-        let (r, rn) = ev.as_record().unwrap();
+        let (r, rn) = match ev {
+            StreamEvent::Record(r, rn) => (r, rn),
+            StreamEvent::Punctuation(_) => panic!("expected Record"),
+        };
         assert_eq!(rn, 42);
         assert_eq!(r.values()[0], Value::Integer(1));
     }
@@ -174,9 +153,11 @@ mod tests {
     fn punctuation_event_carries_doc_id_and_kind() {
         let ctx = synthetic_document_context();
         let ev = StreamEvent::punctuation(Punctuation::document_open(Arc::clone(&ctx)));
-        assert!(ev.is_punctuation());
         assert!(!ev.is_record());
-        let p = ev.as_punctuation().unwrap();
+        let p = match ev {
+            StreamEvent::Punctuation(p) => p,
+            StreamEvent::Record(..) => panic!("expected Punctuation"),
+        };
         assert_eq!(p.kind(), PunctuationKind::DocumentOpen);
         assert_eq!(p.doc_id(), ctx.id());
     }
