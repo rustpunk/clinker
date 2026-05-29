@@ -3453,7 +3453,13 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         };
         values.push(v);
     }
-    Record::new(Arc::clone(target), values)
+    let mut out = Record::new(Arc::clone(target), values);
+    // Widening reshapes the schema for the same document's row; carry
+    // the envelope context forward so a downstream node reading
+    // `$doc.<section>.<field>` resolves against the originating
+    // document rather than the empty synthetic context.
+    out.set_doc_ctx(Arc::clone(input.doc_ctx()));
+    out
 }
 
 /// Recover an engine-stamped column's value when the input does not

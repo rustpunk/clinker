@@ -1391,7 +1391,12 @@ pub(crate) fn canonicalize_to_source_schema(
             values[*target_idx] = reader_vals[src_idx].clone();
         }
     }
-    Record::new(Arc::clone(target), values)
+    let mut out = Record::new(Arc::clone(target), values);
+    // Canonicalization reshapes the schema but the record is the same
+    // document's row — carry its envelope context forward so
+    // `$doc.<section>.<field>` resolves on the canonicalized record.
+    out.set_doc_ctx(Arc::clone(r.doc_ctx()));
+    out
 }
 
 /// Seed declared and channel-supplied `$source.<key>` defaults for
@@ -1951,7 +1956,7 @@ pub(crate) async fn transform_fused_consume(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &rec_source_name_arc,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
+                doc_ctx: rec.doc_ctx(),
             };
             let target_schema = output_schema
                 .as_ref()
@@ -2376,7 +2381,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
-                    doc_ctx: clinker_record::synthetic_document_context_ref(),
+                    doc_ctx: record.doc_ctx(),
                 };
 
                 let target_schema = output_schema
@@ -2662,7 +2667,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
-                        doc_ctx: clinker_record::synthetic_document_context_ref(),
+                        doc_ctx: record.doc_ctx(),
                     };
 
                     let route_result = {
@@ -2923,9 +2928,14 @@ pub(crate) async fn dispatch_plan_node(
                         // Rebuild record with the Merge's
                         // `Arc<Schema>` so downstream operators hit
                         // the ptr_eq fast path regardless of which
-                        // input the record originated from.
+                        // input the record originated from. Carry the
+                        // per-record envelope context across the
+                        // rebuild — each merged row keeps the document
+                        // it came from.
+                        let doc_ctx = Arc::clone(record.doc_ctx());
                         let values = record.values().to_vec();
                         record = Record::new(Arc::clone(canonical), values);
+                        record.set_doc_ctx(doc_ctx);
                     }
                     merged.push((record, rn));
                     Ok(())
@@ -3354,7 +3364,7 @@ pub(crate) async fn dispatch_plan_node(
                             source_batch: ctx.source_batch_arc,
                             ingestion_timestamp: ctx.source_ingestion_timestamp,
                             source_name: &source_name_arc,
-                            doc_ctx: clinker_record::synthetic_document_context_ref(),
+                            doc_ctx: record.doc_ctx(),
                         };
                         let add_result =
                             stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
@@ -4731,7 +4741,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
-                    doc_ctx: clinker_record::synthetic_document_context_ref(),
+                    doc_ctx: probe_record.doc_ctx(),
                 };
 
                 // Probe-side key extraction routes through the
@@ -6239,7 +6249,7 @@ fn run_time_windowed_aggregate(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
-                        doc_ctx: clinker_record::synthetic_document_context_ref(),
+                        doc_ctx: rec.doc_ctx(),
                     };
                     let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
                     if add_result.is_ok() {
@@ -6340,7 +6350,7 @@ where
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &source_name_arc,
-        doc_ctx: clinker_record::synthetic_document_context_ref(),
+        doc_ctx: record.doc_ctx(),
     };
     let stream = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),

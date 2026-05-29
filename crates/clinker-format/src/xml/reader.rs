@@ -839,6 +839,29 @@ mod tests {
     }
 
     #[test]
+    fn body_records_navigate_past_sibling_envelope_sections() {
+        // record_path body sits between a head section and a tail
+        // section; navigation must skip both siblings and still yield
+        // every record.
+        let xml = r#"<doc>
+  <BatchInfo><batch_id>RUN-001</batch_id></BatchInfo>
+  <records>
+    <record><amount>10</amount></record>
+    <record><amount>20</amount></record>
+    <record><amount>30</amount></record>
+  </records>
+  <Summary><total>3</total></Summary>
+</doc>"#;
+        let mut r = reader_from_str(xml, default_config_with_path("doc/records/record"));
+        let _ = r.schema().unwrap();
+        let mut n = 0;
+        while let Some(_rec) = r.next_record().unwrap() {
+            n += 1;
+        }
+        assert_eq!(n, 3, "expected 3 body records past sibling sections");
+    }
+
+    #[test]
     fn test_xml_record_path_navigation() {
         let xml = r#"<Root><Orders><Order><id>1</id><name>Alice</name></Order><Order><id>2</id><name>Bob</name></Order></Orders></Root>"#;
         let mut r = reader_from_str(xml, default_config_with_path("Root/Orders/Order"));

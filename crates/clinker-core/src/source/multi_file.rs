@@ -190,6 +190,23 @@ impl FormatReader for MultiFileFormatReader {
         Ok(schema)
     }
 
+    fn prepare_document(
+        &mut self,
+        config: &clinker_format::EnvelopeConfig,
+    ) -> Result<indexmap::IndexMap<Box<str>, clinker_record::Value>, FormatError> {
+        // Each file is its own document; forward the pre-scan to the
+        // active per-file reader. The executor's ingest loop calls this
+        // once per file (at each `current_source_file` transition), so
+        // `active` is the file currently being streamed.
+        if self.active.is_none() && !self.advance()? {
+            return Ok(indexmap::IndexMap::new());
+        }
+        self.active
+            .as_mut()
+            .expect("advance() set active or returned false")
+            .prepare_document(config)
+    }
+
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         // Materialize file 0 if we haven't yet.
         if self.active.is_none() {
