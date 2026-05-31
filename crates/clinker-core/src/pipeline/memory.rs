@@ -1277,6 +1277,89 @@ mod tests {
     }
 
     #[test]
+    fn arena_consumer_contributes_to_sum_and_silences_disagreement_warning() {
+        use crate::pipeline::arena::ArenaConsumer;
+
+        // A window arena holding ~8 MiB. The arbitrator's RSS reflects
+        // exactly that allocation (idealized — no harness slack).
+        const ARENA_BYTES: u64 = 8 * 1024 * 1024;
+        // 100 GiB hard limit so real-process RSS cannot push peak_rss
+        // above the test-seeded value via `observe()`'s `fetch_max`.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(NoOpPolicy));
+        arbitrator.set_peak_rss_for_test(ARENA_BYTES);
+
+        // Before registration the arena contributes nothing, so the
+        // pull-mode picture disagrees with RSS by the full arena size —
+        // exactly the false-positive the registration closes.
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+        let tenth = arbitrator.limit() / 10;
+        assert!(
+            ARENA_BYTES.abs_diff(arbitrator.sum_consumer_usage()) <= tenth,
+            "sanity: 8 MiB is within 10% of a 100 GiB limit even unregistered"
+        );
+
+        // Register the arena exactly as `finalize_node_rooted_windows`
+        // does: a fresh handle seeded to the arena's measured bytes.
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(ARENA_BYTES);
+        let id = arbitrator.register_consumer(Arc::new(ArenaConsumer::new(handle.clone())));
+
+        // Attribution: the arena's bytes now flow through pull-mode.
+        assert_eq!(arbitrator.sum_consumer_usage(), ARENA_BYTES);
+        assert_eq!(arbitrator.consumer_count(), 1);
+
+        // Disagreement-warning silence: the charged sum reaches parity
+        // with peak RSS, so `peak_rss.abs_diff(charged_sum)` is zero —
+        // far under the 10%-of-limit threshold `poll_arbitration` warns
+        // on. The arena is the only sizable in-memory state.
+        let charged_sum = arbitrator.sum_consumer_usage();
+        let peak_rss = arbitrator.peak_rss().unwrap();
+        assert_eq!(
+            peak_rss.abs_diff(charged_sum),
+            0,
+            "registered arena makes charged bytes match RSS — no disagreement"
+        );
+
+        // Teardown leaves the registry empty (the executor's top-scope
+        // and body-scope drains unregister exactly this way).
+        arbitrator.unregister_consumer(id);
+        assert_eq!(arbitrator.consumer_count(), 0);
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn arena_consumer_ranks_last_among_spill_victims() {
+        use crate::pipeline::arena::ArenaConsumer;
+
+        // A non-actionable arena (can't pause, can't free) must never be
+        // preferred over a spillable consumer. Under `Priority`, lower
+        // spill_priority wins; the arena's `i32::MAX - 1` sits behind a
+        // grace-hash-shaped consumer at priority 10, so the policy elects
+        // the spillable. `should_spill` drives the round and acts on the
+        // victim — a back-pressureable MockConsumer gets paused, which is
+        // the observable proof it (not the arena) was elected.
+        // 100 GiB hard limit so real-process RSS cannot push peak_rss
+        // above the test-seeded value via `observe()`'s `fetch_max`.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(Priority));
+        let arena_handle = ConsumerHandle::new();
+        arena_handle.set_bytes(512 * 1024 * 1024);
+        // The arena is far larger than the spillable; only the priority
+        // ordering keeps it from being elected, which is the point.
+        arbitrator.register_consumer(Arc::new(ArenaConsumer::new(arena_handle)));
+        let spillable = Arc::new(MockConsumer::new(1024, 10, 0));
+        arbitrator.register_consumer(spillable.clone());
+
+        arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
+        assert!(arbitrator.should_spill());
+        assert!(
+            spillable.is_paused(),
+            "Priority must elect the spillable consumer, never the non-actionable arena"
+        );
+    }
+
+    #[test]
     fn test_consumer_ids_are_never_reused_after_unregister() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
@@ -1351,7 +1434,10 @@ mod tests {
         reader.join().unwrap();
         writer.join().unwrap();
         assert_eq!(arbitrator.consumer_count(), WRITES);
-        assert_eq!(arbitrator.sum_consumer_usage(), PER_CONSUMER * WRITES as u64);
+        assert_eq!(
+            arbitrator.sum_consumer_usage(),
+            PER_CONSUMER * WRITES as u64
+        );
     }
 
     /// Operator that intentionally does NOT override the default

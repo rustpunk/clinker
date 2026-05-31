@@ -8,9 +8,9 @@ use std::sync::Arc;
 use clinker_format::traits::FormatReader;
 use clinker_record::{MinimalRecord, RecordStorage, Schema, SchemaBuilder, Value};
 
-use super::memory::MemoryArbitrator;
 #[cfg(test)]
 use super::memory::NoOpPolicy;
+use super::memory::{ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer};
 
 /// Columnar-projected record storage for Phase 1 indexing.
 /// Stores only the fields needed by window expressions.
@@ -182,6 +182,69 @@ impl Arena {
     /// Whether the Arena is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Sum of the per-record `estimated_size` heuristic over every
+    /// stored record — the arena's projected in-memory footprint.
+    ///
+    /// Blocking, whole-arena cost: the arena is immutable once built, so
+    /// this total is fixed for its lifetime. The executor seeds an
+    /// `ArenaConsumer`'s `ConsumerHandle` from this value once, after
+    /// `from_records` returns, so cross-arena attribution flows through
+    /// the arbitrator's pull-mode registry like every other operator.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.records.iter().map(estimated_size).sum()
+    }
+}
+
+/// `MemoryConsumer` wrapper for a window-runtime `Arena`. Holds an
+/// `Arc<ConsumerHandle>` whose `bytes` the executor seeds from
+/// [`Arena::estimated_bytes`] right after the arena is built, so the
+/// arbitrator's pull-mode `sum_consumer_usage` accounts for every byte
+/// a window arena holds.
+///
+/// An arena is immutable after construction and is released only
+/// indirectly — when the operator that consumes its windows drains to
+/// disk — so the wrapper itself cannot free bytes. `try_spill` reports
+/// zero freed (`BelowTarget`), `can_back_pressure` is `false` (an arena
+/// has no upstream channel to gate), and `spill_priority` is
+/// `i32::MAX - 1` — ranked just ahead of Sources (which at least pause)
+/// and behind every spillable consumer, so a policy elects an arena
+/// only when nothing else can act. The wrapper exists for attribution,
+/// not for victim selection.
+pub(crate) struct ArenaConsumer {
+    handle: Arc<ConsumerHandle>,
+}
+
+impl ArenaConsumer {
+    /// Construct a consumer reading bytes from the shared handle the
+    /// executor seeds with the arena's measured footprint.
+    pub(crate) fn new(handle: Arc<ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl MemoryConsumer for ArenaConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        // A consumer that can neither pause nor free is never a useful
+        // victim; rank it last among everything so `Priority` reaches
+        // the arena only when no spillable or pauseable consumer remains.
+        i32::MAX - 1
+    }
+
+    fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        Err(ConsumerSpillError::BelowTarget {
+            target: target_bytes,
+            freed: 0,
+        })
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
     }
 }
 
@@ -609,6 +672,53 @@ mod tests {
             }
             other => panic!("expected SchemaMismatch, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn estimated_bytes_sums_records_and_zero_when_empty() {
+        use clinker_record::Schema;
+        let schema = Arc::new(Schema::new(vec!["id".into(), "name".into()]));
+        let empty = Arena::empty(Arc::clone(&schema));
+        assert_eq!(empty.estimated_bytes(), 0);
+
+        let records = vec![
+            MinimalRecord::new(vec![Value::Integer(1), Value::String("alice".into())]),
+            MinimalRecord::new(vec![Value::Integer(2), Value::String("bob".into())]),
+        ];
+        let arena = Arena::from_parts(schema, records);
+        assert!(
+            arena.estimated_bytes() > 0,
+            "non-empty arena reports a positive footprint"
+        );
+    }
+
+    #[test]
+    fn arena_consumer_reports_handle_bytes_and_never_frees() {
+        use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer};
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(64 * 1024);
+        let consumer = ArenaConsumer::new(handle.clone());
+        assert_eq!(consumer.current_usage(), 64 * 1024);
+        // Arenas cannot release bytes: try_spill reports zero freed.
+        match consumer.try_spill(128 * 1024) {
+            Err(ConsumerSpillError::BelowTarget { target, freed }) => {
+                assert_eq!(target, 128 * 1024);
+                assert_eq!(freed, 0);
+            }
+            other => panic!("expected BelowTarget with freed 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arena_consumer_is_not_back_pressureable_and_ranks_below_spillables() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
+        let consumer = ArenaConsumer::new(ConsumerHandle::new());
+        assert!(!consumer.can_back_pressure());
+        // Ranked behind every spillable consumer (node_buffers 0,
+        // grace-hash 10, sort 20, Aggregate 30) and just ahead of
+        // Sources (i32::MAX) so it is elected only as a last resort.
+        assert_eq!(consumer.spill_priority(), i32::MAX - 1);
+        assert!(consumer.spill_priority() < i32::MAX);
     }
 
     #[test]

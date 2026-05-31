@@ -395,6 +395,11 @@ async fn recurse_into_body(
     let body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
+    // Window-arena consumer ids are keyed by slot index, which the body
+    // re-uses from zero just like its window-runtime overlay. Swap to a
+    // fresh map so a body slot-0 arena registration does not clobber the
+    // parent's slot-0 entry; restore the parent map on exit.
+    let saved_arena_ids = std::mem::take(&mut ctx.window_arena_consumer_ids);
     let saved_combine = std::mem::take(&mut ctx.source_records);
     let saved_body_refs = ctx
         .current_body_node_input_refs
@@ -504,6 +509,13 @@ async fn recurse_into_body(
     for (_, (id, _)) in body_consumer_ids {
         ctx.memory_budget.unregister_consumer(id);
     }
+    // Unregister body-local window-arena consumers for the same reason:
+    // the body's arenas drop when its window-runtime overlay is popped
+    // below, so their wrappers must leave the arbitrator's registry too.
+    let body_arena_ids = std::mem::take(&mut ctx.window_arena_consumer_ids);
+    for (_, (id, _)) in body_arena_ids {
+        ctx.memory_budget.unregister_consumer(id);
+    }
 
     // Restore parent scope on every exit. The window-runtime body
     // overlay is popped first so subsequent parent-scope walks route
@@ -515,6 +527,7 @@ async fn recurse_into_body(
     ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
     ctx.node_buffer_consumer_ids = saved_consumer_ids;
+    ctx.window_arena_consumer_ids = saved_arena_ids;
 
     let harvested = walk_and_harvest?;
 

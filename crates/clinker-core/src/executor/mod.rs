@@ -1427,6 +1427,7 @@ impl PipelineExecutor {
 
             node_buffers: HashMap::new(),
             node_buffer_consumer_ids: HashMap::new(),
+            window_arena_consumer_ids: HashMap::new(),
             source_records,
             fused_sources,
             fused_transforms,
@@ -1538,6 +1539,16 @@ impl PipelineExecutor {
         }
 
         walk_result?;
+
+        // Top-scope teardown: the run has drained, so unregister every
+        // window-runtime arena consumer that survived to the top scope.
+        // Body-scope arenas already unregistered at body exit; this
+        // sweeps the top-level (source-rooted and parent-scope node-
+        // rooted) arenas so the arbitrator's registry does not outlive
+        // the run with stale wrappers reading zero forever.
+        for (_, (id, _)) in std::mem::take(&mut ctx.window_arena_consumer_ids) {
+            ctx.memory_budget.unregister_consumer(id);
+        }
 
         // Take the pipeline-scoped TempDir out of the context. Held
         // until the very end of the walk so any operator-side spill
