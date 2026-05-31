@@ -87,5 +87,71 @@ fn bench_sum_consumer_usage(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_should_spill, bench_sum_consumer_usage);
+/// Integer EWMA (alpha = 1/8) of per-record byte sizes, mirroring the
+/// private `ewma_step` the Source ingest channel folds samples through.
+///
+/// Inlined here rather than imported: benches link against the crate's
+/// public API only, and the production step is a private free function
+/// with no need to widen its visibility for a microbenchmark. The body
+/// must track that function — `prev == 0` seeds, the `/ 8` decay is a
+/// bit shift, and the subtraction is ordered to stay underflow-safe.
+fn ewma_step(prev: u64, sample: u64) -> u64 {
+    if prev == 0 {
+        sample
+    } else if sample >= prev {
+        prev + (sample - prev) / 8
+    } else {
+        prev - (prev - sample) / 8
+    }
+}
+
+/// Characterizes the per-sample EWMA update cost under both a uniform
+/// record-size stream and a 10x mixed-size stream.
+///
+/// The mixed-size case is the drift scenario the smoothing targets: 99
+/// small records punctuated by one kilobyte record, repeated. Folding
+/// the whole sequence through the step exercises both the climbing and
+/// decaying branches and confirms the update stays sub-microsecond on
+/// the hot send path regardless of size variance.
+fn bench_record_bytes_ewma(c: &mut Criterion) {
+    let mut group = c.benchmark_group("arbitration_record_bytes_ewma");
+
+    // Uniform: every record reports the same heap size, so the average
+    // seeds once and then holds steady.
+    let uniform: Vec<u64> = vec![256; 1000];
+    group.bench_function("uniform", |b| {
+        b.iter(|| {
+            let mut ewma = 0u64;
+            for &sample in &uniform {
+                ewma = ewma_step(ewma, black_box(sample));
+            }
+            black_box(ewma)
+        });
+    });
+
+    // Mixed: 99 small records then one ~1 KiB record, repeated — a 10x
+    // intermittent drift that swings the raw last-sample proxy but that
+    // the EWMA absorbs into a stable estimate.
+    let mixed: Vec<u64> = (0..1000)
+        .map(|i| if i % 100 == 99 { 1024 } else { 96 })
+        .collect();
+    group.bench_function("mixed_10x_drift", |b| {
+        b.iter(|| {
+            let mut ewma = 0u64;
+            for &sample in &mixed {
+                ewma = ewma_step(ewma, black_box(sample));
+            }
+            black_box(ewma)
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_should_spill,
+    bench_sum_consumer_usage,
+    bench_record_bytes_ewma
+);
 criterion_main!(benches);
