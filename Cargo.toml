@@ -40,6 +40,7 @@ regex = "1"
 ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
+arc-swap = "1.9"
 static_assertions = "1"
 dioxus = { version = "=0.7.4" }
 rfd = "0.15"

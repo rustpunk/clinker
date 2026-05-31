@@ -154,7 +154,7 @@ impl crate::pipeline::memory::MemoryConsumer for SortConsumer {
     }
 
     fn try_spill(
-        &mut self,
+        &self,
         target_bytes: u64,
     ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
         self.handle.request_spill();

@@ -17,6 +17,7 @@ rayon = "1"
 chrono = { workspace = true }
 regex = { workspace = true }
 ahash = { workspace = true }
+arc-swap = { workspace = true }
 hashbrown = "0.15"
 lz4_flex = "0.11"
 postcard = { workspace = true }

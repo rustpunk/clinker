@@ -1236,7 +1236,7 @@ pub(crate) fn admit_node_buffer(
     }
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
-    let consumer_id = ctx.memory_budget.register_consumer(Box::new(
+    let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
         crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
     ));
     ctx.node_buffer_consumer_ids
@@ -3295,7 +3295,7 @@ pub(crate) async fn dispatch_plan_node(
                 // mirrors its value_heap_bytes total into the
                 // handle's counter on every admit / spill / reset.
                 let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                ctx.memory_budget.register_consumer(Box::new(
+                ctx.memory_budget.register_consumer(Arc::new(
                     crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
                 ));
                 let mut stream = crate::aggregation::AggregateStream::for_node(
@@ -4312,7 +4312,7 @@ pub(crate) async fn dispatch_plan_node(
                     // `SortConsumer` (priority 20); the handle's bytes
                     // start at zero and gain wiring once IEJoin's build
                     // path is plumbed.
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::sort_buffer::SortConsumer::new(
                             crate::pipeline::memory::ConsumerHandle::new(),
                         ),
@@ -4414,7 +4414,7 @@ pub(crate) async fn dispatch_plan_node(
                     // sum into the handle's counter on every admit /
                     // spill_partition transition.
                     let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::grace_hash::GraceHashConsumer::new(
                             grace_consumer_handle.clone(),
                         ),
@@ -4511,7 +4511,7 @@ pub(crate) async fn dispatch_plan_node(
                     // matching-run accumulator size into the handle's
                     // counter at every push / spill transition.
                     let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::sort_merge_join::SortMergeConsumer::new(
                             sm_consumer_handle.clone(),
                         ),
@@ -4617,7 +4617,7 @@ pub(crate) async fn dispatch_plan_node(
             // ConsumerId is unregistered at arm exit so the
             // arbitrator's registry tracks live tables only.
             let inline_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let inline_consumer_id = ctx.memory_budget.register_consumer(Box::new(
+            let inline_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::combine::CombineHashConsumer::new(inline_consumer_handle.clone()),
             ));
 
@@ -5927,7 +5927,7 @@ fn run_time_windowed_aggregate(
         };
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         ctx.memory_budget
-            .register_consumer(Box::new(crate::aggregation::AggregateConsumer::new(
+            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(
                 agg_consumer_handle.clone(),
             )));
         AggregateStream::for_node(

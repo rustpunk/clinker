@@ -22,7 +22,7 @@ impl MemoryConsumer for AggregateLike {
     fn spill_priority(&self) -> i32 {
         30
     }
-    fn try_spill(&mut self, _target: u64) -> Result<u64, ConsumerSpillError> {
+    fn try_spill(&self, _target: u64) -> Result<u64, ConsumerSpillError> {
         // The wrapper's `request_spill` flips the handle's flag — the
         // operator hot loop consumes it via `take_spill_request`.
         // Returning the handle's current bytes simulates an operator
@@ -45,14 +45,14 @@ fn largest_first_picks_the_larger_aggregate() {
     // Smaller aggregate: 64 KiB
     let small_handle = ConsumerHandle::new();
     small_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Box::new(AggregateLike {
+    arbitrator.register_consumer(Arc::new(AggregateLike {
         handle: small_handle.clone(),
     }));
 
     // Larger aggregate: 256 KiB
     let large_handle = ConsumerHandle::new();
     large_handle.set_bytes(256 * 1024);
-    arbitrator.register_consumer(Box::new(AggregateLike {
+    arbitrator.register_consumer(Arc::new(AggregateLike {
         handle: large_handle.clone(),
     }));
 
@@ -85,13 +85,13 @@ fn largest_first_picks_a_new_victim_each_round() {
 
     let small_handle = ConsumerHandle::new();
     small_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Box::new(AggregateLike {
+    arbitrator.register_consumer(Arc::new(AggregateLike {
         handle: small_handle.clone(),
     }));
 
     let large_handle = ConsumerHandle::new();
     large_handle.set_bytes(256 * 1024);
-    arbitrator.register_consumer(Box::new(AggregateLike {
+    arbitrator.register_consumer(Arc::new(AggregateLike {
         handle: large_handle.clone(),
     }));
 

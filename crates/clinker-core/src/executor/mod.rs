@@ -1009,7 +1009,7 @@ impl PipelineExecutor {
                 crate::executor::source_stream::TokioSourceStream::DEFAULT_CAPACITY,
                 source_consumer_handle.clone(),
             );
-            let _source_consumer_id = memory_budget.register_consumer(Box::new(
+            let _source_consumer_id = memory_budget.register_consumer(Arc::new(
                 crate::executor::source_stream::SourceConsumer::new(source_consumer_handle),
             ));
             source_records.insert(src_cfg.name.clone(), rx);

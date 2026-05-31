@@ -374,7 +374,7 @@ impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
     }
 
     fn try_spill(
-        &mut self,
+        &self,
         target_bytes: u64,
     ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
         self.handle.request_spill();
@@ -393,11 +393,11 @@ impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
         self.back_pressureable
     }
 
-    fn pause(&mut self) {
+    fn pause(&self) {
         self.handle.pause();
     }
 
-    fn resume(&mut self) {
+    fn resume(&self) {
         self.handle.resume();
     }
 }
@@ -631,7 +631,7 @@ mod tests {
     fn node_buffer_consumer_back_pressureable_routes_pause_to_handle() {
         use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
         let handle = ConsumerHandle::new();
-        let mut consumer = NodeBufferConsumer::new(handle.clone(), true);
+        let consumer = NodeBufferConsumer::new(handle.clone(), true);
         assert!(consumer.can_back_pressure());
         assert!(!handle.is_paused());
         consumer.pause();
@@ -645,7 +645,7 @@ mod tests {
         use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer};
         let handle = ConsumerHandle::new();
         handle.set_bytes(1024);
-        let mut consumer = NodeBufferConsumer::new(handle.clone(), false);
+        let consumer = NodeBufferConsumer::new(handle.clone(), false);
         // Below-target: handle has 1024, asked for 4096.
         match consumer.try_spill(4096) {
             Err(ConsumerSpillError::BelowTarget { target, freed }) => {

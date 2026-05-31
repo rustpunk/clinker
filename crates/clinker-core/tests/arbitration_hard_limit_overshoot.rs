@@ -27,7 +27,7 @@ impl MemoryConsumer for StuckAggregate {
     fn spill_priority(&self) -> i32 {
         30
     }
-    fn try_spill(&mut self, target: u64) -> Result<u64, ConsumerSpillError> {
+    fn try_spill(&self, target: u64) -> Result<u64, ConsumerSpillError> {
         // Simulates a consumer that cannot free what the arbitrator
         // asked for — e.g. a per-group accumulator whose entire
         // working set fits in a single record's heap. The arbitrator
@@ -55,7 +55,7 @@ fn should_abort_trips_when_rss_exceeds_hard_limit() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Box::new(StuckAggregate {
+    arbitrator.register_consumer(Arc::new(StuckAggregate {
         handle: handle.clone(),
     }));
 
@@ -76,7 +76,7 @@ fn soft_limit_arbitration_runs_before_hard_limit_aborts() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Box::new(StuckAggregate {
+    arbitrator.register_consumer(Arc::new(StuckAggregate {
         handle: handle.clone(),
     }));
 

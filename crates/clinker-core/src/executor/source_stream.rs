@@ -169,7 +169,7 @@ impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
     }
 
     fn try_spill(
-        &mut self,
+        &self,
         _target_bytes: u64,
     ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
         Ok(0)
@@ -179,11 +179,11 @@ impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
         true
     }
 
-    fn pause(&mut self) {
+    fn pause(&self) {
         self.handle.pause();
     }
 
-    fn resume(&mut self) {
+    fn resume(&self) {
         self.handle.resume();
     }
 }
@@ -197,7 +197,7 @@ mod tests {
     fn source_consumer_reports_handle_bytes_and_never_spills() {
         let handle = ConsumerHandle::new();
         handle.set_bytes(16 * 1024);
-        let mut consumer = SourceConsumer::new(handle.clone());
+        let consumer = SourceConsumer::new(handle.clone());
         assert_eq!(consumer.current_usage(), 16 * 1024);
         // Sources don't spill: try_spill always reports zero freed.
         assert_eq!(consumer.try_spill(u64::MAX).unwrap(), 0);
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn source_consumer_is_back_pressureable_and_routes_pause_to_handle() {
         let handle = ConsumerHandle::new();
-        let mut consumer = SourceConsumer::new(handle.clone());
+        let consumer = SourceConsumer::new(handle.clone());
         assert!(consumer.can_back_pressure());
         // Source spill priority sits above the integer range used by
         // other consumers; the Priority policy ranks Sources last,
