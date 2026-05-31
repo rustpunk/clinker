@@ -559,7 +559,7 @@ impl CombineHashTable {
         records: Vec<Record>,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
-        budget: &mut MemoryArbitrator,
+        budget: &MemoryArbitrator,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError> {
         let expected = estimated_rows.unwrap_or(records.len());
@@ -625,7 +625,7 @@ impl CombineHashTable {
                 let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
                 return Err(CombineError::MemoryLimitExceeded {
                     used: used as u64,
-                    limit: budget.limit,
+                    limit: budget.limit(),
                 });
             }
         }
@@ -643,7 +643,7 @@ impl CombineHashTable {
         if budget.should_abort() {
             return Err(CombineError::MemoryLimitExceeded {
                 used: table.memory_bytes() as u64,
-                limit: budget.limit,
+                limit: budget.limit(),
             });
         }
 
@@ -783,6 +783,61 @@ fn partial_memory_bytes(
                     + k.iter().map(Value::heap_size).sum::<usize>()
             })
             .sum::<usize>()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// MemoryConsumer wrapper for the inline-combine `CombineHashTable`
+// ──────────────────────────────────────────────────────────────────────────
+
+/// `MemoryConsumer` wrapper for the inline-combine `CombineHashTable`.
+/// Holds an `Arc<ConsumerHandle>` shared with the dispatch site: after
+/// the build completes the executor mirrors `CombineHashTable::memory_bytes`
+/// into the handle so the arbitrator's pull-mode `current_usage` reads
+/// the live in-memory footprint of the table at policy-poll time.
+///
+/// `spill_priority = 30`: hash-build spill costs match `HashAggregator` —
+/// sort-by-encoded-key, write every record, rebuild on finalize. Last-
+/// resort victim alongside hash-aggregation. `can_back_pressure = false`:
+/// an in-flight combine has no upstream channel to gate; pausing the
+/// probe loop would stall the join without releasing memory.
+pub struct CombineHashConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl CombineHashConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for CombineHashConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        30
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

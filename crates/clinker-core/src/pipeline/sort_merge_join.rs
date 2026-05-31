@@ -125,6 +125,7 @@ fn push_to_buffer(
     byte_limit: usize,
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
+    consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> std::io::Result<u64> {
     let incoming = std::mem::size_of::<Record>() + record.estimated_heap_size();
     match buf {
@@ -132,6 +133,12 @@ fn push_to_buffer(
             if bytes.saturating_add(incoming) > byte_limit && !records.is_empty() {
                 // Promote to Spilled: drain all records to a fresh
                 // segment, then start a tail with the incoming record.
+                // Every in-memory byte previously charged into the
+                // consumer handle is now off-process; subtract before
+                // the variant flip so the handle stays aligned with
+                // the operator's live state (Velox's "reclaimable ≠
+                // held" point).
+                let prev_in_memory = *bytes as u64;
                 let mut drained = std::mem::take(records);
                 let schema = Arc::clone(drained[0].schema());
                 drained.push(record);
@@ -144,10 +151,12 @@ fn push_to_buffer(
                     tail: Vec::new(),
                     tail_bytes: 0,
                 };
+                consumer_handle.sub_bytes(prev_in_memory);
                 Ok(written)
             } else {
                 *bytes = bytes.saturating_add(incoming);
                 records.push(record);
+                consumer_handle.add_bytes(incoming as u64);
                 Ok(0)
             }
         }
@@ -161,16 +170,19 @@ fn push_to_buffer(
             if tail_bytes.saturating_add(incoming) > byte_limit && !tail.is_empty() {
                 // Tail itself overflowed; flush it as a new segment
                 // and start a fresh tail with the incoming record.
+                let prev_tail = *tail_bytes as u64;
                 let mut drained = std::mem::take(tail);
                 drained.push(record);
                 let (segment_path, written) = write_spill_segment(spill_dir, spill_seq, &drained)?;
                 *spilled_count = spilled_count.saturating_add(drained.len() as u64);
                 *tail_bytes = 0;
                 segments.push(segment_path);
+                consumer_handle.sub_bytes(prev_tail);
                 Ok(written)
             } else {
                 *tail_bytes = tail_bytes.saturating_add(incoming);
                 tail.push(record);
+                consumer_handle.add_bytes(incoming as u64);
                 Ok(0)
             }
         }
@@ -338,12 +350,18 @@ pub(crate) struct SortMergeExec<'a> {
     /// `copy_build_ck_columns` at each emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryArbitrator,
+    pub budget: &'a MemoryArbitrator,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. Matching-run spill segments
     /// land inside it; the surrounding `Arc<TempDir>` Drop is the
     /// secondary panic-safe cleanup sweep.
     pub spill_dir: &'a Path,
+    /// Shared with the registered `SortMergeConsumer` wrapper.
+    /// Phase A per-side `SortBuffer.bytes_used` plus Phase B
+    /// matching-run accumulator size mirror into `handle.bytes`
+    /// so the arbitrator's pull-mode `current_usage` reads the
+    /// operator's live in-memory state.
+    pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 /// Snapshot of which phases ran during a sort-merge execution. Used by
@@ -407,6 +425,7 @@ fn execute_combine_sort_merge_with_stats(
         ctx,
         budget,
         spill_dir,
+        consumer_handle,
     } = args;
 
     let mut stats = SortMergeStats::default();
@@ -555,8 +574,20 @@ fn execute_combine_sort_merge_with_stats(
         // Phase A external sort: build a SortBuffer<RecordOrder> per
         // side, sized against the configured memory limit, and read
         // back via the LoserTree merge when spills occurred.
-        sort_driver_pairs_externally(&mut driver_pairs, name, &driver_field, budget)?;
-        sort_build_pairs_externally(&mut build_pairs, name, &build_field, budget)?;
+        sort_driver_pairs_externally(
+            &mut driver_pairs,
+            name,
+            &driver_field,
+            budget,
+            &consumer_handle,
+        )?;
+        sort_build_pairs_externally(
+            &mut build_pairs,
+            name,
+            &build_field,
+            budget,
+            &consumer_handle,
+        )?;
         stats.phase_a_sort_invocations = 2;
     } else {
         // Pre-sorted skip: the upstream NodeProperties::ordering covers
@@ -621,6 +652,7 @@ fn execute_combine_sort_merge_with_stats(
         matched_driver_orders: &mut matched_driver_orders,
         emitted_since_check: &mut emitted_since_check,
         budget,
+        consumer_handle: &consumer_handle,
     })?;
 
     // ── on_miss / collect-mode flush ─────────────────────────────────
@@ -721,7 +753,8 @@ fn sort_driver_pairs_externally(
     pairs: &mut Vec<(Record, RecordOrder, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
+    consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -751,17 +784,30 @@ fn sort_driver_pairs_externally(
     let mut buf: SortBuffer<RecordOrder> =
         SortBuffer::new(vec![sort_field], spill_threshold, None, schema);
 
+    // Track this helper's contribution to the consumer handle so the
+    // Spilled-finish branch can rewind correctly. Without a local
+    // counter, residual bytes flushed inside `buf.finish()` would
+    // remain charged after the records moved off-process.
+    let mut local_charged: u64 = 0;
+
     // Drain pairs into the buffer; payload is the order tag. The key
     // value rides on the record itself (read by the SortBuffer's
     // field comparator), so we drop it here and re-extract on read.
     for (record, order, _key) in pairs.drain(..) {
+        let pre = buf.bytes_used();
         buf.push(record, order);
+        let delta = (buf.bytes_used().saturating_sub(pre)) as u64;
+        consumer_handle.add_bytes(delta);
+        local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
+            let pre_spill = buf.bytes_used() as u64;
             buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge driver phase A spill failed: {e}"
                 )))
             })?;
+            consumer_handle.sub_bytes(pre_spill);
+            local_charged = local_charged.saturating_sub(pre_spill);
         }
     }
 
@@ -773,12 +819,21 @@ fn sort_driver_pairs_externally(
 
     match sorted {
         SortedOutput::InMemory(out) => {
+            // Records remain in memory inside the returned `out` Vec
+            // and are immediately re-pushed into `pairs`. The
+            // accumulated `local_charged` already reflects them, so
+            // nothing to adjust on the handle.
             for (record, order) in out {
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
                 pairs.push((record, order, key));
             }
         }
         SortedOutput::Spilled(files) => {
+            // `buf.finish()` may have spilled the in-memory residue
+            // we last charged into `local_charged`. Those bytes are
+            // now off-process; the records flow back from disk into
+            // `pairs` below and re-charge per-record.
+            consumer_handle.sub_bytes(local_charged);
             // Single-file path is exact (the buffer sort is stable).
             // Multi-file would need a k-way merge via `LoserTree`; the
             // matching-run spill is independent and handled in Phase B,
@@ -807,6 +862,10 @@ fn sort_driver_pairs_externally(
                         )))
                     })?;
                     let key = record.get(field).cloned().unwrap_or(Value::Null);
+                    let bytes = std::mem::size_of::<Record>()
+                        + record.estimated_heap_size()
+                        + std::mem::size_of::<RecordOrder>();
+                    consumer_handle.add_bytes(bytes as u64);
                     pairs.push((record, order, key));
                 }
             }
@@ -822,7 +881,8 @@ fn sort_build_pairs_externally(
     pairs: &mut Vec<(Record, Value)>,
     name: &str,
     range_field: &Option<String>,
-    budget: &mut MemoryArbitrator,
+    budget: &MemoryArbitrator,
+    consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -845,14 +905,23 @@ fn sort_build_pairs_externally(
     };
     let mut buf: SortBuffer<()> = SortBuffer::new(vec![sort_field], spill_threshold, None, schema);
 
+    let mut local_charged: u64 = 0;
+
     for (record, _key) in pairs.drain(..) {
+        let pre = buf.bytes_used();
         buf.push(record, ());
+        let delta = (buf.bytes_used().saturating_sub(pre)) as u64;
+        consumer_handle.add_bytes(delta);
+        local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
+            let pre_spill = buf.bytes_used() as u64;
             buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge build phase A spill failed: {e}"
                 )))
             })?;
+            consumer_handle.sub_bytes(pre_spill);
+            local_charged = local_charged.saturating_sub(pre_spill);
         }
     }
 
@@ -870,6 +939,7 @@ fn sort_build_pairs_externally(
             }
         }
         SortedOutput::Spilled(files) => {
+            consumer_handle.sub_bytes(local_charged);
             if files.len() > 1 {
                 return Err(PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge build phase A produced {} spill files; multi-file \
@@ -891,6 +961,8 @@ fn sort_build_pairs_externally(
                         )))
                     })?;
                     let key = record.get(field).cloned().unwrap_or(Value::Null);
+                    let bytes = std::mem::size_of::<Record>() + record.estimated_heap_size();
+                    consumer_handle.add_bytes(bytes as u64);
                     pairs.push((record, key));
                 }
             }
@@ -936,7 +1008,8 @@ struct WalkArgs<'a, 'b, 'c> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'c mut MemoryArbitrator,
+    budget: &'c MemoryArbitrator,
+    consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
 /// Walk the two pre-sorted cursors, emitting cross-product matches per
@@ -973,6 +1046,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
         matched_driver_orders,
         emitted_since_check,
         budget,
+        consumer_handle,
     } = args;
 
     let mut di = 0usize;
@@ -998,6 +1072,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     byte_limit,
                     spill_dir,
                     spill_seq,
+                    consumer_handle,
                 )
                 .map_err(|e| PipelineError::Internal {
                     op: "combine",
@@ -1049,9 +1124,28 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
             budget,
         })?;
 
+        // Discharge any in-memory residue still held by the
+        // matching-run buffer. The next iteration's
+        // `MatchingRunBuffer::new()` shadow-rebinds and drops `run`;
+        // without this sub the handle would leak its in-memory bytes
+        // forever across drivers.
+        consumer_handle.sub_bytes(matching_run_in_memory_bytes(&run));
+
         di += 1;
     }
     Ok(())
+}
+
+/// In-memory byte count for a matching-run buffer. `InMemory` carries
+/// its accumulated bytes directly; `Spilled` reports only the tail
+/// (on-disk segments are off-process and don't count against the
+/// pull-mode `current_usage` surface — same convention as the grace-
+/// hash partition Building → OnDisk transition).
+fn matching_run_in_memory_bytes(buf: &MatchingRunBuffer) -> u64 {
+    match buf {
+        MatchingRunBuffer::InMemory { bytes, .. } => *bytes as u64,
+        MatchingRunBuffer::Spilled { tail_bytes, .. } => *tail_bytes as u64,
+    }
 }
 
 struct EmitForRunArgs<'a, 'b> {
@@ -1070,7 +1164,7 @@ struct EmitForRunArgs<'a, 'b> {
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
-    budget: &'b mut MemoryArbitrator,
+    budget: &'b MemoryArbitrator,
 }
 
 /// Emit cross-product records for one driver row against the buffered
@@ -1226,10 +1320,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                 if args.budget.should_abort() {
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
-                                        used: args
-                                            .budget
-                                            .peak_rss
-                                            .unwrap_or(args.budget.arena_bytes_charged()),
+                                        used: args.budget.peak_rss().unwrap_or(0),
                                         limit: args.budget.hard_limit(),
                                         source: BudgetCategory::Arena,
                                         detail: Some(
@@ -1290,10 +1381,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                         if args.budget.should_abort() {
                             return Err(PipelineError::MemoryBudgetExceeded {
                                 node: name.to_string(),
-                                used: args
-                                    .budget
-                                    .peak_rss
-                                    .unwrap_or(args.budget.arena_bytes_charged()),
+                                used: args.budget.peak_rss().unwrap_or(0),
                                 limit: args.budget.hard_limit(),
                                 source: BudgetCategory::Arena,
                                 detail: Some("sort-merge combine probe RSS abort".to_string()),
@@ -1335,6 +1423,59 @@ impl clinker_record::RecordStorage for NullStorage {
     }
     fn record_count(&self) -> u64 {
         0
+    }
+}
+
+/// `MemoryConsumer` wrapper for a `SortMergeExec` mid-execution.
+/// Holds an `Arc<ConsumerHandle>` shared with the executor: Phase A
+/// per-side `SortBuffer.bytes_used` plus Phase B matching-run
+/// accumulator size sum into `handle.bytes`. `try_spill` flips the
+/// handle's spill-request flag; the executor reacts at the next
+/// batch boundary by flushing its current run to disk.
+///
+/// `spill_priority = 25`: sort-merge spill is more expensive than
+/// either sort or grace-hash because it involves both per-side sort
+/// flush AND matching-run accumulator flush; only hash-aggregation
+/// (priority 30) is more expensive. `can_back_pressure = false`:
+/// sort-merge holds two cursors that walk inputs monotonically;
+/// pausing either side stalls the match scan.
+pub struct SortMergeConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl SortMergeConsumer {
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        25
+    }
+
+    fn try_spill(
+        &mut self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
     }
 }
 
@@ -1576,6 +1717,7 @@ mod tests {
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         };
         let result = execute_combine_sort_merge_with_stats(args)
             .expect("sort-merge kernel execution failed");

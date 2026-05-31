@@ -423,7 +423,7 @@ pub(crate) struct IEJoinExec<'a> {
     /// the shared `copy_build_ck_columns` helper at every emit site.
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
-    pub budget: &'a mut MemoryArbitrator,
+    pub budget: &'a MemoryArbitrator,
 }
 
 pub(crate) fn execute_combine_iejoin(
@@ -825,9 +825,7 @@ pub(crate) fn execute_combine_iejoin(
                                         if budget.should_abort() {
                                             return Err(PipelineError::MemoryBudgetExceeded {
                                                 node: name.to_string(),
-                                                used: budget
-                                                    .peak_rss
-                                                    .unwrap_or(budget.arena_bytes_charged()),
+                                                used: budget.peak_rss().unwrap_or(0),
                                                 limit: budget.hard_limit(),
                                                 source: BudgetCategory::Arena,
                                                 detail: Some(
@@ -892,9 +890,7 @@ pub(crate) fn execute_combine_iejoin(
                                 if budget.should_abort() {
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
-                                        used: budget
-                                            .peak_rss
-                                            .unwrap_or(budget.arena_bytes_charged()),
+                                        used: budget.peak_rss().unwrap_or(0),
                                         limit: budget.hard_limit(),
                                         source: BudgetCategory::Arena,
                                         detail: Some("iejoin combine probe RSS abort".to_string()),
@@ -986,7 +982,7 @@ pub(crate) fn execute_combine_iejoin(
                             if budget.should_abort() {
                                 return Err(PipelineError::MemoryBudgetExceeded {
                                     node: name.to_string(),
-                                    used: budget.peak_rss.unwrap_or(budget.arena_bytes_charged()),
+                                    used: budget.peak_rss().unwrap_or(0),
                                     limit: budget.hard_limit(),
                                     source: BudgetCategory::Arena,
                                     detail: Some("iejoin combine probe RSS abort".to_string()),
