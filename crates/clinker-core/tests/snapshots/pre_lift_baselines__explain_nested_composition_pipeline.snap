@@ -1,6 +1,5 @@
 ---
 source: crates/clinker-core/tests/pre_lift_baselines.rs
-assertion_line: 547
 expression: scrubbed
 ---
 === Execution Plan ===
@@ -23,6 +22,7 @@ source.raw_src:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true
 
 composition.nested_process:
   ordering: <none>
@@ -30,6 +30,7 @@ composition.nested_process:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=false
 
 output.final_out:
   ordering: <none>
@@ -37,6 +38,17 @@ output.final_out:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false
+
+=== Buffer Edges ===
+
+edge source.raw_src -> composition.nested_process:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+
+edge composition.nested_process -> output.final_out:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false (producer: composition)
 
 === CXL Expressions ===
 

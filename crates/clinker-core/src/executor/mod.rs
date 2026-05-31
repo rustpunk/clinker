@@ -3800,12 +3800,12 @@ mod tests {
     mod aggregation;
     mod branching;
     mod ck_aligned_partition_runtime;
+    mod composition_port_admission_overshoot;
     mod correlated_dlq;
     mod correlated_dlq_retract;
     mod correlated_post_aggregate_retract;
     mod correlated_window_after_aggregate_retract;
     mod correlated_window_retract;
-    mod composition_port_admission_overshoot;
     mod cross_source_window_topology;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;

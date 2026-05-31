@@ -1,6 +1,6 @@
 ---
-source: crates/clinker-core/tests/pre_lift_baselines.rs
-expression: scrubbed
+source: crates/clinker-core/tests/explain_arbitration.rs
+expression: text
 ---
 === Execution Plan ===
 
@@ -8,15 +8,31 @@ Mode: Streaming
 Indices to build: 0
 Transforms: 0
 Output projections: 1
-DAG nodes: 4
+DAG nodes: 3
 arbitration: BackPressurePreferred -> Priority
 
 Source DAG:
-  Tier 0: customers_src, addresses_src
+  Tier 0: orders
 
 === Physical Properties ===
 
-output.enriched_out:
+source.orders:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true
+
+aggregation.dept_totals:
+  ordering: <none>
+  ordering_provenance: DestroyedByHashAggregate { at_node: "dept_totals", confidence: Proven }
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=30, can_back_pressure=false
+
+output.out:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -24,37 +40,21 @@ output.enriched_out:
   buffer: streaming
   arbitration: spill_priority=N/A, can_back_pressure=false
 
-source.addresses_src:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-  buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
-
-composition.addr_norm:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-  buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
-
-source.customers_src:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-  buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
-
 === Buffer Edges ===
 
-edge source.addresses_src -> composition.addr_norm:
-  buffer: node_buffer (slot=1)
+edge source.orders -> aggregation.dept_totals:
+  buffer: node_buffer (slot=0)
   arbitration: spill_priority=0, can_back_pressure=false (producer: source)
 
+edge aggregation.dept_totals -> output.out:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false (producer: aggregation)
+
 === CXL Expressions ===
+
+Transform 'dept_totals':
+  emit department = department
+  emit total = sum(amount)
 
 === Type Annotations ===
 
@@ -66,7 +66,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [output] enriched_out (line:48)
-  ● [source] addresses_src (line:17)
-  │ [composition:body=<ID>] addr_norm (line:39)
-  ● [source] customers_src (line:7)
+  ● [source] orders (line:5)
+  ◇ [aggregation:hash] dept_totals (line:15)
+  │ [output] out (line:24)

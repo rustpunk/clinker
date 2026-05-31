@@ -88,6 +88,26 @@ Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk
 
 Window-runtime arenas (the columnar backing store that analytic-window evaluation reads from) are attributed but not independently spillable: an arena is immutable once built and is freed only indirectly, when the operator that consumes its windows drains to disk. Its wrapper reports the arena's bytes so the arbitrator's attribution is complete, but ranks last among spill victims so a policy never elects an arena while any consumer that can actually pause or spill remains.
 
+### Per-operator arbitration parameters
+
+Each registered consumer carries two parameters the active policy reads: a **spill priority** (lower is spilled first under `Priority`) and a **back-pressure flag** (whether its producer can be paused instead). The defaults are:
+
+| Operator class | `spill_priority` | `can_back_pressure` |
+|----------------|------------------|---------------------|
+| `node_buffers` slot (inter-stage buffer) | 0 | false |
+| grace-hash Combine | 10 | false |
+| sort buffer / IEJoin build | 20 | false |
+| sort-merge Combine | 25 | false |
+| hash Aggregate | 30 | false |
+| inline-hash Combine | 30 | false |
+| Source ingest | N/A | true |
+| streaming Aggregate | N/A | false |
+| window arena | last | false |
+
+Lower priority is spilled first, so `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. The blocking operators climb from there: a grace-hash Combine (10) is preferred over a sort buffer (20), which is preferred over a hash Aggregate or inline-hash Combine (30).
+
+A **Source** and a **streaming Aggregate** show `spill_priority=N/A` because neither holds spillable state. A Source's `try_spill` always frees zero bytes — its only real lever is the pause its `can_back_pressure=true` advertises. A streaming Aggregate emits each group as it completes and never accumulates a spillable table. Both still appear in the explain annotation so the model is complete; they are simply never elected as spill victims.
+
 When memory pressure crosses the soft threshold (80 % of `limit`), the arbitrator runs the active policy to pick a victim and invokes the corresponding action: `pause()` on a back-pressureable consumer (its producer's hot loop parks on a `Condvar` until `resume`), or `try_spill(target_bytes)` on a spillable consumer (the consumer's wrapper flips a spill-requested flag the operator reads at its next batch boundary). When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded`.
 
 This means:
@@ -105,6 +125,38 @@ When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs
 Spill fires at the producer side of the first slot whose downstream topology permits it — single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
 
 Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation, and the materialized nodes are exactly the ones that charge `pipeline.memory.limit` and are spill-eligible.
+
+## Reading `--explain` arbitration output
+
+Alongside the `buffer:` class, every node in the **Physical Properties** stanza of `--explain` carries an `arbitration:` line giving the [per-operator parameters](#per-operator-arbitration-parameters) the arbitrator would apply at runtime. The numbers are derived at plan time — `--explain` does no I/O, so there are no live consumers to query — but they mirror the runtime values exactly, so an author can read the spill/pause model before running the pipeline.
+
+For a fast Source feeding a slow Aggregate (the canonical bounded-memory shape), the relevant lines read:
+
+```text
+=== Physical Properties ===
+
+source.orders:
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true
+
+aggregation.dept_totals:
+  buffer: materialized
+  arbitration: spill_priority=30, can_back_pressure=false
+```
+
+The Source advertises `can_back_pressure=true` and `spill_priority=N/A`: when memory pressure rises, the arbitrator pauses the Source rather than asking it to spill (it has nothing to free). The hash Aggregate advertises the opposite — `spill_priority=30`, `can_back_pressure=false` — so it is a spill victim, ranked behind any cheaper consumer.
+
+A **`=== Buffer Edges ===`** section follows, listing the `node_buffers` slot between each pair of non-fused stages. Every slot is a priority-0, non-back-pressureable `NodeBufferConsumer` — the cheapest victim class — and the `slot=` number is the stable index the executor admits into:
+
+```text
+=== Buffer Edges ===
+
+edge source.orders -> aggregation.dept_totals:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+```
+
+Reading top to bottom: under memory pressure the arbitrator first spills the inter-stage buffer (priority 0), then — if the soft threshold is still tripped — pauses the Source before it ever forces the Aggregate (priority 30) to spill. That ordering is exactly what the default `pause` policy (`BackPressurePreferred -> Priority`) encodes. Cross-reference the [per-operator table](#per-operator-arbitration-parameters) to see where any operator in your own pipeline lands.
 
 ## Sizing guidelines
 
