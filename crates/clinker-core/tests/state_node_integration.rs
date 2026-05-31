@@ -64,7 +64,7 @@ async fn run_single(yaml: &str, csv_input: &str) -> String {
     buf.as_string()
 }
 
-async fn run_multi(yaml: &str, primary: &str, inputs: &[(&str, &str)]) -> String {
+async fn run_multi(yaml: &str, inputs: &[(&str, &str)]) -> String {
     let config = parse_config(yaml).expect("parse_config");
     let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
@@ -421,12 +421,7 @@ nodes:
 "#;
     let left = "id,tag_val\n1,L1\n2,L2\n";
     let right = "id,tag_val\n10,R1\n20,R2\n";
-    let out = run_multi(
-        yaml,
-        "left_src",
-        &[("left_src", left), ("right_src", right)],
-    )
-    .await;
+    let out = run_multi(yaml, &[("left_src", left), ("right_src", right)]).await;
     let header = out.lines().next().unwrap();
     assert_eq!(header, "id,lt,rt");
     let lines = body_lines_sorted(&out);
@@ -518,7 +513,6 @@ nodes:
     let orders_csv = "id,amount\n1,100\n2,200\n3,300\n";
     let out = run_multi(
         yaml,
-        "orders_src",
         &[("orders_src", orders_csv), ("config_src", config_csv)],
     )
     .await;

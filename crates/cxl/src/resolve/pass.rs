@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("has no member 'MAZ'"));
         assert!(
-            diags[0].help.as_ref().map_or(false, |h| h.contains("MAX")),
+            diags[0].help.as_ref().is_some_and(|h| h.contains("MAX")),
             "Expected suggestion 'MAX', got: {:?}",
             diags[0].help
         );

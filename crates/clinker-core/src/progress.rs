@@ -94,6 +94,13 @@ impl VecReporter {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+impl Default for VecReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 impl ProgressReporter for VecReporter {
     fn report(&self, update: &ProgressUpdate) {
         self.updates.lock().unwrap().push(update.clone());

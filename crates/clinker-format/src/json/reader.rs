@@ -643,7 +643,10 @@ mod tests {
         JsonReaderConfig::default()
     }
 
-    fn envelope_config(sections: &[(&str, &str, &[(&str, EnvelopeFieldType)])]) -> EnvelopeConfig {
+    /// `(section name, JSON pointer, [(field name, type)])` for one envelope section.
+    type SectionSpec<'a> = (&'a str, &'a str, &'a [(&'a str, EnvelopeFieldType)]);
+
+    fn envelope_config(sections: &[SectionSpec]) -> EnvelopeConfig {
         use crate::envelope::EnvelopeSection;
         let mut cfg = EnvelopeConfig::default();
         for (name, pointer, fields) in sections {
@@ -925,12 +928,12 @@ mod tests {
 
     #[test]
     fn test_json_schema_inference_types() {
-        let input = r#"[{"i":42,"f":3.14,"s":"hello","b":true,"n":null}]"#;
+        let input = r#"[{"i":42,"f":2.5,"s":"hello","b":true,"n":null}]"#;
         let mut r = reader_from_str(input, default_config());
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("i"), Some(&Value::Integer(42)));
-        assert_eq!(r1.get("f"), Some(&Value::Float(3.14)));
+        assert_eq!(r1.get("f"), Some(&Value::Float(2.5)));
         assert_eq!(r1.get("s"), Some(&Value::String("hello".into())));
         assert_eq!(r1.get("b"), Some(&Value::Bool(true)));
         assert_eq!(r1.get("n"), Some(&Value::Null));

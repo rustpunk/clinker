@@ -457,13 +457,13 @@ mod tests {
             big_csv.push_str(&format!("D{},{},Name{}\n", i % 3, i * 10, i));
         }
         let mut reader = make_csv_reader(&big_csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap();
         assert_eq!(arena.record_count(), 100);
@@ -473,13 +473,13 @@ mod tests {
     fn test_arena_field_projection() {
         let csv = "dept,amount,name,extra\nA,100,Alice,X\nB,200,Bob,Y\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap();
 
@@ -503,13 +503,13 @@ mod tests {
     fn test_arena_record_view_resolve() {
         let csv = "dept,amount\nA,100\nB,200\nC,300\nD,400\nE,500\nF,600\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap();
 
@@ -522,13 +522,13 @@ mod tests {
     fn test_arena_record_view_missing_field() {
         let csv = "dept,amount\nA,100\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap();
 
@@ -555,13 +555,13 @@ mod tests {
     fn test_arena_empty_input() {
         let csv = "dept,amount\n";
         let mut reader = make_csv_reader(csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let arena = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap();
         assert_eq!(arena.record_count(), 0);
@@ -575,13 +575,13 @@ mod tests {
             csv.push_str(&format!("Department_{},{}00\n", i, i));
         }
         let mut reader = make_csv_reader(&csv);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let result = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             100,
             None,
-            &mut budget,
+            &budget,
         );
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -654,13 +654,13 @@ mod tests {
             second_schema: Arc::clone(&second_schema),
             emitted: 0,
         };
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let result = Arena::build(
             &mut reader,
             &["dept".into(), "amount".into()],
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         );
         match result {
             Err(ArenaError::SchemaMismatch { expected, actual }) => {
@@ -735,8 +735,8 @@ mod tests {
                 (Record::new(Arc::clone(&schema), v), i as u64)
             })
             .collect();
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 1.0, Box::new(NoOpPolicy));
-        let arena = Arena::from_records(&rows, &["id".into(), "name".into()], &schema, &mut budget)
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 1.0, Box::new(NoOpPolicy));
+        let arena = Arena::from_records(&rows, &["id".into(), "name".into()], &schema, &budget)
             .expect("uniform-variant arena builds");
         assert_eq!(arena.record_count(), 50);
     }

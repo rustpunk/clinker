@@ -318,14 +318,13 @@ async fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<Strin
         .collect()
 }
 
-/// Map a fixture to its (source_name, data_filename) inputs and its list of
-/// (baseline_filename, output_name) assertions.
-fn fixture_io(
-    name: &str,
-) -> (
-    Vec<(&'static str, &'static str)>,
-    Vec<(&'static str, &'static str)>,
-) {
+/// `(source_name, data_filename)` for one fixture input.
+type SourceInput = (&'static str, &'static str);
+/// `(baseline_filename, output_name)` for one fixture output assertion.
+type BaselineAssertion = (&'static str, &'static str);
+
+/// Map a fixture to its source inputs and its list of baseline assertions.
+fn fixture_io(name: &str) -> (Vec<SourceInput>, Vec<BaselineAssertion>) {
     match name {
         "csv_transform_sink" => (
             vec![("employees", "employees.csv")],

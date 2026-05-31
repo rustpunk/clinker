@@ -2036,7 +2036,7 @@ o6,ENG,300
     // No HR record reaches either Output: HR's aggregate emit hit /0
     // and was retracted; iteration 2's `restore_baseline` wiped any
     // speculative HR record from iteration 1's buffer.
-    for line in big_out.lines().chain(small_out.lines()).skip(0) {
+    for line in big_out.lines().chain(small_out.lines()) {
         if line.starts_with("department,") {
             continue;
         }

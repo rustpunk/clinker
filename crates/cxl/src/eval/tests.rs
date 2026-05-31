@@ -333,8 +333,8 @@ fn test_eval_conversion_lenient() {
         Value::Null
     );
     assert_eq!(
-        eval_single("emit val = \"3.14\".try_float()", &[], HashMap::new()),
-        Value::Float(3.14)
+        eval_single("emit val = \"2.5\".try_float()", &[], HashMap::new()),
+        Value::Float(2.5)
     );
 }
 

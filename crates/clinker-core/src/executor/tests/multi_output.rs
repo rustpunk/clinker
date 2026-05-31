@@ -603,10 +603,7 @@ async fn test_multi_output_writer_error_propagated() {
     impl std::io::Write for FailingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             if self.remaining == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "simulated write failure",
-                ));
+                return Err(std::io::Error::other("simulated write failure"));
             }
             let n = buf.len().min(self.remaining);
             self.remaining -= n;
@@ -614,10 +611,7 @@ async fn test_multi_output_writer_error_propagated() {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             if self.remaining == 0 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "simulated flush failure",
-                ))
+                Err(std::io::Error::other("simulated flush failure"))
             } else {
                 Ok(())
             }
@@ -908,10 +902,7 @@ async fn test_multi_output_writer_panic_propagated() {
                 panic!("simulated writer panic");
             }
             // During unwind/drop, don't panic again
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "already panicked",
-            ))
+            Err(std::io::Error::other("already panicked"))
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -1187,10 +1178,7 @@ async fn test_multi_output_multiple_errors_collected() {
             Ok(buf.len()) // Accept writes
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "flush failed",
-            ))
+            Err(std::io::Error::other("flush failed"))
         }
     }
 

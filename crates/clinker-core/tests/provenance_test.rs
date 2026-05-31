@@ -19,11 +19,6 @@ fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
     clinker_core::yaml::from_str(yaml).expect("parse PipelineConfig")
 }
 
-#[test]
-fn scaffold_compiles() {
-    assert!(true);
-}
-
 // ---------------------------------------------------------------------
 // ResolvedValue + ProvenanceLayer tests
 // ---------------------------------------------------------------------

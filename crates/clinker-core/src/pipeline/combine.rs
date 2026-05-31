@@ -1373,10 +1373,10 @@ mod tests {
         let extractor = single_int_key("id");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
+        let budget = test_budget(256 * 1024 * 1024);
 
         let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
         assert_eq!(table.len(), 1000);
         assert!(!table.is_empty());
 
@@ -1400,9 +1400,9 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
+        let budget = test_budget(256 * 1024 * 1024);
 
-        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(5), Value::Null]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1424,8 +1424,8 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        let budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(9999)]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1448,8 +1448,8 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        let budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
         assert_eq!(
             table.len(),
             2,
@@ -1498,8 +1498,8 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        let budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
         assert_eq!(
             table.len(),
             3,
@@ -1566,9 +1566,9 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
+        let budget = test_budget(256 * 1024 * 1024);
         let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
 
         // These keys are NOT in the build set.
         for missing_key in [1000i64, 10_000, -1, -999] {
@@ -1608,9 +1608,8 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(100)).unwrap();
+        let budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, Some(100)).unwrap();
 
         let total = table.memory_bytes();
 
@@ -1692,9 +1691,9 @@ mod tests {
 
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
+        let budget = test_budget(256 * 1024 * 1024);
         let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -1754,10 +1753,9 @@ mod tests {
 
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(1024 * 1024 * 1024);
+        let budget = test_budget(1024 * 1024 * 1024);
         let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(N_RECORDS))
-                .unwrap();
+            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(N_RECORDS)).unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -1784,9 +1782,9 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(1); // 1 byte — impossibly tight.
+        let budget = test_budget(1); // 1 byte — impossibly tight.
 
-        match CombineHashTable::build(records, &extractor, &ctx, &mut budget, None) {
+        match CombineHashTable::build(records, &extractor, &ctx, &budget, None) {
             Err(CombineError::MemoryLimitExceeded { used, limit }) => {
                 assert_eq!(limit, 1);
                 // `used` is either non-zero if the final check fires and
@@ -1818,8 +1816,8 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(vec![], &extractor, &ctx, &mut budget, None).unwrap();
+        let budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(vec![], &extractor, &ctx, &budget, None).unwrap();
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
 
@@ -1845,9 +1843,9 @@ mod tests {
         let extractor = single_int_key("k");
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
-        let mut budget = test_budget(256 * 1024 * 1024);
+        let budget = test_budget(256 * 1024 * 1024);
         let table =
-            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(10_000)).unwrap();
+            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(10_000)).unwrap();
 
         for key in [0i64, 500, 9999] {
             let probe = mk_record(&schema, vec![Value::Integer(key)]);
@@ -1907,9 +1905,9 @@ mod tests {
                     )
                 })
                 .collect();
-            let mut budget = test_budget(256 * 1024 * 1024);
-            let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None)
-                .expect("build");
+            let budget = test_budget(256 * 1024 * 1024);
+            let table =
+                CombineHashTable::build(records, &extractor, &ctx, &budget, None).expect("build");
             assert_eq!(table.len(), n);
 
             // For every key in the universe PLUS a few definitely-missing

@@ -8,15 +8,24 @@ The CI gauntlet — exactly what GitHub CI runs (`.github/workflows/ci.yml`):
 
 1. `cargo fmt --all` (CI runs `--check`; locally fix first)
 2. `cargo clippy --workspace -- -D warnings`
-3. `cargo test --workspace`
-4. `cargo check --benches --workspace` — `cargo test --workspace` does NOT compile benches; a changed crate API can leave bench call-sites broken and only surface in CI
-5. `cargo check --features bench-alloc -p clinker-benchmarks`
-6. `cargo test --benches -p clinker-benchmarks`
-7. `cargo deny check`
+3. `cargo clippy --workspace --all-targets -- -D warnings`
+4. `cargo test --workspace`
+5. `cargo check --benches --workspace` — `cargo test --workspace` does NOT compile benches; a changed crate API can leave bench call-sites broken and only surface in CI
+6. `cargo check --features bench-alloc -p clinker-benchmarks`
+7. `cargo test --benches -p clinker-benchmarks`
+8. `cargo deny check`
+
+Steps 2 and 3 are both clippy and both load-bearing. Step 2 omits
+`--all-targets` deliberately: with test targets excluded, a `pub(crate)`
+item referenced only from `#[cfg(test)]` code still trips the dead-code
+lint, so step 2 is the dead-code gate the sprint-boundary rule below
+relies on. Step 3 adds `--all-targets` purely for lint coverage of test,
+bench, and example code that step 2 never compiles — it does not replace
+step 2.
 
 **The gauntlet is a sprint-closing gate, not a per-commit gate.** Only the
 sprint's closing commit (the commit that gets pushed / merged) must pass
-all seven. Intermediate commits within a multi-commit sprint may carry
+all eight. Intermediate commits within a multi-commit sprint may carry
 transitional CI-failing state — compile errors, dead-code warnings,
 fmt/clippy noise, transient `#[allow]` / `#[ignore]`, unused imports —
 provided subsequent commits in the same sprint eliminate every such

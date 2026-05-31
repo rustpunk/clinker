@@ -2127,8 +2127,8 @@ mod tests {
         let schema = schema_with(&["k"]);
         // Deposit a record and force a spill so a file actually exists.
         let rec = record_for(&schema, vec![Value::Integer(7)]);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        exec.add_build_record(rec, 0, &mut budget).unwrap();
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        exec.add_build_record(rec, 0, &budget).unwrap();
         exec.spill_partition(0).unwrap();
         let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
         assert!(spilled_inside >= 1, "spill_partition must commit a file");
@@ -2164,8 +2164,8 @@ mod tests {
             .unwrap();
             let schema = schema_with(&["k"]);
             let rec = record_for(&schema, vec![Value::Integer(99)]);
-            let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-            exec.add_build_record(rec, 0, &mut budget).unwrap();
+            let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+            exec.add_build_record(rec, 0, &budget).unwrap();
             exec.spill_partition(0).unwrap();
             panic!("simulated mid-spill panic");
         }));
@@ -2192,7 +2192,7 @@ mod tests {
             crate::pipeline::memory::ConsumerHandle::new(),
         )
         .unwrap();
-        let mut budget = tiny_budget();
+        let budget = tiny_budget();
         for i in 0..256i64 {
             let rec = record_for(
                 &schema,
@@ -2200,7 +2200,7 @@ mod tests {
             );
             // Synthetic hash: distribute uniformly across 16 partitions.
             let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            exec.add_build_record(rec, hash, &mut budget).unwrap();
+            exec.add_build_record(rec, hash, &budget).unwrap();
         }
         let on_disk = exec
             .partitions
@@ -2229,18 +2229,18 @@ mod tests {
             crate::pipeline::memory::ConsumerHandle::new(),
         )
         .unwrap();
-        let mut budget = tiny_budget();
+        let budget = tiny_budget();
 
         // Send 64 records all to partition 0 (top 4 bits = 0). Use a
         // hash with high-bits zero.
         let probe_partition_hash: u64 = 0x0000_0000_0000_1234;
         for i in 0..64i64 {
             let rec = record_for(&schema, vec![Value::Integer(i)]);
-            exec.add_build_record(rec, probe_partition_hash, &mut budget)
+            exec.add_build_record(rec, probe_partition_hash, &budget)
                 .unwrap();
         }
         // Force spill of partition 0.
-        exec.spill_largest_building(&mut budget).unwrap();
+        exec.spill_largest_building(&budget).unwrap();
         let p0_disk = matches!(&exec.partitions[0], PartitionState::OnDisk { .. });
         assert!(p0_disk, "partition 0 must be on disk after force-spill");
 
@@ -2397,7 +2397,7 @@ mod tests {
         let stable = StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
 
         // Drive everything through grace hash. body_program=None so
         // the synthetic-step concatenation path is exercised; that's
@@ -2428,7 +2428,7 @@ mod tests {
             partition_bits: 4,
             propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
-            budget: &mut budget,
+            budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })
@@ -2587,7 +2587,7 @@ mod tests {
         // threshold so should_spill fires immediately (process RSS
         // far exceeds 1 KiB on any host). This decouples spill
         // activation from build abort.
-        let mut budget =
+        let budget =
             MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
 
         let mut combined_schema_builder = clinker_record::SchemaBuilder::new();
@@ -2615,7 +2615,7 @@ mod tests {
             partition_bits: 4,
             propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
-            budget: &mut budget,
+            budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })
@@ -2766,7 +2766,7 @@ mod tests {
         // Memory hard limit huge so should_abort never fires; spill
         // threshold tiny so spills happen; disk quota tight so the
         // first partition flush trips it.
-        let mut budget =
+        let budget =
             MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
         budget.set_max_spill_bytes(64);
 
@@ -2795,7 +2795,7 @@ mod tests {
             partition_bits: 4,
             propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
-            budget: &mut budget,
+            budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         });
@@ -2840,7 +2840,7 @@ mod tests {
             crate::pipeline::memory::ConsumerHandle::new(),
         )
         .unwrap();
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
         let originals: Vec<Record> = (0..16i64)
             .map(|i| {
                 record_for(
@@ -2850,8 +2850,7 @@ mod tests {
             })
             .collect();
         for (i, r) in originals.iter().enumerate() {
-            exec.add_build_record(r.clone(), i as u64, &mut budget)
-                .unwrap();
+            exec.add_build_record(r.clone(), i as u64, &budget).unwrap();
         }
         // Force-spill every partition.
         for idx in 0..exec.partitions.len() {
@@ -3194,7 +3193,7 @@ mod tests {
         // Now drive BNL directly and confirm it produces the expected
         // 5 driver × 200 build = 1000 join rows.
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
         with_reload_context(&h, |rc| {
@@ -3203,7 +3202,7 @@ mod tests {
                 &sp,
                 builds,
                 &mut body_eval,
-                &mut budget,
+                &budget,
                 &mut output,
                 &mut stats,
             )
@@ -3248,7 +3247,7 @@ mod tests {
 
         // Force a small chunk budget so the chunked path actually
         // splits the build into pieces (not a single chunk).
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3258,7 +3257,7 @@ mod tests {
                 &sp,
                 builds,
                 &mut body_eval,
-                &mut budget,
+                &budget,
                 &mut output,
                 &mut stats,
             )
@@ -3328,7 +3327,7 @@ mod tests {
         // floor kicks in). spill_threshold_pct expresses soft as a
         // fraction of hard.
         let target_soft = (PROBE_BUFFER_RESERVATION as f64) / 2.0; // ~2 MB < reservation
-        let mut budget = MemoryArbitrator::with_policy(
+        let budget = MemoryArbitrator::with_policy(
             u64::MAX,
             target_soft / (u64::MAX as f64),
             Box::new(NoOpPolicy),
@@ -3343,7 +3342,7 @@ mod tests {
                 &sp,
                 builds,
                 &mut body_eval,
-                &mut budget,
+                &budget,
                 &mut output,
                 &mut stats,
             )
@@ -3371,7 +3370,7 @@ mod tests {
         // (soft - reservation) / 2 value. hard_limit stays at u64::MAX
         // so should_abort cannot fire on RSS.
         let big_soft = (PROBE_BUFFER_RESERVATION as u64) * 8;
-        let mut big_budget = MemoryArbitrator::with_policy(
+        let big_budget = MemoryArbitrator::with_policy(
             u64::MAX,
             (big_soft as f64) / (u64::MAX as f64),
             Box::new(NoOpPolicy),
@@ -3407,7 +3406,7 @@ mod tests {
                 &sp2,
                 builds2,
                 &mut body_eval2,
-                &mut big_budget,
+                &big_budget,
                 &mut output2,
                 &mut stats2,
             )
@@ -3459,7 +3458,7 @@ mod tests {
             .collect();
         let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
 
-        let mut budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3469,7 +3468,7 @@ mod tests {
                 &sp,
                 builds,
                 &mut body_eval,
-                &mut budget,
+                &budget,
                 &mut output,
                 &mut stats,
             )
@@ -3521,7 +3520,7 @@ mod tests {
         let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
 
         // 1-byte hard limit → should_abort fires immediately.
-        let mut budget = MemoryArbitrator::with_policy(1, 1.0, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(1, 1.0, Box::new(NoOpPolicy));
         let mut output: Vec<(Record, RecordOrder)> = Vec::new();
         let mut stats = BnlStats::default();
         let mut body_eval: Option<ProgramEvaluator> = None;
@@ -3531,7 +3530,7 @@ mod tests {
                 &sp,
                 builds,
                 &mut body_eval,
-                &mut budget,
+                &budget,
                 &mut output,
                 &mut stats,
             )

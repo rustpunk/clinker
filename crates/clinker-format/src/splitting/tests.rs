@@ -113,10 +113,8 @@ fn csv_writer_factory(config: CsvWriterConfig, repeat_header: bool) -> WriterFac
             } else {
                 // Subsequent files: replay captured header
                 let mut csv = CsvWriter::new(counting, Arc::clone(&schema), config.clone());
-                if repeat_header {
-                    if let Some(ref header) = *shared_header.lock().unwrap() {
-                        csv.write_preset_header(header)?;
-                    }
+                if repeat_header && let Some(ref header) = *shared_header.lock().unwrap() {
+                    csv.write_preset_header(header)?;
                 }
                 Ok(Box::new(csv) as Box<dyn FormatWriter>)
             }

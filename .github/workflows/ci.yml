@@ -26,7 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --all --check
+      # Two clippy passes. The first omits --all-targets on purpose: with
+      # test targets excluded, a pub(crate) item referenced only from
+      # #[cfg(test)] code still trips the dead-code lint, so the dead-code
+      # gate keeps working. The second adds --all-targets to lint test,
+      # bench, and example code that the first pass never compiles.
       - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
       # Bench infrastructure CI gate (compile + smoke)

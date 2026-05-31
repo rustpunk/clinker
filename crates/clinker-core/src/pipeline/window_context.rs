@@ -334,7 +334,7 @@ mod tests {
                 has_header: true,
             },
         );
-        let mut budget = crate::pipeline::memory::MemoryArbitrator::with_policy(
+        let budget = crate::pipeline::memory::MemoryArbitrator::with_policy(
             u64::MAX,
             0.80,
             Box::new(crate::pipeline::memory::NoOpPolicy),
@@ -344,7 +344,7 @@ mod tests {
             &fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             usize::MAX,
             None,
-            &mut budget,
+            &budget,
         )
         .unwrap()
     }

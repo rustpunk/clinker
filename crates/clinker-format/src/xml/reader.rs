@@ -689,7 +689,10 @@ mod tests {
         }
     }
 
-    fn envelope_config(sections: &[(&str, &str, &[(&str, EnvelopeFieldType)])]) -> EnvelopeConfig {
+    /// `(section name, XPath, [(field name, type)])` for one envelope section.
+    type SectionSpec<'a> = (&'a str, &'a str, &'a [(&'a str, EnvelopeFieldType)]);
+
+    fn envelope_config(sections: &[SectionSpec]) -> EnvelopeConfig {
         use crate::envelope::EnvelopeSection;
         let mut cfg = EnvelopeConfig::default();
         for (name, xpath, fields) in sections {

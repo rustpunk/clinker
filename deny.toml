@@ -36,10 +36,6 @@ allow = [
 yanked = "deny"
 unmaintained = "all"
 # Dioxus desktop transitive deps: GTK3 bindings, instant, proc-macro-error.
-# RUSTSEC-2026-0104: rustls-webpki CRL-parsing-panic advisory reaching us
-# transitively through dioxus-devtools → tungstenite → rustls-webpki. Patched
-# rustls-webpki not yet adopted by tungstenite 0.28; tracked upstream. Clinker
-# does not perform CRL parsing directly.
 ignore = [
     "RUSTSEC-2024-0370",
     "RUSTSEC-2024-0384",
@@ -53,5 +49,4 @@ ignore = [
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
     "RUSTSEC-2025-0057",
-    "RUSTSEC-2026-0104",
 ]

@@ -263,7 +263,7 @@ mod tests {
             dispatcher.counters[0] += 1;
             let counter = dispatcher.counters[0];
             let every = d.every.unwrap();
-            if counter == 1 || (counter - 1) % every == 0 {
+            if counter == 1 || (counter - 1).is_multiple_of(every) {
                 fire_count += 1;
             }
         }
