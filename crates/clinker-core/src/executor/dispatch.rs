@@ -503,6 +503,26 @@ pub(crate) struct ExecutorContext<'a> {
             std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         ),
     >,
+    /// Per-slot consumer registration for window-runtime arenas.
+    /// `finalize_node_rooted_windows` registers an `ArenaConsumer` with
+    /// the pipeline-scoped arbitrator after each arena builds and stores
+    /// the returned `ConsumerId` plus a clone of the seeded
+    /// `Arc<ConsumerHandle>`. Keyed by the window-runtime slot index —
+    /// the same `idx` `WindowRuntimeRegistry::install` uses — so a re-
+    /// build at the same slot replaces exactly one entry. Body-scope
+    /// swaps replace this map alongside `window_runtime` body overlays
+    /// so a body walk's slot-0 arena does not clobber the parent's
+    /// slot-0 registration. Without this, window arenas contribute zero
+    /// to `sum_consumer_usage`, so `Priority` / `LargestFirst` cannot
+    /// see them and the RSS-vs-charged disagreement warning false-trips
+    /// when a large arena is the only sizable in-memory state.
+    pub(crate) window_arena_consumer_ids: HashMap<
+        usize,
+        (
+            crate::pipeline::memory::ConsumerId,
+            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
     /// Per-source live ingest channels keyed by Source node name. Each
     /// declared Source has one `tokio::spawn`-ed task pushing records
     /// through a `TokioSourceStream`; this map holds the paired
@@ -1236,7 +1256,7 @@ pub(crate) fn admit_node_buffer(
     }
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
-    let consumer_id = ctx.memory_budget.register_consumer(Box::new(
+    let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
         crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
     ));
     ctx.node_buffer_consumer_ids
@@ -1489,6 +1509,26 @@ pub(crate) fn finalize_node_rooted_windows(
         let arena_len = arena.record_count();
         ctx.collector
             .record(arena_timer.finish(arena_len, arena_len));
+
+        // Register the arena with the pipeline-scoped arbitrator so its
+        // projected footprint flows through pull-mode attribution
+        // (`sum_consumer_usage`) like every other memory-touching
+        // operator. The handle is seeded once from the arena's measured
+        // bytes — the arena is immutable after this point, so a single
+        // absolute write suffices. A re-build at the same slot (commit-
+        // pass deferred-region replay overwrites the slot each
+        // iteration) unregisters the stale wrapper first so the registry
+        // holds exactly one entry per live arena slot.
+        if let Some((stale_id, _)) = ctx.window_arena_consumer_ids.remove(&idx) {
+            ctx.memory_budget.unregister_consumer(stale_id);
+        }
+        let arena_handle = crate::pipeline::memory::ConsumerHandle::new();
+        arena_handle.set_bytes(arena.estimated_bytes() as u64);
+        let arena_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
+            crate::pipeline::arena::ArenaConsumer::new(arena_handle.clone()),
+        ));
+        ctx.window_arena_consumer_ids
+            .insert(idx, (arena_consumer_id, arena_handle));
 
         // Node-rooted arenas project from already-coerced upstream
         // output Records — the upstream operator's plan-time
@@ -3295,7 +3335,7 @@ pub(crate) async fn dispatch_plan_node(
                 // mirrors its value_heap_bytes total into the
                 // handle's counter on every admit / spill / reset.
                 let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                ctx.memory_budget.register_consumer(Box::new(
+                ctx.memory_budget.register_consumer(Arc::new(
                     crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
                 ));
                 let mut stream = crate::aggregation::AggregateStream::for_node(
@@ -4312,7 +4352,7 @@ pub(crate) async fn dispatch_plan_node(
                     // `SortConsumer` (priority 20); the handle's bytes
                     // start at zero and gain wiring once IEJoin's build
                     // path is plumbed.
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::sort_buffer::SortConsumer::new(
                             crate::pipeline::memory::ConsumerHandle::new(),
                         ),
@@ -4414,7 +4454,7 @@ pub(crate) async fn dispatch_plan_node(
                     // sum into the handle's counter on every admit /
                     // spill_partition transition.
                     let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::grace_hash::GraceHashConsumer::new(
                             grace_consumer_handle.clone(),
                         ),
@@ -4511,7 +4551,7 @@ pub(crate) async fn dispatch_plan_node(
                     // matching-run accumulator size into the handle's
                     // counter at every push / spill transition.
                     let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                    ctx.memory_budget.register_consumer(Box::new(
+                    ctx.memory_budget.register_consumer(Arc::new(
                         crate::pipeline::sort_merge_join::SortMergeConsumer::new(
                             sm_consumer_handle.clone(),
                         ),
@@ -4617,7 +4657,7 @@ pub(crate) async fn dispatch_plan_node(
             // ConsumerId is unregistered at arm exit so the
             // arbitrator's registry tracks live tables only.
             let inline_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let inline_consumer_id = ctx.memory_budget.register_consumer(Box::new(
+            let inline_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::combine::CombineHashConsumer::new(inline_consumer_handle.clone()),
             ));
 
@@ -5730,6 +5770,13 @@ async fn execute_composition_body(
     // as the defense-in-depth `Internal` error from the Source arm.
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_combine = std::mem::take(&mut ctx.source_records);
+    // Window-arena consumer ids key by slot index, which the body
+    // re-uses from zero alongside its window-runtime overlay. Swap to a
+    // fresh map so a body arena registration at slot N does not clobber
+    // the parent's slot N; body-local arenas drop when the body's
+    // window-runtime overlay is popped on exit, so their wrappers are
+    // unregistered there and the parent map is restored.
+    let saved_arena_ids = std::mem::take(&mut ctx.window_arena_consumer_ids);
     // Install the body's `input:` reference table so the Route arm
     // can resolve `<route>.<branch>` references against body
     // siblings. Restored on exit.
@@ -5826,6 +5873,14 @@ async fn execute_composition_body(
     ctx.node_buffers = saved_buffers;
     ctx.source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
+    // Unregister body-local window-arena consumers and restore the
+    // parent map. The body's node-rooted arenas drop when its window-
+    // runtime overlay is popped below, so their wrappers must leave the
+    // arbitrator's registry in lockstep.
+    for (_, (id, _)) in std::mem::take(&mut ctx.window_arena_consumer_ids) {
+        ctx.memory_budget.unregister_consumer(id);
+    }
+    ctx.window_arena_consumer_ids = saved_arena_ids;
     // Pop the window-runtime overlay so subsequent windows in the
     // parent scope route through `top` again. Removing the body's
     // entry releases the `Arc` clones (parent runtimes stay alive in
@@ -5927,7 +5982,7 @@ fn run_time_windowed_aggregate(
         };
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         ctx.memory_budget
-            .register_consumer(Box::new(crate::aggregation::AggregateConsumer::new(
+            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(
                 agg_consumer_handle.clone(),
             )));
         AggregateStream::for_node(

@@ -882,6 +882,117 @@ impl BufferClass {
     }
 }
 
+/// Plan-time projection of an operator's runtime arbitration parameters.
+///
+/// `--explain` runs plan-only: no executor, no I/O, so no
+/// `MemoryConsumer` wrappers are registered and the arbitrator's live
+/// registry is empty. To still show the author which operator the
+/// arbitrator would spill or pause first, this carries the same
+/// `(spill_priority, can_back_pressure)` pair the runtime wrapper would
+/// report once the stage runs.
+///
+/// `spill_priority` is `None` for stages that hold no spillable state —
+/// a Source (its `try_spill` always frees zero; the `i32::MAX` sentinel
+/// only keeps it last in the policy ordering) and a streaming Aggregate
+/// (it emits per-group and never registers a spillable consumer). Those
+/// render `N/A` rather than a misleading number; their back-pressure
+/// flag still prints.
+struct ArbitrationClass {
+    /// Lower = spilled first. `None` for non-spillable stages (rendered
+    /// `N/A`).
+    spill_priority: Option<i32>,
+    /// Whether the active policy can pause this stage's producer instead
+    /// of forcing a spill.
+    can_back_pressure: bool,
+}
+
+/// Classify a plan node's runtime arbitration parameters for the
+/// `--explain` annotation.
+///
+/// This is a plan-time mirror of the per-operator `MemoryConsumer`
+/// impls — the runtime authority. Each constant below is the literal
+/// the matching wrapper's `spill_priority()` / `can_back_pressure()`
+/// returns; the mirror exists because `--explain` has no live consumers
+/// to query. Keep the two in lock-step:
+///
+/// - `node_buffers` slot — `executor::node_buffer::NodeBufferConsumer`
+///   (priority `0`; `can_back_pressure` is the slot's own flag, today
+///   always `false` at the admit site).
+/// - Source ingest — `executor::source_stream::SourceConsumer`
+///   (priority `i32::MAX`, back-pressureable; rendered `N/A` here).
+/// - hash Aggregate — `aggregation::AggregateConsumer` (priority `30`).
+/// - grace-hash Combine — `pipeline::grace_hash::GraceHashConsumer`
+///   (priority `10`).
+/// - sort buffer / IEJoin build — `pipeline::sort_buffer::SortConsumer`
+///   (priority `20`).
+/// - sort-merge Combine — `pipeline::sort_merge_join::SortMergeConsumer`
+///   (priority `25`).
+/// - inline-hash Combine — `pipeline::combine::CombineHashConsumer`
+///   (priority `30`).
+///
+/// The Combine arms follow the runtime dispatch in
+/// `executor::dispatch`: each strategy registers exactly one of the
+/// consumers above (grace-hash, sort-merge, IEJoin-via-sort-buffer, or
+/// inline-hash) before draining its build side.
+fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
+    use crate::plan::combine::CombineStrategy;
+    match node {
+        // Source frees zero on spill; only its pause is a real lever.
+        PlanNode::Source { .. } => ArbitrationClass {
+            spill_priority: None,
+            can_back_pressure: true,
+        },
+        // Streaming Aggregate holds at most one group's state and never
+        // registers a spillable consumer; hash Aggregate accumulates the
+        // full group table and spills it.
+        PlanNode::Aggregation {
+            strategy: AggregateStrategy::Streaming,
+            ..
+        } => ArbitrationClass {
+            spill_priority: None,
+            can_back_pressure: false,
+        },
+        PlanNode::Aggregation { .. } => ArbitrationClass {
+            spill_priority: Some(30),
+            can_back_pressure: false,
+        },
+        PlanNode::Sort { .. } => ArbitrationClass {
+            spill_priority: Some(20),
+            can_back_pressure: false,
+        },
+        PlanNode::Combine { strategy, .. } => {
+            let spill_priority = match strategy {
+                CombineStrategy::GraceHash { .. } => Some(10),
+                CombineStrategy::SortMerge => Some(25),
+                CombineStrategy::IEJoin | CombineStrategy::HashPartitionIEJoin { .. } => Some(20),
+                CombineStrategy::HashBuildProbe => Some(30),
+                // Never selected by `select_combine_strategies` for a
+                // runnable plan — they error at dispatch. No consumer
+                // registers, so there is no spillable state to rank.
+                CombineStrategy::InMemoryHash | CombineStrategy::BlockNestedLoop => None,
+            };
+            ArbitrationClass {
+                spill_priority,
+                can_back_pressure: false,
+            }
+        }
+        // Stateless or sink stages register no spillable consumer:
+        // Transform / Route / Merge stream record-at-a-time, Output is a
+        // sink, Composition is a structural wrapper whose body nodes
+        // carry their own classes, and CorrelationCommit's group buffer
+        // is bounded by `max_group_buffer` rather than the arbitrator.
+        PlanNode::Transform { .. }
+        | PlanNode::Route { .. }
+        | PlanNode::Merge { .. }
+        | PlanNode::Output { .. }
+        | PlanNode::Composition { .. }
+        | PlanNode::CorrelationCommit { .. } => ArbitrationClass {
+            spill_priority: None,
+            can_back_pressure: false,
+        },
+    }
+}
+
 /// DAG-based execution plan — replaces ExecutionPlan.
 ///
 /// The single source of truth for pipeline topology and execution strategy.
@@ -1321,7 +1432,62 @@ impl ExecutionPlanDag {
                 if let Some(class) = buffer_classes.get(&idx) {
                     out.push_str(&format!("  buffer: {}\n", class.label()));
                 }
+                // Per-node arbitration parameters, derived at plan time
+                // from the runtime `MemoryConsumer` impls (see
+                // `arbitration_class`). Lower `spill_priority` = elected
+                // for spill first; `N/A` = the stage holds no spillable
+                // state. Two-space indent so the buffer-class slicers
+                // (which stop at the first non-indented line) keep reading
+                // the stanza.
+                let ac = arbitration_class(node);
+                out.push_str(&format!(
+                    "  arbitration: spill_priority={}, can_back_pressure={}\n",
+                    ac.spill_priority
+                        .map_or_else(|| "N/A".to_string(), |p| p.to_string()),
+                    ac.can_back_pressure,
+                ));
                 out.push('\n');
+            }
+
+            // Buffer-edge pseudo-nodes: one entry per `node_buffers` slot
+            // between non-fused stages. The runtime keys `ctx.node_buffers`
+            // by the producer's `NodeIndex`, so the slot number printed
+            // here is that index — stable and identical to the slot the
+            // executor admits into. Every slot registers a
+            // `NodeBufferConsumer` (priority 0, the cheapest spill victim);
+            // its `can_back_pressure` is the slot's own flag, today always
+            // false at the admit site, so the producer-variant suffix is
+            // informational context only — it does not flip the flag.
+            let materialized_edges: Vec<(NodeIndex, NodeIndex)> = self
+                .topo_order
+                .iter()
+                .filter(|&&idx| buffer_classes.get(&idx) == Some(&BufferClass::Materialized))
+                .flat_map(|&producer| {
+                    self.graph
+                        .edges(producer)
+                        .map(move |edge| (producer, edge.target()))
+                })
+                .collect();
+            if !materialized_edges.is_empty() {
+                out.push_str("=== Buffer Edges ===\n\n");
+                for (producer, target) in materialized_edges {
+                    let producer_node = &self.graph[producer];
+                    let target_node = &self.graph[target];
+                    out.push_str(&format!(
+                        "edge {} -> {}:\n",
+                        producer_node.id_slug(),
+                        target_node.id_slug()
+                    ));
+                    out.push_str(&format!(
+                        "  buffer: node_buffer (slot={})\n",
+                        producer.index()
+                    ));
+                    out.push_str(&format!(
+                        "  arbitration: spill_priority=0, can_back_pressure=false (producer: {})\n",
+                        producer_node.type_tag()
+                    ));
+                    out.push('\n');
+                }
             }
         }
 

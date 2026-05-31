@@ -38,6 +38,7 @@ Key information shown:
 - **Parallelism strategy** -- how the optimizer plans to execute the node
 - **Connections** -- downstream nodes, with port labels for route branches
 - **Buffer class** (Physical Properties section) -- `buffer: streaming` for nodes whose output is consumed record-by-record by a fused downstream stage (Source → Transform → Output chains, Merge.interleave + Source pairs, and every sink Output); `buffer: materialized` for nodes whose output sits in an inter-stage buffer between dispatch arms
+- **Arbitration parameters** (Physical Properties section, plus a `=== Buffer Edges ===` block) -- each node's `arbitration: spill_priority=.., can_back_pressure=..` line shows which operator the memory arbitrator would spill or pause first. See [Reading `--explain` arbitration output](memory.md#reading---explain-arbitration-output) for the full annotation model and a worked example.
 
 The buffer class is a pre-runtime signal for memory pressure: every `materialized` node charges its in-flight rows against `pipeline.memory.limit` and may spill to disk once the soft threshold trips. Streaming stages add no inter-stage allocation. Use the annotation alongside `--memory-limit` / `pipeline.memory.limit` to predict which stages dominate the RSS budget before running the pipeline.
 

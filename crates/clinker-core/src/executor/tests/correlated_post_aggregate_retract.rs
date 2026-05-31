@@ -22,10 +22,10 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-async fn run_pipeline(
-    yaml: &str,
-    csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+/// Successful run yields counters, the DLQ entries, and the rendered output.
+type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
+
+async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
     let config = crate::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -375,14 +375,12 @@ nodes:
     let csv_owned = csv.to_string();
     let join_handle = tokio::spawn(async move { run_pipeline(&yaml_owned, &csv_owned).await });
     let join_outcome = join_handle.await;
-    let outcome: Result<
-        Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError>,
-        Box<dyn std::any::Any + Send>,
-    > = match join_outcome {
-        Ok(inner) => Ok(inner),
-        Err(join_err) if join_err.is_panic() => Err(join_err.into_panic()),
-        Err(join_err) => panic!("unexpected tokio JoinError: {join_err}"),
-    };
+    let outcome: Result<Result<RunOutput, PipelineError>, Box<dyn std::any::Any + Send>> =
+        match join_outcome {
+            Ok(inner) => Ok(inner),
+            Err(join_err) if join_err.is_panic() => Err(join_err.into_panic()),
+            Err(join_err) => panic!("unexpected tokio JoinError: {join_err}"),
+        };
     match outcome {
         Ok(Ok(_)) => {
             // Memory pressure absorbed (or aggregator was not

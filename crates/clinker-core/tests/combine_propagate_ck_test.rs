@@ -25,7 +25,6 @@ use clinker_core::plan::execution::PlanNode;
 async fn run_with_output(
     yaml: &str,
     inputs: &[(&str, &str)],
-    primary: &str,
     output_name: &str,
 ) -> (ExecutionReport, String) {
     let config: PipelineConfig =
@@ -319,7 +318,6 @@ nodes:
     let (_report, csv_out) = run_with_output(
         yaml,
         &[("orders", orders_csv), ("ledger", ledger_csv)],
-        "orders",
         "out",
     )
     .await;
@@ -396,7 +394,6 @@ nodes:
     let (_report, csv_out) = run_with_output(
         yaml,
         &[("orders", orders_csv), ("ledger", ledger_csv)],
-        "orders",
         "out",
     )
     .await;
@@ -587,7 +584,6 @@ nodes:
     let (_report, csv_out) = run_with_output(
         yaml,
         &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
-        "a_src",
         "out",
     )
     .await;
@@ -661,7 +657,6 @@ nodes:
         let (_report, csv_out) = run_with_output(
             &yaml,
             &[("orders", csv_orders), ("ledger", csv_ledger)],
-            "orders",
             "out",
         )
         .await;
@@ -922,7 +917,6 @@ nodes:
     let (_report, csv_out) = run_with_output(
         yaml,
         &[("orders", orders_csv), ("drivers", drivers_csv)],
-        "orders",
         "out",
     )
     .await;
@@ -1026,7 +1020,6 @@ nodes:
     let (_report, csv_out) = run_with_output(
         yaml,
         &[("orders", orders_csv), ("lookup", lookup_csv)],
-        "orders",
         "out",
     )
     .await;

@@ -559,8 +559,8 @@ mod tests {
 
     #[test]
     fn test_lex_float_literal() {
-        let tokens = Lexer::tokenize("3.14");
-        assert_eq!(tokens[0].0, Token::FloatLit(3.14));
+        let tokens = Lexer::tokenize("2.5");
+        assert_eq!(tokens[0].0, Token::FloatLit(2.5));
     }
 
     #[test]

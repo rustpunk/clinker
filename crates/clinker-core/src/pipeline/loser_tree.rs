@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn test_loser_tree_init_16_streams() {
-        let entries: Vec<_> = (0..16).map(|i| entry(i)).collect();
+        let entries: Vec<_> = (0..16).map(entry).collect();
         let lt = LoserTree::new(entries);
         assert_eq!(lt.winner().unwrap().key, vec![0]);
         assert_eq!(lt.winner_index(), 0);

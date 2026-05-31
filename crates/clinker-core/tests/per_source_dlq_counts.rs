@@ -111,7 +111,7 @@ nodes:
         "both src_bad records DLQ'd from the divide-by-zero"
     );
     assert!(
-        report.per_source_dlq_counts.get("src_good").is_none(),
+        !report.per_source_dlq_counts.contains_key("src_good"),
         "src_good has zero DLQ entries — must be absent from the map, \
          not surfaced as Some(0)"
     );

@@ -202,8 +202,10 @@ mod tests {
 
     #[test]
     fn test_pipeline_counters_increment() {
-        let mut c = PipelineCounters::default();
-        c.total_count = 1000;
+        let mut c = PipelineCounters {
+            total_count: 1000,
+            ..Default::default()
+        };
         c.increment_ok(100);
         c.increment_dlq(5);
         assert_eq!(c.ok_count, 100);

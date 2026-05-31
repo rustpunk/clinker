@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(CellValue::Bool(true).to_string(), "true");
         assert_eq!(CellValue::Bool(false).to_string(), "false");
         assert_eq!(CellValue::Int(42).to_string(), "42");
-        assert_eq!(CellValue::Float(3.14).to_string(), "3.14");
+        assert_eq!(CellValue::Float(2.5).to_string(), "2.5");
         assert_eq!(CellValue::Str("hello".into()).to_string(), "hello");
     }
 
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(CellValue::from(Value::Null), CellValue::Null);
         assert_eq!(CellValue::from(Value::Bool(true)), CellValue::Bool(true));
         assert_eq!(CellValue::from(Value::Integer(42)), CellValue::Int(42));
-        assert_eq!(CellValue::from(Value::Float(3.14)), CellValue::Float(3.14));
+        assert_eq!(CellValue::from(Value::Float(2.5)), CellValue::Float(2.5));
         assert_eq!(
             CellValue::from(Value::String("hello".into())),
             CellValue::Str("hello".into())

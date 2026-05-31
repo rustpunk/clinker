@@ -217,8 +217,10 @@ nodes:
       type: csv
       path: /tmp/out.csv
 "#;
-    let mut ctx = CompileContext::default();
-    ctx.allow_absolute_paths = true;
+    let ctx = CompileContext {
+        allow_absolute_paths: true,
+        ..Default::default()
+    };
     let config: PipelineConfig =
         parse_config(yaml).unwrap_or_else(|e| panic!("parse_config: {e:?}"));
     let plan = config
@@ -431,8 +433,10 @@ nodes:
 "#;
     let config: PipelineConfig =
         parse_config(yaml).unwrap_or_else(|e| panic!("parse_config: {e:?}"));
-    let mut ctx = CompileContext::default();
-    ctx.allow_absolute_paths = true;
+    let ctx = CompileContext {
+        allow_absolute_paths: true,
+        ..Default::default()
+    };
     let plan = config
         .compile(&ctx)
         .unwrap_or_else(|diags| panic!("compile merge_fanout: {diags:?}"));

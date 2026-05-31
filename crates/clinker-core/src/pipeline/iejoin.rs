@@ -1174,6 +1174,10 @@ mod tests {
         }
     }
 
+    /// One proptest case: left rows, right rows, and the two range
+    /// operators forming the band predicate.
+    type JoinCase = (Vec<(i64, i64)>, Vec<(i64, i64)>, TOp, TOp);
+
     fn nested_loop(
         left: &[(i64, i64)],
         right: &[(i64, i64)],
@@ -1300,7 +1304,7 @@ mod tests {
         assert!(pwmj_numeric(&empty, &empty, RangeOp::Lt).is_empty());
     }
 
-    fn arb_inputs() -> impl Strategy<Value = (Vec<(i64, i64)>, Vec<(i64, i64)>, TOp, TOp)> {
+    fn arb_inputs() -> impl Strategy<Value = JoinCase> {
         let op = prop_oneof![Just(TOp::Lt), Just(TOp::Le), Just(TOp::Gt), Just(TOp::Ge)];
         (
             prop::collection::vec((-50i64..50, -50i64..50), 0..50),

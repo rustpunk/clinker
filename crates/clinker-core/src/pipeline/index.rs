@@ -94,10 +94,7 @@ mod tests {
     impl TestStorage {
         fn new(columns: &[&str], rows: Vec<Vec<Value>>) -> Self {
             let schema = Arc::new(Schema::new(columns.iter().map(|c| (*c).into()).collect()));
-            let records = rows
-                .into_iter()
-                .map(|fields| MinimalRecord::new(fields))
-                .collect();
+            let records = rows.into_iter().map(MinimalRecord::new).collect();
             TestStorage { schema, records }
         }
     }

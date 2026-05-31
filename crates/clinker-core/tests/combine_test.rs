@@ -493,7 +493,7 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         assert!(
-            artifacts.typed.get("bad_collect").is_none(),
+            !artifacts.typed.contains_key("bad_collect"),
             "no output row published when E311 fires"
         );
     }
@@ -878,8 +878,10 @@ mod tests {
         // scratch directory); opt in to absolute paths so E-SEC-001 does
         // not reject them here. Production CLI sets this via
         // `--allow-absolute-paths` / `CLINKER_ALLOW_ABSOLUTE_PATHS`.
-        let mut ctx = clinker_core::config::CompileContext::default();
-        ctx.allow_absolute_paths = true;
+        let ctx = clinker_core::config::CompileContext {
+            allow_absolute_paths: true,
+            ..Default::default()
+        };
         config
             .compile(&ctx)
             .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
@@ -942,8 +944,10 @@ mod tests {
     fn test_combine_three_input_decomposes_to_binary_chain() {
         let yaml = load_fixture("three_input_shared_key.yaml");
         let config = parse_fixture(&yaml);
-        let mut ctx = clinker_core::config::CompileContext::default();
-        ctx.allow_absolute_paths = true;
+        let ctx = clinker_core::config::CompileContext {
+            allow_absolute_paths: true,
+            ..Default::default()
+        };
         let (plan, diags) = config
             .compile_with_diagnostics(&ctx)
             .unwrap_or_else(|e| panic!("3-input combine must compile after decomposition: {e:?}"));
@@ -1220,8 +1224,10 @@ mod tests {
     /// reach `.dag()`, `.config()`, and `.artifacts()` without re-running
     /// the lowering pipeline. Mirrors `compile_plan`'s scratch-path opt-in.
     fn compile_full_plan(config: &PipelineConfig) -> clinker_core::plan::CompiledPlan {
-        let mut ctx = clinker_core::config::CompileContext::default();
-        ctx.allow_absolute_paths = true;
+        let ctx = clinker_core::config::CompileContext {
+            allow_absolute_paths: true,
+            ..Default::default()
+        };
         config
             .compile(&ctx)
             .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
@@ -1579,8 +1585,10 @@ mod tests {
         ];
         // Combine fixture outputs live under /tmp/; opt in to absolute
         // paths so E-SEC-001 does not reject them in test.
-        let mut ctx = clinker_core::config::CompileContext::default();
-        ctx.allow_absolute_paths = true;
+        let ctx = clinker_core::config::CompileContext {
+            allow_absolute_paths: true,
+            ..Default::default()
+        };
         for name in fixtures {
             let yaml = load_fixture(name);
             let config = parse_fixture(&yaml);

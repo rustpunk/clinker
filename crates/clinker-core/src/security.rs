@@ -335,11 +335,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        let result = (|| {
+        let result = {
             fs::write("sibling.yaml", "pipeline: {name: x}").unwrap();
             let base = std::env::current_dir().unwrap();
             validate_path(Path::new("sibling.yaml"), &base, false)
-        })();
+        };
         // Always restore cwd, even if the assertion below fails.
         std::env::set_current_dir(&original_cwd).unwrap();
         let vp = result.expect("kiln-style validation must succeed");

@@ -33,7 +33,7 @@ impl MemoryConsumer for AggregateLike {
     fn spill_priority(&self) -> i32 {
         30
     }
-    fn try_spill(&mut self, _target: u64) -> Result<u64, ConsumerSpillError> {
+    fn try_spill(&self, _target: u64) -> Result<u64, ConsumerSpillError> {
         self.handle.request_spill();
         Ok(self.handle.bytes())
     }
@@ -55,11 +55,11 @@ fn back_pressure_preferred_pauses_source_under_pressure() {
 
     let source_handle = ConsumerHandle::new();
     source_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Box::new(SourceConsumer::new(source_handle.clone())));
+    arbitrator.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
 
     let aggregate_handle = ConsumerHandle::new();
     aggregate_handle.set_bytes(256 * 1024);
-    arbitrator.register_consumer(Box::new(AggregateLike {
+    arbitrator.register_consumer(Arc::new(AggregateLike {
         handle: aggregate_handle.clone(),
     }));
 

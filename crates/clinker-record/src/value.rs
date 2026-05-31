@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(Value::Null.to_string(), "null");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Integer(42).to_string(), "42");
-        assert_eq!(Value::Float(3.14).to_string(), "3.14");
+        assert_eq!(Value::Float(2.5).to_string(), "2.5");
         assert_eq!(Value::String("hello".into()).to_string(), "hello");
         let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         assert_eq!(Value::Date(d).to_string(), "2024-01-15");
@@ -391,7 +391,7 @@ mod tests {
             Value::Integer(i64::MAX),
             Value::Integer(42),
             Value::Float(0.0),
-            Value::Float(3.14),
+            Value::Float(2.5),
             Value::Float(f64::INFINITY),
             Value::Float(f64::NEG_INFINITY),
             Value::Float(f64::NAN),
@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(Value::Null.heap_size(), 0);
         assert_eq!(Value::Bool(true).heap_size(), 0);
         assert_eq!(Value::Integer(42).heap_size(), 0);
-        assert_eq!(Value::Float(3.14).heap_size(), 0);
+        assert_eq!(Value::Float(2.5).heap_size(), 0);
         let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         assert_eq!(Value::Date(d).heap_size(), 0);
         assert_eq!(
@@ -528,9 +528,8 @@ mod tests {
     #[test]
     fn test_value_heap_size_array() {
         let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
-        let expected = 2 * std::mem::size_of::<Value>() // Vec backing (capacity=2)
-            + 0   // Integer heap = 0
-            + 2; // String "ab" heap = 2
+        // Vec backing (capacity=2) + Integer heap (0) + String "ab" heap (2).
+        let expected = 2 * std::mem::size_of::<Value>() + 2;
         assert_eq!(arr.heap_size(), expected);
     }
 

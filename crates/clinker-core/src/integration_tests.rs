@@ -791,7 +791,7 @@ emit out_code = code"#,
         );
         // Use quoted empty strings to be explicit
         let csv = "code\n\"\"\nfoo\n\"\"\nbar\n";
-        let (counters, _, _output) = run_pipeline(&yaml, &csv).await.unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, csv).await.unwrap();
         // Row 1: empty string "", Row 2: "foo", Row 3: empty string "" (dup), Row 4: "bar"
         assert_eq!(counters.ok_count, 3); // "", "foo", "bar"
         assert_eq!(counters.distinct_count, 1); // second ""

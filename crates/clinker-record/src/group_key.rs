@@ -301,7 +301,7 @@ mod tests {
         // Float round-trips via f64::from_bits, including NaN-canonical
         // groupings (we just check finite values here — NaN can't enter
         // the key in the first place).
-        let f = 3.14_f64;
+        let f = 2.5_f64;
         assert_eq!(GroupByKey::Float(f.to_bits()).to_value(), Value::Float(f));
     }
 

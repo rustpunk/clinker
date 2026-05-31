@@ -278,7 +278,7 @@ mod tests {
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let _ = r.schema().unwrap();
         let mut count = 0;
-        while let Some(_) = r.next_record().unwrap() {
+        while r.next_record().unwrap().is_some() {
             count += 1;
         }
         assert_eq!(count, 3);
@@ -339,7 +339,7 @@ mod tests {
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let _ = r.schema().unwrap();
         let mut count = 0;
-        while let Some(_) = r.next_record().unwrap() {
+        while r.next_record().unwrap().is_some() {
             count += 1;
         }
         assert_eq!(count, 3);

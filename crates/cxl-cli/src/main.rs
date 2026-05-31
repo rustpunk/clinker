@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_parse_field_value_float() {
-        assert_eq!(parse_field_value("3.14"), Value::Float(3.14));
+        assert_eq!(parse_field_value("2.5"), Value::Float(2.5));
         assert_eq!(parse_field_value("-0.5"), Value::Float(-0.5));
     }
 

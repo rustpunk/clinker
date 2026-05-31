@@ -19,8 +19,8 @@
 //! `BackPressurePreferred -> LargestFirst`. Tests that want the older
 //! react-only behavior pass `Box::new(NoOpPolicy)` explicitly.
 
+use arc_swap::ArcSwap;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -364,10 +364,15 @@ impl ConsumerHandle {
 ///
 /// Implementations live with their operator (Aggregate, sort,
 /// grace-hash, sort-merge join, IEJoin, inter-stage buffers). The
-/// arbitrator stores them as `Box<dyn MemoryConsumer>` and reads
-/// `current_usage` / `spill_priority` / `can_back_pressure` on every
-/// arbitration round; `pause` / `resume` / `try_spill` fire only when
-/// a policy selects the consumer as a victim.
+/// arbitrator holds them as `Arc<dyn MemoryConsumer>` in a copy-on-write
+/// snapshot and reads `current_usage` / `spill_priority` /
+/// `can_back_pressure` on every arbitration round; `pause` / `resume` /
+/// `try_spill` fire only when a policy selects the consumer as a victim.
+///
+/// All methods take `&self`: the arbitrator drives them from a shared
+/// snapshot read, and every implementation routes its mutable state
+/// through a shared `Arc<ConsumerHandle>` of atomics, so no exclusive
+/// access is required.
 ///
 /// `Send + Sync` so the arbitrator can be shared across worker threads
 /// without compromising the existing pipeline-context concurrency
@@ -387,7 +392,12 @@ pub trait MemoryConsumer: Send + Sync {
     /// Best-effort attempt to release `target_bytes` of live state to
     /// disk. Returns the actual number of bytes freed, which may be
     /// less than `target_bytes` (the policy then re-selects).
-    fn try_spill(&mut self, target_bytes: u64) -> Result<u64, ConsumerSpillError>;
+    ///
+    /// Takes `&self`: production consumers route the spill request
+    /// through a shared `Arc<ConsumerHandle>` whose atomics need no
+    /// exclusive access, which lets the arbitrator drive the callback
+    /// from a lock-free snapshot read rather than a mutable registry.
+    fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError>;
 
     /// Whether the consumer can be paused at its inbound channel
     /// instead of forced to spill. True for Sources and inter-stage
@@ -400,12 +410,13 @@ pub trait MemoryConsumer: Send + Sync {
     /// inherit the default and do not need to override. Back-pressureable
     /// consumers (Sources, `node_buffers` slots whose producer chains to
     /// a pauseable Source) override with a real `PauseSignal::pause()`
-    /// call.
-    fn pause(&mut self) {}
+    /// call. Takes `&self` because the pause flag lives behind a shared
+    /// handle's atomic.
+    fn pause(&self) {}
 
     /// Resume a previously paused consumer. Default body is a no-op,
     /// mirroring `pause`.
-    fn resume(&mut self) {}
+    fn resume(&self) {}
 }
 
 /// Policy that selects which `MemoryConsumer` gives up memory when
@@ -456,10 +467,9 @@ impl ArbitrationPolicy for NoOpPolicy {
 /// Policy that elects whichever consumer is currently holding the
 /// most bytes. On a tie, the last equally-maximum entry in the
 /// snapshot wins (per `std`'s `max_by_key` contract); the snapshot
-/// itself comes from `HashMap` iteration, so insertion order is
-/// not load-bearing — what is load-bearing is that selection is
-/// deterministic within a single arbitrator instance for a given
-/// `consumers` membership.
+/// preserves registration order, so the tie-break is deterministic
+/// within a single arbitrator instance for a given `consumers`
+/// membership.
 ///
 /// Mirrors Spark's `TaskMemoryManager` largest-acquired-first
 /// strategy: freeing the biggest holder yields the most headroom
@@ -567,9 +577,11 @@ impl ArbitrationPolicy for BackPressurePreferred {
 /// `Arc<MemoryArbitrator>` across every dispatch arm and operator
 /// worker thread without per-arm reconstruction. Counters are
 /// `AtomicU64` (lock-free fetch_update / fetch_max); the consumer
-/// registry is `Mutex<HashMap>` (locked only on register / unregister
-/// / `sum_consumer_usage` / `poll_arbitration`). `policy` is
-/// constructor-set and immutable thereafter.
+/// registry is a copy-on-write `ArcSwap<Vec<..>>` snapshot — readers
+/// (`sum_consumer_usage`, `poll_arbitration`, `should_spill`) load the
+/// current immutable Vec with no lock, and the rare register / unregister
+/// clones-and-swaps a fresh Vec. `policy` is constructor-set and
+/// immutable thereafter.
 ///
 /// `should_spill` is the single polling entry used by every spill-
 /// capable operator. It updates `peak_rss`, consults the registered
@@ -609,10 +621,13 @@ pub struct MemoryArbitrator {
     cumulative_spill_bytes: AtomicU64,
     /// Registry of operator wrappers the arbitrator polls for
     /// per-operator `current_usage()` and routes `pause` / `resume` /
-    /// `try_spill` callbacks to. Locked only on register / unregister
-    /// and inside `poll_arbitration` (rare — at most once per soft-
-    /// trip per polling operator).
-    consumers: Mutex<HashMap<ConsumerId, Box<dyn MemoryConsumer>>>,
+    /// `try_spill` callbacks to. A copy-on-write snapshot: hot read
+    /// paths load the current immutable Vec lock-free and iterate it;
+    /// register / unregister (rare, once per operator lifetime) clone
+    /// the Vec, mutate the clone, and atomically store it. Elements are
+    /// `Arc` so an in-flight reader holding the old snapshot keeps its
+    /// wrappers alive even as a concurrent unregister swaps them out.
+    consumers: ArcSwap<Vec<(ConsumerId, Arc<dyn MemoryConsumer>)>>,
     /// Source of fresh `ConsumerId` values handed out by
     /// `register_consumer`. Monotonic; never reused even across
     /// `unregister_consumer`, so a stale `ConsumerId` cannot collide
@@ -644,7 +659,7 @@ impl MemoryArbitrator {
             peak_rss: AtomicU64::new(0),
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
-            consumers: Mutex::new(HashMap::new()),
+            consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
         }
@@ -801,26 +816,53 @@ impl MemoryArbitrator {
     /// `ConsumerId` the operator records for later
     /// `unregister_consumer` calls. The only path that adds a
     /// contributor to the arbitrator's policy registry.
-    pub fn register_consumer(&self, consumer: Box<dyn MemoryConsumer>) -> ConsumerId {
+    ///
+    /// Clones the current snapshot Vec, appends the new entry, and
+    /// atomically swaps it in. `O(N)` in the registry size, but
+    /// registration is a once-per-operator-lifetime event, so the cost
+    /// is off the per-batch hot path readers traverse.
+    pub fn register_consumer(&self, consumer: Arc<dyn MemoryConsumer>) -> ConsumerId {
         let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
-        self.consumers.lock().unwrap().insert(id, consumer);
+        self.consumers.rcu(|current| {
+            let mut next = Vec::with_capacity(current.len() + 1);
+            next.extend(current.iter().cloned());
+            next.push((id, Arc::clone(&consumer)));
+            next
+        });
         id
     }
 
     /// Remove a previously-registered consumer from the policy
-    /// registry. Returns the boxed consumer if `id` was registered,
-    /// `None` otherwise. Operators call this at teardown when their
-    /// state has been fully drained and the wrapper is no longer a
-    /// meaningful spill victim.
-    pub fn unregister_consumer(&self, id: ConsumerId) -> Option<Box<dyn MemoryConsumer>> {
-        self.consumers.lock().unwrap().remove(&id)
+    /// registry. Returns the consumer if `id` was registered, `None`
+    /// otherwise. Operators call this at teardown when their state has
+    /// been fully drained and the wrapper is no longer a meaningful
+    /// spill victim.
+    ///
+    /// Clones the snapshot minus the removed entry and swaps it in.
+    /// The `id` lookup is a linear scan, acceptable because the
+    /// registry stays small (one entry per spill-capable operator) and
+    /// unregister is a rare teardown event.
+    pub fn unregister_consumer(&self, id: ConsumerId) -> Option<Arc<dyn MemoryConsumer>> {
+        let mut removed = None;
+        self.consumers.rcu(|current| {
+            removed = current
+                .iter()
+                .find(|(cid, _)| *cid == id)
+                .map(|(_, c)| Arc::clone(c));
+            current
+                .iter()
+                .filter(|(cid, _)| *cid != id)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        removed
     }
 
     /// Number of consumers currently registered. Diagnostics surface
     /// for `--explain` and integration tests; per-consumer attribution
     /// reads `current_usage()` via `sum_consumer_usage`.
     pub fn consumer_count(&self) -> usize {
-        self.consumers.lock().unwrap().len()
+        self.consumers.load().len()
     }
 
     /// Sum of `current_usage()` across every registered consumer.
@@ -830,22 +872,23 @@ impl MemoryArbitrator {
     /// Velox / DataFusion memory pools converged on this shape for
     /// victim selection because no central counter can represent the
     /// distinction.
+    ///
+    /// Reads the current snapshot lock-free.
     pub fn sum_consumer_usage(&self) -> u64 {
         self.consumers
-            .lock()
-            .unwrap()
-            .values()
-            .map(|c| c.current_usage())
+            .load()
+            .iter()
+            .map(|(_, c)| c.current_usage())
             .sum()
     }
 
     /// Run one arbitration round and return the elected victim, if
-    /// any. Used internally by `should_spill`. Snapshots the consumer
-    /// registry under the registry lock, computes the policy decision,
-    /// and emits a `tracing::warn` when peak RSS and the sum of
-    /// registered consumer usages disagree by more than 10% of the
-    /// configured limit — useful signal that allocator overhead or
-    /// fragmentation is meaningful, never a failure.
+    /// any. Used internally by `should_spill`. Loads the current
+    /// consumer snapshot lock-free, computes the policy decision, and
+    /// emits a `tracing::warn` when peak RSS and the sum of registered
+    /// consumer usages disagree by more than 10% of the configured
+    /// limit — useful signal that allocator overhead or fragmentation
+    /// is meaningful, never a failure.
     ///
     /// Warning is suppressed when the consumer registry is empty: no
     /// pull-mode attribution means no signal to compare against and
@@ -854,33 +897,34 @@ impl MemoryArbitrator {
         let peak_rss = self.peak_rss.load(Ordering::Relaxed);
         let pressure = peak_rss.saturating_sub(self.soft_limit());
         let limit = self.limit.load(Ordering::Relaxed);
-        let mut consumers = self.consumers.lock().unwrap();
+        // The loaded guard pins the snapshot Vec for the whole round,
+        // so the elected victim's `Arc` stays alive even if a
+        // concurrent unregister swaps in a new snapshot mid-round.
+        let consumers = self.consumers.load();
         if consumers.is_empty() {
             return self.policy.select_victim(&[], pressure);
         }
-        let victim = {
-            let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
-                .iter()
-                .map(|(id, consumer)| (*id, consumer.as_ref()))
-                .collect();
-            let charged_sum: u64 = snapshot.iter().map(|(_, c)| c.current_usage()).sum();
-            let tenth = limit / 10;
-            if tenth > 0 && peak_rss.abs_diff(charged_sum) > tenth {
-                tracing::warn!(
-                    peak_rss = peak_rss,
-                    charged_sum = charged_sum,
-                    limit = limit,
-                    "memory arbitrator: RSS and pull-mode charged bytes disagree by more than 10% of limit"
-                );
-            }
-            self.policy.select_victim(&snapshot, pressure)
-        };
+        let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
+            .iter()
+            .map(|(id, consumer)| (*id, consumer.as_ref()))
+            .collect();
+        let charged_sum: u64 = snapshot.iter().map(|(_, c)| c.current_usage()).sum();
+        let tenth = limit / 10;
+        if tenth > 0 && peak_rss.abs_diff(charged_sum) > tenth {
+            tracing::warn!(
+                peak_rss = peak_rss,
+                charged_sum = charged_sum,
+                limit = limit,
+                "memory arbitrator: RSS and pull-mode charged bytes disagree by more than 10% of limit"
+            );
+        }
+        let victim = self.policy.select_victim(&snapshot, pressure);
         // Round-trip: invoke the corresponding action on the elected
-        // victim. The same registry lock guards both the policy read
-        // and the action call so a concurrent unregister can't race
-        // a freed wrapper.
+        // victim through the shared `&` the snapshot provides. No
+        // exclusive access is needed — every consumer routes its
+        // mutation through atomics behind a shared handle.
         if let Some(id) = victim
-            && let Some(consumer) = consumers.get_mut(&id)
+            && let Some((_, consumer)) = consumers.iter().find(|(cid, _)| *cid == id)
         {
             if consumer.can_back_pressure() {
                 consumer.pause();
@@ -1091,25 +1135,44 @@ mod tests {
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface
-    /// from inside the crate — there are no production implementers
-    /// yet; real ones land alongside operator registration.
+    /// from inside the crate. Mirrors the production wrappers' interior
+    /// mutability — `usage` and `paused` live behind atomics so the
+    /// `&self` trait methods can mutate them without exclusive access.
     struct MockConsumer {
-        usage: u64,
+        usage: AtomicU64,
         priority: i32,
-        paused: bool,
+        paused: AtomicBool,
         spill_response: u64,
+    }
+
+    impl MockConsumer {
+        fn new(usage: u64, priority: i32, spill_response: u64) -> Self {
+            Self {
+                usage: AtomicU64::new(usage),
+                priority,
+                paused: AtomicBool::new(false),
+                spill_response,
+            }
+        }
+
+        fn is_paused(&self) -> bool {
+            self.paused.load(Ordering::Acquire)
+        }
     }
 
     impl MemoryConsumer for MockConsumer {
         fn current_usage(&self) -> u64 {
-            self.usage
+            self.usage.load(Ordering::Acquire)
         }
         fn spill_priority(&self) -> i32 {
             self.priority
         }
-        fn try_spill(&mut self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
             let freed = self.spill_response.min(target_bytes);
-            self.usage = self.usage.saturating_sub(freed);
+            self.usage.fetch_sub(
+                freed.min(self.usage.load(Ordering::Acquire)),
+                Ordering::AcqRel,
+            );
             if freed == target_bytes {
                 Ok(freed)
             } else {
@@ -1122,11 +1185,11 @@ mod tests {
         fn can_back_pressure(&self) -> bool {
             true
         }
-        fn pause(&mut self) {
-            self.paused = true;
+        fn pause(&self) {
+            self.paused.store(true, Ordering::Release);
         }
-        fn resume(&mut self) {
-            self.paused = false;
+        fn resume(&self) {
+            self.paused.store(false, Ordering::Release);
         }
     }
 
@@ -1140,32 +1203,20 @@ mod tests {
     #[test]
     fn test_noop_policy_select_victim_returns_none_with_candidates() {
         let policy = NoOpPolicy;
-        let mut consumer = MockConsumer {
-            usage: 4096,
-            priority: 0,
-            paused: false,
-            spill_response: 4096,
-        };
+        let consumer = MockConsumer::new(4096, 0, 4096);
         let id = ConsumerId(0);
         let consumer_ref: &dyn MemoryConsumer = &consumer;
         assert!(policy.select_victim(&[(id, consumer_ref)], 1024).is_none());
-        // Touch every other trait method so the mock is fully exercised
-        // — this is the in-crate non-test infrastructure that 117b/c
-        // will replace.
+        // Touch every other trait method so the mock is fully exercised.
         assert_eq!(consumer.current_usage(), 4096);
         assert_eq!(consumer.spill_priority(), 0);
         assert!(consumer.can_back_pressure());
         consumer.pause();
-        assert!(consumer.paused);
+        assert!(consumer.is_paused());
         consumer.resume();
-        assert!(!consumer.paused);
+        assert!(!consumer.is_paused());
         assert!(consumer.try_spill(4096).is_ok());
-        let mut short = MockConsumer {
-            usage: 1024,
-            priority: 10,
-            paused: false,
-            spill_response: 100,
-        };
+        let short = MockConsumer::new(1024, 10, 100);
         assert!(matches!(
             short.try_spill(500),
             Err(ConsumerSpillError::BelowTarget {
@@ -1193,24 +1244,9 @@ mod tests {
     #[test]
     fn test_register_consumer_assigns_monotonic_ids() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 10,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
-        let id_b = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 20,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
-        let id_c = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 30,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
+        let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(10, 0, 0)));
+        let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(20, 0, 0)));
+        let id_c = arbitrator.register_consumer(Arc::new(MockConsumer::new(30, 0, 0)));
         assert_ne!(id_a, id_b);
         assert_ne!(id_b, id_c);
         assert_ne!(id_a, id_c);
@@ -1220,12 +1256,7 @@ mod tests {
     #[test]
     fn test_unregister_consumer_returns_removed() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        let id = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 100,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
+        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 0, 0)));
         assert_eq!(arbitrator.consumer_count(), 1);
         let removed = arbitrator.unregister_consumer(id);
         assert!(removed.is_some());
@@ -1239,47 +1270,174 @@ mod tests {
     fn test_sum_consumer_usage_aggregates_registered() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.sum_consumer_usage(), 0);
-        arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 1024,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
-        arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 4096,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
-        arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 100,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(1024, 0, 0)));
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(4096, 0, 0)));
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 0, 0)));
         assert_eq!(arbitrator.sum_consumer_usage(), 1024 + 4096 + 100);
+    }
+
+    #[test]
+    fn arena_consumer_contributes_to_sum_and_silences_disagreement_warning() {
+        use crate::pipeline::arena::ArenaConsumer;
+
+        // A window arena holding ~8 MiB. The arbitrator's RSS reflects
+        // exactly that allocation (idealized — no harness slack).
+        const ARENA_BYTES: u64 = 8 * 1024 * 1024;
+        // 100 GiB hard limit so real-process RSS cannot push peak_rss
+        // above the test-seeded value via `observe()`'s `fetch_max`.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(NoOpPolicy));
+        arbitrator.set_peak_rss_for_test(ARENA_BYTES);
+
+        // Before registration the arena contributes nothing, so the
+        // pull-mode picture disagrees with RSS by the full arena size —
+        // exactly the false-positive the registration closes.
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+        let tenth = arbitrator.limit() / 10;
+        assert!(
+            ARENA_BYTES.abs_diff(arbitrator.sum_consumer_usage()) <= tenth,
+            "sanity: 8 MiB is within 10% of a 100 GiB limit even unregistered"
+        );
+
+        // Register the arena exactly as `finalize_node_rooted_windows`
+        // does: a fresh handle seeded to the arena's measured bytes.
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(ARENA_BYTES);
+        let id = arbitrator.register_consumer(Arc::new(ArenaConsumer::new(handle.clone())));
+
+        // Attribution: the arena's bytes now flow through pull-mode.
+        assert_eq!(arbitrator.sum_consumer_usage(), ARENA_BYTES);
+        assert_eq!(arbitrator.consumer_count(), 1);
+
+        // Disagreement-warning silence: the charged sum reaches parity
+        // with peak RSS, so `peak_rss.abs_diff(charged_sum)` is zero —
+        // far under the 10%-of-limit threshold `poll_arbitration` warns
+        // on. The arena is the only sizable in-memory state.
+        let charged_sum = arbitrator.sum_consumer_usage();
+        let peak_rss = arbitrator.peak_rss().unwrap();
+        assert_eq!(
+            peak_rss.abs_diff(charged_sum),
+            0,
+            "registered arena makes charged bytes match RSS — no disagreement"
+        );
+
+        // Teardown leaves the registry empty (the executor's top-scope
+        // and body-scope drains unregister exactly this way).
+        arbitrator.unregister_consumer(id);
+        assert_eq!(arbitrator.consumer_count(), 0);
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn arena_consumer_ranks_last_among_spill_victims() {
+        use crate::pipeline::arena::ArenaConsumer;
+
+        // A non-actionable arena (can't pause, can't free) must never be
+        // preferred over a spillable consumer. Under `Priority`, lower
+        // spill_priority wins; the arena's `i32::MAX - 1` sits behind a
+        // grace-hash-shaped consumer at priority 10, so the policy elects
+        // the spillable. `should_spill` drives the round and acts on the
+        // victim — a back-pressureable MockConsumer gets paused, which is
+        // the observable proof it (not the arena) was elected.
+        // 100 GiB hard limit so real-process RSS cannot push peak_rss
+        // above the test-seeded value via `observe()`'s `fetch_max`.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(Priority));
+        let arena_handle = ConsumerHandle::new();
+        arena_handle.set_bytes(512 * 1024 * 1024);
+        // The arena is far larger than the spillable; only the priority
+        // ordering keeps it from being elected, which is the point.
+        arbitrator.register_consumer(Arc::new(ArenaConsumer::new(arena_handle)));
+        let spillable = Arc::new(MockConsumer::new(1024, 10, 0));
+        arbitrator.register_consumer(spillable.clone());
+
+        arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
+        assert!(arbitrator.should_spill());
+        assert!(
+            spillable.is_paused(),
+            "Priority must elect the spillable consumer, never the non-actionable arena"
+        );
     }
 
     #[test]
     fn test_consumer_ids_are_never_reused_after_unregister() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
-        let id_a = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 1,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
+        let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
         arbitrator.unregister_consumer(id_a);
-        let id_b = arbitrator.register_consumer(Box::new(MockConsumer {
-            usage: 1,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        }));
+        let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
         // Monotonic allocator: even after unregister, the next id is
         // strictly above the previous one — stale ConsumerId references
         // cannot collide with a later registration.
         assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn test_register_then_unregister_leaves_empty_snapshot() {
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(512, 0, 0)));
+        assert_eq!(arbitrator.consumer_count(), 1);
+        assert_eq!(arbitrator.sum_consumer_usage(), 512);
+        let removed = arbitrator.unregister_consumer(id);
+        assert!(removed.is_some());
+        // The copy-on-write swap leaves an empty Vec behind, not a
+        // tombstoned slot: both the count and the pull-mode sum read
+        // zero from the fresh snapshot.
+        assert_eq!(arbitrator.consumer_count(), 0);
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_register_during_read_never_tears_snapshot() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // A reader thread hammers `sum_consumer_usage` while a writer
+        // thread registers fresh consumers. The copy-on-write snapshot
+        // guarantees each read observes one complete immutable Vec —
+        // never a Vec mid-mutation — so every observed sum is a multiple
+        // of the per-consumer usage and no read panics on a torn entry.
+        const PER_CONSUMER: u64 = 1024;
+        const WRITES: usize = 64;
+
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.80,
+            Box::new(NoOpPolicy),
+        ));
+        let start = Arc::new(Barrier::new(2));
+
+        let reader = {
+            let arbitrator = Arc::clone(&arbitrator);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..10_000 {
+                    let sum = arbitrator.sum_consumer_usage();
+                    // A torn read would surface as a sum that is not an
+                    // exact multiple of the per-consumer charge.
+                    assert_eq!(sum % PER_CONSUMER, 0);
+                }
+            })
+        };
+
+        let writer = {
+            let arbitrator = Arc::clone(&arbitrator);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..WRITES {
+                    arbitrator.register_consumer(Arc::new(MockConsumer::new(PER_CONSUMER, 0, 0)));
+                }
+            })
+        };
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(arbitrator.consumer_count(), WRITES);
+        assert_eq!(
+            arbitrator.sum_consumer_usage(),
+            PER_CONSUMER * WRITES as u64
+        );
     }
 
     /// Operator that intentionally does NOT override the default
@@ -1295,7 +1453,7 @@ mod tests {
         fn spill_priority(&self) -> i32 {
             0
         }
-        fn try_spill(&mut self, _: u64) -> Result<u64, ConsumerSpillError> {
+        fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
             Ok(0)
         }
         fn can_back_pressure(&self) -> bool {
@@ -1354,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_default_pause_resume_are_callable_noops() {
-        let mut consumer = DefaultPauseConsumer { usage: 42 };
+        let consumer = DefaultPauseConsumer { usage: 42 };
         // Both default bodies are no-ops; they must not panic and
         // must leave the consumer's observable state unchanged.
         consumer.pause();
@@ -1365,24 +1523,9 @@ mod tests {
 
     #[test]
     fn test_largest_first_picks_largest() {
-        let small = MockConsumer {
-            usage: 10,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        };
-        let big = MockConsumer {
-            usage: 50,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        };
-        let mid = MockConsumer {
-            usage: 30,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        };
+        let small = MockConsumer::new(10, 0, 0);
+        let big = MockConsumer::new(50, 0, 0);
+        let mid = MockConsumer::new(30, 0, 0);
         let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> = vec![
             (ConsumerId(0), &small),
             (ConsumerId(1), &big),
@@ -1395,25 +1538,15 @@ mod tests {
 
     #[test]
     fn test_largest_first_ties_broken_by_slice_order() {
-        let a = MockConsumer {
-            usage: 100,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        };
-        let b = MockConsumer {
-            usage: 100,
-            priority: 0,
-            paused: false,
-            spill_response: 0,
-        };
+        let a = MockConsumer::new(100, 0, 0);
+        let b = MockConsumer::new(100, 0, 0);
         let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
             vec![(ConsumerId(0), &a), (ConsumerId(1), &b)];
         // `max_by_key` returns the last equally-maximum element; the
-        // policy inherits that contract. The arbitrator's snapshot is
-        // `HashMap`-ordered so insertion order isn't load-bearing —
-        // what matters is the selection is deterministic given a
-        // fixed input slice.
+        // policy inherits that contract. The arbitrator's snapshot
+        // preserves registration order, so insertion order isn't
+        // load-bearing here — what matters is the selection is
+        // deterministic given a fixed input slice.
         assert_eq!(
             LargestFirst.select_victim(&consumers, 0),
             Some(ConsumerId(1))
@@ -1427,24 +1560,9 @@ mod tests {
 
     #[test]
     fn test_priority_picks_lowest_priority_value() {
-        let high = MockConsumer {
-            usage: 100,
-            priority: 10,
-            paused: false,
-            spill_response: 0,
-        };
-        let low = MockConsumer {
-            usage: 100,
-            priority: 1,
-            paused: false,
-            spill_response: 0,
-        };
-        let mid = MockConsumer {
-            usage: 100,
-            priority: 5,
-            paused: false,
-            spill_response: 0,
-        };
+        let high = MockConsumer::new(100, 10, 0);
+        let low = MockConsumer::new(100, 1, 0);
+        let mid = MockConsumer::new(100, 5, 0);
         let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> = vec![
             (ConsumerId(0), &high),
             (ConsumerId(1), &low),
@@ -1456,18 +1574,8 @@ mod tests {
 
     #[test]
     fn test_priority_ties_broken_by_usage_largest_first() {
-        let small = MockConsumer {
-            usage: 10,
-            priority: 5,
-            paused: false,
-            spill_response: 0,
-        };
-        let big = MockConsumer {
-            usage: 90,
-            priority: 5,
-            paused: false,
-            spill_response: 0,
-        };
+        let small = MockConsumer::new(10, 5, 0);
+        let big = MockConsumer::new(90, 5, 0);
         let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
             vec![(ConsumerId(0), &small), (ConsumerId(1), &big)];
         assert_eq!(Priority.select_victim(&consumers, 0), Some(ConsumerId(1)));
@@ -1492,14 +1600,14 @@ mod tests {
         fn spill_priority(&self) -> i32 {
             self.priority
         }
-        fn try_spill(&mut self, _: u64) -> Result<u64, ConsumerSpillError> {
+        fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
             Ok(0)
         }
         fn can_back_pressure(&self) -> bool {
             false
         }
-        fn pause(&mut self) {}
-        fn resume(&mut self) {}
+        fn pause(&self) {}
+        fn resume(&self) {}
     }
 
     #[test]
@@ -1509,12 +1617,7 @@ mod tests {
             priority: 0,
         };
         // MockConsumer.can_back_pressure() returns true.
-        let pausable = MockConsumer {
-            usage: 10,
-            priority: 99,
-            paused: false,
-            spill_response: 0,
-        };
+        let pausable = MockConsumer::new(10, 99, 0);
         let consumers: Vec<(ConsumerId, &dyn MemoryConsumer)> =
             vec![(ConsumerId(0), &unpausable), (ConsumerId(1), &pausable)];
         let policy = BackPressurePreferred::wrapping(Priority);

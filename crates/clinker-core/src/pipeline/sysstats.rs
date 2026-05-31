@@ -365,7 +365,7 @@ mod tests {
                     best = Some((mountpoint.len(), is_mem_fs));
                 }
             }
-            return best.map_or(false, |(_, t)| t);
+            return best.is_some_and(|(_, t)| t);
         }
         false
     }

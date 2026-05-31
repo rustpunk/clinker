@@ -88,10 +88,6 @@ async fn run_pipeline_multi_source(
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let primary = inputs
-        .first()
-        .map(|(n, _)| (*n).to_string())
-        .expect("at least one input source required");
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
             .await

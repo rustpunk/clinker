@@ -894,7 +894,7 @@ mod tests {
         // + ranking + iterable) without pinning the exact count, since new
         // builtins land here regularly.
         let total = r.total_count();
-        assert!(total >= 80 && total <= 100, "expected ~88, got {}", total);
+        assert!((80..=100).contains(&total), "expected ~88, got {}", total);
     }
 
     #[test]

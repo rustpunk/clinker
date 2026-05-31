@@ -104,11 +104,11 @@ async fn run_pipeline(
 /// emitted value. The +1 mutation is load-bearing: under deferred
 /// dispatch `gate` runs ONCE at commit-time on the post-recompute
 /// window emit, so the writer must see the post-recompute window value
-/// + 1. A test that used a value-identity gate (e.g. `+ 0 /`) could
-/// not distinguish "gate ran at commit on corrected data" from "the
-/// pre-retract gate emit happened to value-equal the post-recompute
-/// emit"; the +1 mutation makes the two outcomes structurally
-/// different at the writer.
+/// plus one. A test that used a value-identity gate (e.g. `+ 0 /`)
+/// could not distinguish "gate ran at commit on corrected data" from
+/// "the pre-retract gate emit happened to value-equal the
+/// post-recompute emit"; the +1 mutation makes the two outcomes
+/// structurally different at the writer.
 const PIPELINE: &str = r#"
 pipeline:
   name: window_recompute_correctness
