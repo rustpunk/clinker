@@ -688,12 +688,56 @@ impl PipelineExecutor {
     /// `CompileContext::default()` reads CWD at call time, which is
     /// not thread-safe across parallel test runs that need different
     /// workspace roots.
+    ///
+    /// Builds the pipeline-scoped [`MemoryArbitrator`] from `config` and
+    /// delegates to [`Self::run_with_readers_writers_with_arbitrator`],
+    /// the single owner of the run body. The arbitrator is the only
+    /// process-wide RSS authority for the run; constructing it here keeps
+    /// production call sites free of any test-only seam.
+    ///
+    /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
     pub(crate) async fn run_with_readers_writers_in_context(
+        config: &PipelineConfig,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        compile_ctx: crate::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
+        Self::run_with_readers_writers_with_arbitrator(
+            config,
+            readers,
+            writers,
+            params,
+            compile_ctx,
+            memory_budget,
+        )
+        .await
+    }
+
+    /// Owns the entire run body: compile, source ingest, DAG dispatch,
+    /// and report assembly. Takes the pipeline-scoped
+    /// [`MemoryArbitrator`] as a parameter rather than constructing it,
+    /// so a caller can seed `peak_rss` (via the test hook) before the run
+    /// drives the RSS-based abort and disk-spill-quota gates. Production
+    /// reaches this only through
+    /// [`Self::run_with_readers_writers_in_context`], which builds the
+    /// arbitrator from `config` and delegates.
+    ///
+    /// # Panics
+    ///
+    /// Same multi-thread-runtime constraint as
+    /// [`Self::run_with_readers_writers`]: the CPU-bound operator arms
+    /// call [`tokio::task::block_in_place`].
+    ///
+    /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
+    pub(crate) async fn run_with_readers_writers_with_arbitrator(
         config: &PipelineConfig,
         mut readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: crate::config::CompileContext,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
@@ -956,13 +1000,13 @@ impl PipelineExecutor {
 
         // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
         // envelopes every node-rooted arena finalize — including the
-        // arenas built at Source dispatch-arm exits. Constructed
-        // before the source loop so each Source can register a
-        // `SourceConsumer` with the arbitrator at its construction
-        // site instead of after-the-fact discovery. The active
-        // policy is the one `pipeline.memory.backpressure` selects;
-        // default `pause` installs `BackPressurePreferred -> Priority`.
-        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
+        // arenas built at Source dispatch-arm exits. Arrives as a
+        // parameter (built by the caller before the source loop) so each
+        // Source can register a `SourceConsumer` with it at its
+        // construction site instead of after-the-fact discovery. The
+        // active policy is the one `pipeline.memory.backpressure`
+        // selects; default `pause` installs `BackPressurePreferred ->
+        // Priority`.
 
         // ── Unified source ingest pass ───────────────────────────────
         // Every declared Source spawns one `tokio::task` that drives
@@ -3761,10 +3805,13 @@ mod tests {
     mod correlated_post_aggregate_retract;
     mod correlated_window_after_aggregate_retract;
     mod correlated_window_retract;
+    mod composition_port_admission_overshoot;
     mod cross_source_window_topology;
     mod deferred_dispatch;
+    mod diamond_node_buffer_overshoot;
     mod format_dispatch;
     mod multi_output;
+    mod nested_composition_overshoot;
     mod post_aggregate_any_all;
     mod post_aggregate_lag_lead;
     mod post_aggregate_recompute_determinism;

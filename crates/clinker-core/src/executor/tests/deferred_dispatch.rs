@@ -370,6 +370,171 @@ nodes:
     let _ = BTreeSet::<&str>::new();
 }
 
+/// Whole-process RSS over the hard limit aborts a Combine that lives in
+/// a deferred region with the `BudgetCategory::Arena` admission-failure
+/// shape.
+///
+/// Sibling to [`memory_budget_overflow_on_deferred_buffer_raises_e310`],
+/// which drives the per-arena logical charge with a tight byte budget.
+/// This one drives the RSS-based `should_abort` gate instead: it seeds
+/// the pipeline-scoped arbitrator's `peak_rss` above the hard limit and
+/// runs the combine-in-deferred-region topology through the executor's
+/// arbitrator-injection seam. The Combine's build phase polls
+/// `should_abort` and surfaces `MemoryBudgetExceeded { source: Arena }`
+/// naming the Combine, where `used` is the observed peak RSS and `limit`
+/// is the hard limit.
+///
+/// Seeding `peak_rss` rather than setting a tight YAML budget is the
+/// only deterministic lever under pull-mode: at `cargo test` time the
+/// test process's own RSS dwarfs any tight budget, so a budget-driven
+/// abort would race the framework footprint. A 100 GiB hard limit keeps
+/// the seeded value dominant in the `fetch_max` fold inside `observe()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_budget_overflow_on_region_input_buffer_raises_e310() {
+    let yaml = r#"
+pipeline:
+  name: region_input_buffer_overshoot
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: probe_xform
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+- type: source
+  name: dept_lookup
+  config:
+    name: dept_lookup
+    path: dept_lookup.csv
+    type: csv
+    schema:
+      - { name: department, type: string }
+      - { name: budget, type: int }
+- type: combine
+  name: enriched
+  input:
+    p: probe_xform
+    b: dept_lookup
+  config:
+    where: 'p.department == b.department'
+    match: first
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit total = p.total
+      emit budget = b.budget
+    propagate_ck: driver
+- type: transform
+  name: tail
+  input: enriched
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit budget = budget
+- type: output
+  name: out
+  input: tail
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let orders_csv = "order_id,department,amount\no1,HR,10\no2,HR,20\no3,ENG,100\no4,ENG,200\n";
+    let lookup_csv = "department,budget\nHR,100\nENG,500\n";
+
+    let config = crate::config::parse_config(yaml).expect("parse");
+    let readers: crate::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            crate::executor::single_file_reader(
+                "orders.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "dept_lookup".to_string(),
+            crate::executor::single_file_reader(
+                "dept_lookup.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "region-input-buffer-overshoot".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+
+    // 100 GiB hard limit so the seeded peak RSS stays dominant; seed
+    // just above the hard limit so `should_abort` trips on the first
+    // poll inside the Combine build.
+    const HARD_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
+    let arbitrator = std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+        HARD_LIMIT,
+        0.80,
+        Box::new(crate::pipeline::memory::Priority),
+    ));
+    arbitrator.set_peak_rss_for_test(HARD_LIMIT + 4096);
+
+    let err = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        crate::config::CompileContext::default(),
+        arbitrator,
+    )
+    .await
+    .expect_err("peak RSS above the hard limit must abort the deferred-region Combine");
+
+    match err {
+        crate::error::PipelineError::MemoryBudgetExceeded {
+            source: crate::pipeline::memory::BudgetCategory::Arena,
+            used,
+            limit,
+            ..
+        } => {
+            assert!(
+                used > limit,
+                "reported used ({used}) must exceed the hard limit ({limit}) at abort",
+            );
+        }
+        other => panic!(
+            "RSS overshoot in a deferred-region Combine must carry \
+             MemoryBudgetExceeded (BudgetCategory::Arena); got: {other:?}"
+        ),
+    }
+}
+
 /// Cascading-retraction loop iteration cap protects against a planner
 /// bug where the structural termination invariant breaks. The cap is
 /// `node_count + |source_rows| + 1`; each iteration must add at least
