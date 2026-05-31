@@ -512,7 +512,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// channel capacity so back-pressure flows end-to-end. A missing
     /// entry at the Source arm surfaces as a defense-in-depth Internal
     /// error.
-    pub(crate) source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+    pub(crate) source_records:
+        HashMap<String, tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>>,
     /// Source-node names whose receivers have been moved out of
     /// `source_records` by a downstream Merge.interleave fusion. The
     /// Source dispatch arm checks this set at entry and returns
@@ -779,7 +780,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// path. See
     /// https://github.com/rustpunk/clinker/issues/72.
     pub(crate) streaming_output_senders:
-        HashMap<NodeIndex, tokio::sync::mpsc::Sender<(Record, u64)>>,
+        HashMap<NodeIndex, tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>>,
     /// `Output` `NodeIndex`es whose writes are streamed by a task
     /// spawned at executor entry. The `Output` dispatch arm short-
     /// circuits at the top when its index is in this set — the writer
@@ -1210,9 +1211,10 @@ pub(crate) fn admit_node_buffer(
     node_name: &str,
     node_idx: NodeIndex,
     rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
-    if rows.is_empty() {
+    if rows.is_empty() && puncts.is_empty() {
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
     let bytes = estimate_node_buffer_bytes(&rows);
@@ -1240,7 +1242,7 @@ pub(crate) fn admit_node_buffer(
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
     if !spill_allowed || !ctx.memory_budget.should_spill() {
-        return Ok(NodeBuffer::Memory(rows));
+        return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     match crate::executor::node_buffer_spill::spill_node_buffer(
         rows,
@@ -1262,9 +1264,15 @@ pub(crate) fn admit_node_buffer(
                     detail: Some("spill quota exceeded".to_string()),
                 });
             }
-            Ok(NodeBuffer::Spilled(vec![(file, count)]))
+            Ok(NodeBuffer::Spilled {
+                chunks: vec![(file, count)],
+                pending_puncts: puncts,
+            })
         }
-        None => Ok(NodeBuffer::Memory(Vec::new())),
+        None => Ok(NodeBuffer::memory_from_records_and_puncts(
+            Vec::new(),
+            puncts,
+        )),
     }
 }
 
@@ -1353,7 +1361,12 @@ pub(crate) fn canonicalize_to_source_schema(
             values[*target_idx] = reader_vals[src_idx].clone();
         }
     }
-    Record::new(Arc::clone(target), values)
+    let mut out = Record::new(Arc::clone(target), values);
+    // Canonicalization reshapes the schema but the record is the same
+    // document's row — carry its envelope context forward so
+    // `$doc.<section>.<field>` resolves on the canonicalized record.
+    out.set_doc_ctx(Arc::clone(r.doc_ctx()));
+    out
 }
 
 /// Seed declared and channel-supplied `$source.<key>` defaults for
@@ -1570,7 +1583,7 @@ pub(crate) async fn merge_fused_interleave(
     merge_name: &str,
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
-    streaming_sender: Option<tokio::sync::mpsc::Sender<(Record, u64)>>,
+    streaming_sender: Option<tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>>,
 ) -> Result<Vec<(Record, u64)>, PipelineError> {
     use std::future::poll_fn;
     use std::task::Poll;
@@ -1588,8 +1601,9 @@ pub(crate) async fn merge_fused_interleave(
     }
 
     let mut states: Vec<PredState> = Vec::with_capacity(sorted_preds.len());
-    let mut receivers: Vec<Option<tokio::sync::mpsc::Receiver<(Record, u64)>>> =
-        Vec::with_capacity(sorted_preds.len());
+    let mut receivers: Vec<
+        Option<tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>>,
+    > = Vec::with_capacity(sorted_preds.len());
     for pred in sorted_preds {
         let PlanNode::Source { name, .. } = &current_dag.graph[*pred] else {
             return Err(PipelineError::Internal {
@@ -1668,6 +1682,18 @@ pub(crate) async fn merge_fused_interleave(
         })
         .await;
         let (i, item) = polled;
+        // Fused merge path: punctuations from the per-Source live
+        // channels are currently consumed here. Forwarding them
+        // through the streaming-output channel with multi-input dedup
+        // (Merge-style barrier counter) requires per-source state on
+        // this select loop and lands as a follow-up — file under #91
+        // backlog. The non-fused Merge arm already deduplicates
+        // punctuations via the `all_puncts` collect-then-dedup pass.
+        let item: Option<(Record, u64)> = match item {
+            Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => Some((r, rn)),
+            Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
+            None => None,
+        };
         match item {
             Some((record, rn)) => {
                 let state = &states[i];
@@ -1710,7 +1736,11 @@ pub(crate) async fn merge_fused_interleave(
                         // an error path raced); surface as Internal so
                         // the caller knows the streaming chain is
                         // broken rather than silently dropping records.
-                        if tx.send((rec, rn)).await.is_err() {
+                        if tx
+                            .send(crate::executor::stream_event::StreamEvent::record(rec, rn))
+                            .await
+                            .is_err()
+                        {
                             return Err(PipelineError::Internal {
                                 op: "executor",
                                 node: merge_name.to_string(),
@@ -1837,7 +1867,7 @@ pub(crate) async fn transform_fused_consume(
     let mut count: u64 = 0;
     let mut yields_since_last: u32 = 0;
     loop {
-        let item: Option<(Record, u64)> = match timeout {
+        let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
             Some(t) => match tokio::time::timeout(t, rx.recv()).await {
                 Ok(item) => item,
                 Err(_elapsed) => {
@@ -1848,8 +1878,17 @@ pub(crate) async fn transform_fused_consume(
             },
             None => rx.recv().await,
         };
-        let Some((record, rn)) = item else {
-            break;
+        // Transform-fused-with-Source: this path consumes the live
+        // Source channel directly and drives per-record CXL eval
+        // inline. Punctuations from the upstream Source's
+        // `DocumentOpen` / `DocumentClose` emissions are consumed
+        // here for now; forwarding them through the fused-Transform
+        // output to downstream operators is a follow-up filed under
+        // #91 backlog.
+        let (record, rn) = match item {
+            Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
+            Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
+            None => break,
         };
         last_file = source_file_arc_of(&record);
         let mut rec = canonicalize(&record);
@@ -1883,6 +1922,7 @@ pub(crate) async fn transform_fused_consume(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &rec_source_name_arc,
+                doc_ctx: rec.doc_ctx(),
             };
             let target_schema = output_schema
                 .as_ref()
@@ -1950,6 +1990,7 @@ pub(crate) async fn transform_fused_consume(
         name,
         node_idx,
         output_records,
+        Vec::new(),
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
     ctx.node_buffers.insert(node_idx, nb);
@@ -2028,108 +2069,127 @@ pub(crate) async fn dispatch_plan_node(
                 }
             };
 
-            let records: Vec<(Record, u64)> =
-                if let Some(seeded) = drain_node_buffer_slot(ctx, node_idx) {
-                    // Body-context port source — records were seeded by
-                    // `execute_composition_body` from parent-scope
-                    // output. The seeded records still carry the parent
-                    // producer's `Arc<Schema>`, so canonicalize them
-                    // onto this port source's schema before downstream
-                    // consumers run. Apply per-record seeding for body-
-                    // declared record_vars (parent's writes survive via
-                    // `seed_record_vars`'s preserve-existing semantics).
-                    let mut out: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
-                    let has_record_seed = !ctx.record_var_seed.is_empty();
-                    for pair in seeded.drain() {
-                        let (r, rn) = pair?;
-                        let mut rec = canonicalize(&r);
-                        if has_record_seed {
-                            rec.seed_record_vars(ctx.record_var_seed);
+            let (records, source_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(seeded) = drain_node_buffer_slot(ctx, node_idx) {
+                // Body-context port source — records were seeded by
+                // `execute_composition_body` from parent-scope
+                // output. The seeded records still carry the parent
+                // producer's `Arc<Schema>`, so canonicalize them
+                // onto this port source's schema before downstream
+                // consumers run. Apply per-record seeding for body-
+                // declared record_vars (parent's writes survive via
+                // `seed_record_vars`'s preserve-existing semantics).
+                // Punctuations on the seeded port forward through to
+                // the Source's output buffer so downstream operators
+                // see the original document boundaries.
+                let mut out_records: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
+                let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+                let has_record_seed = !ctx.record_var_seed.is_empty();
+                for event in seeded.drain() {
+                    match event? {
+                        crate::executor::stream_event::StreamEvent::Record(r, rn) => {
+                            let mut rec = canonicalize(&r);
+                            if has_record_seed {
+                                rec.seed_record_vars(ctx.record_var_seed);
+                            }
+                            seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                            out_records.push((rec, rn));
                         }
-                        seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
-                        out.push((rec, rn));
-                    }
-                    out
-                } else if let Some(mut rx) = ctx.source_records.remove(name.as_str()) {
-                    // Live channel: consume per record so back-pressure
-                    // engages — a slow upstream Source no longer blocks
-                    // peers' channels from filling, and watermark
-                    // observations on a different source's records
-                    // flow through the dispatcher in the meantime
-                    // wherever the executor task scheduler interleaves.
-                    let timeout = ctx.idle_timeouts.get(name.as_str()).copied();
-                    let has_record_seed = !ctx.record_var_seed.is_empty();
-                    let source_name_arc: Arc<str> = Arc::from(name.as_str());
-                    let mut drained: Vec<(Record, u64)> = Vec::new();
-                    // Tracked so an idle-timeout flips THAT file's
-                    // partition to `Idle`. Before any record arrives the
-                    // consumer uses the synthetic [`MERGED_SOURCE_FILE`]
-                    // Arc, matching the engine-stamp path for record-
-                    // less source contexts.
-                    let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
-                    let mut count: u64 = 0;
-                    loop {
-                        let item: Option<(Record, u64)> = match timeout {
-                            Some(t) => match tokio::time::timeout(t, rx.recv()).await {
-                                Ok(item) => item,
-                                Err(_elapsed) => {
-                                    // Quiet for longer than
-                                    // `idle_timeout` — flip the
-                                    // partition tracked by `last_file`
-                                    // to `Idle`. The next record un-
-                                    // idles via `observe`. Idempotent on
-                                    // repeat timeouts.
-                                    ctx.watermarks.mark_idle(name.as_str(), &last_file);
-                                    continue;
-                                }
-                            },
-                            None => rx.recv().await,
-                        };
-                        let Some((record, rn)) = item else {
-                            break;
-                        };
-                        last_file = source_file_arc_of(&record);
-                        let mut rec = canonicalize(&record);
-                        if has_record_seed {
-                            rec.seed_record_vars(ctx.record_var_seed);
+                        crate::executor::stream_event::StreamEvent::Punctuation(p) => {
+                            out_puncts.push(p);
                         }
-                        seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
-                        if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
-                            *slot += 1;
+                    }
+                }
+                (out_records, out_puncts)
+            } else if let Some(mut rx) = ctx.source_records.remove(name.as_str()) {
+                // Live channel: consume per record so back-pressure
+                // engages — a slow upstream Source no longer blocks
+                // peers' channels from filling, and watermark
+                // observations on a different source's records
+                // flow through the dispatcher in the meantime
+                // wherever the executor task scheduler interleaves.
+                let timeout = ctx.idle_timeouts.get(name.as_str()).copied();
+                let has_record_seed = !ctx.record_var_seed.is_empty();
+                let source_name_arc: Arc<str> = Arc::from(name.as_str());
+                let mut drained: Vec<(Record, u64)> = Vec::new();
+                let mut drained_puncts: Vec<crate::executor::stream_event::Punctuation> =
+                    Vec::new();
+                // Tracked so an idle-timeout flips THAT file's
+                // partition to `Idle`. Before any record arrives the
+                // consumer uses the synthetic [`MERGED_SOURCE_FILE`]
+                // Arc, matching the engine-stamp path for record-
+                // less source contexts.
+                let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
+                let mut count: u64 = 0;
+                loop {
+                    let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
+                        Some(t) => match tokio::time::timeout(t, rx.recv()).await {
+                            Ok(item) => item,
+                            Err(_elapsed) => {
+                                // Quiet for longer than
+                                // `idle_timeout` — flip the
+                                // partition tracked by `last_file`
+                                // to `Idle`. The next record un-
+                                // idles via `observe`. Idempotent on
+                                // repeat timeouts.
+                                ctx.watermarks.mark_idle(name.as_str(), &last_file);
+                                continue;
+                            }
+                        },
+                        None => rx.recv().await,
+                    };
+                    match item {
+                        Some(crate::executor::stream_event::StreamEvent::Record(record, rn)) => {
+                            last_file = source_file_arc_of(&record);
+                            let mut rec = canonicalize(&record);
+                            if has_record_seed {
+                                rec.seed_record_vars(ctx.record_var_seed);
+                            }
+                            seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
+                            if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
+                                *slot += 1;
+                            }
+                            count += 1;
+                            drained.push((rec, rn));
                         }
-                        count += 1;
-                        drained.push((rec, rn));
+                        Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                            drained_puncts.push(p);
+                        }
+                        None => break,
                     }
-                    ctx.finalize_source_count(&source_name_arc, count);
-                    if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
-                        tracing::debug!(
-                            target: "clinker::watermark",
-                            source = %name,
-                            "source consumer ended with all partitions in WatermarkStatus::Idle"
-                        );
-                    }
-                    drained
-                } else {
-                    // Defense-in-depth: a Source reaching this arm with
-                    // neither a body-port seed, nor an entry in
-                    // `source_records`, nor fused-bit set means the
-                    // executor's unified ingest pass missed it. Every
-                    // declared Source ingests through the same
-                    // `source_records` map (no primary fallthrough), so
-                    // any miss surfaces here as a loud internal error
-                    // rather than the silent-corruption surface at the
-                    // root of #47.
-                    return Err(PipelineError::Internal {
-                        op: "executor",
-                        node: name.clone(),
-                        detail: format!(
-                            "Source '{name}' has no ingested records; \
+                }
+                ctx.finalize_source_count(&source_name_arc, count);
+                if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
+                    tracing::debug!(
+                        target: "clinker::watermark",
+                        source = %name,
+                        "source consumer ended with all partitions in WatermarkStatus::Idle"
+                    );
+                }
+                (drained, drained_puncts)
+            } else {
+                // Defense-in-depth: a Source reaching this arm with
+                // neither a body-port seed, nor an entry in
+                // `source_records`, nor fused-bit set means the
+                // executor's unified ingest pass missed it. Every
+                // declared Source ingests through the same
+                // `source_records` map (no primary fallthrough), so
+                // any miss surfaces here as a loud internal error
+                // rather than the silent-corruption surface at the
+                // root of #47.
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: name.clone(),
+                    detail: format!(
+                        "Source '{name}' has no ingested records; \
                          the executor's source-ingest pass missed this Source — \
                          likely a planner regression introducing a Source topology \
                          the ingest pass doesn't enumerate.",
-                        ),
-                    });
-                };
+                    ),
+                });
+            };
             // Build node-rooted arenas anchored at this Source's
             // `NodeIndex`. Replaces the prologue's Phase-0 build:
             // every spec previously rooted at `PlanIndexRoot::Source`
@@ -2141,6 +2201,7 @@ pub(crate) async fn dispatch_plan_node(
                 name,
                 node_idx,
                 records,
+                source_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2162,28 +2223,33 @@ pub(crate) async fn dispatch_plan_node(
             if ctx.should_fuse_transform(node_idx) {
                 return transform_fused_consume(ctx, current_dag, node_idx, name).await;
             }
-            // Get input records: first check own buffer (set by Route
+            // Get input events: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
-            let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
+            // Records flow into per-record evaluation; punctuations are
+            // preserved verbatim and forwarded onto the output buffer
+            // alongside the transformed records (Preserving behavior).
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
+                own_buf.drain_split()?
+            } else {
+                let predecessors: Vec<NodeIndex> = current_dag
+                    .graph
+                    .neighbors_directed(node_idx, Direction::Incoming)
+                    .collect();
+                let pred_buf = if predecessors.len() == 1 {
+                    drain_node_buffer_slot(ctx, predecessors[0])
                 } else {
-                    let predecessors: Vec<NodeIndex> = current_dag
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let pred_buf = if predecessors.len() == 1 {
-                        drain_node_buffer_slot(ctx, predecessors[0])
-                    } else {
-                        predecessors
-                            .iter()
-                            .find_map(|p| drain_node_buffer_slot(ctx, *p))
-                    };
-                    match pred_buf {
-                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                        None => Vec::new(),
-                    }
+                    predecessors
+                        .iter()
+                        .find_map(|p| drain_node_buffer_slot(ctx, *p))
                 };
+                match pred_buf {
+                    Some(nb) => nb.drain_split()?,
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
 
             // Find the CompiledTransform for this node
             let transform_idx = match ctx.transform_by_name.get(name.as_str()) {
@@ -2196,6 +2262,7 @@ pub(crate) async fn dispatch_plan_node(
                         name.as_str(),
                         node_idx,
                         input_records,
+                        input_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -2277,6 +2344,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
+                    doc_ctx: record.doc_ctx(),
                 };
 
                 let target_schema = output_schema
@@ -2383,6 +2451,7 @@ pub(crate) async fn dispatch_plan_node(
                 name,
                 node_idx,
                 output_records,
+                input_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2403,18 +2472,20 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<(Record, u64)> =
-                if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
-                } else {
-                    match predecessors
-                        .iter()
-                        .find_map(|p| drain_node_buffer_slot(ctx, *p))
-                    {
-                        Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                        None => Vec::new(),
-                    }
-                };
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
+                own_buf.drain_split()?
+            } else {
+                match predecessors
+                    .iter()
+                    .find_map(|p| drain_node_buffer_slot(ctx, *p))
+                {
+                    Some(nb) => nb.drain_split()?,
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
 
             if let Some(expected) = current_dag.graph[node_idx]
                 .expected_input_schema_in(current_dag)
@@ -2557,6 +2628,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
+                        doc_ctx: record.doc_ctx(),
                     };
 
                     let route_result = {
@@ -2670,11 +2742,16 @@ pub(crate) async fn dispatch_plan_node(
                             .push((record.clone(), *rn));
                     }
                 }
+                // Route broadcasts punctuations to every branch — each
+                // downstream subgraph needs the same document-boundary
+                // signal to drive its own per-document accumulators
+                // and writers.
                 let nb = admit_node_buffer(
                     ctx,
                     name,
                     succ_idx,
                     buf,
+                    input_puncts.clone(),
                     node_buffer_spill_allowed(current_dag, succ_idx),
                 )?;
                 ctx.node_buffers.insert(succ_idx, nb);
@@ -2760,6 +2837,16 @@ pub(crate) async fn dispatch_plan_node(
                     _ => false,
                 });
 
+            // Punctuation collection state hoisted above the if-else so
+            // the dedup pass below the merge body can read it. The
+            // fused-mode merge_fused_interleave path does not yet
+            // forward punctuations (a follow-up will route them
+            // through merge_fused_interleave's recv loop); the else
+            // branch's drain logic fills `all_puncts` from each input
+            // NodeBuffer.
+            let fan_in_degree = sorted_preds.len();
+            let mut all_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+
             let merged: Vec<(Record, u64)> = if fused_mode {
                 // Streaming-Output handoff (issue #72): if a single
                 // Output downstream of this Merge passed the
@@ -2801,22 +2888,42 @@ pub(crate) async fn dispatch_plan_node(
                         // Rebuild record with the Merge's
                         // `Arc<Schema>` so downstream operators hit
                         // the ptr_eq fast path regardless of which
-                        // input the record originated from.
+                        // input the record originated from. Carry the
+                        // per-record envelope context across the
+                        // rebuild — each merged row keeps the document
+                        // it came from.
+                        let doc_ctx = Arc::clone(record.doc_ctx());
                         let values = record.values().to_vec();
                         record = Record::new(Arc::clone(canonical), values);
+                        record.set_doc_ctx(doc_ctx);
                     }
                     merged.push((record, rn));
                     Ok(())
                 };
 
+                // Every input's punctuations accumulate in the outer
+                // `all_puncts`; the post-merge dedup pass collapses
+                // multiple-input duplicates so each `DocumentOpen` and
+                // `DocumentClose` traverses downstream exactly once.
                 match mode {
                     crate::config::MergeMode::Concat => {
                         for pred in &sorted_preds {
                             let upstream_name = current_dag.graph[*pred].name().to_string();
                             if let Some(buf) = drain_node_buffer_slot(ctx, *pred) {
-                                for pair in buf.drain() {
-                                    let (record, rn) = pair?;
-                                    emit(&mut merged, &upstream_name, record, rn)?;
+                                for event in buf.drain() {
+                                    match event? {
+                                        crate::executor::stream_event::StreamEvent::Record(
+                                            record,
+                                            rn,
+                                        ) => {
+                                            emit(&mut merged, &upstream_name, record, rn)?;
+                                        }
+                                        crate::executor::stream_event::StreamEvent::Punctuation(
+                                            p,
+                                        ) => {
+                                            all_puncts.push(p);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2837,9 +2944,9 @@ pub(crate) async fn dispatch_plan_node(
                             .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
                                 match drain_node_buffer_slot(ctx, *pred) {
                                     Some(nb) => {
-                                        let v: Vec<_> =
-                                            nb.drain().collect::<Result<Vec<_>, _>>()?;
-                                        Ok(VecDeque::from(v))
+                                        let (records, puncts) = nb.drain_split()?;
+                                        all_puncts.extend(puncts);
+                                        Ok(VecDeque::from(records))
                                     }
                                     None => Ok(VecDeque::new()),
                                 }
@@ -2886,6 +2993,32 @@ pub(crate) async fn dispatch_plan_node(
             // against. The call below is a defense-in-depth no-op:
             // the helper iterates plan.indices_to_build and matches
             // nothing because no spec roots at a Merge NodeIndex.
+            // Punctuation dedup pass: emit `DocumentOpen` once per
+            // document (first sighting wins) and `DocumentClose` only
+            // after every input branch has closed the same document.
+            let mut deduped_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+            let mut open_seen: std::collections::HashSet<clinker_record::DocumentId> =
+                std::collections::HashSet::new();
+            let mut close_counts: std::collections::HashMap<clinker_record::DocumentId, usize> =
+                std::collections::HashMap::new();
+            for p in all_puncts {
+                let id = p.doc_id();
+                match p.kind() {
+                    crate::executor::stream_event::PunctuationKind::DocumentOpen => {
+                        if open_seen.insert(id) {
+                            deduped_puncts.push(p);
+                        }
+                    }
+                    crate::executor::stream_event::PunctuationKind::DocumentClose => {
+                        let count = close_counts.entry(id).or_insert(0);
+                        *count += 1;
+                        if *count == fan_in_degree {
+                            deduped_puncts.push(p);
+                        }
+                    }
+                }
+            }
+
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
             let nb = admit_node_buffer(
@@ -2893,6 +3026,7 @@ pub(crate) async fn dispatch_plan_node(
                 name,
                 node_idx,
                 merged,
+                deduped_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -2914,24 +3048,29 @@ pub(crate) async fn dispatch_plan_node(
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records: Vec<(Record, u64)> = match predecessors
+            let (input_records, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match predecessors
                 .iter()
                 .find_map(|p| drain_node_buffer_slot(ctx, *p))
             {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                None => Vec::new(),
+                Some(nb) => nb.drain_split()?,
+                None => (Vec::new(), Vec::new()),
             };
 
             if input_records.is_empty() {
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
-                // Empty Vec heuristic charges zero bytes — admit helper
-                // is still called for symmetry with the non-empty path,
-                // so the ledger surface treats every Sort insert uniformly.
+                // An empty input still registers a (zero-byte) consumer
+                // via `admit_node_buffer` for symmetry with the non-empty
+                // path, so the arbitrator's pull-mode registry treats
+                // every Sort insert uniformly.
                 let nb = admit_node_buffer(
                     ctx,
                     name,
                     node_idx,
                     Vec::new(),
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3019,6 +3158,7 @@ pub(crate) async fn dispatch_plan_node(
                 name,
                 node_idx,
                 out,
+                input_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -3058,9 +3198,12 @@ pub(crate) async fn dispatch_plan_node(
 
             let pred =
                 crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
-            let input: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                None => Vec::new(),
+            let (input, input_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match drain_node_buffer_slot(ctx, pred) {
+                Some(nb) => nb.drain_split()?,
+                None => (Vec::new(), Vec::new()),
             };
 
             if let Some(expected) = current_dag.graph[node_idx]
@@ -3185,6 +3328,7 @@ pub(crate) async fn dispatch_plan_node(
                             source_batch: ctx.source_batch_arc,
                             ingestion_timestamp: ctx.source_ingestion_timestamp,
                             source_name: &source_name_arc,
+                            doc_ctx: record.doc_ctx(),
                         };
                         let add_result =
                             stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
@@ -3254,6 +3398,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &MERGED_SOURCE_NAME,
+                    doc_ctx: clinker_record::synthetic_document_context_ref(),
                 };
                 if is_relaxed {
                     let mut hash_box = match stream.into_retained_hash() {
@@ -3418,6 +3563,16 @@ pub(crate) async fn dispatch_plan_node(
                 // without an extra commit-time materialization for the
                 // no-retraction case. Retraction iterations overwrite
                 // the slot in `recompute_aggregates::emit_post_recompute`.
+                // Aggregate forwards inbound punctuations to its
+                // output buffer (Preserving). Document-scoped flush
+                // semantics — "flush groups on `DocumentClose` before
+                // forwarding the punctuation" — land as a follow-up
+                // commit within this sprint; today the punctuation
+                // travels at the tail of the aggregated output, which
+                // matches the streaming contract for single-document
+                // pipelines but does not yet split per-document
+                // groups when multiple documents enter the same
+                // aggregate.
                 let buffer_schema = region.buffer_schema.clone();
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
@@ -3427,6 +3582,7 @@ pub(crate) async fn dispatch_plan_node(
                     name,
                     node_idx,
                     projected,
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3445,6 +3601,7 @@ pub(crate) async fn dispatch_plan_node(
                     name,
                     node_idx,
                     out_rows,
+                    input_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
@@ -3467,9 +3624,18 @@ pub(crate) async fn dispatch_plan_node(
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
+            //
+            // Output is terminal — it writes to disk, so punctuations
+            // are consumed at this stage rather than forwarded. The
+            // input drain still uses `drain_split` for symmetry with
+            // every other operator, but the puncts vector goes unused
+            // for non-streaming outputs. Streaming Outputs (#72) take
+            // the early-return path above and forward puncts through
+            // the streaming channel separately.
             let input_records: Vec<(Record, u64)> =
                 if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-                    own_buf.drain().collect::<Result<Vec<_>, _>>()?
+                    let (records, _puncts) = own_buf.drain_split()?;
+                    records
                 } else {
                     let predecessors: Vec<NodeIndex> = current_dag
                         .graph
@@ -3487,7 +3653,8 @@ pub(crate) async fn dispatch_plan_node(
                             .count();
                         if remaining_consumers == 0 {
                             if let Some(nb) = drain_node_buffer_slot(ctx, p) {
-                                found = Some(nb.drain().collect::<Result<Vec<_>, _>>()?);
+                                let (records, _puncts) = nb.drain_split()?;
+                                found = Some(records);
                                 break;
                             }
                         } else {
@@ -3495,8 +3662,23 @@ pub(crate) async fn dispatch_plan_node(
                             // buffer alive for remaining siblings via a
                             // heap clone. The clone's footprint flows
                             // through pull-mode attribution at the
-                            // arbitrator's next poll.
-                            let cloned = ctx.node_buffers.get(&p).map(|nb| nb.clone_memory_only());
+                            // arbitrator's next poll; the producer slot's
+                            // registered consumer keeps reporting the live
+                            // buffer until the last consumer drains it.
+                            //
+                            // Output is terminal — it writes to disk and
+                            // has no downstream node_buffer to receive
+                            // forwarded punctuations. The fan-out clone
+                            // path takes records only; sibling consumers
+                            // that need the document boundary read it from
+                            // the non-cloned (last-consumer) drain through
+                            // their own arm.
+                            let cloned = ctx.node_buffers.get(&p).map(|nb| {
+                                nb.clone_memory_only()
+                                    .into_iter()
+                                    .filter_map(|e| e.into_record())
+                                    .collect::<Vec<(Record, u64)>>()
+                            });
                             if let Some(cloned) = cloned {
                                 found = Some(cloned);
                                 break;
@@ -3747,7 +3929,7 @@ pub(crate) async fn dispatch_plan_node(
                 if let Some(&first_pred) = predecessors.first()
                     && let Some(records) = ctx.node_buffers.get(&first_pred)
                 {
-                    for (record, _) in records.peek_mem() {
+                    for (record, _) in records.peek_mem_records() {
                         check_input_schema(
                             &expected,
                             record.schema(),
@@ -3802,6 +3984,7 @@ pub(crate) async fn dispatch_plan_node(
                 &composition_name,
                 node_idx,
                 output_records,
+                Vec::new(),
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -3981,14 +4164,29 @@ pub(crate) async fn dispatch_plan_node(
                     ),
                 })?;
 
-            let driver_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, driver_pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                None => Vec::new(),
+            // Combine collects puncts from both inputs and forwards
+            // them to the output buffer. Per-document dedup
+            // (Merge-style barrier counter) for two-input Combine is
+            // out of scope for #91 (deferred to follow-up); the
+            // simple union here may emit `DocumentClose` twice
+            // downstream for documents that span both inputs, which
+            // any downstream Aggregate would handle idempotently.
+            let (driver_buf, driver_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match drain_node_buffer_slot(ctx, driver_pred) {
+                Some(nb) => nb.drain_split()?,
+                None => (Vec::new(), Vec::new()),
             };
-            let build_buf: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, build_pred) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
-                None => Vec::new(),
+            let (build_buf, build_puncts): (
+                Vec<(Record, u64)>,
+                Vec<crate::executor::stream_event::Punctuation>,
+            ) = match drain_node_buffer_slot(ctx, build_pred) {
+                Some(nb) => nb.drain_split()?,
+                None => (Vec::new(), Vec::new()),
             };
+            let combined_puncts: Vec<crate::executor::stream_event::Punctuation> =
+                driver_puncts.into_iter().chain(build_puncts).collect();
 
             // Operator-entry schema check per D4: every record
             // arriving on the probe and build channels is
@@ -4159,6 +4357,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound IEJoin kernel — partition + range-walk
                     // + materialize; sized to saturate a worker thread.
@@ -4195,6 +4394,7 @@ pub(crate) async fn dispatch_plan_node(
                         name,
                         node_idx,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4256,6 +4456,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound grace-hash join kernel: partition build
                     // + probe + spill I/O. `block_in_place` keeps the
@@ -4291,6 +4492,7 @@ pub(crate) async fn dispatch_plan_node(
                         name,
                         node_idx,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4359,6 +4561,7 @@ pub(crate) async fn dispatch_plan_node(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &MERGED_SOURCE_NAME,
+                        doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound sort-merge join kernel: two-cursor merge
                     // over pre-sorted inputs. `block_in_place` keeps
@@ -4393,6 +4596,7 @@ pub(crate) async fn dispatch_plan_node(
                         name,
                         node_idx,
                         output_records,
+                        combined_puncts,
                         node_buffer_spill_allowed(current_dag, node_idx),
                     )?;
                     ctx.node_buffers.insert(node_idx, nb);
@@ -4452,6 +4656,7 @@ pub(crate) async fn dispatch_plan_node(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
+                doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
             let build_timer =
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
@@ -4517,6 +4722,7 @@ pub(crate) async fn dispatch_plan_node(
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
                     source_name: &source_name_arc,
+                    doc_ctx: probe_record.doc_ctx(),
                 };
 
                 // Probe-side key extraction routes through the
@@ -4910,6 +5116,7 @@ pub(crate) async fn dispatch_plan_node(
                 name,
                 node_idx,
                 output_records,
+                Vec::new(),
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
             ctx.node_buffers.insert(node_idx, nb);
@@ -5422,10 +5629,19 @@ fn collect_port_records(
         // errors that bubble out of `execute_composition_body`'s
         // topo walk get that wrapper. Detail string discriminates
         // this site from the generic admit in `admit_node_buffer`.
-        let cloned_with_bytes = ctx
-            .node_buffers
-            .get(&edge.source())
-            .map(|nb| (nb.clone_memory_only(), nb.estimated_memory_bytes()));
+        let cloned_with_bytes = ctx.node_buffers.get(&edge.source()).map(|nb| {
+            // Composition port seeding clones records only; the
+            // composition body operates inside its own document-
+            // boundary scope and re-emits punctuations at the call-
+            // site level on body exit, so the parent's puncts do not
+            // forward through the body's port-source boundary.
+            let cloned_records: Vec<(Record, u64)> = nb
+                .clone_memory_only()
+                .into_iter()
+                .filter_map(|e| e.into_record())
+                .collect();
+            (cloned_records, nb.estimated_memory_bytes())
+        });
         let records: Vec<(Record, u64)> = match cloned_with_bytes {
             Some((cloned, _bytes)) => cloned,
             None => Vec::new(),
@@ -5495,7 +5711,7 @@ async fn execute_composition_body(
             .port_name_to_node_idx
             .get(port_name.as_str())
             .ok_or_else(|| PipelineError::compose_unknown_port(composition_name, &port_name))?;
-        body_buffers.insert(*body_idx, NodeBuffer::Memory(records));
+        body_buffers.insert(*body_idx, NodeBuffer::memory_from_records(records));
     }
 
     // Pick the body's terminal output node. The bind-time alias
@@ -5582,8 +5798,16 @@ async fn execute_composition_body(
     // is the single source of records for that slot.
     let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
         (Ok(()), Some(idx)) => {
+            // Composition body output harvest — punctuations on the
+            // body's output port belong to the composition's parent
+            // pipeline scope; they re-emit when the parent's call
+            // site re-introduces document context. The body harvest
+            // takes records only.
             let drained: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, idx) {
-                Some(nb) => nb.drain().collect::<Result<Vec<_>, _>>()?,
+                Some(nb) => {
+                    let (records, _puncts) = nb.drain_split()?;
+                    records
+                }
                 None => Vec::new(),
             };
             if body_dag.deferred_region_at_producer(idx).is_some() {
@@ -5987,6 +6211,7 @@ fn run_time_windowed_aggregate(
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
                         source_name: &source_name_arc,
+                        doc_ctx: rec.doc_ctx(),
                     };
                     let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
                     if add_result.is_ok() {
@@ -6021,6 +6246,7 @@ fn run_time_windowed_aggregate(
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
                 source_name: &MERGED_SOURCE_NAME,
+                doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
             for (_, stream) in entries {
                 match stream.finalize(&finalize_ctx, &mut out_rows) {
@@ -6086,6 +6312,7 @@ where
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &source_name_arc,
+        doc_ctx: record.doc_ctx(),
     };
     let stream = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -6174,6 +6401,7 @@ fn finalize_windows(
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,
         source_name: &MERGED_SOURCE_NAME,
+        doc_ctx: clinker_record::synthetic_document_context_ref(),
     };
     for (_, stream) in entries {
         match stream.finalize(&finalize_ctx, out_rows) {

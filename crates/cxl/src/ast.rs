@@ -263,6 +263,22 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// Envelope-section read: `$doc.<section>.<field>`.
+    ///
+    /// `<section>` names a user-declared envelope section from the
+    /// source's `envelope.sections:` config (no engine-reserved
+    /// names). `<field>` names a field within that section's parsed
+    /// payload. Resolves through the per-record
+    /// `Arc<DocumentContext>`'s sections map at eval time. Sections
+    /// are populated by the reader's envelope pre-scan before any
+    /// body record streams, so every body record sees every declared
+    /// `$doc.<section>.<field>` value throughout the body stream.
+    DocAccess {
+        node_id: NodeId,
+        section: Box<str>,
+        field: Box<str>,
+        span: Span,
+    },
     /// The `now` keyword — wall-clock DateTime at the point of evaluation.
     Now {
         node_id: NodeId,
@@ -342,6 +358,7 @@ impl Expr {
             | Expr::SourceAccess { span, .. }
             | Expr::RecordAccess { span, .. }
             | Expr::QualifiedSourceAccess { span, .. }
+            | Expr::DocAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
             | Expr::AggCall { span, .. }
@@ -370,6 +387,7 @@ impl Expr {
             | Expr::SourceAccess { node_id, .. }
             | Expr::RecordAccess { node_id, .. }
             | Expr::QualifiedSourceAccess { node_id, .. }
+            | Expr::DocAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
             | Expr::AggCall { node_id, .. }
@@ -465,6 +483,7 @@ impl Expr {
             | Expr::SourceAccess { .. }
             | Expr::RecordAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
+            | Expr::DocAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::Literal { .. }
@@ -477,6 +496,7 @@ impl Expr {
 fn is_system_namespace(name: &str) -> bool {
     name.starts_with("$pipeline")
         || name.starts_with("$source")
+        || name.starts_with("$doc")
         || name.starts_with("$ck")
         || name.starts_with("$widened")
 }

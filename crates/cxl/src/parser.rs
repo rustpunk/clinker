@@ -1042,11 +1042,12 @@ impl Parser {
                 })
             }
 
-            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn()
+            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn(), $doc.section.field
             Token::Dollar => {
                 self.advance(); // consume '$'
-                let ns =
-                    self.expect_ident("system namespace (pipeline, vars, source, record, window)")?;
+                let ns = self.expect_ident(
+                    "system namespace (pipeline, vars, source, record, window, doc)",
+                )?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
                 match ns.as_str() {
@@ -1131,10 +1132,24 @@ impl Parser {
                             })
                         }
                     }
+                    "doc" => {
+                        let section = self.expect_ident("envelope section name")?;
+                        self.expect_token(&Token::Dot, "'.'")?;
+                        let field = self.expect_ident("envelope section field name")?;
+                        let end = self.prev_span();
+                        let nid = self.alloc_id();
+                        Ok(Expr::DocAccess {
+                            node_id: nid,
+                            section: section.into(),
+                            field: field.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
                     other => Err(self.error(
                         &format!("unknown system namespace '${other}'"),
-                        "Valid system namespaces are: pipeline, source, record, window",
-                        "Use $pipeline.field, $source.field, $record.field, or $window.fn()",
+                        "Valid system namespaces are: pipeline, source, record, window, doc",
+                        "Use $pipeline.field, $source.field, $record.field, $window.fn(), or \
+                         $doc.<section>.<field>",
                     )),
                 }
             }
@@ -2024,6 +2039,43 @@ mod tests {
             }
             _ => panic!("expected SourceAccess"),
         }
+    }
+
+    #[test]
+    fn test_parse_doc_access_arbitrary_section_names() {
+        // Section names are user-defined identifiers; no engine-reserved
+        // labels. Pipelines pick whatever fits their format.
+        for (input, expected_section, expected_field) in &[
+            ("let x = $doc.Head.batch_id", "Head", "batch_id"),
+            ("let x = $doc.Foot.record_count", "Foot", "record_count"),
+            (
+                "let x = $doc.batch_metadata.run_date",
+                "batch_metadata",
+                "run_date",
+            ),
+            ("let x = $doc.eob_summary.hash", "eob_summary", "hash"),
+        ] {
+            let r = parse_ok(input);
+            let expr = let_expr(&r);
+            match expr {
+                Expr::DocAccess { section, field, .. } => {
+                    assert_eq!(&**section, *expected_section, "input {input}");
+                    assert_eq!(&**field, *expected_field, "input {input}");
+                }
+                other => panic!("expected DocAccess for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_doc_access_requires_section_and_field() {
+        // `$doc.foo` alone is a parse error — DocAccess is always
+        // two-level (`$doc.<section>.<field>`).
+        let result = Parser::parse("let x = $doc.foo");
+        assert!(
+            !result.errors.is_empty(),
+            "expected parse error for `$doc.<section>` without `.<field>`"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
 mod schema_check;
 pub mod source_stream;
+pub(crate) mod stream_event;
 pub(crate) mod time_window;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
@@ -975,8 +976,10 @@ impl PipelineExecutor {
         // the run's accounting once the receivers have drained.
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
         let counters = PipelineCounters::default();
-        let mut source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>> =
-            HashMap::new();
+        let mut source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
         let mut ingest_handles: Vec<
             tokio::task::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
@@ -1140,7 +1143,10 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag(
         config: &PipelineConfig,
-        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+        source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        >,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1214,7 +1220,10 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dag_branching(
         config: &PipelineConfig,
-        source_records: HashMap<String, tokio::sync::mpsc::Receiver<(Record, u64)>>,
+        source_records: HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+        >,
         source_configs: &[crate::config::SourceConfig],
         mut writers: WriterRegistry,
         transforms: &[CompiledTransform],
@@ -1377,7 +1386,7 @@ impl PipelineExecutor {
         );
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
-            tokio::sync::mpsc::Sender<(Record, u64)>,
+            tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
         let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<tokio::task::JoinHandle<StreamingOutputTaskOutput>> =
@@ -1393,7 +1402,8 @@ impl PipelineExecutor {
             // on the slow-writer / fast-merge end of the back-pressure
             // curve. Mirrors the Source ingest channel sizing (issue
             // #67) — the same bound paces both ends of the pipeline.
-            let (tx, rx) = tokio::sync::mpsc::channel::<(Record, u64)>(256);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<crate::executor::stream_event::StreamEvent>(256);
             let merge_idx = spec.merge_idx;
             let output_idx = spec.output_idx;
             let handle = tokio::spawn(streaming_output_task(rx, raw_writer, spec));
@@ -1757,8 +1767,7 @@ fn build_format_reader(
         }
         crate::config::InputFormat::Xml(opts) => {
             let config = build_xml_reader_config(opts.as_ref(), input.array_paths.as_deref());
-            let buf_reader = std::io::BufReader::new(reader);
-            Ok(Box::new(XmlReader::new(buf_reader, config)))
+            Ok(Box::new(XmlReader::new(reader, config)?))
         }
         crate::config::InputFormat::FixedWidth(opts) => {
             let fields = extract_field_defs(input)?;
@@ -2027,6 +2036,25 @@ async fn ingest_source_task(
         let mut rn: u64 = 0;
         let mut total_count: u64 = 0;
         let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
+        // Per-file envelope context. Tracks the document currently
+        // being streamed; transitions to a new file emit `DocumentClose`
+        // for the previous context and `DocumentOpen` for the new one.
+        // Envelope sections are empty until reader-side pre-scan lands
+        // — CXL `$doc.<section>.<field>` against this context resolves
+        // to `Value::Null`, which is the streaming-resolver convention
+        // for an absent section.
+        let mut current_doc: Option<Arc<clinker_record::DocumentContext>> = None;
+        let push_punct = |stream: &mut crate::executor::source_stream::TokioSourceStream,
+                          punct: crate::executor::stream_event::Punctuation|
+         -> Result<(), PipelineError> {
+            stream
+                .blocking_push_punctuation(punct)
+                .map_err(|e| PipelineError::Internal {
+                    op: "source-stream-push-punctuation",
+                    node: src_cfg.name.clone(),
+                    detail: e.to_string(),
+                })
+        };
         loop {
             match src_reader.next_record() {
                 Ok(Some(record)) => {
@@ -2036,6 +2064,51 @@ async fn ingest_source_task(
                         .current_source_file()
                         .cloned()
                         .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    // Document boundary detection: on the first record,
+                    // or when the reader transitions to a new file, close
+                    // the previous document (if any) and open a fresh one
+                    // whose Arc is shared across all records of this file.
+                    let need_new_doc = match current_doc.as_ref() {
+                        None => true,
+                        Some(ctx) => !Arc::ptr_eq(ctx.source_file(), &file_arc),
+                    };
+                    if need_new_doc {
+                        if let Some(prev) = current_doc.take() {
+                            push_punct(
+                                &mut stream,
+                                crate::executor::stream_event::Punctuation::document_close(prev),
+                            )?;
+                        }
+                        // Pre-scan declared envelope sections for the new
+                        // file. Sources without `envelope:` config pass
+                        // an empty section map; the default trait impl
+                        // also returns an empty section map. Sections
+                        // populate before the first body record's
+                        // punctuation emits so every record carries the
+                        // same fully-populated context.
+                        let envelope_sections = match src_cfg.envelope.as_ref() {
+                            Some(cfg) => src_reader.prepare_document(cfg).map_err(|e| {
+                                PipelineError::Internal {
+                                    op: "envelope-pre-scan",
+                                    node: src_cfg.name.clone(),
+                                    detail: e.to_string(),
+                                }
+                            })?,
+                            None => indexmap::IndexMap::new(),
+                        };
+                        let new_ctx = Arc::new(clinker_record::DocumentContext::new(
+                            clinker_record::DocumentId::next(),
+                            Arc::clone(&file_arc),
+                            envelope_sections,
+                        ));
+                        push_punct(
+                            &mut stream,
+                            crate::executor::stream_event::Punctuation::document_open(Arc::clone(
+                                &new_ctx,
+                            )),
+                        )?;
+                        current_doc = Some(new_ctx);
+                    }
                     let mut values: Vec<clinker_record::Value> = record.values().to_vec();
                     let event_time_value: clinker_record::Value = if let Some(idx) =
                         watermark_column_idx
@@ -2055,8 +2128,11 @@ async fn ingest_source_task(
                         source_name_arc.as_ref().to_string().into_boxed_str(),
                     ));
                     values.push(event_time_value);
-                    let widened_record =
+                    let mut widened_record =
                         clinker_record::Record::new(Arc::clone(&widened_schema), values);
+                    if let Some(ctx) = current_doc.as_ref() {
+                        widened_record.set_doc_ctx(Arc::clone(ctx));
+                    }
                     stream.blocking_push(widened_record, rn).map_err(|e| {
                         PipelineError::Internal {
                             op: "source-stream-push",
@@ -2068,6 +2144,13 @@ async fn ingest_source_task(
                 Ok(None) => break,
                 Err(other) => return Err(other.into()),
             }
+        }
+        // Close the last document (if any records were emitted).
+        if let Some(last) = current_doc.take() {
+            push_punct(
+                &mut stream,
+                crate::executor::stream_event::Punctuation::document_close(last),
+            )?;
         }
         // Drop the sender so the dispatch-side `recv().await` returns
         // `None` once the channel drains.
@@ -2906,7 +2989,7 @@ impl StreamingOutputTaskOutput {
 /// predicate and https://github.com/rustpunk/clinker/issues/72 for the
 /// rationale.
 async fn streaming_output_task(
-    mut rx: tokio::sync::mpsc::Receiver<(Record, u64)>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingOutputSpec,
 ) -> StreamingOutputTaskOutput {
@@ -2933,7 +3016,15 @@ async fn streaming_output_task(
     let mut writer: Option<Box<dyn FormatWriter>> = None;
     let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
 
-    while let Some((record, rn)) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
+        // Streaming output is terminal — it writes records straight to
+        // disk. Punctuations are consumed here; per-document writer
+        // finalization (envelope header/footer streaming reconstruction
+        // on `DocumentClose`) is a follow-up filed under #91 backlog.
+        let (record, rn) = match event {
+            crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
+            crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,
+        };
         if let Some(expected) = spec.expected_input_schema.as_ref()
             && let Err(err) = crate::executor::schema_check::check_input_schema(
                 expected,
@@ -3378,7 +3469,13 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         };
         values.push(v);
     }
-    Record::new(Arc::clone(target), values)
+    let mut out = Record::new(Arc::clone(target), values);
+    // Widening reshapes the schema for the same document's row; carry
+    // the envelope context forward so a downstream node reading
+    // `$doc.<section>.<field>` resolves against the originating
+    // document rather than the empty synthetic context.
+    out.set_doc_ctx(Arc::clone(input.doc_ctx()));
+    out
 }
 
 /// Recover an engine-stamped column's value when the input does not

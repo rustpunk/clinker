@@ -829,6 +829,10 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         Expr::SourceAccess { field, .. } => Ok(ctx.resolve_source(field).unwrap_or(Value::Null)),
 
+        Expr::DocAccess { section, field, .. } => {
+            Ok(ctx.resolve_doc(section, field).unwrap_or(Value::Null))
+        }
+
         Expr::QualifiedSourceAccess {
             input_name, field, ..
         } => {

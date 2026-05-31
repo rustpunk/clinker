@@ -279,8 +279,9 @@ pub fn eval_expr_in_agg_scope(
         | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
-        | Expr::RecordAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
-            what: "$pipeline/$source/$record access",
+        | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
+            what: "$pipeline/$source/$record/$doc access",
         }),
         Expr::MethodCall { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "method call",

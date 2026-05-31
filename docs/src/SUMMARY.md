@@ -23,6 +23,7 @@
 - [Error Handling & DLQ](pipeline/error-handling.md)
 - [Correlation Keys](pipeline/correlation-keys.md)
 - [Pipeline Variables](pipeline/variables.md)
+- [Document Envelope Context](pipeline/envelope-and-doc-context.md)
 - [Channels](pipeline/channels.md)
 - [Compositions](pipeline/compositions.md)
 

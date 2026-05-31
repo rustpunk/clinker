@@ -434,12 +434,13 @@ mod tests {
         // Read back
         let cursor = std::io::Cursor::new(output.as_bytes().to_vec());
         let mut reader = XmlReader::new(
-            std::io::BufReader::new(cursor),
+            cursor,
             XmlReaderConfig {
                 record_path: Some("Root/Record".into()),
                 ..Default::default()
             },
-        );
+        )
+        .expect("XML buffer read");
         let _s = reader.schema().unwrap();
         let r1 = reader.next_record().unwrap().unwrap();
         let r2 = reader.next_record().unwrap().unwrap();

@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use chrono::{NaiveDateTime, Utc};
-use clinker_record::{PipelineCounters, Value};
+use clinker_record::{DocumentContext, PipelineCounters, Value, synthetic_document_context};
 use indexmap::IndexMap;
 
 /// Shared, lock-protected store for `$pipeline.<key>` runtime values.
@@ -223,6 +223,15 @@ pub struct EvalContext<'a> {
     /// every record from the same Source; survives Merge / Combine via
     /// the per-record `FieldMetadata::SourceName` engine-stamp.
     pub source_name: &'a Arc<str>,
+    /// Envelope context for the record currently under evaluation.
+    /// `$doc.<section>.<field>` resolves through this Arc's sections
+    /// map. Construction sites that evaluate against a real record
+    /// borrow the record's own `Arc<DocumentContext>`; sites that
+    /// evaluate in a record-free context (init-phase state, certain
+    /// finalize paths) borrow [`synthetic_document_context`]'s Arc,
+    /// whose section map is empty so every `$doc.*` resolves to
+    /// `Value::Null`.
+    pub doc_ctx: &'a Arc<DocumentContext>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -230,6 +239,14 @@ impl<'a> EvalContext<'a> {
     /// Per-record provenance lives under `$source.*`; see `resolve_source`.
     pub fn resolve_pipeline(&self, member: &str) -> Option<Value> {
         self.stable.resolve_pipeline_stable(member)
+    }
+
+    /// Resolve `$doc.<section>.<field>` against the per-record
+    /// envelope context. Returns `None` if the section is undeclared
+    /// on this document or the field is missing from the section's
+    /// payload; eval-site callers map `None` to `Value::Null`.
+    pub fn resolve_doc(&self, section: &str, field: &str) -> Option<Value> {
+        self.doc_ctx.get_section_field(section, field)
     }
 
     /// Resolve a `$source.*` member — per-record / per-source provenance.
@@ -271,6 +288,7 @@ impl<'a> EvalContext<'a> {
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
             source_name: test_default_source_name(),
+            doc_ctx: test_default_doc_ctx(),
         }
     }
 
@@ -296,6 +314,7 @@ impl<'a> EvalContext<'a> {
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
             source_name: test_default_source_name(),
+            doc_ctx: test_default_doc_ctx(),
         }
     }
 }
@@ -323,6 +342,17 @@ fn test_default_source_name() -> &'static Arc<str> {
     use std::sync::OnceLock;
     static NAME: OnceLock<Arc<str>> = OnceLock::new();
     NAME.get_or_init(|| Arc::from("test_source"))
+}
+
+/// Borrow a `'static` reference to the process-wide synthetic
+/// document context. The synthetic context's section map is empty, so
+/// `$doc.*` evaluation against it returns `Value::Null` uniformly —
+/// the right default for test contexts and any record-free finalize
+/// path that doesn't have a real envelope.
+fn test_default_doc_ctx() -> &'static Arc<DocumentContext> {
+    use std::sync::OnceLock;
+    static CTX: OnceLock<Arc<DocumentContext>> = OnceLock::new();
+    CTX.get_or_init(synthetic_document_context)
 }
 
 #[cfg(test)]
@@ -449,7 +479,44 @@ mod tests {
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
             source_name: test_default_source_name(),
+            doc_ctx: test_default_doc_ctx(),
         }
+    }
+
+    #[test]
+    fn resolve_doc_returns_section_field_when_present() {
+        use clinker_record::DocumentId;
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("payments.xml");
+        let batch: Arc<str> = Arc::from("b");
+        let mut sections = IndexMap::new();
+        let mut head = IndexMap::new();
+        head.insert(Box::from("batch_id"), Value::String("RUN-001".into()));
+        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
+        let doc = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::clone(&file),
+            sections,
+        ));
+        let mut ctx = make_ctx(&stable, &file, &batch, 1);
+        ctx.doc_ctx = &doc;
+        assert_eq!(
+            ctx.resolve_doc("Head", "batch_id"),
+            Some(Value::String("RUN-001".into()))
+        );
+        // Unknown section / field → None (eval maps to Value::Null).
+        assert!(ctx.resolve_doc("Foot", "x").is_none());
+        assert!(ctx.resolve_doc("Head", "missing").is_none());
+    }
+
+    #[test]
+    fn resolve_doc_against_synthetic_returns_none() {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("none");
+        let batch: Arc<str> = Arc::from("b");
+        let ctx = make_ctx(&stable, &file, &batch, 1);
+        // Default doc_ctx is the synthetic context — empty sections.
+        assert!(ctx.resolve_doc("any", "field").is_none());
     }
 
     #[test]

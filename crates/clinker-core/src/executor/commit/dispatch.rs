@@ -484,9 +484,11 @@ async fn recurse_into_body(
         let mut harvested: Vec<(Record, u64)> = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
             if let Some(nb) = drain_node_buffer_slot(ctx, *body_out_idx) {
-                for pair in nb.drain() {
-                    harvested.push(pair?);
-                }
+                // Commit-pass body harvest: composition body output
+                // punctuations re-emit at the parent's call site;
+                // here we take records only.
+                let (records, _puncts) = nb.drain_split()?;
+                harvested.extend(records);
             }
         }
         Ok::<Vec<(Record, u64)>, PipelineError>(harvested)

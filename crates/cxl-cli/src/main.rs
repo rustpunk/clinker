@@ -304,6 +304,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         source_batch: &source_batch_arc,
         ingestion_timestamp: stable.pipeline_start_time,
         source_name: &source_name_arc,
+        doc_ctx: clinker_record::synthetic_document_context_ref(),
     };
 
     let resolver = HashMapResolver::new(record_map);
@@ -580,6 +581,7 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::QualifiedSourceAccess {
             input_name, field, ..
         } => format!("$source.{}.{}", input_name, field),
+        cxl::ast::Expr::DocAccess { section, field, .. } => format!("$doc.{}.{}", section, field),
         cxl::ast::Expr::RecordAccess { field, .. } => format!("$record.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
@@ -753,6 +755,7 @@ mod tests {
             source_batch: &source_batch_arc,
             ingestion_timestamp: stable.pipeline_start_time,
             source_name: &source_name_arc,
+            doc_ctx: clinker_record::synthetic_document_context_ref(),
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
@@ -808,6 +811,7 @@ mod tests {
             source_batch: &source_batch_arc,
             ingestion_timestamp: stable.pipeline_start_time,
             source_name: &source_name_arc,
+            doc_ctx: clinker_record::synthetic_document_context_ref(),
         };
 
         let resolver = HashMapResolver::new(fields);

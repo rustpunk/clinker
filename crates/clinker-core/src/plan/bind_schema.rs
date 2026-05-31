@@ -876,6 +876,7 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
         | Expr::AggSlot { .. }
         | Expr::GroupKey { .. }
         | Expr::QualifiedSourceAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::VarsAccess { .. } => {
             // $vars.* reads are global static config — no producer, no
             // DAG-descendant rule applies. Skipped from the scope-read
@@ -3757,6 +3758,7 @@ fn walk_for_unknown_refs(
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }

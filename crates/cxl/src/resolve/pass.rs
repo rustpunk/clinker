@@ -485,6 +485,14 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
+            Expr::DocAccess { node_id, .. } => {
+                // `$doc.<section>.<field>` resolves at eval time against
+                // the per-record `Arc<DocumentContext>`'s section map.
+                // Section-name validation against the source's envelope
+                // config is tightened in a later phase; today an
+                // undeclared section silently yields `Value::Null`.
+                self.bind(*node_id, ResolvedBinding::PipelineMember);
+            }
             Expr::Now { .. } => {
                 // `now` is a keyword, no binding needed — evaluator handles directly
             }

@@ -1,14 +1,22 @@
 //! Per-source live ingest channel.
 //!
 //! [`TokioSourceStream`] wraps a bounded `tokio::sync::mpsc::Sender` so a
-//! Source-reader task can push records into the executor's dispatch loop
-//! through the paired `Receiver`. Channel capacity is bounded so producers
-//! `.await` (or `blocking_send`) when the consumer falls behind, supplying
+//! Source-reader task can push records and document-boundary
+//! punctuations into the executor's dispatch loop through the paired
+//! `Receiver`. Channel capacity is bounded so producers `.await` (or
+//! `blocking_send`) when the consumer falls behind, supplying
 //! back-pressure end-to-end without an intermediate spill tier.
+//!
+//! Payload is [`StreamEvent`]: either a `(Record, u64)` body event or
+//! a [`Punctuation`] marking a document boundary. Source ingest emits
+//! one `DocumentOpen` before the first body record of each source
+//! file and one `DocumentClose` after the last.
 
 use std::sync::Arc;
 
 use clinker_record::Record;
+
+use crate::executor::stream_event::{Punctuation, StreamEvent};
 
 /// Error surface for [`TokioSourceStream`] sends.
 #[derive(Debug)]
@@ -35,12 +43,13 @@ impl std::error::Error for SourceStreamError {}
 /// `tokio::sync::mpsc::Receiver` returned by [`Self::new`] and consumed
 /// via `recv().await` by the dispatch loop's Source arm.
 pub(crate) struct TokioSourceStream {
-    tx: tokio::sync::mpsc::Sender<(Record, u64)>,
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
     /// Shared with the registered `SourceConsumer` wrapper. Each
     /// `blocking_push` updates `handle.bytes` from the current channel
     /// queue depth times the most-recent record's estimated heap size,
     /// so the arbitrator's pull-mode `current_usage` reads the
-    /// channel's in-flight memory at every policy poll.
+    /// channel's in-flight memory at every policy poll. Punctuation
+    /// sends carry no record bytes and leave the handle untouched.
     consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
@@ -58,7 +67,7 @@ impl TokioSourceStream {
     pub(crate) fn new(
         capacity: usize,
         consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-    ) -> (Self, tokio::sync::mpsc::Receiver<(Record, u64)>) {
+    ) -> (Self, tokio::sync::mpsc::Receiver<StreamEvent>) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (
             Self {
@@ -69,11 +78,12 @@ impl TokioSourceStream {
         )
     }
 
-    /// Push from a synchronous worker (typically the closure inside
-    /// `tokio::task::spawn_blocking` driving a sync format reader).
-    /// Blocks the calling thread when the channel is at capacity,
-    /// preserving the bounded-channel back-pressure semantics without
-    /// requiring the caller to be inside an `async fn`.
+    /// Push a body record from a synchronous worker (typically the
+    /// closure inside `tokio::task::spawn_blocking` driving a sync
+    /// format reader). Blocks the calling thread when the channel is
+    /// at capacity, preserving the bounded-channel back-pressure
+    /// semantics without requiring the caller to be inside an
+    /// `async fn`.
     pub(crate) fn blocking_push(
         &mut self,
         record: Record,
@@ -96,9 +106,9 @@ impl TokioSourceStream {
         // staleness is bounded to a few records).
         let record_bytes = (std::mem::size_of::<Record>() + record.estimated_heap_size()) as u64;
         self.tx
-            .blocking_send((record, row_num))
+            .blocking_send(StreamEvent::record(record, row_num))
             .map_err(|_| SourceStreamError::Closed)?;
-        // `max_capacity - capacity` is the number of records sitting
+        // `max_capacity - capacity` is the number of events sitting
         // in the channel buffer waiting for the consumer. The product
         // approximates the channel's in-flight memory footprint and
         // is what the arbitrator's `current_usage` reports.
@@ -108,6 +118,21 @@ impl TokioSourceStream {
         self.consumer_handle
             .set_bytes(queued.saturating_mul(record_bytes));
         Ok(())
+    }
+
+    /// Push a document-boundary punctuation. One `DocumentOpen` and
+    /// one `DocumentClose` per file; the executor's dispatch loop
+    /// forwards them through downstream stages with operator-specific
+    /// behavior (Aggregate / Output flush; Merge dedupes; Transform /
+    /// Route pass through). Punctuations carry no record bytes, so the
+    /// `ConsumerHandle` byte estimate is left untouched.
+    pub(crate) fn blocking_push_punctuation(
+        &mut self,
+        punct: Punctuation,
+    ) -> Result<(), SourceStreamError> {
+        self.tx
+            .blocking_send(StreamEvent::punctuation(punct))
+            .map_err(|_| SourceStreamError::Closed)
     }
 }
 

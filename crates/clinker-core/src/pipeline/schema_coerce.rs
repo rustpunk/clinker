@@ -180,6 +180,17 @@ impl FormatReader for CoercingReader {
     fn current_source_file(&self) -> Option<&Arc<str>> {
         self.inner.current_source_file()
     }
+
+    fn prepare_document(
+        &mut self,
+        config: &clinker_format::EnvelopeConfig,
+    ) -> Result<indexmap::IndexMap<Box<str>, clinker_record::Value>, clinker_format::FormatError>
+    {
+        // Envelope sections are extracted from the raw source by the
+        // underlying format reader; schema coercion applies to body
+        // records only, so forward the pre-scan straight through.
+        self.inner.prepare_document(config)
+    }
 }
 
 /// Unwrap Nullable to get the inner type for coercion.

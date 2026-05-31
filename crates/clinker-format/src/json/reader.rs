@@ -7,13 +7,25 @@
 //! - record_path: `DeserializeSeed` + `IgnoredAny` navigates to the target
 //!   path, skipping non-matching keys without allocation, then streams the
 //!   array. Total memory: ~10KB buffer + one record.
+//!
+//! Envelope-aware sources buffer the full input at construction so the
+//! envelope pre-scan (which walks the entire JSON document for sections
+//! at arbitrary JSON pointer paths) can run before any body record
+//! emits. The buffered bytes are also the input to the body parser, so
+//! there is one read of the source from disk regardless of whether
+//! envelope sections are declared.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use clinker_record::{
+    DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, Record, Schema, SchemaBuilder, Value,
+    coerce_to_bool, coerce_to_date, coerce_to_datetime, coerce_to_float, coerce_to_int,
+    coerce_to_string,
+};
 use indexmap::IndexMap;
 
+use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 
@@ -53,6 +65,11 @@ pub struct JsonReader {
     schema: Option<Arc<Schema>>,
     config: JsonReaderConfig,
     pending: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Buffered source bytes shared with the envelope pre-scan. The
+    /// body parser drains a cursor over these bytes; `prepare_document`
+    /// re-parses the same bytes as a `serde_json::Value` to resolve
+    /// JSON pointer paths to envelope sections.
+    raw_bytes: Arc<[u8]>,
 }
 
 enum InnerReader {
@@ -74,16 +91,21 @@ enum InnerReader {
 
 impl JsonReader {
     pub fn from_reader<R: Read + Send + 'static>(
-        reader: R,
+        mut reader: R,
         config: JsonReaderConfig,
     ) -> Result<Self, FormatError> {
-        let mut buf = BufReader::new(Box::new(reader) as Box<dyn Read + Send>);
+        let mut bytes_vec = Vec::new();
+        reader.read_to_end(&mut bytes_vec)?;
+        let raw_bytes: Arc<[u8]> = Arc::from(bytes_vec);
+        let body_cursor: Box<dyn Read + Send> = Box::new(Cursor::new(Arc::clone(&raw_bytes)));
+        let mut buf = BufReader::new(body_cursor);
         let inner = Self::init(&mut buf, &config)?;
         Ok(JsonReader {
             inner,
             schema: None,
             config,
             pending: Vec::new(),
+            raw_bytes,
         })
     }
 
@@ -280,6 +302,52 @@ impl JsonReader {
 }
 
 impl FormatReader for JsonReader {
+    fn prepare_document(
+        &mut self,
+        config: &EnvelopeConfig,
+    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+        if config.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
+        // The pre-scan reads the full document as a `serde_json::Value`
+        // and resolves each declared section's JSON pointer against
+        // that parsed tree. Body iteration continues to drain its own
+        // cursor over `raw_bytes`; this parse is independent.
+        let root: serde_json::Value = serde_json::from_slice(&self.raw_bytes)
+            .map_err(|e| FormatError::Json(format!("envelope pre-scan: {e}")))?;
+
+        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        for (name, section) in &config.sections {
+            let pointer = match &section.extract {
+                EnvelopeExtract::JsonPointer(p) => p.as_str(),
+                EnvelopeExtract::XmlPath(_) => {
+                    return Err(FormatError::Json(format!(
+                        "envelope section {name:?}: declared `xml_path` extract \
+                         against a JSON source. Use `json_pointer` for JSON envelope sections."
+                    )));
+                }
+            };
+            let node = match root.pointer(pointer) {
+                Some(n) => n,
+                None => continue,
+            };
+            let payload_obj = match node {
+                serde_json::Value::Object(obj) => obj,
+                other => {
+                    return Err(FormatError::Json(format!(
+                        "envelope section {name:?}: JSON pointer {pointer:?} resolves to \
+                         {kind} but envelope sections must be JSON objects",
+                        kind = json_value_kind(other),
+                    )));
+                }
+            };
+            let typed = coerce_json_section_fields(name, payload_obj, &section.fields)?;
+            out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
+        }
+        Ok(out)
+    }
+
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
         if let Some(ref s) = self.schema {
             return Ok(Arc::clone(s));
@@ -493,6 +561,58 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     }
 }
 
+/// Lowercase descriptor for the JSON value kind, used in
+/// envelope-section diagnostics when the pointer resolves to a
+/// non-object value.
+fn json_value_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Coerce a JSON object's fields into the section's declared schema.
+/// Unknown fields are dropped silently (the schema is the contract);
+/// missing fields drop out (CXL eval maps to `Value::Null`); type
+/// mismatch raises a format error citing the section + field +
+/// observed JSON value.
+fn coerce_json_section_fields(
+    section_name: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    schema: &IndexMap<String, EnvelopeFieldType>,
+) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
+    for (field, ty) in schema {
+        let json_val = match obj.get(field.as_str()) {
+            Some(v) if !v.is_null() => v,
+            _ => continue,
+        };
+        let intermediate = json_to_value(json_val);
+        let coerced = match ty {
+            EnvelopeFieldType::String => coerce_to_string(&intermediate),
+            EnvelopeFieldType::Int => coerce_to_int(&intermediate),
+            EnvelopeFieldType::Float => coerce_to_float(&intermediate),
+            EnvelopeFieldType::Bool => coerce_to_bool(&intermediate),
+            EnvelopeFieldType::Date => coerce_to_date(&intermediate, DEFAULT_DATE_FORMATS),
+            EnvelopeFieldType::DateTime => {
+                coerce_to_datetime(&intermediate, DEFAULT_DATETIME_FORMATS)
+            }
+        }
+        .map_err(|e| {
+            FormatError::Json(format!(
+                "envelope section {section_name:?} field {field:?} (declared type {ty:?}): \
+                 cannot coerce JSON value {json_val}: {e}"
+            ))
+        })?;
+        out.insert(Box::from(field.as_str()), coerced);
+    }
+    Ok(out)
+}
+
 fn peek_first_byte(
     reader: &mut BufReader<Box<dyn Read + Send>>,
 ) -> Result<Option<u8>, FormatError> {
@@ -521,6 +641,169 @@ mod tests {
 
     fn default_config() -> JsonReaderConfig {
         JsonReaderConfig::default()
+    }
+
+    fn envelope_config(sections: &[(&str, &str, &[(&str, EnvelopeFieldType)])]) -> EnvelopeConfig {
+        use crate::envelope::EnvelopeSection;
+        let mut cfg = EnvelopeConfig::default();
+        for (name, pointer, fields) in sections {
+            let mut field_map = IndexMap::new();
+            for (fname, ftype) in *fields {
+                field_map.insert((*fname).to_string(), *ftype);
+            }
+            cfg.sections.insert(
+                (*name).to_string(),
+                EnvelopeSection {
+                    extract: EnvelopeExtract::JsonPointer((*pointer).to_string()),
+                    fields: field_map,
+                },
+            );
+        }
+        cfg
+    }
+
+    fn unwrap_section_map(value: &Value) -> &IndexMap<Box<str>, Value> {
+        match value {
+            Value::Map(m) => m,
+            other => panic!("expected Value::Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_document_extracts_arbitrary_named_sections() {
+        let json = r#"{
+            "BatchInfo": {"batch_id": "RUN-001", "count": 42},
+            "records": [{"x": 1}, {"x": 2}],
+            "Summary": {"hash": "abc", "processed": 2}
+        }"#;
+        let cfg = envelope_config(&[
+            (
+                "BatchInfo",
+                "/BatchInfo",
+                &[
+                    ("batch_id", EnvelopeFieldType::String),
+                    ("count", EnvelopeFieldType::Int),
+                ],
+            ),
+            (
+                "Summary",
+                "/Summary",
+                &[
+                    ("hash", EnvelopeFieldType::String),
+                    ("processed", EnvelopeFieldType::Int),
+                ],
+            ),
+        ]);
+        let mut reader = reader_from_str(
+            json,
+            JsonReaderConfig {
+                record_path: Some("records".into()),
+                ..Default::default()
+            },
+        );
+        let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
+
+        assert_eq!(sections.len(), 2);
+        let head = unwrap_section_map(sections.get("BatchInfo").unwrap());
+        assert_eq!(head.get("batch_id"), Some(&Value::String("RUN-001".into())));
+        assert_eq!(head.get("count"), Some(&Value::Integer(42)));
+
+        let foot = unwrap_section_map(sections.get("Summary").unwrap());
+        assert_eq!(foot.get("hash"), Some(&Value::String("abc".into())));
+        assert_eq!(foot.get("processed"), Some(&Value::Integer(2)));
+
+        // Envelope pre-scan does not consume body iteration; body
+        // records still stream from byte 0.
+        let r1 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("x"), Some(&Value::Integer(1)));
+        let r2 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("x"), Some(&Value::Integer(2)));
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn prepare_document_empty_config_returns_empty() {
+        let mut reader = reader_from_str(r#"[{"a":1}]"#, default_config());
+        let sections = reader.prepare_document(&EnvelopeConfig::default()).unwrap();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn prepare_document_rejects_xml_path_extract() {
+        use crate::envelope::EnvelopeSection;
+        let mut cfg = EnvelopeConfig::default();
+        cfg.sections.insert(
+            "Bad".into(),
+            EnvelopeSection {
+                extract: EnvelopeExtract::XmlPath("/doc/Bad".into()),
+                fields: IndexMap::new(),
+            },
+        );
+        let mut reader = reader_from_str(r#"{"records":[]}"#, default_config());
+        let err = reader.prepare_document(&cfg).unwrap_err();
+        assert!(matches!(err, FormatError::Json(msg) if msg.contains("xml_path")));
+    }
+
+    #[test]
+    fn prepare_document_non_object_pointer_errors() {
+        // A pointer that resolves to a non-object value is a structural
+        // misconfiguration — envelope sections are object payloads of
+        // typed fields.
+        let json = r#"{"value": 42, "records": []}"#;
+        let cfg = envelope_config(&[("Val", "/value", &[("v", EnvelopeFieldType::Int)])]);
+        let mut reader = reader_from_str(
+            json,
+            JsonReaderConfig {
+                record_path: Some("records".into()),
+                ..Default::default()
+            },
+        );
+        let err = reader.prepare_document(&cfg).unwrap_err();
+        assert!(matches!(err, FormatError::Json(msg) if msg.contains("number")));
+    }
+
+    #[test]
+    fn prepare_document_missing_pointer_yields_no_entry() {
+        let json = r#"{"records": [{"x":1}]}"#;
+        let cfg = envelope_config(&[("Trailer", "/trailer", &[("count", EnvelopeFieldType::Int)])]);
+        let mut reader = reader_from_str(
+            json,
+            JsonReaderConfig {
+                record_path: Some("records".into()),
+                ..Default::default()
+            },
+        );
+        let sections = reader.prepare_document(&cfg).unwrap();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn prepare_document_coerces_typed_fields_from_json() {
+        let json = r#"{
+            "Meta": {"run_date": "2026-05-22", "enabled": true, "ratio": 0.5},
+            "records": [{"x":1}]
+        }"#;
+        let cfg = envelope_config(&[(
+            "Meta",
+            "/Meta",
+            &[
+                ("run_date", EnvelopeFieldType::Date),
+                ("enabled", EnvelopeFieldType::Bool),
+                ("ratio", EnvelopeFieldType::Float),
+            ],
+        )]);
+        let mut reader = reader_from_str(
+            json,
+            JsonReaderConfig {
+                record_path: Some("records".into()),
+                ..Default::default()
+            },
+        );
+        let sections = reader.prepare_document(&cfg).unwrap();
+        let meta = unwrap_section_map(sections.get("Meta").unwrap());
+        assert!(matches!(meta.get("run_date"), Some(Value::Date(_))));
+        assert_eq!(meta.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(meta.get("ratio"), Some(&Value::Float(0.5)));
     }
 
     #[test]
