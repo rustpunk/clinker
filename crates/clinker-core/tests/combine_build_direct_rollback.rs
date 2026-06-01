@@ -130,11 +130,11 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_drv".to_string(),
-            vec![slot("drv", "id,amt\n1,10\n2,20\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("drv", "id,amt\n1,10\n2,20\n")]),
         ),
         (
             "src_bld".to_string(),
-            vec![slot("bld", "id,factor\n1,2\n2,0\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "id,factor\n1,2\n2,0\n")]),
         ),
     ]);
     let buf = SharedBuffer::new();

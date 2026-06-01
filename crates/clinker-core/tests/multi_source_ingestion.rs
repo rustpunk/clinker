@@ -93,11 +93,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -190,11 +196,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -307,11 +319,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -419,11 +437,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf_a = SharedBuffer::new();
@@ -523,11 +547,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -632,11 +662,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf_a = SharedBuffer::new();
@@ -718,8 +754,14 @@ nodes:
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id\n1\n2\n")]),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n11\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id\n1\n2\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n11\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =

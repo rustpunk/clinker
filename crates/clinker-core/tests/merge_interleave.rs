@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
@@ -113,8 +113,14 @@ fn run_pipeline(yaml: &str, a_count: u32, b_count: u32) -> Vec<String> {
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", &src_a_csv(a_count))]),
-        ("src_b".to_string(), vec![slot("b", &src_b_csv(b_count))]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", &src_a_csv(a_count))]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(b_count))]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -243,12 +249,16 @@ fn interleave_does_not_block_peer_on_slow_source() {
         (
             "src_a".to_string(),
             // 5 records, each preceded by 50 ms — total ~250 ms.
-            vec![slow_slot("a", &src_a_csv(5), Duration::from_millis(50))],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &src_a_csv(5),
+                Duration::from_millis(50),
+            )]),
         ),
         (
             "src_b".to_string(),
             // 5 records, produced as fast as the channel admits.
-            vec![slot("b", &src_b_csv(5))],
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(5))]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -433,35 +443,35 @@ fn interleave_fairness_under_four_predecessors() {
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "a",
                 &tagged_csv('a', 10),
                 Duration::from_millis(0),
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "b",
                 &tagged_csv('b', 10),
                 Duration::from_millis(10),
-            )],
+            )]),
         ),
         (
             "src_c".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "c",
                 &tagged_csv('c', 10),
                 Duration::from_millis(25),
-            )],
+            )]),
         ),
         (
             "src_d".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "d",
                 &tagged_csv('d', 10),
                 Duration::from_millis(50),
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -596,11 +606,19 @@ fn interleave_shutdown_unwinds_mid_stream() {
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slow_slot("a", &src_a_csv(6000), Duration::from_millis(1))],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &src_a_csv(6000),
+                Duration::from_millis(1),
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slow_slot("b", &src_b_csv(6000), Duration::from_millis(1))],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "b",
+                &src_b_csv(6000),
+                Duration::from_millis(1),
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();

@@ -190,16 +190,23 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
     out
 }
 
-/// Map from source-node name to the ordered list of files feeding that
-/// source. Each entry pairs the originating filesystem path (used to
-/// stamp `$source.file` per record) with an open `Read` handle.
+/// Map from source-node name to the input feeding that source.
 ///
-/// For literal-`path:` sources the vec holds a single element. For
-/// `glob`/`regex`/`paths` sources the discovery layer produces one
-/// entry per matched file; the executor concatenates them into a single
-/// stream via [`crate::source::multi_file::MultiFileFormatReader`] and
-/// stamps each record with the file it came from.
-pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot>>;
+/// The value is a [`crate::source::SourceInput`], generalized off the
+/// file-slot model so a non-file transport registers without being
+/// forced through the file abstractions. The `Files` arm carries the
+/// ordered file slots (one per matched file; the executor concatenates
+/// them via [`crate::source::multi_file::MultiFileFormatReader`] and
+/// stamps each record with its originating file); the `Records` arm
+/// carries a ready-to-drive [`crate::source::RecordSource`]. Both arms
+/// feed the identical `SourceIngestChannel` — the dispatcher never
+/// branches on transport.
+pub type SourceReaders = HashMap<String, crate::source::SourceInput>;
+
+/// Re-export so callers building a [`SourceReaders`] reach the transport
+/// variants and the row-yielding contract through the same module that
+/// owns the registry alias and [`single_file_reader`].
+pub use crate::source::{RecordSource, SourceInput};
 
 /// Dispatch result threaded out of `execute_dag` and
 /// `execute_dag_branching` and folded into the [`ExecutionReport`].
@@ -279,16 +286,18 @@ impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
 }
 
 /// Helper for callers (mostly tests and benchmarks) that have a single
-/// in-memory reader per source: wraps it in the one-element
-/// `Vec<FileSlot>` shape that the executor's reader registry expects.
+/// in-memory reader per source: wraps it in the one-element file-slot
+/// [`crate::source::SourceInput::Files`] shape the reader registry
+/// expects, hiding the transport variant so the common single-file case
+/// registers in one call.
 pub fn single_file_reader(
     path: impl Into<std::path::PathBuf>,
     reader: Box<dyn Read + Send>,
-) -> Vec<crate::source::multi_file::FileSlot> {
-    vec![crate::source::multi_file::FileSlot {
+) -> crate::source::SourceInput {
+    crate::source::SourceInput::Files(vec![crate::source::multi_file::FileSlot {
         path: path.into(),
         reader,
-    }]
+    }])
 }
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
@@ -1030,7 +1039,7 @@ impl PipelineExecutor {
             if src_cfg.watermark.is_some() {
                 watermarks.declare(&src_cfg.name);
             }
-            let files = readers.remove(&src_cfg.name).ok_or_else(|| {
+            let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
                 PipelineError::Config(crate::config::ConfigError::Validation(format!(
                     "no reader registered for source '{}'",
                     src_cfg.name
@@ -1059,7 +1068,7 @@ impl PipelineExecutor {
             // dispatch returns (receivers already drained).
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-ingest-{}", src_cfg.name))
-                .spawn(move || ingest_source(src_cfg_owned, files, config_clone, stream))
+                .spawn(move || ingest_source(src_cfg_owned, source_input, config_clone, stream))
                 .map_err(|e| PipelineError::Internal {
                     op: "source-ingest-spawn",
                     node: src_cfg.name.clone(),
@@ -2053,21 +2062,52 @@ struct IngestTaskOutcome {
 /// applies the channel's back-pressure.
 fn ingest_source(
     src_cfg: crate::config::SourceConfig,
-    files: Vec<crate::source::multi_file::FileSlot>,
+    input: crate::source::SourceInput,
     config: PipelineConfig,
     stream: crate::executor::source_stream::SourceIngestChannel,
 ) -> Result<IngestTaskOutcome, PipelineError> {
-    if files.is_empty() {
-        return Err(PipelineError::Config(
-            crate::config::ConfigError::Validation(format!(
-                "source '{}' has empty file list",
-                src_cfg.name
-            )),
-        ));
+    // Branch once on transport. The file arm builds the
+    // MultiFileFormatReader + schema-coercion stack and hands the
+    // resulting `Box<dyn FormatReader>` to the shared driver as a
+    // `RecordSource`; the records arm hands its already-built row
+    // yielder straight through. Everything downstream of the source
+    // reader — schema widening, document boundaries, watermark
+    // observation, channel push — is identical, so it lives in
+    // `drive_record_source`.
+    match input {
+        crate::source::SourceInput::Files(files) => {
+            if files.is_empty() {
+                return Err(PipelineError::Config(
+                    crate::config::ConfigError::Validation(format!(
+                        "source '{}' has empty file list",
+                        src_cfg.name
+                    )),
+                ));
+            }
+            let raw_reader = build_multi_file_reader(&src_cfg, files)?;
+            let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+            // The file arm reaches the shared driver through the blanket
+            // `RecordSource for Box<dyn FormatReader>` impl.
+            drive_record_source(src_cfg, Box::new(src_reader), stream)
+        }
+        crate::source::SourceInput::Records(src_reader) => {
+            drive_record_source(src_cfg, src_reader, stream)
+        }
     }
+}
+
+/// Drive one Source's [`RecordSource`](crate::source::RecordSource) to
+/// completion, widening every record with the `$source.*` engine-stamped
+/// tail columns, emitting document-boundary punctuation, observing
+/// event-time watermarks, and pushing into `stream`. Shared by both the
+/// file and non-file ingest arms — see [`ingest_source`].
+fn drive_record_source(
+    src_cfg: crate::config::SourceConfig,
+    src_reader: Box<dyn crate::source::RecordSource>,
+    stream: crate::executor::source_stream::SourceIngestChannel,
+) -> Result<IngestTaskOutcome, PipelineError> {
     {
-        let raw_reader = build_multi_file_reader(&src_cfg, files)?;
-        let mut src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+        let mut src_reader = src_reader;
         let reader_schema = src_reader.schema()?;
 
         // Widen the reader schema with `$source.file`, `$source.name`,
@@ -2103,8 +2143,16 @@ fn ingest_source(
             )
             .build();
 
+        // Fallback `$source.file` for records whose reader exposes no
+        // per-record file identity (`current_source_file() == None`):
+        // single-file readers and every non-file transport. Derived from
+        // the Source node name so a pathless source has one stable
+        // synthetic identifier. The document-boundary `need_new_doc`
+        // logic keys on this Arc by pointer equality, so a single stable
+        // Arc yields exactly one document per pathless source rather than
+        // a fresh document per record.
         let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
-            Arc::from("<source>")
+            Arc::from(format!("<source:{}>", src_cfg.name))
         } else {
             Arc::from(src_cfg.path_str())
         };
@@ -3864,6 +3912,7 @@ mod tests {
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;
     mod post_combine_window_strategies;
+    mod record_source_transport;
     mod strict_pipeline_zero_overhead;
     mod window_recompute_correctness;
 }

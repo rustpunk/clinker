@@ -93,11 +93,17 @@ fn five_each_readers() -> SourceReaders {
     HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,amt\n1,10\n2,20\n3,30\n4,40\n5,50\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,amt\n1,10\n2,20\n3,30\n4,40\n5,50\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,amt\n10,10\n11,11\n12,12\n13,13\n14,14\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,amt\n10,10\n11,11\n12,12\n13,13\n14,14\n",
+            )]),
         ),
     ])
 }

@@ -101,8 +101,14 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id,amt\n1,10\n2,20\n")]),
-        ("src_b".to_string(), vec![slot("b", "id,amt\n1,99\n2,99\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id,amt\n1,10\n2,20\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id,amt\n1,99\n2,99\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -194,7 +200,10 @@ nodes:
     let config = parse_config(yaml).unwrap();
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![slot("in", "id,tag,amt\n1,good,10\n1,bad,20\n2,good,30\n")],
+        clinker_core::executor::SourceInput::Files(vec![slot(
+            "in",
+            "id,tag,amt\n1,good,10\n1,bad,20\n2,good,30\n",
+        )]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -302,11 +311,11 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_drv".to_string(),
-            vec![slot("drv", "id,amt\n1,10\n2,20\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("drv", "id,amt\n1,10\n2,20\n")]),
         ),
         (
             "src_bld".to_string(),
-            vec![slot("bld", "id,dept\n1,HR\n2,ENG\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "id,dept\n1,HR\n2,ENG\n")]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -423,11 +432,11 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_drv".to_string(),
-            vec![slot("drv", "id,amt\n1,10\n2,20\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("drv", "id,amt\n1,10\n2,20\n")]),
         ),
         (
             "src_bld".to_string(),
-            vec![slot("bld", "id,factor\n1,2\n2,0\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "id,factor\n1,2\n2,0\n")]),
         ),
     ]);
     let buf = SharedBuffer::new();

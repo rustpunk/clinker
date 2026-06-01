@@ -75,8 +75,14 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id\n1\n2\n3\n4\n5\n")]),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n20\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id\n1\n2\n3\n4\n5\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n20\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -153,9 +159,15 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id\n1\n2\n3\n4\n5\n6\n7\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id\n1\n2\n3\n4\n5\n6\n7\n",
+            )]),
         ),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n20\n30\n")]),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n20\n30\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =

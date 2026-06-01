@@ -67,8 +67,10 @@ fn dispatch_routes_records_to_per_file_writers() {
             "order_id,amount\nORD-3,300.0\n".as_bytes().to_vec(),
         )),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("orders".to_string(), vec![file_a, file_b])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file_a, file_b]),
+    )]);
 
     // Pre-build one in-memory buffer per source file. The dispatcher
     // routes records by exactly these `Arc<str>` keys (Arc-equality

@@ -716,7 +716,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 Box::new(std::io::empty()),
             ));
         }
-        readers.insert(source.name.clone(), slots);
+        readers.insert(
+            source.name.clone(),
+            clinker_core::executor::SourceInput::Files(slots),
+        );
     }
 
     // Outputs are written atomically: each output writes to a sibling

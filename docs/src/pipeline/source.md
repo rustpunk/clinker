@@ -49,9 +49,30 @@ schema:
 | `any` | Unknown type -- field used in type-agnostic contexts |
 | `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
 
+## Transport vs format
+
+A source declaration has two independent layers:
+
+- **Transport** (`transport:`) selects *where* the records come from. The only transport today is `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
+- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`.
+
+```yaml
+- type: source
+  name: orders
+  config:
+    name: orders
+    transport: file        # optional; this is the default
+    type: csv              # the on-disk format
+    path: "./data/orders.csv"
+    schema:
+      - { name: order_id, type: int }
+```
+
+A `file` transport requires **exactly one** file matcher (`path`, `glob`, `regex`, or `paths`). Declaring none fails validation with `E211`; declaring more than one fails with `E210`. Both are reported at config-load time, before any file is opened.
+
 ## Format types
 
-The `type:` field inside `config:` selects the file format. Supported values: `csv`, `json`, `xml`, `fixed_width`.
+The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`.
 
 ### CSV
 

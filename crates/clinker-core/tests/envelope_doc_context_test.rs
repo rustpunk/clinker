@@ -82,8 +82,10 @@ fn envelope_sections_available_on_every_body_record() {
         PathBuf::from("payments.xml"),
         Box::new(Cursor::new(DOC_XML.as_bytes().to_vec())),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("payments".to_string(), vec![file])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "payments".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file]),
+    )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(

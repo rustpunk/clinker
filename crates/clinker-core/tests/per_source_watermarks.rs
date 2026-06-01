@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry};
+use clinker_core::executor::{
+    PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders, WriterRegistry,
+};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
@@ -104,17 +106,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:00\n2,2026-01-01T00:01:00\n3,2026-01-01T00:02:00\n",
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "b",
                 "id,event_time\n10,2026-01-01T00:00:30\n11,2026-01-01T00:00:45\n",
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -188,7 +190,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![
+        SourceInput::Files(vec![
             slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n3,2026-01-01T00:00:03\n",
@@ -197,7 +199,7 @@ nodes:
                 "b",
                 "id,event_time\n10,2026-01-01T01:00:00\n11,2026-01-01T02:00:00\n12,2026-01-01T03:00:00\n",
             ),
-        ],
+        ]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -257,10 +259,10 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![slot(
+        SourceInput::Files(vec![slot(
             "a",
             "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n",
-        )],
+        )]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -325,17 +327,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n",
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "b",
                 "id,event_time\n100,2030-01-01T00:00:00\n200,2030-01-01T00:00:01\n",
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -385,8 +387,10 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let readers: SourceReaders =
-        HashMap::from([("src".to_string(), vec![slot("a", "id,tag\n1,foo\n2,bar\n")])]);
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![slot("a", "id,tag\n1,foo\n2,bar\n")]),
+    )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
@@ -432,8 +436,10 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let readers: SourceReaders =
-        HashMap::from([("src".to_string(), vec![slot("a", "id,event_time\n")])]);
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![slot("a", "id,event_time\n")]),
+    )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
@@ -490,7 +496,7 @@ nodes:
     let arc_b: Arc<str> = Arc::from("b.csv");
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![
+        SourceInput::Files(vec![
             FileSlot::new(
                 PathBuf::from(arc_a.as_ref()),
                 Box::new(Cursor::new(
@@ -507,7 +513,7 @@ nodes:
                         .to_vec(),
                 )),
             ),
-        ],
+        ]),
     )]);
 
     let buf_a = SharedBuffer::new();

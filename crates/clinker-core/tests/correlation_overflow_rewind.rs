@@ -107,8 +107,14 @@ nodes:
     // The group's four buffered records exceed max_group_buffer=3, so the
     // commit arm flips the overflow disposition.
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id,amt\n1,10\n1,11\n")]),
-        ("src_b".to_string(), vec![slot("b", "id,amt\n1,20\n1,21\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id,amt\n1,10\n1,11\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id,amt\n1,20\n1,21\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -252,10 +258,16 @@ nodes:
     // non-overflowing group id=9 and so does not pull src_b's rewind
     // floor below 2.
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id,amt\n7,10\n7,11\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id,amt\n7,10\n7,11\n")]),
+        ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,amt\n9,90\n7,20\n7,21\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,amt\n9,90\n7,20\n7,21\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();

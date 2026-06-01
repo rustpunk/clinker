@@ -585,8 +585,10 @@ nodes:
         PathBuf::from("orders_b.csv"),
         Box::new(Cursor::new("id,tag\n3,beta\n".as_bytes().to_vec())),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("orders".to_string(), vec![file_a, file_b])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file_a, file_b]),
+    )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
         config.output_configs().next().unwrap().name.clone(),

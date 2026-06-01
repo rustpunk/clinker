@@ -159,9 +159,16 @@ fn run_streaming_pipeline(
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slow_slot("a", &src_a_csv(a_count), a_delay)],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &src_a_csv(a_count),
+                a_delay,
+            )]),
         ),
-        ("src_b".to_string(), vec![slot("b", &src_b_csv(b_count))]),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(b_count))]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> =
@@ -348,8 +355,14 @@ fn streaming_writer_failure_mid_stream_does_not_deadlock() {
     let plan = config.compile(&CompileContext::default()).unwrap();
 
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", &src_a_csv(800))]),
-        ("src_b".to_string(), vec![slot("b", &src_b_csv(800))]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", &src_a_csv(800))]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(800))]),
+        ),
     ]);
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
         "out".to_string(),

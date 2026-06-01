@@ -123,7 +123,11 @@ nodes:
     }
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![slow_slot("in", &csv, Duration::from_millis(25))],
+        clinker_core::executor::SourceInput::Files(vec![slow_slot(
+            "in",
+            &csv,
+            Duration::from_millis(25),
+        )]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> =
@@ -212,7 +216,11 @@ nodes:
         5,b,15\n";
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![slow_slot("in", csv, Duration::from_millis(5))],
+        clinker_core::executor::SourceInput::Files(vec![slow_slot(
+            "in",
+            csv,
+            Duration::from_millis(5),
+        )]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> =
@@ -345,9 +353,16 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slow_slot("a", &a_csv, Duration::from_millis(50))],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &a_csv,
+                Duration::from_millis(50),
+            )]),
         ),
-        ("src_b".to_string(), vec![fast_slot("b", &b_csv)]),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![fast_slot("b", &b_csv)]),
+        ),
     ]);
     let buf_a = SharedBuffer::new();
     let buf_b = SharedBuffer::new();

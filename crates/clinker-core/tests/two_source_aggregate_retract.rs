@@ -130,8 +130,14 @@ fn run_two_source(src_a_csv: &str, src_b_csv: &str) -> RunOutput {
     let config = parse_config(PIPELINE_YAML).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", src_a_csv)]),
-        ("src_b".to_string(), vec![slot("b", src_b_csv)]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", src_a_csv)]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", src_b_csv)]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =

@@ -88,11 +88,14 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_good".to_string(),
-            vec![slot("g", "id,amt\n1,10\n2,20\n3,30\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "g",
+                "id,amt\n1,10\n2,20\n3,30\n",
+            )]),
         ),
         (
             "src_bad".to_string(),
-            vec![slot("b", "id,amt\n100,1\n200,2\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id,amt\n100,1\n200,2\n")]),
         ),
     ]);
     let buf = SharedBuffer::new();

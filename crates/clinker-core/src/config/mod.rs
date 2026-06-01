@@ -372,6 +372,16 @@ pub struct SourceConfig {
     /// `files.sort_order` which orders the file set itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<Vec<SortFieldSpec>>,
+    /// Transport selecting WHERE the records come from, sitting above the
+    /// on-disk FORMAT (`format` / `type:` below). A plain optional
+    /// snake_case enum field — deliberately NOT a second
+    /// `#[serde(flatten)]`+tagged enum, because a flattened tagged enum
+    /// loses YAML source spans (the same edge case `InputFormat` already
+    /// hits), and a second one would compound that loss. Defaults to
+    /// [`SourceTransport::File`] so every existing file pipeline that
+    /// omits `transport:` parses byte-identically.
+    #[serde(default)]
+    pub transport: SourceTransport,
     #[serde(flatten)]
     pub format: InputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
@@ -662,6 +672,25 @@ impl<'de> Deserialize<'de> for ByteSize {
         }
         d.deserialize_any(V)
     }
+}
+
+/// Transport selecting where a source's records originate, layered ABOVE
+/// the on-disk [`InputFormat`]. `File` (the default) reads bytes from the
+/// filesystem and decodes them with the declared format; future non-file
+/// transports (a paginated REST cursor, a SQL `SELECT` cursor) yield rows
+/// without going through fs discovery or the file matchers.
+///
+/// Selected by a plain optional `transport:` key — a flat snake_case
+/// enum, not a `#[serde(flatten)]`+tagged enum, to avoid the YAML
+/// span-loss that a second flattened tagged enum on `SourceConfig` would
+/// cause.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTransport {
+    /// Read bytes from the filesystem; resolve the file set through the
+    /// discovery layer's `path`/`glob`/`regex`/`paths` matchers.
+    #[default]
+    File,
 }
 
 /// Adjacently tagged format enum for inputs.
@@ -3992,6 +4021,53 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
                      overrides only apply to externally referenced schemas",
                 input.name
             )));
+        }
+
+        // Matcher-exclusivity, gated on transport. A file transport
+        // resolves its file set through the discovery layer's
+        // `path`/`glob`/`regex`/`paths` matchers, so exactly one must be
+        // set — surfaced here at config time (E210/E211) rather than only
+        // when `discover` runs at CLI time, so a misconfigured file source
+        // fails on `--explain` and in-process executor callers too. The
+        // discovery layer keeps its own `pick_matcher` guard for the
+        // direct-`discover` path; this is the parse/validate-time mirror.
+        if matches!(input.transport, SourceTransport::File) {
+            let matcher_count = [
+                input.path.is_some(),
+                input.glob.is_some(),
+                input.regex.is_some(),
+                input.paths.is_some(),
+            ]
+            .into_iter()
+            .filter(|&set| set)
+            .count();
+            match matcher_count {
+                1 => {}
+                0 => {
+                    return Err(ConfigError::Validation(format!(
+                        "[E211] source '{}': file transport declares no matcher; set exactly \
+                         one of `path`, `glob`, `regex`, `paths`",
+                        input.name
+                    )));
+                }
+                _ => {
+                    let which: Vec<&str> = [
+                        ("path", input.path.is_some()),
+                        ("glob", input.glob.is_some()),
+                        ("regex", input.regex.is_some()),
+                        ("paths", input.paths.is_some()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, set)| set.then_some(name))
+                    .collect();
+                    return Err(ConfigError::Validation(format!(
+                        "[E210] source '{}': file transport declares more than one matcher \
+                         ({}); set exactly one of `path`, `glob`, `regex`, `paths`",
+                        input.name,
+                        which.join(", ")
+                    )));
+                }
+            }
         }
     }
 

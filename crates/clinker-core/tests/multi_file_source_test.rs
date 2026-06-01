@@ -70,8 +70,10 @@ fn multi_file_glob_concatenates_and_stamps_source_provenance() {
             "order_id,amount\nORD-3,300.0\n".as_bytes().to_vec(),
         )),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("orders".to_string(), vec![file_a, file_b])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file_a, file_b]),
+    )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
