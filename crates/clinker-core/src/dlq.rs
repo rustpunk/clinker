@@ -7,7 +7,7 @@ use clinker_record::{FieldMetadata, Schema, Value};
 use crate::config::DlqConfig;
 use crate::executor::DlqEntry;
 
-/// All 6 DLQ error categories per spec §10.4.
+/// All 12 DLQ error categories per spec §10.4.
 ///
 /// Passed from the error site — no string matching. Each error path
 /// constructs the correct variant at the point of failure.
@@ -45,6 +45,21 @@ pub enum DlqErrorCategory {
     /// originating record is routed to DLQ before the fan-out can
     /// emit any of its truncated body records.
     ExpansionLimitExceeded,
+    /// A Combine output-stage CXL evaluation or coercion failed for one
+    /// driver row — probe-key extraction, residual-filter eval, or the
+    /// matched / `on_miss: null_fields` body eval. Distinct from the
+    /// upstream-Transform `TypeCoercionFailure` because the failing row
+    /// carries contributing-build lineage: the entry is attributed to
+    /// the contributing input source(s) rather than the synthetic merged
+    /// source, and the failure rewinds each contributing source's
+    /// rollback cursor to the captured pre-fold floor so a downstream
+    /// resume reprocesses both the driver and the matched build row.
+    /// Routed only under `Continue` / `BestEffort`; `FailFast` propagates
+    /// the eval error unchanged. Recovery is implemented for the hash
+    /// build-probe (inline) Combine arm; the IEJoin, grace-hash, and
+    /// sort-merge kernels propagate an output-eval failure as fail-fast
+    /// regardless of strategy.
+    CombineOutputRow,
 }
 
 impl DlqErrorCategory {
@@ -61,6 +76,7 @@ impl DlqErrorCategory {
             Self::GroupSizeExceeded => "group_size_exceeded",
             Self::LateRecord => "late_record",
             Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
+            Self::CombineOutputRow => "combine_output_row",
         }
     }
 }
@@ -629,6 +645,14 @@ mod tests {
             "group_size_exceeded"
         );
         assert_eq!(DlqErrorCategory::LateRecord.as_str(), "late_record");
+        assert_eq!(
+            DlqErrorCategory::ExpansionLimitExceeded.as_str(),
+            "expansion_limit_exceeded"
+        );
+        assert_eq!(
+            DlqErrorCategory::CombineOutputRow.as_str(),
+            "combine_output_row"
+        );
     }
 
     #[test]

@@ -594,6 +594,12 @@ impl DlqEntry {
     pub fn stage_output(name: &str) -> String {
         format!("output:{name}")
     }
+
+    /// Stage: Combine output-stage evaluation error (probe-key, residual,
+    /// or body eval for one driver row).
+    pub fn stage_combine(name: &str) -> String {
+        format!("combine:{name}")
+    }
 }
 
 /// Unified pipeline executor. Plan-driven branching:

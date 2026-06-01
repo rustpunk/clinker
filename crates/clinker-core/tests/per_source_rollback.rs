@@ -353,3 +353,149 @@ nodes:
         "build source advances at Combine operator-entry walk over build_buf"
     );
 }
+
+/// A recoverable Combine output-row eval failure under
+/// `error_handling: strategy: continue` routes the failing driver row to
+/// the DLQ with category `combine_output_row`, attributes the entry to
+/// the contributing input sources (driver + matched build), and rewinds
+/// BOTH contributing sources' rollback cursors to the captured pre-fold
+/// floor.
+///
+/// Topology clones `ac3_combine_snapshot_capture_clean_run` but routes
+/// the driver direct into the Combine (no upstream Transform) so both
+/// sources' captured snapshot floor is 0. The Combine arm's
+/// operator-entry walk advances both cursors to 2 before the probe loop;
+/// the matched-body division-by-zero on driver row `id=2` then rewinds
+/// each contributing source back to its floor of 0. The clean `id=1`
+/// driver row still reaches the output. No `correlation_key` is declared,
+/// so the recoverable path takes the direct `push_dlq` branch rather than
+/// parking under a correlation group cell.
+#[test]
+fn ac3_combine_output_row_recoverable_dlq_rewinds_both_sources() {
+    let yaml = r#"
+pipeline:
+  name: ac3_combine_output_row_recoverable
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_drv
+    config:
+      name: src_drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amt, type: int }
+  - type: source
+    name: src_bld
+    config:
+      name: src_bld
+      type: csv
+      path: bld.csv
+      schema:
+        - { name: id, type: int }
+        - { name: factor, type: int }
+  - type: combine
+    name: enriched
+    input:
+      d: src_drv
+      b: src_bld
+    config:
+      where: 'd.id == b.id'
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = d.id
+        emit ratio = d.amt / b.factor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    // Build row id=2 carries factor=0, so the matched-body
+    // `d.amt / b.factor` eval divides by zero for driver row id=2 only.
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_drv".to_string(),
+            vec![slot("drv", "id,amt\n1,10\n2,20\n")],
+        ),
+        (
+            "src_bld".to_string(),
+            vec![slot("bld", "id,factor\n1,2\n2,0\n")],
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .unwrap();
+
+    // The failing output row produces a `combine_output_row` DLQ entry
+    // scoped to the contributing sources — a trigger on the driver and a
+    // non-trigger entry on the matched build. Neither falls back to the
+    // synthetic merged source.
+    let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
+        .dlq_entries
+        .iter()
+        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .collect();
+    assert_eq!(
+        combine_dlq.len(),
+        2,
+        "one trigger (driver) + one build-side entry for the failing row: {:?}",
+        report
+            .dlq_entries
+            .iter()
+            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+        "driver row is the attributed trigger on src_drv"
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+        "matched build row is attributed to src_bld, not the merged source"
+    );
+
+    // Both contributing sources rewind to their captured pre-fold floor
+    // (0), undoing the operator-entry advance to row 2. Asserted exactly
+    // like the GroupSizeExceeded per-source rewind above.
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_drv"),
+        Some(&0),
+        "driver source rewinds to its pre-fold snapshot floor of 0"
+    );
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_bld"),
+        Some(&0),
+        "build source rewinds to its pre-fold snapshot floor of 0"
+    );
+
+    // The clean id=1 driver row still reaches the writer; the failing
+    // id=2 row is dropped from the output.
+    let output = buf.as_string();
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        1,
+        "only the clean id=1 row reaches the output: {output}"
+    );
+    assert!(
+        body[0].starts_with("1,"),
+        "the surviving row is id=1: {output}"
+    );
+}

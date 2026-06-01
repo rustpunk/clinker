@@ -404,6 +404,153 @@ fn dispatch_transform_eval_error(
         },
     )
 }
+
+/// Route a recoverable Combine output-stage eval failure for one driver
+/// row through the DLQ, rewinding each contributing source's rollback
+/// cursor to the captured pre-fold floor before any DLQ admission.
+///
+/// Called from the inline Combine arm's per-driver loop under
+/// [`ErrorStrategy::Continue`] / [`ErrorStrategy::BestEffort`] when
+/// probe-key extraction, the residual filter, or a matched /
+/// `on_miss: null_fields` body eval fails. The caller `continue`s the
+/// driver loop afterward so the failing output row is dropped.
+///
+/// Unlike [`dispatch_transform_eval_error`], a Combine output row has up
+/// to two contributing input sources — the driver row (`probe_record`)
+/// and, once a build candidate has matched, the build row
+/// (`matched_build_record`). Both must rewind: the captured snapshot in
+/// `combine_input_snapshots[node_idx]` holds each contributing source's
+/// pre-fold cursor, and this consumes that snapshot to lower each
+/// contributing source's `rollback_cursors` entry to its captured floor
+/// (the per-source-min rewind the `CorrelationCommit` overflow path
+/// uses). The snapshot stays installed for the rest of the driver loop —
+/// the arm's single clear at fold exit is the only drop point — so a
+/// later row's failure rewinds against the same pre-fold floor.
+///
+/// The DLQ entry is attributed to the real contributing source(s), never
+/// the synthetic [`MERGED_SOURCE_NAME`]: a trigger entry on the probe
+/// row's source, plus a build-side entry when a build row contributed.
+/// When correlation buffering is active each entry parks under its
+/// group cell so the group's success/failure stays atomic; otherwise it
+/// pushes directly to the run-scoped DLQ.
+fn dispatch_combine_output_error(
+    ctx: &mut ExecutorContext<'_>,
+    node_idx: NodeIndex,
+    probe_record: &Record,
+    row_num: u64,
+    matched_build_record: Option<&Record>,
+    combine_name: &str,
+    eval_err: cxl::eval::EvalError,
+) -> Result<(), PipelineError> {
+    let category = crate::dlq::DlqErrorCategory::CombineOutputRow;
+    let stage = Some(DlqEntry::stage_combine(combine_name));
+    let message = eval_err.to_string();
+
+    let probe_source = source_name_arc_of(probe_record);
+    let build_source = matched_build_record.map(source_name_arc_of);
+
+    // Rewind every contributing source to its captured pre-fold floor
+    // before admitting any DLQ entry. The snapshot was taken at fold
+    // start (before this arm's operator-entry `advance_cursor` walk
+    // raised each cursor to the highest contributed row), so restoring
+    // it narrows the replay anchor back across this fold for the driver
+    // and the matched build row alike. Only sources that fed THIS row
+    // are rewound — co-folded sources that did not contribute keep their
+    // forward progress. The snapshot is left installed: the arm's single
+    // clear at fold exit is the only drop point.
+    if let Some(snapshot) = ctx.combine_input_snapshots.get(&node_idx) {
+        let mut floors: Vec<(Arc<str>, u64)> = Vec::new();
+        if let Some(&floor) = snapshot.get(&probe_source) {
+            floors.push((Arc::clone(&probe_source), floor));
+        }
+        if let Some(bsrc) = build_source.as_ref()
+            && let Some(&floor) = snapshot.get(bsrc)
+        {
+            floors.push((Arc::clone(bsrc), floor));
+        }
+        for (sn, floor) in floors {
+            ctx.rollback_cursors
+                .entry(sn)
+                .and_modify(|c| *c = (*c).min(floor))
+                .or_insert(floor);
+        }
+    }
+
+    // Trigger entry on the probe row's source. Park under the
+    // correlation group cell when buffering is active so the group stays
+    // atomic; otherwise push directly to the run-scoped DLQ.
+    let triggering_field = eval_err.triggering_field.clone();
+    let triggering_value = eval_err.triggering_value();
+    let routed = record_error_to_buffer_if_grouped(
+        ctx,
+        probe_record,
+        row_num,
+        category,
+        message.clone(),
+        stage.clone(),
+        None,
+    );
+    if !routed {
+        push_dlq(
+            ctx,
+            DlqEntry {
+                source_row: row_num,
+                category,
+                error_message: message.clone(),
+                original_record: probe_record.clone(),
+                stage: stage.clone(),
+                route: None,
+                trigger: true,
+                source_name: Arc::clone(&probe_source),
+                triggering_field,
+                triggering_value,
+            },
+        )?;
+    }
+
+    // When a build row contributed, attribute a build-side entry too so
+    // the contributing build lineage reaches the DLQ. It carries the
+    // same category but is not the trigger. The build row's own source
+    // row number is not threaded to the output stage (build-side row
+    // numbers are consumed at the operator-entry cursor advance), so the
+    // entry borrows the driver row number; the build record's
+    // `original_record` still carries the build's real `$source.name`
+    // stamp and `$ck.*` lineage, which is what attribution and
+    // group-atomicity key off.
+    if let Some(build_record) = matched_build_record {
+        let build_routed = record_error_to_buffer_if_grouped(
+            ctx,
+            build_record,
+            row_num,
+            category,
+            message.clone(),
+            stage.clone(),
+            None,
+        );
+        if !build_routed {
+            let build_source_name = build_source
+                .clone()
+                .unwrap_or_else(|| source_name_arc_of(build_record));
+            push_dlq(
+                ctx,
+                DlqEntry {
+                    source_row: row_num,
+                    category,
+                    error_message: message,
+                    original_record: build_record.clone(),
+                    stage,
+                    route: None,
+                    trigger: false,
+                    source_name: build_source_name,
+                    triggering_field: None,
+                    triggering_value: None,
+                },
+            )?;
+        }
+    }
+
+    Ok(())
+}
 use crate::aggregation::AggregateStrategy;
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
@@ -4809,7 +4956,7 @@ pub(crate) fn dispatch_plan_node(
             // pushes into the end; we clear before each call.
             let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
 
-            for (probe_record, rn) in driver_buf {
+            'driver: for (probe_record, rn) in driver_buf {
                 let source_file_arc = source_file_arc_of(&probe_record);
                 let source_name_arc = source_name_arc_of(&probe_record);
                 let eval_ctx = EvalContext {
@@ -4837,12 +4984,23 @@ pub(crate) fn dispatch_plan_node(
                 let probe_key_resolver =
                     CombineResolver::new(&resolver_mapping, &probe_record, None);
                 probe_keys_buf.clear();
-                probe_extractor
-                    .extract_into(&eval_ctx, &probe_key_resolver, &mut probe_keys_buf)
-                    .map_err(|e| PipelineError::Compilation {
-                        transform_name: name.clone(),
-                        messages: vec![format!("combine probe key eval error: {e}")],
-                    })?;
+                if let Err(e) = probe_extractor.extract_into(
+                    &eval_ctx,
+                    &probe_key_resolver,
+                    &mut probe_keys_buf,
+                ) {
+                    if ctx.strategy == ErrorStrategy::FailFast {
+                        return Err(PipelineError::Compilation {
+                            transform_name: name.clone(),
+                            messages: vec![format!("combine probe key eval error: {e}")],
+                        });
+                    }
+                    // No build candidate has matched yet — the failure is
+                    // on the probe key itself, so only the driver source
+                    // rewinds.
+                    dispatch_combine_output_error(ctx, node_idx, &probe_record, rn, None, name, e)?;
+                    continue 'driver;
+                }
 
                 match match_mode {
                     MatchMode::Collect => {
@@ -4884,7 +5042,19 @@ pub(crate) fn dispatch_plan_node(
                                         continue;
                                     }
                                     Err(e) => {
-                                        return Err(PipelineError::from(e));
+                                        if ctx.strategy == ErrorStrategy::FailFast {
+                                            return Err(PipelineError::from(e));
+                                        }
+                                        dispatch_combine_output_error(
+                                            ctx,
+                                            node_idx,
+                                            &probe_record,
+                                            rn,
+                                            Some(candidate.record),
+                                            name,
+                                            e,
+                                        )?;
+                                        continue 'driver;
                                     }
                                 }
                             }
@@ -4987,7 +5157,19 @@ pub(crate) fn dispatch_plan_node(
                                             });
                                         }
                                         Err(e) => {
-                                            return Err(PipelineError::from(e));
+                                            if ctx.strategy == ErrorStrategy::FailFast {
+                                                return Err(PipelineError::from(e));
+                                            }
+                                            dispatch_combine_output_error(
+                                                ctx,
+                                                node_idx,
+                                                &probe_record,
+                                                rn,
+                                                Some(candidate.record),
+                                                name,
+                                                e,
+                                            )?;
+                                            continue 'driver;
                                         }
                                     }
                                 }
@@ -5066,7 +5248,22 @@ pub(crate) fn dispatch_plan_node(
                                             });
                                         }
                                         Err(e) => {
-                                            return Err(PipelineError::from(e));
+                                            if ctx.strategy == ErrorStrategy::FailFast {
+                                                return Err(PipelineError::from(e));
+                                            }
+                                            // on_miss path: no build row
+                                            // matched, so only the driver
+                                            // source rewinds.
+                                            dispatch_combine_output_error(
+                                                ctx,
+                                                node_idx,
+                                                &probe_record,
+                                                rn,
+                                                None,
+                                                name,
+                                                e,
+                                            )?;
+                                            continue 'driver;
                                         }
                                     }
                                 }
@@ -5124,7 +5321,19 @@ pub(crate) fn dispatch_plan_node(
                                         });
                                     }
                                     Err(e) => {
-                                        return Err(PipelineError::from(e));
+                                        if ctx.strategy == ErrorStrategy::FailFast {
+                                            return Err(PipelineError::from(e));
+                                        }
+                                        dispatch_combine_output_error(
+                                            ctx,
+                                            node_idx,
+                                            &probe_record,
+                                            rn,
+                                            Some(matched),
+                                            name,
+                                            e,
+                                        )?;
+                                        continue 'driver;
                                     }
                                 }
                             }

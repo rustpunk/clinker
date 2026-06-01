@@ -88,6 +88,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `aggregate_type_error` | An aggregate function received an incompatible type |
 | `validation_failure` | A declarative validation check failed |
 | `aggregate_finalize` | An aggregate function failed during finalization |
+| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Recovery applies to the hash build-probe (inline) Combine arm only; IEJoin, grace-hash, and sort-merge output-eval failures stay fail-fast |
 
 ## Advanced options
 
