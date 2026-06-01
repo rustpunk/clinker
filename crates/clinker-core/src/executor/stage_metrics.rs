@@ -197,10 +197,11 @@ impl CumulativeTimer {
     }
 
     /// Fold another timer's accumulated time into `self`. Used by the
-    /// streaming-output writer task to merge its task-local timer back
-    /// into the dispatcher's `ctx.write_timer` / `ctx.projection_timer`
-    /// after `JoinHandle::await`, matching the cross-task convention
-    /// already established by `ChunkTimers::merge` for rayon folds.
+    /// streaming-output writer thread to merge its thread-local timer
+    /// back into the dispatcher's `ctx.write_timer` /
+    /// `ctx.projection_timer` after `JoinHandle::join`, matching the
+    /// cross-thread convention already established by `ChunkTimers::merge`
+    /// for rayon folds.
     pub fn add(&mut self, other: CumulativeTimer) {
         self.nanos = self.nanos.saturating_add(other.nanos);
     }

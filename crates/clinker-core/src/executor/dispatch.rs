@@ -115,9 +115,9 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
 /// once at executor entry from
 /// [`ExecutorContext::total_per_source`] — not a moving "records
 /// processed so far" counter. The total is read from each ingest
-/// task's `JoinHandle` once its `mpsc::Receiver` drains, then frozen
-/// for the duration of the run, so the ratio remains stable across
-/// the dispatch loop's `recv().await` interleaving.
+/// thread's `JoinHandle` once its crossbeam `Receiver` drains, then
+/// frozen for the duration of the run, so the ratio remains stable
+/// across the dispatch loop's `recv` interleaving.
 pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
@@ -147,7 +147,7 @@ pub(crate) fn push_dlq(
 /// which still fail-fast.
 ///
 /// `row_num` is the engine-stamped source row number stamped on each
-/// record as it leaves the Source ingest task's `TokioSourceStream`
+/// record as it leaves the Source ingest thread's `SourceIngestChannel`
 /// and threaded through every `(record, row_num)` tuple in the
 /// dispatch path. It is the same value the relaxed-CK retract
 /// orchestrator passes to
@@ -437,11 +437,11 @@ use clinker_record::Schema;
 ///
 /// Owned (mutated across the walk):
 /// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
-/// * `source_records` — per-source live `mpsc::Receiver`s keyed by
+/// * `source_records` — per-source live crossbeam `Receiver`s keyed by
 ///   Source node name. The Source dispatch arm drains its receiver
-///   via `recv().await`; the paired sender lives in a `tokio::spawn`-ed
-///   ingest task that drives the format reader and pushes through a
-///   `TokioSourceStream`. The `$source.file` per-record stamp travels
+///   via `recv`; the paired sender lives on a `std::thread` ingest
+///   worker that drives the format reader and pushes through a
+///   `SourceIngestChannel`. The `$source.file` per-record stamp travels
 ///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
 /// * `compiled_route` — cached evaluator for Route arms.
@@ -469,8 +469,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// `pipeline.batch_id`.
     pub(crate) source_batch_arc: &'a Arc<str>,
     /// Per-source finalized record count, keyed by Source node name.
-    /// `Some(n)` once the Source's `mpsc::Receiver` has returned `None`
-    /// — i.e. the upstream ingest task closed its sender and we know
+    /// `Some(n)` once the Source's crossbeam `Receiver` has disconnected
+    /// — i.e. the upstream ingest thread closed its sender and we know
     /// the total. `None` while the source is still streaming.
     ///
     /// The `$source.count` evaluator reads this through
@@ -524,16 +524,15 @@ pub(crate) struct ExecutorContext<'a> {
         ),
     >,
     /// Per-source live ingest channels keyed by Source node name. Each
-    /// declared Source has one `tokio::spawn`-ed task pushing records
-    /// through a `TokioSourceStream`; this map holds the paired
-    /// `Receiver` the dispatch loop's Source arm drains via
-    /// `recv().await`. Replaces the pre-drained `Vec<(Record, u64)>`
-    /// carrier: producers run concurrently with consumption, bounded by
-    /// channel capacity so back-pressure flows end-to-end. A missing
-    /// entry at the Source arm surfaces as a defense-in-depth Internal
-    /// error.
+    /// declared Source has one `std::thread` pushing records through a
+    /// `SourceIngestChannel`; this map holds the paired `Receiver` the
+    /// dispatch loop's Source arm drains via `recv`. Replaces the
+    /// pre-drained `Vec<(Record, u64)>` carrier: producers run
+    /// concurrently with consumption, bounded by channel capacity so
+    /// back-pressure flows end-to-end. A missing entry at the Source arm
+    /// surfaces as a defense-in-depth Internal error.
     pub(crate) source_records:
-        HashMap<String, tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>>,
+        HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
     /// Source-node names whose receivers have been moved out of
     /// `source_records` by a downstream Merge.interleave fusion. The
     /// Source dispatch arm checks this set at entry and returns
@@ -545,9 +544,9 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) fused_sources: HashSet<String>,
 
     /// Transforms whose sole upstream is a `PlanNode::Source` and that
-    /// have taken ownership of the Source's
-    /// [`tokio::sync::mpsc::Receiver`] out of [`Self::source_records`].
-    /// The Transform arm drives `recv().await` per record and runs CXL
+    /// have taken ownership of the Source's crossbeam `Receiver` out of
+    /// [`Self::source_records`].
+    /// The Transform arm drives `recv` per record and runs CXL
     /// evaluation inline; the upstream Source's dispatch arm short-
     /// circuits via [`Self::fused_sources`] (the same set membership
     /// the Merge.interleave fusion relies on). Populated at executor
@@ -576,9 +575,8 @@ pub(crate) struct ExecutorContext<'a> {
         &'a indexmap::IndexMap<String, indexmap::IndexMap<String, Value>>,
     /// Per-source idle-timeout durations derived from
     /// `SourceConfig.watermark.idle_timeout`. The Source dispatch
-    /// arm wraps its `rx.recv().await` in `tokio::time::timeout`
-    /// when its source name is present; absent entries fall back to
-    /// unbounded `rx.recv().await`.
+    /// arm uses `rx.recv_timeout` when its source name is present;
+    /// absent entries fall back to blocking `rx.recv`.
     pub(crate) idle_timeouts: &'a HashMap<String, std::time::Duration>,
     /// Per-source set of `(file_arc)` slots whose source-scope vars
     /// have already been seeded into `stable.source_vars`. The
@@ -791,16 +789,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// `Merge` node's `NodeIndex`. Present when the executor entry has
     /// matched a `Merge.interleave → single Output` chain against
     /// the streaming eligibility predicate (issue #72) and spawned the
-    /// writer task. The fused Merge arm checks the map for its index;
+    /// writer thread. The fused Merge arm checks the map for its index;
     /// if present, it streams each canonicalized record through the
-    /// bounded `tokio::sync::mpsc::channel` instead of accumulating
-    /// into a `Vec`, and drops its sender at clean exit so the writer
-    /// task's `recv()` returns `None`. Empty for pipelines that don't
-    /// match the topology — every other Output stays on the buffered
-    /// path. See
+    /// bounded crossbeam channel instead of accumulating into a `Vec`,
+    /// and drops its sender at clean exit so the writer thread's `recv`
+    /// returns `Err` (channel disconnected). Empty for pipelines that
+    /// don't match the topology — every other Output stays on the
+    /// buffered path. See
     /// https://github.com/rustpunk/clinker/issues/72.
     pub(crate) streaming_output_senders:
-        HashMap<NodeIndex, tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>>,
+        HashMap<NodeIndex, crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
     /// `Output` `NodeIndex`es whose writes are streamed by a task
     /// spawned at executor entry. The `Output` dispatch arm short-
     /// circuits at the top when its index is in this set — the writer
@@ -808,15 +806,34 @@ pub(crate) struct ExecutorContext<'a> {
     /// buffered batch to drain. Empty when no streaming chain
     /// qualified.
     pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
-    /// `JoinHandle`s for spawned streaming-output writer tasks. Owned
+    /// `JoinHandle`s for spawned streaming-output writer threads. Owned
     /// by the dispatcher so the end-of-DAG join surface (in
-    /// `execute_dag_branching`) folds per-task counter / timer /
+    /// `execute_dag_branching`) folds per-thread counter / timer /
     /// error accounting back into the dispatcher's
     /// `counters` / `records_emitted` / `write_timer` /
     /// `projection_timer` / `ok_source_rows` / `output_errors`.
     /// Drained via `std::mem::take` at the join surface.
     pub(crate) streaming_output_tasks:
-        Vec<tokio::task::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
+        Vec<std::thread::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
+
+    /// Shared Rayon pool for CPU-bound owned-input kernels (sort,
+    /// grace-hash partition build, IEJoin range-walk, sort-merge). Sized
+    /// off the run's thread budget; each kernel extracts its owned input
+    /// out of `ctx` and runs under `pool.install(...)`, so the closures
+    /// capture only owned data plus `&memory_budget` and stay order-
+    /// preserving (the kernels emit in a deterministic order independent
+    /// of pool scheduling).
+    pub(crate) kernel_pool: Arc<rayon::ThreadPool>,
+
+    /// Per-run shutdown handle, cloned from `PipelineRunParams`. The
+    /// operator loops poll it at chunk boundaries via
+    /// [`Self::check_shutdown`]; `None` disables shutdown signaling.
+    pub(crate) shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+
+    /// Set when a chunk-boundary shutdown poll tripped and the run
+    /// unwound early. Surfaced through the report so the CLI can return
+    /// the interrupted exit code.
+    pub(crate) interrupted: bool,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -874,6 +891,26 @@ impl ExecutorContext<'_> {
         &self.spill_root
     }
 
+    /// Poll the run's shutdown flag at an operator chunk boundary. When
+    /// the token has tripped (SIGINT/SIGTERM, or a programmatic
+    /// request), record the interruption and return
+    /// [`PipelineError::Interrupted`] so the dispatch unwinds back to
+    /// the join surface, which drops senders and joins worker threads
+    /// before the run exits — a graceful run → drain → exit, never an
+    /// abort mid-write. Cheap (one relaxed atomic load) when no token is
+    /// installed or the flag is clear.
+    pub(crate) fn check_shutdown(&mut self) -> Result<(), PipelineError> {
+        if self
+            .shutdown_token
+            .as_ref()
+            .is_some_and(|t| t.is_requested())
+        {
+            self.interrupted = true;
+            return Err(PipelineError::Interrupted);
+        }
+        Ok(())
+    }
+
     /// Resolve `$source.count` by explicit source name. Used by
     /// finalize sites that don't have a per-record source attribution
     /// — they pass [`MERGED_SOURCE_NAME`], whose slot is stamped with
@@ -896,7 +933,7 @@ impl ExecutorContext<'_> {
     /// every per-source slot is now populated, derive and stamp the
     /// pipeline-wide total under [`MERGED_SOURCE_NAME`]. Called by the
     /// Source dispatch arm (and the Merge.interleave fusion arm) when
-    /// a source's `mpsc::Receiver` returns `None`.
+    /// a source's crossbeam `Receiver` disconnects.
     pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
         self.source_count_per_source
             .insert(Arc::clone(source_name), Some(count));
@@ -1587,47 +1624,47 @@ pub(crate) fn finalize_node_rooted_windows(
 /// Drive the fused `Merge.mode: interleave` arm when every direct
 /// predecessor is a `PlanNode::Source` whose receiver is parked in
 /// `ctx.source_records`. Takes ownership of each predecessor's
-/// `mpsc::Receiver`, runs a fair `tokio::select!` over them via a
-/// `FuturesUnordered`, applies the same per-record pipeline the
-/// non-fused Source arm runs (canonicalize onto the source's plan-
-/// time schema, seed `$record.<key>` defaults, seed
-/// `$source.<key>` defaults per `(source, file_arc)`, advance the
-/// per-source running counter), and re-canonicalizes each emitted
-/// record onto the Merge's output schema.
+/// crossbeam `Receiver`, runs a fair `crossbeam_channel::Select` over
+/// them, applies the same per-record pipeline the non-fused Source arm
+/// runs (canonicalize onto the source's plan-time schema, seed
+/// `$record.<key>` defaults, seed `$source.<key>` defaults per
+/// `(source, file_arc)`, advance the per-source running counter), and
+/// re-canonicalizes each emitted record onto the Merge's output schema.
 ///
-/// Live back-pressure semantic: a slow upstream Source's
-/// `tokio::time::sleep`-gated reader does not delay peer Source
-/// records from being consumed off their bounded `mpsc::channel`.
-/// The select! schedules whichever receiver has a ready record;
-/// the others continue producing into their channels concurrently.
+/// Live back-pressure semantic: a slow upstream Source's ingest thread
+/// does not delay peer Source records from being consumed off their
+/// bounded channel. `Select::select` blocks the merge thread (no busy
+/// spin) until some receiver has a message or is disconnected, then
+/// returns one ready operation; among several ready peers crossbeam
+/// picks at random, and registering from a per-iteration rotating
+/// cursor offset keeps the choice round-robin-fair so no predecessor
+/// monopolizes the schedule.
 ///
-/// Seeded interleaves (`interleave_seed: Some(n)`) replace the
-/// arrival-driven schedule with a deterministic fastrand-driven
-/// poll order so snapshot tests remain reproducible. Records are
-/// pulled in seed-determined order from whichever receivers have
-/// records available; unseeded variants follow arrival order via
-/// pure `tokio::select!`.
+/// This fused path runs UNSEEDED only — seeded interleaves
+/// (`interleave_seed: Some(n)`) take the non-fused Merge arm, whose
+/// `fastrand`-driven deterministic order is unaffected by this rewrite.
+/// Unseeded interleave is arrival-order-driven by contract, which
+/// crossbeam's randomized ready-pick matches; no snapshot/baseline test
+/// asserts a specific order on this path.
 ///
 /// `streaming_sender` is `Some` iff the executor matched a fused
 /// `Merge.interleave → single Output` chain against the streaming
 /// eligibility predicate (issue #72). In streaming mode this function
-/// pushes each canonicalized record through the bounded
-/// `mpsc::channel` instead of accumulating into a Vec, applies live
-/// back-pressure end-to-end (writer slow → Merge yields → Sources
-/// yield), and returns an empty Vec at close. In non-streaming mode
-/// (`None`) it returns the accumulated `Vec<(Record, u64)>` that the
-/// Merge arm then teed into `node_buffers` for downstream consumers.
-pub(crate) async fn merge_fused_interleave(
+/// pushes each canonicalized record through the bounded channel instead
+/// of accumulating into a Vec, applies live back-pressure end-to-end
+/// (writer slow → Merge `send` blocks → Sources' channels fill →
+/// ingest threads block), and returns an empty Vec at close. In
+/// non-streaming mode (`None`) it returns the accumulated
+/// `Vec<(Record, u64)>` that the Merge arm then teed into
+/// `node_buffers` for downstream consumers.
+pub(crate) fn merge_fused_interleave(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     merge_name: &str,
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
-    streaming_sender: Option<tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>>,
+    streaming_sender: Option<crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
 ) -> Result<Vec<(Record, u64)>, PipelineError> {
-    use std::future::poll_fn;
-    use std::task::Poll;
-
     // Per-predecessor state: the source's plan-time schema, its
     // engine-stamped tail mapping, its `Arc<str>` name (used for
     // the per-source running counter and the
@@ -1642,7 +1679,7 @@ pub(crate) async fn merge_fused_interleave(
 
     let mut states: Vec<PredState> = Vec::with_capacity(sorted_preds.len());
     let mut receivers: Vec<
-        Option<tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>>,
+        Option<crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
     > = Vec::with_capacity(sorted_preds.len());
     for pred in sorted_preds {
         let PlanNode::Source { name, .. } = &current_dag.graph[*pred] else {
@@ -1691,37 +1728,57 @@ pub(crate) async fn merge_fused_interleave(
     // this fused path runs unseeded only.
     let mut cursor: usize = 0;
 
-    // Each iteration: poll every active receiver via `poll_recv`,
-    // taking the first ready one. Tokio guarantees `poll_recv`
-    // wakes the task when a sender pushes; combining with
-    // `poll_fn` gives a fair scheduler without dependencies
-    // beyond tokio.
+    // Each iteration: build a fresh `Select`, register every still-
+    // active receiver starting from the rotating cursor offset (so
+    // registration order rotates and crossbeam's random ready-pick
+    // stays round-robin-fair across iterations), block on `select()`
+    // (parks the thread — no busy spin — until some receiver has a
+    // message or is disconnected), then map the chosen operation back
+    // to its predecessor index. A disconnected channel surfaces as a
+    // ready op whose `recv` returns `Err`, so closed-source detection
+    // happens inside the same select loop.
+    let n = receivers.len();
     loop {
-        let active_count = receivers.iter().filter(|r| r.is_some()).count();
-        if active_count == 0 {
-            break;
-        }
-        let n = receivers.len();
+        // Honor cooperative shutdown at the chunk boundary before blocking on
+        // the next `select()`. Without this poll a long fused
+        // Merge.interleave -> streaming-Output stream ignores a tripped token
+        // and runs to natural EOF, blowing the shutdown-latency bound that the
+        // non-fused operator loops already respect.
+        ctx.check_shutdown()?;
         let start = {
-            let s = cursor % n;
+            let s = if n == 0 { 0 } else { cursor % n };
             cursor = cursor.wrapping_add(1);
             s
         };
-        let polled = poll_fn(|poll_cx| {
-            for offset in 0..n {
-                let i = (start + offset) % n;
-                let Some(rx) = receivers[i].as_mut() else {
-                    continue;
-                };
-                match rx.poll_recv(poll_cx) {
-                    Poll::Ready(item) => return Poll::Ready((i, item)),
-                    Poll::Pending => continue,
-                }
+        let mut sel = crossbeam_channel::Select::new();
+        // Map each registered select operation index back to its
+        // predecessor index.
+        let mut op_to_pred: Vec<usize> = Vec::with_capacity(n);
+        for offset in 0..n {
+            let i = (start + offset) % n;
+            if let Some(rx) = receivers[i].as_ref() {
+                sel.recv(rx);
+                op_to_pred.push(i);
             }
-            Poll::Pending
-        })
-        .await;
-        let (i, item) = polled;
+        }
+        if op_to_pred.is_empty() {
+            // Every source closed.
+            break;
+        }
+        let oper = sel.select();
+        let op_index = oper.index();
+        let i = op_to_pred[op_index];
+        // Complete the chosen operation on its receiver. `Ok` is a
+        // record/punctuation; `Err(RecvError)` means that source's
+        // channel disconnected (all senders dropped) — `ok()` maps it to
+        // the `None` close arm below.
+        let item: Option<crate::executor::stream_event::StreamEvent> = oper
+            .recv(
+                receivers[i]
+                    .as_ref()
+                    .expect("select op_index maps to an active receiver"),
+            )
+            .ok();
         // Fused merge path: punctuations from the per-Source live
         // channels are currently consumed here. Forwarding them
         // through the streaming-output channel with multi-input dedup
@@ -1767,18 +1824,17 @@ pub(crate) async fn merge_fused_interleave(
                 }
                 match streaming_sender.as_ref() {
                     Some(tx) => {
-                        // Bounded `send().await` is the back-pressure
-                        // pivot — if the writer task is slow, the Merge
-                        // arm yields here, which in turn slows the
-                        // `poll_recv` loop above and lets the Source
+                        // Bounded blocking `send` is the back-pressure
+                        // pivot — if the writer thread is slow, the
+                        // Merge thread blocks here, which stops it
+                        // calling `select()` and lets the Source
                         // channels fill up. Send errors mean the
-                        // receiver was dropped (writer task panicked or
+                        // receiver was dropped (writer thread panicked or
                         // an error path raced); surface as Internal so
                         // the caller knows the streaming chain is
                         // broken rather than silently dropping records.
                         if tx
                             .send(crate::executor::stream_event::StreamEvent::record(rec, rn))
-                            .await
                             .is_err()
                         {
                             return Err(PipelineError::Internal {
@@ -1810,7 +1866,7 @@ pub(crate) async fn merge_fused_interleave(
 }
 
 /// Drive a `PlanNode::Transform` whose sole upstream is a
-/// `PlanNode::Source` directly off the Source's `mpsc::Receiver`,
+/// `PlanNode::Source` directly off the Source's crossbeam `Receiver`,
 /// running per-record CXL evaluation inline instead of consuming a
 /// pre-drained `Vec` from `node_buffers`. The Source dispatch arm
 /// short-circuits via [`ExecutorContext::fused_sources`]; this helper
@@ -1827,7 +1883,7 @@ pub(crate) async fn merge_fused_interleave(
 /// enforced upstream by `compute_transform_fused_sources` in
 /// `executor/mod.rs`; this helper trusts the predicate and panics on
 /// shape violations.
-pub(crate) async fn transform_fused_consume(
+pub(crate) fn transform_fused_consume(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -1887,7 +1943,7 @@ pub(crate) async fn transform_fused_consume(
         )
     });
 
-    let mut rx = ctx
+    let rx = ctx
         .source_records
         .remove(source_name_owned.as_str())
         .ok_or_else(|| PipelineError::Internal {
@@ -1905,18 +1961,19 @@ pub(crate) async fn transform_fused_consume(
     let mut output_records: Vec<(Record, u64)> = Vec::new();
     let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
     let mut count: u64 = 0;
-    let mut yields_since_last: u32 = 0;
+    let mut records_since_check: u32 = 0;
     loop {
         let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
-            Some(t) => match tokio::time::timeout(t, rx.recv()).await {
-                Ok(item) => item,
-                Err(_elapsed) => {
+            Some(t) => match rx.recv_timeout(t) {
+                Ok(item) => Some(item),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     ctx.watermarks
                         .mark_idle(source_name_owned.as_str(), &last_file);
                     continue;
                 }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
             },
-            None => rx.recv().await,
+            None => rx.recv().ok(),
         };
         // Transform-fused-with-Source: this path consumes the live
         // Source channel directly and drives per-record CXL eval
@@ -1940,10 +1997,10 @@ pub(crate) async fn transform_fused_consume(
             *slot += 1;
         }
         count += 1;
-        yields_since_last += 1;
-        if yields_since_last >= 1024 {
-            yields_since_last = 0;
-            tokio::task::yield_now().await;
+        records_since_check += 1;
+        if records_since_check >= 1024 {
+            records_since_check = 0;
+            ctx.check_shutdown()?;
         }
 
         if let Some(exp) = expected_input.as_ref() {
@@ -2048,7 +2105,7 @@ pub(crate) async fn transform_fused_consume(
 /// `ctx.output_errors` instead of short-circuiting so sibling outputs still
 /// get their chance to fail (and be reported) — the caller aggregates after
 /// the walk.
-pub(crate) async fn dispatch_plan_node(
+pub(crate) fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -2069,26 +2126,24 @@ pub(crate) async fn dispatch_plan_node(
             //
             // 1. Source name in `ctx.fused_sources` — a downstream
             //    `Merge.interleave` arm has taken ownership of this
-            //    Source's `mpsc::Receiver` and is consuming records
-            //    directly via `tokio::select!`. This arm returns
-            //    cleanly without emitting; the fused Merge populates
-            //    the merge node's buffer.
+            //    Source's crossbeam `Receiver` and is consuming records
+            //    directly via `crossbeam_channel::Select`. This arm
+            //    returns cleanly without emitting; the fused Merge
+            //    populates the merge node's buffer.
             // 2. Records already seeded into `ctx.node_buffers[node_idx]`
             //    by the body executor at composition entry —
             //    composition input ports surface as synthetic Source
             //    nodes owning the records the parent scope harvested.
-            // 3. The live `mpsc::Receiver` in `source_records[name]`,
-            //    consumed via `recv().await` per record until the
-            //    paired ingest task drops its sender. Per record:
-            //    canonicalize onto the source's plan-time schema,
-            //    seed `$record.<key>` defaults, seed
-            //    `$source.<key>` defaults per `(source, file_arc)`,
-            //    advance the per-source running counter. On
-            //    `recv().await` returning `None`, stamp the
-            //    finalized per-source count and call
-            //    `finalize_node_rooted_windows` so every spec
-            //    rooted at this Source's `NodeIndex` lands its
-            //    arena.
+            // 3. The live crossbeam `Receiver` in `source_records[name]`,
+            //    consumed via `recv` per record until the paired ingest
+            //    thread drops its sender. Per record: canonicalize onto
+            //    the source's plan-time schema, seed `$record.<key>`
+            //    defaults, seed `$source.<key>` defaults per
+            //    `(source, file_arc)`, advance the per-source running
+            //    counter. On `recv` returning `Err` (channel
+            //    disconnected), stamp the finalized per-source count and
+            //    call `finalize_node_rooted_windows` so every spec rooted
+            //    at this Source's `NodeIndex` lands its arena.
             //
             // Records are canonicalized onto the Source's plan-time
             // `Arc<Schema>` so every downstream operator hits the
@@ -2143,7 +2198,7 @@ pub(crate) async fn dispatch_plan_node(
                     }
                 }
                 (out_records, out_puncts)
-            } else if let Some(mut rx) = ctx.source_records.remove(name.as_str()) {
+            } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {
                 // Live channel: consume per record so back-pressure
                 // engages — a slow upstream Source no longer blocks
                 // peers' channels from filling, and watermark
@@ -2163,11 +2218,12 @@ pub(crate) async fn dispatch_plan_node(
                 // less source contexts.
                 let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
                 let mut count: u64 = 0;
+                let mut records_since_check: u32 = 0;
                 loop {
                     let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
-                        Some(t) => match tokio::time::timeout(t, rx.recv()).await {
-                            Ok(item) => item,
-                            Err(_elapsed) => {
+                        Some(t) => match rx.recv_timeout(t) {
+                            Ok(item) => Some(item),
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                                 // Quiet for longer than
                                 // `idle_timeout` — flip the
                                 // partition tracked by `last_file`
@@ -2177,8 +2233,9 @@ pub(crate) async fn dispatch_plan_node(
                                 ctx.watermarks.mark_idle(name.as_str(), &last_file);
                                 continue;
                             }
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
                         },
-                        None => rx.recv().await,
+                        None => rx.recv().ok(),
                     };
                     match item {
                         Some(crate::executor::stream_event::StreamEvent::Record(record, rn)) => {
@@ -2192,6 +2249,11 @@ pub(crate) async fn dispatch_plan_node(
                                 *slot += 1;
                             }
                             count += 1;
+                            records_since_check += 1;
+                            if records_since_check >= 1024 {
+                                records_since_check = 0;
+                                ctx.check_shutdown()?;
+                            }
                             drained.push((rec, rn));
                         }
                         Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
@@ -2261,7 +2323,7 @@ pub(crate) async fn dispatch_plan_node(
             // of consuming a Vec from `node_buffers`. See
             // https://github.com/rustpunk/clinker/issues/74.
             if ctx.should_fuse_transform(node_idx) {
-                return transform_fused_consume(ctx, current_dag, node_idx, name).await;
+                return transform_fused_consume(ctx, current_dag, node_idx, name);
             }
             // Get input events: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
@@ -2361,14 +2423,11 @@ pub(crate) async fn dispatch_plan_node(
             let mut output_records = Vec::with_capacity(input_records.len());
 
             for (i, (record, rn)) in input_records.into_iter().enumerate() {
-                // Cooperative yield every 1024 records so long
-                // Transform chains do not starve sibling tokio tasks
-                // (Vector's in-line VRL pattern). Per-record CXL eval
-                // sits well below the 10–100 µs "what is blocking"
-                // threshold, so on-runtime execution with periodic
-                // yields beats a `block_in_place` wrap here.
+                // Poll the shutdown flag every 1024 records so a long
+                // Transform chain terminates promptly on SIGINT without
+                // paying the atomic load per record.
                 if i > 0 && i.is_multiple_of(1024) {
-                    tokio::task::yield_now().await;
+                    ctx.check_shutdown()?;
                 }
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
@@ -2650,12 +2709,11 @@ pub(crate) async fn dispatch_plan_node(
 
             if let Some(ref mut route) = route_handle {
                 for (i, (record, rn)) in input_records.into_iter().enumerate() {
-                    // Cooperative yield every 1024 records so long
-                    // Route chains do not starve sibling tokio tasks.
-                    // Same Vector-style on-runtime + periodic yield
-                    // pattern the Transform arm uses.
+                    // Poll the shutdown flag every 1024 records so a long
+                    // Route chain terminates promptly on SIGINT. Same
+                    // chunk-boundary cadence the Transform arm uses.
                     if i > 0 && i.is_multiple_of(1024) {
-                        tokio::task::yield_now().await;
+                        ctx.check_shutdown()?;
                     }
                     let source_file_arc = source_file_arc_of(&record);
                     let source_name_arc = source_name_arc_of(&record);
@@ -2808,8 +2866,9 @@ pub(crate) async fn dispatch_plan_node(
             //    returned cleanly without consuming, and the receivers
             //    are still parked in `ctx.source_records`. This arm
             //    takes ownership of those receivers and runs a fair
-            //    `tokio::select!` over them so a slow Source no longer
-            //    blocks peers — back-pressure flows end-to-end.
+            //    `crossbeam_channel::Select` over them so a slow Source
+            //    no longer blocks peers — back-pressure flows
+            //    end-to-end.
             //
             // 2. **Non-fused** — concat mode, or a mix of Source and
             //    non-Source predecessors. Predecessor arms have
@@ -2890,12 +2949,12 @@ pub(crate) async fn dispatch_plan_node(
             let merged: Vec<(Record, u64)> = if fused_mode {
                 // Streaming-Output handoff (issue #72): if a single
                 // Output downstream of this Merge passed the
-                // eligibility predicate at executor entry, its
-                // `mpsc::Sender` was installed under our `node_idx`.
-                // Take it here so the Merge arm streams every record
-                // through the channel instead of accumulating, and so
-                // dropping the sender at clean exit closes the
-                // streaming task's `recv()` loop.
+                // eligibility predicate at executor entry, its crossbeam
+                // `Sender` was installed under our `node_idx`. Take it
+                // here so the Merge arm streams every record through the
+                // channel instead of accumulating, and so dropping the
+                // sender at clean exit disconnects the streaming thread's
+                // `recv` loop.
                 let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
                 merge_fused_interleave(
                     ctx,
@@ -2904,8 +2963,7 @@ pub(crate) async fn dispatch_plan_node(
                     &sorted_preds,
                     merge_output_schema.as_ref(),
                     streaming_sender,
-                )
-                .await?
+                )?
             } else {
                 let total: usize = sorted_preds
                     .iter()
@@ -3129,13 +3187,11 @@ pub(crate) async fn dispatch_plan_node(
             let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let sort_count = input_records.len() as u64;
             // CPU-bound: sort buffer push + per-batch comparison + spill
-            // I/O can saturate a worker thread. `block_in_place` runs
-            // synchronously on the current multi-thread runtime worker
-            // and moves the worker's other tasks to a sibling, keeping
-            // the runtime responsive (DataFusion/Vector pattern: CPU-
-            // bound operators stay on-runtime via `block_in_place` so
-            // borrows of `&mut ExecutorContext` survive the boundary).
-            let sorted = tokio::task::block_in_place(|| {
+            // I/O. The kernel owns its input (`input_records`, `buf`) and
+            // borrows nothing from `ctx`, so it runs on the shared Rayon
+            // pool; output order is fully determined by the sort itself,
+            // so pool scheduling cannot perturb it.
+            let sorted = ctx.kernel_pool.install(|| {
                 for (record, row_num) in input_records {
                     buf.push(record, row_num);
                     if buf.should_spill() {
@@ -3350,12 +3406,12 @@ pub(crate) async fn dispatch_plan_node(
                     agg_consumer_handle,
                 )?;
 
-                // CPU-bound: per-record accumulator updates + spill I/O.
-                // `block_in_place` keeps the `&mut ExecutorContext` borrows
-                // alive across the synchronous body while moving sibling
-                // tokio tasks off this worker (DataFusion/Vector pattern).
+                // Per-record accumulator updates + spill I/O. The loop
+                // threads `&mut ctx` (cursor advance, DLQ routing) per
+                // record, so it stays on the dispatch thread rather than
+                // crossing into the Rayon pool.
                 let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-                tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+                (|| -> Result<(), PipelineError> {
                     for (record, row_num) in &input {
                         let source_file_arc = source_file_arc_of(record);
                         let source_name_arc = source_name_arc_of(record);
@@ -3413,7 +3469,7 @@ pub(crate) async fn dispatch_plan_node(
                         }
                     }
                     Ok(())
-                })?;
+                })()?;
 
                 // Finalize. Accumulator finalize errors get the
                 // typed `PipelineError::Accumulator` mapping; under
@@ -3651,13 +3707,12 @@ pub(crate) async fn dispatch_plan_node(
         PlanNode::Output { ref name, .. } => {
             // Streaming-Output short-circuit (issue #72). The executor
             // entry already moved this Output's writer into a
-            // `tokio::spawn`-ed task that drained records from a
-            // bounded `mpsc::channel` populated by the fused Merge
-            // arm. Per-record `write_record` already fired concurrently
-            // with Merge production; the dispatcher's end-of-DAG join
-            // surface awaits the task and folds its counters / timers /
-            // errors into the context. The Output's topo turn here is
-            // a no-op.
+            // `std::thread` that drained records from a bounded crossbeam
+            // channel populated by the fused Merge arm. Per-record
+            // `write_record` already fired concurrently with Merge
+            // production; the dispatcher's end-of-DAG join surface joins
+            // the thread and folds its counters / timers / errors into
+            // the context. The Output's topo turn here is a no-op.
             if ctx.streaming_output_nodes.contains(&node_idx) {
                 return Ok(());
             }
@@ -3993,13 +4048,12 @@ pub(crate) async fn dispatch_plan_node(
 
             let composition_name = name.clone();
             let port_records = collect_port_records(ctx, current_dag, node_idx, &composition_name)?;
-            let output_records = Box::pin(execute_composition_body(
-                ctx,
-                body,
-                port_records,
-                &composition_name,
-            ))
-            .await?;
+            // Direct sync recursion into the body executor. Depth is
+            // bounded by MAX_COMPOSITION_DEPTH (compile-time) plus the
+            // E112 runtime cap, so the recursion cannot overflow the
+            // stack.
+            let output_records =
+                execute_composition_body(ctx, body, port_records, &composition_name)?;
             // Materialize node-rooted window runtimes for any IndexSpec
             // rooted at this composition's call-site NodeIndex. The
             // body executor returned with `active_stack` already
@@ -4399,14 +4453,14 @@ pub(crate) async fn dispatch_plan_node(
                         source_name: &MERGED_SOURCE_NAME,
                         doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
-                    // CPU-bound IEJoin kernel — partition + range-walk
-                    // + materialize; sized to saturate a worker thread.
-                    // `block_in_place` keeps the runtime responsive
-                    // for sibling tasks (e.g. concurrent source
-                    // ingest still pumping records into other
-                    // receivers) while this Combine arm holds the
-                    // worker.
-                    let output_records = tokio::task::block_in_place(|| {
+                    // CPU-bound IEJoin kernel — partition + range-walk +
+                    // materialize. The kernel owns its inputs
+                    // (`driver_buf`, `build_records`) and borrows only
+                    // `&ctx.memory_budget` + the local `iejoin_ctx`, so
+                    // it runs on the shared Rayon pool. Row order is
+                    // determined by the kernel's deterministic
+                    // partition-then-merge, not by pool scheduling.
+                    let output_records = ctx.kernel_pool.install(|| {
                         execute_combine_iejoin(IEJoinExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -4498,11 +4552,13 @@ pub(crate) async fn dispatch_plan_node(
                         source_name: &MERGED_SOURCE_NAME,
                         doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
-                    // CPU-bound grace-hash join kernel: partition build
-                    // + probe + spill I/O. `block_in_place` keeps the
-                    // borrow shape unchanged while letting the runtime
-                    // park other tasks during the heavy phase.
-                    let output_records = tokio::task::block_in_place(|| {
+                    // CPU-bound grace-hash join kernel: partition build +
+                    // probe + spill I/O. The kernel owns its inputs and
+                    // borrows only `&ctx.memory_budget`, the local
+                    // `grace_ctx`, and the spill dir, so it runs on the
+                    // shared Rayon pool. Emitted-row order is fixed by the
+                    // kernel's deterministic partition-then-probe walk.
+                    let output_records = ctx.kernel_pool.install(|| {
                         execute_combine_grace_hash(GraceHashExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -4604,9 +4660,12 @@ pub(crate) async fn dispatch_plan_node(
                         doc_ctx: clinker_record::synthetic_document_context_ref(),
                     };
                     // CPU-bound sort-merge join kernel: two-cursor merge
-                    // over pre-sorted inputs. `block_in_place` keeps
-                    // sibling tasks unblocked during the merge body.
-                    let output_records = tokio::task::block_in_place(|| {
+                    // over pre-sorted inputs. The kernel owns its inputs
+                    // and borrows only `&ctx.memory_budget`, the local
+                    // `sm_ctx`, and the spill dir, so it runs on the
+                    // shared Rayon pool. The two-cursor merge emits in a
+                    // deterministic order independent of pool scheduling.
+                    let output_records = ctx.kernel_pool.install(|| {
                         execute_combine_sort_merge(SortMergeExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -5173,7 +5232,7 @@ pub(crate) async fn dispatch_plan_node(
         }
 
         PlanNode::CorrelationCommit { .. } => {
-            Box::pin(crate::executor::commit::orchestrate(ctx, current_dag)).await?;
+            crate::executor::commit::orchestrate(ctx, current_dag)?;
         }
     }
 
@@ -5704,7 +5763,7 @@ fn collect_port_records(
 /// fresh space; the parent buffers are restored after the walk.
 /// The depth-counter guard increments via RAII so `?`-bubbled
 /// errors can't leak the counter.
-async fn execute_composition_body(
+fn execute_composition_body(
     ctx: &mut ExecutorContext<'_>,
     body_id: crate::plan::composition_body::CompositionBodyId,
     port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
@@ -5823,7 +5882,7 @@ async fn execute_composition_body(
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
     let mut walk_result: Result<(), PipelineError> = Ok(());
     for node_idx in topo {
-        if let Err(inner) = Box::pin(dispatch_plan_node(ctx, &body_dag, node_idx)).await {
+        if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
             walk_result = Err(PipelineError::compose_body_error(
                 composition_name.to_string(),
                 Box::new(inner),
@@ -6046,7 +6105,7 @@ fn run_time_windowed_aggregate(
                 });
             }
             let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
-            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+            (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
                         continue;
@@ -6087,7 +6146,7 @@ fn run_time_windowed_aggregate(
                     )?;
                 }
                 Ok(())
-            })?;
+            })()?;
             finalize_windows(ctx, name, per_window, &mut out_rows, &output_schema, input)?;
         }
         TimeWindowSpec::Hopping { size, slide } => {
@@ -6101,7 +6160,7 @@ fn run_time_windowed_aggregate(
                 });
             }
             let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
-            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+            (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
                         continue;
@@ -6160,7 +6219,7 @@ fn run_time_windowed_aggregate(
                         .or_insert(t);
                 }
                 Ok(())
-            })?;
+            })()?;
             finalize_windows(ctx, name, per_window, &mut out_rows, &output_schema, input)?;
         }
         TimeWindowSpec::Session { gap } => {
@@ -6215,7 +6274,7 @@ fn run_time_windowed_aggregate(
             // without changing the underlying HashAggregator's
             // group-by contract.
             let mut session_streams: HashMap<SessionStreamKey, AggregateStream> = HashMap::new();
-            tokio::task::block_in_place(|| -> Result<(), PipelineError> {
+            (|| -> Result<(), PipelineError> {
                 for (i, (rec, rn)) in input.iter().enumerate() {
                     let Some(info) = record_session_info[i].clone() else {
                         continue;
@@ -6277,7 +6336,7 @@ fn run_time_windowed_aggregate(
                     }
                 }
                 Ok(())
-            })?;
+            })()?;
             // Finalize every (group, session) stream. Walk in
             // deterministic order (sorted by (group_key, session_idx))
             // so emit order is stable across runs.

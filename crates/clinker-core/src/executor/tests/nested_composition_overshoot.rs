@@ -76,8 +76,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn body_interior_overshoot_is_wrapped_under_the_call_site() {
+#[test]
+fn body_interior_overshoot_is_wrapped_under_the_call_site() {
     let config = crate::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
     let ctx = crate::config::CompileContext::with_pipeline_dir(
         fixture_workspace_root(),
@@ -117,7 +117,6 @@ async fn body_interior_overshoot_is_wrapped_under_the_call_site() {
         ctx,
         spill_tripped_arbitrator(),
     )
-    .await
     .expect_err("one-byte spill quota must abort a body-interior admission");
 
     match err {

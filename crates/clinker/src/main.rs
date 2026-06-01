@@ -293,20 +293,15 @@ fn main() -> ExitCode {
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
             tracing_subscriber::fmt().with_max_level(filter).init();
 
-            // The executor is async; build a multi-thread runtime so
-            // `block_in_place` inside its CPU-bound operator arms is
-            // legal, and drive `run` to completion on it.
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("clinker: failed to build tokio runtime: {e}");
-                    return ExitCode::from(4);
-                }
-            };
-            match runtime.block_on(run(args)) {
+            // Install the process-wide SIGINT/SIGTERM handler before the
+            // run starts so an interrupt during a long pipeline trips the
+            // run's shutdown token. Idempotent — the first call wins.
+            if let Err(e) = clinker_core::pipeline::shutdown::install_signal_handler() {
+                eprintln!("clinker: failed to install signal handler: {e}");
+            }
+
+            // The executor is fully synchronous — call it directly.
+            match run(args) {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     render_pipeline_error(&e, &args.config);
@@ -340,6 +335,10 @@ fn main() -> ExitCode {
                         // E316). Treat as a data-quality halt — exit 3
                         // sits between config (1) and infrastructure (4).
                         PipelineError::DlqRateExceeded { .. } => ExitCode::from(3),
+                        // A shutdown signal unwound the run before it
+                        // finished draining. 130 is the conventional
+                        // "terminated by SIGINT" status.
+                        PipelineError::Interrupted => ExitCode::from(130),
                     }
                 }
             }
@@ -467,7 +466,7 @@ fn abort_on_overlay_errors(
     Ok(())
 }
 
-async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
+fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
         .env
@@ -859,6 +858,11 @@ async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         single: writers,
         fan_out: fan_out_writers,
     };
+    // Fresh per-run shutdown token. `ShutdownToken::new()` auto-registers
+    // with the process-wide signal-handler registry installed in `main`,
+    // so a SIGINT/SIGTERM during the run trips it; the executor polls it
+    // at operator chunk boundaries and unwinds gracefully.
+    let shutdown_token = clinker_core::pipeline::shutdown::ShutdownToken::new();
     let run_params = clinker_core::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
@@ -866,16 +870,14 @@ async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         static_vars: channel_static_vars,
         source_vars: channel_source_vars,
         record_vars: channel_record_vars,
-        shutdown_token: None,
+        shutdown_token: Some(shutdown_token),
     };
     let report = match PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,
         registry,
         &run_params,
-    )
-    .await
-    {
+    ) {
         Ok(report) => report,
         Err(e) => {
             // Reservations auto-unlink via TempPath::Drop when output_temps
@@ -1060,8 +1062,17 @@ async fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         counters.dlq_count
     );
 
-    // Exit codes per spec §10.2
-    let exit_code: u8 = if counters.dlq_count > 0 { 2 } else { 0 };
+    // Exit codes per spec §10.2. An interrupted run takes precedence:
+    // the pipeline drained what it could before unwinding on the
+    // shutdown signal, so report the conventional SIGINT status (130)
+    // even when some DLQ entries also landed.
+    let exit_code: u8 = if report.interrupted {
+        130
+    } else if counters.dlq_count > 0 {
+        2
+    } else {
+        0
+    };
 
     // Write execution metrics to spool directory (if configured)
     if let Some(ref dir) = spool_dir {

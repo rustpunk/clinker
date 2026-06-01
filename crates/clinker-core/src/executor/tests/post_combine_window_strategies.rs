@@ -24,8 +24,8 @@ use super::*;
 /// HashBuildProbe combine + downstream window. Window's `partition_by`
 /// is the join key; `$window.sum(matched_amount)` over the join output
 /// equals the per-key total across surviving driver rows.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_combine_window_sum_with_hash_build_probe_strategy() {
+#[test]
+fn post_combine_window_sum_with_hash_build_probe_strategy() {
     let yaml = r#"
 pipeline:
   name: combine_then_window_hbp
@@ -134,7 +134,6 @@ ENG,5000
         ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("pipeline must run");
     let _output = buf.as_string();
     // The Output node above is wired to the combine `enriched`, so the
@@ -148,8 +147,8 @@ ENG,5000
 /// HashBuildProbe combine feeding a windowed Transform whose output
 /// reaches the writer. Asserts `dept_total` per department equals the
 /// arithmetic ground truth across strategy-independent partitions.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_combine_window_value_correctness_through_writer() {
+#[test]
+fn post_combine_window_value_correctness_through_writer() {
     let yaml = r#"
 pipeline:
   name: combine_window_writer
@@ -259,7 +258,6 @@ ENG,5000
         ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("pipeline must run");
     let output = buf.as_string();
 

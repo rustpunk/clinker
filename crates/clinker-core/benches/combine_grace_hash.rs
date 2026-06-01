@@ -60,7 +60,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clinker_bench_support::{CombineDataGen, bench_runtime as runtime};
+use clinker_bench_support::CombineDataGen;
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -258,10 +258,7 @@ fn run_grace(
         "out".to_string(),
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
-    runtime()
-        .block_on(PipelineExecutor::run_plan_with_readers_writers(
-            plan, readers, writers, params,
-        ))
+    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
         .expect("grace hash pipeline must execute");
     out_buf.0.lock().unwrap().clone()
 }

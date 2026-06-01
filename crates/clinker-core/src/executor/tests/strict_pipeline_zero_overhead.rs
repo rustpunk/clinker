@@ -70,8 +70,8 @@ fn strict_pipeline_has_no_deferred_regions_at_plan_time() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn strict_pipeline_runs_without_engaging_deferred_dispatcher() {
+#[test]
+fn strict_pipeline_runs_without_engaging_deferred_dispatcher() {
     let csv = "\
 order_id,department,amount
 o1,HR,10
@@ -101,7 +101,6 @@ o3,ENG,100
     let config = crate::config::parse_config(STRICT_PIPELINE).expect("parse");
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .expect("strict pipeline must run on the FastPath without error");
 
     // Strict pipelines emit every record through the strict commit

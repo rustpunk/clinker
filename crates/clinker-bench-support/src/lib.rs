@@ -39,29 +39,6 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-// ── Shared tokio runtime for executor-driving benches ─────────────
-
-/// Returns a process-wide multi-thread tokio runtime suitable for
-/// driving the pipeline executor from a Criterion bench body.
-///
-/// The executor wraps its heavyweight CPU-bound operator arms (sort,
-/// aggregate finalize, grace-hash, IEJoin, sort-merge) in
-/// [`tokio::task::block_in_place`], which panics outside a multi-thread
-/// runtime — `Builder::new_current_thread` and `#[tokio::test]` without
-/// `flavor = "multi_thread"` both trip the assertion. One Runtime per
-/// bench binary is sufficient and amortizes construction off the
-/// timing hot path; every bench `b.iter` body calls `block_on` against
-/// the returned reference.
-pub fn bench_runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime")
-    })
-}
-
 // ── Pipeline config discovery ─────────────────────────────────────
 
 /// A discovered benchmark pipeline config.

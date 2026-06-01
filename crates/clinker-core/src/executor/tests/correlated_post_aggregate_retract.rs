@@ -25,7 +25,7 @@ use std::collections::HashMap;
 /// Successful run yields counters, the DLQ entries, and the rendered output.
 type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
 
-async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
+fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
     let config = crate::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -51,8 +51,7 @@ async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, Pipeline
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -81,8 +80,8 @@ fn sort_body(s: &str) -> Vec<String> {
 /// The baseline rerun uses an input with all HR rows pre-excluded so
 /// only ENG appears in either output. Bit-for-bit equivalence proves
 /// the synthetic-CK fan-out covered every contributing source row.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_aggregate_failure_retracts_every_contributing_source_row() {
+#[test]
+fn post_aggregate_failure_retracts_every_contributing_source_row() {
     let yaml = r#"
 pipeline:
   name: post_aggregate_div_zero
@@ -158,8 +157,8 @@ O8,ENG,200
 O9,ENG,300
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
 
@@ -207,8 +206,8 @@ O9,ENG,300
 /// expand-delta and break before incrementing). The fixture mirrors
 /// the bit-for-bit test's shape so a regression in either surfaces
 /// the same failure mode.
-#[tokio::test(flavor = "multi_thread")]
-async fn cascading_retraction_loop_converges_and_excludes_failing_partition() {
+#[test]
+fn cascading_retraction_loop_converges_and_excludes_failing_partition() {
     let yaml = r#"
 pipeline:
   name: cascading_retract
@@ -264,9 +263,8 @@ o8,ENG,200
 o9,ENG,300
 ";
 
-    let (counters, _dlq, output) = run_pipeline(yaml, csv)
-        .await
-        .expect("cascading-retract pipeline must converge");
+    let (counters, _dlq, output) =
+        run_pipeline(yaml, csv).expect("cascading-retract pipeline must converge");
 
     let body_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
     assert!(
@@ -317,8 +315,8 @@ o9,ENG,300
 /// strict-collateral DLQ. The protocol must NOT panic and MUST NOT
 /// produce a spurious retract — output is either valid (no-spill)
 /// or the failure is surfaced through DLQ accounting.
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregator_state_degraded_falls_back_without_panic() {
+#[test]
+fn aggregator_state_degraded_falls_back_without_panic() {
     let yaml = r#"
 pipeline:
   name: degraded_post_aggregate
@@ -373,14 +371,12 @@ nodes:
 
     let yaml_owned = yaml.to_string();
     let csv_owned = csv.to_string();
-    let join_handle = tokio::spawn(async move { run_pipeline(&yaml_owned, &csv_owned).await });
-    let join_outcome = join_handle.await;
+    // Run on a dedicated OS thread so a panic inside the degrade path
+    // surfaces as the `Err` arm of the join (the unwound panic payload),
+    // letting the assertions below distinguish a clean error from a crash.
+    let join_handle = std::thread::spawn(move || run_pipeline(&yaml_owned, &csv_owned));
     let outcome: Result<Result<RunOutput, PipelineError>, Box<dyn std::any::Any + Send>> =
-        match join_outcome {
-            Ok(inner) => Ok(inner),
-            Err(join_err) if join_err.is_panic() => Err(join_err.into_panic()),
-            Err(join_err) => panic!("unexpected tokio JoinError: {join_err}"),
-        };
+        join_handle.join();
     match outcome {
         Ok(Ok(_)) => {
             // Memory pressure absorbed (or aggregator was not
@@ -417,8 +413,8 @@ nodes:
 /// `input_rows` to the retraction. Source rows in the OTHER aggregate
 /// remain untouched in its lineage and the other branch's output is
 /// bit-identical to a baseline that omitted only the failing branch.
-#[tokio::test(flavor = "multi_thread")]
-async fn sibling_aggregates_isolate_per_branch_fan_out() {
+#[test]
+fn sibling_aggregates_isolate_per_branch_fan_out() {
     let yaml = r#"
 pipeline:
   name: sibling_aggregates_isolation
@@ -482,7 +478,7 @@ O8,ENG,West,200
 O9,ENG,East,300
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
     assert!(
         !output.contains("HR"),
         "HR rolled back via synthetic-CK fan-out; got: {output}"
@@ -500,8 +496,8 @@ O9,ENG,East,300
 /// `count` aggregator. The lineage path retraction round-trips
 /// cleanly; a baseline rerun with the failing group's contributors
 /// excluded matches the retracted output bit-for-bit.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_aggregate_reversible_only_matches_baseline_rerun() {
+#[test]
+fn post_aggregate_reversible_only_matches_baseline_rerun() {
     let yaml = r#"
 pipeline:
   name: reversible_post_aggregate
@@ -569,8 +565,8 @@ O4,ENG,100
 O5,ENG,200
 ";
 
-    let (_counters, _dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (_counters, _dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0);
     assert!(

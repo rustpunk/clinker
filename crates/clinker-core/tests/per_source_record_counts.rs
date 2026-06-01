@@ -40,8 +40,8 @@ fn run_params() -> PipelineRunParams {
 /// the non-fused Source dispatch arm. Per-source ingest counts must
 /// reflect each source's row count independently of the aggregate
 /// `counters.total_count`.
-#[tokio::test(flavor = "multi_thread")]
-async fn concat_merge_per_source_counts() {
+#[test]
+fn concat_merge_per_source_counts() {
     let yaml = r#"
 pipeline:
   name: per_source_counts_concat
@@ -85,7 +85,6 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .unwrap();
 
     assert_eq!(
@@ -115,8 +114,8 @@ nodes:
 /// every record through the fused `Merge.interleave` arm. Each source's
 /// finalize stamp must still land on `source_count_per_source` so both
 /// names surface in the report's per-source map.
-#[tokio::test(flavor = "multi_thread")]
-async fn fused_interleave_merge_per_source_counts() {
+#[test]
+fn fused_interleave_merge_per_source_counts() {
     let yaml = r#"
 pipeline:
   name: per_source_counts_fused_interleave
@@ -165,7 +164,6 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .unwrap();
 
     assert_eq!(

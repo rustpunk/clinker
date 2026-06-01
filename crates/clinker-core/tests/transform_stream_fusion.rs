@@ -3,7 +3,7 @@
 //!
 //! When a `PlanNode::Transform`'s sole upstream is a `PlanNode::Source`
 //! with a parked receiver in `ExecutorContext::source_records`, the
-//! Transform takes ownership of the receiver and drives `recv().await`
+//! Transform takes ownership of the receiver and drives `recv()`
 //! per-record evaluation directly. The Source dispatch arm short-
 //! circuits via the same `fused_sources` membership check that
 //! `merge_fused_interleave` uses (issue #67 pattern).
@@ -72,7 +72,7 @@ fn body_lines(buf: &SharedBuffer) -> Vec<String> {
 /// A 25 ms-per-row slow reader on the Source verifies that:
 /// - The fused Transform arm takes the receiver out of
 ///   `ctx.source_records` and drives per-record evaluation via
-///   `recv().await` without tripping the Source arm's
+///   `recv()` without tripping the Source arm's
 ///   "no ingested records" defense-in-depth `Internal` error.
 /// - Schema canonicalization, `seed_record_vars`, and
 ///   `seed_source_vars_for_record` run inside the fused loop so the
@@ -81,8 +81,8 @@ fn body_lines(buf: &SharedBuffer) -> Vec<String> {
 /// - DLQ counters land on the upstream Source's name (verified via
 ///   `report.counters.dlq_count` being zero — no record should DLQ on
 ///   the well-formed input).
-#[tokio::test(flavor = "multi_thread")]
-async fn fused_transform_streams_source_records_correctly() {
+#[test]
+fn fused_transform_streams_source_records_correctly() {
     let yaml = r#"
 pipeline:
   name: transform_stream_fusion_smoke
@@ -131,7 +131,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes under fused Transform arm");
     assert_eq!(report.counters.dlq_count, 0, "no records should DLQ");
 
@@ -164,8 +163,8 @@ nodes:
 /// If the predicate ever regressed to accept windowed Transforms, the
 /// fused arm would dereference an unbuilt arena and either panic or
 /// produce nonsense; this test would surface that.
-#[tokio::test(flavor = "multi_thread")]
-async fn windowed_transform_keeps_buffered_path() {
+#[test]
+fn windowed_transform_keeps_buffered_path() {
     let yaml = r#"
 pipeline:
   name: transform_stream_fusion_windowed
@@ -221,7 +220,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("windowed pipeline executes via buffered path");
     assert_eq!(report.counters.dlq_count, 0);
 
@@ -278,8 +276,8 @@ nodes:
 /// requires either streaming Output (issue #72) or parallel branch
 /// dispatch — neither is in scope for #74, but both are unblocked by
 /// the per-record streaming Transform arm landed here.
-#[tokio::test(flavor = "multi_thread")]
-async fn two_branch_fused_transforms_run_without_serializing() {
+#[test]
+fn two_branch_fused_transforms_run_without_serializing() {
     let yaml = r#"
 pipeline:
   name: transform_stream_fusion_two_branch
@@ -361,7 +359,6 @@ nodes:
     let start = Instant::now();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes");
     let elapsed = start.elapsed();
 

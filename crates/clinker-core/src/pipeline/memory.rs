@@ -185,10 +185,9 @@ impl std::error::Error for ConsumerSpillError {
 /// The atomic flag is the fast path — `is_paused()` is lock-free, so
 /// the common unblocked case stays uncontended.
 ///
-/// Concurrency-substrate agnostic: works under tokio + `spawn_blocking`
-/// (the calling OS thread parks on `Condvar::wait`) and under a
-/// future Rayon worker pool (a Rayon worker parks the same way).
-/// No new crate dependencies — `Condvar` and `Mutex` are `std`.
+/// Concurrency-substrate agnostic: a dedicated source thread parks on
+/// `Condvar::wait`, and a Rayon worker parks the same way. No new crate
+/// dependencies — `Condvar` and `Mutex` are `std`.
 pub struct PauseSignal {
     paused: AtomicBool,
     mu: Mutex<()>,

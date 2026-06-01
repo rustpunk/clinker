@@ -71,8 +71,8 @@ const DOC_XML: &str = r#"<doc>
   <Summary><total>3</total></Summary>
 </doc>"#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn envelope_sections_available_on_every_body_record() {
+#[test]
+fn envelope_sections_available_on_every_body_record() {
     let config = parse_config(YAML).expect("parse envelope pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -100,7 +100,6 @@ async fn envelope_sections_available_on_every_body_record() {
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("run envelope pipeline");
     assert_eq!(report.counters.total_count, 3, "three body records");
     assert_eq!(report.counters.dlq_count, 0);

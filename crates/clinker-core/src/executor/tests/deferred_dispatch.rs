@@ -176,8 +176,8 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
 /// errors the cascading-retraction loop converges on iteration 1
 /// (no DLQ events fold into the next iteration's scope) and every
 /// aggregate emit lands as a record on the sink.
-#[tokio::test(flavor = "multi_thread")]
-async fn deferred_consumers_emit_through_commit_time_dispatch() {
+#[test]
+fn deferred_consumers_emit_through_commit_time_dispatch() {
     let config = crate::config::parse_config(DEFERRED_PIPELINE).expect("parse");
     let primary = "src".to_string();
     let csv = "\
@@ -207,7 +207,6 @@ o3,ENG,100
     };
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .expect("pipeline must run without error");
 
     let written = buf.as_string();
@@ -257,8 +256,8 @@ o3,ENG,100
 /// E310 admission failure shape that the windowed-Transform's buffer-
 /// recompute path uses, so callers see a uniform error mode regardless
 /// of which deferred-region path tripped the overflow.
-#[tokio::test(flavor = "multi_thread")]
-async fn memory_budget_overflow_on_deferred_buffer_raises_e310() {
+#[test]
+fn memory_budget_overflow_on_deferred_buffer_raises_e310() {
     // Force the per-arena budget to a very small value so the deferred
     // region producer's narrow projection trips memory accounting on
     // the first record.
@@ -336,7 +335,7 @@ nodes:
     // surfaces the E310 admission failure shape; assert the err string
     // carries that signature.
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
@@ -389,8 +388,8 @@ nodes:
 /// test process's own RSS dwarfs any tight budget, so a budget-driven
 /// abort would race the framework footprint. A 100 GiB hard limit keeps
 /// the seeded value dominant in the `fetch_max` fold inside `observe()`.
-#[tokio::test(flavor = "multi_thread")]
-async fn memory_budget_overflow_on_region_input_buffer_raises_e310() {
+#[test]
+fn memory_budget_overflow_on_region_input_buffer_raises_e310() {
     let yaml = r#"
 pipeline:
   name: region_input_buffer_overshoot
@@ -513,7 +512,6 @@ nodes:
         crate::config::CompileContext::default(),
         arbitrator,
     )
-    .await
     .expect_err("peak RSS above the hard limit must abort the deferred-region Combine");
 
     match err {
@@ -552,9 +550,9 @@ nodes:
 /// [`crate::executor::commit::with_test_loop_cap`] thread-local
 /// override exists exactly to exercise this defensive contract under
 /// a synthetic small cap; production code never reads it.
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[should_panic(expected = "cascading-retraction loop exceeded")]
-async fn cascading_retraction_loop_cap_panics_with_documented_message() {
+fn cascading_retraction_loop_cap_panics_with_documented_message() {
     use crate::executor::commit::with_test_loop_cap;
     // Same shape as the convergence test in
     // `correlated_post_aggregate_retract::cascading_retraction_loop_converges_and_excludes_failing_partition`
@@ -632,12 +630,10 @@ o3,HR,30
         ..Default::default()
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    with_test_loop_cap(0, || async {
+    with_test_loop_cap(0, || {
         let _ =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-                .await;
-    })
-    .await;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
+    });
 }
 
 /// Combine inside a deferred region with a non-deferred build-side
@@ -669,8 +665,8 @@ o3,HR,30
 /// re-load would shift source row numbers and change the
 /// `iterations` count under cascading retraction; today's
 /// architecture iterates exactly once on this happy fixture.
-#[tokio::test(flavor = "multi_thread")]
-async fn combine_in_deferred_region_replays_build_side_through_region_input_buffer() {
+#[test]
+fn combine_in_deferred_region_replays_build_side_through_region_input_buffer() {
     let yaml = r#"
 pipeline:
   name: combine_deferred_region
@@ -788,7 +784,6 @@ ENG,500
     };
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .expect("combine-in-region pipeline must converge");
 
     let written = buf.as_string();
@@ -848,8 +843,8 @@ ENG,500
 /// `dispatch_plan_node` arms with `in_deferred_dispatch=true`. The
 /// surviving (non-DLQ'd) row therefore reaches the parent Output;
 /// HR's failed contribution does not.
-#[tokio::test(flavor = "multi_thread")]
-async fn composition_body_relaxed_aggregate_runs_under_commit_time_dispatch() {
+#[test]
+fn composition_body_relaxed_aggregate_runs_under_commit_time_dispatch() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -991,7 +986,6 @@ o6,ENG,300
         &params,
         ctx,
     )
-    .await
     .expect("composition pipeline must run without error");
 
     assert!(
@@ -1065,8 +1059,8 @@ o6,ENG,300
 /// the parent's continuation (just the Output node) runs over them.
 /// ENG's surviving row therefore reaches the parent Output; HR does
 /// not.
-#[tokio::test(flavor = "multi_thread")]
-async fn recursive_composition_inner_body_relaxed_aggregate_dispatches_at_commit() {
+#[test]
+fn recursive_composition_inner_body_relaxed_aggregate_dispatches_at_commit() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -1227,7 +1221,6 @@ o6,ENG,300
         &params,
         ctx,
     )
-    .await
     .expect("recursive composition pipeline must run without error");
 
     // The inner body's commit-pass deferred dispatch must surface the
@@ -1312,8 +1305,8 @@ o6,ENG,300
 /// Asserts both surviving rows reach the writer with the parent
 /// Transform's mutation applied; no DLQ entries because the mutation
 /// is total.
-#[tokio::test(flavor = "multi_thread")]
-async fn composition_body_harvest_runs_parent_continuation_on_post_recompute_data() {
+#[test]
+fn composition_body_harvest_runs_parent_continuation_on_post_recompute_data() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -1458,7 +1451,6 @@ o6,ENG,300
         &params,
         ctx,
     )
-    .await
     .expect("nested composition + parent continuation must run without error");
 
     assert_eq!(
@@ -1516,8 +1508,8 @@ o6,ENG,300
 /// Pins the cap-widening fix for cross-boundary lineage: the loop's
 /// termination cap must include body node counts, otherwise the
 /// retraction can panic with the documented cap-exceeded message.
-#[tokio::test(flavor = "multi_thread")]
-async fn composition_body_harvest_with_cascading_retraction_preserves_mutation() {
+#[test]
+fn composition_body_harvest_with_cascading_retraction_preserves_mutation() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -1662,7 +1654,6 @@ o6,ENG,300
         &params,
         ctx,
     )
-    .await
     .expect("nested composition + cascading retract must run without error");
 
     // The parent Transform's /0 on HR routes the error into the
@@ -1727,8 +1718,8 @@ o6,ENG,300
 /// writer must capture the mutated rows. Pins the cross-scope demand
 /// path end-to-end without an in-body identity Transform softening
 /// the geometry.
-#[tokio::test(flavor = "multi_thread")]
-async fn body_with_aggregate_at_output_port_harvests_through_parent_continuation() {
+#[test]
+fn body_with_aggregate_at_output_port_harvests_through_parent_continuation() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -1848,7 +1839,6 @@ o6,ENG,300
         &params,
         ctx,
     )
-    .await
     .expect("bare-Aggregate body + parent continuation must run without error");
 
     assert_eq!(
@@ -1901,8 +1891,8 @@ o6,ENG,300
 /// This pins sub-agent D's snapshot/restore architecture: speculative
 /// records are dropped per iteration; only the converged set reaches
 /// the writer.
-#[tokio::test(flavor = "multi_thread")]
-async fn output_fanout_writers_do_not_double_flush_across_iterations() {
+#[test]
+fn output_fanout_writers_do_not_double_flush_across_iterations() {
     let yaml = r#"
 pipeline:
   name: fanout_no_double_flush
@@ -2002,7 +1992,6 @@ o6,ENG,300
     let config = crate::config::parse_config(yaml).expect("parse");
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .expect("fan-out pipeline must converge");
 
     let big_out = big_buf.as_string();

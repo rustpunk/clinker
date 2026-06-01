@@ -62,7 +62,7 @@ nodes:
     include_unmapped: true
 "#;
 
-async fn run_once(csv: &str) -> String {
+fn run_once(csv: &str) -> String {
     let config = crate::config::parse_config(LAG_LEAD_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
@@ -84,7 +84,6 @@ async fn run_once(csv: &str) -> String {
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .await
         .expect("pipeline must run");
     buf.as_string()
 }
@@ -105,8 +104,8 @@ fn canonicalize(s: &str) -> Vec<Vec<String>> {
     out
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn lag_window_byte_identical_across_runs_under_hash_aggregate() {
+#[test]
+fn lag_window_byte_identical_across_runs_under_hash_aggregate() {
     let csv = "\
 department,region,amount
 HR,east,10
@@ -118,9 +117,9 @@ ENG,north,300
 ENG,south,400
 ";
 
-    let run1 = run_once(csv).await;
-    let run2 = run_once(csv).await;
-    let run3 = run_once(csv).await;
+    let run1 = run_once(csv);
+    let run2 = run_once(csv);
+    let run3 = run_once(csv);
 
     let canon1 = canonicalize(&run1);
     let canon2 = canonicalize(&run2);

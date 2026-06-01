@@ -1000,8 +1000,8 @@ mod tests {
     /// schema's encoded columns are the load-bearing invariant — step 1
     /// reads `b.category_id` from the `__products__category_id` slot of
     /// the encoded driver record.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_nary_three_input_exec_correct() {
+    #[test]
+    fn test_nary_three_input_exec_correct() {
         let yaml = load_fixture("three_input_shared_key.yaml");
         let orders_csv =
             "order_id,product_id,amount\nord-1,p-1,100\nord-2,p-2,200\nord-3,p-3,300\n";
@@ -1022,7 +1022,6 @@ mod tests {
             ],
             Some("orders"),
         )
-        .await
         .expect("3-input shared-key fixture must execute end-to-end");
         let canon = canonicalize_csv(result.primary_output());
         let expected = canonicalize_csv(
@@ -1042,8 +1041,8 @@ mod tests {
     /// pure-equi on the shared `id` column so every step uses
     /// HashBuildProbe; both intermediate steps emit encoded passthrough
     /// records that the next step's resolver mapping reads positionally.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_nary_four_input_exec_correct() {
+    #[test]
+    fn test_nary_four_input_exec_correct() {
         let yaml = load_fixture("four_input_equi.yaml");
         let a_csv = "id,a_val\n1,a-one\n2,a-two\n3,a-three\n";
         let b_csv = "id,b_val\n1,b-one\n2,b-two\n3,b-three\n";
@@ -1059,7 +1058,6 @@ mod tests {
             ],
             Some("a_src"),
         )
-        .await
         .expect("4-input combine fixture must execute end-to-end");
         let canon = canonicalize_csv(result.primary_output());
         let expected = canonicalize_csv(
@@ -1080,8 +1078,8 @@ mod tests {
     /// range → IEJoin). Strategy selection runs per chain step against
     /// each step's predicate slice, so this fixture exercises the
     /// hash-then-IEJoin transition across the chain boundary.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_nary_three_input_mixed_exec_correct() {
+    #[test]
+    fn test_nary_three_input_mixed_exec_correct() {
         let yaml = load_fixture("three_input_mixed.yaml");
         let a_csv = "id,seq\n1,1\n2,2\n3,3\n";
         let b_csv = "id,start,fin\n1,10,20\n2,30,40\n3,50,60\n";
@@ -1091,7 +1089,6 @@ mod tests {
             &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
             Some("a_src"),
         )
-        .await
         .expect("3-input mixed-predicate fixture must execute end-to-end");
         let canon = canonicalize_csv(result.primary_output());
         // Hand-computed: each (a,b) row falls into exactly one c
@@ -2098,7 +2095,7 @@ nodes:
     /// pins a specific source as the driving input; pass `None` to
     /// default to the first entry in `inputs`.
     #[allow(dead_code)] // Wired by C.2.0+ tests; gate test enforces it compiles.
-    async fn run_combine_fixture(
+    fn run_combine_fixture(
         yaml: &str,
         inputs: &[(&str, &str)],
         _primary_override: Option<&str>,
@@ -2157,7 +2154,6 @@ nodes:
 
         let report =
             PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-                .await
                 .map_err(CombineFixtureError::Run)?;
 
         let outputs: HashMap<String, String> = output_buffers
@@ -2247,8 +2243,8 @@ nodes:
     /// C.2.2's gate suite. The C.2.0 gate is "the helper compiles and is
     /// callable" — equivalent to the existing
     /// `test_combine_scaffold_compiles` for the C.0 module gate.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_scaffold_compiles() {
+    #[test]
+    fn test_combine_exec_scaffold_compiles() {
         // The simplest in-tree pipeline that exercises the helper
         // end-to-end without depending on combine execution: a 1-source,
         // 1-transform, 1-output pipeline. This proves the helper's
@@ -2281,7 +2277,6 @@ nodes:
 "#;
         let inputs = "id\nA\nB\nC\n";
         let result = run_combine_fixture(yaml, &[("src", inputs)], None)
-            .await
             .expect("run_combine_fixture must compile and execute the scaffold pipeline");
         assert_eq!(
             result.report.counters.total_count, 3,
@@ -2588,8 +2583,8 @@ nodes:
     /// Equality enrichment: 1:1 match, NullFields on miss (default).
     /// Asserts byte-identical output (modulo row order) against the
     /// stored `lookup_baseline_equality` snapshot.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_equality() {
+    #[test]
+    fn test_combine_baseline_equality() {
         let orders =
             "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\nORD-3,PROD-X,7\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
@@ -2598,7 +2593,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("combine equality baseline must execute");
         let expected = load_baseline_snapshot("lookup_baseline_equality");
         assert_records_match(result.primary_output(), &expected);
@@ -2606,8 +2600,8 @@ nodes:
 
     /// Range enrichment: compound `and` across equi + range predicates.
     /// Asserts against the stored `lookup_baseline_range` snapshot.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_range() {
+    #[test]
+    fn test_combine_baseline_range() {
         let employees =
             "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
         let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
@@ -2616,7 +2610,6 @@ nodes:
             &[("employees", employees), ("rate_bands", rate_bands)],
             Some("employees"),
         )
-        .await
         .expect("combine range baseline must execute");
         let expected = load_baseline_snapshot("lookup_baseline_range");
         assert_records_match(result.primary_output(), &expected);
@@ -2624,8 +2617,8 @@ nodes:
 
     /// on_miss: skip — unmatched driver rows are dropped. Asserts
     /// against `lookup_baseline_on_miss_skip`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_on_miss_skip() {
+    #[test]
+    fn test_combine_baseline_on_miss_skip() {
         let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-X\nORD-3,PROD-B\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
         let result = run_combine_fixture(
@@ -2633,7 +2626,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("combine on_miss:skip baseline must execute");
         let expected = load_baseline_snapshot("lookup_baseline_on_miss_skip");
         assert_records_match(result.primary_output(), &expected);
@@ -2642,8 +2634,8 @@ nodes:
     /// match: all — one driver row fans out to N output rows, one per
     /// matching build-side row. Asserts against
     /// `lookup_baseline_match_all`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_match_all() {
+    #[test]
+    fn test_combine_baseline_match_all() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE002,Borealis\nE003,Phoenix\nE003,Atlas\nE003,Vega\n";
         let result = run_combine_fixture(
@@ -2651,7 +2643,6 @@ nodes:
             &[("employees", employees), ("assignments", assignments)],
             Some("employees"),
         )
-        .await
         .expect("combine match:all baseline must execute");
         let expected = load_baseline_snapshot("lookup_baseline_match_all");
         assert_records_match(result.primary_output(), &expected);
@@ -2660,8 +2651,8 @@ nodes:
     /// match: all + on_miss: skip — unmatched driver rows dropped;
     /// matched ones fan out. Asserts against
     /// `lookup_baseline_match_all_skip`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_match_all_skip() {
+    #[test]
+    fn test_combine_baseline_match_all_skip() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\nE004,Marketing\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE003,Vega\n";
         let result = run_combine_fixture(
@@ -2669,7 +2660,6 @@ nodes:
             &[("employees", employees), ("assignments", assignments)],
             Some("employees"),
         )
-        .await
         .expect("combine match:all+skip baseline must execute");
         let expected = load_baseline_snapshot("lookup_baseline_match_all_skip");
         assert_records_match(result.primary_output(), &expected);
@@ -2836,8 +2826,8 @@ nodes:
     /// Multi-output order_fulfillment pattern — combine output split
     /// by route into fulfilled + priority buckets. Asserts both
     /// outputs against the stored baselines.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_order_fulfillment() {
+    #[test]
+    fn test_combine_baseline_order_fulfillment() {
         let orders = concat!(
             "order_id,order_date,quantity,unit_price,product_code,priority_level\n",
             "1,2024-01-15,5,29.99,PROD-A,urgent\n",
@@ -2855,7 +2845,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("combine order_fulfillment baseline must execute");
         let fulfilled = result
             .output("fulfilled_orders")
@@ -2875,8 +2864,8 @@ nodes:
     /// combine output split by route on whether the match produced a
     /// non-UNKNOWN product_name. Asserts both outputs against the
     /// stored baselines.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_baseline_enrichment() {
+    #[test]
+    fn test_combine_baseline_enrichment() {
         let orders = concat!(
             "f0,f1,f2,f3\n",
             "1,PROD-A,10,priority\n",
@@ -2890,7 +2879,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("combine enrichment baseline must execute");
         // Unified ingest counts every declared source's records, so
         // `total_count = orders (4) + products (2) = 6`. The driver-
@@ -3175,15 +3163,14 @@ nodes:
     /// match: first, on_miss: null_fields — a matched order enriches
     /// with product fields; an unmatched order emits with null product
     /// fields.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_equi_match_first() {
+    #[test]
+    fn test_combine_exec_equi_match_first() {
         let yaml = combine_exec_yaml("first", "null_fields");
         let result = run_combine_fixture(
             &yaml,
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect("combine executor must run a pure-equi 2-input fixture");
         let canon = canonicalize_csv(result.primary_output());
         // Post-rip: combine output_schema follows emit-statement order
@@ -3200,8 +3187,8 @@ nodes:
 
     /// match: all — verifies fan-out: every matching build record
     /// produces an independent output row.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_equi_match_all() {
+    #[test]
+    fn test_combine_exec_equi_match_all() {
         // Two products for the same product_id so match:all fans out.
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
         let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
@@ -3211,7 +3198,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("match:all fan-out must run");
         let canon = canonicalize_csv(result.primary_output());
         // Two matching build rows → two output rows with the same
@@ -3233,8 +3219,8 @@ nodes:
     /// `<build_qualifier>: Value::Array(Value::Map)` field per driver;
     /// the `cxl:` body is required-empty (E311). Verify the output
     /// contains a serialized array per order including nested maps.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_equi_match_collect() {
+    #[test]
+    fn test_combine_exec_equi_match_collect() {
         let yaml = r#"
 pipeline:
   name: combine_exec_collect
@@ -3286,7 +3272,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("match:collect must run");
         let out = result.primary_output();
         // The array serializes as bracketed content in CSV; each
@@ -3307,8 +3292,8 @@ nodes:
     /// match: collect on a driver with zero matches — the array field
     /// is an empty array, not Value::Null. Verify the driver row is
     /// emitted (no on_miss skip).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_collect_empty_array_on_miss() {
+    #[test]
+    fn test_combine_exec_collect_empty_array_on_miss() {
         let yaml = r#"
 pipeline:
   name: combine_exec_collect_empty
@@ -3361,7 +3346,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("collect empty-array must run");
         let out = result.primary_output();
         // Exactly one data row (the driver row, with an empty array).
@@ -3380,8 +3364,8 @@ nodes:
     /// match: collect with 10K+1 matches on one driver record truncates
     /// at COLLECT_PER_GROUP_CAP = 10_000. Build the build-side with
     /// 10_001 rows that all share the same key so every one collides.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_collect_per_group_cap() {
+    #[test]
+    fn test_combine_exec_collect_per_group_cap() {
         let yaml = r#"
 pipeline:
   name: combine_exec_collect_cap
@@ -3436,7 +3420,6 @@ nodes:
             &[("orders", orders), ("products", &products)],
             Some("orders"),
         )
-        .await
         .expect("collect cap must run");
         let out = result.primary_output();
         // The driver row is emitted.
@@ -3454,15 +3437,14 @@ nodes:
     /// on_miss: null_fields — unmatched driver row emits with
     /// build-qualifier fields filled with Null. The `product_name`
     /// field in the CSV output is empty for ORD-X.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_on_miss_null_fields() {
+    #[test]
+    fn test_combine_exec_on_miss_null_fields() {
         let yaml = combine_exec_yaml("first", "null_fields");
         let result = run_combine_fixture(
             &yaml,
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect("null_fields must run");
         let canon = canonicalize_csv(result.primary_output());
         // ORD-3 has PROD-X which has no matching product — emit row
@@ -3477,15 +3459,14 @@ nodes:
     }
 
     /// on_miss: skip — unmatched driver rows are silently dropped.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_on_miss_skip() {
+    #[test]
+    fn test_combine_exec_on_miss_skip() {
         let yaml = combine_exec_yaml("first", "skip");
         let result = run_combine_fixture(
             &yaml,
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect("skip must run");
         let canon = canonicalize_csv(result.primary_output());
         // Two matches (ORD-1, ORD-2). Unmatched ORD-3 is dropped.
@@ -3496,15 +3477,14 @@ nodes:
 
     /// on_miss: error — the pipeline fails on the first unmatched row.
     /// Verify a structured CombineMissingMatch error surfaces.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_on_miss_error() {
+    #[test]
+    fn test_combine_exec_on_miss_error() {
         let yaml = combine_exec_yaml("first", "error");
         let err = run_combine_fixture(
             &yaml,
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect_err("on_miss:error must fail the pipeline on first unmatched row");
         match &err {
             CombineFixtureError::Run(clinker_core::error::PipelineError::CombineMissingMatch {
@@ -3533,8 +3513,8 @@ nodes:
     /// Skipped silently when `rss_bytes()` is unavailable on the host
     /// platform — the same gate the unit test uses, applied via
     /// `clinker_core::pipeline::memory::rss_bytes()`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_e310_memory_abort() {
+    #[test]
+    fn test_combine_exec_e310_memory_abort() {
         if clinker_core::pipeline::memory::rss_bytes().is_none() {
             return;
         }
@@ -3589,7 +3569,6 @@ nodes:
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect_err("1-byte mem_limit must abort combine");
         match &err {
             CombineFixtureError::Run(
@@ -3623,8 +3602,8 @@ nodes:
     /// Fixture: order's `amount >= 20` AND orders.product_id ==
     /// products.product_id. The `amount >= 20` conjunct is a
     /// single-input comparison against a literal → residual.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_residual_predicate() {
+    #[test]
+    fn test_combine_exec_residual_predicate() {
         let yaml = r#"
 pipeline:
   name: combine_exec_residual
@@ -3676,7 +3655,6 @@ nodes:
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
         )
-        .await
         .expect("residual predicate must run");
         let canon = canonicalize_csv(result.primary_output());
         // ORD-1 amount=10 is rejected by residual; ORD-2 amount=20 is
@@ -3691,8 +3669,8 @@ nodes:
 
     /// Null key on the probe side — CXL ternary rules dictate no match.
     /// Verify an order with NULL product_id produces no join match.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_combine_exec_null_key_no_match() {
+    #[test]
+    fn test_combine_exec_null_key_no_match() {
         // Empty product_id field on ORD-2 triggers Null after schema
         // coercion (string type preserves it as empty string, not
         // Null). To generate a true Null probe key, use a compare-to-
@@ -3752,7 +3730,6 @@ nodes:
             &[("orders", orders), ("products", products)],
             Some("orders"),
         )
-        .await
         .expect("null-key fixture must run");
         let canon = canonicalize_csv(result.primary_output());
         // ORD-1 matches; ORD-2 has a Null probe key and never matches
@@ -3808,8 +3785,8 @@ nodes:
     /// emp-002 (ent-A, 87500) → bkt-A3 (80000..150000).
     /// emp-003 (ent-B, 15000) → bkt-B1 (0..40000).
     /// emp-004 (ent-B, 210000) → bkt-B4 (150000..500000).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_tax_bracket_correct() {
+    #[test]
+    fn test_iejoin_tax_bracket_correct() {
         let yaml = load_iejoin_fixture("iejoin_tax_bracket");
         let result = run_combine_fixture(
             &yaml,
@@ -3819,7 +3796,6 @@ nodes:
             ],
             Some("employees"),
         )
-        .await
         .expect("tax bracket fixture must run");
         let canon = canonicalize_csv(result.primary_output());
         let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
@@ -3838,8 +3814,8 @@ nodes:
     /// Temporal overlap: events match overlapping sessions in the
     /// same group via mixed equi+range. `match: all` so multiple
     /// overlaps all surface.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_temporal_overlap_correct() {
+    #[test]
+    fn test_iejoin_temporal_overlap_correct() {
         let events_csv = "group_id,event_id,start,end\n\
             grp-1,evt-001,10,20\n\
             grp-1,evt-002,15,25\n\
@@ -3858,7 +3834,6 @@ nodes:
             &[("events", events_csv), ("sessions", sessions_csv)],
             Some("events"),
         )
-        .await
         .expect("temporal overlap fixture must run");
         let canon = canonicalize_csv(result.primary_output());
         // Hand-computed expected matches:
@@ -3878,8 +3853,8 @@ nodes:
 
     /// NULL income → no bracket match. With `on_miss: null_fields`,
     /// those employees emit one row with build-side fields null-filled.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_null_range_never_matches() {
+    #[test]
+    fn test_iejoin_null_range_never_matches() {
         let null_employees = "entity_id,employee_id,income\n\
             ent-A,emp-001,42000\n\
             ent-A,emp-002,\n\
@@ -3895,7 +3870,6 @@ nodes:
             ],
             Some("employees"),
         )
-        .await
         .expect("null-range fixture must run");
         let canon = canonicalize_csv(result.primary_output());
         let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
@@ -3923,8 +3897,8 @@ nodes:
 
     /// Inclusive vs exclusive boundary: a value equal to a boundary
     /// matches `>=` (inclusive) but not `>` (strict).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_boundary_inclusive_exclusive() {
+    #[test]
+    fn test_iejoin_boundary_inclusive_exclusive() {
         // Inclusive: build.lo = 50, driver.x = 50, predicate `>=`
         // → match.
         let inclusive_yaml = r#"
@@ -3978,7 +3952,6 @@ nodes:
             &[("drivers", drivers), ("builds", builds)],
             Some("drivers"),
         )
-        .await
         .expect("inclusive boundary fixture must run");
         let data_rows = canonicalize_csv(result.primary_output())
             .lines()
@@ -3994,7 +3967,6 @@ nodes:
             &[("drivers", drivers), ("builds", builds)],
             Some("drivers"),
         )
-        .await
         .expect("strict boundary fixture must run");
         let data_rows_strict = canonicalize_csv(result_strict.primary_output())
             .lines()
@@ -4006,8 +3978,8 @@ nodes:
 
     /// Empty build → all drivers unmatched. `on_miss: skip` drops
     /// them; output is empty (header only).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_empty_build_side() {
+    #[test]
+    fn test_iejoin_empty_build_side() {
         let empty_brackets = "entity_id,bracket_id,bracket_lo,bracket_hi,rate\n";
         let yaml = load_iejoin_fixture("iejoin_empty_build");
         let result = run_combine_fixture(
@@ -4018,7 +3990,6 @@ nodes:
             ],
             Some("employees"),
         )
-        .await
         .expect("empty-build fixture must run");
         let data_rows = canonicalize_csv(result.primary_output())
             .lines()
@@ -4031,8 +4002,8 @@ nodes:
     /// All build records identical (errata point 4 territory):
     /// every driver should match every build under inclusive ops.
     /// 10 drivers × 10 builds with `match: all` → 100 output rows.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_all_duplicates() {
+    #[test]
+    fn test_iejoin_all_duplicates() {
         let drivers = "entity_id,driver_id,lo,hi\n\
             ent-A,drv-01,50,100\nent-A,drv-02,50,100\n\
             ent-A,drv-03,50,100\nent-A,drv-04,50,100\n\
@@ -4051,7 +4022,6 @@ nodes:
             &[("drivers", drivers), ("builds", builds)],
             Some("drivers"),
         )
-        .await
         .expect("all-duplicates fixture must run");
         let data_rows = canonicalize_csv(result.primary_output())
             .lines()
@@ -4068,8 +4038,8 @@ nodes:
     /// routes to the IEJoin strategy (PWMJ kernel under the hood).
     /// Asserts correctness end-to-end without observing the kernel
     /// directly.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_single_inequality_uses_pwmj() {
+    #[test]
+    fn test_single_inequality_uses_pwmj() {
         let yaml = r#"
 pipeline:
   name: pure_range_single
@@ -4122,7 +4092,6 @@ nodes:
             &[("drivers", drivers), ("builds", builds)],
             Some("drivers"),
         )
-        .await
         .expect("single-inequality fixture must run");
         let canon = canonicalize_csv(result.primary_output());
         // D1 (x=1) < B1 (y=3), B2 (7), B3 (12) → 3 rows.
@@ -4138,8 +4107,8 @@ nodes:
 
     /// `match: first` short-circuits to one row per matching driver
     /// even when multiple builds satisfy the predicate.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_iejoin_match_first_short_circuits() {
+    #[test]
+    fn test_iejoin_match_first_short_circuits() {
         let yaml = r#"
 pipeline:
   name: first_short_circuit
@@ -4194,7 +4163,6 @@ nodes:
             &[("drivers", drivers), ("builds", builds)],
             Some("drivers"),
         )
-        .await
         .expect("match-first fixture must run");
         let data_rows = canonicalize_csv(result.primary_output())
             .lines()
@@ -4219,8 +4187,8 @@ nodes:
     /// - P2 (20) → B25 (20 < 25).
     /// - P3 (30) → B40 (30 < 40).
     /// - P4 (42) → B100 (42 < 100).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_sort_merge_price_range_exec_correct() {
+    #[test]
+    fn test_sort_merge_price_range_exec_correct() {
         let yaml = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/combine/sort_merge_price_range.yaml"),
@@ -4233,7 +4201,6 @@ nodes:
             &[("products", products), ("brackets", brackets)],
             Some("products"),
         )
-        .await
         .expect("sort-merge fixture must run end-to-end");
         let canon = canonicalize_csv(result.primary_output());
         let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
@@ -4404,8 +4371,8 @@ nodes:
     /// rows_per_group^3`. A regression where the chain decomposition
     /// drops or duplicates rows would surface here long before the
     /// bench's perf gate at full scale flags it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_nary_three_input_correctness_at_scale() {
+    #[test]
+    fn test_nary_three_input_correctness_at_scale() {
         use clinker_bench_support::CombineDataGen;
 
         const ROWS_PER_INPUT: usize = 100;
@@ -4491,7 +4458,6 @@ nodes:
             &[("a", &a_csv), ("b", &b_csv), ("c", &c_csv)],
             Some("a"),
         )
-        .await
         .expect("3-input chain pipeline must execute");
         let canon = canonicalize_csv(result.primary_output());
         let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
@@ -4514,8 +4480,8 @@ nodes:
     /// `CombineStrategy::GraceHash`, and (b) the two budgets produce
     /// identical output row sets. The full bench at 100K × 1M scale is
     /// what exercises the spill-vs-no-spill timing comparison.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_grace_hash_correctness_at_scale() {
+    #[test]
+    fn test_grace_hash_correctness_at_scale() {
         use clinker_bench_support::CombineDataGen;
 
         let workload = CombineDataGen {
@@ -4592,14 +4558,12 @@ nodes:
             &[("build", &build_csv), ("probe", &probe_csv)],
             Some("probe"),
         )
-        .await
         .expect("in-memory grace hash must run");
         let spill = run_combine_fixture(
             &yaml_spill,
             &[("build", &build_csv), ("probe", &probe_csv)],
             Some("probe"),
         )
-        .await
         .expect("spilled grace hash must run");
 
         let canon_inmem = canonicalize_csv(inmem.primary_output());

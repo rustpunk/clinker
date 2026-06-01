@@ -87,8 +87,8 @@ nodes:
         emit id = id
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
+#[test]
+fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -134,7 +134,6 @@ async fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
         ctx,
         spill_tripped_arbitrator(),
     )
-    .await
     .expect_err("one-byte spill quota must abort the body's port-source admission");
 
     match err {

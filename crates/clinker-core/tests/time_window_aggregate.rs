@@ -62,7 +62,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-async fn run_pipeline(
+fn run_pipeline(
     yaml: &str,
     sources: &[(&str, &str, &str)], // (source_name, file_label, csv)
 ) -> (ExecutionReport, String) {
@@ -92,7 +92,6 @@ async fn run_pipeline(
         writers,
         &params,
     )
-    .await
     .expect("run");
 
     (report, buf.as_string())
@@ -112,8 +111,8 @@ fn sorted_body_lines(output: &str) -> Vec<String> {
 /// sources have records spanning the same time range; every record
 /// emits because no source is lagging. Verifies the multi-source
 /// merge path produces correct per-window counts.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac1_multi_source_emits_when_both_sources_in_sync() {
+#[test]
+fn ac1_multi_source_emits_when_both_sources_in_sync() {
     let yaml = r#"
 pipeline:
   name: ac1_in_sync
@@ -174,8 +173,7 @@ u2,2026-05-14T09:40:00\n";
     let (report, output) = run_pipeline(
         yaml,
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
-    )
-    .await;
+    );
 
     let lines = sorted_body_lines(&output);
     // All five records land in window [09:00, 10:00):
@@ -202,8 +200,8 @@ u2,2026-05-14T09:40:00\n";
 ///
 /// The test asserts the per-source rollup on the report reflects
 /// the delay subtraction.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac2_watermark_delay_shifts_per_source_rollup_earlier() {
+#[test]
+fn ac2_watermark_delay_shifts_per_source_rollup_earlier() {
     let yaml = r#"
 pipeline:
   name: ac2_delay
@@ -242,7 +240,7 @@ error_handling:
 "#;
     let csv = "user_id,event_ts\nu1,2026-05-14T10:00:00\n";
 
-    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]).await;
+    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
 
     let per_source = report
         .per_source_watermarks
@@ -275,8 +273,8 @@ error_handling:
 /// that pushes the watermark past the earlier window's end. With
 /// `allowed_lateness: 0` the out-of-order record routes to DLQ;
 /// with `allowed_lateness: 30m` the same record is admitted.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac2_allowed_lateness_widens_close_threshold() {
+#[test]
+fn ac2_allowed_lateness_widens_close_threshold() {
     fn pipeline(allowed_lateness: &str) -> String {
         format!(
             r#"
@@ -345,8 +343,7 @@ error_handling:
     let (report_a, _out_a) = run_pipeline(
         &pipeline("0s"),
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
-    )
-    .await;
+    );
     let late_count_a = report_a
         .dlq_entries
         .iter()
@@ -361,8 +358,7 @@ error_handling:
     let (report_b, output_b) = run_pipeline(
         &pipeline("30m"),
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
-    )
-    .await;
+    );
     let late_count_b = report_b
         .dlq_entries
         .iter()
@@ -387,8 +383,8 @@ error_handling:
 /// The later-arriving record falls in a window that the
 /// streaming-watermark has already closed by the time the record is
 /// processed. Asserts the DLQ entry carries the expected category.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac3_late_record_routes_to_dlq_with_late_record_category() {
+#[test]
+fn ac3_late_record_routes_to_dlq_with_late_record_category() {
     let yaml = r#"
 pipeline:
   name: ac3_late
@@ -427,7 +423,7 @@ error_handling:
     // (out-of-order; window [09:00, 10:00) already closed).
     let csv = "user_id,event_ts\nu1,2026-05-14T09:00:00\nu1,2026-05-14T10:30:00\nu1,2026-05-14T09:30:00\n";
 
-    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]).await;
+    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
     let late_entries: Vec<_> = report
         .dlq_entries
         .iter()
@@ -465,8 +461,8 @@ error_handling:
 /// fire, and execution produces the standard single-bucket-per-key
 /// output. Confirms the time-windowed surface adds no overhead /
 /// no spurious validation for pipelines that don't opt in.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac4_positional_aggregate_without_watermark_compiles_and_runs() {
+#[test]
+fn ac4_positional_aggregate_without_watermark_compiles_and_runs() {
     let yaml = r#"
 pipeline:
   name: ac4_positional
@@ -498,7 +494,7 @@ error_handling:
   strategy: fail_fast
 "#;
     let csv = "user_id\nu1\nu1\nu1\nu2\nu2\n";
-    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]).await;
+    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
     assert_eq!(report.dlq_entries.len(), 0);
     let lines = sorted_body_lines(&output);
     assert_eq!(lines, vec!["u1,3".to_string(), "u2,2".to_string()]);
@@ -512,8 +508,8 @@ error_handling:
 /// time `t` belongs to up to 2 overlapping windows (`size / slide`).
 /// Verifies the operator emits one row per (key, window-start) and
 /// that overlap math matches Flink TVF HOP.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac5_hop_emits_one_row_per_key_per_window() {
+#[test]
+fn ac5_hop_emits_one_row_per_key_per_window() {
     let yaml = r#"
 pipeline:
   name: ac5_hop
@@ -556,7 +552,7 @@ error_handling:
     // So 2 windows; 2 emit rows. (w_start = 8:50 ends at 9:00 which
     // does NOT contain 9:00 by the half-open convention.)
     let csv = "user_id,event_ts\nu1,2026-05-14T09:00:00\n";
-    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]).await;
+    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
     assert_eq!(report.dlq_entries.len(), 0);
     let lines = sorted_body_lines(&output);
     assert_eq!(
@@ -571,8 +567,8 @@ error_handling:
 /// operator emits one row per (user, session_idx). Verifies the
 /// session boundary discovery (sort-by-event-time + gap-walk)
 /// against a deliberately gap-crossing input.
-#[tokio::test(flavor = "multi_thread")]
-async fn ac5_session_emits_one_row_per_key_per_session() {
+#[test]
+fn ac5_session_emits_one_row_per_key_per_session() {
     let yaml = r#"
 pipeline:
   name: ac5_session
@@ -618,7 +614,7 @@ u2,2026-05-14T09:10:00\n\
 u1,2026-05-14T09:20:00\n\
 u1,2026-05-14T09:22:00\n";
 
-    let (report, output) = run_pipeline(yaml, &[("logins", "in.csv", csv)]).await;
+    let (report, output) = run_pipeline(yaml, &[("logins", "in.csv", csv)]);
     assert_eq!(report.dlq_entries.len(), 0);
     let lines = sorted_body_lines(&output);
     // u1: two sessions (counts 3 and 2). u2: one session (count 1).

@@ -204,8 +204,8 @@ nodes:
 /// End-to-end body-window value correctness. The body's
 /// `Aggregate → Transform(window)` must produce correct
 /// `running_total` values reaching the writer.
-#[tokio::test(flavor = "multi_thread")]
-async fn body_post_aggregate_window_runtime_values_match_aggregate_total() {
+#[test]
+fn body_post_aggregate_window_runtime_values_match_aggregate_total() {
     let yaml = r#"
 pipeline:
   name: body_post_aggregate_window_runtime
@@ -261,7 +261,6 @@ ENG,300
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-        .await
         .expect("pipeline must run");
     let output = buf.as_string();
 

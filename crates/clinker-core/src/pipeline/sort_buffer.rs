@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rayon::slice::ParallelSliceMut;
 use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
@@ -45,7 +46,7 @@ pub struct SortBuffer<P> {
     schema: Arc<Schema>,
 }
 
-impl<P: Serialize + DeserializeOwned> SortBuffer<P> {
+impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
     pub fn new(
         sort_by: Vec<SortField>,
         spill_threshold: usize,
@@ -84,8 +85,11 @@ impl<P: Serialize + DeserializeOwned> SortBuffer<P> {
         }
 
         let sort_by = &self.sort_by;
+        // Parallel stable sort on the shared kernel pool. `par_sort_by`
+        // preserves the tie-break order of `slice::sort_by` (both stable),
+        // so the spilled run is byte-identical to the sequential sort.
         self.pairs
-            .sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+            .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
 
         let mut writer: SpillWriter<P> =
             SpillWriter::new(self.schema.clone(), self.spill_dir.as_deref())?;
@@ -104,8 +108,11 @@ impl<P: Serialize + DeserializeOwned> SortBuffer<P> {
     pub fn finish(mut self) -> Result<SortedOutput<P>, SpillError> {
         if self.spill_files.is_empty() {
             let sort_by = &self.sort_by;
+            // Parallel stable sort on the shared kernel pool; tie-break
+            // order matches the sequential `slice::sort_by` exactly, so
+            // the in-memory result is byte-identical.
             self.pairs
-                .sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+                .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
             Ok(SortedOutput::InMemory(self.pairs))
         } else {
             if !self.pairs.is_empty() {

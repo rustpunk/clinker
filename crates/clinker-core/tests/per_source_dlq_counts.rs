@@ -40,8 +40,8 @@ fn run_params() -> PipelineRunParams {
 /// record DLQs; every `src_good` record clears. The per-source DLQ
 /// map must surface `src_bad` with the failing count and omit
 /// `src_good` entirely (zero-entry sources are absent).
-#[tokio::test(flavor = "multi_thread")]
-async fn per_source_dlq_counts_attribute_failures_to_offending_source() {
+#[test]
+fn per_source_dlq_counts_attribute_failures_to_offending_source() {
     let yaml = r#"
 pipeline:
   name: per_source_dlq_counts
@@ -102,7 +102,6 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .unwrap();
 
     assert_eq!(

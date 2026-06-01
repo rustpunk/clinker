@@ -22,9 +22,9 @@
 //!    must not deadlock when the source's bounded channel fills while
 //!    the streaming writer is mid-drain.
 //! 3. Topology repeat-stability — the per-source FIFO invariant must
-//!    survive many runs because the streaming task and the Merge arm
-//!    race on a bounded `tokio::sync::mpsc::channel` and tokio's
-//!    scheduler is non-deterministic.
+//!    survive many runs because the streaming writer thread and the
+//!    Merge arm race on a bounded crossbeam channel and OS thread
+//!    scheduling is non-deterministic.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -148,7 +148,7 @@ fn assert_per_source_fifo(body: &[String]) {
 
 /// Single run of the streaming pipeline. Returns `(body_lines, counters)`.
 /// Body lines exclude the header row.
-async fn run_streaming_pipeline(
+fn run_streaming_pipeline(
     a_count: u32,
     b_count: u32,
     a_delay: Duration,
@@ -169,7 +169,6 @@ async fn run_streaming_pipeline(
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes");
     let output = buf.as_string();
     let body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
@@ -182,10 +181,10 @@ async fn run_streaming_pipeline(
 /// completes within a generous wall-clock bound (no deadlock when the
 /// streaming task's bounded channel meets a slow Source's bounded
 /// channel mid-drain).
-#[tokio::test(flavor = "multi_thread")]
-async fn streaming_writes_correct_output_under_slow_source() {
+#[test]
+fn streaming_writes_correct_output_under_slow_source() {
     let start = Instant::now();
-    let (body, counters) = run_streaming_pipeline(10, 10, Duration::from_millis(50)).await;
+    let (body, counters) = run_streaming_pipeline(10, 10, Duration::from_millis(50));
     let elapsed = start.elapsed();
 
     assert_eq!(body.len(), 20, "expected 20 records, got {body:?}");
@@ -241,23 +240,23 @@ async fn streaming_writes_correct_output_under_slow_source() {
     assert!(
         elapsed < Duration::from_secs(2),
         "pipeline took {elapsed:?}, expected < 2 s — \
-         streaming task back-pressure may have deadlocked the run",
+         streaming writer back-pressure may have deadlocked the run",
     );
 }
 
 /// Streaming-Output preserves per-source FIFO across many independent
-/// runs. The streaming task and the fused Merge arm race on a
-/// bounded `tokio::sync::mpsc::channel` and tokio's scheduler is
-/// non-deterministic, so this test rerun catches a regression that
-/// would tear per-source order only on a fraction of runs.
+/// runs. The streaming writer thread and the fused Merge arm race on a
+/// bounded crossbeam channel and OS thread scheduling is
+/// non-deterministic, so rerunning catches a regression that would tear
+/// per-source order only on a fraction of runs.
 ///
-/// 20 runs is the issue-72 stability bar; bumping this number is
-/// safe but each run costs ~50 ms of slow-source delay so the test
-/// is bounded at ~1 s when stable.
-#[tokio::test(flavor = "multi_thread")]
-async fn streaming_writes_stable_across_repeats() {
+/// 20 runs is the stability bar; bumping this number is safe but each
+/// run costs ~50 ms of slow-source delay so the test is bounded at
+/// ~1 s when stable.
+#[test]
+fn streaming_writes_stable_across_repeats() {
     for run in 0..20 {
-        let (body, counters) = run_streaming_pipeline(5, 5, Duration::from_millis(10)).await;
+        let (body, counters) = run_streaming_pipeline(5, 5, Duration::from_millis(10));
         assert_eq!(
             body.len(),
             10,
@@ -283,12 +282,12 @@ async fn streaming_writes_stable_across_repeats() {
 
 /// Streaming-Output sees every record from a fast pair of sources
 /// (no slow side) and produces a correct merged stream. Sanity check
-/// that the streaming task drains its `mpsc::Receiver` cleanly when
+/// that the streaming writer thread drains its receiver cleanly when
 /// both sources finish microseconds apart and the bounded channel
 /// never fills.
-#[tokio::test(flavor = "multi_thread")]
-async fn streaming_writes_correct_output_under_fast_sources() {
-    let (body, counters) = run_streaming_pipeline(20, 20, Duration::from_millis(0)).await;
+#[test]
+fn streaming_writes_correct_output_under_fast_sources() {
+    let (body, counters) = run_streaming_pipeline(20, 20, Duration::from_millis(0));
     assert_eq!(body.len(), 40, "expected 40 records, got {body:?}");
     assert_per_source_fifo(&body);
     assert_eq!(counters.dlq_count, 0);
@@ -306,4 +305,80 @@ async fn streaming_writes_correct_output_under_fast_sources() {
     b_seen.sort_unstable();
     assert_eq!(a_seen, (1..=20).collect::<Vec<u32>>());
     assert_eq!(b_seen, (1..=20).collect::<Vec<u32>>());
+}
+
+/// A sink whose first `write` fails, modeling a streaming Output writer
+/// that dies mid-stream (disk full, broken pipe). The format writer
+/// builds successfully against the first record's schema; the failure
+/// surfaces on the first `write_record`.
+struct WriteFailsImmediately;
+
+impl Write for WriteFailsImmediately {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("simulated streaming writer failure"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Back-pressure deadlock regression: a streaming Output writer that
+/// fails on its first write must NOT hang the run while the Merge
+/// producer is still mid-stream.
+///
+/// Each source emits far more than the streaming channel's bounded
+/// capacity, so once the writer dies the Merge arm keeps trying to
+/// `send` into a channel no one is draining. The streaming thread's
+/// dead-writer drain (consume until every sender disconnects) and the
+/// join surface dropping all senders before joining are what keep this
+/// from deadlocking — without either, the Merge producer would block
+/// forever on a full bounded channel and the run would never return.
+///
+/// The executor runs on a worker thread; the main thread waits on a
+/// completion signal with a timeout so a regression manifests as a
+/// bounded test failure instead of hanging the whole suite.
+#[test]
+fn streaming_writer_failure_mid_stream_does_not_deadlock() {
+    // Records per source: comfortably above the 256-element streaming
+    // channel capacity so the Merge producer is forced to block on a
+    // full channel if the dead-writer drain is absent.
+    let yaml = pipeline_yaml();
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+
+    let readers: SourceReaders = HashMap::from([
+        ("src_a".to_string(), vec![slot("a", &src_a_csv(800))]),
+        ("src_b".to_string(), vec![slot("b", &src_b_csv(800))]),
+    ]);
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(WriteFailsImmediately) as Box<dyn Write + Send>,
+    )]);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params());
+        // Ignore send errors: if the main thread already timed out and
+        // gave up, the receiver is gone — nothing to report to.
+        let _ = done_tx.send(result.is_ok());
+    });
+
+    // 10 s is far beyond a healthy run of this size (sub-second). A true
+    // deadlock would never signal; this bound turns it into a failure.
+    match done_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(ran_ok) => {
+            worker.join().expect("executor thread did not panic");
+            // The pipeline drains and exits regardless of the writer
+            // failure. A failed Output is surfaced as a non-OK run, not
+            // a hang; either outcome proves the back-pressure path is
+            // deadlock-free, which is what this test guards.
+            let _ = ran_ok;
+        }
+        Err(_) => panic!(
+            "streaming pipeline did not terminate within 10 s — \
+             dead-writer drain or sender-drop-before-join regressed"
+        ),
+    }
 }

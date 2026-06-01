@@ -7,6 +7,11 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
+/// Counters, DLQ entries, and per-output CSV bodies keyed by output name —
+/// the result of driving a multi-output pipeline to completion.
+type MultiOutputResult =
+    Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError>;
+
 /// Build a multi-output test fixture with the given YAML config.
 ///
 /// Returns the parsed `PipelineConfig` and a `HashMap<String, SharedBuffer>`
@@ -288,10 +293,7 @@ default: regular
 // --- Multi-output channel integration tests ---
 
 /// Helper: run a multi-output pipeline and return per-output CSV strings.
-async fn run_multi_output(
-    yaml: &str,
-    csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError> {
+fn run_multi_output(yaml: &str, csv_input: &str) -> MultiOutputResult {
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params();
 
@@ -314,8 +316,7 @@ async fn run_multi_output(
         .collect();
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -325,8 +326,8 @@ async fn run_multi_output(
     Ok((report.counters, report.dlq_entries, outputs))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_two_writers() {
+#[test]
+fn test_multi_output_two_writers() {
     let yaml = r#"
 pipeline:
   name: test_two_outputs
@@ -374,7 +375,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4);
     let high = &outputs["high"];
@@ -394,8 +395,8 @@ nodes:
     assert!(!low.contains("1,200"), "low should not contain id=1: {low}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_three_writers() {
+#[test]
+fn test_multi_output_three_writers() {
     let yaml = r#"
 pipeline:
   name: test_three_outputs
@@ -452,7 +453,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,5000\n2,500\n3,50\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(outputs["high"].contains("1,5000"));
@@ -460,8 +461,8 @@ nodes:
     assert!(outputs["low"].contains("3,50"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_record_counts() {
+#[test]
+fn test_multi_output_record_counts() {
     let yaml = r#"
 pipeline:
   name: test_record_counts
@@ -509,7 +510,7 @@ nodes:
 "#;
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n5,300\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 5);
     assert_eq!(counters.total_count, 5);
@@ -522,8 +523,8 @@ nodes:
     assert_eq!(small_rows, 2); // 10, 20
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_order_preserved() {
+#[test]
+fn test_multi_output_order_preserved() {
     let yaml = r#"
 pipeline:
   name: test_order
@@ -572,7 +573,7 @@ nodes:
 
     // All go to "big" — order must match input order
     let csv = "id,amount\n1,100\n2,200\n3,300\n4,400\n5,500\n";
-    let (_, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     let big_lines: Vec<&str> = outputs["big"].lines().skip(1).collect();
     assert_eq!(big_lines.len(), 5);
@@ -594,8 +595,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_writer_error_propagated() {
+#[test]
+fn test_multi_output_writer_error_propagated() {
     /// A writer that fails after N bytes.
     struct FailingWriter {
         remaining: usize,
@@ -689,12 +690,12 @@ nodes:
     ]);
 
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(result.is_err(), "should propagate writer error");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_inclusive_duplicate() {
+#[test]
+fn test_multi_output_inclusive_duplicate() {
     let yaml = r#"
 pipeline:
   name: test_inclusive
@@ -753,7 +754,7 @@ nodes:
 
     // amount=500 matches both audit (>100) and report (>50)
     let csv = "id,amount\n1,500\n2,30\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     // Dual counters:
     //   ok_count = 2 (both input records reached at least one Output)
@@ -775,8 +776,8 @@ nodes:
     assert!(outputs["standard"].contains("2,30"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_single_output_no_channel_overhead() {
+#[test]
+fn test_single_output_no_channel_overhead() {
     // No route config → single-output direct write path (no channels spawned)
     let yaml = r#"
 pipeline:
@@ -809,7 +810,7 @@ nodes:
 "#;
 
     let csv = "id\n1\n2\n3\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(outputs["out"].contains("1\n"));
@@ -817,8 +818,8 @@ nodes:
     assert!(outputs["out"].contains("3\n"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_empty_route() {
+#[test]
+fn test_multi_output_empty_route() {
     let yaml = r#"
 pipeline:
   name: test_empty_route
@@ -867,7 +868,7 @@ nodes:
 
     // No records match "special" (all < 99999)
     let csv = "id,amount\n1,100\n2,200\n";
-    let (_, _, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
     // Special output should have just a header (or be empty)
     let special_lines: Vec<&str> = outputs["special"]
@@ -885,8 +886,8 @@ nodes:
     assert!(outputs["normal"].contains("2,200"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_writer_panic_propagated() {
+#[test]
+fn test_multi_output_writer_panic_propagated() {
     /// A writer that panics on the first write call (not flush).
     /// BufWriter buffers everything, so the inner write is only called when BufWriter flushes.
     /// This guarantees a single panic (no double-panic on drop).
@@ -979,23 +980,23 @@ nodes:
         ),
     ]);
 
-    // Panic should be caught and propagated, not hang or abort. Spawn the
-    // executor on a tokio task so a panic inside it surfaces through
-    // `JoinError::is_panic`, the async-friendly analogue of
-    // `std::panic::catch_unwind` (which cannot cross an `.await`).
-    let join = tokio::spawn(async move {
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await
+    // Panic should be caught and propagated, not hang or abort. Run the
+    // executor on a dedicated OS thread so a panic inside it surfaces
+    // through `JoinHandle::join` returning `Err` — the synchronous
+    // analogue of catching an unwinding panic at the join point.
+    let join = std::thread::spawn(move || {
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
     });
-    let join_result = join.await;
+    let join_result = join.join();
     assert!(
-        matches!(&join_result, Err(e) if e.is_panic()),
-        "writer panic should propagate as a tokio JoinError panic, got: {:?}",
+        join_result.is_err(),
+        "writer panic should propagate as a thread-join error, got: {:?}",
         join_result.as_ref().map(|_| "Ok(_)")
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_cancel_drains_and_flushes() {
+#[test]
+fn test_multi_output_cancel_drains_and_flushes() {
     // Cancel scenario: pipeline errors mid-stream but already-dispatched
     // records should be flushed. We test this by having a FailFast error
     // strategy with a record that triggers an eval error, but records before
@@ -1053,7 +1054,7 @@ nodes:
 
     // "bad" will fail to_int → DLQ, but other records should still be written
     let csv = "id,amount\n1,100\n2,bad\n3,200\n";
-    let (counters, dlq, outputs) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, dlq, outputs) = run_multi_output(yaml, csv).unwrap();
 
     // Record 2 should fail and go to DLQ
     assert_eq!(counters.dlq_count, 1);
@@ -1064,8 +1065,8 @@ nodes:
     assert!(outputs["big"].contains("3,200"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_send_error_disconnected() {
+#[test]
+fn test_multi_output_send_error_disconnected() {
     /// A writer that errors after writing N records (simulating a writer dying mid-stream).
     struct DyingWriter {
         inner: SharedBuffer,
@@ -1163,14 +1164,14 @@ nodes:
 
     // Should not deadlock — producer handles SendError::Disconnected
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     // Either error (from the dying writer) or success if the writer survived long enough
     // The key assertion: no deadlock, no hang — the test completes
     let _ = result;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_multi_output_multiple_errors_collected() {
+#[test]
+fn test_multi_output_multiple_errors_collected() {
     /// A writer that always fails on flush.
     struct FlushFailWriter;
     impl std::io::Write for FlushFailWriter {
@@ -1252,7 +1253,7 @@ nodes:
     ]);
 
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     // The DAG-walk Output arm collects every Output's write/flush
     // failure across the topo walk before aggregating into
     // PipelineError::Multiple. With both writers failing on flush, the
@@ -1293,8 +1294,8 @@ fn test_dlq_stage_source() {
     assert_eq!(entry.route, None);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dlq_stage_transform() {
+#[test]
+fn test_dlq_stage_transform() {
     // Run a pipeline with a transform eval error (non-integer value + to_int),
     // verify DLQ entry has stage "transform:classify".
     let yaml = r#"
@@ -1347,7 +1348,7 @@ nodes:
 
     // "bad_value" cannot be converted to int → transform eval error
     let csv = "id,amount\n1,bad_value\n";
-    let (counters, dlq, _) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 1);
     assert_eq!(dlq.len(), 1);
@@ -1362,8 +1363,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dlq_stage_route_eval() {
+#[test]
+fn test_dlq_stage_route_eval() {
     // Route condition that causes division by zero → DLQ with stage "route_eval".
     let yaml = r#"
 pipeline:
@@ -1417,7 +1418,7 @@ nodes:
 "#;
 
     let csv = "id,amount,zero\n1,100,0\n";
-    let (counters, dlq, _) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 1,
@@ -1454,8 +1455,8 @@ fn test_dlq_stage_output() {
     assert_eq!(entry.route, Some("high_value".to_string()));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dlq_pre_routing_null_route() {
+#[test]
+fn test_dlq_pre_routing_null_route() {
     // Pre-routing errors (transform eval) always have route: None.
     let yaml = r#"
 pipeline:
@@ -1507,7 +1508,7 @@ nodes:
 
     // Two records fail, one succeeds
     let csv = "id,amount\n1,bad\n2,worse\n3,200\n";
-    let (counters, dlq, _) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 2);
     for entry in &dlq {
@@ -1561,8 +1562,8 @@ fn test_dlq_columns_in_csv() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dlq_backward_compat() {
+#[test]
+fn test_dlq_backward_compat() {
     // Single-output pipeline DLQ has new columns with null (empty) values.
     let yaml = r#"
 pipeline:
@@ -1599,7 +1600,7 @@ nodes:
 
     // "bad" fails to_int → DLQ
     let csv = "id,amount\n1,bad\n2,100\n";
-    let (counters, dlq, _) = run_multi_output(yaml, csv).await.unwrap();
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 1);
     assert_eq!(dlq.len(), 1);
@@ -1626,8 +1627,8 @@ nodes:
 
 // --- HashMap registry backward compat tests ---
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_single_writer_hashmap_backward_compat() {
+#[test]
+fn test_single_writer_hashmap_backward_compat() {
     let yaml = r#"
 pipeline:
   name: backward_compat_writer
@@ -1683,7 +1684,7 @@ nodes:
         .collect();
 
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(
         result.is_ok(),
         "single-writer HashMap should work: {result:?}"
@@ -1694,8 +1695,8 @@ nodes:
     assert!(output.contains("Bob"), "output should contain Bob");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_reader_hashmap_backward_compat() {
+#[test]
+fn test_reader_hashmap_backward_compat() {
     let yaml = r#"
 pipeline:
   name: backward_compat_reader
@@ -1750,7 +1751,7 @@ nodes:
         .collect();
 
     let result =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params).await;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
     assert!(
         result.is_ok(),
         "single-reader HashMap should work: {result:?}"

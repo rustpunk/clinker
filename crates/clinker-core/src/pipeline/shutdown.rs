@@ -1,7 +1,8 @@
 //! Per-executor shutdown signaling for graceful SIGINT/SIGTERM handling.
 //!
 //! Each `PipelineExecutor` run owns a [`ShutdownToken`] that the executor
-//! checks at chunk boundaries (Phase 2) and during `Arena::build` (Phase 1).
+//! checks at operator chunk boundaries during dispatch and inside
+//! `Arena::build`.
 //! Tokens are cheap `Arc<AtomicBool>` handles — clones share the same flag.
 //!
 //! `install_signal_handler()` installs a process-wide `ctrlc` handler that
@@ -72,6 +73,7 @@ fn register(flag: &Arc<AtomicBool>) {
 /// Install the SIGINT + SIGTERM handler. Safe to call multiple times — only
 /// the first call wins. The handler walks the live-token registry and trips
 /// every flag.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn install_signal_handler() -> Result<(), String> {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -90,6 +92,14 @@ pub fn install_signal_handler() -> Result<(), String> {
         }
     });
     result
+}
+
+/// No-op on wasm32: the web build has no process to signal, so there is no
+/// OS signal handler to install. Shutdown remains driveable through a token's
+/// programmatic `request()`.
+#[cfg(target_arch = "wasm32")]
+pub fn install_signal_handler() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]

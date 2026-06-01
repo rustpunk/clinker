@@ -431,6 +431,11 @@ pub enum PipelineError {
         observed_count: u64,
         total_count: u64,
     },
+    /// A chunk-boundary shutdown poll tripped (SIGINT/SIGTERM or a
+    /// programmatic [`crate::pipeline::shutdown::ShutdownToken::request`]).
+    /// The dispatch unwinds so the executor can drop senders, join worker
+    /// threads, and exit gracefully (the CLI maps this to exit code 130).
+    Interrupted,
 }
 
 impl fmt::Display for PipelineError {
@@ -581,6 +586,7 @@ impl fmt::Display for PipelineError {
                      max_rate {max_rate:.4} ({observed_count}/{total_count} records)"
                 ),
             },
+            Self::Interrupted => write!(f, "pipeline interrupted by shutdown signal"),
         }
     }
 }
