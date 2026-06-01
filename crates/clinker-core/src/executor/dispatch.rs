@@ -1084,6 +1084,33 @@ impl ExecutorContext<'_> {
         self.current_body_node_input_refs.is_none() && self.fused_transforms.contains(&node_idx)
     }
 
+    /// Take the streaming-Output sender installed under `node_idx`, but
+    /// only for a top-level producer. Returns `None` inside a composition
+    /// body even when the index happens to match.
+    ///
+    /// A composition body has no streaming arm by construction: its
+    /// terminal is an output *port* harvested back into the parent's
+    /// `node_buffers[composition_idx]` (and, for a body whose terminal
+    /// aliases a relaxed-CK aggregate, re-emitted by the commit pass), not
+    /// a sink `Output` with its own writer thread. The streaming substrate
+    /// only ever targets a terminal `Output` writer thread, so there is no
+    /// body sender to install — `streaming_output_senders` is computed
+    /// over the top-level plan's `Output` nodes alone. Bodies nonetheless
+    /// share the `NodeIndex` numeric space with the top-level plan and run
+    /// on the same `ExecutorContext`, so a body operator whose index
+    /// collides with a top-level Output's producer could otherwise steal
+    /// that top-level sender; gating on
+    /// `current_body_node_input_refs.is_none()` forecloses that collision.
+    pub(crate) fn take_streaming_sender(
+        &mut self,
+        node_idx: NodeIndex,
+    ) -> Option<crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>> {
+        if self.current_body_node_input_refs.is_some() {
+            return None;
+        }
+        self.streaming_output_senders.remove(&node_idx)
+    }
+
     /// Resolve the streaming-handoff batch size for the Transform named
     /// `transform_name`: its per-Transform `batch_size` override when
     /// present, otherwise the pipeline-resolved [`Self::batch_size`].
@@ -1506,6 +1533,73 @@ pub(crate) fn admit_node_buffer(
             puncts,
         )),
     }
+}
+
+/// Hand an operator's already-produced output rows to a downstream
+/// streaming `Output` thread over the bounded crossbeam channel `sender`,
+/// in `batch_size`-event batches, instead of admitting the whole stage to
+/// a charged `node_buffers` slot.
+///
+/// The callers (single-branch Route, non-fused Merge, streaming-strategy
+/// Aggregate, inline Combine probe) have each already materialized their
+/// full output in the `rows` Vec by the time they reach this handoff, so
+/// this does NOT bound the producer's working set to one batch — `rows`
+/// still holds the whole result. What it saves over the materialized path
+/// is the *second* full copy: the result is streamed straight to the
+/// writer thread rather than admitted to a `node_buffers` slot that would
+/// charge the memory budget, become spill-eligible, and be re-drained by
+/// the Output arm. The writer thread also overlaps with the next topo
+/// node's work. (The fused Source→Transform→Output and fused
+/// Merge.interleave paths are the true one-batch-bounded streamers; they
+/// pull record-by-record off a live channel and never build a full result
+/// Vec — they do not call this helper.) Per-batch inter-stage charge
+/// accounting for these handoffs is a separate follow-up.
+///
+/// Each record is pushed through an [`EventBatcher`] sized at
+/// `batch_size`; a full batch sends its events to the writer thread,
+/// whose bounded `send` is the back-pressure pivot — a slow writer stalls
+/// this producer and lets upstream channels fill. Punctuations follow the
+/// records (a terminal `Output` consumes punctuations, so their relative
+/// position past the records is immaterial to the sink, and the within-
+/// records order — the FIFO the writer observes — is preserved by the
+/// batcher's append-only cut). Callers reach this only when
+/// [`super::streaming_output_producer`] certified the producer roots no
+/// window and tees to no deferred region, so no materialized-tail
+/// bookkeeping is skipped that a downstream stage depends on.
+fn stream_linear_producer_emit(
+    sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    batch_size: usize,
+    node_name: &str,
+    rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+) -> Result<(), PipelineError> {
+    let send_event =
+        |event: crate::executor::stream_event::StreamEvent| -> Result<(), PipelineError> {
+            sender.send(event).map_err(|_| PipelineError::Internal {
+                op: "executor",
+                node: node_name.to_string(),
+                detail: String::from(
+                    "streaming Output writer task dropped its receiver before the \
+                 streaming producer arm finished",
+                ),
+            })
+        };
+    let mut batcher = crate::executor::batch_handoff::EventBatcher::new(
+        batch_size,
+        |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
+            for event in batch.into_events() {
+                send_event(event)?;
+            }
+            Ok(())
+        },
+    );
+    for (record, rn) in rows {
+        batcher.push_record(record, rn)?;
+    }
+    for punct in puncts {
+        batcher.push_punctuation(punct)?;
+    }
+    batcher.finish()
 }
 
 /// Build the engine-stamped tail mapping for a Source's plan-time
@@ -3085,6 +3179,27 @@ pub(crate) fn dispatch_plan_node(
                 }
             }
 
+            // Streaming-Output handoff: a single-branch Route whose sole
+            // successor is a streaming-eligible Output installed its
+            // sender under our `node_idx` at executor entry. The one
+            // branch's records are already collected into `merged`, so
+            // this does not shrink the Route's own working set; what it
+            // saves is the second copy — the records stream straight to
+            // the writer thread rather than crossing a charged
+            // `node_buffers` slot the Output would re-drain, and the
+            // writer overlaps with the next topo node. The eligibility
+            // predicate certified the single outgoing edge, so
+            // `branch_buffers` holds exactly the one successor here, and a
+            // streaming Route → terminal Output crosses no deferred
+            // region, so the cross-region tee below is correctly skipped.
+            // Dropping the sender disconnects the writer's recv.
+            if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+                let batch_size = ctx.batch_size;
+                let merged: Vec<(Record, u64)> = branch_buffers.into_values().flatten().collect();
+                stream_linear_producer_emit(&sender, batch_size, name, merged, input_puncts)?;
+                return Ok(());
+            }
+
             // Put branch buffers into node_buffers keyed by successor.
             // For successors that fall inside a deferred region while
             // this Route does not, also park the per-branch records on
@@ -3235,16 +3350,25 @@ pub(crate) fn dispatch_plan_node(
             let fan_in_degree = sorted_preds.len();
             let mut all_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
 
+            // Streaming-Output handoff: if a single Output downstream of
+            // this Merge passed the eligibility predicate at executor
+            // entry, its crossbeam `Sender` was installed under our
+            // `node_idx`. Take it here so the Merge arm streams every
+            // record through the channel instead of accumulating, and so
+            // dropping the sender at clean exit disconnects the streaming
+            // thread's `recv` loop. The fused-interleave path streams
+            // inside `merge_fused_interleave` (the sender moves there);
+            // the non-fused path (concat, or interleave with non-Source
+            // inputs) accumulates `merged` then streams it through
+            // `stream_linear_producer_emit` below, skipping the
+            // materialized `admit_node_buffer` slot.
+            let streaming_sender = ctx.take_streaming_sender(node_idx);
+            // Held only on the non-fused streaming path; the fused path
+            // consumes its sender inside `merge_fused_interleave`.
+            let mut nonfused_sender: Option<
+                crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+            > = None;
             let merged: Vec<(Record, u64)> = if fused_mode {
-                // Streaming-Output handoff (issue #72): if a single
-                // Output downstream of this Merge passed the
-                // eligibility predicate at executor entry, its crossbeam
-                // `Sender` was installed under our `node_idx`. Take it
-                // here so the Merge arm streams every record through the
-                // channel instead of accumulating, and so dropping the
-                // sender at clean exit disconnects the streaming thread's
-                // `recv` loop.
-                let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
                 merge_fused_interleave(
                     ctx,
                     current_dag,
@@ -3254,6 +3378,7 @@ pub(crate) fn dispatch_plan_node(
                     streaming_sender,
                 )?
             } else {
+                nonfused_sender = streaming_sender;
                 let total: usize = sorted_preds
                     .iter()
                     .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len_hint()))
@@ -3404,6 +3529,27 @@ pub(crate) fn dispatch_plan_node(
                         }
                     }
                 }
+            }
+
+            // Non-fused streaming path: the predecessors' slots are
+            // already drained into the full `merged` Vec, so this does not
+            // shrink the Merge's own working set; what it saves is the
+            // second copy — hand `merged` straight to the downstream
+            // Output thread over the bounded channel rather than admitting
+            // a charged `node_buffers` slot the Output would re-drain, and
+            // overlap the writer with the next topo node. (The fused
+            // Merge.interleave path is the true one-batch streamer; it
+            // forwards records off the live Source channels inside
+            // `merge_fused_interleave` and returns an empty `merged`, its
+            // sender already dropped there.) The eligibility predicate
+            // certified this Merge roots no window and tees to no deferred
+            // region, so the helper calls below are correctly skipped.
+            // Dropping `nonfused_sender` at the end of this branch
+            // disconnects the writer thread's `recv` loop.
+            if let Some(sender) = nonfused_sender {
+                let batch_size = ctx.batch_size;
+                stream_linear_producer_emit(&sender, batch_size, name, merged, deduped_puncts)?;
+                return Ok(());
             }
 
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
@@ -3972,6 +4118,29 @@ pub(crate) fn dispatch_plan_node(
                 )?;
                 ctx.node_buffers.insert(node_idx, nb);
             } else {
+                // Streaming-Output handoff: a streaming-strategy
+                // aggregate (the planner certified pre-sorted input)
+                // whose sole downstream is a streaming-eligible Output
+                // installed its sender under our `node_idx`. The finalized
+                // group rows are already collected into `out_rows`, so
+                // this does not shrink the aggregate's own working set;
+                // what it saves is the second copy — hand `out_rows`
+                // straight to the writer thread over the bounded channel
+                // rather than admitting a charged `node_buffers` slot the
+                // Output would re-drain, and overlap the writer with the
+                // next topo node. Retraction-mode and time-windowed
+                // aggregates take other branches above and never reach
+                // this streaming handoff; the eligibility predicate
+                // certified this aggregate roots no window and is not a
+                // deferred-region producer, so the helper calls below are
+                // correctly skipped. Dropping the sender disconnects the
+                // writer's recv loop.
+                if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+                    let batch_size = ctx.batch_size;
+                    stream_linear_producer_emit(&sender, batch_size, name, out_rows, input_puncts)?;
+                    return Ok(());
+                }
+
                 // Materialize node-rooted window runtimes for any IndexSpec
                 // rooted at this aggregate. The aggregate emits columns the
                 // source arena cannot project (e.g. `total = sum(amount)`,
@@ -5559,6 +5728,32 @@ pub(crate) fn dispatch_plan_node(
             let probe_records_out = output_records.len() as u64;
             ctx.collector
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
+
+            // Streaming-Output handoff: an inline hash build-probe combine
+            // whose sole downstream is a streaming-eligible Output
+            // installed its sender under our `node_idx`. The build side is
+            // already fully materialized in the hash table and the whole
+            // probe emit is already collected into `output_records`, so
+            // this does not shrink the combine's own working set; what it
+            // saves is the second copy — hand `output_records` straight to
+            // the writer thread over the bounded channel rather than
+            // admitting a charged `node_buffers` slot the Output would
+            // re-drain, and overlap the writer with the next topo node.
+            // The eligibility predicate certified this combine roots no
+            // window and tees to no deferred region, so the helper calls
+            // below are correctly skipped. Punctuations are dropped on the
+            // inline path (matching the materialized inline admit, which
+            // forwards no puncts), and the terminal writer drops them
+            // regardless. The per-fold snapshot and hash-table consumer
+            // are still released before the streaming return.
+            if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+                let batch_size = ctx.batch_size;
+                stream_linear_producer_emit(&sender, batch_size, name, output_records, Vec::new())?;
+                ctx.combine_input_snapshots.remove(&node_idx);
+                ctx.memory_budget.unregister_consumer(inline_consumer_id);
+                return Ok(());
+            }
+
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
             let nb = admit_node_buffer(

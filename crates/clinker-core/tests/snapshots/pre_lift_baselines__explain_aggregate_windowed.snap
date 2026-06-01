@@ -42,7 +42,7 @@ aggregation.by_dept:
   ordering_provenance: IntroducedByStreamingAggregate { at_node: "by_dept", enabled_by: DestroyedByDistinct { at_node: "active_only", confidence: Proven } }
   partitioning: Single
   partitioning_provenance: SingleStream
-  buffer: materialized
+  buffer: streaming
   arbitration: spill_priority=N/A, can_back_pressure=false
 
 output.dept_totals:
@@ -58,10 +58,6 @@ output.dept_totals:
 edge transform.active_only -> aggregation.by_dept:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false (producer: transform)
-
-edge aggregation.by_dept -> output.dept_totals:
-  buffer: node_buffer (slot=2)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: aggregation)
 
 === CXL Expressions ===
 

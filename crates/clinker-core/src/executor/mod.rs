@@ -1473,7 +1473,6 @@ impl PipelineExecutor {
         let streaming_specs = compute_streaming_output_specs(
             plan,
             config,
-            &fused_sources,
             &fused_transforms,
             &init_phase_set,
             &output_configs,
@@ -3017,13 +3016,7 @@ pub(crate) fn classify_stream_nodes(
         plan.graph
             .node_indices()
             .filter_map(|output_idx| {
-                streaming_output_producer(
-                    plan,
-                    output_idx,
-                    &fused_sources,
-                    &fused_transforms,
-                    &init_phase,
-                )
+                streaming_output_producer(plan, output_idx, &fused_transforms, &init_phase)
             })
             .collect()
     };
@@ -3036,7 +3029,22 @@ pub(crate) fn classify_stream_nodes(
                 PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
                     StreamClass::Streaming
                 }
-                PlanNode::Transform { .. } if streaming_producers.contains(&idx) => {
+                // Any producer the eligibility predicate accepts as
+                // feeding a streaming Output — fused Transform, non-fused
+                // Merge, single-branch Route, streaming Aggregate, inline
+                // Combine probe — streams its output to the writer thread
+                // and admits no `node_buffers` slot, so it renders
+                // `streaming`. The predicate already excluded blocking
+                // strategies (hash Aggregate, range/sort-merge/grace
+                // Combine) and window roots, so this branch only fires for
+                // genuinely streaming producers.
+                PlanNode::Transform { .. }
+                | PlanNode::Merge { .. }
+                | PlanNode::Route { .. }
+                | PlanNode::Aggregation { .. }
+                | PlanNode::Combine { .. }
+                    if streaming_producers.contains(&idx) =>
+                {
                     StreamClass::Streaming
                 }
                 _ => StreamClass::Materialized,
@@ -3085,16 +3093,59 @@ pub(crate) fn classify_stream_nodes(
 ///   build the arena, so streaming would starve it; such a Transform
 ///   stays on the buffered path.
 ///
+/// Producer = non-fused `Merge` (concat, or interleave with non-Source
+/// inputs):
+///
+/// - The Merge feeds only this Output and roots no window arena. The
+///   arm drains its predecessors' `node_buffers` slots in declaration
+///   order (concat) or round-robin (interleave) into the merged result,
+///   then streams that result to the writer thread rather than admitting
+///   it to its own charged `node_buffers` slot. (The fused
+///   Merge.interleave path streams record-by-record off the live Source
+///   channels instead and is the only Merge whose footprint is one
+///   batch.)
+///
+/// Producer = single-branch `Route`:
+///
+/// - The Route has exactly one outgoing edge (its sole branch) and that
+///   edge feeds this Output, and the Route roots no window arena. A
+///   multi-branch Route forks records across several successor slots and
+///   stays on the materialized fan-out path so each branch keeps its own
+///   slot — only a Route with a single downstream consumer is a linear
+///   producer the streaming writer can drain.
+///
+/// Producer = streaming-strategy `Aggregate`:
+///
+/// - The aggregate resolved to [`AggregateStrategy::Streaming`] (the
+///   planner certified pre-sorted input), feeds only this Output, and
+///   roots no window arena. Hash aggregation stays blocking: it must
+///   accumulate every group before emitting, so it cannot stream.
+///
+/// Producer = `Combine` probe-side (`HashBuildProbe`):
+///
+/// - The combine resolved to [`CombineStrategy::HashBuildProbe`], feeds
+///   only this Output, and roots no window arena. The build side stays
+///   fully materialized inside the arm; only the probe-side emit streams.
+///   Range / sort-merge / grace-hash strategies are blocking and stay
+///   materialized.
+///
+/// Common to every non-`Output` producer kind below: the producer must
+/// have exactly one outgoing edge (this Output) and root no node-anchored
+/// window arena, because a window rooted at the producer needs the
+/// producer's full output materialized to build the arena and streaming
+/// would starve it.
+///
 /// Correlation buffering disables streaming pipeline-wide — the
 /// `CorrelationCommit` terminal owns the writes — so the caller short-
 /// circuits before calling this.
 fn streaming_output_producer(
     plan: &crate::plan::execution::ExecutionPlanDag,
     output_idx: petgraph::graph::NodeIndex,
-    fused_merge_sources: &HashSet<String>,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
 ) -> Option<petgraph::graph::NodeIndex> {
+    use crate::aggregation::AggregateStrategy;
+    use crate::plan::combine::CombineStrategy;
     use crate::plan::execution::PlanNode;
 
     let PlanNode::Output { resolved, .. } = &plan.graph[output_idx] else {
@@ -3121,22 +3172,38 @@ fn streaming_output_producer(
         return None;
     }
 
+    // A window rooted at the producer needs the producer's full output
+    // materialized to build the arena, so a streaming producer must root
+    // no node-anchored window. Shared by every linear-producer arm below.
+    let roots_window = |idx: petgraph::graph::NodeIndex| -> bool {
+        plan.indices_to_build.iter().any(|spec| {
+            matches!(
+                &spec.root,
+                crate::plan::index::PlanIndexRoot::Node { upstream, .. }
+                    if *upstream == idx
+            )
+        })
+    };
+
     match &plan.graph[producer_idx] {
         PlanNode::Merge { .. } => {
-            // Every Merge predecessor must be a fused Source, and the
-            // Merge must feed only this Output.
-            let merge_predecessors: Vec<_> = plan
+            // Fused Merge.interleave streams off the live Source channels
+            // directly inside `merge_fused_interleave`; the non-fused
+            // Merge (concat, or interleave with non-Source inputs) drains
+            // its predecessors' `node_buffers` slots and forwards each
+            // record to the writer thread. Both route their emit through
+            // the streaming sender — the runtime arm picks the path — so
+            // every Merge with a single downstream Output and no window
+            // root is eligible regardless of fusion.
+            let has_predecessor = plan
                 .graph
                 .neighbors_directed(producer_idx, petgraph::Direction::Incoming)
-                .collect();
-            if merge_predecessors.is_empty() {
-                return None;
-            }
-            let all_fused = merge_predecessors.iter().all(|p| match &plan.graph[*p] {
-                PlanNode::Source { name, .. } => fused_merge_sources.contains(name),
-                _ => false,
-            });
-            if !all_fused || !has_single_outgoing(plan, producer_idx) {
+                .next()
+                .is_some();
+            if !has_predecessor
+                || !has_single_outgoing(plan, producer_idx)
+                || roots_window(producer_idx)
+            {
                 return None;
             }
             Some(producer_idx)
@@ -3144,18 +3211,44 @@ fn streaming_output_producer(
         PlanNode::Transform { .. } => {
             // The Transform must be a fused Source→Transform that feeds
             // only this Output and roots no node-anchored window arena.
-            if !fused_transforms.contains(&producer_idx) || !has_single_outgoing(plan, producer_idx)
+            if !fused_transforms.contains(&producer_idx)
+                || !has_single_outgoing(plan, producer_idx)
+                || roots_window(producer_idx)
             {
                 return None;
             }
-            let roots_window = plan.indices_to_build.iter().any(|spec| {
-                matches!(
-                    &spec.root,
-                    crate::plan::index::PlanIndexRoot::Node { upstream, .. }
-                        if *upstream == producer_idx
-                )
-            });
-            if roots_window {
+            Some(producer_idx)
+        }
+        PlanNode::Route { .. } => {
+            // Single-branch Route: exactly one outgoing edge (this
+            // Output). A multi-branch Route forks across successor slots
+            // and stays materialized.
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Aggregation { strategy, .. } => {
+            // Streaming aggregation emits one group per sort-key
+            // boundary, so it can stream to the writer; hash aggregation
+            // must accumulate every group before emitting and stays
+            // blocking.
+            if !matches!(strategy, AggregateStrategy::Streaming) {
+                return None;
+            }
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Combine { strategy, .. } => {
+            // Only the inline hash build-probe streams its probe-side
+            // emit; the build side stays fully materialized inside the
+            // arm. Range / sort-merge / grace-hash joins are blocking.
+            if !matches!(strategy, CombineStrategy::HashBuildProbe) {
+                return None;
+            }
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
                 return None;
             }
             Some(producer_idx)
@@ -3191,7 +3284,6 @@ fn streaming_output_producer(
 fn compute_streaming_output_specs(
     plan: &crate::plan::execution::ExecutionPlanDag,
     config: &PipelineConfig,
-    fused_merge_sources: &HashSet<String>,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
     output_configs: &[OutputConfig],
@@ -3213,13 +3305,9 @@ fn compute_streaming_output_specs(
         else {
             continue;
         };
-        let Some(producer_idx) = streaming_output_producer(
-            plan,
-            output_idx,
-            fused_merge_sources,
-            fused_transforms,
-            init_phase_set,
-        ) else {
+        let Some(producer_idx) =
+            streaming_output_producer(plan, output_idx, fused_transforms, init_phase_set)
+        else {
             continue;
         };
 
