@@ -7,7 +7,6 @@ use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
 use clinker_core::metrics::{self, ExecutionMetrics};
 use clinker_core::pipeline::memory::parse_memory_limit_bytes;
-use clinker_format::FormatReader;
 
 /// CXL streaming ETL engine.
 #[derive(Parser, Debug)]
@@ -529,22 +528,30 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut source_name_by_node: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for src in pipeline_config.source_configs() {
-        if let Some(stem) = std::path::Path::new(src.path_str())
+        if !src.transport.is_file() {
+            // A network source has no file path. Resolve `{source_file}`
+            // to the same stable synthetic id the executor stamps on each
+            // record (`<source:NAME>`) so fan-out templates render a
+            // deterministic, source-identifying token instead of an empty
+            // stem.
+            source_name_by_node.insert(src.name.clone(), format!("<source:{}>", src.name));
+        } else if let Some(stem) = std::path::Path::new(src.path_str())
             .file_stem()
             .and_then(|s| s.to_str())
         {
             source_name_by_node.insert(src.name.clone(), stem.to_string());
         }
     }
-    let source_name_default: Option<String> = pipeline_config
-        .source_configs()
-        .next()
-        .and_then(|s| {
-            std::path::Path::new(s.path_str())
-                .file_stem()
-                .map(|st| st.to_owned())
-        })
-        .and_then(|os| os.into_string().ok());
+    let source_name_default: Option<String> =
+        pipeline_config.source_configs().next().and_then(|s| {
+            if !s.transport.is_file() {
+                Some(format!("<source:{}>", s.name))
+            } else {
+                std::path::Path::new(s.path_str())
+                    .file_stem()
+                    .and_then(|st| st.to_str().map(|s| s.to_string()))
+            }
+        });
     let template_ctx = clinker_core::output::path_template::TemplateContext {
         source_name_default: source_name_default.as_deref(),
         source_name_by_node: source_name_by_node.clone(),
@@ -649,13 +656,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut channel_record_vars: indexmap::IndexMap<String, clinker_record::Value> =
         Default::default();
 
-    // Run the pipeline using file-based I/O — open readers for ALL sources
-    // (primary + lookup references) and writers for ALL outputs.
+    // Open readers for ALL sources (primary + lookup references) and
+    // writers for ALL outputs. The first source's identity seeds the DLQ
+    // sidecar's global `_cxl_dlq_source_file` fallback: a file source uses
+    // its path, a pathless network source uses the same `<source:NAME>`
+    // synthetic id the executor stamps per record.
     let first_source = pipeline_config
         .source_configs()
         .next()
         .expect("pipeline has at least one source");
-    let input_path = first_source.path_str().to_string();
+    let input_path = if first_source.transport.is_file() {
+        first_source.path_str().to_string()
+    } else {
+        format!("<source:{}>", first_source.name)
+    };
 
     // Build the source reader registry. Each source's matcher
     // (`path` / `glob` / `regex` / `paths`) resolves through the
@@ -674,52 +688,75 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // each record so fan-out writers key correctly.
     let mut source_files_by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
         std::collections::HashMap::new();
-    for source in pipeline_config.source_configs() {
-        let outcome =
-            clinker_core::source::discovery::discover(source, &workspace_root).map_err(|e| {
-                use clinker_core::source::discovery::DiscoveryError;
-                let code = match &e {
-                    DiscoveryError::MultipleMatchers { .. } => "E210",
-                    DiscoveryError::NoMatcher => "E211",
-                    DiscoveryError::InvalidGlob { .. } => "E212",
-                    DiscoveryError::InvalidRegex { .. } => "E213",
-                    DiscoveryError::NoMatch { .. } => "E216",
-                    DiscoveryError::TakeBothSpecified => "E218",
-                    DiscoveryError::Io(_) => "E216",
-                };
-                clinker_core::error::PipelineError::Config(
-                    clinker_core::config::ConfigError::Validation(format!(
-                        "[{code}] source '{}' discovery failed: {e}",
-                        source.name
-                    )),
+    for body in pipeline_config.source_bodies() {
+        let source = &body.source;
+        match &source.transport {
+            clinker_core::config::SourceTransport::File => {
+                let outcome = clinker_core::source::discovery::discover(source, &workspace_root)
+                    .map_err(|e| {
+                        use clinker_core::source::discovery::DiscoveryError;
+                        let code = match &e {
+                            DiscoveryError::MultipleMatchers { .. } => "E210",
+                            DiscoveryError::NoMatcher => "E211",
+                            DiscoveryError::InvalidGlob { .. } => "E212",
+                            DiscoveryError::InvalidRegex { .. } => "E213",
+                            DiscoveryError::NoMatch { .. } => "E216",
+                            DiscoveryError::TakeBothSpecified => "E218",
+                            DiscoveryError::Io(_) => "E216",
+                        };
+                        clinker_core::error::PipelineError::Config(
+                            clinker_core::config::ConfigError::Validation(format!(
+                                "[{code}] source '{}' discovery failed: {e}",
+                                source.name
+                            )),
+                        )
+                    })?;
+                let mut slots: Vec<clinker_core::source::multi_file::FileSlot> = Vec::new();
+                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                for f in outcome.files() {
+                    let file = std::fs::File::open(&f.path)?;
+                    slots.push(clinker_core::source::multi_file::FileSlot::new(
+                        f.path.clone(),
+                        Box::new(file),
+                    ));
+                    paths.push(f.path.clone());
+                }
+                source_files_by_name.insert(source.name.clone(), paths);
+                // EmptyWarn / EmptySkip outcomes leave `slots` empty; the
+                // executor short-circuits via the empty-list guard upstream.
+                if slots.is_empty() {
+                    // Stash a single empty reader so the executor's "missing
+                    // reader" check passes. Records flow through as zero-row
+                    // sources.
+                    slots.push(clinker_core::source::multi_file::FileSlot::new(
+                        "<empty>",
+                        Box::new(std::io::empty()),
+                    ));
+                }
+                readers.insert(
+                    source.name.clone(),
+                    clinker_core::executor::SourceInput::Files(slots),
+                );
+            }
+            clinker_core::config::SourceTransport::Rest(rest_cfg) => {
+                // The rest transport bypasses fs discovery entirely. The
+                // reader is a row yielder driven on the ingest thread; the
+                // `{source_file}` fan-out side-table gets no file paths, so
+                // the `<source:NAME>` synthetic id is the stable identity.
+                let reader = clinker_net::build_rest_source(
+                    rest_cfg.clone(),
+                    source,
+                    &body.schema.columns,
+                    body.on_unmapped.clone(),
                 )
-            })?;
-        let mut slots: Vec<clinker_core::source::multi_file::FileSlot> = Vec::new();
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        for f in outcome.files() {
-            let file = std::fs::File::open(&f.path)?;
-            slots.push(clinker_core::source::multi_file::FileSlot::new(
-                f.path.clone(),
-                Box::new(file),
-            ));
-            paths.push(f.path.clone());
+                .map_err(clinker_core::error::PipelineError::Format)?;
+                source_files_by_name.insert(source.name.clone(), Vec::new());
+                readers.insert(
+                    source.name.clone(),
+                    clinker_core::executor::SourceInput::Records(reader),
+                );
+            }
         }
-        source_files_by_name.insert(source.name.clone(), paths);
-        // EmptyWarn / EmptySkip outcomes leave `slots` empty; the
-        // executor short-circuits via the empty-list guard upstream.
-        if slots.is_empty() {
-            // Stash a single empty reader so the executor's "missing
-            // reader" check passes. Records flow through as zero-row
-            // sources.
-            slots.push(clinker_core::source::multi_file::FileSlot::new(
-                "<empty>",
-                Box::new(std::io::empty()),
-            ));
-        }
-        readers.insert(
-            source.name.clone(),
-            clinker_core::executor::SourceInput::Files(slots),
-        );
     }
 
     // Outputs are written atomically: each output writes to a sibling
@@ -957,13 +994,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     {
         let buckets = clinker_core::dlq::partition_dlq_entries(dlq_entries, dlq_config);
         if !buckets.is_empty() {
+            // DLQ user-row columns come from the source's authored
+            // `schema:` declaration, not from re-reading the input file.
+            // The authored schema is the runtime schema for every
+            // transport, and a pathless network source has no file to
+            // re-open, so deriving columns from the declaration is the
+            // single correct path for both file and network sources.
             let input_schema = {
-                let f = std::fs::File::open(&input_path)?;
-                let mut r = clinker_format::csv::reader::CsvReader::from_reader(
-                    f,
-                    clinker_format::csv::reader::CsvReaderConfig::default(),
-                );
-                r.schema().map_err(PipelineError::Format)?
+                let mut builder = clinker_record::SchemaBuilder::new();
+                if let Some(body) = pipeline_config.source_bodies().next() {
+                    for col in &body.schema.columns {
+                        builder = builder.with_field(col.name.as_str());
+                    }
+                }
+                builder.build()
             };
             let include_reason = dlq_config.include_reason.unwrap_or(true);
             let include_source_row = dlq_config.include_source_row.unwrap_or(true);

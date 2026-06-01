@@ -37,6 +37,9 @@
 //! | `E216`      | error    | Source matched zero files (with `on_no_match: error`) |
 //! | `E217`      | error    | Schema mismatch across multi-file source's files     |
 //! | `E218`      | error    | `files.take_first` and `files.take_last` both set    |
+//! | `E219`      | error    | `rest` transport declares a file matcher (path/glob/regex/paths) |
+//! | `E220`      | error    | `rest` transport declares a non-`json`/`xml` decode format |
+//! | `E221`      | error    | REST source read failure (HTTP request / body-read error) |
 //! | `E15Y`      | error    | Aggregate with streaming strategy over relaxed-CK group_by |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |

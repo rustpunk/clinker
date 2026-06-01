@@ -63,6 +63,15 @@ pub trait RecordSource: Send {
     ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
         Ok(IndexMap::new())
     }
+
+    /// Hand the source its run shutdown handle so it can poll for
+    /// cancellation at page/row-batch boundaries and stop cleanly
+    /// (returning `Ok(None)` like a normal EOF). The ingest driver
+    /// injects the token before the first `next_record`. The default is
+    /// a no-op: the file arm relies on the dropped-receiver stop signal,
+    /// so it ignores the token. Network readers holding a live socket
+    /// override this to bound cancellation latency.
+    fn set_shutdown_token(&mut self, _token: crate::pipeline::shutdown::ShutdownToken) {}
 }
 
 /// Byte-stream transports reach the row-yielding contract by delegating

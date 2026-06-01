@@ -7,6 +7,7 @@ description = "CLI for the Clinker ETL engine"
 
 [dependencies]
 clinker-core = { workspace = true }
+clinker-net = { workspace = true }
 clinker-channel = { workspace = true }
 clinker-format = { workspace = true }
 clinker-record = { workspace = true }

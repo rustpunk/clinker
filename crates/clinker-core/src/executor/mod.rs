@@ -1063,13 +1063,26 @@ impl PipelineExecutor {
             source_records.insert(src_cfg.name.clone(), rx);
             let src_cfg_owned = src_cfg.clone();
             let config_clone = config.clone();
+            // Per-thread clone of the run's cancellation handle. A network
+            // ingest reader polls it at page/row-batch boundaries to stop
+            // within the documented shutdown bound; the file arm ignores
+            // it (dropped-receiver stop suffices).
+            let ingest_shutdown = params.shutdown_token.clone();
             // One OS thread per Source. Spawned before the DAG dispatch
             // drains so the producers fill the bounded channels while the
             // consumer dispatch loop runs concurrently. Joined after
             // dispatch returns (receivers already drained).
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-ingest-{}", src_cfg.name))
-                .spawn(move || ingest_source(src_cfg_owned, source_input, config_clone, stream))
+                .spawn(move || {
+                    ingest_source(
+                        src_cfg_owned,
+                        source_input,
+                        config_clone,
+                        stream,
+                        ingest_shutdown,
+                    )
+                })
                 .map_err(|e| PipelineError::Internal {
                     op: "source-ingest-spawn",
                     node: src_cfg.name.clone(),
@@ -2071,6 +2084,7 @@ fn ingest_source(
     input: crate::source::SourceInput,
     config: PipelineConfig,
     stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     // Branch once on transport. The file arm builds the
     // MultiFileFormatReader + schema-coercion stack and hands the
@@ -2094,10 +2108,10 @@ fn ingest_source(
             let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
-            drive_record_source(src_cfg, Box::new(src_reader), stream)
+            drive_record_source(src_cfg, Box::new(src_reader), stream, shutdown_token)
         }
         crate::source::SourceInput::Records(src_reader) => {
-            drive_record_source(src_cfg, src_reader, stream)
+            drive_record_source(src_cfg, src_reader, stream, shutdown_token)
         }
     }
 }
@@ -2111,9 +2125,17 @@ fn drive_record_source(
     src_cfg: crate::config::SourceConfig,
     src_reader: Box<dyn crate::source::RecordSource>,
     stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     {
         let mut src_reader = src_reader;
+        // Hand the reader its cancellation handle before any read so a
+        // network reader can poll `is_requested()` at page/batch
+        // boundaries and stop within the shutdown bound. The file arm's
+        // default impl ignores it (the dropped-receiver stop suffices).
+        if let Some(token) = shutdown_token {
+            src_reader.set_shutdown_token(token);
+        }
         let reader_schema = src_reader.schema()?;
 
         // Widen the reader schema with `$source.file`, `$source.name`,

@@ -687,21 +687,201 @@ impl<'de> Deserialize<'de> for ByteSize {
 
 /// Transport selecting where a source's records originate, layered ABOVE
 /// the on-disk [`InputFormat`]. `File` (the default) reads bytes from the
-/// filesystem and decodes them with the declared format; future non-file
-/// transports (a paginated REST cursor, a SQL `SELECT` cursor) yield rows
-/// without going through fs discovery or the file matchers.
+/// filesystem and decodes them with the declared format; the `Rest`
+/// transport (a paginated HTTP cursor) yields rows without going through
+/// fs discovery or the file matchers and carries its own
+/// connection/pagination config inline.
 ///
-/// Selected by a plain optional `transport:` key — a flat snake_case
-/// enum, not a `#[serde(flatten)]`+tagged enum, to avoid the YAML
-/// span-loss that a second flattened tagged enum on `SourceConfig` would
-/// cause.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Selected by a nested `transport:` value, NOT a `#[serde(flatten)]`+
+/// tagged enum on `SourceConfig`. A second flattened tagged enum on
+/// `SourceConfig` would lose YAML source spans (the same edge case
+/// [`InputFormat`] already hits); a nested `transport:` value keeps the
+/// span on every payload field. Tagged with an internal `kind:` so the
+/// network variant can carry a payload struct:
+///
+/// ```yaml
+/// transport:
+///   kind: rest
+///   url: https://api.example.com/v1/records
+///   pagination: { strategy: link_header }
+///   max_pages: 50
+/// ```
+///
+/// Defaults to [`SourceTransport::File`] so every existing file pipeline
+/// that omits `transport:` (or writes the bare `transport: file` scalar)
+/// parses byte-identically — the `untagged`-free default arm plus the
+/// `kind` tag accept both the bare-`file` scalar and the nested forms.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceTransport {
     /// Read bytes from the filesystem; resolve the file set through the
     /// discovery layer's `path`/`glob`/`regex`/`paths` matchers.
     #[default]
     File,
+    /// Paginated HTTP GET cursor. Issues GETs to cursor exhaustion or a
+    /// hard page/record cap, decoding each response body through the
+    /// declared on-disk [`InputFormat`] (`json`/`xml`).
+    Rest(RestSourceConfig),
+}
+
+impl<'de> Deserialize<'de> for SourceTransport {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Two accepted YAML shapes:
+        //   transport: file                  (bare scalar)
+        //   transport: { kind: rest, ... }   (internally-tagged map)
+        // serde's internally-tagged enums reject a bare scalar for a unit
+        // variant, so the scalar form is handled explicitly and the map
+        // form delegates to a private `kind`-tagged mirror.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            File,
+            Rest(RestSourceConfig),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Scalar(String),
+            Tagged(Tagged),
+        }
+
+        match Either::deserialize(d)? {
+            Either::Scalar(s) if s == "file" => Ok(SourceTransport::File),
+            Either::Scalar(other) => Err(de::Error::custom(format!(
+                "unknown transport {other:?}; the bare scalar form only accepts `file` — \
+                 the rest transport uses a nested `transport: {{ kind: rest, … }}`"
+            ))),
+            Either::Tagged(Tagged::File) => Ok(SourceTransport::File),
+            Either::Tagged(Tagged::Rest(c)) => Ok(SourceTransport::Rest(c)),
+        }
+    }
+}
+
+impl SourceTransport {
+    /// Whether this transport reads from the filesystem (the only
+    /// transport that goes through fs discovery and the file matchers).
+    pub fn is_file(&self) -> bool {
+        matches!(self, SourceTransport::File)
+    }
+
+    /// Short lowercase transport name for diagnostics.
+    pub fn transport_name(&self) -> &'static str {
+        match self {
+            SourceTransport::File => "file",
+            SourceTransport::Rest(_) => "rest",
+        }
+    }
+}
+
+/// Pagination strategy for a [`RestSourceConfig`]. Determines how the
+/// reader advances from one page to the next and how it detects the last
+/// page. Every strategy is bounded by the source's hard page/record cap —
+/// finiteness is a HARD reader property, not a server promise.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum RestPagination {
+    /// Single GET, no pagination. The response body is the whole result.
+    #[default]
+    None,
+    /// `?<offset_param>=N&<limit_param>=L`, advancing the offset by the
+    /// page size each request; stops when a page returns fewer than
+    /// `limit` records (or the cap trips).
+    Offset {
+        /// Query parameter carrying the row offset (default `offset`).
+        #[serde(default = "default_offset_param")]
+        offset_param: String,
+        /// Query parameter carrying the page size (default `limit`).
+        #[serde(default = "default_limit_param")]
+        limit_param: String,
+        /// Page size requested per GET.
+        limit: u32,
+    },
+    /// Cursor-token pagination: the reader reads a token from a JSON
+    /// pointer in each response and sends it back as a query parameter
+    /// on the next request; stops when the token field is absent/null.
+    CursorToken {
+        /// Query parameter carrying the continuation token.
+        cursor_param: String,
+        /// JSON pointer (RFC 6901) into the response body locating the
+        /// next-page token (e.g. `/meta/next_cursor`).
+        next_token_pointer: String,
+    },
+    /// RFC 5988 `Link` header pagination: the reader follows the URL in
+    /// the `rel="next"` link until no such link is present.
+    LinkHeader,
+}
+
+fn default_offset_param() -> String {
+    "offset".to_string()
+}
+
+fn default_limit_param() -> String {
+    "limit".to_string()
+}
+
+/// HTTP authentication for a [`RestSourceConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+pub enum RestAuth {
+    /// No authentication header.
+    #[default]
+    None,
+    /// `Authorization: Bearer <token>`.
+    Bearer {
+        /// The bearer token, sent verbatim after `Bearer `.
+        token: String,
+    },
+    /// An arbitrary static header, e.g. `X-API-Key: <value>`.
+    Header {
+        /// Header name.
+        name: String,
+        /// Header value.
+        value: String,
+    },
+}
+
+/// Connection + pagination config for the `rest` transport. The reader
+/// issues paginated GETs against [`url`](Self::url) until the pagination
+/// strategy reports no next page OR a hard cap trips, decoding each
+/// response body through the source's declared on-disk format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestSourceConfig {
+    /// Base request URL. Pagination appends/overrides query parameters.
+    pub url: String,
+    /// Pagination strategy (default [`RestPagination::None`] — a single
+    /// GET).
+    #[serde(default)]
+    pub pagination: RestPagination,
+    /// Authentication (default [`RestAuth::None`]).
+    #[serde(default)]
+    pub auth: RestAuth,
+    /// HARD page cap. The reader stops after this many GETs even if the
+    /// server keeps offering a next page. Required — finiteness is
+    /// unenforceable downstream, so an explicit ceiling is mandatory.
+    pub max_pages: u32,
+    /// Optional HARD record cap, applied in addition to `max_pages`. The
+    /// reader stops emitting once this many records have been yielded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+    /// Bounded transient-failure retry count per request (5xx / timeout /
+    /// connect error). Default 3.
+    #[serde(default = "default_rest_retries")]
+    pub retries: u32,
+    /// Per-request timeout in seconds. Bounds in-flight request time so
+    /// SIGINT cancellation lands within the documented shutdown bound.
+    /// Default 30.
+    #[serde(default = "default_rest_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_rest_retries() -> u32 {
+    3
+}
+
+fn default_rest_timeout_secs() -> u64 {
+    30
 }
 
 /// Adjacently tagged format enum for inputs.
@@ -4042,7 +4222,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
         // fails on `--explain` and in-process executor callers too. The
         // discovery layer keeps its own `pick_matcher` guard for the
         // direct-`discover` path; this is the parse/validate-time mirror.
-        if matches!(input.transport, SourceTransport::File) {
+        if input.transport.is_file() {
             let matcher_count = [
                 input.path.is_some(),
                 input.glob.is_some(),
@@ -4078,6 +4258,42 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
                         which.join(", ")
                     )));
                 }
+            }
+        } else {
+            // The rest transport never goes through fs discovery, so a
+            // file matcher on it is dead config that would mislead a
+            // reader into thinking the source reads from disk. Reject it
+            // so the transport's intent is unambiguous.
+            let matchers: Vec<&str> = [
+                ("path", input.path.is_some()),
+                ("glob", input.glob.is_some()),
+                ("regex", input.regex.is_some()),
+                ("paths", input.paths.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect();
+            if !matchers.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[E219] source '{}': {} transport declares file matcher(s) ({}); the rest \
+                     transport reads from its endpoint, not the filesystem — remove the \
+                     matcher key(s)",
+                    input.name,
+                    input.transport.transport_name(),
+                    matchers.join(", ")
+                )));
+            }
+
+            // REST decodes each response body through the declared on-disk
+            // format, so only the byte-stream formats with multi-record
+            // bodies (`json`/`xml`) are meaningful.
+            if !matches!(input.format, InputFormat::Json(_) | InputFormat::Xml(_)) {
+                return Err(ConfigError::Validation(format!(
+                    "[E220] source '{}': rest transport decodes response bodies through the \
+                     declared format, which must be `json` or `xml` (got `{}`)",
+                    input.name,
+                    input.format.format_name()
+                )));
             }
         }
     }

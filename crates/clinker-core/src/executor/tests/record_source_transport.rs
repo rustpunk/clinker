@@ -14,9 +14,9 @@ use super::*;
 use crate::source::RecordSource;
 
 /// In-memory row yielder with no byte stream behind it — the shape a
-/// SQL-cursor transport takes. Holds a fixed schema and a queue of rows;
-/// `current_source_file` stays `None` so the ingest loop falls back to
-/// the source's stable synthetic id.
+/// pathless row-yielding transport takes. Holds a fixed schema and a queue
+/// of rows; `current_source_file` stays `None` so the ingest loop falls
+/// back to the source's stable synthetic id.
 struct StubRecordSource {
     schema: Arc<Schema>,
     rows: std::collections::VecDeque<Vec<Value>>,

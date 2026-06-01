@@ -84,3 +84,58 @@ fn file_transport_with_two_matchers_is_rejected_at_config_time() {
     assert!(msg.contains("path"), "got: {msg}");
     assert!(msg.contains("glob"), "got: {msg}");
 }
+
+#[test]
+fn rest_transport_parses_with_nested_kind_and_pagination() {
+    let body = "      type: json\n      options:\n        format: array\n      transport:\n        kind: rest\n        url: https://api.example.com/v1/rows\n        max_pages: 25\n        pagination:\n          strategy: link_header";
+    let config = parse_config(&pipeline_with_source(body)).expect("rest transport must parse");
+    let src = config.source_configs().next().unwrap();
+    match &src.transport {
+        clinker_core::config::SourceTransport::Rest(c) => {
+            assert_eq!(c.url, "https://api.example.com/v1/rows");
+            assert_eq!(c.max_pages, 25);
+            assert!(matches!(
+                c.pagination,
+                clinker_core::config::RestPagination::LinkHeader
+            ));
+        }
+        other => panic!("expected rest transport, got {other:?}"),
+    }
+}
+
+#[test]
+fn network_transport_with_file_matcher_is_rejected() {
+    // A `path:` on a rest transport is dead config — the source reads from
+    // its endpoint, not the filesystem.
+    let body = "      type: json\n      path: ./oops.json\n      transport:\n        kind: rest\n        url: https://api.example.com/r\n        max_pages: 5";
+    let err = parse_config(&pipeline_with_source(body))
+        .expect_err("network transport with file matcher must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("E219"), "expected E219 diagnostic, got: {msg}");
+}
+
+#[test]
+fn rest_transport_with_csv_format_is_rejected() {
+    // REST decodes response bodies through the declared format, which must
+    // be json or xml.
+    let body = "      type: csv\n      transport:\n        kind: rest\n        url: https://api.example.com/r\n        max_pages: 5";
+    let err = parse_config(&pipeline_with_source(body))
+        .expect_err("rest transport with csv format must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("E220"), "expected E220 diagnostic, got: {msg}");
+}
+
+#[test]
+fn unknown_scalar_transport_is_rejected() {
+    // The bare-scalar transport form accepts only `file`; an unknown
+    // scalar (or a database name that is not a built transport) fails to
+    // deserialize with a message naming the rest nested form.
+    let body = "      type: json\n      path: ./oops.json\n      transport: postgres\n      options:\n        format: array";
+    let err = parse_config(&pipeline_with_source(body))
+        .expect_err("unknown scalar transport must fail to parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown transport") || msg.contains("postgres"),
+        "expected unknown-transport diagnostic, got: {msg}"
+    );
+}

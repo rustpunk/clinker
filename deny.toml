@@ -30,6 +30,11 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "Zlib",
+    # Mozilla's CA trust-anchor list (webpki-roots, pulled by ureq's
+    # rustls TLS) ships under this permissive data-sharing license. It
+    # covers the root-certificate *data*, not code, and imposes no
+    # copyleft on the dependent crate.
+    "CDLA-Permissive-2.0",
 ]
 
 [advisories]

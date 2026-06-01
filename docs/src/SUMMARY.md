@@ -13,6 +13,7 @@
 
 - [Pipeline YAML Structure](pipeline/structure.md)
 - [Source Nodes](pipeline/source.md)
+- [Network Sources (REST)](pipeline/source-network.md)
 - [Auto-Widen & Schema Drift](pipeline/auto-widen.md)
 - [Transform Nodes](pipeline/transform.md)
 - [Aggregate Nodes](pipeline/aggregate.md)
