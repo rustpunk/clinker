@@ -981,6 +981,14 @@ pub(crate) struct ExecutorContext<'a> {
     /// unwound early. Surfaced through the report so the CLI can return
     /// the interrupted exit code.
     pub(crate) interrupted: bool,
+
+    /// Resolved per-batch event count for the streaming inter-stage
+    /// handoff, from `pipeline.batch_size` (or
+    /// [`crate::executor::batch_handoff::DEFAULT_BATCH_SIZE`] when
+    /// omitted). A per-Transform `batch_size` override takes precedence
+    /// for that one stage via [`Self::batch_size_for`]. Read by the fused
+    /// streaming arms to size their [`crate::executor::batch_handoff::EventBatcher`].
+    pub(crate) batch_size: usize,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -1074,6 +1082,26 @@ impl ExecutorContext<'_> {
     /// only.
     pub(crate) fn should_fuse_transform(&self, node_idx: NodeIndex) -> bool {
         self.current_body_node_input_refs.is_none() && self.fused_transforms.contains(&node_idx)
+    }
+
+    /// Resolve the streaming-handoff batch size for the Transform named
+    /// `transform_name`: its per-Transform `batch_size` override when
+    /// present, otherwise the pipeline-resolved [`Self::batch_size`].
+    /// Both have been validated `>= 1` at config time, so the returned
+    /// value is always a usable flush threshold.
+    pub(crate) fn batch_size_for(&self, transform_name: &str) -> usize {
+        self.config
+            .nodes
+            .iter()
+            .find_map(|spanned| match &spanned.value {
+                crate::config::PipelineNode::Transform { header, config }
+                    if header.name == transform_name =>
+                {
+                    config.batch_size
+                }
+                _ => None,
+            })
+            .unwrap_or(self.batch_size)
     }
 
     /// Stamp the per-source finalized count for `source_name` and, if
@@ -2081,6 +2109,27 @@ pub(crate) fn transform_fused_consume(
         .cloned();
     let output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
     let upstream_name = source_name_owned.clone();
+    // Per-Transform-resolved streaming batch size. The fused loop drives
+    // emitted records through an `EventBatcher` of this size, bounding the
+    // in-flight working set to one batch before each flush. Resolved
+    // before the receiver is consumed so the immutable `ctx` borrow ends
+    // before the loop's `&mut ctx` work begins.
+    let batch_size = ctx.batch_size_for(name);
+
+    // Streaming inter-stage handoff: when a single streaming-eligible
+    // Output downstream of this fused Transform installed its sender under
+    // this node's index at executor entry (per `classify_stream_nodes` /
+    // `compute_streaming_output_specs`), take it here. Each flushed batch
+    // is then sent straight to the writer thread over the bounded channel
+    // — the blocking `send` is the back-pressure pivot, so peak
+    // inter-stage memory is one batch plus the channel's bound, never the
+    // whole stage. The Transform admits no `node_buffers` slot in this
+    // mode. When absent (the Transform feeds a fan-out, a window root, or
+    // a blocking operator), each batch drains into the stage's full output
+    // accumulator and `admit_node_buffer` charges it as one slot, the
+    // existing materialized path.
+    let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
+    let streaming = streaming_sender.is_some();
 
     let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
         ProgramEvaluator::with_max_expansion(
@@ -2105,119 +2154,201 @@ pub(crate) fn transform_fused_consume(
     let has_record_seed = !ctx.record_var_seed.is_empty();
     let source_name_arc: Arc<str> = Arc::from(source_name_owned.as_str());
 
+    // In materialized mode `output_records` accumulates emitted records
+    // (records only), the input to `finalize_node_rooted_windows` and
+    // `tee_emit_to_region_input_buffers` below — both reshape records and
+    // never read punctuations — and `forwarded_puncts` carries the
+    // document-boundary punctuations to the slot tail (matching the
+    // non-fused Transform arm). In streaming mode both stay empty: the
+    // batcher sink sends every event to the Output thread instead, and a
+    // streaming-eligible Transform roots no window and tees to no region
+    // (enforced by `streaming_output_producer`), so the helper calls see
+    // an empty slice and the slot is never admitted.
+    //
+    // The fused loop pushes each emitted record AND each document-boundary
+    // punctuation through `event_batcher` in arrival order. The batcher
+    // bounds the live working set to `batch_size` events before each
+    // flush — the per-batch boundary the streaming inter-stage handoff is
+    // built on. Forwarding punctuations (rather than dropping them, as
+    // this fused path historically did) lets a downstream document-scoped
+    // operator observe the same boundaries the non-fused Transform arm
+    // preserves; punctuations are O(1) per document, so they stay tiny
+    // next to the record stream — no per-record clone.
     let mut output_records: Vec<(Record, u64)> = Vec::new();
+    let mut forwarded_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
     let mut count: u64 = 0;
     let mut records_since_check: u32 = 0;
-    loop {
-        let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
-            Some(t) => match rx.recv_timeout(t) {
-                Ok(item) => Some(item),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    ctx.watermarks
-                        .mark_idle(source_name_owned.as_str(), &last_file);
-                    continue;
+    // The batcher's sink either streams each flushed batch to the Output
+    // thread (back-pressured `send`, bounding inter-stage memory to one
+    // batch) or, in materialized mode, splits the batch into the
+    // records-only accumulator (the input to the window/region helpers)
+    // and the punctuation list. A send error or accumulation error
+    // bubbles out through `loop_result`. The closure owns
+    // `streaming_sender` by value so the bounded channel's sender drops
+    // when the batcher drops — clean exit then disconnects the writer
+    // thread's `recv` loop and triggers its flush.
+    let mut event_batcher = crate::executor::batch_handoff::EventBatcher::new(
+        batch_size,
+        |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
+            if let Some(tx) = streaming_sender.as_ref() {
+                for event in batch.into_events() {
+                    // Bounded blocking `send`: a slow writer thread blocks
+                    // this producer here, stalling the fused Source recv
+                    // loop and letting the ingest channel fill — the
+                    // back-pressure pivot. A send error means the writer
+                    // dropped its receiver (it panicked or hit an error
+                    // path), so the streaming chain is broken; surface it
+                    // rather than silently dropping the record.
+                    tx.send(event).map_err(|_| PipelineError::Internal {
+                        op: "executor",
+                        node: String::from("fused-transform-stream"),
+                        detail: String::from(
+                            "streaming Output writer task dropped its receiver \
+                             before the fused Transform arm finished",
+                        ),
+                    })?;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
-            },
-            None => rx.recv().ok(),
-        };
-        // Transform-fused-with-Source: this path consumes the live
-        // Source channel directly and drives per-record CXL eval
-        // inline. Punctuations from the upstream Source's
-        // `DocumentOpen` / `DocumentClose` emissions are consumed
-        // here for now; forwarding them through the fused-Transform
-        // output to downstream operators is a follow-up filed under
-        // #91 backlog.
-        let (record, rn) = match item {
-            Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
-            Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
-            None => break,
-        };
-        last_file = source_file_arc_of(&record);
-        let mut rec = canonicalize(&record);
-        if has_record_seed {
-            rec.seed_record_vars(ctx.record_var_seed);
-        }
-        seed_source_vars_for_record(ctx, source_name_owned.as_str(), &rec)?;
-        if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
-            *slot += 1;
-        }
-        count += 1;
-        records_since_check += 1;
-        if records_since_check >= 1024 {
-            records_since_check = 0;
-            ctx.check_shutdown()?;
-        }
-
-        if let Some(exp) = expected_input.as_ref() {
-            check_input_schema(exp, rec.schema(), name, "transform", &upstream_name)?;
-        }
-
-        if let Some(evaluator) = evaluator_opt.as_mut() {
-            let source_file_arc = Arc::clone(&last_file);
-            let rec_source_name_arc = source_name_arc_of(&rec);
-            let eval_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &source_file_arc,
-                source_row: rn,
-                source_path: &source_file_arc,
-                source_count: ctx.source_count_by_name(&rec_source_name_arc),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &rec_source_name_arc,
-                doc_ctx: rec.doc_ctx(),
-            };
-            let target_schema = output_schema
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| Arc::clone(rec.schema()));
-            let eval_result = {
-                let _guard = ctx.transform_timer.guard();
-                evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
-            };
-            match eval_result {
-                Ok(records) => {
-                    if records.is_empty() {
-                        // No-record outcome (e.g. emit_each on Null source);
-                        // still advance the cursor to keep watermarks live.
-                        advance_cursor(ctx, &source_name_arc_of(&rec), rn);
-                    } else {
-                        let mut emitted_any = false;
-                        for (modified_record, status) in records {
-                            match status {
-                                Ok(()) => {
-                                    let advance_source = source_name_arc_of(&modified_record);
-                                    output_records.push((modified_record, rn));
-                                    advance_cursor(ctx, &advance_source, rn);
-                                    emitted_any = true;
-                                }
-                                Err(SkipReason::Filtered) => {
-                                    ctx.counters.filtered_count += 1;
-                                }
-                                Err(SkipReason::Duplicate) => {
-                                    ctx.counters.distinct_count += 1;
-                                }
-                            }
-                        }
-                        if !emitted_any {
-                            advance_cursor(ctx, &source_name_arc_of(&rec), rn);
-                        }
+                return Ok(());
+            }
+            for event in batch.into_events() {
+                match event {
+                    crate::executor::stream_event::StreamEvent::Record(r, rn) => {
+                        output_records.push((r, rn));
+                    }
+                    crate::executor::stream_event::StreamEvent::Punctuation(p) => {
+                        forwarded_puncts.push(p);
                     }
                 }
-                Err((transform_name, eval_err)) => {
-                    dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
-                }
             }
-        } else {
-            // Transform has no compiled CXL — passthrough behavior
-            // mirrors the buffered arm's `transform_by_name.get` miss
-            // at the top of the existing path.
-            let advance_source = source_name_arc_of(&rec);
-            output_records.push((rec, rn));
-            advance_cursor(ctx, &advance_source, rn);
+            Ok(())
+        },
+    );
+    let loop_result: Result<(), PipelineError> = (|| {
+        loop {
+            let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
+                Some(t) => match rx.recv_timeout(t) {
+                    Ok(item) => Some(item),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        ctx.watermarks
+                            .mark_idle(source_name_owned.as_str(), &last_file);
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+                },
+                None => rx.recv().ok(),
+            };
+            // Transform-fused-with-Source: this path consumes the live
+            // Source channel directly and drives per-record CXL eval
+            // inline. A document-boundary punctuation forwards verbatim onto
+            // this stage's output event stream at the position it arrived,
+            // so a downstream document-scoped operator observes the same
+            // boundaries the non-fused Transform arm preserves. Because it is
+            // appended in arrival order, a `DocumentClose` stays after the
+            // last record of its own document even when a multi-file Source
+            // interleaves several documents through this one fused Transform.
+            let (record, rn) = match item {
+                Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
+                Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                    event_batcher.push_punctuation(p)?;
+                    continue;
+                }
+                None => break,
+            };
+            last_file = source_file_arc_of(&record);
+            let mut rec = canonicalize(&record);
+            if has_record_seed {
+                rec.seed_record_vars(ctx.record_var_seed);
+            }
+            seed_source_vars_for_record(ctx, source_name_owned.as_str(), &rec)?;
+            if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
+                *slot += 1;
+            }
+            count += 1;
+            records_since_check += 1;
+            if records_since_check >= 1024 {
+                records_since_check = 0;
+                ctx.check_shutdown()?;
+            }
+
+            if let Some(exp) = expected_input.as_ref() {
+                check_input_schema(exp, rec.schema(), name, "transform", &upstream_name)?;
+            }
+
+            if let Some(evaluator) = evaluator_opt.as_mut() {
+                let source_file_arc = Arc::clone(&last_file);
+                let rec_source_name_arc = source_name_arc_of(&rec);
+                let eval_ctx = EvalContext {
+                    stable: ctx.stable,
+                    source_file: &source_file_arc,
+                    source_row: rn,
+                    source_path: &source_file_arc,
+                    source_count: ctx.source_count_by_name(&rec_source_name_arc),
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: &rec_source_name_arc,
+                    doc_ctx: rec.doc_ctx(),
+                };
+                let target_schema = output_schema
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(rec.schema()));
+                let eval_result = {
+                    let _guard = ctx.transform_timer.guard();
+                    evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
+                };
+                match eval_result {
+                    Ok(records) => {
+                        if records.is_empty() {
+                            // No-record outcome (e.g. emit_each on Null source);
+                            // still advance the cursor to keep watermarks live.
+                            advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                        } else {
+                            let mut emitted_any = false;
+                            for (modified_record, status) in records {
+                                match status {
+                                    Ok(()) => {
+                                        let advance_source = source_name_arc_of(&modified_record);
+                                        event_batcher.push_record(modified_record, rn)?;
+                                        advance_cursor(ctx, &advance_source, rn);
+                                        emitted_any = true;
+                                    }
+                                    Err(SkipReason::Filtered) => {
+                                        ctx.counters.filtered_count += 1;
+                                    }
+                                    Err(SkipReason::Duplicate) => {
+                                        ctx.counters.distinct_count += 1;
+                                    }
+                                }
+                            }
+                            if !emitted_any {
+                                advance_cursor(ctx, &source_name_arc_of(&rec), rn);
+                            }
+                        }
+                    }
+                    Err((transform_name, eval_err)) => {
+                        dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
+                    }
+                }
+            } else {
+                // Transform has no compiled CXL — passthrough behavior
+                // mirrors the buffered arm's `transform_by_name.get` miss
+                // at the top of the existing path.
+                let advance_source = source_name_arc_of(&rec);
+                event_batcher.push_record(rec, rn)?;
+                advance_cursor(ctx, &advance_source, rn);
+            }
         }
-    }
+        Ok(())
+    })();
+    // Surface a loop error first (the originating failure), then flush the
+    // trailing partial batch. `finish` consumes the batcher, dropping the
+    // streaming sender (clean-exit disconnect of the writer thread) or
+    // releasing the borrow of `output_records` for the materialized-path
+    // helper calls below; on the loop-error path the batcher drops here
+    // instead, which also drops the sender / releases the borrow.
+    loop_result?;
+    event_batcher.finish()?;
     ctx.finalize_source_count(&source_name_arc, count);
     if timeout.is_some() && ctx.watermarks.is_idle(source_name_owned.as_str()) {
         tracing::debug!(
@@ -2227,6 +2358,17 @@ pub(crate) fn transform_fused_consume(
         );
     }
 
+    // Streaming mode already handed every record to the Output thread over
+    // the bounded channel; it admits no `node_buffers` slot, so peak
+    // inter-stage memory for this stage is one batch rather than the whole
+    // output. The window-root / region-tee helpers are skipped because a
+    // streaming-eligible Transform roots no node-anchored window and tees
+    // to no deferred region (enforced by `streaming_output_producer`), and
+    // `output_records` is empty in this mode anyway.
+    if streaming {
+        return Ok(());
+    }
+
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
     let nb = admit_node_buffer(
@@ -2234,7 +2376,7 @@ pub(crate) fn transform_fused_consume(
         name,
         node_idx,
         output_records,
-        Vec::new(),
+        forwarded_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
     ctx.node_buffers.insert(node_idx, nb);

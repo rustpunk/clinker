@@ -64,6 +64,17 @@ pub struct PipelineMeta {
     /// backpressure policy).
     #[serde(default, skip_serializing_if = "MemoryConfig::is_default")]
     pub memory: MemoryConfig,
+    /// Per-batch event count for streaming inter-stage handoff. Bounds
+    /// how many records (plus document-boundary punctuations) a
+    /// streaming-eligible stage accumulates before charging and handing
+    /// off one batch, so peak inter-stage memory is one batch rather than
+    /// the whole stage. `None` (omitted) falls back to
+    /// [`crate::executor::batch_handoff::DEFAULT_BATCH_SIZE`]; an explicit
+    /// `0` is rejected at config validation (a zero batch never flushes).
+    /// A per-Transform `batch_size` on `TransformBody` overrides this for
+    /// that one stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<usize>,
     /// Static configuration knobs read via `$vars.<key>`. Flat top-level
     /// shape: `vars: { fuzzy_threshold: { type: float, default: 0.85 } }`.
     /// Channel-overridable, frozen at pipeline start. No producer; no
@@ -4141,6 +4152,30 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
                     }
                 }
             }
+        }
+    }
+
+    // Reject a zero `batch_size` at both the pipeline level and any
+    // per-Transform override: a zero-event batch never flushes, so it
+    // would accumulate a whole stage in memory — the inverse of the
+    // streaming handoff's purpose. Omitting the knob (`None`) inherits
+    // the built-in default and is the common case.
+    if config.pipeline.batch_size == Some(0) {
+        return Err(ConfigError::Validation(
+            "pipeline.batch_size must be >= 1 (omit it to use the default)".to_string(),
+        ));
+    }
+    for spanned in &config.nodes {
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &spanned.value
+            && body.batch_size == Some(0)
+        {
+            return Err(ConfigError::Validation(format!(
+                "transform '{}': batch_size must be >= 1 (omit it to inherit pipeline.batch_size)",
+                header.name,
+            )));
         }
     }
 

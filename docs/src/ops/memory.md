@@ -82,6 +82,18 @@ The `arbitration:` line shows the composed policy name. A pipeline with `backpre
 - **Two parallel Aggregate stages, one much larger than the other** → consider `both`. `BackPressurePreferred -> LargestFirst` pauses where it can, then targets the dominant Aggregate for spill, freeing the most headroom per spill call.
 - **Pure react-only with deterministic priority** → `spill`. Pauses are disabled; the arbitrator picks the cheapest-to-spill consumer (`node_buffers` before grace-hash before sort before Aggregate) every time. Closest to the pre-arbitrator behavior.
 
+## Streaming batch size (`batch_size`)
+
+`pipeline.batch_size` sets how many events (records plus document-boundary punctuations) a streaming-eligible stage accumulates before handing off one batch to its downstream consumer over a back-pressured channel. It bounds a streaming stage's in-flight working set to one batch rather than the whole stage. The knob is optional; omit it to use the built-in default of 2048 events.
+
+```yaml
+pipeline:
+  name: orders_rollup
+  batch_size: 1024          # optional; default 2048
+```
+
+A per-transform override is available on a Transform's `config.batch_size` (see [Transform Nodes](../pipeline/transform.md#batch-size-batch_size)); it takes precedence over the pipeline value for that one stage. A `batch_size` of `0` is rejected at config load. The knob affects only the memory *profile* of streaming stages, never their output — blocking stages (sort, hash Aggregate, Combine build side) ignore it and continue to fully materialize. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the full model.
+
 ## How it works
 
 Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, `node_buffers` slots, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion.

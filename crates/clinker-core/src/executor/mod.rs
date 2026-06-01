@@ -1,5 +1,6 @@
 pub mod stage_metrics;
 
+pub(crate) mod batch_handoff;
 pub mod combine;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
@@ -1460,6 +1461,7 @@ impl PipelineExecutor {
             plan,
             config,
             &fused_sources,
+            &fused_transforms,
             &init_phase_set,
             &output_configs,
             &writers,
@@ -1484,7 +1486,7 @@ impl PipelineExecutor {
             // #67) — the same bound paces both ends of the pipeline.
             let (tx, rx) =
                 crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
-            let merge_idx = spec.merge_idx;
+            let producer_idx = spec.producer_idx;
             let output_idx = spec.output_idx;
             let output_name = spec.output_name.clone();
             let handle = std::thread::Builder::new()
@@ -1495,7 +1497,7 @@ impl PipelineExecutor {
                     node: output_name,
                     detail: format!("failed to spawn streaming output thread: {e}"),
                 })?;
-            streaming_output_senders.insert(merge_idx, tx);
+            streaming_output_senders.insert(producer_idx, tx);
             streaming_output_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
         }
@@ -1562,6 +1564,10 @@ impl PipelineExecutor {
             kernel_pool,
             shutdown_token: params.shutdown_token.clone(),
             interrupted: false,
+            batch_size: config
+                .pipeline
+                .batch_size
+                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2909,40 +2915,252 @@ pub(crate) fn compute_transform_fused_sources(
     (extra_fused_sources, fused_transforms)
 }
 
-/// Identify fused `Merge.interleave` → single `Output` chains eligible for
-/// per-record streaming writes (issue #72). The buffered Output arm waits
-/// until the Merge arm has produced every record before invoking the
-/// writer; under a slow upstream Source this defeats the live back-
-/// pressure #67 delivered, because every record sits in
-/// `ctx.node_buffers[merge_idx]` until the Merge finishes.
+/// Per-node inter-stage materialization class.
 ///
-/// The streaming path moves the Output's writer into a `std::thread`
-/// that consumes from a bounded crossbeam channel populated by the
-/// fused Merge arm. The Output arm becomes a no-op at its topo turn;
-/// per-record `Writer::write_record` fires concurrently with Merge
-/// production, and back-pressure flows writer → Merge → Source.
+/// A `Streaming` stage's output bypasses a `ctx.node_buffers` slot: a
+/// sink (`Output`) that never admits a buffer, a fused `Source` whose
+/// receiver the downstream consumer takes directly, or a fused
+/// `Transform` that hands each bounded batch to a streaming Output thread
+/// over a back-pressured channel without admitting a slot. A
+/// `Materialized` stage's output crosses a `node_buffers` slot that
+/// registers a `NodeBufferConsumer` and is spill-eligible.
 ///
-/// Eligibility (every predicate must hold; otherwise the buffered path
-/// runs):
+/// The non-trivial verdict — whether a fused Transform streams — is
+/// decided by [`streaming_output_producer`], the one predicate both
+/// [`classify_stream_nodes`] (the `--explain` annotation) and
+/// [`compute_streaming_output_specs`] (the runtime sender install)
+/// consult. A Transform is `Streaming` here iff a streaming sender is
+/// installed for it at runtime, so the explain annotation can never drift
+/// from what the dispatcher does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamClass {
+    /// No `node_buffers` slot, no arbitrator charge, no spill.
+    Streaming,
+    /// Output crosses a `node_buffers` slot; spill-eligible.
+    Materialized,
+}
+
+/// Classify every node in `plan` as [`StreamClass::Streaming`] or
+/// [`StreamClass::Materialized`], derived from the same fusion analysis
+/// the runtime dispatch consumes.
 ///
-/// - The Output node has exactly one incoming edge, and that predecessor
-///   is a `PlanNode::Merge`.
-/// - The Merge is `mode: interleave` with every direct predecessor a
-///   `PlanNode::Source` (the [`compute_merge_interleave_fused_sources`]
-///   predicate — same membership the fused arm relies on).
-/// - The Merge has no other downstream consumer besides this one Output
-///   (no fan-out from the Merge).
+/// Streaming nodes:
+///
+/// - **Outputs**, unconditionally — sinks that write to their writer and
+///   never admit a `node_buffers` slot.
+/// - **Sources** whose name lands in either fused-source set
+///   (Merge.interleave fusion or single-Transform fusion). The Source
+///   dispatch arm returns without admitting a buffer; the downstream
+///   fused consumer takes the receiver directly.
+/// - A fused **Transform** whose single downstream is a streaming-
+///   eligible Output, as decided by [`streaming_output_producer`]. Such a
+///   Transform hands each bounded batch straight to the streaming Output
+///   thread over a back-pressured channel and never admits a
+///   `node_buffers` slot, so its peak inter-stage footprint is one batch
+///   rather than the whole stage. A fused Transform that feeds anything
+///   other than a streaming Output (a fan-out, a window root, a blocking
+///   operator) stays `Materialized`: it accumulates and admits its full
+///   output.
+///
+/// Everything else materializes.
+///
+/// Both `--explain` (plan-only, no live consumers) and the runtime
+/// dispatch call this — the dispatcher reads the same `Streaming` verdict
+/// for a fused Transform to decide whether to install a streaming sender,
+/// so the explain annotation can never disagree with the dispatcher. The
+/// returned map covers every `node_indices()` slot so callers can index
+/// it by `NodeIndex` directly.
+pub(crate) fn classify_stream_nodes(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    config: &PipelineConfig,
+) -> HashMap<petgraph::graph::NodeIndex, StreamClass> {
+    use crate::plan::execution::PlanNode;
+    let init_phase = compute_init_phase_node_set(plan);
+    let mut fused_sources = compute_merge_interleave_fused_sources(plan, config);
+    let (extra_fused_sources, fused_transforms) =
+        compute_transform_fused_sources(plan, &fused_sources, &init_phase);
+    fused_sources.extend(extra_fused_sources);
+
+    // Pipeline-wide correlation buffering routes every write through the
+    // CorrelationCommit terminal, so no Output streams. Mirrors the same
+    // short-circuit in `compute_streaming_output_specs` so the explain
+    // annotation matches the runtime spec computation.
+    let correlation_active = config.any_source_has_correlation_key();
+
+    // A fused Transform streams iff some streaming-eligible Output names
+    // it as its producer. Collect those producer indices once.
+    let streaming_producers: HashSet<petgraph::graph::NodeIndex> = if correlation_active {
+        HashSet::new()
+    } else {
+        plan.graph
+            .node_indices()
+            .filter_map(|output_idx| {
+                streaming_output_producer(
+                    plan,
+                    output_idx,
+                    &fused_sources,
+                    &fused_transforms,
+                    &init_phase,
+                )
+            })
+            .collect()
+    };
+
+    plan.graph
+        .node_indices()
+        .map(|idx| {
+            let class = match &plan.graph[idx] {
+                PlanNode::Output { .. } => StreamClass::Streaming,
+                PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
+                    StreamClass::Streaming
+                }
+                PlanNode::Transform { .. } if streaming_producers.contains(&idx) => {
+                    StreamClass::Streaming
+                }
+                _ => StreamClass::Materialized,
+            };
+            (idx, class)
+        })
+        .collect()
+}
+
+/// Resolve the streaming producer for an `Output` node, or `None` when
+/// the Output is not streaming-eligible.
+///
+/// A streaming Output's writer moves into a `std::thread` that consumes a
+/// bounded crossbeam channel; the producer arm sends records into that
+/// channel as it produces them, so back-pressure flows writer → producer
+/// → Source and no inter-stage `node_buffers` slot is charged. Two
+/// producer topologies qualify, and this function is the single
+/// plan-derived eligibility predicate both the runtime spawn path
+/// ([`compute_streaming_output_specs`]) and the `--explain` buffer-class
+/// annotation ([`classify_stream_nodes`]) consult, so the explain
+/// annotation can never disagree with what the dispatcher does.
+///
+/// Common eligibility (independent of producer kind):
+///
+/// - The Output has exactly one incoming edge.
 /// - The Output is not in the init-phase ancestor closure.
-/// - The Output's writer entry lives in `writers.single` (not
-///   `fan_out_writers` — splitting / per-source-file writers handle
-///   their own buffering).
-/// - The OutputConfig has no `split:` block — `SplittingWriter` owns its
-///   file rotation lifecycle and is incompatible with the streaming
-///   writer task.
-/// - Correlation buffering is inactive pipeline-wide
-///   (`!any_source_has_correlation_key`). The correlation path defers
-///   writes to [`PlanNode::CorrelationCommit`] which is incompatible
-///   with per-record write at Merge-arm time.
+/// - The Output is not a per-source-file fan-out writer and its config
+///   declares no `split:` block — both own their own writer lifecycle
+///   and are incompatible with the single streaming writer task.
+///
+/// Producer = fused `Merge.interleave` (issue #72):
+///
+/// - The predecessor is a `PlanNode::Merge` in `interleave` mode whose
+///   every direct predecessor is a fused Source, with exactly one
+///   outgoing edge (this Output).
+///
+/// Producer = fused `Source → Transform` (the bounded per-batch
+/// inter-stage handoff):
+///
+/// - The predecessor is a `PlanNode::Transform` that
+///   `compute_transform_fused_sources` classified as fused (its sole
+///   upstream is a single-outgoing Source it streams off directly), with
+///   exactly one outgoing edge (this Output).
+/// - The Transform roots no node-anchored window arena. A window rooted
+///   at this Transform needs the Transform's full output materialized to
+///   build the arena, so streaming would starve it; such a Transform
+///   stays on the buffered path.
+///
+/// Correlation buffering disables streaming pipeline-wide — the
+/// `CorrelationCommit` terminal owns the writes — so the caller short-
+/// circuits before calling this.
+fn streaming_output_producer(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    output_idx: petgraph::graph::NodeIndex,
+    fused_merge_sources: &HashSet<String>,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> Option<petgraph::graph::NodeIndex> {
+    use crate::plan::execution::PlanNode;
+
+    let PlanNode::Output { resolved, .. } = &plan.graph[output_idx] else {
+        return None;
+    };
+    let payload = resolved.as_deref()?;
+    if init_phase_set.contains(&output_idx) {
+        return None;
+    }
+    // Per-source-file fan-out and split writers own their own file
+    // rotation lifecycle and cannot share the single streaming writer
+    // task. Both are plan-derived so the explain and runtime surfaces
+    // agree without consulting the runtime writer registry.
+    if payload.fan_out_per_source_file || payload.output.split.is_some() {
+        return None;
+    }
+
+    // Exactly one incoming edge.
+    let mut incoming = plan
+        .graph
+        .neighbors_directed(output_idx, petgraph::Direction::Incoming);
+    let producer_idx = incoming.next()?;
+    if incoming.next().is_some() {
+        return None;
+    }
+
+    match &plan.graph[producer_idx] {
+        PlanNode::Merge { .. } => {
+            // Every Merge predecessor must be a fused Source, and the
+            // Merge must feed only this Output.
+            let merge_predecessors: Vec<_> = plan
+                .graph
+                .neighbors_directed(producer_idx, petgraph::Direction::Incoming)
+                .collect();
+            if merge_predecessors.is_empty() {
+                return None;
+            }
+            let all_fused = merge_predecessors.iter().all(|p| match &plan.graph[*p] {
+                PlanNode::Source { name, .. } => fused_merge_sources.contains(name),
+                _ => false,
+            });
+            if !all_fused || !has_single_outgoing(plan, producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Transform { .. } => {
+            // The Transform must be a fused Source→Transform that feeds
+            // only this Output and roots no node-anchored window arena.
+            if !fused_transforms.contains(&producer_idx) || !has_single_outgoing(plan, producer_idx)
+            {
+                return None;
+            }
+            let roots_window = plan.indices_to_build.iter().any(|spec| {
+                matches!(
+                    &spec.root,
+                    crate::plan::index::PlanIndexRoot::Node { upstream, .. }
+                        if *upstream == producer_idx
+                )
+            });
+            if roots_window {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        _ => None,
+    }
+}
+
+/// Identify fused producer → single `Output` chains eligible for
+/// streaming writes and build a [`StreamingOutputSpec`] for each.
+///
+/// The buffered Output arm waits until its producer has emitted every
+/// record before invoking the writer; under a slow upstream Source this
+/// defeats the live back-pressure the Source ingest channel delivers,
+/// because every record sits in the producer's `node_buffers` slot until
+/// the producer finishes. The streaming path moves the Output's writer
+/// into a `std::thread` that consumes a bounded crossbeam channel the
+/// producer arm fills as it produces; per-record `Writer::write_record`
+/// fires concurrently with production and back-pressure flows writer →
+/// producer → Source. The producer's output never crosses a
+/// `node_buffers` slot, so peak inter-stage memory for that stage is one
+/// bounded batch rather than its whole output.
+///
+/// Eligibility is decided by [`streaming_output_producer`] (the shared
+/// plan-derived predicate); this function adds the runtime writer-
+/// registry checks (the writer must be a registered single writer, not a
+/// fan-out) and packages the owned per-task metadata.
 ///
 /// Returns the list of streaming specs (one per qualifying Output). Empty
 /// for pipelines that don't match the topology, leaving every Output on
@@ -2952,6 +3170,7 @@ fn compute_streaming_output_specs(
     plan: &crate::plan::execution::ExecutionPlanDag,
     config: &PipelineConfig,
     fused_merge_sources: &HashSet<String>,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
     output_configs: &[OutputConfig],
     writers: &WriterRegistry,
@@ -2972,66 +3191,27 @@ fn compute_streaming_output_specs(
         else {
             continue;
         };
-        if init_phase_set.contains(&output_idx) {
-            continue;
-        }
-
-        // Exactly one incoming edge, and that predecessor is a Merge.
-        let mut incoming = plan
-            .graph
-            .neighbors_directed(output_idx, petgraph::Direction::Incoming);
-        let Some(merge_idx) = incoming.next() else {
-            continue;
-        };
-        if incoming.next().is_some() {
-            continue;
-        }
-        let PlanNode::Merge {
-            name: merge_name, ..
-        } = &plan.graph[merge_idx]
-        else {
+        let Some(producer_idx) = streaming_output_producer(
+            plan,
+            output_idx,
+            fused_merge_sources,
+            fused_transforms,
+            init_phase_set,
+        ) else {
             continue;
         };
 
-        // The Merge must be fused — every predecessor is a Source whose
-        // name appears in the fused-source set the Merge arm uses to
-        // run a live `crossbeam_channel::Select`.
-        let merge_predecessors: Vec<_> = plan
-            .graph
-            .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
-            .collect();
-        if merge_predecessors.is_empty() {
-            continue;
-        }
-        let all_fused_sources = merge_predecessors.iter().all(|p| match &plan.graph[*p] {
-            PlanNode::Source { name, .. } => fused_merge_sources.contains(name),
-            _ => false,
-        });
-        if !all_fused_sources {
-            continue;
-        }
-
-        // The Merge has exactly one outgoing edge (this Output). Anything
-        // else and the buffered path is needed so siblings still see the
-        // merged records via `node_buffers`.
-        if !has_single_outgoing(plan, merge_idx) {
-            continue;
-        }
-
-        // Output writer registry checks: must be a single writer, not a
-        // fan-out, and the OutputConfig must not declare a split block.
-        if !writers.single.contains_key(output_name) {
-            continue;
-        }
-        if writers.fan_out.contains_key(output_name) {
+        // Runtime writer-registry checks: the writer must be registered
+        // as a single writer, never a fan-out. (The plan-derived
+        // fan-out / split exclusions live in `streaming_output_producer`
+        // so the explain surface agrees; this is the runtime-only
+        // registry confirmation.)
+        if !writers.single.contains_key(output_name) || writers.fan_out.contains_key(output_name) {
             continue;
         }
         let Some(out_cfg) = output_configs.iter().find(|o| &o.name == output_name) else {
             continue;
         };
-        if out_cfg.split.is_some() {
-            continue;
-        }
 
         // Pre-compute the schema-check + projection metadata so the
         // spawned task carries owned `Arc<Schema>` / `Vec<String>` / the
@@ -3043,10 +3223,10 @@ fn compute_streaming_output_specs(
         let cxl_emit_names: Vec<String> = plan.graph[output_idx].cxl_emit_names_in(plan);
 
         specs.push(StreamingOutputSpec {
-            merge_idx,
+            producer_idx,
             output_idx,
             output_name: output_name.clone(),
-            merge_name: merge_name.clone(),
+            producer_name: plan.graph[producer_idx].name().to_string(),
             out_cfg: out_cfg.clone(),
             expected_input_schema,
             cxl_emit_names,
@@ -3060,16 +3240,21 @@ fn compute_streaming_output_specs(
 /// independently of the borrowed `&PipelineConfig` / `&ExecutionPlanDag`
 /// references that anchor the dispatcher's `ExecutorContext`.
 pub(crate) struct StreamingOutputSpec {
-    /// `NodeIndex` of the upstream `Merge` node. The Merge arm looks up
-    /// its sender in [`dispatch::ExecutorContext::streaming_output_senders`]
-    /// keyed by this index.
-    pub(crate) merge_idx: petgraph::graph::NodeIndex,
+    /// `NodeIndex` of the upstream producer node whose arm writes records
+    /// into the streaming channel — either a fused `Merge.interleave` or
+    /// a fused `Source → Transform`. The producer arm looks up its sender
+    /// in [`dispatch::ExecutorContext::streaming_output_senders`] keyed by
+    /// this index.
+    pub(crate) producer_idx: petgraph::graph::NodeIndex,
     /// `NodeIndex` of the downstream `Output` node. The Output arm
     /// short-circuits when its index appears in
     /// [`dispatch::ExecutorContext::streaming_output_nodes`].
     pub(crate) output_idx: petgraph::graph::NodeIndex,
     pub(crate) output_name: String,
-    pub(crate) merge_name: String,
+    /// Name of the upstream producer (`Merge` or fused `Transform`), used
+    /// as the upstream-node label in the streaming task's E314
+    /// schema-mismatch diagnostics.
+    pub(crate) producer_name: String,
     pub(crate) out_cfg: OutputConfig,
     /// Compile-time input schema for the Output; used by the streaming
     /// task to run the same `check_input_schema` invariant the buffered
@@ -3178,7 +3363,7 @@ fn streaming_output(
                 record.schema(),
                 &spec.output_name,
                 "output",
-                &spec.merge_name,
+                &spec.producer_name,
             )
         {
             out.errors.push(err);

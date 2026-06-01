@@ -59,6 +59,7 @@
 - [Validation & Dry Run](ops/validation.md)
 - [Explain Plans](ops/explain.md)
 - [Memory Tuning](ops/memory.md)
+- [Streaming vs. Blocking Stages](ops/streaming-vs-blocking.md)
 - [Metrics & Monitoring](ops/metrics.md)
 - [Exit Codes & Error Diagnosis](ops/exit-codes.md)
 - [Production Deployment](ops/deployment.md)
