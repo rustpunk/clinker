@@ -5,7 +5,7 @@ Every node in a pipeline plan is one of two kinds at runtime:
 - **Streaming** stages hand their output downstream in bounded batches over a back-pressured channel, never crossing an inter-stage buffer that charges the memory budget. The two *fused* streaming paths additionally hold at most one batch of in-flight events at a time, so their inter-stage memory does not grow with input size. The other streaming stages still build their own result before handing it off — streaming spares them the *second* copy into a charged buffer and overlaps the writer with downstream work, but their own working set is as large as a blocking stage's would be.
 - **Blocking** stages must see their whole input before they can produce any output. They accumulate state inside the memory budget and spill to disk when the soft threshold trips, rather than holding everything in RAM.
 
-This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice and never spill-eligible.
+This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
 
 ## Which stages stream
 
@@ -53,7 +53,7 @@ aggregation.dept_totals:
   buffer: materialized
 ```
 
-`buffer: streaming` marks a stage whose output is consumed without an inter-stage buffer; `buffer: materialized` marks a stage whose output crosses a `node_buffers` slot that charges the memory budget and is spill-eligible. The explain annotation is derived from the same classifier the executor uses at runtime, so what `--explain` reports is exactly what the dispatcher does. See [Explain Plans](explain.md) and [Memory Tuning](memory.md) for the arbitration model that rides alongside the buffer class.
+`buffer: streaming` marks a stage whose output is consumed without an inter-stage buffer — it charges the budget per in-flight batch and, on a single-consumer edge, spills those batches to disk under pressure; `buffer: materialized` marks a stage whose output crosses a `node_buffers` slot that charges the memory budget as one full-stage slot and spills the whole stage. Both classes are spill-eligible; they differ in granularity, not in whether they can spill. The explain annotation is derived from the same classifier the executor uses at runtime, so what `--explain` reports is exactly what the dispatcher does. See [Explain Plans](explain.md) and [Memory Tuning](memory.md) for the arbitration model that rides alongside the buffer class.
 
 ## Tuning the batch size
 

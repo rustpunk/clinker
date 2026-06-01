@@ -32,7 +32,12 @@
 //! is appended after that record in whichever batch it lands in, and no
 //! earlier batch can contain it.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::error::PipelineError;
 use crate::executor::stream_event::{Punctuation, StreamEvent};
+use crate::pipeline::memory::{BudgetCategory, ConsumerHandle, MemoryArbitrator};
 
 /// Default per-batch event count when no `pipeline.batch_size` knob and
 /// no per-Transform override is set.
@@ -77,6 +82,29 @@ impl EventBatch {
     /// Consume the batch into its event vector in arrival order.
     pub(crate) fn into_events(self) -> Vec<StreamEvent> {
         self.events
+    }
+
+    /// Heuristic in-memory footprint of the batch's records, mirroring
+    /// [`crate::executor::node_buffer::NodeBuffer::estimated_memory_bytes`]:
+    /// records contribute the shared
+    /// [`crate::executor::node_buffer::record_byte_cost`] per row,
+    /// punctuations contribute `0` (they are O(1) per document and never
+    /// spill). The streaming per-batch charge `add_bytes` this value into
+    /// the slot's [`crate::pipeline::memory::ConsumerHandle`] on flush so
+    /// the arbitrator sees "batches in flight," and the writer
+    /// `sub_bytes` the same amount on drain — the per-batch counterpart of
+    /// the full-stage `estimate_node_buffer_bytes` charge.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let column_count = self.events.iter().find_map(|e| match e {
+            StreamEvent::Record(r, _) => Some(r.schema().column_count()),
+            StreamEvent::Punctuation(_) => None,
+        });
+        let Some(column_count) = column_count else {
+            return 0;
+        };
+        let record_count = self.events.iter().filter(|e| e.is_record()).count();
+        crate::executor::node_buffer::record_byte_cost(column_count)
+            .saturating_mul(record_count as u64)
     }
 
     /// Append a record event, preserving arrival order.
@@ -183,6 +211,170 @@ where
     /// exhausted so the final under-full batch reaches the sink.
     pub(crate) fn finish(mut self) -> Result<(), E> {
         self.flush_current()
+    }
+}
+
+/// Per-batch arbitrator accounting for a streaming inter-stage handoff.
+///
+/// Where [`crate::executor::dispatch::admit_node_buffer`] charges a
+/// blocking stage's *entire* output as one `NodeBufferConsumer` slot, a
+/// streaming stage registers exactly one consumer wrapper for its logical
+/// slot and then drives this handle once per flushed [`EventBatch`]:
+///
+/// - **Charge on flush.** [`Self::charge_and_route`] adds the batch's
+///   [`EventBatch::estimated_bytes`] to the shared
+///   [`ConsumerHandle`] before the events leave the producer, so the
+///   arbitrator's `current_usage` for the slot reflects "batches in
+///   flight," never the whole stage.
+/// - **Discharge on consume.** The downstream writer thread holds a clone
+///   of the same `ConsumerHandle` and subtracts each consumed record's
+///   [`crate::executor::node_buffer::record_byte_cost`] as it drains, so
+///   the live count tracks exactly what is still buffered between the
+///   producer and the writer.
+///
+/// On a soft-threshold trip (`MemoryArbitrator::should_spill_self()`,
+/// which observes RSS without driving the pausing arbitration round) —
+/// and only when `spill_allowed` certifies the slot has a single drain
+/// consumer — the flushed batch's records round-trip through a
+/// `SpillFile<u64>` on disk instead of being held in the producer's
+/// working set: each maximal run of consecutive records is written out,
+/// re-read, and forwarded to the writer one at a time, relieving the
+/// in-memory peak for that batch. Punctuations are forwarded in place
+/// between the runs they separate, so the records-and-punctuations
+/// interleaving the producer emitted survives the spill round-trip
+/// byte-for-byte in arrival order — a `DocumentOpen` that frames a run
+/// still precedes that run's records, and a `DocumentClose` still trails
+/// them, exactly as on the in-memory path. `spill_allowed` is `false` for
+/// any slot whose consumer would reach `NodeBuffer::clone_memory_only`
+/// (multi-consumer fan-out / composition input-port edge), because that
+/// method panics on spill-backed variants.
+///
+/// One `StreamingChargeHandle` lives per producer slot for the slot's
+/// whole lifetime; the wrapper it pairs with is unregistered when the
+/// stream finishes.
+pub(crate) struct StreamingChargeHandle {
+    handle: Arc<ConsumerHandle>,
+    arbitrator: Arc<MemoryArbitrator>,
+    spill_root_path: Arc<Path>,
+    node_name: String,
+    spill_allowed: bool,
+}
+
+impl StreamingChargeHandle {
+    /// Construct a charge handle for one streaming producer slot.
+    ///
+    /// `handle` is the shared [`ConsumerHandle`] already registered with
+    /// the arbitrator as a `NodeBufferConsumer`; the same `Arc` is cloned
+    /// into the writer thread so the discharge side subtracts from the
+    /// counter this side adds to. `spill_allowed` mirrors
+    /// `dispatch::node_buffer_spill_allowed` for the slot.
+    pub(crate) fn new(
+        handle: Arc<ConsumerHandle>,
+        arbitrator: Arc<MemoryArbitrator>,
+        spill_root_path: Arc<Path>,
+        node_name: String,
+        spill_allowed: bool,
+    ) -> Self {
+        Self {
+            handle,
+            arbitrator,
+            spill_root_path,
+            node_name,
+            spill_allowed,
+        }
+    }
+
+    /// Charge one flushed batch against the arbitrator and route its
+    /// events downstream through `send`.
+    ///
+    /// Adds the batch's estimated bytes to the slot's handle and samples
+    /// the arbitrator's peak charged usage. When `spill_allowed` and the
+    /// soft RSS threshold has tripped, each maximal run of consecutive
+    /// records is spilled to a `SpillFile<u64>` and streamed back out from
+    /// disk one at a time (relieving the producer's in-memory peak for the
+    /// batch) with its spill bytes recorded against the disk quota; an
+    /// over-quota total surfaces the structured `MemoryBudgetExceeded`
+    /// shape with `detail: "spill quota exceeded"`. Punctuations are
+    /// forwarded in place between the runs they separate, so the spill path
+    /// emits the batch's events in the same arrival order the in-memory
+    /// path does — the records-and-punctuations interleaving the producer
+    /// built is preserved across the disk round-trip. Otherwise the events
+    /// go straight to `send` in memory.
+    ///
+    /// `send` is the producer's bounded-channel send; its blocking
+    /// back-pressure paces the producer when the writer falls behind.
+    pub(crate) fn charge_and_route(
+        &self,
+        batch: EventBatch,
+        mut send: impl FnMut(StreamEvent) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let bytes = batch.estimated_bytes();
+        self.handle.add_bytes(bytes);
+        self.arbitrator.sample_peak_consumer_usage();
+
+        if self.spill_allowed && self.arbitrator.should_spill_self() {
+            // Spill record *runs* in place rather than partitioning the
+            // batch into all-records-then-all-punctuations: a punctuation
+            // flushes the run that preceded it through disk and is then
+            // forwarded at its own offset, so a `[DocumentOpen, r0, r1,
+            // DocumentClose]` batch re-emits in that exact order instead of
+            // moving the open after the records it frames.
+            let mut run: Vec<(clinker_record::Record, u64)> = Vec::new();
+            for event in batch.into_events() {
+                match event {
+                    StreamEvent::Record(record, rn) => run.push((record, rn)),
+                    StreamEvent::Punctuation(p) => {
+                        self.spill_and_forward_run(std::mem::take(&mut run), &mut send)?;
+                        send(StreamEvent::punctuation(p))?;
+                    }
+                }
+            }
+            self.spill_and_forward_run(run, &mut send)?;
+            return Ok(());
+        }
+
+        for event in batch.into_events() {
+            send(event)?;
+        }
+        Ok(())
+    }
+
+    /// Spill one run of consecutive records to disk, then re-read and
+    /// forward them in order through `send`.
+    ///
+    /// The writer's discharge path stays uniform — it always sees
+    /// `StreamEvent::Record`s and subtracts their per-record cost
+    /// regardless of whether the batch round-tripped through disk. An
+    /// empty run is a no-op (no spill file). Records the spilled file's
+    /// on-disk size against the arbitrator's disk quota and surfaces
+    /// `MemoryBudgetExceeded` when the cumulative total exceeds the cap.
+    fn spill_and_forward_run(
+        &self,
+        run: Vec<(clinker_record::Record, u64)>,
+        send: &mut impl FnMut(StreamEvent) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let Some((file, _count)) = crate::executor::node_buffer_spill::spill_node_buffer(
+            run,
+            Some(self.spill_root_path.as_ref()),
+        )?
+        else {
+            return Ok(());
+        };
+        let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
+        if self.arbitrator.record_spill_bytes(file_bytes) {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: self.node_name.clone(),
+                used: self.arbitrator.cumulative_spill_bytes(),
+                limit: self.arbitrator.max_spill_bytes(),
+                source: BudgetCategory::NodeBuffer,
+                detail: Some("spill quota exceeded".to_string()),
+            });
+        }
+        for item in file.reader()? {
+            let (record, rn) = item?;
+            send(StreamEvent::record(record, rn))?;
+        }
+        Ok(())
     }
 }
 
@@ -358,6 +550,214 @@ mod tests {
         // Clamped to 1 → one record per batch.
         assert_eq!(sizes, vec![1, 1]);
         assert_eq!(flat.len(), 2);
+    }
+
+    #[test]
+    fn estimated_bytes_counts_records_only() {
+        let ctx = synthetic_document_context();
+        let mut batch = EventBatch::with_capacity(4);
+        // Empty batch and punctuation-only batch both cost zero.
+        assert_eq!(EventBatch::with_capacity(0).estimated_bytes(), 0);
+        batch.push_punctuation(Punctuation::document_open(Arc::clone(&ctx)));
+        assert_eq!(batch.estimated_bytes(), 0, "puncts contribute zero");
+        batch.push_record(rec(1), 1);
+        batch.push_record(rec(2), 2);
+        // Two records of a 1-column schema; punctuations still contribute 0.
+        let per_row = crate::executor::node_buffer::record_byte_cost(1);
+        assert_eq!(batch.estimated_bytes(), per_row * 2);
+    }
+
+    /// The streaming per-batch spill path round-trips a batch's records
+    /// through disk while preserving the full records-and-punctuations
+    /// interleaving — the leading `DocumentOpen` still precedes the run it
+    /// frames and the trailing `DocumentClose` still follows it — and
+    /// records the spill bytes against the arbitrator. Forces a
+    /// deterministic soft-threshold trip by pinning the arbitrator's limit
+    /// and peak RSS so `should_spill()` fires on every platform regardless
+    /// of `rss_bytes()` availability.
+    #[test]
+    fn charge_handle_spills_a_batch_preserving_order_and_close() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            Box::new(NoOpPolicy),
+        ));
+        // Force the soft threshold to trip unconditionally. The streaming
+        // charge path polls `should_spill_self` (no pausing round), so the
+        // precondition asserts that variant.
+        arbitrator.set_limit(1);
+        arbitrator.set_peak_rss_for_test(u64::MAX);
+        assert!(arbitrator.should_spill_self());
+
+        let spill_dir = tempfile::tempdir().expect("temp dir");
+        let spill_root: Arc<std::path::Path> = Arc::from(spill_dir.path());
+        let handle = ConsumerHandle::new();
+        let charge = StreamingChargeHandle::new(
+            handle.clone(),
+            Arc::clone(&arbitrator),
+            spill_root,
+            "stream-spill-test".to_string(),
+            true,
+        );
+
+        // One document: open, three records, close — at this batch size
+        // the whole document is one batch, so the close trails its records
+        // even after the records round-trip through the spill file.
+        let ctx = synthetic_document_context();
+        let mut batch = EventBatch::with_capacity(8);
+        batch.push_punctuation(Punctuation::document_open(Arc::clone(&ctx)));
+        for i in 0..3 {
+            batch.push_record(rec(i), i as u64);
+        }
+        batch.push_punctuation(Punctuation::document_close(Arc::clone(&ctx)));
+
+        let routed: Arc<std::sync::Mutex<Vec<StreamEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routed_sink = Arc::clone(&routed);
+        charge
+            .charge_and_route(batch, move |event| {
+                routed_sink.lock().unwrap().push(event);
+                Ok(())
+            })
+            .expect("charge_and_route on the spill path");
+
+        let out = Arc::try_unwrap(routed).unwrap().into_inner().unwrap();
+        // The spill path emits the same arrival order the in-memory path
+        // would: leading open, then the three records (re-read from the
+        // spill file in order), then the trailing close. The open frames
+        // the run it precedes and the close trails it — the substrate's
+        // strict-arrival-order invariant, preserved across the disk
+        // round-trip rather than collapsed to records-then-punctuations.
+        let record_rns: Vec<u64> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Record(_, rn) => Some(*rn),
+                StreamEvent::Punctuation(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            record_rns,
+            vec![0, 1, 2],
+            "spill round-trip preserved order"
+        );
+        let open_pos = out
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Punctuation(p) if p.kind() == PunctuationKind::DocumentOpen))
+            .expect("leading open forwarded at its arrival offset");
+        let close_pos = out
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Punctuation(p) if p.kind() == PunctuationKind::DocumentClose))
+            .expect("close forwarded after the spilled records");
+        let first_record_pos = out
+            .iter()
+            .position(|e| e.is_record())
+            .expect("records present");
+        let last_record_pos = out
+            .iter()
+            .rposition(|e| e.is_record())
+            .expect("records present");
+        assert!(
+            open_pos < first_record_pos,
+            "DocumentOpen must precede the records it frames across the spill round-trip"
+        );
+        assert!(
+            close_pos > last_record_pos,
+            "DocumentClose must trail every record across the spill round-trip"
+        );
+
+        // The arbitrator recorded the batch's spill to disk.
+        assert!(
+            arbitrator.cumulative_spill_bytes() > 0,
+            "the spilled batch must have recorded spill bytes"
+        );
+    }
+
+    /// A batch whose records are split into two runs by an interior
+    /// `Close`/`Open` pair re-emits each run in place across the spill
+    /// path: the two documents stay distinct and every event keeps its
+    /// arrival offset, proving the spill path spills record *runs* rather
+    /// than collapsing the batch to all-records-then-all-punctuations.
+    #[test]
+    fn charge_handle_spill_preserves_two_interleaved_document_runs() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            Box::new(NoOpPolicy),
+        ));
+        arbitrator.set_limit(1);
+        arbitrator.set_peak_rss_for_test(u64::MAX);
+        assert!(arbitrator.should_spill_self());
+
+        let spill_dir = tempfile::tempdir().expect("temp dir");
+        let spill_root: Arc<std::path::Path> = Arc::from(spill_dir.path());
+        let handle = ConsumerHandle::new();
+        let charge = StreamingChargeHandle::new(
+            handle.clone(),
+            Arc::clone(&arbitrator),
+            spill_root,
+            "stream-spill-two-docs".to_string(),
+            true,
+        );
+
+        // [Open(A), r0, r1, Close(A), Open(B), r2, Close(B)] — two record
+        // runs separated by the A-close / B-open boundary.
+        let doc_a = distinct_doc();
+        let doc_b = distinct_doc();
+        let mut batch = EventBatch::with_capacity(8);
+        batch.push_punctuation(Punctuation::document_open(Arc::clone(&doc_a)));
+        batch.push_record(rec(0), 0);
+        batch.push_record(rec(1), 1);
+        batch.push_punctuation(Punctuation::document_close(Arc::clone(&doc_a)));
+        batch.push_punctuation(Punctuation::document_open(Arc::clone(&doc_b)));
+        batch.push_record(rec(2), 2);
+        batch.push_punctuation(Punctuation::document_close(Arc::clone(&doc_b)));
+
+        let routed: Arc<std::sync::Mutex<Vec<StreamEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routed_sink = Arc::clone(&routed);
+        charge
+            .charge_and_route(batch, move |event| {
+                routed_sink.lock().unwrap().push(event);
+                Ok(())
+            })
+            .expect("charge_and_route on the spill path");
+
+        let out = Arc::try_unwrap(routed).unwrap().into_inner().unwrap();
+        // Flatten to a comparable shape: punctuations as (kind, doc_id),
+        // records as their row number, then assert the exact arrival order.
+        #[derive(Debug, PartialEq)]
+        enum Shape {
+            Open(DocumentId),
+            Close(DocumentId),
+            Rec(u64),
+        }
+        let shapes: Vec<Shape> = out
+            .iter()
+            .map(|e| match e {
+                StreamEvent::Record(_, rn) => Shape::Rec(*rn),
+                StreamEvent::Punctuation(p) => match p.kind() {
+                    PunctuationKind::DocumentOpen => Shape::Open(p.doc_id()),
+                    PunctuationKind::DocumentClose => Shape::Close(p.doc_id()),
+                },
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                Shape::Open(doc_a.id()),
+                Shape::Rec(0),
+                Shape::Rec(1),
+                Shape::Close(doc_a.id()),
+                Shape::Open(doc_b.id()),
+                Shape::Rec(2),
+                Shape::Close(doc_b.id()),
+            ],
+            "both record runs re-emit in place with their framing punctuations"
+        );
     }
 
     #[test]

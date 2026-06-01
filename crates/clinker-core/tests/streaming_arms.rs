@@ -178,6 +178,108 @@ nodes:
     assert_eq!(report.counters.dlq_count, 0);
 }
 
+/// A streaming stage flushes one batch at a time to disk on a
+/// soft-threshold trip instead of materializing the whole stage. A
+/// single-branch `Route → Output` streams its records through the slot's
+/// per-batch charge handle, whose `should_spill()` poll fires per flushed
+/// batch; under a 1 MiB budget the test process's own RSS crosses the
+/// 80 % soft floor, so each batch's records round-trip through a
+/// `SpillFile<u64>` (re-read and forwarded to the writer). The run
+/// completes — the streaming path never polls the hard-limit
+/// `should_abort`, so a tiny test budget spills rather than aborts, the
+/// same posture the materialized `route_fanout_soft_spill` test relies on.
+///
+/// Asserts every record is delivered in order and
+/// `cumulative_spill_bytes > 0`. The companion `route_fanout_soft_spill`
+/// pins the blocking full-stage spill path; the unit test
+/// `batch_handoff::charge_handle_spills_a_batch_preserving_order_and_close`
+/// pins the per-batch spill round-trip in isolation.
+///
+/// Skipped silently when `rss_bytes()` is unavailable — the spill
+/// predicate is RSS-based, so without it the path stays in memory.
+#[test]
+fn streaming_arm_soft_spills_under_one_megabyte_budget() {
+    if clinker_core::pipeline::memory::rss_bytes().is_none() {
+        return;
+    }
+
+    const ROWS: usize = 4_000;
+    let yaml = r#"
+pipeline:
+  name: streaming_route_soft_spill
+  batch_size: 128
+  memory: { limit: "1M" }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./orders.csv
+      options: { has_header: true }
+      schema:
+        - { name: id, type: string }
+        - { name: payload, type: string }
+        - { name: amount, type: int }
+  - type: route
+    name: r
+    input: orders
+    config:
+      mode: exclusive
+      conditions:
+        all: "true"
+      default: all
+  - type: output
+    name: out
+    input: r.all
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    // The Route is a streaming arm (single outgoing edge to the Output).
+    assert_streaming_to_output(&explain_of(&config, &plan), "route.r", "output.out");
+
+    let mut csv = String::from("id,payload,amount\n");
+    for i in 1..=ROWS {
+        csv.push_str(&format!("o-{i},payload_{i},{}\n", i * 10));
+    }
+    let readers: SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![fast_slot("orders", &csv)]),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("streaming soft-spill run must complete under a 1 MiB budget");
+
+    assert_eq!(
+        report.counters.total_count as usize, ROWS,
+        "total ingested row count must match the input"
+    );
+    assert_eq!(
+        body_lines(&buf).len(),
+        ROWS,
+        "every record must reach the Output even after batch spills"
+    );
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "a streaming pipeline under a 1 MiB budget must spill at least one \
+         batch; report.cumulative_spill_bytes = {}",
+        report.cumulative_spill_bytes,
+    );
+}
+
 /// A `Combine` resolving to the hash build-probe strategy whose sole
 /// downstream is a sink `Output` streams its probe-side emit; the build
 /// relation stays materialized in the hash table. Equi-join on

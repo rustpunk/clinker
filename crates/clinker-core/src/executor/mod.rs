@@ -253,6 +253,11 @@ pub(crate) struct DispatchOutcome {
     /// running total at dispatch close so an aborted run still
     /// reports the last committed value.
     pub(crate) cumulative_spill_bytes: u64,
+    /// High-water mark of `MemoryArbitrator::sum_consumer_usage()` sampled
+    /// at every streaming per-batch charge. A streaming stage's peak stays
+    /// bounded to one in-flight batch (plus the channel's bound), proving
+    /// the per-batch admit/discharge model never charges the whole stage.
+    pub(crate) peak_consumer_usage_bytes: u64,
     /// `true` when a chunk-boundary shutdown poll tripped and the topo
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
@@ -417,6 +422,13 @@ pub struct ExecutionReport {
     /// `MemoryArbitrator`'s running total at dispatch close; an aborted
     /// run still surfaces the last committed value.
     pub cumulative_spill_bytes: u64,
+    /// High-water mark of the arbitrator's summed pull-mode charged bytes
+    /// observed across streaming per-batch charges. For a streaming stage
+    /// this stays bounded to one in-flight batch (plus the bounded
+    /// channel's capacity) rather than the whole stage output — the
+    /// observable that proves the per-batch admit/discharge model. `0`
+    /// when no streaming charge fired (a fully materialized pipeline).
+    pub peak_consumer_usage_bytes: u64,
     /// `true` when the run unwound early because a shutdown signal
     /// (SIGINT/SIGTERM, or a programmatic request) tripped the run's
     /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to
@@ -1100,6 +1112,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
             interrupted,
         } = Self::execute_dag(
             config,
@@ -1193,6 +1206,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
             interrupted,
         })
     }
@@ -1485,6 +1499,13 @@ impl PipelineExecutor {
         let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
             Vec::new();
+        let mut streaming_charge_consumers: HashMap<
+            petgraph::graph::NodeIndex,
+            (
+                crate::pipeline::memory::ConsumerId,
+                Arc<crate::pipeline::memory::ConsumerHandle>,
+            ),
+        > = HashMap::new();
         for spec in streaming_specs {
             let raw_writer = writers
                 .single
@@ -1501,9 +1522,23 @@ impl PipelineExecutor {
             let producer_idx = spec.producer_idx;
             let output_idx = spec.output_idx;
             let output_name = spec.output_name.clone();
+            // Register exactly one charge consumer per streaming slot. The
+            // producer arm `add_bytes` each flushed batch into this
+            // handle; the writer thread holds a clone and `sub_bytes` each
+            // consumed record, so the live count is "batches in flight,"
+            // never the whole stage. `can_back_pressure` is conservatively
+            // false: the bounded channel already paces the producer, and
+            // the static pause-reachability analysis that would let the
+            // arbitrator prefer pausing this slot over spilling has not
+            // landed — matching `admit_node_buffer`'s posture.
+            let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
+            let charge_consumer_id = memory_budget.register_consumer(Arc::new(
+                crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+            ));
+            let writer_charge_handle = charge_handle.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
-                .spawn(move || streaming_output(rx, raw_writer, spec))
+                .spawn(move || streaming_output(rx, raw_writer, spec, writer_charge_handle))
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",
                     node: output_name,
@@ -1512,6 +1547,7 @@ impl PipelineExecutor {
             streaming_output_senders.insert(producer_idx, tx);
             streaming_output_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
+            streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
 
         let mut ctx = dispatch::ExecutorContext {
@@ -1573,6 +1609,7 @@ impl PipelineExecutor {
             streaming_output_senders,
             streaming_output_nodes,
             streaming_output_tasks,
+            streaming_charge_consumers,
             kernel_pool,
             shutdown_token: params.shutdown_token.clone(),
             interrupted: false,
@@ -1653,6 +1690,16 @@ impl PipelineExecutor {
                     });
                 }
             }
+        }
+
+        // Every streaming writer has joined, so its discharge is
+        // complete and no more batches will charge these slots.
+        // Unregister each per-slot charge consumer so the arbitrator's
+        // registry does not outlive the run with a stale wrapper reading
+        // zero forever. The peak charged usage was already sampled at the
+        // producer-side charges, so the report read survives this.
+        for (_, (id, _)) in std::mem::take(&mut ctx.streaming_charge_consumers) {
+            ctx.memory_budget.unregister_consumer(id);
         }
 
         // A tripped shutdown token unwinds the walk via
@@ -1759,6 +1806,7 @@ impl PipelineExecutor {
             .collect();
 
         let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
+        let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
         let interrupted = ctx.interrupted;
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
@@ -1769,6 +1817,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
             interrupted,
         })
     }
@@ -3434,6 +3483,7 @@ fn streaming_output(
     rx: crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingOutputSpec,
+    charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> StreamingOutputTaskOutput {
     use crate::projection::project_output_from_record;
 
@@ -3467,6 +3517,17 @@ fn streaming_output(
             crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
             crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,
         };
+        // Discharge this record's per-row cost from the shared charge
+        // handle — the consume half of the per-batch admit/discharge
+        // model. The producer charged the whole batch's
+        // `EventBatch::estimated_bytes` on flush; subtracting each
+        // record's `record_byte_cost` as it drains keeps the slot's live
+        // count tracking exactly what is still buffered between producer
+        // and writer. The formula matches the producer's charge, so a
+        // fully-drained stream nets the counter back to zero.
+        charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
+            record.schema().column_count(),
+        ));
         if let Some(expected) = spec.expected_input_schema.as_ref()
             && let Err(err) = crate::executor::schema_check::check_input_schema(
                 expected,
@@ -3513,6 +3574,11 @@ fn streaming_output(
                     // even when the writer is dead, otherwise the Merge
                     // producer blocks forever on a full bounded channel.
                     while rx.recv().is_ok() {}
+                    // Nothing is buffered downstream once the channel
+                    // drains, so zero the slot's charge unconditionally —
+                    // the error path never discharged the records it
+                    // dropped on the floor above.
+                    charge_handle.set_bytes(0);
                     return out;
                 }
             }
@@ -3534,6 +3600,7 @@ fn streaming_output(
             Err(e) => {
                 out.errors.push(PipelineError::from(e));
                 while rx.recv().is_ok() {}
+                charge_handle.set_bytes(0);
                 return out;
             }
         }
@@ -3556,6 +3623,12 @@ fn streaming_output(
             out.errors.push(PipelineError::from(e));
         }
     }
+    // The channel is fully drained, so nothing is in flight; the
+    // per-record discharge above should have zeroed the counter already.
+    // Pin it to zero defensively so a heuristic mismatch between the
+    // batch charge and the per-record discharge can never leave a stale
+    // positive charge for the post-join arbitrator read.
+    charge_handle.set_bytes(0);
     out
 }
 

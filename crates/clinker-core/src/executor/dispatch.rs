@@ -946,6 +946,23 @@ pub(crate) struct ExecutorContext<'a> {
     /// https://github.com/rustpunk/clinker/issues/72.
     pub(crate) streaming_output_senders:
         HashMap<NodeIndex, crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
+    /// Per-streaming-producer-slot arbitrator registration. One
+    /// `NodeBufferConsumer` is registered per logical streaming slot at
+    /// executor entry (keyed by the producer's `NodeIndex`); its shared
+    /// [`crate::pipeline::memory::ConsumerHandle`] is the per-batch charge
+    /// counter the producer arm `add_bytes` into on flush and the writer
+    /// thread `sub_bytes` out of on drain. Exactly one wrapper per slot so
+    /// `sum_consumer_usage` never double-counts a streaming stage. The
+    /// `ConsumerId` is unregistered at the end-of-DAG writer join, after
+    /// the writer's discharge has completed. Empty for pipelines with no
+    /// streaming chain.
+    pub(crate) streaming_charge_consumers: HashMap<
+        NodeIndex,
+        (
+            crate::pipeline::memory::ConsumerId,
+            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
     /// `Output` `NodeIndex`es whose writes are streamed by a task
     /// spawned at executor entry. The `Output` dispatch arm short-
     /// circuits at the top when its index is in this set — the writer
@@ -1109,6 +1126,33 @@ impl ExecutorContext<'_> {
             return None;
         }
         self.streaming_output_senders.remove(&node_idx)
+    }
+
+    /// Build the [`crate::executor::batch_handoff::StreamingChargeHandle`]
+    /// for the streaming producer slot at `node_idx`, if one was
+    /// registered at executor entry.
+    ///
+    /// The slot's `NodeBufferConsumer` wrapper and its shared
+    /// `ConsumerHandle` are installed once per streaming spec; this clones
+    /// the handle into a charge handle the producer arm drives per flushed
+    /// batch. `spill_allowed` is computed by the caller via
+    /// [`node_buffer_spill_allowed`] so a future multi-consumer streaming
+    /// topology cannot spill a batch into a slot whose consumer would hit
+    /// `NodeBuffer::clone_memory_only`.
+    pub(crate) fn streaming_charge_handle(
+        &self,
+        node_idx: NodeIndex,
+        node_name: &str,
+        spill_allowed: bool,
+    ) -> Option<crate::executor::batch_handoff::StreamingChargeHandle> {
+        let (_id, handle) = self.streaming_charge_consumers.get(&node_idx)?;
+        Some(crate::executor::batch_handoff::StreamingChargeHandle::new(
+            std::sync::Arc::clone(handle),
+            std::sync::Arc::clone(&self.memory_budget),
+            std::sync::Arc::clone(&self.spill_root_path),
+            node_name.to_string(),
+            spill_allowed,
+        ))
     }
 
     /// Resolve the streaming-handoff batch size for the Transform named
@@ -1382,9 +1426,8 @@ fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
     let Some((first, _)) = rows.first() else {
         return 0;
     };
-    let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
-        + std::mem::size_of::<(Record, u64)>();
-    (row_bytes as u64).saturating_mul(rows.len() as u64)
+    crate::executor::node_buffer::record_byte_cost(first.schema().column_count())
+        .saturating_mul(rows.len() as u64)
 }
 
 /// Predicate: does the topology at `slot_key` permit a soft-threshold
@@ -1552,45 +1595,50 @@ pub(crate) fn admit_node_buffer(
 /// node's work. (The fused Source→Transform→Output and fused
 /// Merge.interleave paths are the true one-batch-bounded streamers; they
 /// pull record-by-record off a live channel and never build a full result
-/// Vec — they do not call this helper.) Per-batch inter-stage charge
-/// accounting for these handoffs is a separate follow-up.
+/// Vec — they do not call this helper.)
 ///
 /// Each record is pushed through an [`EventBatcher`] sized at
-/// `batch_size`; a full batch sends its events to the writer thread,
-/// whose bounded `send` is the back-pressure pivot — a slow writer stalls
-/// this producer and lets upstream channels fill. Punctuations follow the
-/// records (a terminal `Output` consumes punctuations, so their relative
-/// position past the records is immaterial to the sink, and the within-
-/// records order — the FIFO the writer observes — is preserved by the
-/// batcher's append-only cut). Callers reach this only when
-/// [`super::streaming_output_producer`] certified the producer roots no
-/// window and tees to no deferred region, so no materialized-tail
-/// bookkeeping is skipped that a downstream stage depends on.
+/// `batch_size`; a full batch is routed through `charge` — the slot's
+/// [`crate::executor::batch_handoff::StreamingChargeHandle`] — which
+/// `add_bytes` the batch's footprint to the slot's arbitrator wrapper,
+/// optionally spills the batch to disk on a soft-threshold trip (when the
+/// slot has a single drain consumer), and then sends the events to the
+/// writer thread. The writer discharges each record on drain, so the live
+/// charge is "batches in flight," never the whole stage. The bounded
+/// `send` inside the charge handle is the back-pressure pivot — a slow
+/// writer stalls this producer and lets upstream channels fill.
+/// Punctuations follow the records (a terminal `Output` consumes
+/// punctuations, so their relative position past the records is immaterial
+/// to the sink, and the within-records order — the FIFO the writer
+/// observes — is preserved by the batcher's append-only cut). Callers
+/// reach this only when [`super::streaming_output_producer`] certified the
+/// producer roots no window and tees to no deferred region, so no
+/// materialized-tail bookkeeping is skipped that a downstream stage
+/// depends on.
 fn stream_linear_producer_emit(
     sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     batch_size: usize,
     node_name: &str,
     rows: Vec<(Record, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
+    charge: &crate::executor::batch_handoff::StreamingChargeHandle,
 ) -> Result<(), PipelineError> {
-    let send_event =
-        |event: crate::executor::stream_event::StreamEvent| -> Result<(), PipelineError> {
-            sender.send(event).map_err(|_| PipelineError::Internal {
-                op: "executor",
-                node: node_name.to_string(),
-                detail: String::from(
-                    "streaming Output writer task dropped its receiver before the \
-                 streaming producer arm finished",
-                ),
-            })
-        };
     let mut batcher = crate::executor::batch_handoff::EventBatcher::new(
         batch_size,
         |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
-            for event in batch.into_events() {
-                send_event(event)?;
-            }
-            Ok(())
+            charge.charge_and_route(
+                batch,
+                |event: crate::executor::stream_event::StreamEvent| {
+                    sender.send(event).map_err(|_| PipelineError::Internal {
+                        op: "executor",
+                        node: node_name.to_string(),
+                        detail: String::from(
+                            "streaming Output writer task dropped its receiver before \
+                             the streaming producer arm finished",
+                        ),
+                    })
+                },
+            )
         },
     );
     for (record, rn) in rows {
@@ -1926,13 +1974,26 @@ pub(crate) fn finalize_node_rooted_windows(
 /// non-streaming mode (`None`) it returns the accumulated
 /// `Vec<(Record, u64)>` that the Merge arm then teed into
 /// `node_buffers` for downstream consumers.
+/// Streaming handoff bundle for the fused `Merge.interleave` arm: the
+/// bounded-channel sender to the writer thread, the slot's per-batch
+/// charge handle, and the flush batch size. Present only when a single
+/// streaming-eligible Output downstream of the Merge installed its sender;
+/// absent on the materialized path (the arm accumulates a full `merged`
+/// Vec instead). Bundled into one struct so the arm's signature stays
+/// under the argument-count lint.
+pub(crate) struct MergeStreamHandoff<'a> {
+    pub(crate) sender: crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    pub(crate) charge: &'a crate::executor::batch_handoff::StreamingChargeHandle,
+    pub(crate) batch_size: usize,
+}
+
 pub(crate) fn merge_fused_interleave(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     merge_name: &str,
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
-    streaming_sender: Option<crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
+    streaming: Option<MergeStreamHandoff<'_>>,
 ) -> Result<Vec<(Record, u64)>, PipelineError> {
     // Per-predecessor state: the source's plan-time schema, its
     // engine-stamped tail mapping, its `Arc<str>` name (used for
@@ -1989,6 +2050,16 @@ pub(crate) fn merge_fused_interleave(
     let merge_schema_arc = merge_output_schema.cloned();
     let has_record_seed = !ctx.record_var_seed.is_empty();
     let mut merged: Vec<(Record, u64)> = Vec::new();
+    // Streaming-mode batch accumulator: records collect into one
+    // `EventBatch` and flush through the slot's charge handle once the
+    // batch fills, so the fused Merge participates in per-batch arbitrator
+    // accounting (and one-batch soft-threshold spill) exactly like the
+    // other streaming arms. `None` in materialized mode (`merged`
+    // accumulates the whole result instead).
+    let batch_size = streaming.as_ref().map_or(1, |s| s.batch_size.max(1));
+    let mut stream_batch: Option<crate::executor::batch_handoff::EventBatch> = streaming
+        .as_ref()
+        .map(|_| crate::executor::batch_handoff::EventBatch::with_capacity(batch_size));
     let mut per_source_counts: Vec<u64> = vec![0; receivers.len()];
     // Round-robin start cursor rotated each iteration so no
     // predecessor monopolizes the schedule when several are ready.
@@ -2006,6 +2077,34 @@ pub(crate) fn merge_fused_interleave(
     // to its predecessor index. A disconnected channel surfaces as a
     // ready op whose `recv` returns `Err`, so closed-source detection
     // happens inside the same select loop.
+    //
+    // Flush one accumulated streaming batch through the slot's charge
+    // handle: `add_bytes` its footprint, optionally one-batch spill on a
+    // soft-threshold trip, then send each event over the bounded channel.
+    // Borrows only the streaming sender, the charge handle, and the merge
+    // name (never `ctx`), so it composes with the loop's `&mut ctx` work.
+    let flush_stream_batch =
+        |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
+            let Some(handoff) = streaming.as_ref() else {
+                return Ok(());
+            };
+            handoff.charge.charge_and_route(
+                batch,
+                |event: crate::executor::stream_event::StreamEvent| {
+                    handoff
+                        .sender
+                        .send(event)
+                        .map_err(|_| PipelineError::Internal {
+                            op: "executor",
+                            node: merge_name.to_string(),
+                            detail: String::from(
+                                "streaming Output writer task dropped its receiver \
+                             before the Merge arm finished",
+                            ),
+                        })
+                },
+            )
+        };
     let n = receivers.len();
     loop {
         // Honor cooperative shutdown at the chunk boundary before blocking on
@@ -2091,29 +2190,23 @@ pub(crate) fn merge_fused_interleave(
                     let values = rec.values().to_vec();
                     rec = Record::new(Arc::clone(merge_schema), values);
                 }
-                match streaming_sender.as_ref() {
-                    Some(tx) => {
-                        // Bounded blocking `send` is the back-pressure
-                        // pivot — if the writer thread is slow, the
-                        // Merge thread blocks here, which stops it
-                        // calling `select()` and lets the Source
-                        // channels fill up. Send errors mean the
-                        // receiver was dropped (writer thread panicked or
-                        // an error path raced); surface as Internal so
-                        // the caller knows the streaming chain is
-                        // broken rather than silently dropping records.
-                        if tx
-                            .send(crate::executor::stream_event::StreamEvent::record(rec, rn))
-                            .is_err()
-                        {
-                            return Err(PipelineError::Internal {
-                                op: "executor",
-                                node: merge_name.to_string(),
-                                detail: String::from(
-                                    "streaming Output writer task dropped its \
-                                     receiver before the Merge arm finished",
+                match stream_batch.as_mut() {
+                    // Streaming: accumulate into the current batch and flush
+                    // it through the charge handle once it fills. The
+                    // charge handle's bounded `send` is the back-pressure
+                    // pivot — a slow writer stalls the Merge thread here,
+                    // stopping its `select()` calls and letting the Source
+                    // channels fill.
+                    Some(batch) => {
+                        batch.push_record(rec, rn);
+                        if batch.len() >= batch_size {
+                            let full = std::mem::replace(
+                                batch,
+                                crate::executor::batch_handoff::EventBatch::with_capacity(
+                                    batch_size,
                                 ),
-                            });
+                            );
+                            flush_stream_batch(full)?;
                         }
                     }
                     None => merged.push((rec, rn)),
@@ -2129,6 +2222,15 @@ pub(crate) fn merge_fused_interleave(
                 ctx.finalize_source_count(&name_arc, count);
             }
         }
+    }
+
+    // Flush the trailing partial batch (streaming mode only). The
+    // streaming sender then drops with this function's frame, disconnecting
+    // the writer thread's `recv` loop and triggering its flush.
+    if let Some(batch) = stream_batch.take()
+        && !batch.is_empty()
+    {
+        flush_stream_batch(batch)?;
     }
 
     Ok(merged)
@@ -2224,6 +2326,14 @@ pub(crate) fn transform_fused_consume(
     // existing materialized path.
     let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
     let streaming = streaming_sender.is_some();
+    // The per-batch charge handle for the streaming slot. Built before the
+    // batcher closure that moves it; `None` in materialized mode where the
+    // batch drains into the stage accumulator and `admit_node_buffer`
+    // charges the full slot instead.
+    let charge = streaming_sender.as_ref().and_then(|_| {
+        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+        ctx.streaming_charge_handle(node_idx, name, spill_allowed)
+    });
 
     let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
         ProgramEvaluator::with_max_expansion(
@@ -2286,24 +2396,31 @@ pub(crate) fn transform_fused_consume(
         batch_size,
         |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
             if let Some(tx) = streaming_sender.as_ref() {
-                for event in batch.into_events() {
-                    // Bounded blocking `send`: a slow writer thread blocks
-                    // this producer here, stalling the fused Source recv
-                    // loop and letting the ingest channel fill — the
-                    // back-pressure pivot. A send error means the writer
-                    // dropped its receiver (it panicked or hit an error
-                    // path), so the streaming chain is broken; surface it
-                    // rather than silently dropping the record.
-                    tx.send(event).map_err(|_| PipelineError::Internal {
-                        op: "executor",
-                        node: String::from("fused-transform-stream"),
-                        detail: String::from(
-                            "streaming Output writer task dropped its receiver \
-                             before the fused Transform arm finished",
-                        ),
-                    })?;
-                }
-                return Ok(());
+                // Route the flushed batch through the slot's charge handle:
+                // it `add_bytes` the batch footprint to the arbitrator
+                // wrapper, optionally spills the batch on a soft-threshold
+                // trip, then sends each event over the bounded channel. The
+                // blocking `send` is the back-pressure pivot — a slow writer
+                // stalls this producer's fused recv loop and lets the ingest
+                // channel fill. A send error means the writer dropped its
+                // receiver, so the streaming chain is broken; surface it
+                // rather than silently dropping the record.
+                let charge = charge
+                    .as_ref()
+                    .expect("streaming sender implies a registered charge handle");
+                return charge.charge_and_route(
+                    batch,
+                    |event: crate::executor::stream_event::StreamEvent| {
+                        tx.send(event).map_err(|_| PipelineError::Internal {
+                            op: "executor",
+                            node: String::from("fused-transform-stream"),
+                            detail: String::from(
+                                "streaming Output writer task dropped its receiver \
+                                 before the fused Transform arm finished",
+                            ),
+                        })
+                    },
+                );
             }
             for event in batch.into_events() {
                 match event {
@@ -3195,8 +3312,19 @@ pub(crate) fn dispatch_plan_node(
             // Dropping the sender disconnects the writer's recv.
             if let Some(sender) = ctx.take_streaming_sender(node_idx) {
                 let batch_size = ctx.batch_size;
+                let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+                let charge = ctx
+                    .streaming_charge_handle(node_idx, name, spill_allowed)
+                    .expect("streaming sender implies a registered charge consumer");
                 let merged: Vec<(Record, u64)> = branch_buffers.into_values().flatten().collect();
-                stream_linear_producer_emit(&sender, batch_size, name, merged, input_puncts)?;
+                stream_linear_producer_emit(
+                    &sender,
+                    batch_size,
+                    name,
+                    merged,
+                    input_puncts,
+                    &charge,
+                )?;
                 return Ok(());
             }
 
@@ -3363,19 +3491,35 @@ pub(crate) fn dispatch_plan_node(
             // `stream_linear_producer_emit` below, skipping the
             // materialized `admit_node_buffer` slot.
             let streaming_sender = ctx.take_streaming_sender(node_idx);
+            // The per-batch charge handle for the streaming slot, shared by
+            // both fused and non-fused streaming paths. `None` when this
+            // Merge is materialized (no streaming sender installed).
+            let merge_charge = streaming_sender.as_ref().and_then(|_| {
+                let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+                ctx.streaming_charge_handle(node_idx, name, spill_allowed)
+            });
+            let merge_batch_size = ctx.batch_size;
             // Held only on the non-fused streaming path; the fused path
             // consumes its sender inside `merge_fused_interleave`.
             let mut nonfused_sender: Option<
                 crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
             > = None;
             let merged: Vec<(Record, u64)> = if fused_mode {
+                let handoff = match (streaming_sender, merge_charge.as_ref()) {
+                    (Some(sender), Some(charge)) => Some(MergeStreamHandoff {
+                        sender,
+                        charge,
+                        batch_size: merge_batch_size,
+                    }),
+                    _ => None,
+                };
                 merge_fused_interleave(
                     ctx,
                     current_dag,
                     name,
                     &sorted_preds,
                     merge_output_schema.as_ref(),
-                    streaming_sender,
+                    handoff,
                 )?
             } else {
                 nonfused_sender = streaming_sender;
@@ -3547,8 +3691,17 @@ pub(crate) fn dispatch_plan_node(
             // Dropping `nonfused_sender` at the end of this branch
             // disconnects the writer thread's `recv` loop.
             if let Some(sender) = nonfused_sender {
-                let batch_size = ctx.batch_size;
-                stream_linear_producer_emit(&sender, batch_size, name, merged, deduped_puncts)?;
+                let charge = merge_charge
+                    .as_ref()
+                    .expect("streaming sender implies a registered charge handle");
+                stream_linear_producer_emit(
+                    &sender,
+                    merge_batch_size,
+                    name,
+                    merged,
+                    deduped_puncts,
+                    charge,
+                )?;
                 return Ok(());
             }
 
@@ -4137,7 +4290,18 @@ pub(crate) fn dispatch_plan_node(
                 // writer's recv loop.
                 if let Some(sender) = ctx.take_streaming_sender(node_idx) {
                     let batch_size = ctx.batch_size;
-                    stream_linear_producer_emit(&sender, batch_size, name, out_rows, input_puncts)?;
+                    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+                    let charge = ctx
+                        .streaming_charge_handle(node_idx, name, spill_allowed)
+                        .expect("streaming sender implies a registered charge consumer");
+                    stream_linear_producer_emit(
+                        &sender,
+                        batch_size,
+                        name,
+                        out_rows,
+                        input_puncts,
+                        &charge,
+                    )?;
                     return Ok(());
                 }
 
@@ -5748,7 +5912,18 @@ pub(crate) fn dispatch_plan_node(
             // are still released before the streaming return.
             if let Some(sender) = ctx.take_streaming_sender(node_idx) {
                 let batch_size = ctx.batch_size;
-                stream_linear_producer_emit(&sender, batch_size, name, output_records, Vec::new())?;
+                let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+                let charge = ctx
+                    .streaming_charge_handle(node_idx, name, spill_allowed)
+                    .expect("streaming sender implies a registered charge consumer");
+                stream_linear_producer_emit(
+                    &sender,
+                    batch_size,
+                    name,
+                    output_records,
+                    Vec::new(),
+                    &charge,
+                )?;
                 ctx.combine_input_snapshots.remove(&node_idx);
                 ctx.memory_budget.unregister_consumer(inline_consumer_id);
                 return Ok(());

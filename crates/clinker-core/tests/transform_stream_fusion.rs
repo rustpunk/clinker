@@ -731,3 +731,121 @@ nodes:
         );
     }
 }
+
+/// A fused `Source → Transform → Output` chain's charged footprint stays
+/// bounded to the in-flight working set — never the whole stage output.
+///
+/// The producer `add_bytes` each flushed batch into its slot's charge
+/// handle and the writer thread `sub_bytes` each consumed record, so the
+/// arbitrator's summed charged bytes track only what is buffered between
+/// the bounded source-ingest channel, the bounded streaming-output
+/// channel, and one in-flight batch. That in-flight bound is a constant
+/// fixed by the two channel capacities (1024 + 256 records) and the batch
+/// size — independent of the total record count. The high-water mark
+/// (`report.peak_consumer_usage_bytes`) therefore stays an arbitrarily
+/// small fraction of the full-stage estimate as the input grows: a
+/// materialized admit would charge all `ROWS` records as one slot, which
+/// scales with the input, while the streaming charge does not.
+#[test]
+fn fused_transform_charges_one_batch_not_full_stage() {
+    // Large enough that the constant in-flight bound is a small fraction
+    // of the full-stage estimate (which scales with ROWS).
+    const ROWS: usize = 100_000;
+    // Conservative bytes-per-row lower bound for this 2-column schema; the
+    // real per-row cost (`record_byte_cost`) exceeds this, so the
+    // full-stage estimate computed from it is a safe lower bound.
+    const PER_ROW_LOWER: usize = 48;
+    // Generous bytes-per-row upper bound for the in-flight ceiling.
+    const PER_ROW_UPPER: usize = 256;
+    // Bounded in-flight capacity: the source ingest channel (1024), the
+    // streaming-output channel (256), and one extra batch (64). The peak
+    // charged footprint cannot exceed this many records' worth of bytes
+    // regardless of the total input size.
+    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 64;
+
+    let yaml = r#"
+pipeline:
+  name: transform_stream_fusion_one_batch
+  batch_size: 64
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: transform
+    name: rename
+    input: src
+    config:
+      cxl: |
+        emit id = id
+        emit label = tag
+  - type: output
+    name: out
+    input: rename
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: false
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    let mut csv = String::from("id,tag\n");
+    for i in 1..=ROWS {
+        csv.push_str(&format!("{i},row-{i}\n"));
+    }
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![fast_slot("in", &csv)]),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("fused stream executes");
+    assert_eq!(report.counters.dlq_count, 0, "no records should DLQ");
+    assert_eq!(
+        body_lines(&buf).len(),
+        ROWS,
+        "every record must reach the streaming Output"
+    );
+
+    // The streaming charge must have fired (a fully materialized pipeline
+    // would leave this at 0).
+    assert!(
+        report.peak_consumer_usage_bytes > 0,
+        "streaming per-batch charge never sampled the arbitrator peak"
+    );
+
+    // The peak charged footprint stays bounded to the in-flight working
+    // set — the two bounded channels plus one batch — never the whole
+    // stage. With ROWS far larger than the in-flight bound, the full-stage
+    // estimate dwarfs the peak.
+    let full_stage_lower = (ROWS * PER_ROW_LOWER) as u64;
+    let in_flight_ceiling = (IN_FLIGHT_RECORDS * PER_ROW_UPPER) as u64;
+    assert!(
+        report.peak_consumer_usage_bytes <= in_flight_ceiling,
+        "fused Transform charged {} bytes at peak — expected <= {} \
+         (source channel + output channel + one batch); per-batch \
+         admit/discharge is not bounding the charge to the in-flight set",
+        report.peak_consumer_usage_bytes,
+        in_flight_ceiling,
+    );
+    assert!(
+        report.peak_consumer_usage_bytes * 4 < full_stage_lower,
+        "fused Transform peak charge {} is not well under the full-stage \
+         estimate {} — the stage appears to charge its whole output at once",
+        report.peak_consumer_usage_bytes,
+        full_stage_lower,
+    );
+}
