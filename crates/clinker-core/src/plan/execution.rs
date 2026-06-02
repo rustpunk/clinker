@@ -3715,6 +3715,118 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
+    /// Attach a coarse per-node input-volume byte prediction to every node
+    /// in `node_properties`, derived from the on-disk size of file-backed
+    /// Sources and propagated forward in topological order.
+    ///
+    /// Two predictions land on each node's [`NodeProperties`]:
+    ///
+    /// - `predicted_peak_bytes` — the live volume the node holds at its
+    ///   peak. A file-backed Source seeds it from its single `path:` file's
+    ///   `std::fs::metadata` length; a streaming/stateless operator carries
+    ///   the same volume it receives from its parents (pass-through); a
+    ///   blocking operator (hash Aggregate, sort, grace-hash / sort-merge /
+    ///   IEJoin / hash Combine) must accumulate its whole input before it
+    ///   can emit, so its peak is the sum of its parents' volume.
+    /// - `predicted_freed_bytes_on_complete` — the volume the node releases
+    ///   when it finishes draining. A blocking operator frees the state it
+    ///   accumulated (its peak); a streaming/fused operator and a Source
+    ///   free nothing live, so they report `0`.
+    ///
+    /// Blocking-ness is read from [`arbitration_class`] — the same plan-time
+    /// mirror of the runtime `MemoryConsumer` impls that `--explain` uses, so
+    /// a node counts as blocking exactly when it registers a spillable
+    /// consumer at runtime (`spill_priority.is_some()`). Reusing that
+    /// classifier means the volume model stays in lock-step with the
+    /// arbitrator's notion of which stages hold state, with no second
+    /// blocking/streaming taxonomy to keep aligned.
+    ///
+    /// The pass is deliberately coarse: with no per-node output-cardinality
+    /// estimate available, a blocking reducer (e.g. an Aggregate) propagates
+    /// its accumulated input volume downstream rather than a smaller emitted
+    /// volume. This over-estimates downstream peaks but never under-estimates
+    /// them, and — crucially — is a pure function of the plan shape plus the
+    /// input files' on-disk sizes. `0` is the universal "unknown" value:
+    /// a Source whose size cannot be read seeds `0`, and `0` propagates
+    /// inertly through every arm.
+    ///
+    /// # Determinism
+    ///
+    /// The estimate depends only on the plan topology and the on-disk file
+    /// sizes resolved against a stable anchor — the pipeline file's directory
+    /// (`ctx.workspace_root.join(ctx.pipeline_dir)`), never the process CWD —
+    /// so an identical plan over identically-sized inputs always yields
+    /// identical predictions. Multi-file matchers (`glob`/`regex`/`paths`)
+    /// and absent/unreadable files seed `0`, keeping the estimate environment-
+    /// independent. The topological walk guarantees every parent's volume is
+    /// already set before a child reads it; nodes added by later passes
+    /// (e.g. synthetic combine-chain steps) that never received a
+    /// `node_properties` row contribute `0`, matching how `--explain`
+    /// already skips them.
+    ///
+    /// Runs after aggregation- and combine-strategy selection so the resolved
+    /// strategy is visible to [`arbitration_class`] and no later property
+    /// overwrite clobbers the volume fields.
+    pub fn derive_volume_estimates(&mut self, ctx: &crate::config::CompileContext) {
+        // Stable anchor for resolving relative source `path:` strings — the
+        // pipeline file's directory, reconstructed from the compile context
+        // as `workspace_root.join(pipeline_dir)`. The CLI builds the context
+        // so this equals the runtime discovery anchor (`config.parent()`), so
+        // a `--explain` surfacing of these sizes names the same bytes the
+        // actual run would read and never depends on the process CWD.
+        let anchor = ctx.workspace_root.join(&ctx.pipeline_dir);
+
+        let order = self.topo_order.clone();
+        for idx in order {
+            // Skip nodes that never received a base `node_properties` row
+            // (synthetic combine-chain steps inserted post-derivation). Their
+            // downstream consumers treat the missing volume as `0`.
+            if !self.node_properties.contains_key(&idx) {
+                continue;
+            }
+
+            let (peak, freed) = match &self.graph[idx] {
+                PlanNode::Source { resolved, .. } => {
+                    // Read the seed off the resolved `SourceConfig` the node
+                    // already carries — keyed by node identity, not by a
+                    // separate name map. This stays correct when a node's
+                    // header `name:` differs from its nested `config.name:`,
+                    // a shape the compiler accepts.
+                    let seed = resolved
+                        .as_deref()
+                        .and_then(|payload| source_seed_bytes(&payload.source, &anchor))
+                        .unwrap_or(0);
+                    // A Source streams records out as it reads; it never holds
+                    // an accumulated copy it can free on drain.
+                    (seed, 0)
+                }
+                node => {
+                    // Sum parents' already-computed peak volume. A missing
+                    // parent row (synthetic node) contributes 0.
+                    let incoming: u64 = self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .filter_map(|p| self.node_properties.get(&p))
+                        .map(|p| p.predicted_peak_bytes)
+                        .fold(0u64, |acc, v| acc.saturating_add(v));
+                    // Blocking iff the node registers a spillable consumer at
+                    // runtime. Such a node accumulates its whole input before
+                    // emitting and frees that state on drain; a streaming /
+                    // stateless / sink node holds nothing live to free.
+                    let blocking = arbitration_class(node).spill_priority.is_some();
+                    let freed = if blocking { incoming } else { 0 };
+                    (incoming, freed)
+                }
+            };
+
+            // The presence check above guarantees this entry exists.
+            if let Some(props) = self.node_properties.get_mut(&idx) {
+                props.predicted_peak_bytes = peak;
+                props.predicted_freed_bytes_on_complete = freed;
+            }
+        }
+    }
+
     /// Mark every Output whose path template references a per-record
     /// token (`{source_file}` / `{source_path}`) AND whose parent
     /// partitioning is `FilePartitioned` for runtime fan-out routing.
@@ -3963,6 +4075,9 @@ impl ExecutionPlanDag {
                         provenance: PartitioningProvenance::SingleStream,
                     },
                     ck_set: preserved_ck_set.clone(),
+                    // Volume is re-derived by `derive_volume_estimates`,
+                    // which runs after this strategy pass; zero here.
+                    ..NodeProperties::unordered_single()
                 },
                 AggregateStrategy::Hash => NodeProperties {
                     ordering: Ordering {
@@ -3977,6 +4092,7 @@ impl ExecutionPlanDag {
                         provenance: PartitioningProvenance::SingleStream,
                     },
                     ck_set: preserved_ck_set,
+                    ..NodeProperties::unordered_single()
                 },
             };
             self.node_properties.insert(idx, new_props);
@@ -4086,6 +4202,7 @@ fn compute_one(
                 },
                 partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4100,6 +4217,7 @@ fn compute_one(
             },
             partitioning: parent_partitioning(),
             ck_set: preserve_parent_ck_set(),
+            ..NodeProperties::unordered_single()
         },
 
         PlanNode::Transform {
@@ -4123,6 +4241,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 };
             }
 
@@ -4139,6 +4258,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 };
             };
 
@@ -4160,6 +4280,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             } else {
                 NodeProperties {
@@ -4174,6 +4295,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             }
         }
@@ -4200,6 +4322,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4267,6 +4390,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             } else {
                 NodeProperties {
@@ -4283,6 +4407,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             }
         }
@@ -4353,6 +4478,7 @@ fn compute_one(
                 },
                 partitioning: agg_partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4381,6 +4507,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4407,6 +4534,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4502,6 +4630,7 @@ fn compute_one(
                 },
                 partitioning: combine_partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4519,9 +4648,35 @@ fn compute_one(
                     }),
                 partitioning: parent_partitioning(),
                 ck_set: preserve_parent_ck_set(),
+                ..NodeProperties::unordered_single()
             }
         }
     }
+}
+
+/// On-disk byte seed for a file-backed Source's `predicted_peak_bytes`.
+///
+/// Returns `Some(len)` only for the single-file `path:` matcher, resolving
+/// the path against `anchor` (the pipeline file's directory) so the size is
+/// independent of the process CWD. Returns `None` — the universal "unknown"
+/// seed, written as `0` by the caller — for every case this issue does not
+/// cover: multi-file matchers (`glob`/`regex`/`paths`), an absent `path:`,
+/// or an unreadable/missing file (`std::fs::metadata` error). Absolute paths
+/// resolve as-is, matching the source-discovery resolver.
+fn source_seed_bytes(source: &SourceConfig, anchor: &std::path::Path) -> Option<u64> {
+    // Multi-file matchers fan out to a `Vec<PathBuf>` at discovery time with
+    // no single literal size to seed; leave them unknown.
+    if source.glob.is_some() || source.regex.is_some() || source.paths.is_some() {
+        return None;
+    }
+    let path = source.path.as_deref()?;
+    let p = std::path::Path::new(path);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        anchor.join(p)
+    };
+    std::fs::metadata(resolved).ok().map(|m| m.len())
 }
 
 /// Idempotency predicate for enforcer-sort insertion.

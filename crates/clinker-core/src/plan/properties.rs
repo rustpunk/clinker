@@ -40,6 +40,39 @@ pub struct NodeProperties {
     /// / Combine that propagates them; the lattice value here is the
     /// post-union view at this specific node.
     pub ck_set: BTreeSet<String>,
+
+    /// Estimated bytes this node holds live at its peak, derived from the
+    /// on-disk input volume flowing in from its parents. `0` means
+    /// "unknown" — no file-size seed reached this node, or every upstream
+    /// seed was itself unknown.
+    ///
+    /// The estimate is a coarse plan-time prediction, not a runtime
+    /// measurement. It is seeded at file-backed Source nodes from the
+    /// literal `path:` file's `std::fs::metadata` length, then propagated
+    /// forward in topological order: a streaming/fused operator carries
+    /// the same live volume it receives, while a blocking operator
+    /// (Aggregate / sort / grace-hash) holds its whole accumulated input
+    /// before it can emit, so its peak is the sum of its parents' volume.
+    ///
+    /// Computed by `compute_node_properties` and intentionally `#[serde(skip)]`:
+    /// it carries no scheduling behavior yet and must not perturb the
+    /// `--explain --format json` surface until a later change wires it in.
+    #[serde(skip)]
+    pub predicted_peak_bytes: u64,
+
+    /// Estimated bytes this node releases back to the budget when it
+    /// finishes draining. `0` means "unknown" or "frees nothing live".
+    ///
+    /// A blocking operator frees the accumulated state it held at peak
+    /// once it has emitted its last row (a hash Aggregate drops its hash
+    /// table; a sort drops its run buffers), so its freed estimate equals
+    /// the peak it accumulated. A fully streaming / fused chain holds no
+    /// cross-record state, so it frees `0`.
+    ///
+    /// Computed by `compute_node_properties` and intentionally `#[serde(skip)]`
+    /// for the same reason as [`Self::predicted_peak_bytes`].
+    #[serde(skip)]
+    pub predicted_freed_bytes_on_complete: u64,
 }
 
 /// Effective output ordering of a node, together with a provenance chain
@@ -196,8 +229,11 @@ impl PartitioningKind {
 }
 
 impl NodeProperties {
-    /// Construct a `NodeProperties` with no ordering and a single-stream
-    /// partitioning. Convenience for tests and fallback cases.
+    /// Construct a `NodeProperties` with no ordering, single-stream
+    /// partitioning, and unknown (`0`) volume estimates. Convenience for
+    /// tests, fallback cases, and as a struct-update base for the
+    /// derivation rules, which set ordering/partitioning/ck explicitly and
+    /// inherit the zeroed volume fields until `derive_volume_estimates` runs.
     pub fn unordered_single() -> Self {
         Self {
             ordering: Ordering {
@@ -209,6 +245,8 @@ impl NodeProperties {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: BTreeSet::new(),
+            predicted_peak_bytes: 0,
+            predicted_freed_bytes_on_complete: 0,
         }
     }
 }
@@ -430,6 +468,7 @@ mod render_tests {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: BTreeSet::new(),
+            ..NodeProperties::unordered_single()
         }
     }
 

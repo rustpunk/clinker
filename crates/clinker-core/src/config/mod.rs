@@ -3205,6 +3205,19 @@ impl PipelineConfig {
             self.pipeline.memory.limit.as_deref(),
         );
 
+        // Per-node input-volume byte estimates. Runs last among the
+        // property passes so the resolved aggregation/combine strategies
+        // are visible (blocking-ness is read from the same arbitration
+        // classifier `--explain` uses) and no later overwrite of an
+        // Aggregation node's `NodeProperties` can clobber the volume
+        // fields. Each Source reads its own resolved `SourceConfig` off the
+        // plan node, so the seed is keyed by node identity rather than by a
+        // separate name map; sizes resolve against the pipeline file's
+        // directory and propagate forward in topo order. Pipelines whose
+        // sources are unsized or multi-file keep every estimate at the `0`
+        // "unknown" sentinel.
+        dag.derive_volume_estimates(ctx);
+
         // Correlation-key planner passes. Run AFTER the DAG is fully
         // enriched so we see every Transform's `window_index` and every
         // Aggregate's resolved `group_by`.

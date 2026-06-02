@@ -3098,6 +3098,7 @@ mod accumulator_op_tests {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: std::collections::BTreeSet::new(),
+            ..NodeProperties::unordered_single()
         }
     }
 
@@ -3112,6 +3113,7 @@ mod accumulator_op_tests {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: std::collections::BTreeSet::new(),
+            ..NodeProperties::unordered_single()
         }
     }
 
@@ -3202,6 +3204,7 @@ mod accumulator_op_tests {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: std::collections::BTreeSet::new(),
+            ..NodeProperties::unordered_single()
         };
         let gb = vec!["a".to_string(), "b".to_string()];
         assert!(matches!(

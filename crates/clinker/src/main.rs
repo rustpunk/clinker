@@ -465,6 +465,47 @@ fn abort_on_overlay_errors(
     Ok(())
 }
 
+/// Resolve the `(workspace_root, pipeline_dir)` pair for a `run` /
+/// `run --explain` compile context from the pipeline file `config` and an
+/// optional `--base-dir`.
+///
+/// Upholds the invariant `workspace_root.join(pipeline_dir) == config`'s
+/// parent directory: that reconstructed directory is the anchor relative
+/// source `path:` strings resolve against at compile time, and it must equal
+/// the runtime source-discovery anchor (the pipeline file's directory) so a
+/// file-size estimate computed at compile time names the same bytes the run
+/// actually reads. The anchor is independent of the process CWD, keeping the
+/// estimate reproducible across machines and launch directories.
+///
+/// `--base-dir` selects the workspace root used for the `.comp.yaml` scan and
+/// composition `use:` resolution; absent, it defaults to the pipeline file's
+/// own directory (`pipeline_dir` then empty). When a `--base-dir` is supplied
+/// that is an ancestor of the pipeline file, `pipeline_dir` is the pipeline
+/// file's directory expressed relative to it, so the join still reconstructs
+/// the pipeline file's directory. Paths are canonicalized when they exist so
+/// the result is symlink- and `..`-stable; a non-existent path falls back to
+/// its lexical form rather than failing the run.
+fn resolve_compile_anchor(
+    config: &std::path::Path,
+    base_dir: Option<&std::path::Path>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config_dir = config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let config_dir = config_dir.canonicalize().unwrap_or(config_dir);
+    let workspace_root = match base_dir {
+        Some(base) => base.canonicalize().unwrap_or_else(|_| base.to_path_buf()),
+        None => config_dir.clone(),
+    };
+    let pipeline_dir = config_dir
+        .strip_prefix(&workspace_root)
+        .unwrap_or_else(|_| std::path::Path::new(""))
+        .to_path_buf();
+    (workspace_root, pipeline_dir)
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -509,12 +550,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         }
     }
 
-    // Resolve workspace_root ONCE at the entry point.
-    // Production CLI path — never call env::current_dir() inside compile().
-    let mut compile_ctx = clinker_core::config::CompileContext::new(
-        std::env::current_dir()
-            .map_err(|e| PipelineError::Config(clinker_core::config::ConfigError::Io(e)))?,
-    );
+    // Resolve workspace_root and pipeline_dir ONCE at the entry point so
+    // `compile()` never touches the process CWD. The invariant the compile
+    // context must uphold is `workspace_root.join(pipeline_dir) ==` the
+    // pipeline file's directory — that reconstructed directory is the
+    // anchor every relative source `path:` resolves against, and it MUST
+    // equal the runtime discovery anchor (`args.config.parent()` below at
+    // the reader-registry build) so a file-size estimate computed at compile
+    // time names the same bytes the run actually reads.
+    let (workspace_root, pipeline_dir) =
+        resolve_compile_anchor(&args.config, args.base_dir.as_deref());
+    let mut compile_ctx =
+        clinker_core::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
 
     // Run identity values flow through Output path templates and the
@@ -1447,6 +1494,67 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// The compile anchor must reconstruct the pipeline file's directory —
+    /// the same directory the runtime source-discovery layer anchors on — and
+    /// must NOT collapse to the process CWD. Here the pipeline lives in a temp
+    /// directory that is not the CWD, so an anchor equal to the CWD would mean
+    /// compile-time source-size estimates name different files than the run
+    /// reads.
+    #[test]
+    fn compile_anchor_reconstructs_pipeline_dir_not_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pdir = tmp.path().canonicalize().expect("canonicalize tmp");
+        let pipeline = pdir.join("pipeline.yaml");
+        std::fs::write(&pipeline, "pipeline:\n  name: x\n").expect("write pipeline");
+
+        let (workspace_root, pipeline_dir) = resolve_compile_anchor(&pipeline, None);
+        assert_eq!(
+            workspace_root.join(&pipeline_dir),
+            pdir,
+            "anchor must reconstruct the pipeline file's directory"
+        );
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|c| c.canonicalize().ok());
+        assert_ne!(
+            Some(workspace_root.join(&pipeline_dir)),
+            cwd,
+            "the temp pipeline dir is not the CWD; the anchor must not collapse to the CWD"
+        );
+        assert_eq!(
+            pipeline_dir,
+            PathBuf::new(),
+            "with no --base-dir the pipeline lives at the workspace root"
+        );
+    }
+
+    /// With `--base-dir` set to an ancestor of the pipeline file, the join of
+    /// workspace_root + pipeline_dir must still reconstruct the pipeline
+    /// file's directory (the runtime discovery anchor), with pipeline_dir the
+    /// relative offset.
+    #[test]
+    fn compile_anchor_honors_base_dir_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize tmp");
+        let sub = root.join("sub").join("nested");
+        std::fs::create_dir_all(&sub).expect("mkdir nested");
+        let pipeline = sub.join("pipeline.yaml");
+        std::fs::write(&pipeline, "pipeline:\n  name: x\n").expect("write pipeline");
+
+        let (workspace_root, pipeline_dir) = resolve_compile_anchor(&pipeline, Some(&root));
+        assert_eq!(workspace_root, root, "workspace root is the --base-dir");
+        assert_eq!(
+            pipeline_dir,
+            PathBuf::from("sub").join("nested"),
+            "pipeline_dir is the offset from base-dir to the pipeline directory"
+        );
+        assert_eq!(
+            workspace_root.join(&pipeline_dir),
+            sub,
+            "join must reconstruct the pipeline file's directory"
+        );
+    }
 
     #[test]
     fn test_cli_run_positional_config_path() {
