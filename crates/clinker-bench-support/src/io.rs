@@ -65,11 +65,11 @@ impl Write for SharedBuffer {
 /// produces deterministic, configurable per-row latency at the byte
 /// stream layer where the CSV format reader actually sits.
 ///
-/// The blocking `std::thread::sleep` is intentional — the format reader
-/// runs inside `tokio::task::spawn_blocking`, so blocking sleeps do not
-/// stall the runtime. The header row is exempt from the sleep (the CSV
-/// reader consumes it during schema inference, before any record-level
-/// pacing matters).
+/// The blocking `std::thread::sleep` is intentional — each Source reader
+/// owns a dedicated OS thread, so a blocking sleep paces that source
+/// without stalling any other stage. The header row is exempt from the
+/// sleep (the CSV reader consumes it during schema inference, before any
+/// record-level pacing matters).
 pub struct DelayedRowReader {
     bytes: Vec<u8>,
     pos: usize,

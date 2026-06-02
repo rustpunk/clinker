@@ -31,6 +31,24 @@ use crate::pipeline::spill::{SpillFile, SpillReader};
 /// document boundaries unchanged.
 pub(crate) type DrainedEvents = (Vec<(Record, u64)>, Vec<Punctuation>);
 
+/// Per-record heuristic byte cost for a record of `column_count` columns.
+///
+/// The single source of truth every memory-accounting surface shares:
+/// `NodeBuffer::estimated_memory_bytes` (full-stage `node_buffers`
+/// admission), the dispatcher's per-batch `estimate_node_buffer_bytes`,
+/// and `EventBatch::estimated_bytes` (streaming per-batch charge). Routing
+/// all three through this fn keeps the charged byte total an operator
+/// reports to the arbitrator consistent whether its output is admitted as
+/// one full slot or streamed batch-by-batch.
+///
+/// Counts the `Value` slots plus the `(Record, u64)` pair overhead; it is
+/// a fixed-width heuristic that ignores per-`Value` heap (string / list
+/// payload), matching the existing admission model the soft-spill
+/// threshold is tuned against.
+pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
+    (std::mem::size_of::<Value>() * column_count + std::mem::size_of::<(Record, u64)>()) as u64
+}
+
 /// One slot inside `ExecutorContext::node_buffers`.
 pub(crate) enum NodeBuffer {
     /// All events live in memory — records and punctuations interleaved
@@ -193,9 +211,7 @@ impl NodeBuffer {
         let Some((first, _)) = mem_records.first() else {
             return 0;
         };
-        let row_bytes = std::mem::size_of::<Value>() * first.schema().column_count()
-            + std::mem::size_of::<(Record, u64)>();
-        (row_bytes as u64).saturating_mul(mem_records.len() as u64)
+        record_byte_cost(first.schema().column_count()).saturating_mul(mem_records.len() as u64)
     }
 
     /// Consume the buffer and partition its events into a records

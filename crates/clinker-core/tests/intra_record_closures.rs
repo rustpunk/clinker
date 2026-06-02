@@ -47,7 +47,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-async fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (ExecutionReport, String) {
+fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
     let src_name = config.source_configs().next().unwrap().name.clone();
@@ -65,7 +65,6 @@ async fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (Execut
     )]);
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
@@ -73,8 +72,8 @@ async fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (Execut
 /// Closure-bearing array builtins (`.filter`, `.map`) running against
 /// a nested `items` array — each element is a `Value::Map` and the
 /// closure body resolves bracket-index access on the binding.
-#[tokio::test(flavor = "multi_thread")]
-async fn ndjson_filter_and_map_closures_resolve_against_nested_arrays() {
+#[test]
+fn ndjson_filter_and_map_closures_resolve_against_nested_arrays() {
     let yaml = r#"
 pipeline:
   name: filter_map
@@ -113,7 +112,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload).await;
+    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
     let line = output.lines().next().expect("at least one record");
     let parsed: serde_json::Value = serde_json::from_str(line).expect("ndjson output parses");
     let kept = parsed.get("kept").and_then(|v| v.as_array()).expect("kept");
@@ -132,8 +131,8 @@ nodes:
 /// element. Each emitted record carries the body's emits (`sku`,
 /// `price`); upstream fields are suppressed via `include_unmapped:
 /// false` plus `exclude: [items]`.
-#[tokio::test(flavor = "multi_thread")]
-async fn ndjson_emit_each_fans_one_record_into_array_length_records() {
+#[test]
+fn ndjson_emit_each_fans_one_record_into_array_length_records() {
     let yaml = r#"
 pipeline:
   name: emit_each_fanout
@@ -174,7 +173,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload).await;
+    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
     let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 3, "one record per array element: {output:?}");
     let records: Vec<serde_json::Value> = lines
@@ -197,8 +196,8 @@ nodes:
 /// of records `emit each` can produce from a single original input. On
 /// exceed, the originating record routes to the DLQ with category
 /// `expansion_limit_exceeded`.
-#[tokio::test(flavor = "multi_thread")]
-async fn emit_each_overflow_routes_to_expansion_dlq() {
+#[test]
+fn emit_each_overflow_routes_to_expansion_dlq() {
     let yaml = r#"
 pipeline:
   name: emit_each_overflow
@@ -236,7 +235,7 @@ nodes:
 "#;
     let payload = br#"{"items":[1,2,3,4,5,6,7,8,9,10]}
 "#;
-    let (report, _output) = run_with_payload(yaml, "rows.ndjson", payload).await;
+    let (report, _output) = run_with_payload(yaml, "rows.ndjson", payload);
     let saw_expansion = report
         .dlq_entries
         .iter()
@@ -253,8 +252,8 @@ nodes:
 /// element of the items array (a `Value::Map`); the builtins return
 /// new `Value::Map`/`Value::Array` per element, surfaced through the
 /// outer `.map` that wraps them.
-#[tokio::test(flavor = "multi_thread")]
-async fn ndjson_map_builtins_run_inside_array_closures() {
+#[test]
+fn ndjson_map_builtins_run_inside_array_closures() {
     let yaml = r#"
 pipeline:
   name: map_builtins
@@ -294,7 +293,7 @@ nodes:
 "#;
     let payload = br#"{"items":[{"sku":"a","price":10,"internal_id":"ix-1"},{"sku":"b","price":20,"internal_id":"ix-2"}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload).await;
+    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
     let line = output.lines().next().expect("at least one record");
     let parsed: serde_json::Value = serde_json::from_str(line).expect("ndjson parses");
     let key_sets = parsed
@@ -341,8 +340,8 @@ nodes:
 
 /// Array-only builtins plus bracket-index access on an array
 /// receiver: `items[0]`, `.find`, `.any`, `.remove(idx)`.
-#[tokio::test(flavor = "multi_thread")]
-async fn ndjson_array_builtins_round_trip() {
+#[test]
+fn ndjson_array_builtins_round_trip() {
     let yaml = r#"
 pipeline:
   name: array_builtins
@@ -383,7 +382,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload).await;
+    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
     let parsed: serde_json::Value =
         serde_json::from_str(output.lines().next().expect("a record")).expect("parses");
     let first = parsed

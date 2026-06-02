@@ -71,8 +71,8 @@ const DOC_XML: &str = r#"<doc>
   <Summary><total>3</total></Summary>
 </doc>"#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn envelope_sections_available_on_every_body_record() {
+#[test]
+fn envelope_sections_available_on_every_body_record() {
     let config = parse_config(YAML).expect("parse envelope pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -82,8 +82,10 @@ async fn envelope_sections_available_on_every_body_record() {
         PathBuf::from("payments.xml"),
         Box::new(Cursor::new(DOC_XML.as_bytes().to_vec())),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("payments".to_string(), vec![file])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "payments".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file]),
+    )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -100,7 +102,6 @@ async fn envelope_sections_available_on_every_body_record() {
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("run envelope pipeline");
     assert_eq!(report.counters.total_count, 3, "three body records");
     assert_eq!(report.counters.dlq_count, 0);

@@ -45,8 +45,8 @@ nodes:
       include_unmapped: true
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn multi_file_glob_concatenates_and_stamps_source_provenance() {
+#[test]
+fn multi_file_glob_concatenates_and_stamps_source_provenance() {
     let config = parse_config(YAML_SOURCE_FILE_PROJECTED).unwrap();
     let plan = config
         .compile(&CompileContext::default())
@@ -70,8 +70,10 @@ async fn multi_file_glob_concatenates_and_stamps_source_provenance() {
             "order_id,amount\nORD-3,300.0\n".as_bytes().to_vec(),
         )),
     );
-    let readers: clinker_core::executor::SourceReaders =
-        HashMap::from([("orders".to_string(), vec![file_a, file_b])]);
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![file_a, file_b]),
+    )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -88,7 +90,6 @@ async fn multi_file_glob_concatenates_and_stamps_source_provenance() {
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("run pipeline");
     assert_eq!(report.counters.total_count, 3);
     assert_eq!(report.counters.dlq_count, 0);

@@ -1,0 +1,19 @@
+[package]
+name = "clinker-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Network finite-pull Source readers (REST, SQL cursors) for Clinker"
+
+[dependencies]
+clinker-core = { workspace = true }
+clinker-format = { workspace = true }
+clinker-record = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+tracing = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+clinker-core = { workspace = true, features = ["test-utils"] }
+clinker-bench-support = { workspace = true }

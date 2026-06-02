@@ -6,6 +6,7 @@ members = [
     "crates/cxl-cli",
     "crates/clinker-format",
     "crates/clinker-core",
+    "crates/clinker-net",
     "crates/clinker-channel",
     "crates/clinker",
     "crates/clinker-kiln",
@@ -25,6 +26,7 @@ clinker-record = { path = "crates/clinker-record" }
 cxl = { path = "crates/cxl" }
 clinker-format = { path = "crates/clinker-format" }
 clinker-core = { path = "crates/clinker-core" }
+clinker-net = { path = "crates/clinker-net" }
 clinker-channel = { path = "crates/clinker-channel" }
 clinker-schema = { path = "crates/clinker-schema" }
 clinker-git = { path = "crates/clinker-git" }
@@ -48,12 +50,17 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread", "macros", "sync"] }
+crossbeam-channel = "0.5"
 notify = "7"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 petgraph = "0.8"
 fastrand = "2"
 quick-xml = "0.37"
+# Synchronous HTTP client for the `rest` source transport. rustls + ring
+# only (pure-Rust TLS) — `default-features = false` drops the native-tls
+# path so no openssl/native-tls/cmake enters the graph.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 clinker-bench-support = { path = "crates/clinker-bench-support" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }

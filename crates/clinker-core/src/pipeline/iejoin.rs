@@ -47,6 +47,7 @@ use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator};
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
@@ -591,70 +592,79 @@ pub(crate) fn execute_combine_iejoin(
     let mut build_range_keys: Vec<Option<(i64, i64)>> = vec![None; build_records.len()];
     let mut unmatched_drivers: Vec<usize> = Vec::new();
 
-    let mut eq_buf: Vec<Value> = Vec::new();
-    let mut range_buf: Vec<Value> = Vec::new();
+    // Per-record key extraction is the expensive part of the pre-scan:
+    // every record runs the CXL eq-key and range-key programs through
+    // `eval_expr`. The extractors are stateless (`&self`, a fresh
+    // per-call `env`) and `EvalContext` is read-only, so the extraction
+    // parallelizes across the shared kernel pool. Each record yields an
+    // independent `RecordScan`; the routing loops below replay those
+    // outcomes in strict ascending index order, so the partition vectors
+    // and `unmatched_drivers` end up byte-identical to a sequential scan.
+    let driver_scans: Vec<RecordScan> = driver_records
+        .par_iter()
+        .map(|(rec, _rn)| {
+            // Driver-side key extraction routes through `CombineResolver`
+            // so chain-buried qualifiers (e.g. `b.id` against an N-ary
+            // decomposition step's encoded intermediate record) resolve
+            // via the resolved column map rather than `Record`'s
+            // bare-name fallback.
+            let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
+            scan_record(
+                &driver_extractor,
+                &driver_range_extractor,
+                ctx,
+                &driver_resolver,
+                n_buckets,
+                &hash_state,
+            )
+            .map_err(|e| key_eval_error(name, "driving", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    for (i, (rec, _rn)) in driver_records.iter().enumerate() {
-        // Driver-side key extraction routes through `CombineResolver`
-        // so chain-buried qualifiers (e.g. `b.id` against an N-ary
-        // decomposition step's encoded intermediate record) resolve
-        // via the resolved column map rather than `Record`'s
-        // bare-name fallback.
-        let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
-        eq_buf.clear();
-        if !driver_extractor.is_empty() {
-            driver_extractor
-                .extract_into(ctx, &driver_resolver, &mut eq_buf)
-                .map_err(|e| key_eval_error(name, "driving", e))?;
+    for (i, scan) in driver_scans.into_iter().enumerate() {
+        match scan {
+            RecordScan::Unmatched => unmatched_drivers.push(i),
+            RecordScan::Matched {
+                eq_keys,
+                range_key,
+                bucket,
+            } => {
+                driver_partitions[bucket].push(i);
+                driver_eq_keys[i] = Some(eq_keys);
+                driver_range_keys[i] = Some(range_key);
+            }
         }
-        if eq_buf.iter().any(|v| matches!(v, Value::Null)) {
-            unmatched_drivers.push(i);
-            continue;
-        }
-        range_buf.clear();
-        driver_range_extractor
-            .extract_into(ctx, &driver_resolver, &mut range_buf)
-            .map_err(|e| key_eval_error(name, "driving", e))?;
-        let Some(rk) = range_keys_to_i64_pair(&range_buf) else {
-            unmatched_drivers.push(i);
-            continue;
-        };
-        let bucket = if n_buckets > 1 {
-            (hash_composite_key(&eq_buf, &hash_state) as usize) & (n_buckets - 1)
-        } else {
-            0
-        };
-        driver_partitions[bucket].push(i);
-        driver_eq_keys[i] = Some(eq_buf.clone());
-        driver_range_keys[i] = Some(rk);
     }
 
-    for (j, rec) in build_records.iter().enumerate() {
-        eq_buf.clear();
-        if !build_extractor.is_empty() {
-            build_extractor
-                .extract_into(ctx, rec, &mut eq_buf)
-                .map_err(|e| key_eval_error(name, "build", e))?;
+    let build_scans: Vec<RecordScan> = build_records
+        .par_iter()
+        .map(|rec| {
+            scan_record(
+                &build_extractor,
+                &build_range_extractor,
+                ctx,
+                rec,
+                n_buckets,
+                &hash_state,
+            )
+            .map_err(|e| key_eval_error(name, "build", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (j, scan) in build_scans.into_iter().enumerate() {
+        // NULL build eq keys (3VL) and NULL / non-integer range keys can
+        // never match, so the build side drops them — there is no
+        // build-side `on_miss` bucket the driver side fills.
+        if let RecordScan::Matched {
+            eq_keys,
+            range_key,
+            bucket,
+        } = scan
+        {
+            build_partitions[bucket].push(j);
+            build_eq_keys[j] = Some(eq_keys);
+            build_range_keys[j] = Some(range_key);
         }
-        if eq_buf.iter().any(|v| matches!(v, Value::Null)) {
-            // NULL build eq keys can never match (3VL); drop.
-            continue;
-        }
-        range_buf.clear();
-        build_range_extractor
-            .extract_into(ctx, rec, &mut range_buf)
-            .map_err(|e| key_eval_error(name, "build", e))?;
-        let Some(rk) = range_keys_to_i64_pair(&range_buf) else {
-            continue;
-        };
-        let bucket = if n_buckets > 1 {
-            (hash_composite_key(&eq_buf, &hash_state) as usize) & (n_buckets - 1)
-        } else {
-            0
-        };
-        build_partitions[bucket].push(j);
-        build_eq_keys[j] = Some(eq_buf.clone());
-        build_range_keys[j] = Some(rk);
     }
 
     let mut matched_driver: Vec<bool> = vec![false; driver_records.len()];
@@ -1011,6 +1021,59 @@ pub(crate) fn execute_combine_iejoin(
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────
+
+/// Outcome of extracting one record's join keys in the pre-scan. Produced
+/// in parallel (per record, independently) and replayed sequentially in
+/// index order, so the order-sensitive partition fill stays deterministic.
+enum RecordScan {
+    /// Record has a NULL eq key (3VL) or a NULL / non-integer range key —
+    /// it can never match. Driver records route to the `on_miss` bucket;
+    /// build records drop.
+    Unmatched,
+    /// Record carries valid eq + range keys and lands in `bucket`.
+    Matched {
+        eq_keys: Vec<Value>,
+        range_key: (i64, i64),
+        bucket: usize,
+    },
+}
+
+/// Extract one record's eq + range keys and assign its hash bucket.
+/// Pure over `&self`-borrowed extractors and a read-only `EvalContext`,
+/// so it runs concurrently across records without shared mutable state.
+/// Returns `Unmatched` on a NULL eq key or an unrepresentable range key,
+/// matching the sequential pre-scan's 3VL routing exactly.
+fn scan_record(
+    eq_extractor: &KeyExtractor,
+    range_extractor: &KeyExtractor,
+    ctx: &EvalContext<'_>,
+    resolver: &dyn cxl::resolve::traits::FieldResolver,
+    n_buckets: usize,
+    hash_state: &RandomState,
+) -> Result<RecordScan, EvalError> {
+    let mut eq_buf: Vec<Value> = Vec::new();
+    if !eq_extractor.is_empty() {
+        eq_extractor.extract_into(ctx, resolver, &mut eq_buf)?;
+    }
+    if eq_buf.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(RecordScan::Unmatched);
+    }
+    let mut range_buf: Vec<Value> = Vec::new();
+    range_extractor.extract_into(ctx, resolver, &mut range_buf)?;
+    let Some(range_key) = range_keys_to_i64_pair(&range_buf) else {
+        return Ok(RecordScan::Unmatched);
+    };
+    let bucket = if n_buckets > 1 {
+        (hash_composite_key(&eq_buf, hash_state) as usize) & (n_buckets - 1)
+    } else {
+        0
+    };
+    Ok(RecordScan::Matched {
+        eq_keys: eq_buf,
+        range_key,
+        bucket,
+    })
+}
 
 /// Convert a 1-or-2-element vector of range key Values to an
 /// `(i64, i64)` pair, returning `None` if any element is NULL or

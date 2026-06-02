@@ -106,8 +106,8 @@ fn count_data_rows(csv_bytes: &str) -> usize {
     csv_bytes.lines().skip(1).filter(|l| !l.is_empty()).count()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn route_fanout_emits_spill_under_one_megabyte_budget() {
+#[test]
+fn route_fanout_emits_spill_under_one_megabyte_budget() {
     // RSS-based spill predicate: no RSS reading, no spill firing — skip
     // rather than assert a false-negative.
     if clinker_core::pipeline::memory::rss_bytes().is_none() {
@@ -157,7 +157,6 @@ async fn route_fanout_emits_spill_under_one_megabyte_budget() {
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .await
         .expect("soft-spill run must complete");
 
     assert_eq!(

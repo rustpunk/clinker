@@ -82,6 +82,18 @@ The `arbitration:` line shows the composed policy name. A pipeline with `backpre
 - **Two parallel Aggregate stages, one much larger than the other** → consider `both`. `BackPressurePreferred -> LargestFirst` pauses where it can, then targets the dominant Aggregate for spill, freeing the most headroom per spill call.
 - **Pure react-only with deterministic priority** → `spill`. Pauses are disabled; the arbitrator picks the cheapest-to-spill consumer (`node_buffers` before grace-hash before sort before Aggregate) every time. Closest to the pre-arbitrator behavior.
 
+## Streaming batch size (`batch_size`)
+
+`pipeline.batch_size` sets how many events (records plus document-boundary punctuations) a streaming-eligible stage hands off to its downstream consumer at a time over a back-pressured channel. For a fused stage (Source → Transform → Output, Merge.interleave of Sources) it bounds the in-flight working set to one batch rather than the whole stage, because the stage pulls records off a live upstream channel without ever building a full result. The other streaming stages build their full result first and stream it in batches; there the knob sizes only the inter-stage slice, not the producer's footprint. The knob is optional; omit it to use the built-in default of 2048 events. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the distinction.
+
+```yaml
+pipeline:
+  name: orders_rollup
+  batch_size: 1024          # optional; default 2048
+```
+
+A per-transform override is available on a Transform's `config.batch_size` (see [Transform Nodes](../pipeline/transform.md#batch-size-batch_size)); it takes precedence over the pipeline value for that one stage. A `batch_size` of `0` is rejected at config load. The knob affects only the memory *profile* of streaming stages, never their output — blocking stages (sort, hash Aggregate, Combine build side) ignore it and continue to fully materialize. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the full model.
+
 ## How it works
 
 Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, `node_buffers` slots, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion.
@@ -106,7 +118,7 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 
 Lower priority is spilled first, so `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. The blocking operators climb from there: a grace-hash Combine (10) is preferred over a sort buffer (20), which is preferred over a hash Aggregate or inline-hash Combine (30).
 
-A **Source** and a **streaming Aggregate** show `spill_priority=N/A` because neither holds spillable state. A Source's `try_spill` always frees zero bytes — its only real lever is the pause its `can_back_pressure=true` advertises. A streaming Aggregate emits each group as it completes and never accumulates a spillable table. Both still appear in the explain annotation so the model is complete; they are simply never elected as spill victims.
+A **Source** and a **streaming Aggregate** show `spill_priority=N/A` because neither *operator* holds spillable accumulated state. A Source's `try_spill` always frees zero bytes — its only real lever is the pause its `can_back_pressure=true` advertises. A streaming Aggregate emits each group as it completes and never accumulates a spillable group table. The `N/A` here is about the operator's own state, not its downstream handoff: when a streaming stage's output rides a per-batch streaming handoff to a single consumer, that handoff registers a priority-0 consumer just like a `node_buffers` slot does, and its in-flight batches are spilled to disk one batch at a time if RSS crosses the soft threshold while they are in flight. So a streaming Aggregate's *group table* is never a spill victim, but the batches it hands downstream can be.
 
 When memory pressure crosses the soft threshold (80 % of `limit`), the arbitrator runs the active policy to pick a victim and invokes the corresponding action: `pause()` on a back-pressureable consumer (its producer's hot loop parks on a `Condvar` until `resume`), or `try_spill(target_bytes)` on a spillable consumer (the consumer's wrapper flips a spill-requested flag the operator reads at its next batch boundary). When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded`.
 
@@ -118,13 +130,13 @@ This means:
 
 ## Bounded-memory contract for non-fused stages
 
-Fused chains (Source → Transform → Output, Merge.interleave fed by Sources) run streaming with no per-stage materialization. Non-fused boundaries — Route fan-out, Merge fan-in, Composition bodies, diamond DAGs — materialize records into per-stage `node_buffers`. Each slot registers a `NodeBufferConsumer` with the arbitrator (priority 0 — the cheapest-to-spill victim class), so the active policy's victim selection is fully attributed.
+A stage runs streaming — no charged per-stage `node_buffers` slot — when it hands its output to a single downstream sink Output and roots no window: fused Source → Transform → Output and Merge.interleave-of-Sources chains, plus single-branch Route, non-fused Merge, `streaming`-strategy Aggregate, and hash-build-probe Combine probe-side feeding one Output (see [Streaming vs. Blocking Stages](streaming-vs-blocking.md)). The remaining boundaries — multi-branch Route fan-out, a Merge or other operator whose output forks to several consumers, Composition bodies, diamond DAGs, and every blocking strategy — materialize records into per-stage `node_buffers`. Each slot registers a `NodeBufferConsumer` with the arbitrator (priority 0 — the cheapest-to-spill victim class), so the active policy's victim selection is fully attributed.
 
 When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs the active policy. Under the default `pause`, the producer feeding the buffer is paused at its inbound channel; under `spill` or when no consumer can be paused, the slot spills to disk using the same LZ4 + postcard frame format as grace-hash sort partitions. When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded { node }` naming the operator whose hot loop polled the abort gate. See [error E310](../explain/E310.html) for the full diagnostic model, including the composition-involved two-shape error model.
 
 Spill fires at the producer side of the first slot whose downstream topology permits it — single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
 
-Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation, and the materialized nodes are exactly the ones that charge `pipeline.memory.limit` and are spill-eligible.
+Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation. Materialized nodes charge `pipeline.memory.limit` as one full-stage slot and spill the whole stage; streaming nodes charge per in-flight batch and, on a single-consumer edge, spill those batches one at a time. Both classes count against the limit and can spill — the annotation tells you the *granularity* (whole-stage vs. per-batch), not whether a stage is exempt from the budget.
 
 ## Reading `--explain` arbitration output
 

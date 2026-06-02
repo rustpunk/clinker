@@ -5,8 +5,10 @@
 //! the named nodes. The runtime correspondence the label encodes is:
 //!
 //! - `streaming`  — the node's output does not pass through a
-//!   `ctx.node_buffers` slot at runtime (fused Source/Transform chain
-//!   or a sink Output).
+//!   `ctx.node_buffers` slot at runtime: a sink Output, a fused Source
+//!   whose receiver the downstream consumer takes directly, or a fused
+//!   Transform that hands each bounded batch to a streaming Output
+//!   thread over a back-pressured channel.
 //! - `materialized` — the node's output is admitted into `node_buffers`
 //!   between dispatch arms and charges `MemoryArbitrator`.
 //!
@@ -61,7 +63,7 @@ fn buffer_class_for(block: &str, id_slug: &str) -> String {
     panic!("`buffer:` line missing inside `{id_slug}` stanza:\n{block}")
 }
 
-// ── Gate 1: fused Source + materialized Transform + sink Output ──────
+// ── Gate 1: fused Source + streaming Transform + sink Output ─────────
 
 fn linear_streaming_yaml() -> &'static str {
     r#"
@@ -97,21 +99,22 @@ nodes:
 
 /// Source → Transform → Output. The Source's receiver is consumed
 /// directly by the fused Transform's per-record loop (no
-/// `node_buffers[source]` slot, so the Source streams). The fused
-/// Transform still admits its evaluated output to
-/// `node_buffers[transform]` at stage close — fusion saves the
-/// source-side allocation, not the transform-side — so the Transform
-/// renders `materialized`. The Output is a sink and renders
-/// `streaming`.
+/// `node_buffers[source]` slot, so the Source streams). The Transform's
+/// sole downstream is a single sink Output, so the Transform hands each
+/// bounded batch straight to the streaming Output thread over a
+/// back-pressured channel and admits no `node_buffers[transform]` slot —
+/// it renders `streaming`, and peak inter-stage memory for the stage is
+/// one batch rather than the whole output. The Output is a sink and
+/// renders `streaming`.
 #[test]
-fn buffer_class_marks_fused_source_streaming_transform_materialized() {
+fn buffer_class_marks_fused_source_transform_output_chain_streaming() {
     let config = parse_fixture(linear_streaming_yaml());
     let dag = compile(&config);
     let text = dag.explain_text(&config);
     let block = physical_properties_block(&text);
 
     assert_eq!(buffer_class_for(block, "source.primary"), "streaming");
-    assert_eq!(buffer_class_for(block, "transform.scale"), "materialized");
+    assert_eq!(buffer_class_for(block, "transform.scale"), "streaming");
     assert_eq!(buffer_class_for(block, "output.out"), "streaming");
 }
 

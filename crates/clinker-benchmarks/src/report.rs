@@ -460,6 +460,8 @@ mod tests {
             per_source_record_counts: Default::default(),
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
+            peak_consumer_usage_bytes: 0,
+            interrupted: false,
         };
         report.counters.total_count = 1000;
         report.counters.ok_count = 995;
@@ -539,6 +541,8 @@ mod tests {
             per_source_record_counts: Default::default(),
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
+            peak_consumer_usage_bytes: 0,
+            interrupted: false,
         };
         let output = format_summary_table("test/bad", "small", &report);
         assert!(

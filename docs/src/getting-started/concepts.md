@@ -113,12 +113,17 @@ stateless parts of the graph (Transform, Route, Merge, most Combine
 probe-side work, Output). Every stage is charged against the configured
 RSS budget. Fused Source → Transform → Output paths run streaming, with
 no per-stage materialization, so a 100 GB CSV passes through with the
-same footprint as a 100 KB CSV. Non-fused boundaries -- Route fan-out,
-Merge fan-in, Composition bodies, diamond DAGs -- materialize records
-into per-stage buffers that charge against the same budget envelope.
-When a buffer would push cumulative usage past the soft threshold (80%
-of the limit), the engine spills the buffer to disk; when it would
-exceed the hard limit, the engine fails fast with a structured
+same footprint as a 100 KB CSV. A stage that hands its output to a single
+downstream sink Output also avoids a charged inter-stage buffer --
+single-branch Route, non-fused Merge, streaming Aggregate, and the Combine
+probe-side stream their result straight to the writer (see
+[Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md)).
+The remaining boundaries -- multi-branch Route fan-out, output that forks
+to several consumers, Composition bodies, diamond DAGs -- materialize
+records into per-stage buffers that charge against the same budget
+envelope. When a buffer would push cumulative usage past the soft
+threshold (80% of the limit), the engine spills the buffer to disk; when
+it would exceed the hard limit, the engine fails fast with a structured
 `E310 MemoryBudgetExceeded` diagnostic that names the offending
 producer.
 

@@ -72,7 +72,7 @@ use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 /// short-circuits the walk; `Continue` / `BestEffort` route per-record
 /// failures to `ctx.dlq_entries` (which the dispatcher captures into
 /// the returned [`DlqEvent`] vec).
-pub(crate) async fn dispatch_deferred_subdag(
+pub(crate) fn dispatch_deferred_subdag(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     scope: &RetractScope,
@@ -95,7 +95,7 @@ pub(crate) async fn dispatch_deferred_subdag(
     let saved_in_deferred = ctx.in_deferred_dispatch;
     ctx.in_deferred_dispatch = true;
 
-    let result = dispatch_deferred_inner(ctx, current_dag, &mut events).await;
+    let result = dispatch_deferred_inner(ctx, current_dag, &mut events);
 
     ctx.in_deferred_dispatch = saved_in_deferred;
     result.map(|()| events)
@@ -106,7 +106,7 @@ pub(crate) async fn dispatch_deferred_subdag(
 /// guard (an RAII guard holding `&mut ExecutorContext` would extend
 /// the borrow through every recursive `dispatch_plan_node` call,
 /// which the borrow-checker rejects).
-async fn dispatch_deferred_inner(
+fn dispatch_deferred_inner(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     events: &mut Vec<DlqEvent>,
@@ -132,7 +132,7 @@ async fn dispatch_deferred_inner(
             .get(&producer)
             .expect("deferred_regions keys producer to its own region")
             .clone();
-        dispatch_one_region(ctx, current_dag, &region, events).await?;
+        dispatch_one_region(ctx, current_dag, &region, events)?;
     }
 
     // Body-internal regions: when any Composition node's bound body
@@ -172,14 +172,7 @@ async fn dispatch_deferred_inner(
         if !needs_recurse {
             continue;
         }
-        Box::pin(recurse_into_body(
-            ctx,
-            current_dag,
-            composition_idx,
-            body_id,
-            events,
-        ))
-        .await?;
+        recurse_into_body(ctx, current_dag, composition_idx, body_id, events)?;
     }
 
     Ok(())
@@ -189,7 +182,7 @@ async fn dispatch_deferred_inner(
 /// filter (`members ∪ {producer}`), seeding cross-region inputs from
 /// `region_input_buffers` before each member dispatch and capturing
 /// any DLQ entries the arm produced.
-async fn dispatch_one_region(
+fn dispatch_one_region(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     region: &DeferredRegion,
@@ -257,7 +250,7 @@ async fn dispatch_one_region(
                 ..
             }
         );
-        Box::pin(dispatch_plan_node(ctx, current_dag, idx)).await?;
+        dispatch_plan_node(ctx, current_dag, idx)?;
         if is_windowed_transform {
             ctx.counters.retraction.partitions_dispatched += 1;
         }
@@ -374,7 +367,7 @@ fn seed_cross_region_inputs_for(
 /// continuation walk then runs against the parent DAG so its members
 /// see the seeded slot via the same predecessor-walk logic the
 /// forward pass uses.
-async fn recurse_into_body(
+fn recurse_into_body(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     composition_idx: NodeIndex,
@@ -430,12 +423,14 @@ async fn recurse_into_body(
     // re-runs the body detect against the updated
     // `correlation_buffers`.
     //
-    // Inlined (no closure wrapper) because the inner body now
-    // contains `.await` calls; an `||` closure cannot be async, and
-    // an `async ||` closure would capture `&mut` borrows the helper
-    // arms below also need. Restore the parent-scope borrows
-    // explicitly on every exit path.
-    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = async {
+    // Wrapped in an immediately-invoked closure so the parent-scope
+    // borrows can be restored explicitly on every exit path below
+    // regardless of whether the inner walk succeeds: the harvest result
+    // is bound here, the swaps are reversed, then the result is
+    // unwrapped via `?`. A `Drop`-guard would extend the `&mut ctx`
+    // borrow through the recursive dispatch calls, which the borrow
+    // checker rejects.
+    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = (|| {
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
         let body_initial_rows: Vec<(u64, std::sync::Arc<str>)> = body_scope
             .seen_source_rows
@@ -478,7 +473,7 @@ async fn recurse_into_body(
             }
         }
 
-        let inner_events = Box::pin(dispatch_deferred_subdag(ctx, &body_dag, &body_scope)).await?;
+        let inner_events = dispatch_deferred_subdag(ctx, &body_dag, &body_scope)?;
         events.extend(inner_events);
 
         // Drain every declared output port BEFORE the parent-scope
@@ -497,8 +492,7 @@ async fn recurse_into_body(
             }
         }
         Ok::<Vec<(Record, u64)>, PipelineError>(harvested)
-    }
-    .await;
+    })();
 
     // Unregister every body-local NodeBufferConsumer so the
     // arbitrator's registry stays aligned with the post-swap parent
@@ -552,7 +546,7 @@ async fn recurse_into_body(
         .get(&composition_idx)
         .cloned()
     {
-        dispatch_continuation(ctx, parent_dag, &continuation, events).await?;
+        dispatch_continuation(ctx, parent_dag, &continuation, events)?;
     }
 
     Ok(())
@@ -571,7 +565,7 @@ async fn recurse_into_body(
 /// Captures any DLQ entries the dispatched arms produce into `events`
 /// so the orchestrator's outer cascading-retract loop sees them and
 /// can widen the next iteration's scope.
-async fn dispatch_continuation(
+fn dispatch_continuation(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     continuation: &ParentContinuation,
@@ -612,7 +606,7 @@ async fn dispatch_continuation(
             continue;
         }
         let dlq_len_before = ctx.dlq_entries.len();
-        Box::pin(dispatch_plan_node(ctx, parent_dag, idx)).await?;
+        dispatch_plan_node(ctx, parent_dag, idx)?;
         if ctx.dlq_entries.len() > dlq_len_before {
             for entry in &ctx.dlq_entries[dlq_len_before..] {
                 events.push(DlqEvent {

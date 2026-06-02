@@ -37,6 +37,8 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator, SkipReason};
@@ -534,17 +536,32 @@ fn execute_combine_sort_merge_with_stats(
     let mut driver_pairs: Vec<(Record, RecordOrder, Value)> = Vec::new();
     let mut driver_unmatched_orders: Vec<RecordOrder> = Vec::new();
     let mut driver_unmatched_records: Vec<(Record, RecordOrder)> = Vec::new();
-    let mut range_buf: Vec<Value> = Vec::new();
-    for (record, order) in driver_records {
-        let key = extract_range_key(
-            &driver_extractor,
-            ctx,
-            &record,
-            resolver_mapping,
-            true,
-            &mut range_buf,
-        )
-        .map_err(|e| key_eval_error(name, "driving", e))?;
+
+    // Range-key extraction runs the CXL range program per record through
+    // `eval_expr` — the costly part of Phase A. `extract_range_key` is
+    // stateless (`&self` extractor, a per-call key buffer) and
+    // `EvalContext` is read-only, so the extraction parallelizes across
+    // the shared kernel pool. The routing loop replays the owned
+    // `(record, order, key)` outcomes in declared order, so `driver_pairs`
+    // and the two unmatched vectors stay byte-identical to a sequential
+    // extraction.
+    let driver_keyed: Vec<(Record, RecordOrder, Option<Value>)> = driver_records
+        .into_par_iter()
+        .map(|(record, order)| {
+            let mut range_buf: Vec<Value> = Vec::new();
+            let key = extract_range_key(
+                &driver_extractor,
+                ctx,
+                &record,
+                resolver_mapping,
+                true,
+                &mut range_buf,
+            )
+            .map_err(|e| key_eval_error(name, "driving", e))?;
+            Ok::<_, PipelineError>((record, order, key))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (record, order, key) in driver_keyed {
         match key {
             Some(k) => driver_pairs.push((record, order, k)),
             None => {
@@ -555,16 +572,23 @@ fn execute_combine_sort_merge_with_stats(
     }
 
     let mut build_pairs: Vec<(Record, Value)> = Vec::new();
-    for record in build_records {
-        let key = extract_range_key(
-            &build_extractor,
-            ctx,
-            &record,
-            resolver_mapping,
-            false,
-            &mut range_buf,
-        )
-        .map_err(|e| key_eval_error(name, "build", e))?;
+    let build_keyed: Vec<(Record, Option<Value>)> = build_records
+        .into_par_iter()
+        .map(|record| {
+            let mut range_buf: Vec<Value> = Vec::new();
+            let key = extract_range_key(
+                &build_extractor,
+                ctx,
+                &record,
+                resolver_mapping,
+                false,
+                &mut range_buf,
+            )
+            .map_err(|e| key_eval_error(name, "build", e))?;
+            Ok::<_, PipelineError>((record, key))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (record, key) in build_keyed {
         if let Some(k) = key {
             build_pairs.push((record, k));
         }

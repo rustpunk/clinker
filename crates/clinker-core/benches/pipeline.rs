@@ -1,4 +1,4 @@
-use clinker_bench_support::{CsvPayload, MEDIUM, SMALL, bench_runtime as runtime};
+use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -89,7 +89,7 @@ nodes:
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.to_async(runtime()).iter(|| async {
+            b.iter(|| {
                 let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
                     clinker_core::executor::single_file_reader(
@@ -112,7 +112,6 @@ nodes:
                     writers,
                     &params,
                 )
-                .await
                 .unwrap();
                 black_box(report);
             });
@@ -179,7 +178,7 @@ nodes:
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.to_async(runtime()).iter(|| async {
+            b.iter(|| {
                 let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
                     clinker_core::executor::single_file_reader(
@@ -202,7 +201,6 @@ nodes:
                     writers,
                     &params,
                 )
-                .await
                 .unwrap();
                 black_box(report);
             });
@@ -283,7 +281,7 @@ nodes:
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.to_async(runtime()).iter(|| async {
+            b.iter(|| {
                 let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
                     clinker_core::executor::single_file_reader(
@@ -318,7 +316,6 @@ nodes:
                     writers,
                     &params,
                 )
-                .await
                 .unwrap();
                 black_box(report);
             });
@@ -384,7 +381,7 @@ nodes:
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.to_async(runtime()).iter(|| async {
+            b.iter(|| {
                 let readers: clinker_core::executor::SourceReaders = HashMap::from([(
                     "src".to_string(),
                     clinker_core::executor::single_file_reader(
@@ -407,7 +404,6 @@ nodes:
                     writers,
                     &params,
                 )
-                .await
                 .unwrap();
                 black_box(report);
             });

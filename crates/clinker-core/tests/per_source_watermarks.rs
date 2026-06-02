@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry};
+use clinker_core::executor::{
+    PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders, WriterRegistry,
+};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
@@ -60,8 +62,8 @@ fn iso_dt_nanos(s: &str) -> i64 {
 /// Two sources of differing event-time density. Pins per-source +
 /// effective-watermark rollups. Acceptance criterion 2 of
 /// https://github.com/rustpunk/clinker/issues/52.
-#[tokio::test(flavor = "multi_thread")]
-async fn two_sources_differing_density() {
+#[test]
+fn two_sources_differing_density() {
     let yaml = r#"
 pipeline:
   name: per_source_watermarks
@@ -104,17 +106,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:00\n2,2026-01-01T00:01:00\n3,2026-01-01T00:02:00\n",
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "b",
                 "id,event_time\n10,2026-01-01T00:00:30\n11,2026-01-01T00:00:45\n",
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -123,7 +125,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute multi-source watermarked pipeline");
 
     let a_max = iso_dt_nanos("2026-01-01T00:02:00");
@@ -160,8 +161,8 @@ nodes:
 /// Flink/Arroyo per-partition + min reducer pattern. This is the
 /// invariant the `fan_out_per_source_file` 1:1 source-file → sink
 /// topology relies on.
-#[tokio::test(flavor = "multi_thread")]
-async fn glob_source_multi_file_per_partition() {
+#[test]
+fn glob_source_multi_file_per_partition() {
     let yaml = r#"
 pipeline:
   name: glob_source_watermark
@@ -189,7 +190,7 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![
+        SourceInput::Files(vec![
             slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n3,2026-01-01T00:00:03\n",
@@ -198,7 +199,7 @@ nodes:
                 "b",
                 "id,event_time\n10,2026-01-01T01:00:00\n11,2026-01-01T02:00:00\n12,2026-01-01T03:00:00\n",
             ),
-        ],
+        ]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -206,7 +207,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute glob source");
 
     let a_max = iso_dt_nanos("2026-01-01T00:00:03");
@@ -230,8 +230,8 @@ nodes:
 /// Acceptance criterion 4: single-source pipelines still produce a
 /// per-source-watermarks report entry equal to `max(event_time)`,
 /// with no regression in pipeline output.
-#[tokio::test(flavor = "multi_thread")]
-async fn single_source_unaffected() {
+#[test]
+fn single_source_unaffected() {
     let yaml = r#"
 pipeline:
   name: single_source_watermark
@@ -259,10 +259,10 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![slot(
+        SourceInput::Files(vec![slot(
             "a",
             "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n",
-        )],
+        )]),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -270,7 +270,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute single-source watermarked pipeline");
 
     let expected = iso_dt_nanos("2026-01-01T00:00:02");
@@ -286,8 +285,8 @@ nodes:
 /// rollup. The `effective_watermark` then equals the declared source's
 /// rollup alone — the undeclared source does not pull the min toward
 /// `None`.
-#[tokio::test(flavor = "multi_thread")]
-async fn undeclared_source_skipped_at_min() {
+#[test]
+fn undeclared_source_skipped_at_min() {
     let yaml = r#"
 pipeline:
   name: undeclared_skipped
@@ -328,17 +327,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "a",
                 "id,event_time\n1,2026-01-01T00:00:01\n2,2026-01-01T00:00:02\n",
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot(
+            SourceInput::Files(vec![slot(
                 "b",
                 "id,event_time\n100,2030-01-01T00:00:00\n200,2030-01-01T00:00:01\n",
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -347,7 +346,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute mixed-watermark pipeline");
 
     let a_max = iso_dt_nanos("2026-01-01T00:00:02");
@@ -364,8 +362,8 @@ nodes:
 /// Pipeline with zero `watermark:` declarations: report is well-formed
 /// (empty maps, `None` effective watermark), pipeline output is
 /// unchanged from a pre-sprint baseline.
-#[tokio::test(flavor = "multi_thread")]
-async fn no_watermarks_anywhere() {
+#[test]
+fn no_watermarks_anywhere() {
     let yaml = r#"
 pipeline:
   name: no_watermarks
@@ -389,15 +387,16 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let readers: SourceReaders =
-        HashMap::from([("src".to_string(), vec![slot("a", "id,tag\n1,foo\n2,bar\n")])]);
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![slot("a", "id,tag\n1,foo\n2,bar\n")]),
+    )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute no-watermark pipeline");
 
     assert!(report.per_source_watermarks.is_empty());
@@ -410,8 +409,8 @@ nodes:
 /// file is empty / contains only headers): the declared-source list
 /// still surfaces the entry with `None`, and rollups gracefully
 /// degrade.
-#[tokio::test(flavor = "multi_thread")]
-async fn zero_records_keeps_declared_entry_with_none() {
+#[test]
+fn zero_records_keeps_declared_entry_with_none() {
     let yaml = r#"
 pipeline:
   name: zero_records_watermark
@@ -437,15 +436,16 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let readers: SourceReaders =
-        HashMap::from([("src".to_string(), vec![slot("a", "id,event_time\n")])]);
+    let readers: SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_core::executor::SourceInput::Files(vec![slot("a", "id,event_time\n")]),
+    )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("execute empty-input watermarked pipeline");
 
     // Declared, but with no observations: source entry exists with
@@ -461,8 +461,8 @@ nodes:
 /// AND each output file must contain only its own source-file's
 /// records. Exercises the 1:1 source-file → sink invariant the
 /// granularity decision is designed to preserve.
-#[tokio::test(flavor = "multi_thread")]
-async fn fan_out_per_source_file_watermark_isolation() {
+#[test]
+fn fan_out_per_source_file_watermark_isolation() {
     let yaml = r#"
 pipeline:
   name: fan_out_watermark_isolation
@@ -496,7 +496,7 @@ nodes:
     let arc_b: Arc<str> = Arc::from("b.csv");
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
-        vec![
+        SourceInput::Files(vec![
             FileSlot::new(
                 PathBuf::from(arc_a.as_ref()),
                 Box::new(Cursor::new(
@@ -513,7 +513,7 @@ nodes:
                         .to_vec(),
                 )),
             ),
-        ],
+        ]),
     )]);
 
     let buf_a = SharedBuffer::new();
@@ -537,7 +537,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("run fan-out watermark pipeline");
 
     // Per-file watermarks reported independently — the early file's

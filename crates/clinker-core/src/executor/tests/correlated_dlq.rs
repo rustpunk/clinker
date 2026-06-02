@@ -10,7 +10,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-async fn run_correlated_pipeline(
+fn run_correlated_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -39,8 +39,7 @@ async fn run_correlated_pipeline(
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -86,11 +85,11 @@ nodes:
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_fail_dlqs_whole_group() {
+#[test]
+fn one_fail_dlqs_whole_group() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
@@ -105,11 +104,11 @@ async fn one_fail_dlqs_whole_group() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn good_groups_emit_bad_groups_dlq() {
+#[test]
+fn good_groups_emit_bad_groups_dlq() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,200\nB,bad\nB,300\nC,500\nC,600\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4, "groups A and C emitted (4 records)");
     assert_eq!(counters.dlq_count, 2, "group B DLQ'd (2 records)");
@@ -118,11 +117,11 @@ async fn good_groups_emit_bad_groups_dlq() {
     assert!(output.contains("C,500"), "output has group C");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn trigger_marks_root_cause_only() {
+#[test]
+fn trigger_marks_root_cause_only() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\n";
-    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(dlq_entries.len(), 3);
 
@@ -141,14 +140,14 @@ async fn trigger_marks_root_cause_only() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn collateral_carries_correlated_category() {
+#[test]
+fn collateral_carries_correlated_category() {
     // Per the deferred-commit design, collateral entries carry the
     // dedicated `Correlated` category (was `ValidationFailure` in the
     // deleted impl).
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\n";
-    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
     assert_eq!(
@@ -165,11 +164,11 @@ async fn collateral_carries_correlated_category() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn null_key_records_are_per_record_groups() {
+#[test]
+fn null_key_records_are_per_record_groups() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\n,100\n,bad\n,300\nA,400\n";
-    let (counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3, "three good records emitted");
     assert_eq!(counters.dlq_count, 1, "only the bad null-key record DLQ'd");
@@ -177,8 +176,8 @@ async fn null_key_records_are_per_record_groups() {
     assert!(dlq_entries[0].trigger, "individual rejection is root cause");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn compound_key_groups_dlq_atomically() {
+#[test]
+fn compound_key_groups_dlq_atomically() {
     let yaml = r#"
 pipeline:
   name: compound_key_test
@@ -220,7 +219,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,dept,value\nA,HR,100\nA,HR,bad\nA,ENG,200\nB,HR,300\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 2, "group (A,HR) DLQ'd");
     assert_eq!(counters.ok_count, 2, "groups (A,ENG) and (B,HR) emitted");
@@ -229,11 +228,11 @@ nodes:
     assert!(output.contains("B,HR"), "output has (B,HR)");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn empty_input_zero_dlq_zero_emit() {
+#[test]
+fn empty_input_zero_dlq_zero_emit() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.total_count, 0);
     assert_eq!(counters.dlq_count, 0);
@@ -243,8 +242,8 @@ async fn empty_input_zero_dlq_zero_emit() {
     assert!(lines.len() <= 1, "empty or header-only output");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn group_overflow_emits_root_cause_and_collaterals() {
+#[test]
+fn group_overflow_emits_root_cause_and_collaterals() {
     let yaml = r#"
 pipeline:
   name: buffer_overflow_test
@@ -286,7 +285,7 @@ nodes:
     // becomes a DLQ entry: one root-cause with category=GroupSizeExceeded,
     // the rest collaterals with category=Correlated.
     let csv = "employee_id,value\nA,100\nA,200\nA,300\nA,400\nA,500\nB,600\n";
-    let (counters, dlq_entries, _output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, _output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 5,
@@ -311,8 +310,8 @@ nodes:
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn multi_output_route_dlqs_group_across_branches() {
+#[test]
+fn multi_output_route_dlqs_group_across_branches() {
     // A.1: multi-output via inclusive Route. A transform error on a
     // record reachable from any output branch DLQs the whole
     // correlation group across both outputs.
@@ -405,7 +404,6 @@ nodes:
     ]);
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .unwrap();
 
     let out_a = buf_a.as_string();
@@ -546,8 +544,8 @@ nodes:
     assert!(!agg_node.requires_buffer_mode);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_output_inherits_correlation_meta() {
+#[test]
+fn aggregate_output_inherits_correlation_meta() {
     // A strict aggregate (`group_by ⊇ correlation_key`) must have its
     // emitted rows participate in correlation rollback. When a transform
     // error fails one record in group A, the surviving A records still
@@ -618,7 +616,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,7\nB,11\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 2,
@@ -651,8 +649,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn group_identity_fixed_at_ingest_when_transform_rewrites_key() {
+#[test]
+fn group_identity_fixed_at_ingest_when_transform_rewrites_key() {
     // A Transform that rewrites the correlation_key field must not
     // change a row's group identity. Group identity is captured at
     // Source ingest into a write-protected `$ck.<field>` shadow
@@ -703,7 +701,7 @@ nodes:
     // ingest-time-identity contract says only the original-A group's
     // 3 records get DLQ'd.
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
-    let (counters, _dlq_entries, _output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, _dlq_entries, _output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
@@ -712,8 +710,8 @@ nodes:
     assert_eq!(counters.ok_count, 1, "the original-B group emitted");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_after_transform_rewrite_groups_by_original_identity() {
+#[test]
+fn aggregate_after_transform_rewrite_groups_by_original_identity() {
     // When a Transform rewrites the user-declared correlation_key field
     // and an Aggregate follows, the engine produces one aggregate row
     // per ORIGINAL ingest group — not one coalesced row keyed on the
@@ -769,7 +767,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,3\nB,7\n";
-    let (counters, _dlq_entries, output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, _dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 0, "no bad records → no DLQ");
     assert_eq!(
@@ -790,8 +788,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn combine_output_inherits_driver_correlation_meta() {
+#[test]
+fn combine_output_inherits_driver_correlation_meta() {
     // A combine's output rows must inherit the driver record's
     // correlation meta so they participate in the same buffer cell as
     // any driver-side trigger error from the same correlation group.
@@ -913,7 +911,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .unwrap();
     let output = buf.as_string();
 
@@ -957,8 +954,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn combine_chain_output_inherits_driver_correlation_meta() {
+#[test]
+fn combine_chain_output_inherits_driver_correlation_meta() {
     // Three-input combine decomposed into a left-deep chain of two
     // binary steps. Step 0 (synthetic, body-less) joins the driver
     // with the first build input and emits an intermediate record
@@ -1103,7 +1100,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .unwrap();
     let output = buf.as_string();
 
@@ -1140,8 +1136,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn route_eval_error_dlqs_whole_group() {
+#[test]
+fn route_eval_error_dlqs_whole_group() {
     // A Route condition that errors at evaluation time (e.g., a CXL
     // expression that fails to convert) is routed to the correlation
     // buffer as a trigger event for the failing record's group, just
@@ -1189,7 +1185,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,4\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
@@ -1207,8 +1203,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn combine_iejoin_output_inherits_driver_correlation_meta() {
+#[test]
+fn combine_iejoin_output_inherits_driver_correlation_meta() {
     // The IEJoin combine strategy (selected for mixed equi+range
     // predicates) must inherit driver `$ck.<field>` snapshot columns
     // the same way the HashBuildProbe path does. The kernel emits
@@ -1323,7 +1319,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .unwrap();
     let output = buf.as_string();
 

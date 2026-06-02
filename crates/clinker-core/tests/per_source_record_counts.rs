@@ -40,8 +40,8 @@ fn run_params() -> PipelineRunParams {
 /// the non-fused Source dispatch arm. Per-source ingest counts must
 /// reflect each source's row count independently of the aggregate
 /// `counters.total_count`.
-#[tokio::test(flavor = "multi_thread")]
-async fn concat_merge_per_source_counts() {
+#[test]
+fn concat_merge_per_source_counts() {
     let yaml = r#"
 pipeline:
   name: per_source_counts_concat
@@ -75,8 +75,14 @@ nodes:
 "#;
     let config = parse_config(yaml).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id\n1\n2\n3\n4\n5\n")]),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n20\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id\n1\n2\n3\n4\n5\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n20\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -85,7 +91,6 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .unwrap();
 
     assert_eq!(
@@ -115,8 +120,8 @@ nodes:
 /// every record through the fused `Merge.interleave` arm. Each source's
 /// finalize stamp must still land on `source_count_per_source` so both
 /// names surface in the report's per-source map.
-#[tokio::test(flavor = "multi_thread")]
-async fn fused_interleave_merge_per_source_counts() {
+#[test]
+fn fused_interleave_merge_per_source_counts() {
     let yaml = r#"
 pipeline:
   name: per_source_counts_fused_interleave
@@ -154,9 +159,15 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id\n1\n2\n3\n4\n5\n6\n7\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id\n1\n2\n3\n4\n5\n6\n7\n",
+            )]),
         ),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n20\n30\n")]),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n20\n30\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -165,7 +176,6 @@ nodes:
     let plan = config.compile(&CompileContext::default()).unwrap();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .unwrap();
 
     assert_eq!(

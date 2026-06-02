@@ -29,7 +29,7 @@ use std::collections::HashMap;
 /// Successful run yields counters, the DLQ entries, and the rendered output.
 type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
 
-async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
+fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
     let config = crate::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -55,8 +55,7 @@ async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, Pipeline
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -65,8 +64,8 @@ async fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, Pipeline
 /// workload runs unchanged after the orchestrator landed. The
 /// orchestrator's `is_relaxed_pipeline` check picks the FastPath
 /// branch so the strict body emits the same DLQ shape as before.
-#[tokio::test(flavor = "multi_thread")]
-async fn strict_pipeline_zero_overhead_short_circuits_to_fast_path() {
+#[test]
+fn strict_pipeline_zero_overhead_short_circuits_to_fast_path() {
     let yaml = r#"
 pipeline:
   name: strict_test
@@ -102,7 +101,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nB,200\n";
-    let (counters, dlq_entries, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
 
     // Group A is dirty (one bad record); group B is clean.
     assert_eq!(counters.dlq_count, 2, "group A DLQ'd as a unit (2 records)");
@@ -120,8 +119,8 @@ nodes:
 /// every group is clean, the recompute / deferred-dispatch phases are
 /// no-ops, and the flush phase produces the same output as the strict
 /// path.
-#[tokio::test(flavor = "multi_thread")]
-async fn relaxed_pipeline_no_failures_emits_normally() {
+#[test]
+fn relaxed_pipeline_no_failures_emits_normally() {
     let yaml = r#"
 pipeline:
   name: relaxed_clean
@@ -159,7 +158,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE3,ENG,100\n";
-    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 0, "no failures expected");
     // sum(amount) per dept: HR=30, ENG=100. Output rows materialize
@@ -180,8 +179,8 @@ nodes:
 /// in-group slot, so `All` collapses to `Any`'s observed behavior here;
 /// the test covers the resolution wiring rather than partial-match
 /// shaping which only fires under multi-CK fan-out).
-#[tokio::test(flavor = "multi_thread")]
-async fn fanout_policy_resolution_precedence_pipeline_default() {
+#[test]
+fn fanout_policy_resolution_precedence_pipeline_default() {
     let yaml = r#"
 pipeline:
   name: policy_default
@@ -218,7 +217,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "emp_id,value\nA,100\nA,bad\nB,200\n";
-    let (counters, dlq_entries, _output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq_entries, _output) = run_pipeline(yaml, csv).unwrap();
     // Pipeline-level All policy still rolls back the whole A group
     // because every collateral slot's CK matches the trigger fully.
     assert_eq!(counters.dlq_count, 2);
@@ -228,8 +227,8 @@ nodes:
 /// Per-Output `Primary` override should resolve through the orchestrator
 /// regardless of the pipeline-level setting. Verifies the per-Output
 /// override takes precedence over the per-pipeline default.
-#[tokio::test(flavor = "multi_thread")]
-async fn fanout_policy_resolution_output_override_wins() {
+#[test]
+fn fanout_policy_resolution_output_override_wins() {
     let yaml = r#"
 pipeline:
   name: policy_override
@@ -267,7 +266,7 @@ nodes:
     correlation_fanout_policy: primary
 "#;
     let csv = "emp_id,value\nA,100\nB,200\n";
-    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
     // No failures, so the policy resolution does not affect emission;
     // the test verifies the override field parses end-to-end and
     // doesn't break the strict-path emission shape.
@@ -289,8 +288,8 @@ nodes:
 /// claim — anything that breaks the chain (lineage drop, retract
 /// mis-attribution, replay overshoot) shows up as a value mismatch
 /// against the baseline rerun.
-#[tokio::test(flavor = "multi_thread")]
-async fn end_to_end_retraction_reversible_matches_baseline_rerun() {
+#[test]
+fn end_to_end_retraction_reversible_matches_baseline_rerun() {
     let yaml = r#"
 pipeline:
   name: retract_reversible
@@ -375,9 +374,9 @@ O11,ENG,500
 O12,HR,60
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
     let (baseline_counters, baseline_dlq, baseline_output) =
-        run_pipeline(yaml, baseline_csv).await.unwrap();
+        run_pipeline(yaml, baseline_csv).unwrap();
 
     // Baseline is the canonical reference: it has zero DLQ entries
     // (no bad rows) and the surviving groups' aggregate output reaches
@@ -442,8 +441,8 @@ O12,HR,60
 /// equivalence assertion proves the buffer-mode aggregator's
 /// finalize-after-retract path produces the same min/max/avg across
 /// surviving rows that a clean rerun would produce.
-#[tokio::test(flavor = "multi_thread")]
-async fn end_to_end_retraction_buffer_required_matches_baseline_rerun() {
+#[test]
+fn end_to_end_retraction_buffer_required_matches_baseline_rerun() {
     let yaml = r#"
 pipeline:
   name: retract_buffer_required
@@ -519,8 +518,8 @@ O7,HR,40
 O8,HR,50
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O3 row");
@@ -561,8 +560,8 @@ O8,HR,50
 /// The bit-for-bit assertion proves the downstream Transform observes
 /// the retract-corrected aggregate state, not the pre-retract state: a
 /// stale aggregate output would surface as a wrong per_capita.
-#[tokio::test(flavor = "multi_thread")]
-async fn end_to_end_retraction_downstream_transform_observes_corrected_state() {
+#[test]
+fn end_to_end_retraction_downstream_transform_observes_corrected_state() {
     let yaml = r#"
 pipeline:
   name: retract_downstream_transform
@@ -650,8 +649,8 @@ O7,ENG,300
 O8,HR,40
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O4 row");
@@ -698,8 +697,8 @@ O8,HR,40
 /// one. The recompute phase pairs HR's pre-retract row against `None`,
 /// producing a delete-only Delta that the replay phase removes from
 /// the correlation buffer.
-#[tokio::test(flavor = "multi_thread")]
-async fn empty_group_after_retraction_disappears_from_output() {
+#[test]
+fn empty_group_after_retraction_disappears_from_output() {
     let yaml = r#"
 pipeline:
   name: empty_group_retract
@@ -765,8 +764,8 @@ O5,ENG,200
 O6,ENG,300
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     assert_eq!(
@@ -825,8 +824,8 @@ O6,ENG,300
 /// see the row's contribution retracted exactly once — a
 /// double-retract would shift `count(*)` and `sum(amount)` into
 /// negative-shaped territory that doesn't match a baseline rerun.
-#[tokio::test(flavor = "multi_thread")]
-async fn idempotent_retract_dedupes_multi_failure_row() {
+#[test]
+fn idempotent_retract_dedupes_multi_failure_row() {
     let yaml = r#"
 pipeline:
   name: idempotent_retract
@@ -913,8 +912,8 @@ O5,ENG,100,5
 O6,ENG,200,6
 ";
 
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
-    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     // The bad row participates in both failures but the orchestrator
@@ -974,8 +973,8 @@ O6,ENG,200,6
 /// present) rather than the FastPath strict body. Documents that the
 /// orchestrator's flush step honors `Any` identically to the strict
 /// path's flush.
-#[tokio::test(flavor = "multi_thread")]
-async fn fanout_policy_any_under_relaxed_orchestrator() {
+#[test]
+fn fanout_policy_any_under_relaxed_orchestrator() {
     let yaml = r#"
 pipeline:
   name: fanout_any_relaxed
@@ -1032,7 +1031,7 @@ O3,HR,BAD
 O4,ENG,100
 O5,ENG,200
 ";
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
     // Trigger row is the failing record; collateral handling is
     // policy-specific. Under `Any` in shared-CK groups, every slot
     // sharing the trigger's CK gets rolled back. The relaxed
@@ -1059,8 +1058,8 @@ O5,ENG,200
 /// lands). This test pins the current shared-CK behavior and verifies
 /// `All` resolves through the orchestrator without regressing the
 /// observed output shape.
-#[tokio::test(flavor = "multi_thread")]
-async fn fanout_policy_all_under_relaxed_orchestrator() {
+#[test]
+fn fanout_policy_all_under_relaxed_orchestrator() {
     let yaml = r#"
 pipeline:
   name: fanout_all_relaxed
@@ -1117,7 +1116,7 @@ O3,HR,BAD
 O4,ENG,100
 O5,ENG,200
 ";
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
     assert_eq!(
         dlq.len(),
         1,
@@ -1142,8 +1141,8 @@ O5,ENG,200
 /// retraction lands. This test pins the single-source semantics and
 /// proves `Primary` resolves through the orchestrator's policy
 /// precedence chain.
-#[tokio::test(flavor = "multi_thread")]
-async fn fanout_policy_primary_under_relaxed_orchestrator() {
+#[test]
+fn fanout_policy_primary_under_relaxed_orchestrator() {
     let yaml = r#"
 pipeline:
   name: fanout_primary_relaxed
@@ -1200,7 +1199,7 @@ O3,HR,BAD
 O4,ENG,100
 O5,ENG,200
 ";
-    let (counters, dlq, output) = run_pipeline(yaml, csv).await.unwrap();
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
     assert_eq!(
         dlq.len(),
         1,
@@ -1233,8 +1232,8 @@ O5,ENG,200
 /// reaching the per-row guard, e.g. via spill), the test asserts the
 /// expected DLQ shape; if the panic fires, the test surfaces the
 /// finding so the bug can be addressed in a dedicated commit.
-#[tokio::test(flavor = "multi_thread")]
-async fn degrade_fallback_runtime_protection_or_documented_panic() {
+#[test]
+fn degrade_fallback_runtime_protection_or_documented_panic() {
     let yaml = r#"
 pipeline:
   name: degrade_fallback
@@ -1276,14 +1275,11 @@ nodes:
 
     let yaml_owned = yaml.to_string();
     let csv_owned = csv.to_string();
-    let join_handle = tokio::spawn(async move { run_pipeline(&yaml_owned, &csv_owned).await });
-    let join_outcome = join_handle.await;
+    // Run on a worker thread so a runtime guard panic surfaces as the
+    // join's Err arm rather than aborting the test harness; the join
+    // payload IS the panic payload.
     let outcome: Result<Result<RunOutput, PipelineError>, Box<dyn std::any::Any + Send>> =
-        match join_outcome {
-            Ok(inner) => Ok(inner),
-            Err(join_err) if join_err.is_panic() => Err(join_err.into_panic()),
-            Err(join_err) => panic!("unexpected tokio JoinError: {join_err}"),
-        };
+        std::thread::spawn(move || run_pipeline(&yaml_owned, &csv_owned)).join();
     match outcome {
         Ok(Ok((counters, _dlq, output))) => {
             // Pipeline completed cleanly. Memory pressure was absorbed

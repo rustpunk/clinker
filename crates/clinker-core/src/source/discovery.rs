@@ -455,6 +455,7 @@ mod tests {
             schema_overrides: None,
             array_paths: None,
             sort_order: None,
+            transport: crate::config::SourceTransport::File,
             format: InputFormat::Csv(None),
             notes: None,
         }

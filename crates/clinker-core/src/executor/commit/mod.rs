@@ -107,7 +107,7 @@ pub(crate) struct DlqEvent {
 /// `ctx.correlation_max_group_buffer` directly, and the per-group
 /// emission shape carries enough context in the buffer cell itself
 /// to format DLQ trigger messages without the carrier's name.
-pub(crate) async fn orchestrate(
+pub(crate) fn orchestrate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
@@ -163,8 +163,9 @@ pub(crate) async fn orchestrate(
         .sum();
     // Bound the cap by the total per-source ingest count, which is
     // seeded once at executor entry from the unified ingest counters
-    // — the live `mpsc::Receiver`s here surface records as they
-    // arrive and have no `.len()` to inspect.
+    // — the live crossbeam `Receiver`s here surface records as they
+    // arrive and their `.len()` reflects only what is currently
+    // buffered, not the run total.
     let total_source_rows: usize = ctx.total_per_source.values().map(|v| *v as usize).sum();
     let cap = test_cap_override()
         .unwrap_or(current_dag.graph.node_count() + body_node_count + total_source_rows + 1);
@@ -207,8 +208,7 @@ pub(crate) async fn orchestrate(
         // emit through its `input_rows_by_group_index` back to
         // contributing source rows — the same lineage the strict-path
         // detect uses.
-        let direct_events =
-            Box::pin(dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)).await?;
+        let direct_events = dispatch::dispatch_deferred_subdag(ctx, current_dag, &scope)?;
         let post_dispatch_scope = detect::detect_retract_scope(ctx, current_dag);
         archive_iteration_errors(&mut error_archive, ctx.correlation_buffers.as_ref());
         let mut new_events: Vec<DlqEvent> = direct_events;
@@ -441,15 +441,12 @@ fn test_cap_override() -> Option<usize> {
 }
 
 /// Run `body` with the cascading-retraction loop cap forced to `cap`.
-/// Test-only; the override unsets on exit so a panicking body — or an
-/// awaiter cancellation — cannot leak the override into a sibling test
-/// on the same thread. `body` returns a future so the cap remains in
-/// effect for the entire awaited execution.
+/// Test-only; the override unsets on exit so a panicking body cannot
+/// leak the override into a sibling test on the same thread.
 #[cfg(test)]
-pub(crate) async fn with_test_loop_cap<R, F, Fut>(cap: usize, body: F) -> R
+pub(crate) fn with_test_loop_cap<R, F>(cap: usize, body: F) -> R
 where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = R>,
+    F: FnOnce() -> R,
 {
     struct Guard {
         prev: Option<usize>,
@@ -461,5 +458,5 @@ where
     }
     let prev = TEST_LOOP_CAP.with(|c| c.replace(Some(cap)));
     let _guard = Guard { prev };
-    body().await
+    body()
 }

@@ -48,10 +48,7 @@ fn test_params() -> PipelineRunParams {
 }
 
 /// Run a single-input, single-output pipeline. Returns (report, output_csv).
-async fn run_single(
-    yaml: &str,
-    csv_input: &str,
-) -> (clinker_core::executor::ExecutionReport, String) {
+fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::ExecutionReport, String) {
     let config = parse_config(yaml).unwrap();
     let params = test_params();
 
@@ -79,7 +76,6 @@ async fn run_single(
         writers,
         &params,
     )
-    .await
     .unwrap();
     (report, buf.as_string())
 }
@@ -102,8 +98,8 @@ fn sorted_body_lines(output: &str) -> Vec<String> {
     lines
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_group_by_sum_count() {
+#[test]
+fn test_e2e_group_by_sum_count() {
     // Full pipeline: CSV → aggregate(group_by: [dept], cxl: sum + count) → CSV output
     let yaml = r#"
 pipeline:
@@ -154,7 +150,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2, "two output groups");
     assert_eq!(
@@ -163,8 +159,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_aggregate_avg_min_max() {
+#[test]
+fn test_e2e_aggregate_avg_min_max() {
     let yaml = r#"
 pipeline:
   name: agg_avg_min_max
@@ -216,7 +212,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\neng,300\nsales,50\nsales,150\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
     assert_eq!(
@@ -228,8 +224,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_aggregate_collect() {
+#[test]
+fn test_e2e_aggregate_collect() {
     // Collect produces a JSON-array-like string in CSV output. We assert
     // length and membership rather than exact serialization to avoid
     // coupling to formatter details.
@@ -277,7 +273,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
     let body = sorted_body_lines(&output);
@@ -297,8 +293,8 @@ nodes:
     assert!(sales_line.contains("Carol"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_aggregate_weighted_avg() {
+#[test]
+fn test_e2e_aggregate_weighted_avg() {
     // Weighted average: sum(salary*hours) / sum(hours).
     // eng: (100*40 + 200*20) / 60 = 8000 / 60 = 133.333...
     // sales: (50*40) / 40 = 50
@@ -352,7 +348,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary,hours\neng,100,40\neng,200,20\nsales,50,40\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
     let body = sorted_body_lines(&output);
@@ -377,8 +373,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_global_fold_no_group_by() {
+#[test]
+fn test_e2e_global_fold_no_group_by() {
     // group_by: [] → single output row with global aggregates.
     let yaml = r#"
 pipeline:
@@ -426,14 +422,14 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "amount\n10\n20\n30\n40\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 1, "one global-fold row");
     assert_eq!(sorted_body_lines(&output), vec!["100,4".to_string()]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_aggregate_null_handling() {
+#[test]
+fn test_e2e_aggregate_null_handling() {
     // sum(field) and count(field) skip NULL inputs; count(*) counts every
     // row regardless. With salary=NULL on the second eng row, eng should
     // see total=100 (one non-null), count(salary)=1, count(*)=2.
@@ -490,7 +486,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,\nsales,50\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
     assert_eq!(
@@ -499,8 +495,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_aggregate_chained_with_transform() {
+#[test]
+fn test_e2e_aggregate_chained_with_transform() {
     // Transform → Aggregate: a row-level transform projects a field, then
     // an aggregate consumes it. Verifies schema flows from a non-aggregate
     // predecessor into the aggregation node and the executor wires the
@@ -561,7 +557,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-    let (report, output) = run_single(yaml, csv).await;
+    let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
     // (100+10) + (200+10) = 320 ; 50+10 = 60
@@ -571,8 +567,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_streaming_vs_hash_identical() {
+#[test]
+fn test_e2e_streaming_vs_hash_identical() {
     // Same input, two pipelines: one with declared sort_order on the
     // group-by key (eligible for the streaming aggregator), one without
     // (forces hash). Set-equality of the bodies must hold regardless of
@@ -682,8 +678,8 @@ nodes:
     path: out.csv
     include_unmapped: true
 "#;
-    let (hash_report, hash_out) = run_single(yaml_hash, csv).await;
-    let (stream_report, stream_out) = run_single(yaml_streaming, csv).await;
+    let (hash_report, hash_out) = run_single(yaml_hash, csv);
+    let (stream_report, stream_out) = run_single(yaml_streaming, csv);
     assert_eq!(hash_report.dlq_entries.len(), 0);
     assert_eq!(stream_report.dlq_entries.len(), 0);
     assert_eq!(hash_report.counters.ok_count, 2);
@@ -702,8 +698,8 @@ nodes:
 ///   * `total_metric` per group = sum of `metric` (= f2) per `f1` group.
 ///   * `record_count` per group = count of input records per `f1` group.
 ///   * `avg_w_sum` per group is non-null (window values flowed through).
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_windowed_transform_then_aggregate() {
+#[test]
+fn test_e2e_windowed_transform_then_aggregate() {
     let yaml = r#"
 pipeline:
   name: windowed_then_aggregate
@@ -770,7 +766,7 @@ nodes:
         2,c,400\n\
         2,c,500\n";
 
-    let (report, out) = run_single(yaml, csv).await;
+    let (report, out) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
     assert!(
         !out.is_empty() && out.lines().count() >= 2,

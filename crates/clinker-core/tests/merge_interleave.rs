@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
@@ -109,12 +109,18 @@ fn src_b_csv(count: u32) -> String {
 }
 
 /// Run the pipeline once and return the output body lines (header skipped).
-async fn run_pipeline(yaml: &str, a_count: u32, b_count: u32) -> Vec<String> {
+fn run_pipeline(yaml: &str, a_count: u32, b_count: u32) -> Vec<String> {
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", &src_a_csv(a_count))]),
-        ("src_b".to_string(), vec![slot("b", &src_b_csv(b_count))]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", &src_a_csv(a_count))]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(b_count))]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
@@ -122,7 +128,6 @@ async fn run_pipeline(yaml: &str, a_count: u32, b_count: u32) -> Vec<String> {
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes");
     assert_eq!(report.counters.dlq_count, 0);
     let output = buf.as_string();
@@ -166,10 +171,10 @@ fn assert_per_source_fifo(body: &[String]) {
 
 /// `mode: interleave` preserves per-source FIFO for both sources and
 /// emits every record exactly once.
-#[tokio::test(flavor = "multi_thread")]
-async fn interleave_preserves_per_source_fifo() {
+#[test]
+fn interleave_preserves_per_source_fifo() {
     let yaml = pipeline_yaml("mode: interleave");
-    let body = run_pipeline(&yaml, 3, 3).await;
+    let body = run_pipeline(&yaml, 3, 3);
     assert_eq!(body.len(), 6, "expected 6 records, got {body:?}");
     assert_per_source_fifo(&body);
 
@@ -185,10 +190,10 @@ async fn interleave_preserves_per_source_fifo() {
 
 /// Without `mode:` the Merge defaults to `concat`, which drains
 /// predecessors in declaration order (all `src_a` before any `src_b`).
-#[tokio::test(flavor = "multi_thread")]
-async fn concat_default_drains_in_declaration_order() {
+#[test]
+fn concat_default_drains_in_declaration_order() {
     let yaml = pipeline_yaml("");
-    let body = run_pipeline(&yaml, 3, 3).await;
+    let body = run_pipeline(&yaml, 3, 3);
     assert_eq!(body.len(), 6);
 
     // First three rows are src_a; last three are src_b.
@@ -204,11 +209,11 @@ async fn concat_default_drains_in_declaration_order() {
 /// independent runs. The seeded `fastrand::Rng` schedule is
 /// deterministic regardless of executor scheduling because the
 /// Interleave arm consumes pre-buffered records in a single fold.
-#[tokio::test(flavor = "multi_thread")]
-async fn seeded_interleave_is_reproducible() {
+#[test]
+fn seeded_interleave_is_reproducible() {
     let yaml = pipeline_yaml("mode: interleave\n      interleave_seed: 42");
-    let first = run_pipeline(&yaml, 5, 5).await;
-    let second = run_pipeline(&yaml, 5, 5).await;
+    let first = run_pipeline(&yaml, 5, 5);
+    let second = run_pipeline(&yaml, 5, 5);
     assert_eq!(
         first, second,
         "same seed must yield identical ordering across runs"
@@ -221,25 +226,20 @@ async fn seeded_interleave_is_reproducible() {
 /// reader between every record) does not block `src_b` from
 /// flowing through the Merge.interleave arm.
 ///
-/// Pre-rip behavior (sequential per-Source drain): the executor
-/// drains `src_a` fully before reading `src_b`'s channel, so the
-/// Merge round-robin sees both inputs as pre-buffered Vecs and
-/// emits them interleaved (`a-1, b-1, a-2, b-2, …`). Half of
-/// `src_b`'s records appear in the back half of the output stream.
+/// The interleave arm reads whichever source channel is ready via a
+/// crossbeam `Select`, so `src_b`'s records arrive into the Merge fold
+/// immediately while `src_a` is still sleeping between rows. The arm
+/// pulls every `src_b` record in the first ~5 ms, then waits 50 ms for
+/// each `src_a` record. Result: every `src_b` record sits in the first
+/// half of the output stream.
 ///
-/// Post-rip (fused `tokio::select!` over both source receivers):
-/// `src_b`'s records arrive into the Merge fold immediately while
-/// `src_a` is still sleeping between rows. The fused arm pulls
-/// every `src_b` record in the first ~5 ms, then waits 50 ms for
-/// each `src_a` record. Result: every `src_b` record sits in the
-/// first half of the output stream.
-///
-/// Discriminator: the position of the last `b-` tag in the output
-/// must be `<= 5` (first half of 10 total records). Sequential
-/// drain places the last `b-` at position 9; fused select! places
-/// it at position 4.
-#[tokio::test(flavor = "multi_thread")]
-async fn interleave_does_not_block_peer_on_slow_source() {
+/// Discriminator: the position of the last `b-` tag in the output must
+/// be `< 5` (first half of 10 total records). A regime that pre-buffers
+/// each source into a Vec and round-robins them would place the last
+/// `b-` at position 9; readiness-driven selection places it at the
+/// front.
+#[test]
+fn interleave_does_not_block_peer_on_slow_source() {
     use std::time::Instant;
 
     let yaml = pipeline_yaml("mode: interleave");
@@ -249,12 +249,16 @@ async fn interleave_does_not_block_peer_on_slow_source() {
         (
             "src_a".to_string(),
             // 5 records, each preceded by 50 ms — total ~250 ms.
-            vec![slow_slot("a", &src_a_csv(5), Duration::from_millis(50))],
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &src_a_csv(5),
+                Duration::from_millis(50),
+            )]),
         ),
         (
             "src_b".to_string(),
             // 5 records, produced as fast as the channel admits.
-            vec![slot("b", &src_b_csv(5))],
+            clinker_core::executor::SourceInput::Files(vec![slot("b", &src_b_csv(5))]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -264,7 +268,6 @@ async fn interleave_does_not_block_peer_on_slow_source() {
     let start = Instant::now();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes");
     let elapsed = start.elapsed();
 
@@ -275,8 +278,8 @@ async fn interleave_does_not_block_peer_on_slow_source() {
     assert_per_source_fifo(&body);
 
     // Discriminator assertion: the LAST b-tag must appear in the
-    // first half of the output. Sequential-drain regimes place it
-    // at the back; fused select! places it at the front.
+    // first half of the output. Pre-buffered round-robin would place
+    // it at the back; readiness-driven selection places it at the front.
     let last_b_pos = body
         .iter()
         .rposition(|row| tag_of(row).starts_with("b-"))
@@ -285,9 +288,9 @@ async fn interleave_does_not_block_peer_on_slow_source() {
         last_b_pos < 5,
         "Merge.interleave failed to back-pressure: last src_b record \
          landed at position {last_b_pos} (>=5) in {body:?}. \
-         Pre-rip pre-buffered round-robin places b records throughout \
-         the output; the fused select! path concentrates them at the \
-         front because src_a is still sleeping when src_b finishes \
+         Pre-buffered round-robin would place b records throughout \
+         the output; readiness-driven selection concentrates them at \
+         the front because src_a is still sleeping when src_b finishes \
          producing."
     );
 
@@ -430,8 +433,8 @@ fn assert_per_source_fifo_n(body: &[String], prefixes: &[char]) {
 ///    first inter-row sleep. Asserting it lands in both quartiles
 ///    would require artificial pacing antagonistic to live ingest;
 ///    the slowest-source spread is the spec-meaningful direction.)
-#[tokio::test(flavor = "multi_thread")]
-async fn interleave_fairness_under_four_predecessors() {
+#[test]
+fn interleave_fairness_under_four_predecessors() {
     use std::time::Instant;
 
     let yaml = pipeline_yaml_four_sources();
@@ -440,35 +443,35 @@ async fn interleave_fairness_under_four_predecessors() {
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "a",
                 &tagged_csv('a', 10),
                 Duration::from_millis(0),
-            )],
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "b",
                 &tagged_csv('b', 10),
                 Duration::from_millis(10),
-            )],
+            )]),
         ),
         (
             "src_c".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "c",
                 &tagged_csv('c', 10),
                 Duration::from_millis(25),
-            )],
+            )]),
         ),
         (
             "src_d".to_string(),
-            vec![slow_slot(
+            SourceInput::Files(vec![slow_slot(
                 "d",
                 &tagged_csv('d', 10),
                 Duration::from_millis(50),
-            )],
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -478,7 +481,6 @@ async fn interleave_fairness_under_four_predecessors() {
     let start = Instant::now();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline executes");
     let elapsed = start.elapsed();
 
@@ -567,16 +569,105 @@ async fn interleave_fairness_under_four_predecessors() {
 /// records the probability of two distinct fastrand schedules
 /// coinciding bit-for-bit is negligible; this would only fail on a
 /// regression that ignores the seed.
-#[tokio::test(flavor = "multi_thread")]
-async fn distinct_seeds_diverge() {
+#[test]
+fn distinct_seeds_diverge() {
     let yaml_one = pipeline_yaml("mode: interleave\n      interleave_seed: 1");
     let yaml_two = pipeline_yaml("mode: interleave\n      interleave_seed: 2");
-    let with_one = run_pipeline(&yaml_one, 8, 8).await;
-    let with_two = run_pipeline(&yaml_two, 8, 8).await;
+    let with_one = run_pipeline(&yaml_one, 8, 8);
+    let with_two = run_pipeline(&yaml_two, 8, 8);
     assert_per_source_fifo(&with_one);
     assert_per_source_fifo(&with_two);
     assert_ne!(
         with_one, with_two,
         "distinct seeds must yield distinct round-robin schedules"
+    );
+}
+
+/// Shutdown latency on the fused `Merge.interleave -> streaming-Output`
+/// path: a tripped token must unwind the merge `select()` loop promptly
+/// instead of draining both sources to natural EOF.
+///
+/// This shape is distinct from the `source -> transform -> output` SIGINT
+/// test: an unseeded interleave fuses straight into the streaming Output
+/// writer, so the merge select loop — not a per-operator chunk loop — is
+/// the only place a shutdown poll can land. A clean run never trips
+/// shutdown, so the example-pipeline golden diff cannot exercise this path.
+#[test]
+fn interleave_shutdown_unwinds_mid_stream() {
+    use clinker_core::pipeline::shutdown::ShutdownToken;
+    use std::time::Instant;
+
+    let yaml = pipeline_yaml("mode: interleave");
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+
+    // 6000 rows per source at 1 ms each, on concurrent ingest threads, so
+    // a clean run takes ~6 s; the interrupted run must return far sooner.
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "a",
+                &src_a_csv(6000),
+                Duration::from_millis(1),
+            )]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slow_slot(
+                "b",
+                &src_b_csv(6000),
+                Duration::from_millis(1),
+            )]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let token = ShutdownToken::detached();
+    let token_for_run = token.clone();
+    let params = PipelineRunParams {
+        execution_id: "interleave-sigint".to_string(),
+        batch_id: "interleave-sigint".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: Some(token_for_run),
+        ..Default::default()
+    };
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                .expect("an interrupted run drains gracefully and returns Ok");
+        let _ = done_tx.send(report);
+    });
+
+    // Let the merge interleave a few hundred rows, then signal shutdown.
+    std::thread::sleep(Duration::from_millis(300));
+    let signaled_at = Instant::now();
+    token.request();
+
+    // 3 s is generous over one select iteration yet well under the ~6 s
+    // clean-run wall time, so a regression that ignores the token in the
+    // fused merge loop surfaces as a timeout, not a silent full drain.
+    let report = done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("interrupted fused-merge run must terminate within the shutdown bound");
+    let shutdown_latency = signaled_at.elapsed();
+    worker.join().expect("executor thread did not panic");
+
+    assert!(
+        report.interrupted,
+        "report must flag the fused-merge run interrupted"
+    );
+    assert!(
+        report.counters.total_count < 12000,
+        "interrupted run stopped early; ingested {} of 12000 rows",
+        report.counters.total_count
+    );
+    assert!(
+        shutdown_latency < Duration::from_secs(3),
+        "shutdown took {shutdown_latency:?}, expected prompt unwind"
     );
 }

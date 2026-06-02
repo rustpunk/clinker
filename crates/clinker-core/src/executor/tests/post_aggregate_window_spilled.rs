@@ -21,8 +21,8 @@ use std::collections::HashMap;
 /// `should_abort` gate doesn't fire on the test framework's own
 /// footprint; the assertion target is downstream window correctness,
 /// not the spill trigger.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_aggregate_window_correct_under_memory_pressure() {
+#[test]
+fn post_aggregate_window_correct_under_memory_pressure() {
     let yaml = r#"
 pipeline:
   name: post_aggregate_window_spilled
@@ -97,7 +97,6 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .await
         .expect("pipeline must run under memory pressure");
     let output = buf.as_string();
 

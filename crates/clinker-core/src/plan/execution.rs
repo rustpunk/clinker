@@ -1278,24 +1278,20 @@ impl ExecutionPlanDag {
     /// The returned map is keyed by `NodeIndex` and covers every node in
     /// the graph (one entry per `node_indices()` slot).
     fn classify_node_buffers(&self, config: &PipelineConfig) -> HashMap<NodeIndex, BufferClass> {
-        let init_phase = crate::executor::compute_init_phase_node_set(self);
-        let mut fused_sources =
-            crate::executor::compute_merge_interleave_fused_sources(self, config);
-        let (extra_fused_sources, _fused_transforms) =
-            crate::executor::compute_transform_fused_sources(self, &fused_sources, &init_phase);
-        fused_sources.extend(extra_fused_sources);
-
-        self.graph
-            .node_indices()
-            .map(|idx| {
-                let class = match &self.graph[idx] {
-                    PlanNode::Output { .. } => BufferClass::Streaming,
-                    PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
-                        BufferClass::Streaming
-                    }
-                    _ => BufferClass::Materialized,
+        // Delegate to the fusion classifier whose streaming verdict is
+        // decided by the same `streaming_output_producer` predicate the
+        // runtime sender install consults, so the `--explain` annotation
+        // can never drift from what the dispatcher actually streams.
+        // `StreamClass` is the verdict; `BufferClass` is this surface's
+        // render-time wrapper.
+        crate::executor::classify_stream_nodes(self, config)
+            .into_iter()
+            .map(|(idx, class)| {
+                let buffer_class = match class {
+                    crate::executor::StreamClass::Streaming => BufferClass::Streaming,
+                    crate::executor::StreamClass::Materialized => BufferClass::Materialized,
                 };
-                (idx, class)
+                (idx, buffer_class)
             })
             .collect()
     }

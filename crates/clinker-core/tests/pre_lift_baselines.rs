@@ -272,7 +272,7 @@ fn compare_or_write(baseline_name: &str, actual: &str) {
 }
 
 /// Run a pipeline with in-memory readers/writers keyed by source/output name.
-async fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, String> {
+fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, String> {
     let config = parse_config(yaml).expect("parse_config");
     let params = test_params();
 
@@ -309,7 +309,6 @@ async fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<Strin
         writers,
         &params,
     )
-    .await
     .expect("pipeline run");
 
     buffers
@@ -548,8 +547,8 @@ fn snapshot_composition_pipeline(snap_name: &str, rel_path: &str) {
 
 /// For every DualRun fixture: run pre-lift, byte-compare outputs against
 /// committed baselines, and snapshot the `--explain` topology via insta.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_pre_lift_snapshots() {
+#[test]
+fn test_pre_lift_snapshots() {
     for fx in fixtures() {
         let BaselinePolicy::DualRun = fx.policy else {
             continue;
@@ -562,7 +561,7 @@ async fn test_pre_lift_snapshots() {
             .into_iter()
             .map(|(src, file)| (src, read_data(file)))
             .collect();
-        let outputs = run_pipeline(&yaml, inputs).await;
+        let outputs = run_pipeline(&yaml, inputs);
 
         for (baseline_file, out_name) in outputs_spec {
             let actual = outputs

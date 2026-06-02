@@ -55,7 +55,7 @@ nodes:
     include_unmapped: true
 "#;
 
-async fn run(csv: &str) -> String {
+fn run(csv: &str) -> String {
     let config = crate::config::parse_config(RANKING_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
@@ -77,13 +77,12 @@ async fn run(csv: &str) -> String {
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .await
         .expect("pipeline must run");
     buf.as_string()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn ranking_and_value_columns_over_tied_partition() {
+#[test]
+fn ranking_and_value_columns_over_tied_partition() {
     // Partition `eng` has a clean ascending sequence (no ties);
     // partition `hr` has two pairs of tied scores so rank() must skip
     // and dense_rank() must not.
@@ -109,7 +108,7 @@ hr,20
 hr,10
 ";
 
-    let out = run(csv).await;
+    let out = run(csv);
     let mut lines = out.lines();
     let header_line = lines.next().expect("header");
     let headers: Vec<&str> = header_line.split(',').collect();
@@ -235,8 +234,8 @@ nodes:
     include_unmapped: true
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn every_exists_not_exists_partition_scoped() {
+#[test]
+fn every_exists_not_exists_partition_scoped() {
     // HR scores = [10, 20, 30]   → every >25: false, exists <25: true,  none_neg: true
     // ENG scores = [50, 60, 70]  → every >25: true,  exists <25: false, none_neg: true
     let csv = "\
@@ -270,7 +269,6 @@ ENG,70
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .await
         .expect("pipeline must run");
     let out = buf.as_string();
 

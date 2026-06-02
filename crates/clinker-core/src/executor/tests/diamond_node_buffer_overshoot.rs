@@ -98,8 +98,8 @@ nodes:
     path: out.csv
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
+#[test]
+fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
     let config = crate::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
 
     let mut csv = String::from("id,region\n");
@@ -134,7 +134,6 @@ async fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
         crate::config::CompileContext::default(),
         spill_tripped_arbitrator(),
     )
-    .await
     .expect_err("one-byte spill quota must abort the first branch flush");
 
     match err {

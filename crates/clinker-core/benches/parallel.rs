@@ -1,4 +1,4 @@
-use clinker_bench_support::{CsvPayload, MEDIUM, bench_runtime as runtime};
+use clinker_bench_support::{CsvPayload, MEDIUM};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -131,11 +131,10 @@ nodes:
                         &clinker_core::config::CompileContext::default(),
                     )
                     .expect("compile");
-                    let report = runtime()
-                        .block_on(PipelineExecutor::run_plan_with_readers_writers(
-                            &plan, readers, writers, &params,
-                        ))
-                        .unwrap();
+                    let report = PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
+                    )
+                    .unwrap();
                     black_box(report);
                 });
             });
@@ -232,11 +231,10 @@ nodes:
                         &clinker_core::config::CompileContext::default(),
                     )
                     .expect("compile");
-                    let report = runtime()
-                        .block_on(PipelineExecutor::run_plan_with_readers_writers(
-                            &plan, readers, writers, &params,
-                        ))
-                        .unwrap();
+                    let report = PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
+                    )
+                    .unwrap();
                     black_box(report);
                 });
             });

@@ -44,7 +44,7 @@ pub(crate) struct RetractScope {
     /// delta — a DLQ event whose `(source_row, source_name)` is
     /// already in this set is a no-op for the loop. Pairing on the
     /// source name is load-bearing because each Source has its own
-    /// monotonic `row_num` counter (see `ingest_source_task`); without
+    /// monotonic `row_num` counter (see `ingest_source`); without
     /// source tagging, `src_a.row_5` would dedup against `src_b.row_5`
     /// and the second source's retract would silently no-op.
     /// Termination follows directly: source rows are bounded per

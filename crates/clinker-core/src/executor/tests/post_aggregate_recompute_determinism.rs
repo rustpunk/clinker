@@ -69,7 +69,7 @@ O5,ENG,200
 O6,ENG,300
 ";
 
-async fn run_once() -> u64 {
+fn run_once() -> u64 {
     let config = crate::config::parse_config(PIPELINE).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -93,16 +93,15 @@ async fn run_once() -> u64 {
     )]);
     let report =
         PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await
             .expect("buffer-recompute pipeline must execute");
     report.counters.retraction.partitions_dispatched
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn partitions_dispatched_is_deterministic_across_100_runs() {
+#[test]
+fn partitions_dispatched_is_deterministic_across_100_runs() {
     let mut counts: HashSet<u64> = HashSet::new();
     for _ in 0..100 {
-        counts.insert(run_once().await);
+        counts.insert(run_once());
     }
     assert_eq!(
         counts.len(),

@@ -53,8 +53,8 @@ fn run_params() -> PipelineRunParams {
 /// Topology 1 — `[src_a, src_b] → merge → out`. This is the canonical
 /// shape from #47. Pre-fix, the output silently contained `src_a`'s
 /// records twice; post-fix it carries the union of both sources.
-#[tokio::test(flavor = "multi_thread")]
-async fn merge_direct_two_sources_yields_union() {
+#[test]
+fn merge_direct_two_sources_yields_union() {
     let yaml = r#"
 pipeline:
   name: merge_direct_two_sources
@@ -93,11 +93,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -106,7 +112,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("multi-source merge must execute");
     // Unified source ingest counts every source's records, so
     // `total_count` reports the union (3 + 3 = 6) rather than the
@@ -143,8 +148,8 @@ nodes:
 /// same column shape and downstream operators cannot distinguish them
 /// by schema identity alone. Closes the lineage gap that schema-match
 /// peer Sources left open at the silent-corruption root of #47.
-#[tokio::test(flavor = "multi_thread")]
-async fn merge_preserves_source_name_per_record() {
+#[test]
+fn merge_preserves_source_name_per_record() {
     let yaml = r#"
 pipeline:
   name: merge_source_name
@@ -191,11 +196,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -203,7 +214,6 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("merge_preserves_source_name pipeline must execute");
     assert_eq!(report.counters.total_count, 4);
     assert_eq!(report.counters.dlq_count, 0);
@@ -255,8 +265,8 @@ nodes:
 /// The pipeline maps src_a records cleanly and fails 100% of src_b
 /// records via `1 / 0`; the resulting sidecar must contain three rows,
 /// all attributed to `src_b` in the `_cxl_dlq_source_name` column.
-#[tokio::test(flavor = "multi_thread")]
-async fn dlq_csv_sidecar_attributes_every_row_to_originating_source() {
+#[test]
+fn dlq_csv_sidecar_attributes_every_row_to_originating_source() {
     use std::sync::Arc;
 
     use clinker_record::{Schema, SchemaBuilder};
@@ -309,11 +319,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -322,7 +338,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("pipeline must complete under Continue strategy");
     assert_eq!(report.counters.dlq_count, 3);
 
@@ -364,8 +379,8 @@ nodes:
 /// two chains are wholly disjoint at the DAG level; the bug pre-fix
 /// was that `src_b`'s dispatch silently emitted `src_a`'s records,
 /// so `out_b` carried `src_a`'s data instead of `src_b`'s.
-#[tokio::test(flavor = "multi_thread")]
-async fn disjoint_parallel_chains_dont_cross_streams() {
+#[test]
+fn disjoint_parallel_chains_dont_cross_streams() {
     let yaml = r#"
 pipeline:
   name: disjoint_parallel
@@ -422,11 +437,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf_a = SharedBuffer::new();
@@ -438,7 +459,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("disjoint parallel chains must execute");
     assert_eq!(report.counters.total_count, 6);
 
@@ -471,8 +491,8 @@ nodes:
 /// merge collapsed to two copies of `src_a`-derived rows. The
 /// transforms also stamp an `origin` field so a regression would be
 /// visible even if the ids overlap.
-#[tokio::test(flavor = "multi_thread")]
-async fn chained_into_merge_preserves_per_source_data() {
+#[test]
+fn chained_into_merge_preserves_per_source_data() {
     let yaml = r#"
 pipeline:
   name: chained_into_merge
@@ -527,11 +547,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -540,7 +566,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("chained-into-merge must execute");
     assert_eq!(report.counters.dlq_count, 0);
     // Unified ingest counts every source's records — 3 + 3 = 6.
@@ -586,8 +611,8 @@ nodes:
 /// `src_b`'s chain silently read the primary's records; post-fix the
 /// preload's third pass ingests src_b and the dispatcher reads from
 /// its own stream.
-#[tokio::test(flavor = "multi_thread")]
-async fn non_primary_single_output_reads_own_records() {
+#[test]
+fn non_primary_single_output_reads_own_records() {
     let yaml = r#"
 pipeline:
   name: non_primary_single_output
@@ -637,11 +662,17 @@ nodes:
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            vec![slot("a", "id,tag\n1,a-one\n2,a-two\n3,a-three\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "a",
+                "id,tag\n1,a-one\n2,a-two\n3,a-three\n",
+            )]),
         ),
         (
             "src_b".to_string(),
-            vec![slot("b", "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n")],
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "b",
+                "id,tag\n10,b-ten\n11,b-eleven\n12,b-twelve\n",
+            )]),
         ),
     ]);
     let buf_a = SharedBuffer::new();
@@ -653,7 +684,6 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .await
             .expect("non-primary chain must execute");
     assert_eq!(report.counters.total_count, 6);
 
@@ -681,8 +711,8 @@ nodes:
 /// replaces an earlier external `source_file_arcs[rn-1]` array
 /// indexed by primary-only row numbers, which leaked the primary's
 /// file path to non-primary records (or panicked on out-of-range).
-#[tokio::test(flavor = "multi_thread")]
-async fn post_merge_source_file_resolves_per_record() {
+#[test]
+fn post_merge_source_file_resolves_per_record() {
     let yaml = r#"
 pipeline:
   name: post_merge_source_file
@@ -724,15 +754,20 @@ nodes:
     let config = parse_config(yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
     let readers: SourceReaders = HashMap::from([
-        ("src_a".to_string(), vec![slot("a", "id\n1\n2\n")]),
-        ("src_b".to_string(), vec![slot("b", "id\n10\n11\n")]),
+        (
+            "src_a".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("a", "id\n1\n2\n")]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("b", "id\n10\n11\n")]),
+        ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-        .await
         .expect("post-merge $source.file pipeline must execute");
 
     let output = buf.as_string();

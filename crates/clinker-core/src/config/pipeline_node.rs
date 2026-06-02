@@ -858,6 +858,12 @@ pub struct TransformBody {
     /// truncated or unbounded fan-out. Default 10_000.
     #[serde(default = "default_max_expansion")]
     pub max_expansion: u64,
+    /// Per-Transform override of `pipeline.batch_size` for this stage's
+    /// streaming inter-stage handoff. `None` (omitted) inherits the
+    /// pipeline-level value (or its default). An explicit `0` is rejected
+    /// at config validation, matching the pipeline-level knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<usize>,
 }
 
 fn default_max_expansion() -> u64 {
@@ -1079,7 +1085,7 @@ pub struct RouteBody {
 /// and live-channel interleave. `interleave_seed`, when set, seeds a
 /// per-Merge `fastrand::Rng` so interleave-mode ordering is
 /// reproducible across runs; absent, interleave arbitration follows
-/// `tokio::select!` wall-clock readiness and is non-deterministic.
+/// crossbeam `Select` channel-readiness and is non-deterministic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MergeBody {

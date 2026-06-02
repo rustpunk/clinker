@@ -56,6 +56,7 @@ use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 use cxl::typecheck::TypedProgram;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
@@ -892,15 +893,33 @@ pub(crate) fn execute_combine_grace_hash(
         })?;
 
     // ── Build phase ────────────────────────────────────────────────────
-    for record in build_records {
-        let keys =
-            build_extractor
-                .extract(ctx, &record)
-                .map_err(|e| PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!("grace hash build key eval error: {e}")],
-                })?;
-        let hash = hash_composite_key(&keys, executor.hash_state());
+    //
+    // Partition placement, the byte-driven spill decisions, and the
+    // arbitrator mirroring inside `add_build_record` are order-sensitive
+    // and must stay sequential. The expensive part — running the CXL
+    // build-key program per record through `eval_expr` and hashing the
+    // composite key — is independent per record, so it parallelizes
+    // across the shared kernel pool. The hashed records are then fed into
+    // `add_build_record` in input order, so the resulting partition table
+    // and spill timing are byte-identical to a sequential build. The
+    // hash seed is cloned out of the executor first; `RandomState::clone`
+    // preserves the seed, so every worker hashes identically.
+    let build_hash_state = executor.hash_state().clone();
+    let hashed_build: Vec<(Record, u64)> = build_records
+        .into_par_iter()
+        .map(|record| {
+            let keys =
+                build_extractor
+                    .extract(ctx, &record)
+                    .map_err(|e| PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!("grace hash build key eval error: {e}")],
+                    })?;
+            let hash = hash_composite_key(&keys, &build_hash_state);
+            Ok::<_, PipelineError>((record, hash))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (record, hash) in hashed_build {
         executor
             .add_build_record(record, hash, budget)
             .map_err(|e| PipelineError::Internal {

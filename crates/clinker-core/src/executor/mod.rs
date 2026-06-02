@@ -1,5 +1,6 @@
 pub mod stage_metrics;
 
+pub(crate) mod batch_handoff;
 pub mod combine;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
@@ -190,16 +191,23 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
     out
 }
 
-/// Map from source-node name to the ordered list of files feeding that
-/// source. Each entry pairs the originating filesystem path (used to
-/// stamp `$source.file` per record) with an open `Read` handle.
+/// Map from source-node name to the input feeding that source.
 ///
-/// For literal-`path:` sources the vec holds a single element. For
-/// `glob`/`regex`/`paths` sources the discovery layer produces one
-/// entry per matched file; the executor concatenates them into a single
-/// stream via [`crate::source::multi_file::MultiFileFormatReader`] and
-/// stamps each record with the file it came from.
-pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot>>;
+/// The value is a [`crate::source::SourceInput`], generalized off the
+/// file-slot model so a non-file transport registers without being
+/// forced through the file abstractions. The `Files` arm carries the
+/// ordered file slots (one per matched file; the executor concatenates
+/// them via [`crate::source::multi_file::MultiFileFormatReader`] and
+/// stamps each record with its originating file); the `Records` arm
+/// carries a ready-to-drive [`crate::source::RecordSource`]. Both arms
+/// feed the identical `SourceIngestChannel` — the dispatcher never
+/// branches on transport.
+pub type SourceReaders = HashMap<String, crate::source::SourceInput>;
+
+/// Re-export so callers building a [`SourceReaders`] reach the transport
+/// variants and the row-yielding contract through the same module that
+/// owns the registry alias and [`single_file_reader`].
+pub use crate::source::{RecordSource, SourceInput};
 
 /// Dispatch result threaded out of `execute_dag` and
 /// `execute_dag_branching` and folded into the [`ExecutionReport`].
@@ -245,6 +253,15 @@ pub(crate) struct DispatchOutcome {
     /// running total at dispatch close so an aborted run still
     /// reports the last committed value.
     pub(crate) cumulative_spill_bytes: u64,
+    /// High-water mark of `MemoryArbitrator::sum_consumer_usage()` sampled
+    /// at every streaming per-batch charge. A streaming stage's peak stays
+    /// bounded to one in-flight batch (plus the channel's bound), proving
+    /// the per-batch admit/discharge model never charges the whole stage.
+    pub(crate) peak_consumer_usage_bytes: u64,
+    /// `true` when a chunk-boundary shutdown poll tripped and the topo
+    /// walk unwound early. Carried up so the report surfaces the
+    /// interrupted state to the CLI.
+    pub(crate) interrupted: bool,
 }
 
 /// Output writer registry. Holds two parallel maps:
@@ -275,16 +292,18 @@ impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
 }
 
 /// Helper for callers (mostly tests and benchmarks) that have a single
-/// in-memory reader per source: wraps it in the one-element
-/// `Vec<FileSlot>` shape that the executor's reader registry expects.
+/// in-memory reader per source: wraps it in the one-element file-slot
+/// [`crate::source::SourceInput::Files`] shape the reader registry
+/// expects, hiding the transport variant so the common single-file case
+/// registers in one call.
 pub fn single_file_reader(
     path: impl Into<std::path::PathBuf>,
     reader: Box<dyn Read + Send>,
-) -> Vec<crate::source::multi_file::FileSlot> {
-    vec![crate::source::multi_file::FileSlot {
+) -> crate::source::SourceInput {
+    crate::source::SourceInput::Files(vec![crate::source::multi_file::FileSlot {
         path: path.into(),
         reader,
-    }]
+    }])
 }
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
@@ -382,9 +401,10 @@ pub struct ExecutionReport {
     /// Finalized per-source ingest record counts, keyed by
     /// Source-node name. Equals each source's `total_count`
     /// contribution to the aggregate `counters.total_count`. Sources
-    /// whose ingest task never finalized (e.g. fatal abort before
-    /// `mpsc::Receiver` close) are absent rather than reported as
-    /// zero — distinguishes "stream closed with zero records" from
+    /// whose ingest thread never finalized (e.g. fatal abort before
+    /// the crossbeam `Receiver` disconnected) are absent rather than
+    /// reported as zero — distinguishes "stream closed with zero records"
+    /// from
     /// "never finished". The synthetic pipeline-wide rollup slot
     /// stamped internally under `<merged>` is filtered out before
     /// surfacing here.
@@ -402,6 +422,18 @@ pub struct ExecutionReport {
     /// `MemoryArbitrator`'s running total at dispatch close; an aborted
     /// run still surfaces the last committed value.
     pub cumulative_spill_bytes: u64,
+    /// High-water mark of the arbitrator's summed pull-mode charged bytes
+    /// observed across streaming per-batch charges. For a streaming stage
+    /// this stays bounded to one in-flight batch (plus the bounded
+    /// channel's capacity) rather than the whole stage output — the
+    /// observable that proves the per-batch admit/discharge model. `0`
+    /// when no streaming charge fired (a fully materialized pipeline).
+    pub peak_consumer_usage_bytes: u64,
+    /// `true` when the run unwound early because a shutdown signal
+    /// (SIGINT/SIGTERM, or a programmatic request) tripped the run's
+    /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to
+    /// the interrupted exit code (130). A clean run leaves it `false`.
+    pub interrupted: bool,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
@@ -584,6 +616,12 @@ impl DlqEntry {
     pub fn stage_output(name: &str) -> String {
         format!("output:{name}")
     }
+
+    /// Stage: Combine output-stage evaluation error (probe-key, residual,
+    /// or body eval for one driver row).
+    pub fn stage_combine(name: &str) -> String {
+        format!("combine:{name}")
+    }
 }
 
 /// Unified pipeline executor. Plan-driven branching:
@@ -618,22 +656,18 @@ impl PipelineExecutor {
     /// }
     /// ```
     ///
-    /// # Panics
-    ///
-    /// The executor wraps its heavyweight CPU-bound operator arms
-    /// (sort, aggregate finalize, grace-hash, IEJoin, sort-merge) in
-    /// [`tokio::task::block_in_place`], which panics when invoked
-    /// outside a multi-thread tokio runtime. Callers must drive this
-    /// entry from a runtime built via
-    /// `tokio::runtime::Builder::new_multi_thread().enable_all().build()`
-    /// or annotate tests with `#[tokio::test(flavor = "multi_thread")]`.
-    pub async fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
+    /// The executor is fully synchronous: it drives source ingest on
+    /// `std::thread` workers, runs CPU-bound operator kernels (sort,
+    /// grace-hash, IEJoin, sort-merge) on a shared Rayon pool, and
+    /// blocks the calling thread on bounded crossbeam channels for
+    /// back-pressure. No async runtime is required.
+    pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params).await
+        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params)
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
@@ -657,16 +691,7 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
-    ///
-    /// # Panics
-    ///
-    /// Same constraint as [`Self::run_plan_with_readers_writers`]: the
-    /// executor's CPU-bound operator arms call
-    /// [`tokio::task::block_in_place`], which panics outside a
-    /// multi-thread tokio runtime. Build the runtime via
-    /// `tokio::runtime::Builder::new_multi_thread().enable_all().build()`
-    /// or use `#[tokio::test(flavor = "multi_thread")]`.
-    pub(crate) async fn run_with_readers_writers(
+    pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         readers: SourceReaders,
         writers: WriterRegistry,
@@ -679,7 +704,6 @@ impl PipelineExecutor {
             params,
             crate::config::CompileContext::default(),
         )
-        .await
     }
 
     /// Variant of [`Self::run_with_readers_writers`] that accepts an
@@ -696,7 +720,7 @@ impl PipelineExecutor {
     /// production call sites free of any test-only seam.
     ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
-    pub(crate) async fn run_with_readers_writers_in_context(
+    pub(crate) fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
         readers: SourceReaders,
         writers: WriterRegistry,
@@ -712,7 +736,6 @@ impl PipelineExecutor {
             compile_ctx,
             memory_budget,
         )
-        .await
     }
 
     /// Owns the entire run body: compile, source ingest, DAG dispatch,
@@ -724,14 +747,8 @@ impl PipelineExecutor {
     /// [`Self::run_with_readers_writers_in_context`], which builds the
     /// arbitrator from `config` and delegates.
     ///
-    /// # Panics
-    ///
-    /// Same multi-thread-runtime constraint as
-    /// [`Self::run_with_readers_writers`]: the CPU-bound operator arms
-    /// call [`tokio::task::block_in_place`].
-    ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
-    pub(crate) async fn run_with_readers_writers_with_arbitrator(
+    pub(crate) fn run_with_readers_writers_with_arbitrator(
         config: &PipelineConfig,
         mut readers: SourceReaders,
         writers: WriterRegistry,
@@ -1009,24 +1026,24 @@ impl PipelineExecutor {
         // Priority`.
 
         // ── Unified source ingest pass ───────────────────────────────
-        // Every declared Source spawns one `tokio::task` that drives
-        // its format reader on a blocking worker and pushes records
-        // through a `TokioSourceStream`. The paired `mpsc::Receiver`
-        // lands in `source_records[name]`; the dispatch loop's Source
-        // arm drains it via `recv().await`. No primary asymmetry;
-        // missing reader or empty file list is a hard error.
-        // Per-source totals + per-(source, file) watermark observations
-        // are returned through each task's `JoinHandle` and folded into
-        // the run's accounting once the receivers have drained.
+        // Every declared Source spawns one `std::thread` that drives its
+        // format reader and pushes records through a
+        // `SourceIngestChannel`. The paired crossbeam `Receiver` lands in
+        // `source_records[name]`; the dispatch loop's Source arm drains
+        // it via `recv`. No primary asymmetry; missing reader or empty
+        // file list is a hard error. Per-source totals + per-(source,
+        // file) watermark observations are returned through each thread's
+        // `JoinHandle` and folded into the run's accounting once the
+        // receivers have drained.
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
         let counters = PipelineCounters::default();
         let mut source_records: HashMap<
             String,
-            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
         let mut ingest_handles: Vec<
-            tokio::task::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
+            std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
         > = Vec::with_capacity(source_configs.len());
         for src_cfg in &source_configs {
             // Pre-declare so the report's `iter_declared_sources` view
@@ -1035,7 +1052,7 @@ impl PipelineExecutor {
             if src_cfg.watermark.is_some() {
                 watermarks.declare(&src_cfg.name);
             }
-            let files = readers.remove(&src_cfg.name).ok_or_else(|| {
+            let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
                 PipelineError::Config(crate::config::ConfigError::Validation(format!(
                     "no reader registered for source '{}'",
                     src_cfg.name
@@ -1043,14 +1060,13 @@ impl PipelineExecutor {
             })?;
             // Single ConsumerHandle shared between the SourceConsumer
             // wrapper (BackPressurePreferred / Priority pause target)
-            // and the TokioSourceStream that mirrors the mpsc queue
+            // and the SourceIngestChannel that mirrors the channel queue
             // depth × per-record bytes into the handle's counter on
-            // every `blocking_push`. The arbitrator owns the boxed
-            // wrapper for the run; arbitrator Drop releases it on
-            // pipeline teardown.
+            // every `push`. The arbitrator owns the boxed wrapper for the
+            // run; arbitrator Drop releases it on pipeline teardown.
             let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let (stream, rx) = crate::executor::source_stream::TokioSourceStream::new(
-                crate::executor::source_stream::TokioSourceStream::DEFAULT_CAPACITY,
+            let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
+                crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                 source_consumer_handle.clone(),
             );
             let _source_consumer_id = memory_budget.register_consumer(Arc::new(
@@ -1059,9 +1075,32 @@ impl PipelineExecutor {
             source_records.insert(src_cfg.name.clone(), rx);
             let src_cfg_owned = src_cfg.clone();
             let config_clone = config.clone();
-            ingest_handles.push(tokio::spawn(async move {
-                ingest_source_task(src_cfg_owned, files, config_clone, stream).await
-            }));
+            // Per-thread clone of the run's cancellation handle. A network
+            // ingest reader polls it at page/row-batch boundaries to stop
+            // within the documented shutdown bound; the file arm ignores
+            // it (dropped-receiver stop suffices).
+            let ingest_shutdown = params.shutdown_token.clone();
+            // One OS thread per Source. Spawned before the DAG dispatch
+            // drains so the producers fill the bounded channels while the
+            // consumer dispatch loop runs concurrently. Joined after
+            // dispatch returns (receivers already drained).
+            let handle = std::thread::Builder::new()
+                .name(format!("clinker-ingest-{}", src_cfg.name))
+                .spawn(move || {
+                    ingest_source(
+                        src_cfg_owned,
+                        source_input,
+                        config_clone,
+                        stream,
+                        ingest_shutdown,
+                    )
+                })
+                .map_err(|e| PipelineError::Internal {
+                    op: "source-ingest-spawn",
+                    node: src_cfg.name.clone(),
+                    detail: format!("failed to spawn source ingest thread: {e}"),
+                })?;
+            ingest_handles.push(handle);
         }
 
         let DispatchOutcome {
@@ -1073,6 +1112,8 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
+            interrupted,
         } = Self::execute_dag(
             config,
             source_records,
@@ -1090,8 +1131,7 @@ impl PipelineExecutor {
             counters,
             watermarks,
             memory_budget,
-        )
-        .await?;
+        )?;
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
@@ -1105,10 +1145,13 @@ impl PipelineExecutor {
         let mut total_ingested: u64 = 0;
         let mut counters = counters;
         for handle in ingest_handles {
-            let outcome = handle.await.map_err(|e| PipelineError::Internal {
-                op: "source-ingest-task",
+            // `join()` Err is the panic payload (`Box<dyn Any>`); the
+            // inner `??` then unwraps the ingest fn's own
+            // `Result<IngestTaskOutcome, PipelineError>`.
+            let outcome = handle.join().map_err(|_| PipelineError::Internal {
+                op: "source-ingest-thread",
                 node: String::new(),
-                detail: format!("tokio task join failed: {e}"),
+                detail: String::from("source ingest thread panicked"),
             })??;
             counters.total_count += outcome.total_count;
             total_ingested += outcome.total_count;
@@ -1163,6 +1206,8 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
+            interrupted,
         })
     }
 
@@ -1175,21 +1220,21 @@ impl PipelineExecutor {
     /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
     /// 3. Streaming → read all, walk DAG with per-record evaluation
     ///
-    /// `source_records` holds one live `mpsc::Receiver` per declared
+    /// `source_records` holds one live crossbeam `Receiver` per declared
     /// Source. Each `(Record, row_num)` carries the source-file
     /// `Arc<str>` engine-stamped on the `$source.file` column. The
-    /// caller's ingest pass spawns a `tokio::task` per Source to push
-    /// through a paired `TokioSourceStream`; this function consumes
-    /// the receivers via `recv().await` and never touches a
-    /// `FormatReader` directly.
+    /// caller's ingest pass spawns one `std::thread` per Source to push
+    /// through a paired `SourceIngestChannel`; this function consumes
+    /// the receivers via `recv` and never touches a `FormatReader`
+    /// directly.
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_dag(
+    fn execute_dag(
         config: &PipelineConfig,
         source_records: HashMap<
             String,
-            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
         >,
         source_configs: &[crate::config::SourceConfig],
         writers: WriterRegistry,
@@ -1209,14 +1254,15 @@ impl PipelineExecutor {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
         // No prologue drain or arena build. The dispatch Source arm
-        // is the first consumer of every `mpsc::Receiver`:
+        // is the first consumer of every crossbeam `Receiver`:
         // - canonicalize per record onto the source's plan-time schema,
         // - seed `$record.<key>` defaults per record,
         // - seed `$source.<key>` defaults per `(source, file)` Arc on
         //   first observation,
-        // - on `recv().await` returning `None`, stamp the finalized
-        //   per-source count and call `finalize_node_rooted_windows`
-        //   to populate every spec rooted at this source's NodeIndex.
+        // - on `recv` returning `Err` (channel disconnected), stamp the
+        //   finalized per-source count and call
+        //   `finalize_node_rooted_windows` to populate every spec rooted
+        //   at this source's NodeIndex.
         //
         // The D12 global-fold-over-empty-input case fires from the
         // Aggregate arm's own empty-input emit — the topo walk
@@ -1246,7 +1292,6 @@ impl PipelineExecutor {
             spill_root_path,
             watermarks,
         )
-        .await
     }
 
     /// Execute a branching DAG by walking nodes in topological order.
@@ -1262,11 +1307,11 @@ impl PipelineExecutor {
     /// branch-level fork-join — scheduling overhead exceeds benefit at
     /// typical ETL branch sizes (2-4 branches, millisecond chains).
     #[allow(clippy::too_many_arguments)]
-    async fn execute_dag_branching(
+    fn execute_dag_branching(
         config: &PipelineConfig,
         source_records: HashMap<
             String,
-            tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
         >,
         source_configs: &[crate::config::SourceConfig],
         mut writers: WriterRegistry,
@@ -1322,9 +1367,9 @@ impl PipelineExecutor {
 
         // Per-source idle-timeout durations derived from each
         // `SourceConfig.watermark.idle_timeout`. Borrowed by the
-        // Source dispatch arm to wrap its `rx.recv().await` in
-        // `tokio::time::timeout`. Sources without a configured
-        // timeout fall through to unbounded recv.
+        // Source dispatch arm, which uses `rx.recv_timeout` when a
+        // source has a configured timeout. Sources without one fall
+        // through to blocking `rx.recv`.
         let idle_timeouts: HashMap<String, std::time::Duration> = source_configs
             .iter()
             .filter_map(|s| {
@@ -1392,9 +1437,9 @@ impl PipelineExecutor {
         // Identify Merge.interleave nodes whose predecessors are all
         // Sources. Those Source receivers move out of
         // `ctx.source_records` and into the fused Merge arm's
-        // `tokio::select!` so a slow upstream Source no longer blocks
-        // peer Sources' channels from filling — back-pressure flows
-        // end-to-end. Per-Source arms detect membership in
+        // `crossbeam_channel::Select` so a slow upstream Source no longer
+        // blocks peer Sources' channels from filling — back-pressure
+        // flows end-to-end. Per-Source arms detect membership in
         // `fused_sources` and return cleanly.
         let init_phase_set = compute_init_phase_node_set(plan);
         let mut fused_sources: HashSet<String> =
@@ -1409,51 +1454,100 @@ impl PipelineExecutor {
             compute_transform_fused_sources(plan, &fused_sources, &init_phase_set);
         fused_sources.extend(extra_fused_sources);
 
+        // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
+        // grace-hash partition build, IEJoin, sort-merge). Sized off the
+        // pipeline's `concurrency.threads` knob; `0`/absent defers to
+        // Rayon's default (one worker per logical CPU). Built once per
+        // run and shared via `Arc` so every kernel `install` reuses the
+        // same worker set rather than spinning up a pool per operator.
+        let kernel_pool = {
+            let mut builder = rayon::ThreadPoolBuilder::new();
+            if let Some(n) = config.pipeline.concurrency.as_ref().and_then(|c| c.threads)
+                && n > 0
+            {
+                builder = builder.num_threads(n);
+            }
+            std::sync::Arc::new(
+                builder
+                    .build()
+                    .map_err(|e| PipelineError::ThreadPool(e.to_string()))?,
+            )
+        };
+
         // Streaming-Output setup (issue #72). For every fused
         // `Merge.interleave → single Output` chain that satisfies the
         // eligibility predicate, take the writer out of `writers.single`
-        // and spawn a `tokio::spawn`-ed task that drains a bounded
-        // `mpsc::channel`. The Merge arm streams records into the
-        // channel as it produces them; the Output arm's topo turn
-        // becomes a no-op because its writer has already moved into the
-        // streaming task. `JoinHandle`s are stored on the context so
-        // the dispatcher can await them at end-of-DAG and fold the
-        // per-task counter / timer / error accounting back into the
-        // context.
+        // and spawn one `std::thread` that drains a bounded crossbeam
+        // channel. The Merge arm streams records into the channel as it
+        // produces them; the Output arm's topo turn becomes a no-op
+        // because its writer has already moved into the streaming thread.
+        // `JoinHandle`s are stored on the context so the dispatcher can
+        // join them at end-of-DAG and fold the per-thread counter /
+        // timer / error accounting back into the context.
         let streaming_specs = compute_streaming_output_specs(
             plan,
             config,
-            &fused_sources,
+            &fused_transforms,
             &init_phase_set,
             &output_configs,
             &writers,
         );
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
-            tokio::sync::mpsc::Sender<crate::executor::stream_event::StreamEvent>,
+            crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
         let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
-        let mut streaming_output_tasks: Vec<tokio::task::JoinHandle<StreamingOutputTaskOutput>> =
+        let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
             Vec::new();
+        let mut streaming_charge_consumers: HashMap<
+            petgraph::graph::NodeIndex,
+            (
+                crate::pipeline::memory::ConsumerId,
+                Arc<crate::pipeline::memory::ConsumerHandle>,
+            ),
+        > = HashMap::new();
         for spec in streaming_specs {
             let raw_writer = writers
                 .single
                 .remove(&spec.output_name)
                 .expect("compute_streaming_output_specs verified writers.single contains output");
-            // 256 is the bounded channel capacity. The writer task
+            // 256 is the bounded channel capacity. The writer thread
             // typically clears each record in microseconds; capacity
             // above ~256 buys no measured throughput but burns memory
             // on the slow-writer / fast-merge end of the back-pressure
             // curve. Mirrors the Source ingest channel sizing (issue
             // #67) — the same bound paces both ends of the pipeline.
             let (tx, rx) =
-                tokio::sync::mpsc::channel::<crate::executor::stream_event::StreamEvent>(256);
-            let merge_idx = spec.merge_idx;
+                crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+            let producer_idx = spec.producer_idx;
             let output_idx = spec.output_idx;
-            let handle = tokio::spawn(streaming_output_task(rx, raw_writer, spec));
-            streaming_output_senders.insert(merge_idx, tx);
+            let output_name = spec.output_name.clone();
+            // Register exactly one charge consumer per streaming slot. The
+            // producer arm `add_bytes` each flushed batch into this
+            // handle; the writer thread holds a clone and `sub_bytes` each
+            // consumed record, so the live count is "batches in flight,"
+            // never the whole stage. `can_back_pressure` is conservatively
+            // false: the bounded channel already paces the producer, and
+            // the static pause-reachability analysis that would let the
+            // arbitrator prefer pausing this slot over spilling has not
+            // landed — matching `admit_node_buffer`'s posture.
+            let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
+            let charge_consumer_id = memory_budget.register_consumer(Arc::new(
+                crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+            ));
+            let writer_charge_handle = charge_handle.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("clinker-output-{output_name}"))
+                .spawn(move || streaming_output(rx, raw_writer, spec, writer_charge_handle))
+                .map_err(|e| PipelineError::Internal {
+                    op: "streaming-output-spawn",
+                    node: output_name,
+                    detail: format!("failed to spawn streaming output thread: {e}"),
+                })?;
+            streaming_output_senders.insert(producer_idx, tx);
             streaming_output_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
+            streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
 
         let mut ctx = dispatch::ExecutorContext {
@@ -1515,6 +1609,14 @@ impl PipelineExecutor {
             streaming_output_senders,
             streaming_output_nodes,
             streaming_output_tasks,
+            streaming_charge_consumers,
+            kernel_pool,
+            shutdown_token: params.shutdown_token.clone(),
+            interrupted: false,
+            batch_size: config
+                .pipeline
+                .batch_size
+                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -1535,54 +1637,81 @@ impl PipelineExecutor {
         // a Source feeding both an init branch and a runtime branch
         // correctly clones its buffer for Pass 1's first consumer
         // and removes it for Pass 2's last consumer.
-        // Topo walk. Wrapped so a `?` error inside doesn't short-circuit
-        // past the streaming-output task join below — the spawned tasks
-        // own writers we still need to flush (or drop) before the
-        // function returns, and dropping `ctx.streaming_output_senders`
-        // on the error path is what signals the tasks to close their
-        // channel and run their flush.
-        let walk_result: Result<(), PipelineError> = async {
+        // Topo walk. Wrapped in an immediately-invoked closure so a `?`
+        // error inside doesn't short-circuit past the streaming-output
+        // thread join below — the spawned threads own writers we still
+        // need to flush (or drop) before the function returns, and
+        // dropping `ctx.streaming_output_senders` on the error path is
+        // what signals the threads to disconnect their channel and run
+        // their flush. A tripped shutdown token surfaces as
+        // `PipelineError::Interrupted` from a per-node poll, which lands
+        // here too so the same drain-then-join cleanup runs.
+        let walk_result: Result<(), PipelineError> = (|| {
             if !init_phase_set.is_empty() {
                 for node_idx in plan.topo_order.clone() {
                     if init_phase_set.contains(&node_idx) {
-                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+                        ctx.check_shutdown()?;
+                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
                     }
                 }
                 for node_idx in plan.topo_order.clone() {
                     if !init_phase_set.contains(&node_idx) {
-                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+                        ctx.check_shutdown()?;
+                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
                     }
                 }
             } else {
                 for node_idx in plan.topo_order.clone() {
-                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx).await?;
+                    ctx.check_shutdown()?;
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
                 }
             }
             Ok(())
-        }
-        .await;
+        })();
 
-        // Streaming-output drain. Drop every remaining sender so the
-        // tasks' `rx.recv().await` returns `None` and they fall through
-        // to their flush path. The fused Merge arm normally removes its
-        // sender at clean exit; remaining entries here are the error-
-        // path leftovers (Merge arm never ran) or pipelines where no
-        // streaming chain was eligible (the map is empty).
+        // Streaming-output drain. Drop every remaining sender BEFORE
+        // joining so the writer threads' `rx.recv` returns `Err`
+        // (channel disconnected) and they fall through to their flush
+        // path — joining before dropping would deadlock, the thread
+        // blocked on a `recv` that never disconnects. The fused Merge arm
+        // normally removes its sender at clean exit; remaining entries
+        // here are the error-/interrupt-path leftovers (Merge arm never
+        // ran) or pipelines where no streaming chain was eligible (the
+        // map is empty).
         ctx.streaming_output_senders.clear();
         for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
-            match handle.await {
+            match handle.join() {
                 Ok(out) => out.fold_into(&mut ctx),
-                Err(join_err) => {
+                Err(_panic) => {
                     ctx.output_errors.push(PipelineError::Internal {
                         op: "streaming_output",
                         node: String::from("<unknown>"),
-                        detail: format!("streaming output task panicked: {join_err}"),
+                        detail: String::from("streaming output thread panicked"),
                     });
                 }
             }
         }
 
-        walk_result?;
+        // Every streaming writer has joined, so its discharge is
+        // complete and no more batches will charge these slots.
+        // Unregister each per-slot charge consumer so the arbitrator's
+        // registry does not outlive the run with a stale wrapper reading
+        // zero forever. The peak charged usage was already sampled at the
+        // producer-side charges, so the report read survives this.
+        for (_, (id, _)) in std::mem::take(&mut ctx.streaming_charge_consumers) {
+            ctx.memory_budget.unregister_consumer(id);
+        }
+
+        // A tripped shutdown token unwinds the walk via
+        // `PipelineError::Interrupted`; that is a graceful early stop, not
+        // a failure, so swallow it here (the interruption is recorded in
+        // `ctx.interrupted` and surfaced through the report) and let the
+        // run finish draining. Every other walk error still propagates.
+        match walk_result {
+            Ok(()) => {}
+            Err(PipelineError::Interrupted) => {}
+            Err(other) => return Err(other),
+        }
 
         // Top-scope teardown: the run has drained, so unregister every
         // window-runtime arena consumer that survived to the top scope.
@@ -1602,11 +1731,11 @@ impl PipelineExecutor {
         let pipeline_spill_root = ctx.spill_root().clone();
 
         // Drain mutable per-walk state out of the context for the
-        // post-walk reporting + caller-facing return tuple. Pipeline-
-        // wide ingest total is reconstructed from the per-source
-        // running counters the Source dispatch arm advanced — the
-        // pre-drain prologue no longer exists, so we derive it at
-        // exit instead of pre-computing it.
+        // post-walk reporting + caller-facing return tuple. Sources are
+        // drained lazily by the dispatch loop rather than in a pre-pass,
+        // so the pipeline-wide ingest total is reconstructed here at exit
+        // from the per-source running counters the Source dispatch arm
+        // advanced.
         let transform_timer = ctx.transform_timer;
         let route_timer = ctx.route_timer;
         let projection_timer = ctx.projection_timer;
@@ -1677,6 +1806,8 @@ impl PipelineExecutor {
             .collect();
 
         let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
+        let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
+        let interrupted = ctx.interrupted;
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -1686,6 +1817,8 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            peak_consumer_usage_bytes,
+            interrupted,
         })
     }
 
@@ -1954,10 +2087,10 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
 }
 
 /// Ingest a Source's records into a bounded
-/// [`TokioSourceStream`](crate::executor::source_stream::TokioSourceStream)
-/// so the dispatch loop drains the paired `mpsc::Receiver` via
-/// `recv().await`. Used uniformly by every declared Source — no
-/// primary asymmetry.
+/// [`SourceIngestChannel`](crate::executor::source_stream::SourceIngestChannel)
+/// so the dispatch loop drains the paired crossbeam `Receiver` via
+/// `recv`. Used uniformly by every declared Source — no primary
+/// asymmetry.
 ///
 /// Each ingested record is widened with two tail engine-stamped
 /// columns:
@@ -1975,7 +2108,7 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
 /// without external row-keyed arrays. `counters.total_count`
 /// increments per record so every source contributes to the
 /// pipeline-wide total.
-/// One ingest task's outcome, collected by the executor entry once
+/// One ingest thread's outcome, collected by the executor entry once
 /// dispatch has drained the paired receiver. The watermark
 /// observations are folded back into the executor's owned
 /// `PerSourceWatermarks` (per-(source, file) max-event-time map);
@@ -1987,40 +2120,70 @@ struct IngestTaskOutcome {
     watermark_observations: Vec<(Arc<str>, i64)>,
 }
 
-/// Drive one Source's format reader on a tokio-blocking worker and
-/// push every record through `stream`. Watermark observations are
-/// captured locally so the executor's `PerSourceWatermarks` is owned
-/// by a single task (no shared-mutex contention). The blocking
-/// closure inside `tokio::task::spawn_blocking` runs the synchronous
-/// reader; records are forwarded via `Sender::blocking_send` so the
-/// channel's back-pressure semantics still apply.
-async fn ingest_source_task(
+/// Drive one Source's format reader on its own `std::thread` and push
+/// every record through `stream`. Watermark observations are captured
+/// locally so the executor's `PerSourceWatermarks` is owned by a single
+/// thread (no shared-mutex contention). Every layer below — the format
+/// reader, schema-coercion wrapper, file I/O — is synchronous; records
+/// are forwarded via `SourceIngestChannel::push`, whose blocking `send`
+/// applies the channel's back-pressure.
+fn ingest_source(
     src_cfg: crate::config::SourceConfig,
-    files: Vec<crate::source::multi_file::FileSlot>,
+    input: crate::source::SourceInput,
     config: PipelineConfig,
-    stream: crate::executor::source_stream::TokioSourceStream,
+    stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 ) -> Result<IngestTaskOutcome, PipelineError> {
-    if files.is_empty() {
-        return Err(PipelineError::Config(
-            crate::config::ConfigError::Validation(format!(
-                "source '{}' has empty file list",
-                src_cfg.name
-            )),
-        ));
+    // Branch once on transport. The file arm builds the
+    // MultiFileFormatReader + schema-coercion stack and hands the
+    // resulting `Box<dyn FormatReader>` to the shared driver as a
+    // `RecordSource`; the records arm hands its already-built row
+    // yielder straight through. Everything downstream of the source
+    // reader — schema widening, document boundaries, watermark
+    // observation, channel push — is identical, so it lives in
+    // `drive_record_source`.
+    match input {
+        crate::source::SourceInput::Files(files) => {
+            if files.is_empty() {
+                return Err(PipelineError::Config(
+                    crate::config::ConfigError::Validation(format!(
+                        "source '{}' has empty file list",
+                        src_cfg.name
+                    )),
+                ));
+            }
+            let raw_reader = build_multi_file_reader(&src_cfg, files)?;
+            let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+            // The file arm reaches the shared driver through the blanket
+            // `RecordSource for Box<dyn FormatReader>` impl.
+            drive_record_source(src_cfg, Box::new(src_reader), stream, shutdown_token)
+        }
+        crate::source::SourceInput::Records(src_reader) => {
+            drive_record_source(src_cfg, src_reader, stream, shutdown_token)
+        }
     }
-    // Keep an owned copy of the source name so the post-await error
-    // path retains attribution even though the blocking closure moves
-    // `src_cfg` in.
-    let source_name = src_cfg.name.clone();
+}
 
-    // `spawn_blocking` because every layer below — the format reader,
-    // schema-coercion wrapper, file I/O — is synchronous. The
-    // `TokioSourceStream` sender's `blocking_send` lives inside this
-    // closure to preserve channel back-pressure even though the
-    // producer is on a blocking worker.
-    let join = tokio::task::spawn_blocking(move || -> Result<IngestTaskOutcome, PipelineError> {
-        let raw_reader = build_multi_file_reader(&src_cfg, files)?;
-        let mut src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+/// Drive one Source's [`RecordSource`](crate::source::RecordSource) to
+/// completion, widening every record with the `$source.*` engine-stamped
+/// tail columns, emitting document-boundary punctuation, observing
+/// event-time watermarks, and pushing into `stream`. Shared by both the
+/// file and non-file ingest arms — see [`ingest_source`].
+fn drive_record_source(
+    src_cfg: crate::config::SourceConfig,
+    src_reader: Box<dyn crate::source::RecordSource>,
+    stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+) -> Result<IngestTaskOutcome, PipelineError> {
+    {
+        let mut src_reader = src_reader;
+        // Hand the reader its cancellation handle before any read so a
+        // network reader can poll `is_requested()` at page/batch
+        // boundaries and stop within the shutdown bound. The file arm's
+        // default impl ignores it (the dropped-receiver stop suffices).
+        if let Some(token) = shutdown_token {
+            src_reader.set_shutdown_token(token);
+        }
         let reader_schema = src_reader.schema()?;
 
         // Widen the reader schema with `$source.file`, `$source.name`,
@@ -2056,8 +2219,16 @@ async fn ingest_source_task(
             )
             .build();
 
+        // Fallback `$source.file` for records whose reader exposes no
+        // per-record file identity (`current_source_file() == None`):
+        // single-file readers and every non-file transport. Derived from
+        // the Source node name so a pathless source has one stable
+        // synthetic identifier. The document-boundary `need_new_doc`
+        // logic keys on this Arc by pointer equality, so a single stable
+        // Arc yields exactly one document per pathless source rather than
+        // a fresh document per record.
         let static_source_file: Arc<str> = if src_cfg.path_str().is_empty() {
-            Arc::from("<source>")
+            Arc::from(format!("<source:{}>", src_cfg.name))
         } else {
             Arc::from(src_cfg.path_str())
         };
@@ -2099,16 +2270,17 @@ async fn ingest_source_task(
         // to `Value::Null`, which is the streaming-resolver convention
         // for an absent section.
         let mut current_doc: Option<Arc<clinker_record::DocumentContext>> = None;
-        let push_punct = |stream: &mut crate::executor::source_stream::TokioSourceStream,
+        // A closed channel during punctuation delivery carries the same
+        // meaning as during record delivery — the consumer stopped pulling
+        // (shutdown unwind or early downstream completion). No further
+        // punctuation matters once the receiver is gone, so treat it as a
+        // benign no-op; the loop's record push breaks on the same signal.
+        let push_punct = |stream: &mut crate::executor::source_stream::SourceIngestChannel,
                           punct: crate::executor::stream_event::Punctuation|
          -> Result<(), PipelineError> {
-            stream
-                .blocking_push_punctuation(punct)
-                .map_err(|e| PipelineError::Internal {
-                    op: "source-stream-push-punctuation",
-                    node: src_cfg.name.clone(),
-                    detail: e.to_string(),
-                })
+            match stream.push_punctuation(punct) {
+                Ok(()) | Err(crate::executor::source_stream::SourceStreamError::Closed) => Ok(()),
+            }
         };
         loop {
             match src_reader.next_record() {
@@ -2188,13 +2360,15 @@ async fn ingest_source_task(
                     if let Some(ctx) = current_doc.as_ref() {
                         widened_record.set_doc_ctx(Arc::clone(ctx));
                     }
-                    stream.blocking_push(widened_record, rn).map_err(|e| {
-                        PipelineError::Internal {
-                            op: "source-stream-push",
-                            node: src_cfg.name.clone(),
-                            detail: e.to_string(),
-                        }
-                    })?;
+                    // A closed channel means the consumer stopped pulling —
+                    // a shutdown-token unwind dropped the receiver, or the
+                    // downstream finished early. That is a graceful stop, not
+                    // a failure: stop producing and return the records pushed
+                    // so far. The dispatch side surfaces the interruption (if
+                    // any) through `report.interrupted`.
+                    if stream.push(widened_record, rn).is_err() {
+                        break;
+                    }
                 }
                 Ok(None) => break,
                 Err(other) => return Err(other.into()),
@@ -2207,21 +2381,15 @@ async fn ingest_source_task(
                 crate::executor::stream_event::Punctuation::document_close(last),
             )?;
         }
-        // Drop the sender so the dispatch-side `recv().await` returns
-        // `None` once the channel drains.
+        // Drop the sender so the dispatch-side `recv` returns `Err`
+        // (channel disconnected) once the channel drains.
         drop(stream);
         Ok(IngestTaskOutcome {
             source_name: src_cfg.name.clone(),
             total_count,
             watermark_observations,
         })
-    });
-
-    join.await.map_err(|e| PipelineError::Internal {
-        op: "source-ingest-blocking",
-        node: source_name,
-        detail: format!("blocking worker join failed: {e}"),
-    })?
+    }
 }
 
 /// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
@@ -2675,8 +2843,8 @@ fn has_single_outgoing(
 /// Identify Source-node names whose receivers are claimed by a
 /// downstream `Merge.mode: interleave` whose every direct predecessor
 /// is a `PlanNode::Source`. The Merge arm consumes those receivers
-/// via `tokio::select!` so a slow Source no longer blocks peer
-/// Sources' channels from filling. Per-Source dispatch arms whose
+/// via `crossbeam_channel::Select` so a slow Source no longer blocks
+/// peer Sources' channels from filling. Per-Source dispatch arms whose
 /// name is in this set return cleanly without touching
 /// `ctx.source_records`.
 ///
@@ -2717,8 +2885,8 @@ pub(crate) fn compute_merge_interleave_fused_sources(
         // Seeded interleaves (`interleave_seed: Some(_)`) take the
         // non-fused path so determinism survives — the fastrand
         // schedule over a pre-buffered Vec yields the same sequence
-        // across runs, whereas a live-channel select! depends on
-        // tokio scheduling. Unseeded interleaves get fusion +
+        // across runs, whereas a live-channel `Select` depends on
+        // arrival order. Unseeded interleaves get fusion +
         // back-pressure.
         let (mode, seed) = config
             .nodes
@@ -2817,40 +2985,346 @@ pub(crate) fn compute_transform_fused_sources(
     (extra_fused_sources, fused_transforms)
 }
 
-/// Identify fused `Merge.interleave` → single `Output` chains eligible for
-/// per-record streaming writes (issue #72). The buffered Output arm waits
-/// until the Merge arm has produced every record before invoking the
-/// writer; under a slow upstream Source this defeats the live back-
-/// pressure #67 delivered, because every record sits in
-/// `ctx.node_buffers[merge_idx]` until the Merge finishes.
+/// Per-node inter-stage materialization class.
 ///
-/// The streaming path moves the Output's writer into a `tokio::spawn`-ed
-/// task that consumes from a bounded `mpsc::channel` populated by the
-/// fused Merge arm. The Output arm becomes a no-op at its topo turn;
-/// per-record `Writer::write_record` fires concurrently with Merge
-/// production, and back-pressure flows writer → Merge → Source.
+/// A `Streaming` stage's output bypasses a `ctx.node_buffers` slot: a
+/// sink (`Output`) that never admits a buffer, a fused `Source` whose
+/// receiver the downstream consumer takes directly, or a fused
+/// `Transform` that hands each bounded batch to a streaming Output thread
+/// over a back-pressured channel without admitting a slot. A
+/// `Materialized` stage's output crosses a `node_buffers` slot that
+/// registers a `NodeBufferConsumer` and is spill-eligible.
 ///
-/// Eligibility (every predicate must hold; otherwise the buffered path
-/// runs):
+/// The non-trivial verdict — whether a fused Transform streams — is
+/// decided by [`streaming_output_producer`], the one predicate both
+/// [`classify_stream_nodes`] (the `--explain` annotation) and
+/// [`compute_streaming_output_specs`] (the runtime sender install)
+/// consult. A Transform is `Streaming` here iff a streaming sender is
+/// installed for it at runtime, so the explain annotation can never drift
+/// from what the dispatcher does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamClass {
+    /// No `node_buffers` slot, no arbitrator charge, no spill.
+    Streaming,
+    /// Output crosses a `node_buffers` slot; spill-eligible.
+    Materialized,
+}
+
+/// Classify every node in `plan` as [`StreamClass::Streaming`] or
+/// [`StreamClass::Materialized`], derived from the same fusion analysis
+/// the runtime dispatch consumes.
 ///
-/// - The Output node has exactly one incoming edge, and that predecessor
-///   is a `PlanNode::Merge`.
-/// - The Merge is `mode: interleave` with every direct predecessor a
-///   `PlanNode::Source` (the [`compute_merge_interleave_fused_sources`]
-///   predicate — same membership the fused arm relies on).
-/// - The Merge has no other downstream consumer besides this one Output
-///   (no fan-out from the Merge).
+/// Streaming nodes:
+///
+/// - **Outputs**, unconditionally — sinks that write to their writer and
+///   never admit a `node_buffers` slot.
+/// - **Sources** whose name lands in either fused-source set
+///   (Merge.interleave fusion or single-Transform fusion). The Source
+///   dispatch arm returns without admitting a buffer; the downstream
+///   fused consumer takes the receiver directly.
+/// - A fused **Transform** whose single downstream is a streaming-
+///   eligible Output, as decided by [`streaming_output_producer`]. Such a
+///   Transform hands each bounded batch straight to the streaming Output
+///   thread over a back-pressured channel and never admits a
+///   `node_buffers` slot, so its peak inter-stage footprint is one batch
+///   rather than the whole stage. A fused Transform that feeds anything
+///   other than a streaming Output (a fan-out, a window root, a blocking
+///   operator) stays `Materialized`: it accumulates and admits its full
+///   output.
+///
+/// Everything else materializes.
+///
+/// Both `--explain` (plan-only, no live consumers) and the runtime
+/// dispatch call this — the dispatcher reads the same `Streaming` verdict
+/// for a fused Transform to decide whether to install a streaming sender,
+/// so the explain annotation can never disagree with the dispatcher. The
+/// returned map covers every `node_indices()` slot so callers can index
+/// it by `NodeIndex` directly.
+pub(crate) fn classify_stream_nodes(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    config: &PipelineConfig,
+) -> HashMap<petgraph::graph::NodeIndex, StreamClass> {
+    use crate::plan::execution::PlanNode;
+    let init_phase = compute_init_phase_node_set(plan);
+    let mut fused_sources = compute_merge_interleave_fused_sources(plan, config);
+    let (extra_fused_sources, fused_transforms) =
+        compute_transform_fused_sources(plan, &fused_sources, &init_phase);
+    fused_sources.extend(extra_fused_sources);
+
+    // Pipeline-wide correlation buffering routes every write through the
+    // CorrelationCommit terminal, so no Output streams. Mirrors the same
+    // short-circuit in `compute_streaming_output_specs` so the explain
+    // annotation matches the runtime spec computation.
+    let correlation_active = config.any_source_has_correlation_key();
+
+    // A fused Transform streams iff some streaming-eligible Output names
+    // it as its producer. Collect those producer indices once.
+    let streaming_producers: HashSet<petgraph::graph::NodeIndex> = if correlation_active {
+        HashSet::new()
+    } else {
+        plan.graph
+            .node_indices()
+            .filter_map(|output_idx| {
+                streaming_output_producer(plan, output_idx, &fused_transforms, &init_phase)
+            })
+            .collect()
+    };
+
+    plan.graph
+        .node_indices()
+        .map(|idx| {
+            let class = match &plan.graph[idx] {
+                PlanNode::Output { .. } => StreamClass::Streaming,
+                PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
+                    StreamClass::Streaming
+                }
+                // Any producer the eligibility predicate accepts as
+                // feeding a streaming Output — fused Transform, non-fused
+                // Merge, single-branch Route, streaming Aggregate, inline
+                // Combine probe — streams its output to the writer thread
+                // and admits no `node_buffers` slot, so it renders
+                // `streaming`. The predicate already excluded blocking
+                // strategies (hash Aggregate, range/sort-merge/grace
+                // Combine) and window roots, so this branch only fires for
+                // genuinely streaming producers.
+                PlanNode::Transform { .. }
+                | PlanNode::Merge { .. }
+                | PlanNode::Route { .. }
+                | PlanNode::Aggregation { .. }
+                | PlanNode::Combine { .. }
+                    if streaming_producers.contains(&idx) =>
+                {
+                    StreamClass::Streaming
+                }
+                _ => StreamClass::Materialized,
+            };
+            (idx, class)
+        })
+        .collect()
+}
+
+/// Resolve the streaming producer for an `Output` node, or `None` when
+/// the Output is not streaming-eligible.
+///
+/// A streaming Output's writer moves into a `std::thread` that consumes a
+/// bounded crossbeam channel; the producer arm sends records into that
+/// channel as it produces them, so back-pressure flows writer → producer
+/// → Source and no inter-stage `node_buffers` slot is charged. Two
+/// producer topologies qualify, and this function is the single
+/// plan-derived eligibility predicate both the runtime spawn path
+/// ([`compute_streaming_output_specs`]) and the `--explain` buffer-class
+/// annotation ([`classify_stream_nodes`]) consult, so the explain
+/// annotation can never disagree with what the dispatcher does.
+///
+/// Common eligibility (independent of producer kind):
+///
+/// - The Output has exactly one incoming edge.
 /// - The Output is not in the init-phase ancestor closure.
-/// - The Output's writer entry lives in `writers.single` (not
-///   `fan_out_writers` — splitting / per-source-file writers handle
-///   their own buffering).
-/// - The OutputConfig has no `split:` block — `SplittingWriter` owns its
-///   file rotation lifecycle and is incompatible with the streaming
-///   writer task.
-/// - Correlation buffering is inactive pipeline-wide
-///   (`!any_source_has_correlation_key`). The correlation path defers
-///   writes to [`PlanNode::CorrelationCommit`] which is incompatible
-///   with per-record write at Merge-arm time.
+/// - The Output is not a per-source-file fan-out writer and its config
+///   declares no `split:` block — both own their own writer lifecycle
+///   and are incompatible with the single streaming writer task.
+///
+/// Producer = fused `Merge.interleave` (issue #72):
+///
+/// - The predecessor is a `PlanNode::Merge` in `interleave` mode whose
+///   every direct predecessor is a fused Source, with exactly one
+///   outgoing edge (this Output).
+///
+/// Producer = fused `Source → Transform` (the bounded per-batch
+/// inter-stage handoff):
+///
+/// - The predecessor is a `PlanNode::Transform` that
+///   `compute_transform_fused_sources` classified as fused (its sole
+///   upstream is a single-outgoing Source it streams off directly), with
+///   exactly one outgoing edge (this Output).
+/// - The Transform roots no node-anchored window arena. A window rooted
+///   at this Transform needs the Transform's full output materialized to
+///   build the arena, so streaming would starve it; such a Transform
+///   stays on the buffered path.
+///
+/// Producer = non-fused `Merge` (concat, or interleave with non-Source
+/// inputs):
+///
+/// - The Merge feeds only this Output and roots no window arena. The
+///   arm drains its predecessors' `node_buffers` slots in declaration
+///   order (concat) or round-robin (interleave) into the merged result,
+///   then streams that result to the writer thread rather than admitting
+///   it to its own charged `node_buffers` slot. (The fused
+///   Merge.interleave path streams record-by-record off the live Source
+///   channels instead and is the only Merge whose footprint is one
+///   batch.)
+///
+/// Producer = single-branch `Route`:
+///
+/// - The Route has exactly one outgoing edge (its sole branch) and that
+///   edge feeds this Output, and the Route roots no window arena. A
+///   multi-branch Route forks records across several successor slots and
+///   stays on the materialized fan-out path so each branch keeps its own
+///   slot — only a Route with a single downstream consumer is a linear
+///   producer the streaming writer can drain.
+///
+/// Producer = streaming-strategy `Aggregate`:
+///
+/// - The aggregate resolved to [`AggregateStrategy::Streaming`] (the
+///   planner certified pre-sorted input), feeds only this Output, and
+///   roots no window arena. Hash aggregation stays blocking: it must
+///   accumulate every group before emitting, so it cannot stream.
+///
+/// Producer = `Combine` probe-side (`HashBuildProbe`):
+///
+/// - The combine resolved to [`CombineStrategy::HashBuildProbe`], feeds
+///   only this Output, and roots no window arena. The build side stays
+///   fully materialized inside the arm; only the probe-side emit streams.
+///   Range / sort-merge / grace-hash strategies are blocking and stay
+///   materialized.
+///
+/// Common to every non-`Output` producer kind below: the producer must
+/// have exactly one outgoing edge (this Output) and root no node-anchored
+/// window arena, because a window rooted at the producer needs the
+/// producer's full output materialized to build the arena and streaming
+/// would starve it.
+///
+/// Correlation buffering disables streaming pipeline-wide — the
+/// `CorrelationCommit` terminal owns the writes — so the caller short-
+/// circuits before calling this.
+fn streaming_output_producer(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    output_idx: petgraph::graph::NodeIndex,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> Option<petgraph::graph::NodeIndex> {
+    use crate::aggregation::AggregateStrategy;
+    use crate::plan::combine::CombineStrategy;
+    use crate::plan::execution::PlanNode;
+
+    let PlanNode::Output { resolved, .. } = &plan.graph[output_idx] else {
+        return None;
+    };
+    let payload = resolved.as_deref()?;
+    if init_phase_set.contains(&output_idx) {
+        return None;
+    }
+    // Per-source-file fan-out and split writers own their own file
+    // rotation lifecycle and cannot share the single streaming writer
+    // task. Both are plan-derived so the explain and runtime surfaces
+    // agree without consulting the runtime writer registry.
+    if payload.fan_out_per_source_file || payload.output.split.is_some() {
+        return None;
+    }
+
+    // Exactly one incoming edge.
+    let mut incoming = plan
+        .graph
+        .neighbors_directed(output_idx, petgraph::Direction::Incoming);
+    let producer_idx = incoming.next()?;
+    if incoming.next().is_some() {
+        return None;
+    }
+
+    // A window rooted at the producer needs the producer's full output
+    // materialized to build the arena, so a streaming producer must root
+    // no node-anchored window. Shared by every linear-producer arm below.
+    let roots_window = |idx: petgraph::graph::NodeIndex| -> bool {
+        plan.indices_to_build.iter().any(|spec| {
+            matches!(
+                &spec.root,
+                crate::plan::index::PlanIndexRoot::Node { upstream, .. }
+                    if *upstream == idx
+            )
+        })
+    };
+
+    match &plan.graph[producer_idx] {
+        PlanNode::Merge { .. } => {
+            // Fused Merge.interleave streams off the live Source channels
+            // directly inside `merge_fused_interleave`; the non-fused
+            // Merge (concat, or interleave with non-Source inputs) drains
+            // its predecessors' `node_buffers` slots and forwards each
+            // record to the writer thread. Both route their emit through
+            // the streaming sender — the runtime arm picks the path — so
+            // every Merge with a single downstream Output and no window
+            // root is eligible regardless of fusion.
+            let has_predecessor = plan
+                .graph
+                .neighbors_directed(producer_idx, petgraph::Direction::Incoming)
+                .next()
+                .is_some();
+            if !has_predecessor
+                || !has_single_outgoing(plan, producer_idx)
+                || roots_window(producer_idx)
+            {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Transform { .. } => {
+            // The Transform must be a fused Source→Transform that feeds
+            // only this Output and roots no node-anchored window arena.
+            if !fused_transforms.contains(&producer_idx)
+                || !has_single_outgoing(plan, producer_idx)
+                || roots_window(producer_idx)
+            {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Route { .. } => {
+            // Single-branch Route: exactly one outgoing edge (this
+            // Output). A multi-branch Route forks across successor slots
+            // and stays materialized.
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Aggregation { strategy, .. } => {
+            // Streaming aggregation emits one group per sort-key
+            // boundary, so it can stream to the writer; hash aggregation
+            // must accumulate every group before emitting and stays
+            // blocking.
+            if !matches!(strategy, AggregateStrategy::Streaming) {
+                return None;
+            }
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        PlanNode::Combine { strategy, .. } => {
+            // Only the inline hash build-probe streams its probe-side
+            // emit; the build side stays fully materialized inside the
+            // arm. Range / sort-merge / grace-hash joins are blocking.
+            if !matches!(strategy, CombineStrategy::HashBuildProbe) {
+                return None;
+            }
+            if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
+                return None;
+            }
+            Some(producer_idx)
+        }
+        _ => None,
+    }
+}
+
+/// Identify fused producer → single `Output` chains eligible for
+/// streaming writes and build a [`StreamingOutputSpec`] for each.
+///
+/// The buffered Output arm waits until its producer has emitted every
+/// record before invoking the writer; under a slow upstream Source this
+/// defeats the live back-pressure the Source ingest channel delivers,
+/// because every record sits in the producer's `node_buffers` slot until
+/// the producer finishes. The streaming path moves the Output's writer
+/// into a `std::thread` that consumes a bounded crossbeam channel the
+/// producer arm fills as it produces; per-record `Writer::write_record`
+/// fires concurrently with production and back-pressure flows writer →
+/// producer → Source. The producer's output never crosses a
+/// `node_buffers` slot, so peak inter-stage memory for that stage is one
+/// bounded batch rather than its whole output.
+///
+/// Eligibility is decided by [`streaming_output_producer`] (the shared
+/// plan-derived predicate); this function adds the runtime writer-
+/// registry checks (the writer must be a registered single writer, not a
+/// fan-out) and packages the owned per-task metadata.
 ///
 /// Returns the list of streaming specs (one per qualifying Output). Empty
 /// for pipelines that don't match the topology, leaving every Output on
@@ -2859,7 +3333,7 @@ pub(crate) fn compute_transform_fused_sources(
 fn compute_streaming_output_specs(
     plan: &crate::plan::execution::ExecutionPlanDag,
     config: &PipelineConfig,
-    fused_merge_sources: &HashSet<String>,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
     output_configs: &[OutputConfig],
     writers: &WriterRegistry,
@@ -2880,66 +3354,23 @@ fn compute_streaming_output_specs(
         else {
             continue;
         };
-        if init_phase_set.contains(&output_idx) {
-            continue;
-        }
-
-        // Exactly one incoming edge, and that predecessor is a Merge.
-        let mut incoming = plan
-            .graph
-            .neighbors_directed(output_idx, petgraph::Direction::Incoming);
-        let Some(merge_idx) = incoming.next() else {
-            continue;
-        };
-        if incoming.next().is_some() {
-            continue;
-        }
-        let PlanNode::Merge {
-            name: merge_name, ..
-        } = &plan.graph[merge_idx]
+        let Some(producer_idx) =
+            streaming_output_producer(plan, output_idx, fused_transforms, init_phase_set)
         else {
             continue;
         };
 
-        // The Merge must be fused — every predecessor is a Source whose
-        // name appears in the fused-source set the Merge arm uses to
-        // run a live `tokio::select!`.
-        let merge_predecessors: Vec<_> = plan
-            .graph
-            .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
-            .collect();
-        if merge_predecessors.is_empty() {
-            continue;
-        }
-        let all_fused_sources = merge_predecessors.iter().all(|p| match &plan.graph[*p] {
-            PlanNode::Source { name, .. } => fused_merge_sources.contains(name),
-            _ => false,
-        });
-        if !all_fused_sources {
-            continue;
-        }
-
-        // The Merge has exactly one outgoing edge (this Output). Anything
-        // else and the buffered path is needed so siblings still see the
-        // merged records via `node_buffers`.
-        if !has_single_outgoing(plan, merge_idx) {
-            continue;
-        }
-
-        // Output writer registry checks: must be a single writer, not a
-        // fan-out, and the OutputConfig must not declare a split block.
-        if !writers.single.contains_key(output_name) {
-            continue;
-        }
-        if writers.fan_out.contains_key(output_name) {
+        // Runtime writer-registry checks: the writer must be registered
+        // as a single writer, never a fan-out. (The plan-derived
+        // fan-out / split exclusions live in `streaming_output_producer`
+        // so the explain surface agrees; this is the runtime-only
+        // registry confirmation.)
+        if !writers.single.contains_key(output_name) || writers.fan_out.contains_key(output_name) {
             continue;
         }
         let Some(out_cfg) = output_configs.iter().find(|o| &o.name == output_name) else {
             continue;
         };
-        if out_cfg.split.is_some() {
-            continue;
-        }
 
         // Pre-compute the schema-check + projection metadata so the
         // spawned task carries owned `Arc<Schema>` / `Vec<String>` / the
@@ -2951,10 +3382,10 @@ fn compute_streaming_output_specs(
         let cxl_emit_names: Vec<String> = plan.graph[output_idx].cxl_emit_names_in(plan);
 
         specs.push(StreamingOutputSpec {
-            merge_idx,
+            producer_idx,
             output_idx,
             output_name: output_name.clone(),
-            merge_name: merge_name.clone(),
+            producer_name: plan.graph[producer_idx].name().to_string(),
             out_cfg: out_cfg.clone(),
             expected_input_schema,
             cxl_emit_names,
@@ -2963,21 +3394,26 @@ fn compute_streaming_output_specs(
     specs
 }
 
-/// Plan-time metadata for a streaming `Output` task spawned at executor
-/// entry. Carries every field the task needs in owned form so it can run
+/// Plan-time metadata for a streaming `Output` thread spawned at executor
+/// entry. Carries every field the thread needs in owned form so it can run
 /// independently of the borrowed `&PipelineConfig` / `&ExecutionPlanDag`
 /// references that anchor the dispatcher's `ExecutorContext`.
 pub(crate) struct StreamingOutputSpec {
-    /// `NodeIndex` of the upstream `Merge` node. The Merge arm looks up
-    /// its sender in [`dispatch::ExecutorContext::streaming_output_senders`]
-    /// keyed by this index.
-    pub(crate) merge_idx: petgraph::graph::NodeIndex,
+    /// `NodeIndex` of the upstream producer node whose arm writes records
+    /// into the streaming channel — either a fused `Merge.interleave` or
+    /// a fused `Source → Transform`. The producer arm looks up its sender
+    /// in [`dispatch::ExecutorContext::streaming_output_senders`] keyed by
+    /// this index.
+    pub(crate) producer_idx: petgraph::graph::NodeIndex,
     /// `NodeIndex` of the downstream `Output` node. The Output arm
     /// short-circuits when its index appears in
     /// [`dispatch::ExecutorContext::streaming_output_nodes`].
     pub(crate) output_idx: petgraph::graph::NodeIndex,
     pub(crate) output_name: String,
-    pub(crate) merge_name: String,
+    /// Name of the upstream producer (`Merge` or fused `Transform`), used
+    /// as the upstream-node label in the streaming task's E314
+    /// schema-mismatch diagnostics.
+    pub(crate) producer_name: String,
     pub(crate) out_cfg: OutputConfig,
     /// Compile-time input schema for the Output; used by the streaming
     /// task to run the same `check_input_schema` invariant the buffered
@@ -2990,10 +3426,10 @@ pub(crate) struct StreamingOutputSpec {
     pub(crate) cxl_emit_names: Vec<String>,
 }
 
-/// Per-task return shape merged into the dispatcher's
-/// [`dispatch::ExecutorContext`] after `JoinHandle::await`. Mirrors the
+/// Per-thread return shape merged into the dispatcher's
+/// [`dispatch::ExecutorContext`] after `JoinHandle::join`. Mirrors the
 /// counter / timer / error accounting the buffered Output arm performs
-/// inline; the streaming task accumulates these locally and the
+/// inline; the streaming thread accumulates these locally and the
 /// dispatcher folds them back into `ctx.counters`, `ctx.records_emitted`,
 /// `ctx.write_timer`, `ctx.projection_timer`, `ctx.ok_source_rows`, and
 /// `ctx.output_errors`.
@@ -3008,9 +3444,9 @@ pub(crate) struct StreamingOutputTaskOutput {
 }
 
 impl StreamingOutputTaskOutput {
-    /// Fold the task-local counters / timers / errors / stage metrics
+    /// Fold the thread-local counters / timers / errors / stage metrics
     /// back into the dispatcher's [`dispatch::ExecutorContext`] after
-    /// `JoinHandle::await`. Mirrors the buffered Output arm's inline
+    /// `JoinHandle::join`. Mirrors the buffered Output arm's inline
     /// counter accounting: `ok_count` counts distinct source rows
     /// (deduplicated against `ctx.ok_source_rows`), `records_written`
     /// counts every write, and the per-task timers accumulate via
@@ -3034,7 +3470,7 @@ impl StreamingOutputTaskOutput {
     }
 }
 
-/// Streaming-output writer task body. Drains the `mpsc::Receiver`
+/// Streaming-output writer thread body. Drains the crossbeam `Receiver`
 /// populated by the fused `Merge.interleave` arm, projects each record
 /// through `project_output_from_record`, lazily constructs the writer on
 /// the first record, calls `Writer::write_record` per record, and
@@ -3043,10 +3479,11 @@ impl StreamingOutputTaskOutput {
 /// `output_errors`. See [`StreamingOutputSpec`] for the eligibility
 /// predicate and https://github.com/rustpunk/clinker/issues/72 for the
 /// rationale.
-async fn streaming_output_task(
-    mut rx: tokio::sync::mpsc::Receiver<crate::executor::stream_event::StreamEvent>,
+fn streaming_output(
+    rx: crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingOutputSpec,
+    charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> StreamingOutputTaskOutput {
     use crate::projection::project_output_from_record;
 
@@ -3071,7 +3508,7 @@ async fn streaming_output_task(
     let mut writer: Option<Box<dyn FormatWriter>> = None;
     let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
 
-    while let Some(event) = rx.recv().await {
+    while let Ok(event) = rx.recv() {
         // Streaming output is terminal — it writes records straight to
         // disk. Punctuations are consumed here; per-document writer
         // finalization (envelope header/footer streaming reconstruction
@@ -3080,13 +3517,24 @@ async fn streaming_output_task(
             crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
             crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,
         };
+        // Discharge this record's per-row cost from the shared charge
+        // handle — the consume half of the per-batch admit/discharge
+        // model. The producer charged the whole batch's
+        // `EventBatch::estimated_bytes` on flush; subtracting each
+        // record's `record_byte_cost` as it drains keeps the slot's live
+        // count tracking exactly what is still buffered between producer
+        // and writer. The formula matches the producer's charge, so a
+        // fully-drained stream nets the counter back to zero.
+        charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
+            record.schema().column_count(),
+        ));
         if let Some(expected) = spec.expected_input_schema.as_ref()
             && let Err(err) = crate::executor::schema_check::check_input_schema(
                 expected,
                 record.schema(),
                 &spec.output_name,
                 "output",
-                &spec.merge_name,
+                &spec.producer_name,
             )
         {
             out.errors.push(err);
@@ -3121,11 +3569,16 @@ async fn streaming_output_task(
                         out.stage_metrics.push(timer.finish(0, 0));
                     }
                     // Drain the rest of the channel so the Merge arm's
-                    // bounded send doesn't deadlock — the streaming
-                    // task must keep consuming even when the writer is
-                    // dead, otherwise back-pressure stalls the whole
-                    // pipeline.
-                    while rx.recv().await.is_some() {}
+                    // bounded `send` doesn't deadlock — the streaming
+                    // thread must keep consuming until every sender drops
+                    // even when the writer is dead, otherwise the Merge
+                    // producer blocks forever on a full bounded channel.
+                    while rx.recv().is_ok() {}
+                    // Nothing is buffered downstream once the channel
+                    // drains, so zero the slot's charge unconditionally —
+                    // the error path never discharged the records it
+                    // dropped on the floor above.
+                    charge_handle.set_bytes(0);
                     return out;
                 }
             }
@@ -3146,13 +3599,14 @@ async fn streaming_output_task(
             }
             Err(e) => {
                 out.errors.push(PipelineError::from(e));
-                while rx.recv().await.is_some() {}
+                while rx.recv().is_ok() {}
+                charge_handle.set_bytes(0);
                 return out;
             }
         }
     }
 
-    // Channel closed — every Merge predecessor's receiver returned None,
+    // Channel closed — every sender dropped (`recv` returned `Err`),
     // so no more records will arrive. Flush whatever the writer has
     // buffered. `writer.is_none()` is the empty-stream case (zero
     // records arrived); matches the buffered path's
@@ -3169,6 +3623,12 @@ async fn streaming_output_task(
             out.errors.push(PipelineError::from(e));
         }
     }
+    // The channel is fully drained, so nothing is in flight; the
+    // per-record discharge above should have zeroed the counter already.
+    // Pin it to zero defensively so a heuristic mismatch between the
+    // batch charge and the per-record discharge can never leave a stale
+    // positive charge for the post-join arbitrator read.
+    charge_handle.set_bytes(0);
     out
 }
 
@@ -3761,7 +4221,7 @@ mod tests {
     /// This mirrors `integration_tests::run_pipeline` but lives inside
     /// the `executor` module so submodules can reference it via
     /// `crate::executor::tests::run_test`.
-    pub(super) async fn run_test(
+    pub(super) fn run_test(
         yaml: &str,
         csv_input: &str,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -3790,8 +4250,7 @@ mod tests {
         };
 
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-                .await?;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
@@ -3821,6 +4280,7 @@ mod tests {
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;
     mod post_combine_window_strategies;
+    mod record_source_transport;
     mod strict_pipeline_zero_overhead;
     mod window_recompute_correctness;
 }

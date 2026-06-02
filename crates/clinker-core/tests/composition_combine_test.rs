@@ -62,7 +62,7 @@ fn test_params() -> PipelineRunParams {
 /// pipelines used here pick the driving combine input as the
 /// first-declared source so the default routing matches the combine
 /// driver-selection rule (first-in-IndexMap on a tied cardinality).
-async fn run_pipeline_multi_source(
+fn run_pipeline_multi_source(
     yaml: &str,
     inputs: &[(&str, &str)],
 ) -> (clinker_core::executor::ExecutionReport, String) {
@@ -90,7 +90,6 @@ async fn run_pipeline_multi_source(
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
@@ -160,8 +159,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_combine_in_composition_executes() {
+#[test]
+fn test_combine_in_composition_executes() {
     // End-to-end execution. Source `orders_src` emits a single row
     // {order_id: "1", product_id: "A", quantity: 2}; source
     // `products_src` emits {product_id: "A", name: "Widget", price:
@@ -213,8 +212,7 @@ nodes:
     let (_report, output) = run_pipeline_multi_source(
         yaml,
         &[("orders_src", orders_csv), ("products_src", products_csv)],
-    )
-    .await;
+    );
 
     assert!(
         output.contains("order_id"),
@@ -242,8 +240,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_combine_in_nested_composition() {
+#[test]
+fn test_combine_in_nested_composition() {
     // The outer composition (`nested_combine.comp.yaml`) forwards
     // both ports to the inner composition (`combine_enrich`) and
     // stamps an additional `tenant` field. Both the inner-emitted
@@ -295,8 +293,7 @@ nodes:
     let (_report, output) = run_pipeline_multi_source(
         yaml,
         &[("orders_src", orders_csv), ("products_src", products_csv)],
-    )
-    .await;
+    );
 
     assert!(
         output.contains("product_name"),
@@ -316,8 +313,8 @@ nodes:
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_combine_collect_in_composition_executes() {
+#[test]
+fn test_combine_collect_in_composition_executes() {
     // `match: collect` produces a driver-shaped row carrying every
     // matched build row in a trailing `products` Array column. The
     // composition surfaces this auto-derived shape through its
@@ -369,8 +366,7 @@ nodes:
     let (_report, output) = run_pipeline_multi_source(
         yaml,
         &[("orders_src", orders_csv), ("products_src", products_csv)],
-    )
-    .await;
+    );
 
     // Driver columns appear in the output header; the build-side
     // qualifier (`products`) appears as the trailing Array column.

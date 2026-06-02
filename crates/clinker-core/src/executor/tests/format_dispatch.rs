@@ -50,7 +50,7 @@ fn test_params() -> PipelineRunParams {
 
 /// Run a pipeline with an arbitrary in-memory reader, YAML config, and CSV output.
 /// Returns (counters, dlq_entries, output_string).
-async fn run_format_test(
+fn run_format_test(
     yaml: &str,
     input_name: &str,
     input_data: Cursor<Vec<u8>>,
@@ -69,8 +69,7 @@ async fn run_format_test(
 
     let params = test_params();
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
@@ -85,8 +84,8 @@ fn test_scaffold_compiles() {
 /// JSON NDJSON input produces records through the executor.
 /// Constructs 5 NDJSON records in-memory, runs a passthrough pipeline,
 /// verifies all 5 records appear in CSV output.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_json_ndjson_input_produces_records() {
+#[test]
+fn test_format_dispatch_json_ndjson_input_produces_records() {
     let yaml = r#"
 pipeline:
   name: json-input-test
@@ -119,7 +118,7 @@ nodes:
         serde_json::json!({"name": "Diana", "age": "28"}),
         serde_json::json!({"name": "Eve", "age": "22"}),
     ]);
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 5, "expected 5 records");
     assert_eq!(counters.ok_count, 5);
     assert_eq!(counters.dlq_count, 0);
@@ -129,8 +128,8 @@ nodes:
 }
 
 /// XML input produces records through the executor.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_xml_input_produces_records() {
+#[test]
+fn test_format_dispatch_xml_input_produces_records() {
     let yaml = r#"
 pipeline:
   name: xml-input-test
@@ -164,7 +163,7 @@ nodes:
             vec![("name", "Bob"), ("age", "25")],
         ],
     );
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
     assert_eq!(counters.dlq_count, 0);
@@ -175,8 +174,8 @@ nodes:
 
 /// JSON NDJSON output produces valid newline-delimited JSON.
 /// CSV input → NDJSON output, verify each line parses as JSON.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_json_output_produces_valid_ndjson() {
+#[test]
+fn test_format_dispatch_json_output_produces_valid_ndjson() {
     let yaml = r#"
 pipeline:
   name: json-output-test
@@ -204,7 +203,7 @@ nodes:
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 3, "expected 3 records");
     assert_eq!(counters.ok_count, 3);
 
@@ -223,8 +222,8 @@ nodes:
 
 /// XML output produces valid XML with configured root/record elements.
 /// CSV input → XML output, verify output parses as valid XML.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_xml_output_produces_valid_xml() {
+#[test]
+fn test_format_dispatch_xml_output_produces_valid_xml() {
     let yaml = r#"
 pipeline:
   name: xml-output-test
@@ -253,7 +252,7 @@ nodes:
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
 
@@ -279,8 +278,8 @@ nodes:
 
 /// Cross-format: CSV input, JSON output.
 /// Verifies that input format ≠ output format works correctly.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_csv_to_json_cross_format() {
+#[test]
+fn test_format_dispatch_csv_to_json_cross_format() {
     let yaml = r#"
 pipeline:
   name: csv-to-json-test
@@ -308,7 +307,7 @@ nodes:
 "#;
     let csv_input = "id,value\n1,alpha\n2,beta\n3,gamma\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 3, "expected 3 records");
     assert_eq!(counters.ok_count, 3);
 
@@ -324,8 +323,8 @@ nodes:
 }
 
 /// CSV input backward compatibility — existing behavior unchanged after dispatch refactor.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_csv_input_backward_compat() {
+#[test]
+fn test_format_dispatch_csv_input_backward_compat() {
     let yaml = r#"
 pipeline:
   name: csv-compat-test
@@ -351,7 +350,7 @@ nodes:
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 3, "expected 3 records");
     assert_eq!(counters.ok_count, 3);
     assert_eq!(counters.dlq_count, 0);
@@ -366,8 +365,8 @@ nodes:
 /// Fixed-width input with inline schema produces records through the executor.
 /// Constructs 2 fixed-width records with 2 fields (name: start=0 width=10, age: start=10 width=5),
 /// runs through a passthrough pipeline, verifies correct field extraction.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_fixed_width_input_with_schema() {
+#[test]
+fn test_format_dispatch_fixed_width_input_with_schema() {
     let yaml = r#"
 pipeline:
   name: fw-input-test
@@ -402,7 +401,7 @@ nodes:
     include_unmapped: true
 "#;
     let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
     assert_eq!(counters.dlq_count, 0);
@@ -414,8 +413,8 @@ nodes:
 /// Fixed-width output produces correctly aligned columns.
 /// CSV input → fixed-width output with inline schema, verify output has
 /// correct column widths and alignment.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_fixed_width_output_produces_valid_data() {
+#[test]
+fn test_format_dispatch_fixed_width_output_produces_valid_data() {
     let yaml = r#"
 pipeline:
   name: fw-output-test
@@ -449,7 +448,7 @@ nodes:
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).await.unwrap();
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
 
@@ -483,8 +482,8 @@ nodes:
 
 /// Fixed-width input without schema returns a validation error.
 /// Config validation catches the missing schema early with an actionable message.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_format_dispatch_fixed_width_missing_schema_errors() {
+#[test]
+fn test_format_dispatch_fixed_width_missing_schema_errors() {
     let yaml = r#"
 pipeline:
   name: fw-no-schema-test
@@ -508,7 +507,7 @@ nodes:
     path: output.csv
 "#;
     let input_data = fixed_width_input(&["Alice     00030"]);
-    let result = run_format_test(yaml, "src", input_data).await;
+    let result = run_format_test(yaml, "src", input_data);
     assert!(result.is_err(), "expected error for missing schema");
     let err = result.unwrap_err().to_string();
     assert!(

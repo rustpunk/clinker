@@ -120,6 +120,27 @@ If a single input record's `emit each` block produces more than `max_expansion` 
 
 The DLQ category `expansion_limit_exceeded` is distinct from generic CXL evaluation failures, so DLQ-side filters and metrics can target expansion runaway specifically. See [Error Handling & DLQ](error-handling.md) for the wider DLQ contract.
 
+## Batch size (`batch_size`)
+
+A streaming-eligible transform hands its output downstream in bounded batches rather than accumulating the whole stage before the next stage runs. `batch_size` sets how many events (records plus document-boundary punctuations) a batch holds. A per-transform `batch_size` overrides the pipeline-level [`pipeline.batch_size`](../ops/memory.md#streaming-batch-size-batch_size) for this one stage; omit it to inherit the pipeline value (or the built-in default of 2048).
+
+```yaml
+- type: transform
+  name: enrich
+  input: orders
+  config:
+    batch_size: 512         # override pipeline.batch_size for this stage
+    cxl: |
+      emit order_id = order_id
+      emit total = quantity * unit_price
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `batch_size` | `usize` | inherits `pipeline.batch_size` (else 2048) | Events per streaming batch for this transform. Must be `>= 1`. |
+
+A `batch_size` of `0` is rejected at config load (a zero-event batch never flushes). Smaller batches lower the in-flight memory of a streaming stage at the cost of more per-batch bookkeeping; larger batches amortize the bookkeeping at the cost of a larger live working set. The default suits typical record widths — tune it only when a profiling run shows a streaming stage's per-batch footprint matters. See [Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md) for which stages stream and which fully materialize.
+
 ## Log directives
 
 Log directives control diagnostic output during transform execution:

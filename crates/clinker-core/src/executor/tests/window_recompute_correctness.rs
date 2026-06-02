@@ -53,7 +53,7 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-async fn run_pipeline(
+fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
@@ -82,8 +82,7 @@ async fn run_pipeline(
     )]);
 
     let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .await?;
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -225,11 +224,10 @@ O5,ENG,west,50
 ///    351` — ENG partition is not in the recompute scope, but `gate`
 ///    still runs on every surviving record at commit, so the +1
 ///    mutation appears uniformly across all written rows.
-#[tokio::test(flavor = "multi_thread")]
-async fn post_aggregate_window_recompute_corrects_running_total() {
-    let (counters, dlq, output) = run_pipeline(PIPELINE, CSV)
-        .await
-        .expect("post-aggregate-window pipeline must execute");
+#[test]
+fn post_aggregate_window_recompute_corrects_running_total() {
+    let (counters, dlq, output) =
+        run_pipeline(PIPELINE, CSV).expect("post-aggregate-window pipeline must execute");
 
     assert_eq!(
         counters.dlq_count, 1,

@@ -84,6 +84,8 @@ When a record fails inside a correlation group:
 
 A record with a null value for the correlation-key field is treated as its own per-record group: it has no peers and DLQ atomicity does not span multiple records.
 
+A Combine output-row eval failure that the engine recovers from (under `continue` / `best_effort`, in the hash build-probe inline arm) produces entries under the `combine_output_row` category — distinct from the upstream-Transform `type_coercion_failure` because the entry carries the contributing-build lineage and rewinds both the driver and the matched build source's rollback cursor. See [Per-source rollback narrowing](#per-source-rollback-narrowing) below for the cursor-rewind detail.
+
 The `dlq_count` counter sums triggers and collaterals.
 
 ### Per-source rollback narrowing
@@ -115,7 +117,7 @@ The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionRe
 
 On `max_group_buffer` overflow, every record in the overflowing group still lands in DLQ (one `GroupSizeExceeded` trigger plus per-row collaterals), but the per-source rollback cursor rewinds independently per contributing source. Attributing the overflow failure itself to one source would be a fiction — every contributing source shared blame proportionally — so the DLQ shape stays group-wide while the rewind narrows per source.
 
-The relaxed-CK aggregator's per-row lineage carries `(row_id, source_name)` pairs so a finalize-time retract scoped to one source rewinds only that source's contributions to each affected group. Combine input snapshots are captured at fold start and cleared at every Combine arm's exit (inline, IEJoin, GraceHash, SortMerge); the snapshot restores per-contributing-source cursors if a Combine output-row eval needs to fail recoverably under a future relaxed-Combine path.
+The relaxed-CK aggregator's per-row lineage carries `(row_id, source_name)` pairs so a finalize-time retract scoped to one source rewinds only that source's contributions to each affected group. The source half of the pair is load-bearing under multi-source ingest: each source numbers its rows from its own monotonic counter, so two sources that both feed the same aggregate group can contribute records at identical `row_id` values. Pairing the row id with its source keeps `src_a`'s row 1 distinct from `src_b`'s row 1 when both land in one group, so a retract that must remove both reaches each one instead of collapsing the colliding ids and stranding the second source's contribution. Combine input snapshots are captured at fold start and cleared at every Combine arm's exit (inline, IEJoin, GraceHash, SortMerge). When a Combine output-row eval fails recoverably under `continue` / `best_effort` in the hash build-probe (inline) arm — a probe-key, residual-filter, or matched / `on_miss: null_fields` body failure on one driver row — the snapshot restores each contributing source's rollback cursor to the value it held at the start of the fold (its pre-fold floor), lowering the cursor only if it had since advanced, then routes the row to the DLQ under the `combine_output_row` category. Only the sources that fed the failing row rewind; co-folded sources that did not contribute keep their forward progress. The IEJoin, grace-hash, and sort-merge arms propagate an output-eval failure as fail-fast regardless of strategy.
 
 ## Group buffering
 

@@ -13,6 +13,7 @@
 
 - [Pipeline YAML Structure](pipeline/structure.md)
 - [Source Nodes](pipeline/source.md)
+- [Network Sources (REST)](pipeline/source-network.md)
 - [Auto-Widen & Schema Drift](pipeline/auto-widen.md)
 - [Transform Nodes](pipeline/transform.md)
 - [Aggregate Nodes](pipeline/aggregate.md)
@@ -59,6 +60,7 @@
 - [Validation & Dry Run](ops/validation.md)
 - [Explain Plans](ops/explain.md)
 - [Memory Tuning](ops/memory.md)
+- [Streaming vs. Blocking Stages](ops/streaming-vs-blocking.md)
 - [Metrics & Monitoring](ops/metrics.md)
 - [Exit Codes & Error Diagnosis](ops/exit-codes.md)
 - [Production Deployment](ops/deployment.md)

@@ -185,10 +185,9 @@ impl std::error::Error for ConsumerSpillError {
 /// The atomic flag is the fast path — `is_paused()` is lock-free, so
 /// the common unblocked case stays uncontended.
 ///
-/// Concurrency-substrate agnostic: works under tokio + `spawn_blocking`
-/// (the calling OS thread parks on `Condvar::wait`) and under a
-/// future Rayon worker pool (a Rayon worker parks the same way).
-/// No new crate dependencies — `Condvar` and `Mutex` are `std`.
+/// Concurrency-substrate agnostic: a dedicated source thread parks on
+/// `Condvar::wait`, and a Rayon worker parks the same way. No new crate
+/// dependencies — `Condvar` and `Mutex` are `std`.
 pub struct PauseSignal {
     paused: AtomicBool,
     mu: Mutex<()>,
@@ -619,6 +618,14 @@ pub struct MemoryArbitrator {
     /// E310 with a partition + spill-bytes diagnostic.
     max_spill_bytes: AtomicU64,
     cumulative_spill_bytes: AtomicU64,
+    /// High-water mark of `sum_consumer_usage()` sampled whenever a
+    /// streaming charge handle admits a batch. Lets a test prove the
+    /// charged-bytes peak of a streaming stage stays bounded to one
+    /// in-flight batch (plus the channel's bound) rather than the whole
+    /// stage output — the per-batch admit/discharge invariant. Updated
+    /// lock-free via `fetch_max`. Surfaced on the `ExecutionReport` as
+    /// `peak_consumer_usage_bytes` for callers that assert the bound.
+    peak_consumer_usage: AtomicU64,
     /// Registry of operator wrappers the arbitrator polls for
     /// per-operator `current_usage()` and routes `pause` / `resume` /
     /// `try_spill` callbacks to. A copy-on-write snapshot: hot read
@@ -659,6 +666,7 @@ impl MemoryArbitrator {
             peak_rss: AtomicU64::new(0),
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
+            peak_consumer_usage: AtomicU64::new(0),
             consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
@@ -708,6 +716,24 @@ impl MemoryArbitrator {
             self.poll_arbitration();
         }
         tripped
+    }
+
+    /// True when current RSS exceeds the soft spill threshold, without
+    /// running an arbitration round. Updates `peak_rss` as a side effect
+    /// but never elects a victim, so it never calls `pause()` on a
+    /// registered consumer.
+    ///
+    /// A streaming stage spills *its own* in-flight batch when this trips
+    /// (it owns the batch and discharges it through disk in-thread). It
+    /// must not drive the pausing round `should_spill` runs: that round
+    /// can elect the live Source consumer and `pause()` its ingest thread,
+    /// which has no production resume hook — the Source channel then stops
+    /// refilling, the dispatch loop blocks on `recv`, and the pipeline
+    /// deadlocks. The streaming path's back-pressure is the bounded
+    /// inter-stage channel, not a pause signal.
+    pub fn should_spill_self(&self) -> bool {
+        self.observe();
+        self.peak_rss.load(Ordering::Relaxed) > self.soft_limit()
     }
 
     /// Soft spill threshold in absolute bytes.
@@ -880,6 +906,24 @@ impl MemoryArbitrator {
             .iter()
             .map(|(_, c)| c.current_usage())
             .sum()
+    }
+
+    /// Sample `sum_consumer_usage()` and raise the running peak to it.
+    /// Called at every streaming per-batch charge so the peak reflects
+    /// the largest charged footprint a streaming stage ever held in
+    /// flight. Lock-free `fetch_max` over the freshly summed snapshot.
+    pub fn sample_peak_consumer_usage(&self) {
+        let now = self.sum_consumer_usage();
+        self.peak_consumer_usage.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// High-water mark of `sum_consumer_usage()` observed across the run,
+    /// or `0` if no streaming charge ever sampled it. A streaming stage's
+    /// peak stays bounded to one in-flight batch (plus the channel's
+    /// bound), proving the per-batch admit/discharge model never charges
+    /// the whole stage at once.
+    pub fn peak_consumer_usage(&self) -> u64 {
+        self.peak_consumer_usage.load(Ordering::Relaxed)
     }
 
     /// Run one arbitration round and return the elected victim, if

@@ -1,11 +1,12 @@
 //! Per-source live ingest channel.
 //!
-//! [`TokioSourceStream`] wraps a bounded `tokio::sync::mpsc::Sender` so a
-//! Source-reader task can push records and document-boundary
+//! [`SourceIngestChannel`] wraps a bounded `crossbeam_channel::Sender`
+//! so a Source-reader thread can push records and document-boundary
 //! punctuations into the executor's dispatch loop through the paired
-//! `Receiver`. Channel capacity is bounded so producers `.await` (or
-//! `blocking_send`) when the consumer falls behind, supplying
-//! back-pressure end-to-end without an intermediate spill tier.
+//! `Receiver`. Channel capacity is bounded so the producer's `send`
+//! blocks the calling OS thread when the consumer falls behind,
+//! supplying back-pressure end-to-end without an intermediate spill
+//! tier.
 //!
 //! Payload is [`StreamEvent`]: either a `(Record, u64)` body event or
 //! a [`Punctuation`] marking a document boundary. Source ingest emits
@@ -18,7 +19,7 @@ use clinker_record::Record;
 
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 
-/// Error surface for [`TokioSourceStream`] sends.
+/// Error surface for [`SourceIngestChannel`] sends.
 #[derive(Debug)]
 pub(crate) enum SourceStreamError {
     /// Consumer dropped the receiver before this push completed.
@@ -35,18 +36,18 @@ impl std::fmt::Display for SourceStreamError {
 
 impl std::error::Error for SourceStreamError {}
 
-/// Tokio-mpsc-backed live ingest channel for one Source.
+/// Crossbeam-bounded live ingest channel for one Source.
 ///
-/// Capacity is bounded; producers block (sync `blocking_send` from inside
-/// `tokio::task::spawn_blocking`) when the channel is full, providing
-/// back-pressure to the upstream reader. The consumer is a paired
-/// `tokio::sync::mpsc::Receiver` returned by [`Self::new`] and consumed
-/// via `recv().await` by the dispatch loop's Source arm.
-pub(crate) struct TokioSourceStream {
-    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+/// Capacity is bounded; the producer's `send` blocks the calling OS
+/// thread when the channel is full, providing back-pressure to the
+/// upstream reader. The consumer is a paired `crossbeam_channel::Receiver`
+/// returned by [`Self::new`] and consumed via `recv` by the dispatch
+/// loop's Source arm.
+pub(crate) struct SourceIngestChannel {
+    tx: crossbeam_channel::Sender<StreamEvent>,
     /// Shared with the registered `SourceConsumer` wrapper. Each
-    /// `blocking_push` updates `handle.bytes` from the current channel
-    /// queue depth times a smoothed per-record byte estimate (see
+    /// `push` updates `handle.bytes` from the current channel queue
+    /// depth times a smoothed per-record byte estimate (see
     /// `record_bytes_ewma`), so the arbitrator's pull-mode
     /// `current_usage` reads the channel's in-flight memory at every
     /// policy poll. Punctuation sends carry no record bytes and leave
@@ -87,22 +88,22 @@ const fn ewma_step(prev: u64, sample: u64) -> u64 {
     }
 }
 
-impl TokioSourceStream {
-    /// Default channel capacity. Matches the cooperative-yield cadence
-    /// chosen for the async dispatch loop: one batch of `yield_now`
-    /// calls in Transform/Route corresponds to roughly one channel
-    /// drain.
+impl SourceIngestChannel {
+    /// Default channel capacity. Bounds the in-flight depth between the
+    /// ingest thread and the dispatch loop's Source arm; the producer's
+    /// `send` blocks once this many events are buffered, so the value
+    /// paces back-pressure.
     pub(crate) const DEFAULT_CAPACITY: usize = 1024;
 
-    /// Create a new stream + paired receiver. The receiver is what the
-    /// dispatch loop's Source arm consumes via `recv().await`. The
+    /// Create a new channel + paired receiver. The receiver is what the
+    /// dispatch loop's Source arm consumes via `recv`. The
     /// `consumer_handle` is shared with the pipeline-scoped
     /// arbitrator's `SourceConsumer` wrapper.
     pub(crate) fn new(
         capacity: usize,
         consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-    ) -> (Self, tokio::sync::mpsc::Receiver<StreamEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    ) -> (Self, crossbeam_channel::Receiver<StreamEvent>) {
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
         (
             Self {
                 tx,
@@ -113,17 +114,11 @@ impl TokioSourceStream {
         )
     }
 
-    /// Push a body record from a synchronous worker (typically the
-    /// closure inside `tokio::task::spawn_blocking` driving a sync
-    /// format reader). Blocks the calling thread when the channel is
-    /// at capacity, preserving the bounded-channel back-pressure
-    /// semantics without requiring the caller to be inside an
-    /// `async fn`.
-    pub(crate) fn blocking_push(
-        &mut self,
-        record: Record,
-        row_num: u64,
-    ) -> Result<(), SourceStreamError> {
+    /// Push a body record from the Source ingest thread driving a sync
+    /// format reader. Blocks the calling thread when the channel is at
+    /// capacity, preserving the bounded-channel back-pressure
+    /// semantics.
+    pub(crate) fn push(&mut self, record: Record, row_num: u64) -> Result<(), SourceStreamError> {
         // Block here if the arbitrator has paused this consumer (e.g.
         // `BackPressurePreferred` policy elected this Source as the
         // pause victim). The fast path is lock-free; the slow path
@@ -145,15 +140,13 @@ impl TokioSourceStream {
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
         let record_bytes = self.record_bytes_ewma;
         self.tx
-            .blocking_send(StreamEvent::record(record, row_num))
+            .send(StreamEvent::record(record, row_num))
             .map_err(|_| SourceStreamError::Closed)?;
-        // `max_capacity - capacity` is the number of events sitting
-        // in the channel buffer waiting for the consumer. The product
-        // approximates the channel's in-flight memory footprint and
-        // is what the arbitrator's `current_usage` reports.
-        let max_cap = self.tx.max_capacity() as u64;
-        let remaining = self.tx.capacity() as u64;
-        let queued = max_cap.saturating_sub(remaining);
+        // `Sender::len()` is the number of events sitting in the channel
+        // buffer waiting for the consumer — the in-flight queue depth. The
+        // product approximates the channel's in-flight memory footprint
+        // and is what the arbitrator's `current_usage` reports.
+        let queued = self.tx.len() as u64;
         self.consumer_handle
             .set_bytes(queued.saturating_mul(record_bytes));
         Ok(())
@@ -165,19 +158,16 @@ impl TokioSourceStream {
     /// behavior (Aggregate / Output flush; Merge dedupes; Transform /
     /// Route pass through). Punctuations carry no record bytes, so the
     /// `ConsumerHandle` byte estimate is left untouched.
-    pub(crate) fn blocking_push_punctuation(
-        &mut self,
-        punct: Punctuation,
-    ) -> Result<(), SourceStreamError> {
+    pub(crate) fn push_punctuation(&mut self, punct: Punctuation) -> Result<(), SourceStreamError> {
         self.tx
-            .blocking_send(StreamEvent::punctuation(punct))
+            .send(StreamEvent::punctuation(punct))
             .map_err(|_| SourceStreamError::Closed)
     }
 }
 
-/// `MemoryConsumer` wrapper for a `TokioSourceStream` ingest channel.
-/// Holds an `Arc<ConsumerHandle>` shared with the source ingest task:
-/// the task updates `handle.bytes` from the bounded `mpsc` queue
+/// `MemoryConsumer` wrapper for a `SourceIngestChannel`.
+/// Holds an `Arc<ConsumerHandle>` shared with the source ingest thread:
+/// the thread updates `handle.bytes` from the bounded-channel queue
 /// depth × estimated per-record bytes at each batch boundary.
 ///
 /// Sources do not spill: `try_spill` returns `Ok(0)` and the
@@ -186,8 +176,8 @@ impl TokioSourceStream {
 /// `Priority` fallback ranks Sources last among the spill candidates
 /// when no back-pressureable consumer is available.
 /// `can_back_pressure = true`; `pause` / `resume` forward to the
-/// handle's pause flag, which the ingest task reads at every
-/// `blocking_send` boundary.
+/// handle's pause flag, which the ingest thread reads at every
+/// `push` boundary.
 pub struct SourceConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }

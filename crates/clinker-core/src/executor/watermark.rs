@@ -141,7 +141,7 @@ impl PerSourceWatermarks {
     }
 
     /// Flip `(source, file)`'s status to [`WatermarkStatus::Idle`].
-    /// Called by the source mpsc consumer when `recv().await` exceeds
+    /// Called by the source channel consumer when `recv_timeout` exceeds
     /// the configured `idle_timeout` without yielding a record.
     /// Idempotent — re-marking an already-idle partition is a no-op.
     /// `NoObservation` partitions are eligible to flip directly to

@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
-use std::sync::OnceLock;
 
 use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
@@ -17,20 +16,6 @@ use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use indexmap::IndexMap;
 use tempfile::TempDir;
-use tokio::runtime::{Builder, Runtime};
-
-/// Shared multi-thread tokio runtime used by `BenchPipelineRunner::run`
-/// to drive the async executor synchronously. Multi-thread is required
-/// by `block_in_place` inside CPU-bound operator arms.
-fn runner_runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("build bench runner tokio runtime")
-    })
-}
 
 use crate::format_mapping::input_format_to_data_format;
 
@@ -125,9 +110,7 @@ impl BenchPipelineRunner {
             ..Default::default()
         };
 
-        runner_runtime().block_on(PipelineExecutor::run_plan_with_readers_writers(
-            &plan, readers, writers, &params,
-        ))
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
     }
 }
 

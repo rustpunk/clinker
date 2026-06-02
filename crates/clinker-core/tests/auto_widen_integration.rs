@@ -45,7 +45,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-async fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
+fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
     let readers = HashMap::from([(
@@ -62,12 +62,11 @@ async fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
     )]);
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
 
-async fn run_two_source_merge(
+fn run_two_source_merge(
     yaml: &str,
     src_a_name: &str,
     csv_a: &str,
@@ -99,7 +98,6 @@ async fn run_two_source_merge(
     )]);
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .await
             .expect("pipeline run");
     (report, buf.as_string())
 }
@@ -112,8 +110,8 @@ async fn run_two_source_merge(
 /// canonical reduction). With `include_unmapped: true` at the sink,
 /// no extra column appears beyond `dept` and `total` because the
 /// sidecar is empty.
-#[tokio::test(flavor = "multi_thread")]
-async fn h1_aggregate_drops_widened_payload_to_null() {
+#[test]
+fn h1_aggregate_drops_widened_payload_to_null() {
     let yaml = r#"
 pipeline:
   name: h1_aggregate
@@ -147,7 +145,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,300,n3,e3\n";
-    let (_report, output) = run_single(yaml, csv).await;
+    let (_report, output) = run_single(yaml, csv);
     let header = output.lines().next().expect("header");
     assert_eq!(
         header, "dept,total",
@@ -163,8 +161,8 @@ nodes:
 /// own `$widened` map. The combine output retains driver's sidecar
 /// (verified via `include_unmapped: true` expanding the driver's
 /// extras to top-level), but build-side extras do NOT appear.
-#[tokio::test(flavor = "multi_thread")]
-async fn h2_combine_carries_driver_widened_drops_build() {
+#[test]
+fn h2_combine_carries_driver_widened_drops_build() {
     let yaml = r#"
 pipeline:
   name: h2_combine
@@ -213,8 +211,7 @@ nodes:
     // Driver carries `region` (extra); build carries `category` (extra).
     let orders = "order_id,product_id,region\nO1,P1,US\nO2,P1,EU\n";
     let products = "product_id,name,category\nP1,Widget,hardware\n";
-    let (_report, output) =
-        run_two_source_merge(yaml, "orders", orders, "products", products).await;
+    let (_report, output) = run_two_source_merge(yaml, "orders", orders, "products", products);
     let header = output.lines().next().expect("header");
     let cols: Vec<&str> = header.split(',').collect();
     // Driver-side `region` MUST appear — driver's sidecar rides through.
@@ -250,8 +247,8 @@ nodes:
 /// `products_collected` array must list ONLY the build's
 /// user-declared fields, never `$widened`, `$ck.*`, or any keys
 /// from the build's sidecar map.
-#[tokio::test(flavor = "multi_thread")]
-async fn h2b_combine_collect_drops_build_widened() {
+#[test]
+fn h2b_combine_collect_drops_build_widened() {
     let yaml = r#"
 pipeline:
   name: h2b_collect
@@ -300,8 +297,7 @@ nodes:
     // into driver's sidecar).
     let orders = "order_id,product_id,region\nO1,P1,US\n";
     let products = "product_id,name,extra_meta\nP1,Widget,build-leak-marker\n";
-    let (_report, output) =
-        run_two_source_merge(yaml, "orders", orders, "products", products).await;
+    let (_report, output) = run_two_source_merge(yaml, "orders", orders, "products", products);
     // Driver's sidecar key `region` rides through (include_unmapped
     // expansion at the Output projection).
     assert!(
@@ -413,8 +409,8 @@ nodes:
 /// keys from the sidecar map. Ordering: declared columns first,
 /// sidecar-expanded columns after (matches IndexMap insertion order
 /// in the projection's slow-path expansion).
-#[tokio::test(flavor = "multi_thread")]
-async fn h4_include_unmapped_expands_csv_to_csv() {
+#[test]
+fn h4_include_unmapped_expands_csv_to_csv() {
     let yaml = r#"
 pipeline:
   name: h4_expand
@@ -438,7 +434,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "id,name,city,role\n1,Alice,Paris,admin\n2,Bob,Tokyo,user\n";
-    let (_report, output) = run_single(yaml, csv).await;
+    let (_report, output) = run_single(yaml, csv);
     let header = output.lines().next().expect("header");
     let cols: std::collections::HashSet<&str> = header.split(',').collect();
     for required in &["id", "name", "city", "role"] {
@@ -467,8 +463,8 @@ nodes:
 /// natively for the JSON format, or raise
 /// `FormatError::UnserializableMapValue` for CSV/XML/fixed-width).
 /// This locks the cross-format flow end-to-end.
-#[tokio::test(flavor = "multi_thread")]
-async fn h5_cross_format_csv_to_json_with_include_unmapped() {
+#[test]
+fn h5_cross_format_csv_to_json_with_include_unmapped() {
     let yaml = r#"
 pipeline:
   name: h5_csv_to_json
@@ -491,7 +487,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "id,extra,city\n1,foo,Paris\n2,bar,Tokyo\n";
-    let (_report, output) = run_single(yaml, csv).await;
+    let (_report, output) = run_single(yaml, csv);
     // JSON writer (default) emits one object per record. Each
     // object must contain the declared `id` plus the expanded
     // sidecar keys `extra` and `city`. The literal `$widened` slot
@@ -661,8 +657,8 @@ fn h6b_record_round_trips_through_sort_spill() {
 /// non-JSON writer's silent map-degrade did before commit
 /// `f5ae145`. This test locks both the in-memory DLQ entry shape
 /// AND the on-disk DLQ CSV shape simultaneously.
-#[tokio::test(flavor = "multi_thread")]
-async fn h7_dlq_entry_carries_record_with_widened_but_dlq_csv_strips_it() {
+#[test]
+fn h7_dlq_entry_carries_record_with_widened_but_dlq_csv_strips_it() {
     let yaml = r#"
 pipeline:
   name: h7_dlq
@@ -695,7 +691,7 @@ nodes:
     include_unmapped: false
 "#;
     let csv = "id,amount,note\n1,100,ok\n2,bad,broken\n";
-    let (report, _output) = run_single(yaml, csv).await;
+    let (report, _output) = run_single(yaml, csv);
 
     assert_eq!(
         report.counters.dlq_count, 1,
@@ -765,8 +761,8 @@ nodes:
 /// the `$ck.<field>` shadow column (from a correlation_key source),
 /// but never the literal `$widened` column. Closes the audit's
 /// "include_correlation_keys leak" gap end-to-end.
-#[tokio::test(flavor = "multi_thread")]
-async fn h8_include_correlation_keys_does_not_leak_widened() {
+#[test]
+fn h8_include_correlation_keys_does_not_leak_widened() {
     let yaml = r#"
 pipeline:
   name: h8_ck_only
@@ -798,7 +794,7 @@ nodes:
     // sidecar is stripped at the sink (independent of the
     // correlation-key opt-in).
     let csv = "id,name,extra\n1,Alice,foo\n2,Bob,bar\n";
-    let (_report, output) = run_single(yaml, csv).await;
+    let (_report, output) = run_single(yaml, csv);
     let header = output.lines().next().expect("header");
     let cols: Vec<&str> = header.split(',').collect();
     assert!(
