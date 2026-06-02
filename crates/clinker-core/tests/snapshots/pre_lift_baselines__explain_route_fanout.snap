@@ -27,7 +27,7 @@ source.orders:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B
 
 transform.classify:
   ordering: <none>
@@ -35,7 +35,7 @@ transform.classify:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
 
 route.classify_route:
   ordering: <none>
@@ -43,7 +43,7 @@ route.classify_route:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
 
 output.low:
   ordering: <none>
@@ -51,7 +51,7 @@ output.low:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
 
 output.high:
   ordering: <none>
@@ -59,21 +59,21 @@ output.high:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
 
 === Buffer Edges ===
 
 edge transform.classify -> route.classify_route:
   buffer: node_buffer (slot=1)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: transform)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
 
 edge route.classify_route -> output.low:
   buffer: node_buffer (slot=2)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: route)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 edge route.classify_route -> output.high:
   buffer: node_buffer (slot=2)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: route)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 Route 'classify_route' (mode: exclusive):
   Branch 'high' → output 'high'

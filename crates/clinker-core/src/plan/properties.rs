@@ -54,10 +54,11 @@ pub struct NodeProperties {
     /// (Aggregate / sort / grace-hash) holds its whole accumulated input
     /// before it can emit, so its peak is the sum of its parents' volume.
     ///
-    /// Computed by `compute_node_properties` and intentionally `#[serde(skip)]`:
-    /// it carries no scheduling behavior yet and must not perturb the
-    /// `--explain --format json` surface until a later change wires it in.
-    #[serde(skip)]
+    /// Computed by `derive_volume_estimates`. It is the input the scheduler
+    /// uses to choose among simultaneously-runnable nodes (it prefers a node
+    /// whose peak fits the remaining headroom), so it is surfaced in
+    /// `--explain` text and `--explain --format json` so a pipeline author
+    /// can see the same number the scheduler weighed.
     pub predicted_peak_bytes: u64,
 
     /// Estimated bytes this node releases back to the budget when it
@@ -69,9 +70,9 @@ pub struct NodeProperties {
     /// the peak it accumulated. A fully streaming / fused chain holds no
     /// cross-record state, so it frees `0`.
     ///
-    /// Computed by `compute_node_properties` and intentionally `#[serde(skip)]`
-    /// for the same reason as [`Self::predicted_peak_bytes`].
-    #[serde(skip)]
+    /// Computed by `derive_volume_estimates` and surfaced in `--explain`
+    /// alongside [`Self::predicted_peak_bytes`]: the scheduler uses it as the
+    /// freed-bytes tiebreak when two runnable nodes fit headroom equally.
     pub predicted_freed_bytes_on_complete: u64,
 }
 

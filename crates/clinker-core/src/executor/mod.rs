@@ -670,6 +670,41 @@ impl PipelineExecutor {
         Self::run_with_readers_writers(plan.config(), readers, writers.into(), params)
     }
 
+    /// Run a compiled plan resolving source paths against an explicit
+    /// compile anchor.
+    ///
+    /// The executor re-derives per-node volume estimates from on-disk file
+    /// sizes during its run-time compile, and those estimates drive the
+    /// memory-aware dispatch order. Resolving against `compile_ctx` — the
+    /// same anchor `--explain` used — keeps the run's dispatch order
+    /// identical to the surfaced predictions and independent of the process
+    /// CWD; [`run_plan_with_readers_writers`](Self::run_plan_with_readers_writers)
+    /// anchors at the CWD via `CompileContext::default()`, which is correct
+    /// only for callers whose sources are absent on disk (estimates resolve
+    /// to `0`, so dispatch falls back to topological order). A file-backed
+    /// run must come through here so the scheduler sees the same byte sizes
+    /// it would read.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces every failure of the underlying run: compilation diagnostics,
+    /// reader/writer setup errors, and runtime operator failures.
+    pub fn run_plan_with_readers_writers_in_context<W: Into<WriterRegistry>>(
+        plan: &crate::plan::CompiledPlan,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
+        compile_ctx: crate::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers_in_context(
+            plan.config(),
+            readers,
+            writers.into(),
+            params,
+            compile_ctx,
+        )
+    }
+
     /// `&CompiledPlan`-consuming `--explain` text entry.
     pub fn explain_plan(plan: &crate::plan::CompiledPlan) -> Result<String, PipelineError> {
         Self::explain(plan.config())
@@ -1619,52 +1654,65 @@ impl PipelineExecutor {
                 .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
         };
 
-        // Walk DAG in topological order. `topo_order` is cloned so
-        // the iterator does not hold a whole-struct immutable borrow
-        // of `plan` for the loop body — `&mut ctx` already borrows
-        // `ctx.current_dag` (which aliases `plan`) at the field
-        // granularity through every dispatcher call.
+        // Resolve dispatch order through the memory arbitrator rather
+        // than walking `topo_order` blindly. `scheduled_pass_order` runs
+        // a frontier scheduler over each pass's candidate set: at every
+        // step it asks `MemoryArbitrator::next_runnable` which runnable
+        // node to dispatch by predicted memory impact (headroom fit, then
+        // largest freed-on-complete, then stable topo index). With no
+        // volume estimates the selection collapses to lowest topo index,
+        // reproducing the prior front-to-back walk byte-for-byte; record
+        // output is independent of dispatch order, so only peak resident
+        // memory — never results — moves when estimates distinguish nodes.
         //
-        // two-pass walk for init-phase orchestration.
-        // Pass 1 dispatches every node in the init-phase ancestor
-        // closure (Source/Aggregate/etc. feeding `phase: init`
-        // Transforms, plus the init-phase Transforms themselves).
-        // Pass 2 dispatches every other node — the runtime DAG.
-        // Init-phase Transforms are E164-validated as terminal, so
-        // Pass 2 never references their output edge. The
-        // dispatcher's `remaining_consumers` heuristic counts
-        // neighbors based on graph structure (pass-independent), so
+        // Two-pass orchestration for the init phase.
+        // Pass 1 dispatches every node in the init-phase ancestor closure
+        // (Source/Aggregate/etc. feeding `phase: init` Transforms, plus
+        // the init-phase Transforms themselves). Pass 2 dispatches every
+        // other node — the runtime DAG. Init-phase Transforms are
+        // E164-validated as terminal, so Pass 2 never references their
+        // output edge. The dispatcher's `remaining_consumers` heuristic
+        // counts neighbors based on graph structure (pass-independent), so
         // a Source feeding both an init branch and a runtime branch
-        // correctly clones its buffer for Pass 1's first consumer
-        // and removes it for Pass 2's last consumer.
-        // Topo walk. Wrapped in an immediately-invoked closure so a `?`
-        // error inside doesn't short-circuit past the streaming-output
-        // thread join below — the spawned threads own writers we still
-        // need to flush (or drop) before the function returns, and
-        // dropping `ctx.streaming_output_senders` on the error path is
-        // what signals the threads to disconnect their channel and run
-        // their flush. A tripped shutdown token surfaces as
-        // `PipelineError::Interrupted` from a per-node poll, which lands
-        // here too so the same drain-then-join cleanup runs.
+        // correctly clones its buffer for Pass 1's first consumer and
+        // removes it for Pass 2's last consumer.
+        //
+        // The dispatch sequences are resolved up front (before the loop)
+        // so each `scheduled_pass_order` call borrows `plan` only for its
+        // own duration — `&mut ctx` already borrows `ctx.current_dag`
+        // (which aliases `plan`) at the field granularity through every
+        // dispatcher call, so the resolved `Vec<NodeIndex>` is what the
+        // loop iterates instead of re-borrowing `plan` per step.
+        //
+        // Wrapped in an immediately-invoked closure so a `?` error inside
+        // doesn't short-circuit past the streaming-output thread join
+        // below — the spawned threads own writers we still need to flush
+        // (or drop) before the function returns, and dropping
+        // `ctx.streaming_output_senders` on the error path is what signals
+        // the threads to disconnect their channel and run their flush. A
+        // tripped shutdown token surfaces as `PipelineError::Interrupted`
+        // from a per-node poll, which lands here too so the same
+        // drain-then-join cleanup runs.
+        let dispatch_sequence: Vec<petgraph::graph::NodeIndex> = if !init_phase_set.is_empty() {
+            let runtime_set: HashSet<petgraph::graph::NodeIndex> = plan
+                .topo_order
+                .iter()
+                .copied()
+                .filter(|idx| !init_phase_set.contains(idx))
+                .collect();
+            let mut seq = scheduled_pass_order(plan, &ctx.memory_budget, &init_phase_set);
+            seq.extend(scheduled_pass_order(plan, &ctx.memory_budget, &runtime_set));
+            seq
+        } else {
+            let all: HashSet<petgraph::graph::NodeIndex> =
+                plan.topo_order.iter().copied().collect();
+            scheduled_pass_order(plan, &ctx.memory_budget, &all)
+        };
+
         let walk_result: Result<(), PipelineError> = (|| {
-            if !init_phase_set.is_empty() {
-                for node_idx in plan.topo_order.clone() {
-                    if init_phase_set.contains(&node_idx) {
-                        ctx.check_shutdown()?;
-                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
-                    }
-                }
-                for node_idx in plan.topo_order.clone() {
-                    if !init_phase_set.contains(&node_idx) {
-                        ctx.check_shutdown()?;
-                        dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
-                    }
-                }
-            } else {
-                for node_idx in plan.topo_order.clone() {
-                    ctx.check_shutdown()?;
-                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
-                }
+            for node_idx in dispatch_sequence {
+                ctx.check_shutdown()?;
+                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
             }
             Ok(())
         })();
@@ -2819,6 +2867,81 @@ fn has_single_outgoing(
         .neighbors_directed(idx, petgraph::Direction::Outgoing)
         .count()
         == 1
+}
+
+/// Resolve the dispatch order for a topological pass via the memory
+/// arbitrator's [`next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable)
+/// instead of walking `topo_order` blindly.
+///
+/// `candidates` is the subset of nodes this pass dispatches — the
+/// init-phase ancestor closure on Pass 1, its complement on Pass 2, or
+/// the whole DAG when there is no init phase. The returned vector lists
+/// those same nodes in the order the executor should dispatch them.
+///
+/// At each step the runnable frontier is every not-yet-emitted candidate
+/// whose graph predecessors *within `candidates`* are all emitted. The
+/// arbitrator picks one frontier node by predicted memory impact (headroom
+/// fit, then largest freed-on-complete, then stable topo index); finishing
+/// the chosen node may open new frontier members for the next step.
+///
+/// Restricting the predecessor check to `candidates` is what lets Pass 1
+/// run before Pass 2: an init-phase node is gated only by its init-phase
+/// ancestors, never by runtime-DAG nodes that have not been dispatched
+/// yet. The init-phase closure is exactly the set of init Transforms plus
+/// their transitive upstream ancestors, so every init node's
+/// non-init predecessors are themselves impossible — the restriction is
+/// total within the closure, not a relaxation of any real dependency.
+///
+/// Determinism: with no volume estimates every candidate's
+/// `predicted_peak_bytes` is `0`, so the arbitrator's headroom and
+/// freed-bytes tiers are all-equal and selection collapses to the lowest
+/// stable topo index. Greedily taking the lowest-topo-index frontier node
+/// reproduces a plain front-to-back walk of `topo_order` byte-for-byte —
+/// scheduling reorders the dispatch sequence only when real estimates
+/// distinguish the candidates, and never changes record output, which is
+/// independent of dispatch order.
+fn scheduled_pass_order(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    candidates: &HashSet<petgraph::graph::NodeIndex>,
+) -> Vec<petgraph::graph::NodeIndex> {
+    use crate::pipeline::memory::SchedulingHint;
+
+    let mut emitted: HashSet<petgraph::graph::NodeIndex> = HashSet::with_capacity(candidates.len());
+    let mut order: Vec<petgraph::graph::NodeIndex> = Vec::with_capacity(candidates.len());
+    let hint: &dyn SchedulingHint = plan;
+
+    // A node is runnable once every in-`candidates` predecessor is
+    // already emitted. Recomputed each step from `emitted` so that
+    // finishing a node exposes its now-unblocked successors.
+    while order.len() < candidates.len() {
+        let runnable: Vec<petgraph::graph::NodeIndex> = candidates
+            .iter()
+            .copied()
+            .filter(|idx| !emitted.contains(idx))
+            .filter(|&idx| {
+                plan.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .all(|pred| !candidates.contains(&pred) || emitted.contains(&pred))
+            })
+            .collect();
+
+        // The candidate set is the node set of an acyclic graph, so as
+        // long as work remains at least one node has all in-set
+        // predecessors satisfied. An empty frontier with work left would
+        // mean a cycle, which the planner forbids.
+        debug_assert!(
+            !runnable.is_empty(),
+            "scheduled_pass_order: empty runnable frontier with {} candidates left to emit",
+            candidates.len() - order.len()
+        );
+
+        let chosen = arbitrator.next_runnable(&runnable, hint);
+        emitted.insert(chosen);
+        order.push(chosen);
+    }
+
+    order
 }
 
 /// Build the pipeline-stable evaluation context.
@@ -4281,6 +4404,7 @@ mod tests {
     mod post_combine_synthetic_ck;
     mod post_combine_window_strategies;
     mod record_source_transport;
+    mod scheduling;
     mod strict_pipeline_zero_overhead;
     mod window_recompute_correctness;
 }

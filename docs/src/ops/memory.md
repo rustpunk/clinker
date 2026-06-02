@@ -149,26 +149,46 @@ For a fast Source feeding a slow Aggregate (the canonical bounded-memory shape),
 
 source.orders:
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=1K, predicted_freed=0B
 
 aggregation.dept_totals:
   buffer: materialized
-  arbitration: spill_priority=30, can_back_pressure=false
+  arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K
 ```
 
 The Source advertises `can_back_pressure=true` and `spill_priority=N/A`: when memory pressure rises, the arbitrator pauses the Source rather than asking it to spill (it has nothing to free). The hash Aggregate advertises the opposite — `spill_priority=30`, `can_back_pressure=false` — so it is a spill victim, ranked behind any cheaper consumer.
 
-A **`=== Buffer Edges ===`** section follows, listing the `node_buffers` slot between each pair of non-fused stages. Every slot is a priority-0, non-back-pressureable `NodeBufferConsumer` — the cheapest victim class — and the `slot=` number is the stable index the executor admits into:
+The `predicted_peak` and `predicted_freed` values are the scheduler's inputs (see [Scheduling](#scheduling) below). `predicted_peak` is the live volume a node is expected to hold at its peak — seeded at a file-backed Source from its `path:` file's on-disk size and propagated forward; `predicted_freed` is what the node returns to the budget when it finishes draining. A blocking Aggregate holds its whole accumulated input (`predicted_peak=1K`) and frees it on drain (`predicted_freed=1K`); a streaming Source carries the volume through but frees nothing (`predicted_freed=0B`). Both render `0B` when no file-size seed reached the node — a multi-file (`glob`/`regex`/`paths`) or absent/unreadable Source, or any node downstream of one. The bytes are formatted in the same binary-prefix units as `memory.limit` (`1K`, `64M`, `2G`), and the same two values appear in `--explain --format json` under `node_properties.<name>.predicted_peak_bytes` and `predicted_freed_bytes_on_complete`.
+
+A **`=== Buffer Edges ===`** section follows, listing the `node_buffers` slot between each pair of non-fused stages. Every slot is a priority-0, non-back-pressureable `NodeBufferConsumer` — the cheapest victim class — and the `slot=` number is the stable index the executor admits into. The slot carries the producer's predicted volume (it holds the producer's materialized output and frees that whole buffer once the consumer drains it):
 
 ```text
 === Buffer Edges ===
 
 edge source.orders -> aggregation.dept_totals:
   buffer: node_buffer (slot=0)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K (producer: source)
 ```
 
 Reading top to bottom: under memory pressure the arbitrator first spills the inter-stage buffer (priority 0), then — if the soft threshold is still tripped — pauses the Source before it ever forces the Aggregate (priority 30) to spill. That ordering is exactly what the default `pause` policy (`BackPressurePreferred -> Priority`) encodes. Cross-reference the [per-operator table](#per-operator-arbitration-parameters) to see where any operator in your own pipeline lands.
+
+## Scheduling
+
+When a pipeline has several nodes that are *simultaneously runnable* — every one of their inputs is ready, so the executor could legally run any of them next — the engine picks one deterministically rather than walking topological position blindly. The common case is a single linear chain where only one node is ever runnable at a time, and there is nothing to choose. The choice matters only for a pipeline whose DAG has **multiple independent subgraphs** (for example, two unrelated Source → Aggregate branches that a later Combine or Merge joins): both branches' lead nodes become runnable together.
+
+The engine runs one node to completion before dispatching the next, so the choice does not change a forest of independent linear chains' peak — each chain's working set is reclaimed before the next chain starts regardless of order. What the ranking buys is *when* the frontier offers a mix of node kinds: with a blocking operator ready to drain (and reclaim its accumulated state) alongside a fresh Source about to charge a new buffer, draining first reclaims headroom before the new charge lands, and under a tight budget the engine prefers the runnable node that fits the remaining headroom over one that would overflow it.
+
+The engine ranks the simultaneously-runnable nodes by these rules, in order:
+
+1. **Headroom fit.** A node whose `predicted_peak` fits within the budget's remaining headroom is preferred over one that does not. Running a node that fits avoids tipping the live working set over the soft threshold and forcing a spill that a different ordering would have avoided. A node with an *unknown* peak (`predicted_peak=0B` — no file-size seed reached it) counts as fitting, because `0` is always within any headroom; this keeps an unestimated pipeline on its topological order rather than deprioritizing every node.
+
+2. **Freed-bytes tiebreak.** Among nodes that fit equally, the one with the larger `predicted_freed` runs first. Finishing a node that returns more bytes to the budget soonest maximizes the headroom available to everything still waiting — the same intuition as shortest-remaining-state-first.
+
+3. **Stable-index tiebreak.** If two nodes still tie (equal fit, equal freed bytes — including the all-unknown case where both are `0`), the one with the lower stable node index wins. The index is each node's position in the plan's topological order — the exact sequence the executor walks the DAG — so this tiebreak is fully deterministic and independent of the machine, the thread schedule, and the order the runnable set happened to be assembled in.
+
+**Fallback to topological order.** When no node carries a volume estimate (every `predicted_peak` is `0B`), rules 1 and 2 are no-ops — every node fits and every node frees the same `0` — so rule 3 alone decides, and the engine runs nodes in exactly the lowest-index / topological order it used before any volume estimates existed. This is the load-bearing guarantee: **scheduling never changes record output or branching order.** A pipeline's data output is byte-identical regardless of the predictions; the estimates only steer *which runnable node goes first* to reclaim headroom sooner and prefer fitting nodes under pressure, never *what* each node computes.
+
+Because the predictions are a pure function of the plan shape and the input files' on-disk sizes (resolved against the pipeline file's directory, never the process working directory), the scheduling decision is identical on every machine for an identical plan over identically-sized inputs.
 
 ## Sizing guidelines
 

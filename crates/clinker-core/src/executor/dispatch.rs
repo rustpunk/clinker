@@ -1543,6 +1543,13 @@ pub(crate) fn admit_node_buffer(
     ));
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
+    // Raise the run's high-water mark now that this slot's charge has
+    // joined the registry. Sampling at admission (not only on streaming
+    // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
+    // over every coexisting `node_buffers` slot — which is the quantity
+    // dispatch order moves: finishing a chain's blocking consumer before
+    // charging the next chain's source keeps fewer slots live at once.
+    ctx.memory_budget.sample_peak_consumer_usage();
     if !spill_allowed || !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }

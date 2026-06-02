@@ -8,9 +8,10 @@
 //! streaming/fused nodes free nothing.
 //!
 //! These tests pin the seed, the unknown-fallback, and the propagation +
-//! freed-on-complete model. The estimates are computed but intentionally not
-//! surfaced in `--explain` output yet, so none of the explain/data goldens
-//! may move.
+//! freed-on-complete model. The estimates are surfaced in `--explain` text
+//! (see `explain_arbitration.rs`) and in `--explain --format json` under
+//! `node_properties.<name>.predicted_peak_bytes` /
+//! `predicted_freed_bytes_on_complete`; the data goldens never move.
 
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::plan::compiled::CompiledPlan;
@@ -18,6 +19,73 @@ use clinker_core::plan::execution::ExecutionPlanDag;
 use clinker_core::plan::properties::NodeProperties;
 use std::io::Write;
 use std::path::Path;
+
+/// JSON `--explain` carries the two predictions under
+/// `node_properties.<name>`. The struct field names round-trip verbatim
+/// (no serde rename), and the values match the in-struct predictions for a
+/// sized fixture — so a JSON consumer (Kiln canvas, third-party tooling)
+/// reads the same numbers the scheduler weighed.
+#[test]
+fn json_explain_surfaces_predictions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let len = write_file(
+        tmp.path(),
+        "orders.csv",
+        "department,amount\nsales,100\nops,250\nsales,75\nops,40\n",
+    );
+    assert!(len > 0);
+
+    let yaml = r#"
+pipeline:
+  name: vol
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: dept_totals
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let plan = compile_anchored(yaml, tmp.path());
+    let json = serde_json::to_value(plan.dag()).expect("serialize dag");
+
+    let props = &json["node_properties"];
+    // The streaming Source seeds its file size as peak and frees nothing.
+    assert_eq!(props["orders"]["predicted_peak_bytes"].as_u64(), Some(len));
+    assert_eq!(
+        props["orders"]["predicted_freed_bytes_on_complete"].as_u64(),
+        Some(0)
+    );
+    // The blocking hash Aggregate's peak and freed both equal the
+    // accumulated input volume.
+    assert_eq!(
+        props["dept_totals"]["predicted_peak_bytes"].as_u64(),
+        Some(len)
+    );
+    assert_eq!(
+        props["dept_totals"]["predicted_freed_bytes_on_complete"].as_u64(),
+        Some(len)
+    );
+}
 
 /// Compile `yaml` with the pipeline-file directory anchored at `anchor` so
 /// relative source `path:` strings resolve against the same stable root the

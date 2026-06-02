@@ -959,11 +959,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         record_vars: channel_record_vars,
         shutdown_token: Some(shutdown_token),
     };
-    let report = match PipelineExecutor::run_plan_with_readers_writers(
+    let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
         &run_params,
+        compile_ctx.clone(),
     ) {
         Ok(report) => report,
         Err(e) => {

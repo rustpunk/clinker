@@ -1432,15 +1432,24 @@ impl ExecutionPlanDag {
                 // from the runtime `MemoryConsumer` impls (see
                 // `arbitration_class`). Lower `spill_priority` = elected
                 // for spill first; `N/A` = the stage holds no spillable
-                // state. Two-space indent so the buffer-class slicers
+                // state. The two `predicted_*` values are the scheduler's
+                // inputs: `predicted_peak` is the live volume this node is
+                // expected to hold at its peak, `predicted_freed` is what it
+                // returns to the budget when it drains — the same numbers
+                // `next_runnable` weighs (headroom-fit on peak, freed-bytes
+                // tiebreak). Both render `0B` when no file-size seed reached
+                // this node. Two-space indent so the buffer-class slicers
                 // (which stop at the first non-indented line) keep reading
                 // the stanza.
                 let ac = arbitration_class(node);
                 out.push_str(&format!(
-                    "  arbitration: spill_priority={}, can_back_pressure={}\n",
+                    "  arbitration: spill_priority={}, can_back_pressure={}, \
+                     predicted_peak={}, predicted_freed={}\n",
                     ac.spill_priority
                         .map_or_else(|| "N/A".to_string(), |p| p.to_string()),
                     ac.can_back_pressure,
+                    format_bytes(props.predicted_peak_bytes),
+                    format_bytes(props.predicted_freed_bytes_on_complete),
                 ));
                 out.push('\n');
             }
@@ -1478,8 +1487,20 @@ impl ExecutionPlanDag {
                         "  buffer: node_buffer (slot={})\n",
                         producer.index()
                     ));
+                    // A node_buffer slot holds the producer's materialized
+                    // output, so its predicted peak is the producer's own
+                    // predicted volume; it frees that whole buffer once the
+                    // consumer has drained it. Both render `0B` when the
+                    // producer carried no volume seed.
+                    let producer_peak = self
+                        .node_properties
+                        .get(&producer)
+                        .map_or(0, |p| p.predicted_peak_bytes);
                     out.push_str(&format!(
-                        "  arbitration: spill_priority=0, can_back_pressure=false (producer: {})\n",
+                        "  arbitration: spill_priority=0, can_back_pressure=false, \
+                         predicted_peak={}, predicted_freed={} (producer: {})\n",
+                        format_bytes(producer_peak),
+                        format_bytes(producer_peak),
                         producer_node.type_tag()
                     ));
                     out.push('\n');
