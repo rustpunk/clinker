@@ -4102,6 +4102,43 @@ impl ExecutionPlanDag {
     }
 }
 
+/// Exposes the plan's per-node volume predictions and topological order to
+/// [`MemoryArbitrator::next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable).
+///
+/// The byte predictions are the plan-time estimates `derive_volume_estimates`
+/// stamps onto each node's [`NodeProperties`]; the stable index is the node's
+/// position in [`topo_order`](ExecutionPlanDag::topo_order), which is the same
+/// order the executor walks the DAG. A node absent from `node_properties`
+/// (e.g. a synthetic combine-chain step that never received a base row)
+/// predicts `0` bytes, matching how `derive_volume_estimates` treats it.
+impl crate::pipeline::memory::SchedulingHint for ExecutionPlanDag {
+    fn predicted_peak_bytes(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_peak_bytes)
+            .unwrap_or(0)
+    }
+
+    fn predicted_freed_bytes_on_complete(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_freed_bytes_on_complete)
+            .unwrap_or(0)
+    }
+
+    fn stable_index(&self, id: NodeIndex) -> usize {
+        // Position in `topo_order` is the plan's canonical node ordering and
+        // the exact sequence the executor dispatches in, so it is the stable
+        // tiebreak that makes "no-estimates == today's order" hold. A node
+        // outside `topo_order` sorts last, deterministically, rather than
+        // colliding with the first real node at index 0.
+        self.topo_order
+            .iter()
+            .position(|&n| n == id)
+            .unwrap_or(usize::MAX)
+    }
+}
+
 /// Internal carrier for `select_aggregation_strategies` resolution result.
 struct ResolvedStrategy {
     strategy: crate::aggregation::AggregateStrategy,
