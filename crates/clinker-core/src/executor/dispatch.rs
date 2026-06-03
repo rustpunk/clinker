@@ -5139,7 +5139,7 @@ pub(crate) fn dispatch_plan_node(
                     // it runs on the shared Rayon pool. Row order is
                     // determined by the kernel's deterministic
                     // partition-then-merge, not by pool scheduling.
-                    let output_records = ctx.kernel_pool.install(|| {
+                    let kernel_out = ctx.kernel_pool.install(|| {
                         execute_combine_iejoin(IEJoinExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -5155,8 +5155,30 @@ pub(crate) fn dispatch_plan_node(
                             propagate_ck,
                             ctx: &iejoin_ctx,
                             budget: &ctx.memory_budget,
+                            strategy: ctx.strategy,
                         })
                     })?;
+                    let crate::pipeline::combine::CombineKernelOutput {
+                        records: output_records,
+                        output_eval_failures,
+                    } = kernel_out;
+                    // Route each deferred output-stage eval failure through
+                    // the same `combine_output_row` path the inline arm
+                    // uses. This MUST run before the snapshot is dropped
+                    // below — `dispatch_combine_output_error` reads the
+                    // installed pre-fold snapshot to rewind each
+                    // contributing source's rollback cursor.
+                    for f in output_eval_failures {
+                        dispatch_combine_output_error(
+                            ctx,
+                            node_idx,
+                            &f.probe_record,
+                            f.row,
+                            f.matched_build.as_ref(),
+                            name,
+                            f.error,
+                        )?;
+                    }
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
@@ -5237,7 +5259,7 @@ pub(crate) fn dispatch_plan_node(
                     // `grace_ctx`, and the spill dir, so it runs on the
                     // shared Rayon pool. Emitted-row order is fixed by the
                     // kernel's deterministic partition-then-probe walk.
-                    let output_records = ctx.kernel_pool.install(|| {
+                    let kernel_out = ctx.kernel_pool.install(|| {
                         execute_combine_grace_hash(GraceHashExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -5255,8 +5277,27 @@ pub(crate) fn dispatch_plan_node(
                             budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
                             consumer_handle: grace_consumer_handle,
+                            strategy: ctx.strategy,
                         })
                     })?;
+                    let crate::pipeline::combine::CombineKernelOutput {
+                        records: output_records,
+                        output_eval_failures,
+                    } = kernel_out;
+                    // Route each deferred output-stage eval failure through
+                    // the `combine_output_row` path while the pre-fold
+                    // snapshot is still installed (the rewind reads it).
+                    for f in output_eval_failures {
+                        dispatch_combine_output_error(
+                            ctx,
+                            node_idx,
+                            &f.probe_record,
+                            f.row,
+                            f.matched_build.as_ref(),
+                            name,
+                            f.error,
+                        )?;
+                    }
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
@@ -5344,7 +5385,7 @@ pub(crate) fn dispatch_plan_node(
                     // `sm_ctx`, and the spill dir, so it runs on the
                     // shared Rayon pool. The two-cursor merge emits in a
                     // deterministic order independent of pool scheduling.
-                    let output_records = ctx.kernel_pool.install(|| {
+                    let kernel_out = ctx.kernel_pool.install(|| {
                         execute_combine_sort_merge(SortMergeExec {
                             name,
                             build_qualifier: &build_qualifier,
@@ -5362,8 +5403,27 @@ pub(crate) fn dispatch_plan_node(
                             budget: &ctx.memory_budget,
                             spill_dir: ctx.spill_root_path.as_ref(),
                             consumer_handle: sm_consumer_handle,
+                            strategy: ctx.strategy,
                         })
                     })?;
+                    let crate::pipeline::combine::CombineKernelOutput {
+                        records: output_records,
+                        output_eval_failures,
+                    } = kernel_out;
+                    // Route each deferred output-stage eval failure through
+                    // the `combine_output_row` path while the pre-fold
+                    // snapshot is still installed (the rewind reads it).
+                    for f in output_eval_failures {
+                        dispatch_combine_output_error(
+                            ctx,
+                            node_idx,
+                            &f.probe_record,
+                            f.row,
+                            f.matched_build.as_ref(),
+                            name,
+                            f.error,
+                        )?;
+                    }
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));

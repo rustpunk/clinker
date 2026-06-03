@@ -49,7 +49,7 @@ use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::KeyExtractor;
+use crate::pipeline::combine::{CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -364,6 +364,11 @@ pub(crate) struct SortMergeExec<'a> {
     /// so the arbitrator's pull-mode `current_usage` reads the
     /// operator's live in-memory state.
     pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Error strategy governing output-stage eval failures. Under
+    /// `FailFast` a residual / body eval error propagates immediately;
+    /// under `Continue` / `BestEffort` the failing row is deferred to the
+    /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
+    pub strategy: crate::config::ErrorStrategy,
 }
 
 /// Snapshot of which phases ran during a sort-merge execution. Used by
@@ -398,9 +403,9 @@ struct SortMergeStats {
 /// (e.g. invocation with no range conjuncts) and on spill I/O failures.
 pub(crate) fn execute_combine_sort_merge(
     args: SortMergeExec<'_>,
-) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
-    let (records, _stats) = execute_combine_sort_merge_with_stats(args)?;
-    Ok(records)
+) -> Result<CombineKernelOutput, PipelineError> {
+    let (output, _stats) = execute_combine_sort_merge_with_stats(args)?;
+    Ok(output)
 }
 
 /// Variant of [`execute_combine_sort_merge`] that also returns
@@ -410,7 +415,7 @@ pub(crate) fn execute_combine_sort_merge(
 /// [`execute_combine_sort_merge`].
 fn execute_combine_sort_merge_with_stats(
     args: SortMergeExec<'_>,
-) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
+) -> Result<(CombineKernelOutput, SortMergeStats), PipelineError> {
     let SortMergeExec {
         name,
         build_qualifier,
@@ -428,9 +433,14 @@ fn execute_combine_sort_merge_with_stats(
         budget,
         spill_dir,
         consumer_handle,
+        strategy,
     } = args;
 
     let mut stats = SortMergeStats::default();
+    // Recoverable output-stage eval failures deferred to the dispatcher.
+    // Threaded by `&mut` through `walk_two_cursors` / `emit_for_run` and
+    // the on_miss path below. Always empty under `FailFast`.
+    let mut output_eval_failures: Vec<CombineOutputEvalFailure> = Vec::new();
 
     if decomposed.ranges.is_empty() {
         return Err(PipelineError::Internal {
@@ -677,6 +687,8 @@ fn execute_combine_sort_merge_with_stats(
         emitted_since_check: &mut emitted_since_check,
         budget,
         consumer_handle: &consumer_handle,
+        strategy,
+        failures: &mut output_eval_failures,
     })?;
 
     // ── on_miss / collect-mode flush ─────────────────────────────────
@@ -755,14 +767,31 @@ fn execute_combine_sort_merge_with_stats(
                                     .into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            output_eval_failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: None,
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok((output_records, stats))
+    Ok((
+        CombineKernelOutput {
+            records: output_records,
+            output_eval_failures,
+        },
+        stats,
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1034,6 +1063,8 @@ struct WalkArgs<'a, 'b, 'c> {
     emitted_since_check: &'b mut usize,
     budget: &'c MemoryArbitrator,
     consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
+    strategy: crate::config::ErrorStrategy,
+    failures: &'b mut Vec<CombineOutputEvalFailure>,
 }
 
 /// Walk the two pre-sorted cursors, emitting cross-product matches per
@@ -1071,6 +1102,8 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
         emitted_since_check,
         budget,
         consumer_handle,
+        strategy,
+        failures,
     } = args;
 
     let mut di = 0usize;
@@ -1146,6 +1179,8 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
             matched_driver_orders,
             emitted_since_check,
             budget,
+            strategy,
+            failures,
         })?;
 
         // Discharge any in-memory residue still held by the
@@ -1189,6 +1224,8 @@ struct EmitForRunArgs<'a, 'b> {
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
     budget: &'b MemoryArbitrator,
+    strategy: crate::config::ErrorStrategy,
+    failures: &'b mut Vec<CombineOutputEvalFailure>,
 }
 
 /// Emit cross-product records for one driver row against the buffered
@@ -1235,7 +1272,18 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                 detail: "emit_each fan-out is not supported in a combine residual filter".into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            args.failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: Some(inner.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
                 if arr.len() >= COLLECT_PER_GROUP_CAP {
@@ -1309,7 +1357,18 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                 detail: "emit_each fan-out is not supported in a combine residual filter".into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            args.failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: Some(inner.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
 
@@ -1368,7 +1427,18 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                                     .into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            args.failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: Some(inner.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 } else if let Some(target_schema) = output_schema {
                     // Body-less synthetic chain step: concatenate driver
@@ -1742,14 +1812,15 @@ mod tests {
             budget: &mut budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: crate::config::ErrorStrategy::FailFast,
         };
-        let result = execute_combine_sort_merge_with_stats(args)
+        let (output, stats) = execute_combine_sort_merge_with_stats(args)
             .expect("sort-merge kernel execution failed");
         // Hold the TempDir until the kernel has consumed every spill
         // segment; segments carry `Arc<Path>` references back into
         // this directory.
         drop(dir);
-        result
+        (output.records, stats)
     }
 
     /// Pure-range correctness gate: products vs tax brackets.

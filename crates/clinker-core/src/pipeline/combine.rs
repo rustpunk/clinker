@@ -341,6 +341,57 @@ impl std::error::Error for CombineError {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// CombineKernelOutput
+// ──────────────────────────────────────────────────────────────────────────
+
+/// One recoverable output-stage eval failure surfaced by a combine kernel.
+///
+/// Kernels run inside the Rayon pool with only a `&MemoryArbitrator` and a
+/// local `EvalContext` — they hold no `&mut ExecutorContext`, so they cannot
+/// route a failing row to the dead-letter queue or rewind a source's
+/// rollback cursor themselves. Instead a recoverable failure is captured
+/// here and handed back to the dispatcher, which drains it through the same
+/// `combine_output_row` path the inline hash build-probe arm uses while the
+/// pre-fold input snapshot is still installed. Only output-stage CXL eval
+/// errors (residual filter and matched / `on_miss: null_fields` body) are
+/// recoverable; structural invariants and memory aborts stay fail-fast.
+#[derive(Debug)]
+pub(crate) struct CombineOutputEvalFailure {
+    /// The driver/probe record whose output-stage eval failed. Carries the
+    /// real `$source.name` / `$ck.*` lineage the dispatcher attributes the
+    /// dead-letter entry to.
+    pub probe_record: Record,
+    /// The driver record's source row number, used as the dead-letter
+    /// entry's source row.
+    pub row: u64,
+    /// The matched build record when the failure occurred on a matched pair
+    /// (residual or matched body); `None` for an `on_miss: null_fields`
+    /// failure where no build row contributed.
+    pub matched_build: Option<Record>,
+    /// The captured eval error. `EvalError` is `Clone`, so stashing the
+    /// failing error per row and replaying it from the dispatcher is sound.
+    pub error: EvalError,
+}
+
+/// A combine kernel's emitted rows plus any recoverable output-stage eval
+/// failures it deferred to the dispatcher.
+///
+/// Returned by the IEJoin, grace-hash, and sort-merge kernels in place of a
+/// bare `Vec<(Record, u64)>`. Under `FailFast` the failures vector is always
+/// empty because those errors propagate immediately; under
+/// `Continue` / `BestEffort` each deferred failure is drained by the
+/// dispatcher into the `combine_output_row` dead-letter path.
+#[derive(Debug)]
+pub(crate) struct CombineKernelOutput {
+    /// Emitted `(record, source-row-order)` pairs, identical in shape to the
+    /// pre-change kernel return.
+    pub records: Vec<(Record, u64)>,
+    /// Recoverable output-stage eval failures the dispatcher must route.
+    /// Empty under `FailFast`.
+    pub output_eval_failures: Vec<CombineOutputEvalFailure>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // KeyExtractor
 // ──────────────────────────────────────────────────────────────────────────
 

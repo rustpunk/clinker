@@ -53,7 +53,10 @@ use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{KeyExtractor, hash_composite_key, keys_equal_canonicalized};
+use crate::pipeline::combine::{
+    CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor, hash_composite_key,
+    keys_equal_canonicalized,
+};
 use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
 
@@ -425,11 +428,16 @@ pub(crate) struct IEJoinExec<'a> {
     pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
+    /// Error strategy governing output-stage eval failures. Under
+    /// `FailFast` a residual / body eval error propagates immediately;
+    /// under `Continue` / `BestEffort` the failing row is deferred to the
+    /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
+    pub strategy: crate::config::ErrorStrategy,
 }
 
 pub(crate) fn execute_combine_iejoin(
     args: IEJoinExec<'_>,
-) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+) -> Result<CombineKernelOutput, PipelineError> {
     let IEJoinExec {
         name,
         build_qualifier,
@@ -445,7 +453,11 @@ pub(crate) fn execute_combine_iejoin(
         propagate_ck,
         ctx,
         budget,
+        strategy,
     } = args;
+    // Recoverable output-stage eval failures deferred to the dispatcher.
+    // Always empty under `FailFast` (those errors return immediately).
+    let mut output_eval_failures: Vec<CombineOutputEvalFailure> = Vec::new();
     if decomposed.ranges.is_empty() {
         return Err(PipelineError::Internal {
             op: "combine",
@@ -756,7 +768,18 @@ pub(crate) fn execute_combine_iejoin(
                                 detail: "emit_each fan-out is not supported in a combine residual filter".into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            output_eval_failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: Some(build_record.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
 
@@ -856,7 +879,18 @@ pub(crate) fn execute_combine_iejoin(
                                                 .into(),
                                     });
                                 }
-                                Err(e) => return Err(PipelineError::from(e)),
+                                Err(e) => {
+                                    if strategy == crate::config::ErrorStrategy::FailFast {
+                                        return Err(PipelineError::from(e));
+                                    }
+                                    output_eval_failures.push(CombineOutputEvalFailure {
+                                        probe_record: driver_record.clone(),
+                                        row: driver_order,
+                                        matched_build: Some(build_record.clone()),
+                                        error: e,
+                                    });
+                                    continue;
+                                }
                             }
                         } else {
                             // Body-less synthetic intermediate step
@@ -937,7 +971,12 @@ pub(crate) fn execute_combine_iejoin(
             rec.set(build_qualifier, Value::Array(arr));
             output_records.push((rec, *driver_order));
         }
-        return Ok(output_records);
+        // Collect mode never runs the body eval, so no recoverable
+        // output-stage failure can accrue on this path.
+        return Ok(CombineKernelOutput {
+            records: output_records,
+            output_eval_failures,
+        });
     }
 
     // First/All on_miss dispatch — every driver that saw zero matches
@@ -1009,13 +1048,27 @@ pub(crate) fn execute_combine_iejoin(
                             detail: "emit_each fan-out is not supported in a combine body".into(),
                         });
                     }
-                    Err(e) => return Err(PipelineError::from(e)),
+                    Err(e) => {
+                        if strategy == crate::config::ErrorStrategy::FailFast {
+                            return Err(PipelineError::from(e));
+                        }
+                        output_eval_failures.push(CombineOutputEvalFailure {
+                            probe_record: driver_record.clone(),
+                            row: driver_order,
+                            matched_build: None,
+                            error: e,
+                        });
+                        continue;
+                    }
                 }
             }
         }
     }
 
-    Ok(output_records)
+    Ok(CombineKernelOutput {
+        records: output_records,
+        output_eval_failures,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
