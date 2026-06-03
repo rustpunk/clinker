@@ -22,7 +22,7 @@ source.raw_src:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 composition.nested_process:
   ordering: <none>
@@ -30,7 +30,7 @@ composition.nested_process:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 output.final_out:
   ordering: <none>
@@ -38,17 +38,17 @@ output.final_out:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===
 
 edge source.raw_src -> composition.nested_process:
   buffer: node_buffer (slot=0)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
 edge composition.nested_process -> output.final_out:
   buffer: node_buffer (slot=1)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: composition)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: composition)
 
 === CXL Expressions ===
 

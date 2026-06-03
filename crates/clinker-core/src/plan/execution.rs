@@ -1432,15 +1432,27 @@ impl ExecutionPlanDag {
                 // from the runtime `MemoryConsumer` impls (see
                 // `arbitration_class`). Lower `spill_priority` = elected
                 // for spill first; `N/A` = the stage holds no spillable
-                // state. Two-space indent so the buffer-class slicers
-                // (which stop at the first non-indented line) keep reading
-                // the stanza.
+                // state. The three `predicted_*` values are the scheduler's
+                // inputs: `predicted_peak` is the live volume this node is
+                // expected to hold at its peak, `predicted_freed` is what it
+                // returns to the budget the instant it drains, and
+                // `predicted_subtree_reclaim` is the largest reclaim its
+                // whole downstream subtree eventually unlocks — the same
+                // numbers `next_runnable` weighs (headroom-fit on peak, then
+                // immediate-freed, then subtree-reclaim tiebreaks). All
+                // render `0B` when no file-size seed reached this node.
+                // Two-space indent so the buffer-class slicers (which stop at
+                // the first non-indented line) keep reading the stanza.
                 let ac = arbitration_class(node);
                 out.push_str(&format!(
-                    "  arbitration: spill_priority={}, can_back_pressure={}\n",
+                    "  arbitration: spill_priority={}, can_back_pressure={}, \
+                     predicted_peak={}, predicted_freed={}, predicted_subtree_reclaim={}\n",
                     ac.spill_priority
                         .map_or_else(|| "N/A".to_string(), |p| p.to_string()),
                     ac.can_back_pressure,
+                    format_bytes(props.predicted_peak_bytes),
+                    format_bytes(props.predicted_freed_bytes_on_complete),
+                    format_bytes(props.predicted_subtree_reclaim_bytes),
                 ));
                 out.push('\n');
             }
@@ -1478,8 +1490,20 @@ impl ExecutionPlanDag {
                         "  buffer: node_buffer (slot={})\n",
                         producer.index()
                     ));
+                    // A node_buffer slot holds the producer's materialized
+                    // output, so its predicted peak is the producer's own
+                    // predicted volume; it frees that whole buffer once the
+                    // consumer has drained it. Both render `0B` when the
+                    // producer carried no volume seed.
+                    let producer_peak = self
+                        .node_properties
+                        .get(&producer)
+                        .map_or(0, |p| p.predicted_peak_bytes);
                     out.push_str(&format!(
-                        "  arbitration: spill_priority=0, can_back_pressure=false (producer: {})\n",
+                        "  arbitration: spill_priority=0, can_back_pressure=false, \
+                         predicted_peak={}, predicted_freed={} (producer: {})\n",
+                        format_bytes(producer_peak),
+                        format_bytes(producer_peak),
                         producer_node.type_tag()
                     ));
                     out.push('\n');
@@ -3715,6 +3739,179 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
+    /// Attach a coarse per-node input-volume byte prediction to every node
+    /// in `node_properties`, derived from the on-disk size of file-backed
+    /// Sources and propagated forward in topological order.
+    ///
+    /// Two predictions land on each node's [`NodeProperties`]:
+    ///
+    /// - `predicted_peak_bytes` — the live volume the node holds at its
+    ///   peak. A file-backed Source seeds it from its single `path:` file's
+    ///   `std::fs::metadata` length; a streaming/stateless operator carries
+    ///   the same volume it receives from its parents (pass-through); a
+    ///   blocking operator (hash Aggregate, sort, grace-hash / sort-merge /
+    ///   IEJoin / hash Combine) must accumulate its whole input before it
+    ///   can emit, so its peak is the sum of its parents' volume.
+    /// - `predicted_freed_bytes_on_complete` — the volume the node releases
+    ///   when it finishes draining. A blocking operator frees the state it
+    ///   accumulated (its peak); a streaming/fused operator and a Source
+    ///   free nothing live, so they report `0`.
+    /// - `predicted_subtree_reclaim_bytes` — the largest reclaimable footprint
+    ///   anywhere in the node's downstream subtree, propagated up in a second
+    ///   reverse-topological pass so a Source's value reflects the eventual
+    ///   reclaim its blocking descendants unlock. It is the scheduler's
+    ///   lowest-priority tiebreak, used to front-load the independent chain
+    ///   whose completion frees the most.
+    ///
+    /// Blocking-ness is read from [`arbitration_class`] — the same plan-time
+    /// mirror of the runtime `MemoryConsumer` impls that `--explain` uses, so
+    /// a node counts as blocking exactly when it registers a spillable
+    /// consumer at runtime (`spill_priority.is_some()`). Reusing that
+    /// classifier means the volume model stays in lock-step with the
+    /// arbitrator's notion of which stages hold state, with no second
+    /// blocking/streaming taxonomy to keep aligned.
+    ///
+    /// The pass is deliberately coarse: with no per-node output-cardinality
+    /// estimate available, a blocking reducer (e.g. an Aggregate) propagates
+    /// its accumulated input volume downstream rather than a smaller emitted
+    /// volume. This over-estimates downstream peaks but never under-estimates
+    /// them, and — crucially — is a pure function of the plan shape plus the
+    /// input files' on-disk sizes. `0` is the universal "unknown" value:
+    /// a Source whose size cannot be read seeds `0`, and `0` propagates
+    /// inertly through every arm.
+    ///
+    /// # Determinism
+    ///
+    /// The estimate depends only on the plan topology and the on-disk file
+    /// sizes resolved against a stable anchor — the pipeline file's directory
+    /// (`ctx.workspace_root.join(ctx.pipeline_dir)`), never the process CWD —
+    /// so an identical plan over identically-sized inputs always yields
+    /// identical predictions. Multi-file matchers (`glob`/`regex`/`paths`)
+    /// and absent/unreadable files seed `0`, keeping the estimate environment-
+    /// independent. The topological walk guarantees every parent's volume is
+    /// already set before a child reads it; nodes added by later passes
+    /// (e.g. synthetic combine-chain steps) that never received a
+    /// `node_properties` row contribute `0`, matching how `--explain`
+    /// already skips them.
+    ///
+    /// Runs after aggregation- and combine-strategy selection so the resolved
+    /// strategy is visible to [`arbitration_class`] and no later property
+    /// overwrite clobbers the volume fields.
+    pub fn derive_volume_estimates(&mut self, ctx: &crate::config::CompileContext) {
+        // Stable anchor for resolving relative source `path:` strings — the
+        // pipeline file's directory, reconstructed from the compile context
+        // as `workspace_root.join(pipeline_dir)`. The CLI builds the context
+        // so this equals the runtime discovery anchor (`config.parent()`), so
+        // a `--explain` surfacing of these sizes names the same bytes the
+        // actual run would read and never depends on the process CWD.
+        let anchor = ctx.workspace_root.join(&ctx.pipeline_dir);
+
+        let order = self.topo_order.clone();
+        for idx in order {
+            // Skip nodes that never received a base `node_properties` row
+            // (synthetic combine-chain steps inserted post-derivation). Their
+            // downstream consumers treat the missing volume as `0`.
+            if !self.node_properties.contains_key(&idx) {
+                continue;
+            }
+
+            let (peak, freed) = match &self.graph[idx] {
+                PlanNode::Source { resolved, .. } => {
+                    // Read the seed off the resolved `SourceConfig` the node
+                    // already carries — keyed by node identity, not by a
+                    // separate name map. This stays correct when a node's
+                    // header `name:` differs from its nested `config.name:`,
+                    // a shape the compiler accepts.
+                    let seed = resolved
+                        .as_deref()
+                        .and_then(|payload| source_seed_bytes(&payload.source, &anchor))
+                        .unwrap_or(0);
+                    // A Source streams records out as it reads; it never holds
+                    // an accumulated copy it can free on drain.
+                    (seed, 0)
+                }
+                node => {
+                    // Sum parents' already-computed peak volume. A missing
+                    // parent row (synthetic node) contributes 0.
+                    let incoming: u64 = self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .filter_map(|p| self.node_properties.get(&p))
+                        .map(|p| p.predicted_peak_bytes)
+                        .fold(0u64, |acc, v| acc.saturating_add(v));
+                    // Blocking iff the node registers a spillable consumer at
+                    // runtime. Such a node accumulates its whole input before
+                    // emitting and frees that state on drain; a streaming /
+                    // stateless / sink node holds nothing live to free.
+                    let blocking = arbitration_class(node).spill_priority.is_some();
+                    let freed = if blocking { incoming } else { 0 };
+                    (incoming, freed)
+                }
+            };
+
+            // The presence check above guarantees this entry exists.
+            if let Some(props) = self.node_properties.get_mut(&idx) {
+                props.predicted_peak_bytes = peak;
+                props.predicted_freed_bytes_on_complete = freed;
+            }
+        }
+
+        // Second pass, reverse topological order: propagate the largest
+        // reclaimable footprint of each node's downstream chain UP to the
+        // node itself. A node's `predicted_subtree_reclaim_bytes` is the max
+        // of its own `predicted_freed_bytes_on_complete` and the subtree
+        // reclaim of every immediate successor THIS node solely feeds — a
+        // successor with exactly one incoming edge. Walking children before
+        // parents (reverse of the forward topo order) guarantees each
+        // successor's value is final before its predecessor reads it.
+        //
+        // This is what gives a Source feeding a blocking chain a non-zero
+        // reclaim value: the Source frees nothing itself, but launching it is
+        // the only path to the point where its downstream Aggregate can drain,
+        // so the Source inherits that Aggregate's reclaimable state. The
+        // scheduler uses it to front-load the chain whose completion frees the
+        // most, while keeping immediate (drain-now) reclaim a strictly higher
+        // priority.
+        //
+        // Propagation stops at a convergence node — a successor with more than
+        // one incoming edge, e.g. the `Combine` two independent chains feed.
+        // Reaching that node requires EVERY parent chain to finish, so no
+        // single upstream chain alone "unlocks" its reclaim; charging the
+        // whole join to each feeding Source would make every Source's value
+        // identical and erase the per-chain distinction the scheduler needs.
+        // The join keeps its own reclaim (it elects itself once all inputs are
+        // ready and it can drain), and each feeding chain is ranked by the
+        // reclaim it owns up to that join. `0` propagates inertly, so the
+        // determinism floor — all-zero estimates reproduce topo order — is
+        // untouched.
+        for &idx in self.topo_order.iter().rev() {
+            if !self.node_properties.contains_key(&idx) {
+                continue;
+            }
+            let own_freed = self.node_properties[&idx].predicted_freed_bytes_on_complete;
+            let children_reclaim = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .filter(|&c| {
+                    // Only a child this node solely feeds carries its reclaim
+                    // up; a convergence node (in-degree > 1) does not, so its
+                    // post-join reclaim is not double-counted onto every
+                    // feeding chain.
+                    self.graph
+                        .neighbors_directed(c, petgraph::Direction::Incoming)
+                        .count()
+                        == 1
+                })
+                .filter_map(|c| self.node_properties.get(&c))
+                .map(|p| p.predicted_subtree_reclaim_bytes)
+                .max()
+                .unwrap_or(0);
+            if let Some(props) = self.node_properties.get_mut(&idx) {
+                props.predicted_subtree_reclaim_bytes = own_freed.max(children_reclaim);
+            }
+        }
+    }
+
     /// Mark every Output whose path template references a per-record
     /// token (`{source_file}` / `{source_path}`) AND whose parent
     /// partitioning is `FilePartitioned` for runtime fan-out routing.
@@ -3963,6 +4160,9 @@ impl ExecutionPlanDag {
                         provenance: PartitioningProvenance::SingleStream,
                     },
                     ck_set: preserved_ck_set.clone(),
+                    // Volume is re-derived by `derive_volume_estimates`,
+                    // which runs after this strategy pass; zero here.
+                    ..NodeProperties::unordered_single()
                 },
                 AggregateStrategy::Hash => NodeProperties {
                     ordering: Ordering {
@@ -3977,12 +4177,58 @@ impl ExecutionPlanDag {
                         provenance: PartitioningProvenance::SingleStream,
                     },
                     ck_set: preserved_ck_set,
+                    ..NodeProperties::unordered_single()
                 },
             };
             self.node_properties.insert(idx, new_props);
         }
 
         Ok(())
+    }
+}
+
+/// Exposes the plan's per-node volume predictions and topological order to
+/// [`MemoryArbitrator::next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable).
+///
+/// The byte predictions — peak, immediate freed-on-complete, and downstream
+/// subtree reclaim — are the plan-time estimates `derive_volume_estimates`
+/// stamps onto each node's [`NodeProperties`]; the stable index is the node's
+/// position in [`topo_order`](ExecutionPlanDag::topo_order), which is the same
+/// order the executor walks the DAG. A node absent from `node_properties`
+/// (e.g. a synthetic combine-chain step that never received a base row)
+/// predicts `0` bytes, matching how `derive_volume_estimates` treats it.
+impl crate::pipeline::memory::SchedulingHint for ExecutionPlanDag {
+    fn predicted_peak_bytes(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_peak_bytes)
+            .unwrap_or(0)
+    }
+
+    fn predicted_freed_bytes_on_complete(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_freed_bytes_on_complete)
+            .unwrap_or(0)
+    }
+
+    fn predicted_subtree_reclaim_bytes(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_subtree_reclaim_bytes)
+            .unwrap_or(0)
+    }
+
+    fn stable_index(&self, id: NodeIndex) -> usize {
+        // Position in `topo_order` is the plan's canonical node ordering and
+        // the exact sequence the executor dispatches in, so it is the stable
+        // tiebreak that makes "no-estimates == today's order" hold. A node
+        // outside `topo_order` sorts last, deterministically, rather than
+        // colliding with the first real node at index 0.
+        self.topo_order
+            .iter()
+            .position(|&n| n == id)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -4086,6 +4332,7 @@ fn compute_one(
                 },
                 partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4100,6 +4347,7 @@ fn compute_one(
             },
             partitioning: parent_partitioning(),
             ck_set: preserve_parent_ck_set(),
+            ..NodeProperties::unordered_single()
         },
 
         PlanNode::Transform {
@@ -4123,6 +4371,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 };
             }
 
@@ -4139,6 +4388,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 };
             };
 
@@ -4160,6 +4410,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             } else {
                 NodeProperties {
@@ -4174,6 +4425,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             }
         }
@@ -4200,6 +4452,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4267,6 +4520,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             } else {
                 NodeProperties {
@@ -4283,6 +4537,7 @@ fn compute_one(
                     },
                     partitioning,
                     ck_set,
+                    ..NodeProperties::unordered_single()
                 }
             }
         }
@@ -4353,6 +4608,7 @@ fn compute_one(
                 },
                 partitioning: agg_partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4381,6 +4637,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4407,6 +4664,7 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
                 ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4502,6 +4760,7 @@ fn compute_one(
                 },
                 partitioning: combine_partitioning,
                 ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -4519,9 +4778,35 @@ fn compute_one(
                     }),
                 partitioning: parent_partitioning(),
                 ck_set: preserve_parent_ck_set(),
+                ..NodeProperties::unordered_single()
             }
         }
     }
+}
+
+/// On-disk byte seed for a file-backed Source's `predicted_peak_bytes`.
+///
+/// Returns `Some(len)` only for the single-file `path:` matcher, resolving
+/// the path against `anchor` (the pipeline file's directory) so the size is
+/// independent of the process CWD. Returns `None` — the universal "unknown"
+/// seed, written as `0` by the caller — for every case this issue does not
+/// cover: multi-file matchers (`glob`/`regex`/`paths`), an absent `path:`,
+/// or an unreadable/missing file (`std::fs::metadata` error). Absolute paths
+/// resolve as-is, matching the source-discovery resolver.
+fn source_seed_bytes(source: &SourceConfig, anchor: &std::path::Path) -> Option<u64> {
+    // Multi-file matchers fan out to a `Vec<PathBuf>` at discovery time with
+    // no single literal size to seed; leave them unknown.
+    if source.glob.is_some() || source.regex.is_some() || source.paths.is_some() {
+        return None;
+    }
+    let path = source.path.as_deref()?;
+    let p = std::path::Path::new(path);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        anchor.join(p)
+    };
+    std::fs::metadata(resolved).ok().map(|m| m.len())
 }
 
 /// Idempotency predicate for enforcer-sort insertion.

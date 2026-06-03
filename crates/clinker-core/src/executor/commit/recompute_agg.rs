@@ -75,7 +75,7 @@ pub(crate) fn recompute_aggregates(
         if !retract_ok {
             degraded.push(agg_idx);
             drain_node_buffer_slot(ctx, agg_idx);
-            ctx.relaxed_aggregator_states.remove(&agg_idx);
+            drop_retained_aggregator(ctx, agg_idx);
             continue;
         }
 
@@ -86,7 +86,7 @@ pub(crate) fn recompute_aggregates(
             Err(_) => {
                 degraded.push(agg_idx);
                 drain_node_buffer_slot(ctx, agg_idx);
-                ctx.relaxed_aggregator_states.remove(&agg_idx);
+                drop_retained_aggregator(ctx, agg_idx);
             }
         }
     }
@@ -94,6 +94,22 @@ pub(crate) fn recompute_aggregates(
     ctx.counters.retraction.degrade_fallback_count += degraded.len() as u64;
     ctx.relaxed_aggregator_degrade.extend(degraded);
     Ok(())
+}
+
+/// Drop a degraded aggregate's retained state and unregister its memory
+/// consumer from the arbitrator in the same step.
+///
+/// Degrade discards the aggregator mid-run while the rest of the
+/// pipeline keeps executing, so its `value_heap_bytes` must leave
+/// `sum_consumer_usage` immediately — otherwise the discarded group
+/// state would keep inflating the reported peak for the remainder of the
+/// run even though no live aggregator holds those bytes. Pairing the
+/// unregister with the `remove` keeps the registry aligned with the set
+/// of aggregators actually live, mirroring `drain_node_buffer_slot`.
+fn drop_retained_aggregator(ctx: &mut ExecutorContext<'_>, agg_idx: petgraph::graph::NodeIndex) {
+    if let Some(retained) = ctx.relaxed_aggregator_states.remove(&agg_idx) {
+        ctx.memory_budget.unregister_consumer(retained.consumer_id);
+    }
 }
 
 /// Apply the per-iteration retract delta to the retained aggregator

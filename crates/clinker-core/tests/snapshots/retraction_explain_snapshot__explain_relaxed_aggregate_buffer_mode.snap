@@ -39,7 +39,7 @@ source.orders:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 sort.__correlation_sort_orders:
   ordering: order_id
@@ -47,7 +47,7 @@ sort.__correlation_sort_orders:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=20, can_back_pressure=false
+  arbitration: spill_priority=20, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 transform.windowed:
   ordering: <none>
@@ -55,7 +55,7 @@ transform.windowed:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 aggregation.dept_totals:
   ordering: <none>
@@ -63,7 +63,7 @@ aggregation.dept_totals:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=30, can_back_pressure=false
+  arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 output.out:
   ordering: <none>
@@ -71,25 +71,25 @@ output.out:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===
 
 edge source.orders -> sort.__correlation_sort_orders:
   buffer: node_buffer (slot=0)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
 edge sort.__correlation_sort_orders -> transform.windowed:
   buffer: node_buffer (slot=4)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: sort)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: sort)
 
 edge transform.windowed -> aggregation.dept_totals:
   buffer: node_buffer (slot=1)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: transform)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
 
 edge aggregation.dept_totals -> output.out:
   buffer: node_buffer (slot=2)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: aggregation)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: aggregation)
 
 === Retraction ===
 

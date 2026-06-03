@@ -22,7 +22,7 @@ output.enriched_out:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 source.addresses_src:
   ordering: <none>
@@ -30,7 +30,7 @@ source.addresses_src:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 composition.addr_norm:
   ordering: <none>
@@ -38,7 +38,7 @@ composition.addr_norm:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 source.customers_src:
   ordering: <none>
@@ -46,13 +46,13 @@ source.customers_src:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===
 
 edge source.addresses_src -> composition.addr_norm:
   buffer: node_buffer (slot=1)
-  arbitration: spill_priority=0, can_back_pressure=false (producer: source)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
 === CXL Expressions ===
 

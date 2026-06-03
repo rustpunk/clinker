@@ -1048,6 +1048,14 @@ pub(crate) enum CommitStepPath {
 /// strict pipelines never instantiate this struct.
 pub(crate) struct RetainedAggregatorState {
     pub(crate) aggregator: Box<crate::aggregation::HashAggregator>,
+    /// Arbitrator registration for this aggregator's memory consumer.
+    /// The aggregator survives past forward-pass finalize so the commit
+    /// phase can retract and re-finalize against it, so its bytes stay
+    /// live in `sum_consumer_usage` for that whole window. Held here so
+    /// the consumer is unregistered exactly when the aggregator is
+    /// dropped — at degrade, where the state is discarded mid-run —
+    /// keeping the registry aligned with what is actually live.
+    pub(crate) consumer_id: crate::pipeline::memory::ConsumerId,
 }
 
 impl ExecutorContext<'_> {
@@ -1543,6 +1551,13 @@ pub(crate) fn admit_node_buffer(
     ));
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
+    // Raise the run's high-water mark now that this slot's charge has
+    // joined the registry. Sampling at admission (not only on streaming
+    // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
+    // over every coexisting `node_buffers` slot — which is the quantity
+    // dispatch order moves: finishing a chain's blocking consumer before
+    // charging the next chain's source keeps fewer slots live at once.
+    ctx.memory_budget.sample_peak_consumer_usage();
     if !spill_allowed || !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
@@ -3978,8 +3993,22 @@ pub(crate) fn dispatch_plan_node(
                 // policy registry holds and the HashAggregator that
                 // mirrors its value_heap_bytes total into the
                 // handle's counter on every admit / spill / reset.
+                //
+                // The returned `ConsumerId` is captured so the wrapper is
+                // unregistered the moment its aggregator's state stops
+                // being live. A strict aggregate's `finalize` consumes
+                // the stream and emits every group, so the arm exit
+                // unregisters it directly; without that the finalized
+                // group state keeps contributing to `sum_consumer_usage`
+                // for the rest of the run, inflating the reported peak
+                // even though the bytes are gone. A relaxed aggregate
+                // parks its aggregator on `relaxed_aggregator_states` and
+                // carries this id with it, because the commit phase keeps
+                // retracting and re-finalizing that instance — its bytes
+                // stay live until the aggregator is dropped, at which
+                // point the unregister fires from that state.
                 let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-                ctx.memory_budget.register_consumer(Arc::new(
+                let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                     crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
                 ));
                 let mut stream = crate::aggregation::AggregateStream::for_node(
@@ -4084,7 +4113,7 @@ pub(crate) fn dispatch_plan_node(
                     source_name: &MERGED_SOURCE_NAME,
                     doc_ctx: clinker_record::synthetic_document_context_ref(),
                 };
-                if is_relaxed {
+                let agg_out = if is_relaxed {
                     let mut hash_box = match stream.into_retained_hash() {
                         Some(b) => b,
                         None => {
@@ -4112,6 +4141,7 @@ pub(crate) fn dispatch_plan_node(
                                 node_idx,
                                 RetainedAggregatorState {
                                     aggregator: hash_box,
+                                    consumer_id: agg_consumer_id,
                                 },
                             );
                             emitted_rows
@@ -4225,7 +4255,34 @@ pub(crate) fn dispatch_plan_node(
                         },
                         Err(other) => return Err(other.into()),
                     }
+                };
+                // The aggregate's working set is live exactly as long as
+                // its aggregator is. A strict `finalize` above consumed
+                // the stream and emitted every group, so that state is
+                // now gone; unregister the wrapper here so the finalized
+                // bytes leave `sum_consumer_usage` immediately and the
+                // run peak reflects only concurrently-live state, making
+                // it sensitive to the order aggregates complete in.
+                //
+                // A relaxed aggregate that finalized successfully parked
+                // its boxed aggregator on `relaxed_aggregator_states`
+                // (the key is present): that state stays live across the
+                // commit phase's retract + re-finalize iterations, so its
+                // wrapper must stay registered. Ownership of the
+                // unregister transfers to `RetainedAggregatorState`,
+                // which fires it when the aggregator is dropped — at the
+                // commit-phase degrade `remove`, or at the top-scope
+                // teardown that drains the surviving states once the walk
+                // ends. A relaxed aggregate whose finalize failed and
+                // routed to the DLQ dropped its aggregator without
+                // parking it, so the key is absent and the wrapper is
+                // unregistered here alongside the strict case — the
+                // presence of the retained key, not `is_relaxed`, is the
+                // exact predicate for "the state outlives this arm".
+                if !ctx.relaxed_aggregator_states.contains_key(&node_idx) {
+                    ctx.memory_budget.unregister_consumer(agg_consumer_id);
                 }
+                agg_out
             };
 
             ctx.collector
@@ -6744,7 +6801,19 @@ fn run_time_windowed_aggregate(
     // schema. Building a new `ProgramEvaluator` per window is cheap —
     // the heavy CXL pipeline lives behind `Arc<TypedProgram>` inside
     // `compiled_transforms`.
-    let make_stream = |ctx: &ExecutorContext<'_>| -> Result<AggregateStream, PipelineError> {
+    //
+    // Returns the registered `ConsumerId` alongside the stream so each
+    // per-window aggregator can unregister its wrapper once that window
+    // is finalized. A time-windowed aggregate fans out into one
+    // `AggregateStream` (and one registered consumer) per live window;
+    // leaving them registered past finalize would keep every finalized
+    // window's bytes in `sum_consumer_usage` for the rest of the run,
+    // inflating the reported peak well beyond the largest window that
+    // was ever concurrently live.
+    let make_stream = |ctx: &ExecutorContext<'_>| -> Result<
+        (AggregateStream, crate::pipeline::memory::ConsumerId),
+        PipelineError,
+    > {
         let evaluator = match transform_idx {
             Some(idx) => ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[idx].typed),
@@ -6761,11 +6830,10 @@ fn run_time_windowed_aggregate(
             }
         };
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        ctx.memory_budget
-            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(
-                agg_consumer_handle.clone(),
-            )));
-        AggregateStream::for_node(
+        let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
+            crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
+        ));
+        let stream = AggregateStream::for_node(
             Arc::clone(compiled),
             evaluator,
             strategy,
@@ -6775,7 +6843,8 @@ fn run_time_windowed_aggregate(
             Some(ctx.spill_root_path.to_path_buf()),
             name.to_string(),
             agg_consumer_handle,
-        )
+        )?;
+        Ok((stream, agg_consumer_id))
     };
 
     let mut out_rows: Vec<AggSortRow> = Vec::new();
@@ -6825,7 +6894,10 @@ fn run_time_windowed_aggregate(
                     detail: "tumbling window size must be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
+            let mut per_window: HashMap<
+                i64,
+                (AggregateStream, crate::pipeline::memory::ConsumerId),
+            > = HashMap::new();
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -6880,7 +6952,10 @@ fn run_time_windowed_aggregate(
                     detail: "hopping window size and slide must both be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<i64, AggregateStream> = HashMap::new();
+            let mut per_window: HashMap<
+                i64,
+                (AggregateStream, crate::pipeline::memory::ConsumerId),
+            > = HashMap::new();
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -6994,7 +7069,10 @@ fn run_time_windowed_aggregate(
             // (group_key, session_idx) separates session emits
             // without changing the underlying HashAggregator's
             // group-by contract.
-            let mut session_streams: HashMap<SessionStreamKey, AggregateStream> = HashMap::new();
+            let mut session_streams: HashMap<
+                SessionStreamKey,
+                (AggregateStream, crate::pipeline::memory::ConsumerId),
+            > = HashMap::new();
             (|| -> Result<(), PipelineError> {
                 for (i, (rec, rn)) in input.iter().enumerate() {
                     let Some(info) = record_session_info[i].clone() else {
@@ -7028,7 +7106,7 @@ fn run_time_windowed_aggregate(
                     }
                     let stream_key = (info.key, info.session_idx);
                     let entry = session_streams.entry(stream_key);
-                    let stream = match entry {
+                    let (stream, _consumer_id) = match entry {
                         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                         std::collections::hash_map::Entry::Vacant(v) => {
                             let fresh = make_stream(ctx)?;
@@ -7061,8 +7139,10 @@ fn run_time_windowed_aggregate(
             // Finalize every (group, session) stream. Walk in
             // deterministic order (sorted by (group_key, session_idx))
             // so emit order is stable across runs.
-            let mut entries: Vec<(SessionStreamKey, AggregateStream)> =
-                session_streams.into_iter().collect();
+            let mut entries: Vec<(
+                SessionStreamKey,
+                (AggregateStream, crate::pipeline::memory::ConsumerId),
+            )> = session_streams.into_iter().collect();
             // `GroupByKey` does not implement `Ord`; fall back to a
             // Debug-formatted key for deterministic finalize order
             // across runs. The session_idx breaks ties for the same
@@ -7083,8 +7163,14 @@ fn run_time_windowed_aggregate(
                 source_name: &MERGED_SOURCE_NAME,
                 doc_ctx: clinker_record::synthetic_document_context_ref(),
             };
-            for (_, stream) in entries {
-                match stream.finalize(&finalize_ctx, &mut out_rows) {
+            for (_, (stream, consumer_id)) in entries {
+                // Finalize consumes this session's stream; unregister
+                // its wrapper unconditionally afterward so the session's
+                // bytes leave `sum_consumer_usage` whether finalize
+                // emitted rows or routed a group failure to the DLQ.
+                let result = stream.finalize(&finalize_ctx, &mut out_rows);
+                ctx.memory_budget.unregister_consumer(consumer_id);
+                match result {
                     Ok(()) => {}
                     Err(HashAggError::Accumulator {
                         transform,
@@ -7129,12 +7215,26 @@ fn add_to_window<F>(
     record: &Record,
     row_num: u64,
     window_start: i64,
-    per_window: &mut std::collections::HashMap<i64, crate::aggregation::AggregateStream>,
+    per_window: &mut std::collections::HashMap<
+        i64,
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+    >,
     make_stream: &F,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
 ) -> Result<(), PipelineError>
 where
-    F: Fn(&ExecutorContext<'_>) -> Result<crate::aggregation::AggregateStream, PipelineError>,
+    F: Fn(
+        &ExecutorContext<'_>,
+    ) -> Result<
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    >,
 {
     let source_file_arc = source_file_arc_of(record);
     let source_name_arc = source_name_arc_of(record);
@@ -7149,7 +7249,7 @@ where
         source_name: &source_name_arc,
         doc_ctx: record.doc_ctx(),
     };
-    let stream = match per_window.entry(window_start) {
+    let (stream, _consumer_id) = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
             let fresh = make_stream(ctx)?;
@@ -7218,14 +7318,25 @@ fn handle_aggregate_add_error(
 fn finalize_windows(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    per_window: std::collections::HashMap<i64, crate::aggregation::AggregateStream>,
+    per_window: std::collections::HashMap<
+        i64,
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+    >,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
     output_schema: &Arc<Schema>,
     input: &[(Record, u64)],
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
-    let mut entries: Vec<(i64, crate::aggregation::AggregateStream)> =
-        per_window.into_iter().collect();
+    let mut entries: Vec<(
+        i64,
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+    )> = per_window.into_iter().collect();
     entries.sort_by_key(|(start, _)| *start);
     let finalize_ctx = EvalContext {
         stable: ctx.stable,
@@ -7238,8 +7349,14 @@ fn finalize_windows(
         source_name: &MERGED_SOURCE_NAME,
         doc_ctx: clinker_record::synthetic_document_context_ref(),
     };
-    for (_, stream) in entries {
-        match stream.finalize(&finalize_ctx, out_rows) {
+    for (_, (stream, consumer_id)) in entries {
+        // Finalize consumes this window's stream; unregister its
+        // wrapper unconditionally afterward so the window's bytes leave
+        // `sum_consumer_usage` whether finalize emitted rows or routed a
+        // group failure to the DLQ. The state is gone either way.
+        let result = stream.finalize(&finalize_ctx, out_rows);
+        ctx.memory_budget.unregister_consumer(consumer_id);
+        match result {
             Ok(()) => {}
             Err(HashAggError::Accumulator {
                 transform,

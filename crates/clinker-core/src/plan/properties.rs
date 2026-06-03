@@ -40,6 +40,75 @@ pub struct NodeProperties {
     /// / Combine that propagates them; the lattice value here is the
     /// post-union view at this specific node.
     pub ck_set: BTreeSet<String>,
+
+    /// Estimated bytes this node holds live at its peak, derived from the
+    /// on-disk input volume flowing in from its parents. `0` means
+    /// "unknown" — no file-size seed reached this node, or every upstream
+    /// seed was itself unknown.
+    ///
+    /// The estimate is a coarse plan-time prediction, not a runtime
+    /// measurement. It is seeded at file-backed Source nodes from the
+    /// literal `path:` file's `std::fs::metadata` length, then propagated
+    /// forward in topological order: a streaming/fused operator carries
+    /// the same live volume it receives, while a blocking operator
+    /// (Aggregate / sort / grace-hash) holds its whole accumulated input
+    /// before it can emit, so its peak is the sum of its parents' volume.
+    ///
+    /// Computed by `derive_volume_estimates`. It is the input the scheduler
+    /// uses to choose among simultaneously-runnable nodes (it prefers a node
+    /// whose peak fits the remaining headroom), so it is surfaced in
+    /// `--explain` text and `--explain --format json` so a pipeline author
+    /// can see the same number the scheduler weighed.
+    pub predicted_peak_bytes: u64,
+
+    /// Estimated bytes this node releases back to the budget when it
+    /// finishes draining. `0` means "unknown" or "frees nothing live".
+    ///
+    /// A blocking operator frees the accumulated state it held at peak
+    /// once it has emitted its last row (a hash Aggregate drops its hash
+    /// table; a sort drops its run buffers), so its freed estimate equals
+    /// the peak it accumulated. A fully streaming / fused chain holds no
+    /// cross-record state, so it frees `0`.
+    ///
+    /// Computed by `derive_volume_estimates` and surfaced in `--explain`
+    /// alongside [`Self::predicted_peak_bytes`]: the scheduler uses it as the
+    /// freed-bytes tiebreak when two runnable nodes fit headroom equally.
+    pub predicted_freed_bytes_on_complete: u64,
+
+    /// Largest reclaimable footprint along this node's downstream chain, up
+    /// to the first convergence — the headroom that running this node's chain
+    /// to completion unlocks. `0` means "unknown" or "nothing downstream
+    /// accumulates".
+    ///
+    /// Where [`Self::predicted_freed_bytes_on_complete`] is the state THIS
+    /// node releases the instant IT finishes (immediate reclaim, `0` for a
+    /// Source), this is the *eventual* reclaim its chain will yield: for a
+    /// Source feeding a `Source -> Aggregate` chain it equals the downstream
+    /// Aggregate's accumulated state, because launching that Source is the
+    /// only way to reach the point where the Aggregate can drain. It is the
+    /// max over the node's own freed-on-complete and the subtree reclaim of
+    /// each successor this node SOLELY feeds, computed by
+    /// `derive_volume_estimates` in reverse-topological order.
+    ///
+    /// Propagation stops at a convergence node (one with more than one
+    /// incoming edge, e.g. the `Combine` two independent chains feed):
+    /// reaching it requires every feeding chain, so no single chain unlocks
+    /// its post-join reclaim, and charging that reclaim to each feeding
+    /// Source would erase the per-chain distinction. The join keeps its own
+    /// reclaim and elects itself once it can drain; each feeding chain is
+    /// ranked by the reclaim it owns up to the join.
+    ///
+    /// The scheduler reads it as a lower-priority tiebreak than
+    /// `predicted_freed_bytes_on_complete`: a node that frees memory *now*
+    /// (a ready blocking operator) is always preferred to one that merely
+    /// unlocks an eventual reclaim, so this never elects a fresh heavy
+    /// Source over a ready light Aggregate (which would raise the peak).
+    /// It breaks ties only among candidates with equal immediate reclaim —
+    /// most importantly the fresh Sources of independent chains, where it
+    /// front-loads the chain whose completion frees the most. Surfaced in
+    /// `--explain` so a pipeline author sees the same number the scheduler
+    /// weighed.
+    pub predicted_subtree_reclaim_bytes: u64,
 }
 
 /// Effective output ordering of a node, together with a provenance chain
@@ -196,8 +265,11 @@ impl PartitioningKind {
 }
 
 impl NodeProperties {
-    /// Construct a `NodeProperties` with no ordering and a single-stream
-    /// partitioning. Convenience for tests and fallback cases.
+    /// Construct a `NodeProperties` with no ordering, single-stream
+    /// partitioning, and unknown (`0`) volume estimates. Convenience for
+    /// tests, fallback cases, and as a struct-update base for the
+    /// derivation rules, which set ordering/partitioning/ck explicitly and
+    /// inherit the zeroed volume fields until `derive_volume_estimates` runs.
     pub fn unordered_single() -> Self {
         Self {
             ordering: Ordering {
@@ -209,6 +281,9 @@ impl NodeProperties {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: BTreeSet::new(),
+            predicted_peak_bytes: 0,
+            predicted_freed_bytes_on_complete: 0,
+            predicted_subtree_reclaim_bytes: 0,
         }
     }
 }
@@ -430,6 +505,7 @@ mod render_tests {
                 provenance: PartitioningProvenance::SingleStream,
             },
             ck_set: BTreeSet::new(),
+            ..NodeProperties::unordered_single()
         }
     }
 
