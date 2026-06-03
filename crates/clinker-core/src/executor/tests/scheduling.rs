@@ -21,6 +21,7 @@ use crate::config::{CompileContext, parse_config};
 use crate::pipeline::memory::MemoryArbitrator;
 use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::path::Path;
 
 /// Two independent `Source -> Aggregate -> Output` chains, the smaller
@@ -245,5 +246,332 @@ fn headroom_fit_prefers_fitting_node_over_lower_index() {
         chosen, src_small,
         "headroom fit must prefer the Source that fits remaining headroom over a lower-index \
          Source that would overflow it"
+    );
+}
+
+/// Hard limit large enough that real process RSS can never push the
+/// arbitrator's `peak_rss` above the soft limit, so `should_spill()` never
+/// fires for any of these runs. With spill and back-pressure structurally
+/// out of reach, the consumer accounting these tests inspect is fully
+/// decoupled from process-global RSS: the registry's post-run state is the
+/// same under a quiet machine and under a saturated parallel `cargo test`,
+/// making the assertions below deterministic. 100 GiB mirrors the
+/// huge-budget convention the largest-first arbitration tests use for the
+/// same reason.
+const HUGE_HARD_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+
+fn huge_budget_arbitrator() -> std::sync::Arc<MemoryArbitrator> {
+    std::sync::Arc::new(MemoryArbitrator::with_policy(
+        HUGE_HARD_LIMIT_BYTES,
+        0.80,
+        MemoryArbitrator::default_policy(),
+    ))
+}
+
+/// Run a single-source, single-output pipeline against a caller-owned
+/// arbitrator so the test can read the consumer registry after the run
+/// returns. The shared `run_test` helper hides its arbitrator behind the
+/// public entry point; this threads an `Arc<MemoryArbitrator>` the caller
+/// keeps a clone of, which is what makes the post-run registry observable.
+fn run_with_arbitrator(
+    yaml: &str,
+    csv_input: &str,
+    arbitrator: std::sync::Arc<MemoryArbitrator>,
+) -> crate::executor::ExecutionReport {
+    let config = parse_config(yaml).expect("parse");
+    let primary = config.source_configs().next().unwrap().name.clone();
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        primary,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
+    )]);
+    let output_buf = clinker_bench_support::io::SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        config.output_configs().next().unwrap().name.clone(),
+        Box::new(output_buf) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "test-exec-id".to_string(),
+        batch_id: "test-batch-id".to_string(),
+        pipeline_vars: IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    PipelineExecutor::run_with_readers_writers_with_arbitrator(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        CompileContext::default(),
+        arbitrator,
+    )
+    .expect("pipeline executes")
+}
+
+/// The Source ingest consumer is the only consumer a single-source run
+/// intentionally leaves registered for the arbitrator's lifetime (its
+/// registration id is discarded at the Source dispatch arm, never
+/// unregistered). Every other consumer — Aggregate wrappers included — must
+/// be gone once the run drains.
+const SURVIVING_SOURCE_CONSUMERS: usize = 1;
+
+/// A single `Source -> Aggregate -> Output` chain whose `collect`
+/// accumulator folds each group's values into an `Array`, charging a
+/// non-zero `value_heap_bytes` into the Aggregate's `ConsumerHandle` while
+/// the strict aggregate runs — concrete state the registry must stop
+/// reporting the moment the aggregate finalizes.
+const STRICT_AGG_YAML: &str = r#"
+pipeline:
+  name: strict_agg_consumer_release
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit items = collect(v)
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+/// A finalized strict Aggregate must unregister its memory consumer, so its
+/// accumulated group state stops contributing to the arbitrator's reported
+/// usage for the rest of the run.
+///
+/// The strict dispatch arm registers an `AggregateConsumer` while the
+/// aggregate folds, then `finalize` consumes the stream and emits every
+/// group — at which point the working set is gone. Without the
+/// arm-exit unregister, the wrapper lingers in the registry and keeps
+/// charging the finalized `collect` arrays into `sum_consumer_usage` until
+/// the arbitrator itself drops at run teardown, so the reported peak
+/// becomes retain-forever rather than reflecting only concurrently-live
+/// state. The huge budget keeps `should_spill()` from ever firing, so this
+/// release is the only thing the registry state depends on — no RSS
+/// coupling, deterministic under parallel `cargo test`.
+#[test]
+fn finalized_strict_aggregate_releases_its_consumer() {
+    let arbitrator = huge_budget_arbitrator();
+
+    let csv = "k,v\n\
+        alpha,1\n\
+        beta,2\n\
+        alpha,3\n\
+        gamma,4\n\
+        beta,5\n";
+    let report = run_with_arbitrator(STRICT_AGG_YAML, csv, std::sync::Arc::clone(&arbitrator));
+    assert_eq!(report.counters.dlq_count, 0, "no records should DLQ");
+
+    // The strict aggregate charged a non-zero footprint at its peak (the
+    // `collect` arrays) — the premise that makes "release" observable.
+    assert!(
+        report.peak_consumer_usage_bytes > 0,
+        "the strict aggregate must have charged a non-zero footprint at peak"
+    );
+
+    // Only the Source ingest consumer may outlive the run. A regression
+    // that drops the arm-exit unregister leaves two consumers, with the
+    // finalized aggregate still charging its `collect` arrays.
+    assert_eq!(
+        arbitrator.consumer_count(),
+        SURVIVING_SOURCE_CONSUMERS,
+        "after the Aggregate finalized, only the Source consumer should remain registered — the \
+         finalized AggregateConsumer must have been unregistered (a regression leaves two)"
+    );
+    // The accounting check: post-run registered usage is strictly below
+    // the in-flight peak, because that peak summed the Source ingest
+    // consumer AND the live aggregate together while the aggregate folded,
+    // whereas only the Source consumer survives the drain. A regression
+    // that retained the finalized aggregate would keep its bytes summed in,
+    // so post-run usage would instead match the peak rather than fall below
+    // it.
+    let post_run_usage = arbitrator.sum_consumer_usage();
+    assert!(
+        post_run_usage < report.peak_consumer_usage_bytes,
+        "post-run sum_consumer_usage ({post_run_usage}) is not below the in-flight peak ({}) — the \
+         finalized aggregate's bytes appear retained in the registry rather than released",
+        report.peak_consumer_usage_bytes,
+    );
+}
+
+/// A tumbling time-windowed Aggregate fans out into one registered consumer
+/// per live window; each must unregister as its window finalizes, so no
+/// per-window group state survives the run in the registry.
+const WINDOWED_AGG_YAML: &str = r#"
+pipeline:
+  name: windowed_agg_consumer_release
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      watermark:
+        column: event_ts
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+        - { name: event_ts, type: date_time }
+  - type: aggregate
+    name: agg
+    input: src
+    config:
+      group_by: [k]
+      time_window:
+        tumbling: { size: 1h }
+      cxl: |
+        emit k = k
+        emit items = collect(v)
+  - type: output
+    name: out
+    input: agg
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+/// Every per-window stream of a time-windowed Aggregate registers its own
+/// consumer, and each must be unregistered as its window finalizes. The
+/// fixture spreads records across three distinct tumbling-hour buckets, so
+/// a regression that unregistered only the last window — or none — would
+/// leave extra consumers registered after the run. The huge budget keeps
+/// the per-window registration path off the spill/back-pressure path, so
+/// the surviving-consumer count is RSS-independent and deterministic.
+#[test]
+fn finalized_time_windowed_aggregate_releases_every_window_consumer() {
+    let arbitrator = huge_budget_arbitrator();
+
+    let csv = "k,v,event_ts\n\
+        alpha,1,2024-01-01T00:10:00\n\
+        alpha,2,2024-01-01T00:40:00\n\
+        beta,3,2024-01-01T01:15:00\n\
+        alpha,4,2024-01-01T02:05:00\n\
+        beta,5,2024-01-01T02:50:00\n";
+    let report = run_with_arbitrator(WINDOWED_AGG_YAML, csv, std::sync::Arc::clone(&arbitrator));
+    assert_eq!(report.counters.dlq_count, 0, "no records should DLQ");
+
+    assert_eq!(
+        arbitrator.consumer_count(),
+        SURVIVING_SOURCE_CONSUMERS,
+        "every per-window AggregateConsumer must be unregistered as its window finalizes — only \
+         the Source consumer should outlive the run; a regression that released only the last \
+         window (or none) leaves extra consumers registered"
+    );
+}
+
+/// A relaxed-CK pipeline: the `correlation_key` Source feeds an Aggregate
+/// whose totals an analytic-window Transform divides by `(total - 30)`. The
+/// HR group totals 30, so its ratio divides by zero, routes to the DLQ, and
+/// drives the retraction + recompute path. That path keeps the Aggregate's
+/// `HashAggregator` parked on `relaxed_aggregator_states` so the commit
+/// phase can retract and re-finalize against it, unlike a strict aggregate
+/// that finalizes and discards in one step.
+const RELAXED_CK_AGG_YAML: &str = r#"
+pipeline:
+  name: relaxed_ck_agg_consumer_release
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: src
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: transform
+    name: running
+    input: dept_totals
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+        emit ratio = 1 / (total - 30)
+      analytic_window:
+        group_by: [department]
+  - type: output
+    name: out
+    input: running
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+/// A relaxed-CK Aggregate parks its `HashAggregator` for the commit phase's
+/// retract + re-finalize iterations, so its memory consumer must stay
+/// registered while that state is live and be unregistered the moment it is
+/// dropped — not retained for the rest of the run.
+///
+/// The consumer's lifetime is tied to `relaxed_aggregator_states`: a
+/// successfully-finalized relaxed aggregate releases its consumer at the
+/// top-scope teardown that drains that map after the walk; a degraded one
+/// releases it at the `remove` that discards the aggregator mid-run. Either
+/// way no `AggregateConsumer` survives the run, so only the Source consumer
+/// remains. A regression that drops the parked aggregator without
+/// unregistering its consumer would leave the relaxed aggregate's
+/// `value_heap_bytes` summed into `sum_consumer_usage` for the rest of the
+/// run, with an extra consumer in the registry. The huge budget keeps the
+/// run off the spill/back-pressure path entirely, so the result is
+/// deterministic regardless of real RSS under parallel `cargo test`.
+#[test]
+fn finalized_relaxed_ck_aggregate_releases_its_consumer() {
+    let arbitrator = huge_budget_arbitrator();
+
+    // HR totals 30 -> `1 / (30 - 30)` divides by zero -> DLQ -> the
+    // retraction/recompute path exercises the parked relaxed aggregator.
+    let csv = "order_id,department,amount\n\
+        O1,HR,10\n\
+        O2,HR,20\n\
+        O3,ENG,100\n\
+        O4,ENG,200\n";
+    let report = run_with_arbitrator(RELAXED_CK_AGG_YAML, csv, std::sync::Arc::clone(&arbitrator));
+    assert!(
+        report.counters.dlq_count > 0,
+        "the divide-by-zero on the HR group must route to the DLQ, driving the relaxed retraction \
+         path that parks the aggregator on relaxed_aggregator_states"
+    );
+
+    assert_eq!(
+        arbitrator.consumer_count(),
+        SURVIVING_SOURCE_CONSUMERS,
+        "after the run drains, the relaxed Aggregate's consumer must be unregistered — only the \
+         Source consumer should outlive the run; a regression that drops the parked aggregator \
+         without unregistering its consumer leaves its accumulated bytes summed into \
+         sum_consumer_usage for the rest of the run"
     );
 }

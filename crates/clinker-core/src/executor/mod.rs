@@ -1771,6 +1771,17 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(id);
         }
 
+        // A relaxed-CK aggregate that finalized successfully keeps its
+        // aggregator parked across the commit phase's retract +
+        // re-finalize iterations, so its consumer stays registered for
+        // that whole window. Any state still present once the walk has
+        // drained never degraded; drop it and unregister its consumer
+        // here so the arbitrator's registry does not outlive the run
+        // with the retained aggregator's bytes still summed in.
+        for (_, retained) in std::mem::take(&mut ctx.relaxed_aggregator_states) {
+            ctx.memory_budget.unregister_consumer(retained.consumer_id);
+        }
+
         // Take the pipeline-scoped TempDir out of the context. Held
         // until the very end of the walk so any operator-side spill
         // files survive the topo loop; dropped explicitly below
