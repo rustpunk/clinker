@@ -27,7 +27,7 @@ source.sales:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 transform.active_only:
   ordering: <none>
@@ -35,7 +35,7 @@ transform.active_only:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 aggregation.by_dept:
   ordering: 
@@ -43,7 +43,7 @@ aggregation.by_dept:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 output.dept_totals:
   ordering: <none>
@@ -51,7 +51,7 @@ output.dept_totals:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===
 

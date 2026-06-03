@@ -3,18 +3,21 @@
 //! `scheduled_pass_order` is the production scheduler the executor's
 //! dispatch loop calls: it resolves the order nodes are dispatched in by
 //! asking [`MemoryArbitrator::next_runnable`] which runnable node to take
-//! next, instead of walking `topo_order` blindly. These tests pin its two
+//! next, instead of walking `topo_order` blindly. These tests pin its
 //! load-bearing behaviors against a real compiled [`ExecutionPlanDag`] and
 //! a real arbitrator (no mock hint):
 //!
 //! - With no volume estimates every node predicts `0` bytes, so selection
 //!   collapses to lowest topo index and the resolved order is byte-for-byte
 //!   `topo_order` — the "no-estimates == today's order" determinism floor.
-//! - With real file-size estimates the freed-on-complete tier takes a ready
-//!   blocking Aggregate over a lower-indexed fresh Source (reclaiming its
-//!   accumulated state before the next buffer charges), and the headroom-fit
-//!   tier takes a fitting node over a lower-indexed one that would overflow
-//!   the budget. Both are genuine reorders away from stable topo index.
+//! - With real file-size estimates the immediate freed-on-complete tier takes
+//!   a ready blocking Aggregate over a lower-indexed fresh Source (reclaiming
+//!   its accumulated state before the next buffer charges) — outranking even
+//!   the Source's larger downstream subtree reclaim; the subtree-reclaim tier
+//!   elects the heavy chain's Source ahead of a lower-indexed light Source
+//!   when neither frees anything immediately; and the headroom-fit tier takes
+//!   a fitting node over a lower-indexed one that would overflow the budget.
+//!   Each is a genuine reorder away from stable topo index.
 
 use super::*;
 use crate::config::{CompileContext, parse_config};
@@ -142,19 +145,29 @@ fn no_estimates_reproduces_topo_order_exactly() {
     );
 }
 
-/// The freed-on-complete tiebreak reorders away from stable topo index:
-/// when the runnable frontier offers BOTH a fresh Source (frees nothing on
-/// drain) and a blocking Aggregate ready to drain (frees its accumulated
-/// state), `next_runnable` takes the Aggregate even though the Source has a
-/// lower topo index. Draining the Aggregate first reclaims headroom for the
-/// budget before the next Source charges its buffer.
+/// The immediate freed-on-complete tier reorders away from stable topo
+/// index AND outranks a larger downstream subtree reclaim: when the runnable
+/// frontier offers BOTH a fresh Source (frees nothing the instant it drains,
+/// but whose downstream Aggregate will eventually reclaim a large state) and
+/// a blocking Aggregate ready to drain (frees its accumulated state NOW),
+/// `next_runnable` takes the ready Aggregate even though the Source has the
+/// lower topo index AND the larger subtree reclaim. Draining the ready
+/// Aggregate reclaims headroom this step, which is the peak-minimizing
+/// choice; chasing the Source's larger-but-eventual reclaim would instead
+/// charge its buffer while the ready Aggregate's state still sits.
+///
+/// The heavy Source's chain (`large.csv`, 512 rows) accumulates strictly
+/// more than the light chain's Aggregate (`small.csv`, 64 rows), so the
+/// up-propagated subtree reclaim on `src_large` exceeds `agg_small`'s
+/// immediate freed — making this the exact case the immediate-before-subtree
+/// tier ordering exists to resolve.
 ///
 /// This drives `next_runnable` directly with a frontier the executor's
 /// dispatch loop produces mid-walk (the same call `scheduled_pass_order`
 /// makes each step), pinning the selection rule on the real plan's
 /// predictions rather than a mock hint.
 #[test]
-fn freed_tiebreak_prefers_draining_blocking_aggregate_over_fresh_source() {
+fn immediate_freed_outranks_larger_subtree_reclaim_of_a_fresh_source() {
     let tmp = tempfile::tempdir().unwrap();
     let small_len = write_csv(tmp.path(), "small.csv", 64);
     let large_len = write_csv(tmp.path(), "large.csv", 512);
@@ -166,15 +179,27 @@ fn freed_tiebreak_prefers_draining_blocking_aggregate_over_fresh_source() {
     let agg_small = node_idx(dag, "agg_small");
     let src_large = node_idx(dag, "src_large");
 
-    // Premise: the blocking Aggregate predicts freeing its accumulated input,
-    // the fresh Source frees nothing, yet the Source sorts earlier in topo.
+    // Premise: the ready blocking Aggregate frees its accumulated input the
+    // instant it drains; the fresh Source frees NOTHING immediately but its
+    // chain unlocks a strictly LARGER eventual reclaim (the heavy chain's
+    // Aggregate state propagated up). The Source also sorts earlier in topo.
+    let agg_small_immediate = dag.node_properties[&agg_small].predicted_freed_bytes_on_complete;
+    let src_large_immediate = dag.node_properties[&src_large].predicted_freed_bytes_on_complete;
+    let src_large_subtree = dag.node_properties[&src_large].predicted_subtree_reclaim_bytes;
     assert!(
-        dag.node_properties[&agg_small].predicted_freed_bytes_on_complete > 0,
-        "agg_small must predict freeing its accumulated input"
+        agg_small_immediate > 0,
+        "agg_small must predict freeing its accumulated input the instant it drains"
     );
     assert_eq!(
-        dag.node_properties[&src_large].predicted_freed_bytes_on_complete, 0,
-        "a Source frees nothing on drain"
+        src_large_immediate, 0,
+        "a Source frees nothing the instant it drains"
+    );
+    assert!(
+        src_large_subtree > agg_small_immediate,
+        "the heavy chain's Source must carry a larger up-propagated subtree reclaim \
+         ({src_large_subtree}) than the light Aggregate's immediate freed \
+         ({agg_small_immediate}); otherwise this scenario does not exercise the \
+         immediate-before-subtree tier ordering"
     );
     let topo_pos = |idx: NodeIndex| dag.topo_order.iter().position(|&n| n == idx).unwrap();
 
@@ -191,14 +216,145 @@ fn freed_tiebreak_prefers_draining_blocking_aggregate_over_fresh_source() {
 
     assert_eq!(
         chosen, agg_small,
-        "freed-bytes tiebreak must drain the blocking Aggregate before charging the next Source, \
-         even though the Source has the lower topo index"
+        "immediate freed (drain-now reclaim) must drain the ready Aggregate before charging the \
+         fresh Source, even though the Source has the lower topo index and the larger eventual \
+         subtree reclaim"
     );
     // Confirm this is a genuine reorder: lowest-stable-index alone would have
     // taken the Source.
     assert!(
         topo_pos(src_large) < topo_pos(agg_small),
-        "premise: src_large has the lower topo index, so picking agg_small is a freed-bytes reorder"
+        "premise: src_large has the lower topo index, so picking agg_small is a real reorder"
+    );
+}
+
+/// Two independent `Source -> Aggregate -> Output` chains where the LIGHT
+/// chain sorts first in `topo_order`, so a blind topo walk (and the
+/// no-estimates determinism floor) would dispatch the light Source first.
+/// Heavy-first dispatch therefore requires the scheduler to reorder against
+/// stable topo index. The light chain is declared LAST because the
+/// topological sort emits the most-recently-declared source first, so
+/// declaring `src_light` last places it at topo index 0.
+const HEAVY_FIRST_YAML: &str = r#"
+pipeline:
+  name: heavy_first
+nodes:
+  - type: source
+    name: src_heavy
+    config:
+      name: src_heavy
+      type: csv
+      path: heavy.csv
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+  - type: source
+    name: src_light
+    config:
+      name: src_light
+      type: csv
+      path: light.csv
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+  - type: aggregate
+    name: agg_heavy
+    input: src_heavy
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit total = sum(v)
+  - type: aggregate
+    name: agg_light
+    input: src_light
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit total = sum(v)
+  - type: output
+    name: out_heavy
+    input: agg_heavy
+    config:
+      name: out_heavy
+      type: csv
+      path: out_heavy.csv
+      include_unmapped: true
+  - type: output
+    name: out_light
+    input: agg_light
+    config:
+      name: out_light
+      type: csv
+      path: out_light.csv
+      include_unmapped: true
+"#;
+
+/// The subtree-reclaim tier elects the heavy chain's Source first even
+/// though the light chain's Source sorts earlier in topo order: at the start
+/// of the walk both Sources are runnable and free nothing the instant they
+/// drain (immediate freed `0`), and a no-estimates walk would take the
+/// lower-topo-index light Source. The up-propagated subtree reclaim breaks
+/// that tie toward the heavy Source — its downstream Aggregate accumulates
+/// strictly more, so finishing its chain frees the most capacity.
+/// Front-loading the heavy chain is the whole point: it drains and releases
+/// its large state before the light chain's output has to coexist with it.
+///
+/// This exercises the full-DAG `scheduled_pass_order` walk (not a single
+/// `next_runnable` frontier), so it pins the production dispatch order the
+/// executor resolves.
+#[test]
+fn scheduler_elects_heavy_chain_source_before_lower_index_light_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let light_len = write_csv(tmp.path(), "light.csv", 64);
+    let heavy_len = write_csv(tmp.path(), "heavy.csv", 512);
+    assert!(light_len > 0 && heavy_len > light_len);
+
+    let plan = compile_dag(HEAVY_FIRST_YAML, tmp.path());
+    let dag = plan.dag();
+
+    let src_light = node_idx(dag, "src_light");
+    let src_heavy = node_idx(dag, "src_heavy");
+
+    // Premise: the light Source sorts earlier (lower topo index), both
+    // Sources free nothing the instant they drain, yet the heavy chain's
+    // Source carries the larger up-propagated subtree reclaim — so electing
+    // it first is a genuine reorder away from the determinism floor.
+    let topo_pos = |idx: NodeIndex| dag.topo_order.iter().position(|&n| n == idx).unwrap();
+    assert!(
+        topo_pos(src_light) < topo_pos(src_heavy),
+        "the light Source must sort earlier in topo order so heavy-first is a real reorder"
+    );
+    assert_eq!(
+        dag.node_properties[&src_light].predicted_freed_bytes_on_complete, 0,
+        "a Source frees nothing the instant it drains"
+    );
+    assert_eq!(
+        dag.node_properties[&src_heavy].predicted_freed_bytes_on_complete, 0,
+        "a Source frees nothing the instant it drains"
+    );
+    assert!(
+        dag.node_properties[&src_heavy].predicted_subtree_reclaim_bytes
+            > dag.node_properties[&src_light].predicted_subtree_reclaim_bytes,
+        "the heavy chain's Source must carry the larger up-propagated subtree reclaim"
+    );
+
+    // A huge budget so the headroom-fit tier never fires: both Sources fit,
+    // so selection turns purely on the freed tiers — exactly the regime the
+    // task specifies (no spill, no back-pressure, fully decoupled from RSS).
+    let arbitrator = huge_budget_arbitrator();
+    let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
+    let order = scheduled_pass_order(dag, &arbitrator, &all);
+    let pos = |idx: NodeIndex| order.iter().position(|&n| n == idx).unwrap();
+
+    assert!(
+        pos(src_heavy) < pos(src_light),
+        "the scheduler must elect the heavy chain's Source before the lower-topo-index light \
+         Source (dispatch positions: heavy={}, light={}), front-loading the chain whose \
+         completion frees the most capacity",
+        pos(src_heavy),
+        pos(src_light),
     );
 }
 

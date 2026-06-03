@@ -39,7 +39,7 @@ source.orders:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 sort.__correlation_sort_orders:
   ordering: order_id
@@ -47,7 +47,7 @@ sort.__correlation_sort_orders:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=20, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=20, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 transform.windowed:
   ordering: <none>
@@ -55,7 +55,7 @@ transform.windowed:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 aggregation.dept_totals:
   ordering: <none>
@@ -63,7 +63,7 @@ aggregation.dept_totals:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: materialized
-  arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 output.out:
   ordering: <none>
@@ -71,7 +71,7 @@ output.out:
   partitioning: Single
   partitioning_provenance: SingleStream
   buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===
 

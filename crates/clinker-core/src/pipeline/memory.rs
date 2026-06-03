@@ -445,10 +445,22 @@ pub trait SchedulingHint: Send + Sync {
 
     /// Predicted bytes `id` releases back to the budget when it finishes
     /// draining (a blocking operator drops its accumulated state on its
-    /// last emit; a streaming node frees nothing). Used only as a
-    /// tiebreak: running the node that frees the most soonest reclaims
-    /// headroom for everything downstream.
+    /// last emit; a streaming node frees nothing). Used as the higher-
+    /// priority freed tiebreak: a node that frees memory the instant it
+    /// completes (a ready blocking operator) reclaims headroom *now*, so
+    /// it is preferred over one that merely unlocks an eventual reclaim.
     fn predicted_freed_bytes_on_complete(&self, id: NodeIndex) -> u64;
+
+    /// Predicted largest reclaimable footprint anywhere in the subtree
+    /// rooted at `id` — the headroom that running this node's chain to
+    /// completion eventually unlocks (for a fresh Source, its downstream
+    /// blocking operator's accumulated state). The lower-priority freed
+    /// tiebreak: it distinguishes candidates that free nothing *now* but
+    /// whose chains differ in eventual reclaim, so the scheduler launches
+    /// the independent chain whose completion frees the most first. `0`
+    /// when nothing downstream accumulates, so it never disturbs the
+    /// "no-estimates == today's order" floor.
+    fn predicted_subtree_reclaim_bytes(&self, id: NodeIndex) -> u64;
 
     /// Position of `id` in the plan's canonical topological order — the
     /// deterministic final tiebreak. This must be the SAME order the
@@ -1020,13 +1032,25 @@ impl MemoryArbitrator {
         let remaining_headroom = self.soft_limit().saturating_sub(self.sum_consumer_usage());
 
         // Rank key per candidate, smaller is better:
-        //   (0 if fits else 1, -freed, stable_index)
-        // `Reverse` on freed flips max-freed to a min on the sort key so
-        // the whole comparison is a single ascending min over a tuple.
+        //   (0 if fits else 1, -immediate_freed, -subtree_reclaim, stable_index)
+        // `Reverse` on each freed term flips max-freed to a min on the sort
+        // key so the whole comparison is a single ascending min over a tuple.
         // `predicted_peak_bytes == 0` (unknown) is always <= headroom, so
         // an unknown node fits — it never trips the filter and falls
         // straight through to the stable-index floor, preserving today's
         // order when no estimates exist.
+        //
+        // The two freed terms are ordered immediate-before-subtree on
+        // purpose: a node that reclaims headroom the instant it completes
+        // (a ready blocking operator) is always taken over one that only
+        // unlocks an eventual reclaim (a fresh Source whose downstream
+        // Aggregate will drain later). Draining the ready operator first is
+        // the peak-minimizing greedy choice; the subtree term then breaks
+        // ties only among candidates with equal immediate reclaim — the
+        // fresh Sources of independent chains — front-loading the chain
+        // whose completion frees the most. With no estimates both terms are
+        // `0` for every candidate, so selection still collapses to the
+        // stable-index floor.
         runnable
             .iter()
             .copied()
@@ -1035,6 +1059,7 @@ impl MemoryArbitrator {
                 (
                     u8::from(!fits),
                     std::cmp::Reverse(hint.predicted_freed_bytes_on_complete(id)),
+                    std::cmp::Reverse(hint.predicted_subtree_reclaim_bytes(id)),
                     hint.stable_index(id),
                 )
             })
@@ -1841,19 +1866,20 @@ mod tests {
 
     /// In-memory [`SchedulingHint`] for the `next_runnable` gate tests.
     /// Each `NodeIndex` maps to `(predicted_peak, predicted_freed,
-    /// stable_index)`. An index absent from the map answers `(0, 0,
-    /// usize::MAX)`, mirroring how the production `ExecutionPlanDag` impl
-    /// treats a node missing from `node_properties` / `topo_order`.
+    /// predicted_subtree_reclaim, stable_index)`. An index absent from the
+    /// map answers `(0, 0, 0, usize::MAX)`, mirroring how the production
+    /// `ExecutionPlanDag` impl treats a node missing from `node_properties`
+    /// / `topo_order`.
     struct MockHint {
-        entries: std::collections::HashMap<NodeIndex, (u64, u64, usize)>,
+        entries: std::collections::HashMap<NodeIndex, (u64, u64, u64, usize)>,
     }
 
     impl MockHint {
-        fn new(entries: &[(NodeIndex, u64, u64, usize)]) -> Self {
+        fn new(entries: &[(NodeIndex, u64, u64, u64, usize)]) -> Self {
             Self {
                 entries: entries
                     .iter()
-                    .map(|&(id, peak, freed, idx)| (id, (peak, freed, idx)))
+                    .map(|&(id, peak, freed, subtree, idx)| (id, (peak, freed, subtree, idx)))
                     .collect(),
             }
         }
@@ -1861,15 +1887,18 @@ mod tests {
 
     impl SchedulingHint for MockHint {
         fn predicted_peak_bytes(&self, id: NodeIndex) -> u64 {
-            self.entries.get(&id).map(|&(p, _, _)| p).unwrap_or(0)
+            self.entries.get(&id).map(|&(p, _, _, _)| p).unwrap_or(0)
         }
         fn predicted_freed_bytes_on_complete(&self, id: NodeIndex) -> u64 {
-            self.entries.get(&id).map(|&(_, f, _)| f).unwrap_or(0)
+            self.entries.get(&id).map(|&(_, f, _, _)| f).unwrap_or(0)
+        }
+        fn predicted_subtree_reclaim_bytes(&self, id: NodeIndex) -> u64 {
+            self.entries.get(&id).map(|&(_, _, s, _)| s).unwrap_or(0)
         }
         fn stable_index(&self, id: NodeIndex) -> usize {
             self.entries
                 .get(&id)
-                .map(|&(_, _, s)| s)
+                .map(|&(_, _, _, s)| s)
                 .unwrap_or(usize::MAX)
         }
     }
@@ -1900,7 +1929,7 @@ mod tests {
         // `overflows` would free far more, but its peak (600) exceeds the
         // 500 headroom; `fits` (peak 400) fits. Tier 1 must win over the
         // tier-2 freed-bytes pull.
-        let hint = MockHint::new(&[(fits, 400, 0, 0), (overflows, 600, 10_000, 1)]);
+        let hint = MockHint::new(&[(fits, 400, 0, 0, 0), (overflows, 600, 10_000, 0, 1)]);
         let chosen = arb.next_runnable(&[fits, overflows], &hint);
         assert_eq!(chosen, fits, "fitting node must beat a non-fitting one");
         // Order-independent: same result when the slice lists them reversed.
@@ -1914,7 +1943,7 @@ mod tests {
         let arb = arbitrator_with_headroom(800, 300);
         let small_freed = NodeIndex::new(0);
         let big_freed = NodeIndex::new(1);
-        let hint = MockHint::new(&[(small_freed, 100, 50, 0), (big_freed, 200, 400, 1)]);
+        let hint = MockHint::new(&[(small_freed, 100, 50, 0, 0), (big_freed, 200, 400, 0, 1)]);
         let chosen = arb.next_runnable(&[small_freed, big_freed], &hint);
         assert_eq!(
             chosen, big_freed,
@@ -1922,6 +1951,59 @@ mod tests {
         );
         let chosen_rev = arb.next_runnable(&[big_freed, small_freed], &hint);
         assert_eq!(chosen_rev, big_freed);
+    }
+
+    #[test]
+    fn next_runnable_breaks_freed_tie_by_larger_subtree_reclaim() {
+        // Remaining headroom 500; both candidates fit and free nothing the
+        // instant they complete (immediate freed 0 — the shape of two fresh
+        // Sources feeding independent blocking chains). Only the downstream
+        // subtree reclaim distinguishes them: the candidate whose chain
+        // unlocks the larger eventual reclaim must win, so the scheduler
+        // front-loads the heavier chain.
+        let arb = arbitrator_with_headroom(800, 300);
+        let light_chain_src = NodeIndex::new(0);
+        let heavy_chain_src = NodeIndex::new(1);
+        // light has the LOWER stable index, so a subtree-blind selection
+        // would take it; the heavier subtree reclaim must override that.
+        let hint = MockHint::new(&[
+            (light_chain_src, 100, 0, 1_000, 0),
+            (heavy_chain_src, 200, 0, 9_000, 1),
+        ]);
+        let chosen = arb.next_runnable(&[light_chain_src, heavy_chain_src], &hint);
+        assert_eq!(
+            chosen, heavy_chain_src,
+            "with equal immediate freed, the larger downstream subtree reclaim wins, \
+             front-loading the heavier independent chain even though it sorts later"
+        );
+        let chosen_rev = arb.next_runnable(&[heavy_chain_src, light_chain_src], &hint);
+        assert_eq!(chosen_rev, heavy_chain_src);
+    }
+
+    #[test]
+    fn next_runnable_prefers_immediate_freed_over_larger_subtree_reclaim() {
+        // A ready blocking operator (immediate freed > 0) competes against a
+        // fresh Source whose chain unlocks a far larger eventual reclaim
+        // (subtree reclaim 50_000, immediate 0). Draining the ready operator
+        // reclaims headroom NOW, which is the peak-minimizing choice; the
+        // larger-but-eventual subtree reclaim must not pull selection toward
+        // the fresh Source. This is the tier ordering that keeps the
+        // "drain a ready aggregate before charging the next source" behavior
+        // intact once subtree reclaim is propagated up to Sources.
+        let arb = arbitrator_with_headroom(800, 300);
+        let ready_blocking = NodeIndex::new(0);
+        let fresh_source = NodeIndex::new(1);
+        let hint = MockHint::new(&[
+            (ready_blocking, 100, 400, 400, 0),
+            (fresh_source, 200, 0, 50_000, 1),
+        ]);
+        let chosen = arb.next_runnable(&[ready_blocking, fresh_source], &hint);
+        assert_eq!(
+            chosen, ready_blocking,
+            "immediate freed (drain-now reclaim) must outrank a larger eventual subtree reclaim"
+        );
+        let chosen_rev = arb.next_runnable(&[fresh_source, ready_blocking], &hint);
+        assert_eq!(chosen_rev, ready_blocking);
     }
 
     #[test]
@@ -1935,7 +2017,11 @@ mod tests {
         // stable_index ordering (low=2, mid=4, high=9) is deliberately
         // unrelated to the NodeIndex values, proving the tiebreak keys off
         // the hint's stable index (topo position) and not the raw index.
-        let hint = MockHint::new(&[(low, 100, 200, 2), (mid, 100, 200, 4), (high, 100, 200, 9)]);
+        let hint = MockHint::new(&[
+            (low, 100, 200, 0, 2),
+            (mid, 100, 200, 0, 4),
+            (high, 100, 200, 0, 9),
+        ]);
         let chosen = arb.next_runnable(&[high, mid, low], &hint);
         assert_eq!(
             chosen, low,
@@ -1959,7 +2045,7 @@ mod tests {
         let c = NodeIndex::new(8);
         // stable_index = topo position; a is first (0), c second (1),
         // b last (2).
-        let hint = MockHint::new(&[(a, 0, 0, 0), (c, 0, 0, 1), (b, 0, 0, 2)]);
+        let hint = MockHint::new(&[(a, 0, 0, 0, 0), (c, 0, 0, 0, 1), (b, 0, 0, 0, 2)]);
         // Pass the slice in an order that does NOT match topo position to
         // prove the result is the lowest stable index, not the first slot.
         let chosen = arb.next_runnable(&[b, c, a], &hint);

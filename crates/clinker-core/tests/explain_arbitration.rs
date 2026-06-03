@@ -148,12 +148,14 @@ fn explain_arbitration_semantics_are_not_inverted() {
     // sentinel — a deterministic, environment-independent value.
     assert_eq!(
         arbitration_line_for(&text, "source.orders"),
-        "spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B",
+        "spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, \
+         predicted_subtree_reclaim=0B",
         "Source frees zero on spill; only its pause is a real lever"
     );
     assert_eq!(
         arbitration_line_for(&text, "aggregation.dept_totals"),
-        "spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B",
+        "spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, \
+         predicted_subtree_reclaim=0B",
         "hash Aggregate accumulates the full group table and spills it; it never pauses"
     );
 
@@ -199,13 +201,17 @@ fn explain_nonzero_predictions_are_surfaced() {
 
     assert_eq!(
         arbitration_line_for(&text, "source.orders"),
-        "spill_priority=N/A, can_back_pressure=true, predicted_peak=1K, predicted_freed=0B",
-        "a sized Source seeds its file size as peak and frees nothing live"
+        "spill_priority=N/A, can_back_pressure=true, predicted_peak=1K, predicted_freed=0B, \
+         predicted_subtree_reclaim=1K",
+        "a sized Source seeds its file size as peak, frees nothing live the instant it drains, \
+         but its downstream Aggregate's accumulated state propagates up as its subtree reclaim"
     );
     assert_eq!(
         arbitration_line_for(&text, "aggregation.dept_totals"),
-        "spill_priority=30, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K",
-        "a blocking hash Aggregate's peak is its accumulated input and it frees that on drain"
+        "spill_priority=30, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K, \
+         predicted_subtree_reclaim=1K",
+        "a blocking hash Aggregate's peak is its accumulated input and it frees that on drain; \
+         its subtree reclaim equals its own freed (nothing downstream accumulates more)"
     );
 
     // The node_buffer slot between the sized Source and the Aggregate holds

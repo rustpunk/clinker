@@ -1659,7 +1659,8 @@ impl PipelineExecutor {
         // a frontier scheduler over each pass's candidate set: at every
         // step it asks `MemoryArbitrator::next_runnable` which runnable
         // node to dispatch by predicted memory impact (headroom fit, then
-        // largest freed-on-complete, then stable topo index). With no
+        // largest immediate freed-on-complete, then largest downstream
+        // subtree reclaim, then stable topo index). With no
         // volume estimates the selection collapses to lowest topo index,
         // reproducing the prior front-to-back walk byte-for-byte; record
         // output is independent of dispatch order, so only peak resident
@@ -2892,8 +2893,9 @@ fn has_single_outgoing(
 /// At each step the runnable frontier is every not-yet-emitted candidate
 /// whose graph predecessors *within `candidates`* are all emitted. The
 /// arbitrator picks one frontier node by predicted memory impact (headroom
-/// fit, then largest freed-on-complete, then stable topo index); finishing
-/// the chosen node may open new frontier members for the next step.
+/// fit, then largest immediate freed-on-complete, then largest downstream
+/// subtree reclaim, then stable topo index); finishing the chosen node may
+/// open new frontier members for the next step.
 ///
 /// Restricting the predecessor check to `candidates` is what lets Pass 1
 /// run before Pass 2: an init-phase node is gated only by its init-phase
@@ -2904,9 +2906,9 @@ fn has_single_outgoing(
 /// total within the closure, not a relaxation of any real dependency.
 ///
 /// Determinism: with no volume estimates every candidate's
-/// `predicted_peak_bytes` is `0`, so the arbitrator's headroom and
-/// freed-bytes tiers are all-equal and selection collapses to the lowest
-/// stable topo index. Greedily taking the lowest-topo-index frontier node
+/// `predicted_peak_bytes` is `0`, so the arbitrator's headroom, freed-bytes,
+/// and subtree-reclaim tiers are all-equal and selection collapses to the
+/// lowest stable topo index. Greedily taking the lowest-topo-index frontier node
 /// reproduces a plain front-to-back walk of `topo_order` byte-for-byte —
 /// scheduling reorders the dispatch sequence only when real estimates
 /// distinguish the candidates, and never changes record output, which is

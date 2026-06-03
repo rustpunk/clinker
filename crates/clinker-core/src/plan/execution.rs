@@ -1432,24 +1432,27 @@ impl ExecutionPlanDag {
                 // from the runtime `MemoryConsumer` impls (see
                 // `arbitration_class`). Lower `spill_priority` = elected
                 // for spill first; `N/A` = the stage holds no spillable
-                // state. The two `predicted_*` values are the scheduler's
+                // state. The three `predicted_*` values are the scheduler's
                 // inputs: `predicted_peak` is the live volume this node is
                 // expected to hold at its peak, `predicted_freed` is what it
-                // returns to the budget when it drains — the same numbers
-                // `next_runnable` weighs (headroom-fit on peak, freed-bytes
-                // tiebreak). Both render `0B` when no file-size seed reached
-                // this node. Two-space indent so the buffer-class slicers
-                // (which stop at the first non-indented line) keep reading
-                // the stanza.
+                // returns to the budget the instant it drains, and
+                // `predicted_subtree_reclaim` is the largest reclaim its
+                // whole downstream subtree eventually unlocks — the same
+                // numbers `next_runnable` weighs (headroom-fit on peak, then
+                // immediate-freed, then subtree-reclaim tiebreaks). All
+                // render `0B` when no file-size seed reached this node.
+                // Two-space indent so the buffer-class slicers (which stop at
+                // the first non-indented line) keep reading the stanza.
                 let ac = arbitration_class(node);
                 out.push_str(&format!(
                     "  arbitration: spill_priority={}, can_back_pressure={}, \
-                     predicted_peak={}, predicted_freed={}\n",
+                     predicted_peak={}, predicted_freed={}, predicted_subtree_reclaim={}\n",
                     ac.spill_priority
                         .map_or_else(|| "N/A".to_string(), |p| p.to_string()),
                     ac.can_back_pressure,
                     format_bytes(props.predicted_peak_bytes),
                     format_bytes(props.predicted_freed_bytes_on_complete),
+                    format_bytes(props.predicted_subtree_reclaim_bytes),
                 ));
                 out.push('\n');
             }
@@ -3753,6 +3756,12 @@ impl ExecutionPlanDag {
     ///   when it finishes draining. A blocking operator frees the state it
     ///   accumulated (its peak); a streaming/fused operator and a Source
     ///   free nothing live, so they report `0`.
+    /// - `predicted_subtree_reclaim_bytes` — the largest reclaimable footprint
+    ///   anywhere in the node's downstream subtree, propagated up in a second
+    ///   reverse-topological pass so a Source's value reflects the eventual
+    ///   reclaim its blocking descendants unlock. It is the scheduler's
+    ///   lowest-priority tiebreak, used to front-load the independent chain
+    ///   whose completion frees the most.
     ///
     /// Blocking-ness is read from [`arbitration_class`] — the same plan-time
     /// mirror of the runtime `MemoryConsumer` impls that `--explain` uses, so
@@ -3844,6 +3853,61 @@ impl ExecutionPlanDag {
             if let Some(props) = self.node_properties.get_mut(&idx) {
                 props.predicted_peak_bytes = peak;
                 props.predicted_freed_bytes_on_complete = freed;
+            }
+        }
+
+        // Second pass, reverse topological order: propagate the largest
+        // reclaimable footprint of each node's downstream chain UP to the
+        // node itself. A node's `predicted_subtree_reclaim_bytes` is the max
+        // of its own `predicted_freed_bytes_on_complete` and the subtree
+        // reclaim of every immediate successor THIS node solely feeds — a
+        // successor with exactly one incoming edge. Walking children before
+        // parents (reverse of the forward topo order) guarantees each
+        // successor's value is final before its predecessor reads it.
+        //
+        // This is what gives a Source feeding a blocking chain a non-zero
+        // reclaim value: the Source frees nothing itself, but launching it is
+        // the only path to the point where its downstream Aggregate can drain,
+        // so the Source inherits that Aggregate's reclaimable state. The
+        // scheduler uses it to front-load the chain whose completion frees the
+        // most, while keeping immediate (drain-now) reclaim a strictly higher
+        // priority.
+        //
+        // Propagation stops at a convergence node — a successor with more than
+        // one incoming edge, e.g. the `Combine` two independent chains feed.
+        // Reaching that node requires EVERY parent chain to finish, so no
+        // single upstream chain alone "unlocks" its reclaim; charging the
+        // whole join to each feeding Source would make every Source's value
+        // identical and erase the per-chain distinction the scheduler needs.
+        // The join keeps its own reclaim (it elects itself once all inputs are
+        // ready and it can drain), and each feeding chain is ranked by the
+        // reclaim it owns up to that join. `0` propagates inertly, so the
+        // determinism floor — all-zero estimates reproduce topo order — is
+        // untouched.
+        for &idx in self.topo_order.iter().rev() {
+            if !self.node_properties.contains_key(&idx) {
+                continue;
+            }
+            let own_freed = self.node_properties[&idx].predicted_freed_bytes_on_complete;
+            let children_reclaim = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .filter(|&c| {
+                    // Only a child this node solely feeds carries its reclaim
+                    // up; a convergence node (in-degree > 1) does not, so its
+                    // post-join reclaim is not double-counted onto every
+                    // feeding chain.
+                    self.graph
+                        .neighbors_directed(c, petgraph::Direction::Incoming)
+                        .count()
+                        == 1
+                })
+                .filter_map(|c| self.node_properties.get(&c))
+                .map(|p| p.predicted_subtree_reclaim_bytes)
+                .max()
+                .unwrap_or(0);
+            if let Some(props) = self.node_properties.get_mut(&idx) {
+                props.predicted_subtree_reclaim_bytes = own_freed.max(children_reclaim);
             }
         }
     }
@@ -4126,7 +4190,8 @@ impl ExecutionPlanDag {
 /// Exposes the plan's per-node volume predictions and topological order to
 /// [`MemoryArbitrator::next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable).
 ///
-/// The byte predictions are the plan-time estimates `derive_volume_estimates`
+/// The byte predictions — peak, immediate freed-on-complete, and downstream
+/// subtree reclaim — are the plan-time estimates `derive_volume_estimates`
 /// stamps onto each node's [`NodeProperties`]; the stable index is the node's
 /// position in [`topo_order`](ExecutionPlanDag::topo_order), which is the same
 /// order the executor walks the DAG. A node absent from `node_properties`
@@ -4144,6 +4209,13 @@ impl crate::pipeline::memory::SchedulingHint for ExecutionPlanDag {
         self.node_properties
             .get(&id)
             .map(|p| p.predicted_freed_bytes_on_complete)
+            .unwrap_or(0)
+    }
+
+    fn predicted_subtree_reclaim_bytes(&self, id: NodeIndex) -> u64 {
+        self.node_properties
+            .get(&id)
+            .map(|p| p.predicted_subtree_reclaim_bytes)
             .unwrap_or(0)
     }
 

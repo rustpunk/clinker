@@ -5,13 +5,17 @@
 //! file's directory, never the process CWD) and propagates it forward in
 //! topological order. A blocking node (hash Aggregate) carries a non-zero
 //! `predicted_freed_bytes_on_complete` equal to the volume it accumulates;
-//! streaming/fused nodes free nothing.
+//! streaming/fused nodes free nothing. A second, reverse-topological pass
+//! then propagates `predicted_subtree_reclaim_bytes` UP each chain — the
+//! largest reclaim a node's downstream chain unlocks — stopping at a
+//! convergence node so independent chains feeding a `Combine` keep distinct
+//! per-chain values.
 //!
-//! These tests pin the seed, the unknown-fallback, and the propagation +
-//! freed-on-complete model. The estimates are surfaced in `--explain` text
-//! (see `explain_arbitration.rs`) and in `--explain --format json` under
-//! `node_properties.<name>.predicted_peak_bytes` /
-//! `predicted_freed_bytes_on_complete`; the data goldens never move.
+//! These tests pin the seed, the unknown-fallback, the forward propagation +
+//! freed-on-complete model, and the upward subtree-reclaim propagation. The
+//! estimates are surfaced in `--explain` text (see `explain_arbitration.rs`)
+//! and in `--explain --format json` under `node_properties.<name>`; the data
+//! goldens never move.
 
 use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::plan::compiled::CompiledPlan;
@@ -84,6 +88,28 @@ nodes:
     assert_eq!(
         props["dept_totals"]["predicted_freed_bytes_on_complete"].as_u64(),
         Some(len)
+    );
+    // Subtree reclaim is the largest reclaim along each node's downstream
+    // chain. The Aggregate's own freed (its accumulated input) is the only
+    // reclaimable state, so both the Aggregate and the Source feeding it
+    // carry it as their subtree reclaim; the Source frees nothing itself but
+    // inherits the Aggregate's reclaim because launching it unlocks that
+    // drain. The terminal Output frees nothing and has no descendants, so
+    // its subtree reclaim is `0`.
+    assert_eq!(
+        props["orders"]["predicted_subtree_reclaim_bytes"].as_u64(),
+        Some(len),
+        "the Source inherits its downstream Aggregate's reclaim as its subtree reclaim"
+    );
+    assert_eq!(
+        props["dept_totals"]["predicted_subtree_reclaim_bytes"].as_u64(),
+        Some(len),
+        "the Aggregate's subtree reclaim equals its own freed-on-complete"
+    );
+    assert_eq!(
+        props["out"]["predicted_subtree_reclaim_bytes"].as_u64(),
+        Some(0),
+        "a terminal Output frees nothing and has no descendants, so its subtree reclaim is 0"
     );
 }
 
@@ -365,4 +391,126 @@ fn determinism_identical_plan_identical_sizes() {
         props_for_node(dag, "orders").predicted_peak_bytes
     };
     assert_eq!(mk(), mk());
+}
+
+/// Subtree-reclaim propagation stops at a convergence node: two independent
+/// `Source -> Aggregate` chains feeding a `Combine` must keep DISTINCT
+/// per-chain subtree-reclaim values, so the scheduler can front-load the
+/// heavier chain's Source. If the shared `Combine`'s reclaim flowed up to
+/// both feeding chains, every Source would carry the same (combined) value
+/// and the per-chain distinction the heavy-first policy needs would vanish.
+#[test]
+fn subtree_reclaim_stops_at_a_combine_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Heavy chain's input is strictly larger than the light chain's, so its
+    // Aggregate accumulates more — the per-chain reclaim the Source inherits.
+    let heavy_len = write_file(
+        tmp.path(),
+        "heavy.csv",
+        "k,v\ng,1\ng,2\ng,3\ng,4\ng,5\ng,6\ng,7\ng,8\n",
+    );
+    let light_len = write_file(tmp.path(), "light.csv", "k,v\ng,9\n");
+    assert!(heavy_len > light_len);
+
+    let yaml = r#"
+pipeline:
+  name: converge
+nodes:
+  - type: source
+    name: heavy_src
+    config:
+      name: heavy_src
+      type: csv
+      path: heavy.csv
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+  - type: source
+    name: light_src
+    config:
+      name: light_src
+      type: csv
+      path: light.csv
+      schema:
+        - { name: k, type: string }
+        - { name: v, type: int }
+  - type: aggregate
+    name: heavy_agg
+    input: heavy_src
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit total = sum(v)
+  - type: aggregate
+    name: light_agg
+    input: light_src
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit total = sum(v)
+  - type: combine
+    name: joined
+    input:
+      h: heavy_agg
+      l: light_agg
+    config:
+      where: "h.k == l.k"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit k = h.k
+        emit ht = h.total
+        emit lt = l.total
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: joined
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let plan = compile_anchored(yaml, tmp.path());
+    let dag = plan.dag();
+
+    let heavy_src = props_for_node(dag, "heavy_src");
+    let light_src = props_for_node(dag, "light_src");
+    let heavy_agg = props_for_node(dag, "heavy_agg");
+    let light_agg = props_for_node(dag, "light_agg");
+    let joined = props_for_node(dag, "joined");
+
+    // Each chain's Aggregate reclaims its own accumulated input; the Source
+    // inherits that as its subtree reclaim. The values are DISTINCT — the
+    // heavy chain's exceeds the light chain's — which is exactly what lets
+    // the scheduler elect the heavy Source first.
+    assert_eq!(
+        heavy_src.predicted_subtree_reclaim_bytes, heavy_agg.predicted_freed_bytes_on_complete,
+        "the heavy Source inherits its own chain's Aggregate reclaim, not the shared Combine's"
+    );
+    assert_eq!(
+        light_src.predicted_subtree_reclaim_bytes, light_agg.predicted_freed_bytes_on_complete,
+        "the light Source inherits its own chain's Aggregate reclaim, not the shared Combine's"
+    );
+    assert!(
+        heavy_src.predicted_subtree_reclaim_bytes > light_src.predicted_subtree_reclaim_bytes,
+        "the per-chain reclaim must stay distinct so heavy-first is decidable \
+         (heavy={}, light={})",
+        heavy_src.predicted_subtree_reclaim_bytes,
+        light_src.predicted_subtree_reclaim_bytes,
+    );
+
+    // The post-join reclaim (the Combine's own accumulated state) must NOT
+    // have flowed up to either feeding Source: a Source's value equals its
+    // own chain's Aggregate reclaim, strictly below the Combine's, which
+    // accumulates both inputs.
+    assert!(
+        joined.predicted_freed_bytes_on_complete > heavy_src.predicted_subtree_reclaim_bytes,
+        "the Combine accumulates both chains, so its own reclaim exceeds either feeding chain's — \
+         proving the join's reclaim was not charged onto the Sources (combine={}, heavy_src={})",
+        joined.predicted_freed_bytes_on_complete,
+        heavy_src.predicted_subtree_reclaim_bytes,
+    );
 }

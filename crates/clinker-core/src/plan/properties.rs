@@ -74,6 +74,41 @@ pub struct NodeProperties {
     /// alongside [`Self::predicted_peak_bytes`]: the scheduler uses it as the
     /// freed-bytes tiebreak when two runnable nodes fit headroom equally.
     pub predicted_freed_bytes_on_complete: u64,
+
+    /// Largest reclaimable footprint along this node's downstream chain, up
+    /// to the first convergence — the headroom that running this node's chain
+    /// to completion unlocks. `0` means "unknown" or "nothing downstream
+    /// accumulates".
+    ///
+    /// Where [`Self::predicted_freed_bytes_on_complete`] is the state THIS
+    /// node releases the instant IT finishes (immediate reclaim, `0` for a
+    /// Source), this is the *eventual* reclaim its chain will yield: for a
+    /// Source feeding a `Source -> Aggregate` chain it equals the downstream
+    /// Aggregate's accumulated state, because launching that Source is the
+    /// only way to reach the point where the Aggregate can drain. It is the
+    /// max over the node's own freed-on-complete and the subtree reclaim of
+    /// each successor this node SOLELY feeds, computed by
+    /// `derive_volume_estimates` in reverse-topological order.
+    ///
+    /// Propagation stops at a convergence node (one with more than one
+    /// incoming edge, e.g. the `Combine` two independent chains feed):
+    /// reaching it requires every feeding chain, so no single chain unlocks
+    /// its post-join reclaim, and charging that reclaim to each feeding
+    /// Source would erase the per-chain distinction. The join keeps its own
+    /// reclaim and elects itself once it can drain; each feeding chain is
+    /// ranked by the reclaim it owns up to the join.
+    ///
+    /// The scheduler reads it as a lower-priority tiebreak than
+    /// `predicted_freed_bytes_on_complete`: a node that frees memory *now*
+    /// (a ready blocking operator) is always preferred to one that merely
+    /// unlocks an eventual reclaim, so this never elects a fresh heavy
+    /// Source over a ready light Aggregate (which would raise the peak).
+    /// It breaks ties only among candidates with equal immediate reclaim —
+    /// most importantly the fresh Sources of independent chains, where it
+    /// front-loads the chain whose completion frees the most. Surfaced in
+    /// `--explain` so a pipeline author sees the same number the scheduler
+    /// weighed.
+    pub predicted_subtree_reclaim_bytes: u64,
 }
 
 /// Effective output ordering of a node, together with a provenance chain
@@ -248,6 +283,7 @@ impl NodeProperties {
             ck_set: BTreeSet::new(),
             predicted_peak_bytes: 0,
             predicted_freed_bytes_on_complete: 0,
+            predicted_subtree_reclaim_bytes: 0,
         }
     }
 }

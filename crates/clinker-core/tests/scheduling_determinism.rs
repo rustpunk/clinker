@@ -1,18 +1,19 @@
 //! End-to-end determinism of memory-aware dispatch scheduling.
 //!
 //! The executor resolves dispatch order through the memory arbitrator's
-//! `next_runnable` (headroom fit, then largest-freed-on-complete, then stable
-//! topo index). Whether the scheduler reorders or not, record output and
-//! final counters MUST be byte-identical — scheduling steers only which
-//! runnable node the engine dispatches next, never what each node emits.
+//! `next_runnable` (headroom fit, then largest immediate-freed-on-complete,
+//! then largest downstream subtree reclaim, then stable topo index). Whether
+//! the scheduler reorders or not, record output and final counters MUST be
+//! byte-identical — scheduling steers only which runnable node the engine
+//! dispatches next, never what each node emits.
 //!
 //! Both runs below drive identical in-memory CSV readers keyed by source
 //! name, so the only variable is whether per-node volume estimates exist:
 //!
 //! - With the compile anchor pointed at a directory holding sized `path:`
 //!   files, every Source seeds a non-zero `predicted_peak_bytes`, so the
-//!   freed-bytes and headroom-fit tiers are live and the scheduler is free
-//!   to reorder the runnable frontier.
+//!   freed-bytes, subtree-reclaim, and headroom-fit tiers are live and the
+//!   scheduler is free to reorder the runnable frontier.
 //! - With the anchor pointed at an empty directory the `path:` files do not
 //!   exist, every estimate is `0`, and the scheduler collapses to the plain
 //!   front-to-back topological walk.
