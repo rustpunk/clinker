@@ -83,10 +83,6 @@ cargo run -p clinker -- metrics collect ...                  # spool sweep utili
 
 # CXL REPL
 cargo run -p cxl-cli
-
-# Kiln IDE (Dioxus 0.7) — needs the dx CLI installed (`cargo install dioxus-cli`)
-dx serve --package clinker-kiln                              # web target (Playwright drives this)
-dx serve --package clinker-kiln --platform desktop           # default per Dioxus.toml
 ```
 
 Subcommands: `run`, `metrics`, `explain`. There is no `guess` subcommand yet — source schemas are required at runtime and authored by hand.
@@ -108,12 +104,11 @@ Within a run, stateless operators (Transform, Route, most Combine probe-side wor
 ### Crate dependency layers (bottom → top)
 
 ```
-Applications:   clinker (CLI)  |  cxl-cli (REPL)  |  clinker-kiln (IDE)
-                     ↓                ↓                    ↓
+Applications:   clinker (CLI)  |  cxl-cli (REPL)
+                     ↓                ↓
 Orchestration:  clinker-core (DAG planner + executor)
                 clinker-channel (workspace/channel mgmt)
                 clinker-schema (source .schema.yaml validation)
-                clinker-git (VCS abstraction)
                      ↓
 Language/IO:    cxl (lexer → parser → typecheck → eval)
                 clinker-format (CSV/JSON/XML/fixed-width readers/writers)
@@ -124,7 +119,7 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
                 clinker-benchmarks (cross-crate benchmark harness)
 ```
 
-12 workspace crates total. The bench crates are siblings — not part of the runtime layer.
+11 workspace crates total. The bench crates are siblings — not part of the runtime layer.
 
 ### Key design decisions
 
@@ -256,15 +251,6 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 - `lancedb/` — scratch/working LanceDB store used by integration tests
 - `docs/internal/plans/` — phase plans (e.g. `cxl-engine/phase-combine-node/`); gitignored, never `git add -f`
 - `notes/` — in-tree scratchpad for in-flight reasoning that belongs alongside the code it describes; durable across sessions, distinct from auto-memory
-
-### Kiln IDE
-
-`clinker-kiln` is the Dioxus 0.7.4 IDE for authoring Clinker YAML pipelines. One codebase, two targets:
-
-- **Desktop** — `wry` webview, runs on Linux/macOS/Windows. Default per `Dioxus.toml`. Uses `dioxus = { features = ["desktop"] }` under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, plus `tokio` for async. Launch: `dx serve --package clinker-kiln --platform desktop`.
-- **Web** — `wasm32` target. Launch: `dx serve --package clinker-kiln`. Playwright drives this build only; it cannot drive the desktop wry webview, so all UI integration tests live on the web side.
-
-Dioxus version is pinned to `=0.7.4` to avoid silent breakage. The `dx` CLI is required — install via `cargo install dioxus-cli`.
 
 ## Issue tracking
 

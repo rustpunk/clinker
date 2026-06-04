@@ -52,22 +52,4 @@ fn test_user_docs_files_exist() {
             "clinker-channel lib.rs missing topic: {topic}"
         );
     }
-
-    // 3. Kiln walkthrough (4 sections)
-    let kiln_main = std::fs::read_to_string(root.join("crates/clinker-kiln/src/main.rs"))
-        .expect("clinker-kiln main.rs must exist");
-    let kiln_topics = [
-        "Composition browser",
-        "drill-in",
-        "breadcrumb",
-        "Raw/Resolved",
-        "Provenance panel",
-        "Extract-as-composition",
-    ];
-    for topic in &kiln_topics {
-        assert!(
-            kiln_main.contains(topic),
-            "clinker-kiln main.rs missing topic: {topic}"
-        );
-    }
 }
