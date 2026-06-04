@@ -2319,7 +2319,6 @@ pub(crate) fn transform_fused_consume(
         .expected_input_schema_in(current_dag)
         .cloned();
     let output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
-    let upstream_name = source_name_owned.clone();
     // Per-Transform-resolved streaming batch size. The fused loop drives
     // emitted records through an `EventBatcher` of this size, bounding the
     // in-flight working set to one batch before each flush. Resolved
@@ -2498,7 +2497,7 @@ pub(crate) fn transform_fused_consume(
             }
 
             if let Some(exp) = expected_input.as_ref() {
-                check_input_schema(exp, rec.schema(), name, "transform", &upstream_name)?;
+                check_input_schema(exp, rec.schema(), name, "transform", &source_name_owned)?;
             }
 
             if let Some(evaluator) = evaluator_opt.as_mut() {
