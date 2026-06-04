@@ -354,9 +354,10 @@ pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
 
 /// Build a `MemoryArbitrator` from the pipeline-level `memory:` block.
 /// Resolves `memory.limit` through `parse_memory_limit_bytes` (defaults
-/// to 512 MiB when omitted) and chooses the active policy via
-/// `BackpressureKnob::build_policy`. Used by both the pipeline-scoped
-/// arbitrator and every per-arm budget the dispatch path constructs.
+/// to 512 MiB when omitted) and chooses the active policy by mapping the
+/// `memory.backpressure` knob through `build_policy`. Used by both the
+/// pipeline-scoped arbitrator and every per-arm budget the dispatch path
+/// constructs.
 pub(crate) fn build_arbitrator_from_config(
     config: &PipelineConfig,
 ) -> crate::pipeline::memory::MemoryArbitrator {
@@ -365,6 +366,6 @@ pub(crate) fn build_arbitrator_from_config(
     crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
         0.80,
-        mem.backpressure.build_policy(),
+        crate::pipeline::memory::build_policy(mem.backpressure),
     )
 }
