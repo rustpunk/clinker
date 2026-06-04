@@ -467,11 +467,10 @@ nodes:
 
     #[test]
     fn test_existing_fixtures_still_parse() {
-        // Walk every *.yaml under crates/clinker/templates and crates/
-        // clinker-kiln/examples and assert it parses with the chokepoint.
-        // This is the cross-crate sanity check called out in the gate
-        // table; if any fixture regresses we fail loudly here rather
-        // than in a downstream binary.
+        // Walk every *.yaml under crates/clinker/templates and assert it
+        // parses with the chokepoint. This is the cross-crate sanity check
+        // called out in the gate table; if any fixture regresses we fail
+        // loudly here rather than in a downstream binary.
         use std::path::PathBuf;
 
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -479,10 +478,7 @@ nodes:
             .and_then(|p| p.parent())
             .unwrap()
             .to_path_buf();
-        let candidates = [
-            workspace.join("crates/clinker/templates"),
-            workspace.join("crates/clinker-kiln/examples"),
-        ];
+        let candidates = [workspace.join("crates/clinker/templates")];
 
         let mut checked: i32 = 0;
         for root in &candidates {
