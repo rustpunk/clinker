@@ -24,7 +24,6 @@ mod dispatch {
     use crate::aggregation::{AggregatorConfig, AggregatorGroupState, HashAggregator};
     use crate::config::ErrorStrategy;
     use crate::error::PipelineError;
-    use crate::executor::tests::run_test;
 
     fn make_schema(cols: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
@@ -122,64 +121,6 @@ mod dispatch {
             64 * 1024 * 1024,
             None,
         )
-    }
-
-    // ----- Test 1: happy path -----
-
-    #[test]
-    fn test_aggregation_dispatch_basic_group_by() {
-        let yaml = r#"
-pipeline:
-  name: agg_basic
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: in.csv
-    type: csv
-    schema:
-      - { name: dept, type: string }
-      - { name: salary, type: float }
-
-- type: aggregate
-  name: by_dept
-  input: src
-  config:
-    group_by:
-    - dept
-    cxl: 'emit dept = dept
-
-      emit total = sum(salary)
-
-      emit n = count(*)
-
-      '
-- type: output
-  name: out
-  input: by_dept
-  config:
-    name: out
-    type: csv
-    path: out.csv
-    include_unmapped: true
-"#;
-        let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-        assert_eq!(dlq.len(), 0, "no DLQ entries expected");
-        assert_eq!(counters.ok_count, 2, "two output groups");
-
-        // Set-equality on output rows (order is hash-table arbitrary).
-        // With salary declared as float, `sum(salary)` produces the real
-        // numeric total per group — eng = 100+200 = 300, sales = 50.
-        let mut lines: Vec<&str> = output.lines().skip(1).collect();
-        lines.sort();
-        let expected_a = "eng,300,2";
-        let expected_b = "sales,50,1";
-        assert!(
-            lines.contains(&expected_a) && lines.contains(&expected_b),
-            "got lines = {lines:?}"
-        );
     }
 
     // ----- Test 2: malformed-DAG Internal error via single_predecessor -----
@@ -297,52 +238,6 @@ nodes:
 
         let state = group_state_for_key(&agg, "a").expect("group exists");
         assert_eq!(state.min_row_num, 3);
-    }
-
-    // ----- Test 6: D12 global-fold over empty input emits one row -----
-
-    #[test]
-    fn test_aggregation_dispatch_global_fold_empty_input_emits_one_row() {
-        let yaml = r#"
-pipeline:
-  name: agg_global_empty
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: in.csv
-    type: csv
-    schema:
-      - { name: x, type: string }
-
-- type: aggregate
-  name: total
-  input: src
-  config:
-    group_by: []
-    cxl: 'emit n = count(*)
-
-      '
-- type: output
-  name: out
-  input: total
-  config:
-    name: out
-    type: csv
-    path: out.csv
-    include_unmapped: true
-"#;
-        // Header-only input — zero data rows.
-        let csv = "x\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-        assert_eq!(dlq.len(), 0);
-        assert_eq!(
-            counters.ok_count, 1,
-            "global fold emits one row even on empty input"
-        );
-        let body: Vec<&str> = output.lines().skip(1).collect();
-        assert_eq!(body, vec!["0"], "count(*) over empty = 0");
     }
 
     // ----- Test 7: finalize overflow → DLQ under Continue -----

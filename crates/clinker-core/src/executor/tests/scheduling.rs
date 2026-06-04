@@ -24,7 +24,7 @@ use crate::config::{CompileContext, parse_config};
 use crate::pipeline::memory::MemoryArbitrator;
 use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 /// Two independent `Source -> Aggregate -> Output` chains, the smaller

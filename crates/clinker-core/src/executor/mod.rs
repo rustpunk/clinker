@@ -1588,59 +1588,22 @@ impl PipelineExecutor {
 
 #[cfg(test)]
 mod tests {
-    //! Executor-level tests — submodules below each target a specific
-    //! executor concern (aggregation dispatch, multi-output routing,
-    //! branching/DAG, format dispatch, correlated DLQ).
+    //! Executor white-box tests — submodules below each read a crate-private
+    //! executor seam the public API does not surface (the pre-seeded
+    //! `MemoryArbitrator` run entry, `scheduled_pass_order`,
+    //! `single_predecessor`, `compile_route` / `CompiledRoute`,
+    //! `commit::with_test_loop_cap`, `ExecutionPlanDag::deferred_region_at`),
+    //! so they cannot live in the `tests/` integration directory.
     //!
-    //! Each submodule starts with `use super::*;` and expects the
-    //! executor's public-in-crate symbols (`PipelineExecutor`,
-    //! `PipelineRunParams`, `DlqEntry`, `CompiledRoute`, `PipelineError`,
-    //! etc.) plus a shared `run_test(yaml, csv)` helper (defined here).
-
-    use std::io::Write;
+    //! The pure-integration executor tests — those that drive a pipeline
+    //! end-to-end through the public `&CompiledPlan` entry point — live in
+    //! `crates/clinker-core/tests/` and share the `run_config` helper in
+    //! `tests/common/mod.rs`.
+    //!
+    //! Each submodule starts with `use super::*;` for the executor's
+    //! in-crate symbols.
 
     use super::*;
-
-    /// Run a single-source, single-output pipeline with the given YAML
-    /// config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
-    ///
-    /// This mirrors `integration_tests::run_pipeline` but lives inside
-    /// the `executor` module so submodules can reference it via
-    /// `crate::executor::tests::run_test`.
-    pub(super) fn run_test(
-        yaml: &str,
-        csv_input: &str,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = clinker_bench_support::io::SharedBuffer::new();
-
-        let primary = config.source_configs().next().unwrap().name.clone();
-        let readers: crate::executor::SourceReaders = HashMap::from([(
-            primary.clone(),
-            crate::executor::single_file_reader(
-                "test.csv",
-                Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
-            ),
-        )]);
-        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
-        )]);
-
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars: IndexMap::new(),
-            shutdown_token: None,
-            ..Default::default()
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
-
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
-    }
 
     mod aggregation;
     mod composition_port_admission_overshoot;
