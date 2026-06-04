@@ -259,6 +259,28 @@ fn materialize_eval_result(input: &Record, result: EvalResult) -> Vec<TransformO
     }
 }
 
+/// Window-resolution inputs for [`evaluate_single_transform_windowed`]:
+/// the plan (for the analytic-window spec at `window_index`), the
+/// resolved per-window arena + partition index, and this record's
+/// position within that arena. Grouped so the windowed evaluator takes
+/// one `&` argument for the window context, keeping the per-record
+/// values (`record`, `transform_name`, `evaluator`, `ctx`) it shares
+/// with [`evaluate_single_transform`] in the same positions.
+pub(crate) struct WindowedEvalCtx<'a> {
+    /// Execution DAG, indexed by `window_index` to fetch the
+    /// transform's analytic-window spec (`group_by` / `sort_by`).
+    pub(crate) plan: &'a ExecutionPlanDag,
+    /// Index into `plan.indices_to_build` selecting this transform's
+    /// window spec.
+    pub(crate) window_index: usize,
+    /// Resolved window runtime: the materialized arena plus its
+    /// partition index, against which `$window.*` expressions evaluate.
+    pub(crate) runtime: &'a crate::executor::window_runtime::WindowRuntime,
+    /// This record's position within `runtime.arena`, used to locate
+    /// its slot inside the resolved partition.
+    pub(crate) record_pos: u64,
+}
+
 /// Same as [`evaluate_single_transform`] but threads a
 /// [`PartitionWindowContext`] derived from the resolved
 /// [`crate::executor::window_runtime::WindowRuntime`] so `$window.*`
@@ -282,17 +304,20 @@ fn materialize_eval_result(input: &Record, result: EvalResult) -> Vec<TransformO
 /// in any group key, or no matching partition), the evaluator runs
 /// without a window context — matching the legacy inline arena path's
 /// behavior.
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+#[allow(clippy::result_large_err)]
 pub(crate) fn evaluate_single_transform_windowed(
     record: &Record,
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
-    plan: &ExecutionPlanDag,
-    window_index: usize,
-    runtime: &crate::executor::window_runtime::WindowRuntime,
-    record_pos: u64,
+    window: &WindowedEvalCtx<'_>,
 ) -> Result<Vec<TransformOutput>, TransformEvalError> {
+    let &WindowedEvalCtx {
+        plan,
+        window_index,
+        runtime,
+        record_pos,
+    } = window;
     let spec = &plan.indices_to_build[window_index];
     let arena = runtime.arena.as_ref();
     let index = runtime.index.as_ref();
