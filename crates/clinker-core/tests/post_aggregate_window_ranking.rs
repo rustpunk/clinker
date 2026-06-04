@@ -9,8 +9,10 @@
 //! `cxl::eval::tests::ranking_and_value` already pin the value-shape
 //! contract against a minimal in-memory implementation.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::HashMap;
 
 const RANKING_PIPELINE: &str = r#"
@@ -56,7 +58,7 @@ nodes:
 "#;
 
 fn run(csv: &str) -> String {
-    let config = crate::config::parse_config(RANKING_PIPELINE).expect("parse");
+    let config = clinker_core::config::parse_config(RANKING_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
@@ -64,9 +66,9 @@ fn run(csv: &str) -> String {
         shutdown_token: None,
         ..Default::default()
     };
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -76,8 +78,7 @@ fn run(csv: &str) -> String {
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .expect("pipeline must run");
+    common::run_config(&config, readers, writers, &params).expect("pipeline must run");
     buf.as_string()
 }
 
@@ -248,7 +249,7 @@ ENG,60
 ENG,70
 ";
 
-    let config = crate::config::parse_config(EVERY_EXISTS_PIPELINE).expect("parse");
+    let config = clinker_core::config::parse_config(EVERY_EXISTS_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
@@ -256,9 +257,9 @@ ENG,70
         shutdown_token: None,
         ..Default::default()
     };
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -268,8 +269,7 @@ ENG,70
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .expect("pipeline must run");
+    common::run_config(&config, readers, writers, &params).expect("pipeline must run");
     let out = buf.as_string();
 
     let mut lines = out.lines();

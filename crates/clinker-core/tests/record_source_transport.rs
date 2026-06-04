@@ -10,8 +10,10 @@ use clinker_format::{EnvelopeConfig, FormatError};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use super::*;
-use crate::source::RecordSource;
+use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_core::source::RecordSource;
+use std::collections::HashMap;
+use std::io::Write;
 
 /// In-memory row yielder with no byte stream behind it — the shape a
 /// pathless row-yielding transport takes. Holds a fixed schema and a queue
@@ -95,19 +97,20 @@ nodes:
 
 #[test]
 fn non_file_transport_emits_into_shared_channel_with_synthetic_id() {
-    let mut config = crate::config::parse_config(PIPELINE).unwrap();
+    let mut config = clinker_core::config::parse_config(PIPELINE).unwrap();
 
     // Strip the placeholder matcher so the source is pathless, the shape
     // a non-file transport carries. `path_str()` then returns empty and
     // the ingest loop stamps the stable `<source:ledger>` synthetic id.
     for spanned in &mut config.nodes {
-        if let crate::config::PipelineNode::Source { config: body, .. } = &mut spanned.value {
+        if let clinker_core::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
+        {
             body.source.path = None;
         }
     }
 
     let plan = config
-        .compile(&crate::config::CompileContext::default())
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("compile pathless-source pipeline");
 
     let stub = StubRecordSource::new(
@@ -119,9 +122,9 @@ fn non_file_transport_emits_into_shared_channel_with_synthetic_id() {
         ],
     );
 
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "ledger".to_string(),
-        crate::executor::SourceInput::Records(Box::new(stub)),
+        clinker_core::executor::SourceInput::Records(Box::new(stub)),
     )]);
 
     let output_buf = clinker_bench_support::io::SharedBuffer::new();

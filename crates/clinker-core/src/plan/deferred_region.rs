@@ -1338,3 +1338,73 @@ fn output_consumed_columns(
     }
     set
 }
+
+#[cfg(test)]
+mod tests {
+    //! The strict-pipeline zero-overhead invariant's plan-time half: a
+    //! pipeline whose every aggregate's `group_by` covers the upstream
+    //! correlation key registers zero deferred regions, so the executor
+    //! stays on the strict commit path. This reads the crate-private
+    //! `ExecutionPlanDag::deferred_regions` field directly, so it lives
+    //! here rather than in the relocated integration test
+    //! `tests/strict_pipeline_zero_overhead.rs` (which covers the runtime
+    //! half through the public entry point).
+
+    use crate::config::{CompileContext, parse_config};
+
+    /// Source(CK=order_id) → Aggregate(group_by ⊇ ck_set via
+    /// `[order_id, department]`) → Output. The aggregate covers every CK
+    /// field so the detector finds no relaxed producer.
+    const STRICT_PIPELINE: &str = r#"
+pipeline:
+  name: strict_zero_overhead
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: order_totals
+  input: src
+  config:
+    group_by: [order_id, department]
+    cxl: |
+      emit order_id = order_id
+      emit department = department
+      emit total = sum(amount)
+- type: output
+  name: out
+  input: order_totals
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    #[test]
+    fn strict_pipeline_has_no_deferred_regions_at_plan_time() {
+        let config = parse_config(STRICT_PIPELINE).expect("parse");
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("compile must succeed for the strict pipeline")
+            .dag()
+            .clone();
+
+        assert!(
+            plan.deferred_regions.is_empty(),
+            "strict pipeline (every aggregate's group_by ⊇ ck_set) must \
+             register zero deferred regions; got {:?}",
+            plan.deferred_regions.keys().collect::<Vec<_>>()
+        );
+    }
+}

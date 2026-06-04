@@ -63,8 +63,8 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let result = config.compile(&crate::config::CompileContext::default());
+    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let result = config.compile(&clinker_core::config::CompileContext::default());
     let diags = result.expect_err("E150e expected on window over match:collect array-typed column");
     let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
     assert!(

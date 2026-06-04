@@ -1,15 +1,20 @@
-//! Strict-pipeline zero-overhead invariant.
+//! Strict-pipeline zero-overhead invariant (runtime half).
 //!
 //! A pipeline whose every aggregate's `group_by` covers the upstream
 //! correlation key (or has no upstream CK at all) stays on the strict
-//! commit path: the planner registers no deferred regions, the
-//! orchestrator selects `CommitStepPath::FastPath`, and the cascading-
-//! retraction loop never runs. Pinning this is load-bearing for the
-//! performance contract — strict pipelines must not pay any cost
+//! commit path: the orchestrator selects `CommitStepPath::FastPath`, and
+//! the cascading-retraction loop never runs. Pinning this is load-bearing
+//! for the performance contract — strict pipelines must not pay any cost
 //! introduced by the relaxed-CK retract machinery.
+//!
+//! The plan-time half of this invariant (zero deferred regions registered
+//! at compile) reads the crate-private `ExecutionPlanDag::deferred_regions`
+//! field, so it lives as an inline unit test in `plan::deferred_region`.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::HashMap;
 
 /// Source(CK=order_id) → Aggregate(group_by ⊇ ck_set via
@@ -53,24 +58,6 @@ nodes:
 "#;
 
 #[test]
-fn strict_pipeline_has_no_deferred_regions_at_plan_time() {
-    use crate::config::{CompileContext, parse_config};
-    let config = parse_config(STRICT_PIPELINE).expect("parse");
-    let plan = config
-        .compile(&CompileContext::default())
-        .expect("compile must succeed for the strict pipeline")
-        .dag()
-        .clone();
-
-    assert!(
-        plan.deferred_regions.is_empty(),
-        "strict pipeline (every aggregate's group_by ⊇ ck_set) must \
-         register zero deferred regions; got {:?}",
-        plan.deferred_regions.keys().collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn strict_pipeline_runs_without_engaging_deferred_dispatcher() {
     let csv = "\
 order_id,department,amount
@@ -79,9 +66,9 @@ o2,HR,20
 o3,ENG,100
 ";
     let primary = "src".to_string();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -98,10 +85,9 @@ o3,ENG,100
         shutdown_token: None,
         ..Default::default()
     };
-    let config = crate::config::parse_config(STRICT_PIPELINE).expect("parse");
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .expect("strict pipeline must run on the FastPath without error");
+    let config = clinker_core::config::parse_config(STRICT_PIPELINE).expect("parse");
+    let report = common::run_config(&config, readers, writers, &params)
+        .expect("strict pipeline must run on the FastPath without error");
 
     // Strict pipelines emit every record through the strict commit
     // body — no deferred-Output speculation, no cascading-retraction

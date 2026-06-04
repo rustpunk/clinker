@@ -6,15 +6,19 @@
 //! (Case A.1/A.2/A.3), in-pipeline branching (B.2), and group-identity
 //! preservation (F.1, F.2) cases that motivated the redesign.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::error::PipelineError;
+use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 
 fn run_correlated_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -24,9 +28,9 @@ fn run_correlated_pipeline(
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
         ),
@@ -38,8 +42,7 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+    let report = common::run_config(&config, readers, writers, &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -152,7 +155,7 @@ fn collateral_carries_correlated_category() {
     let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
     assert_eq!(
         collateral.category,
-        crate::dlq::DlqErrorCategory::Correlated,
+        clinker_core::dlq::DlqErrorCategory::Correlated,
         "collateral should carry the Correlated category"
     );
     assert!(
@@ -298,14 +301,14 @@ nodes:
     let trigger_entry = dlq_entries.iter().find(|e| e.trigger).unwrap();
     assert_eq!(
         trigger_entry.category,
-        crate::dlq::DlqErrorCategory::GroupSizeExceeded,
+        clinker_core::dlq::DlqErrorCategory::GroupSizeExceeded,
     );
     let collateral_count = dlq_entries.iter().filter(|e| !e.trigger).count();
     assert_eq!(collateral_count, 4);
     for collateral in dlq_entries.iter().filter(|e| !e.trigger) {
         assert_eq!(
             collateral.category,
-            crate::dlq::DlqErrorCategory::Correlated,
+            clinker_core::dlq::DlqErrorCategory::Correlated,
         );
     }
 }
@@ -374,7 +377,7 @@ nodes:
     // grouping we'd see double-count; with correlation grouping the
     // DLQ entry count is one per source row, not per (row, output).
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -383,9 +386,9 @@ nodes:
         ..Default::default()
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -402,9 +405,7 @@ nodes:
             Box::new(buf_b.clone()) as Box<dyn std::io::Write + Send>,
         ),
     ]);
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .unwrap();
+    let report = common::run_config(&config, readers, writers, &params).unwrap();
 
     let out_a = buf_a.as_string();
     let out_b = buf_b.as_string();
@@ -463,8 +464,8 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = crate::config::parse_config(yaml).unwrap();
-    let result = config.compile(&crate::config::CompileContext::default());
+    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let result = config.compile(&clinker_core::config::CompileContext::default());
     let diags = result.expect_err("E150 should reject correlation_key + arena");
     assert!(
         diags.iter().any(|d| d.code == "E150"),
@@ -520,16 +521,16 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let plan = config
-        .compile(&crate::config::CompileContext::default())
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("retraction-mode aggregate must compile, not error");
     let agg_node = plan
         .dag()
         .graph
         .node_weights()
         .find_map(|n| match n {
-            crate::plan::execution::PlanNode::Aggregation { name, compiled, .. }
+            clinker_core::plan::execution::PlanNode::Aggregation { name, compiled, .. }
                 if name == "agg" =>
             {
                 Some(compiled.clone())
@@ -635,7 +636,7 @@ nodes:
     let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
     assert_eq!(
         collateral.category,
-        crate::dlq::DlqErrorCategory::Correlated,
+        clinker_core::dlq::DlqErrorCategory::Correlated,
         "aggregate-output collateral carries the Correlated category"
     );
 
@@ -876,7 +877,7 @@ nodes:
     let orders_csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,7\n";
     let departments_csv = "employee_id,dept\nA,HR\nB,ENG\n";
 
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -886,17 +887,17 @@ nodes:
     };
 
     let _primary = "orders".to_string();
-    let readers: crate::executor::SourceReaders = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
             ),
         ),
         (
             "departments".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec())),
             ),
@@ -909,9 +910,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .unwrap();
+    let report = common::run_config(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     // Group A driver records: A,1 (clean) and A,3 (clean) survive
@@ -939,7 +938,7 @@ nodes:
     for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
         assert_eq!(
             c.category,
-            crate::dlq::DlqErrorCategory::Correlated,
+            clinker_core::dlq::DlqErrorCategory::Correlated,
             "combined-output collateral carries the Correlated category"
         );
     }
@@ -1058,7 +1057,7 @@ nodes:
     let products_csv = "product_id,name,category_id\nP1,Widget,C1\nP2,Gadget,C2\n";
     let categories_csv = "category_id,category_name\nC1,Hardware\nC2,Software\n";
 
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -1068,24 +1067,24 @@ nodes:
     };
 
     let _primary = "orders".to_string();
-    let readers: crate::executor::SourceReaders = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
             ),
         ),
         (
             "products".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec())),
             ),
         ),
         (
             "categories".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec())),
             ),
@@ -1098,9 +1097,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .unwrap();
+    let report = common::run_config(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     // Department A: O1 and O3 succeed validate; O2 fails (trigger).
@@ -1284,7 +1281,7 @@ nodes:
     let orders_csv = "employee_id,amount,event_time\nA,1,5\nA,bad,10\nA,3,15\nB,4,25\n";
     let sessions_csv = "employee_id,session_start,session_end\nA,0,20\nB,20,30\n";
 
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -1294,17 +1291,17 @@ nodes:
     };
 
     let _primary = "orders".to_string();
-    let readers: crate::executor::SourceReaders = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
             ),
         ),
         (
             "sessions".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec())),
             ),
@@ -1317,9 +1314,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .unwrap();
+    let report = common::run_config(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     assert_eq!(

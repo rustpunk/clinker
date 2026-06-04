@@ -11,8 +11,10 @@
 //! aggregate `total`, regardless of the order in which the aggregator
 //! emitted department rows.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::HashMap;
 
 /// Pipeline with many distinct group keys to exercise the hash
@@ -76,7 +78,7 @@ nodes:
         }
     }
 
-    let config = crate::config::parse_config(yaml).expect("parse");
+    let config = clinker_core::config::parse_config(yaml).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
@@ -84,9 +86,9 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.into_bytes())),
         ),
@@ -96,7 +98,7 @@ nodes:
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
+    common::run_config(&config, readers, writers, &params)
         .expect("pipeline must run under memory pressure");
     let output = buf.as_string();
 

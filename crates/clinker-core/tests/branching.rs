@@ -3,43 +3,48 @@
 //! Tests in this module exercise the DAG executor's branch dispatch,
 //! merge semantics, record conservation, and per-node execution strategy.
 
-use super::*;
+mod common;
 
-/// Helper: run executor with in-memory CSV input/output for branching tests.
+use std::collections::HashMap;
+use std::io::{Cursor, Write};
+
+use clinker_core::config::parse_config;
+use clinker_core::error::PipelineError;
+use clinker_core::executor::{DlqEntry, SourceReaders, single_file_reader};
+use clinker_record::PipelineCounters;
+
+/// Run a single-source, single-output branching pipeline with the given
+/// YAML config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
 fn run_branch_test(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = parse_config(yaml).unwrap();
     let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
-        primary.clone(),
-        crate::executor::single_file_reader(
+    let readers: SourceReaders = HashMap::from([(
+        primary,
+        single_file_reader(
             "test.csv",
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
         ),
     )]);
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
         config.output_configs().next().unwrap().name.clone(),
-        Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        Box::new(output_buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let pipeline_vars = indexmap::IndexMap::new();
-    let params = PipelineRunParams {
+    let params = clinker_core::executor::PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
-        pipeline_vars,
+        pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
         ..Default::default()
     };
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
-
-    let output = output_buf.as_string();
-    Ok((report.counters, report.dlq_entries, output))
+    let report = common::run_config(&config, readers, writers, &params)?;
+    Ok((report.counters, report.dlq_entries, output_buf.as_string()))
 }
 
 /// Diamond DAG: fork -> 2 branches -> merge: all records present in output.
