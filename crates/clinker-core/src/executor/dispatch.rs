@@ -911,7 +911,7 @@ pub(crate) struct RetainedAggregatorState {
     pub(crate) consumer_id: crate::pipeline::memory::ConsumerId,
 }
 
-impl ExecutorContext<'_> {
+impl<'a> ExecutorContext<'a> {
     /// Borrow the pipeline-scoped TempDir handle. Held alongside
     /// the cached `spill_root_path` so every operator that prefers
     /// the owned form (e.g. `SortBuffer::new` taking
@@ -1062,6 +1062,64 @@ impl ExecutorContext<'_> {
                 .sum();
             self.source_count_per_source
                 .insert(Arc::clone(merged_key), Some(total));
+        }
+    }
+
+    /// Build the per-record [`EvalContext`] view from a record's
+    /// engine-stamped `source_file` / `source_name` and its envelope
+    /// `doc_ctx`, at `row_num`. The single construction point for every
+    /// record-driven dispatch arm (Transform, Route, hash probe,
+    /// per-record aggregate add). The returned view borrows only the
+    /// caller's argument references plus the context's `'a`-lifetime
+    /// stable / batch handles — it does NOT hold a `&self` borrow, so the
+    /// caller may mutate other `ExecutorContext` fields (timers, counters,
+    /// cursors) while the view is live.
+    pub(crate) fn eval_ctx_for_record<'r>(
+        &self,
+        source_file: &'r Arc<str>,
+        source_name: &'r Arc<str>,
+        row_num: u64,
+        doc_ctx: &'r Arc<clinker_record::DocumentContext>,
+    ) -> EvalContext<'r>
+    where
+        'a: 'r,
+    {
+        EvalContext {
+            stable: self.stable,
+            source_file,
+            source_row: row_num,
+            source_path: source_file,
+            source_count: self.source_count_by_name(source_name),
+            source_batch: self.source_batch_arc,
+            ingestion_timestamp: self.source_ingestion_timestamp,
+            source_name,
+            doc_ctx,
+        }
+    }
+
+    /// Build the synthetic-provenance [`EvalContext`] for a finalize /
+    /// post-blocking emit that has no per-record source attribution. Uses
+    /// the [`MERGED_SOURCE_FILE`] / [`MERGED_SOURCE_NAME`] sentinels,
+    /// row 0, the finalized `$source.count` total, and the synthetic
+    /// (empty-section) envelope so `$doc.*` resolves to `Null`. The single
+    /// construction point for every blocking-operator finalize arm
+    /// (aggregate / windowed-aggregate finalize, Combine kernel contexts).
+    /// The returned view borrows only `'a`-lifetime and `'static` data, so
+    /// it does not hold a `&self` borrow.
+    pub(crate) fn merged_eval_ctx<'r>(&self) -> EvalContext<'r>
+    where
+        'a: 'r,
+    {
+        EvalContext {
+            stable: self.stable,
+            source_file: &MERGED_SOURCE_FILE,
+            source_row: 0,
+            source_path: &MERGED_SOURCE_FILE,
+            source_count: self.source_count_by_name(&MERGED_SOURCE_NAME),
+            source_batch: self.source_batch_arc,
+            ingestion_timestamp: self.source_ingestion_timestamp,
+            source_name: &MERGED_SOURCE_NAME,
+            doc_ctx: clinker_record::synthetic_document_context_ref(),
         }
     }
 }

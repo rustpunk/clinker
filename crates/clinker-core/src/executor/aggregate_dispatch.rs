@@ -12,18 +12,17 @@
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
-use cxl::eval::{EvalContext, ProgramEvaluator};
+use cxl::eval::ProgramEvaluator;
 use petgraph::graph::NodeIndex;
 
 use crate::aggregation::AggregateStrategy;
 use crate::config::ErrorStrategy;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, MERGED_SOURCE_NAME, RetainedAggregatorState,
-    admit_node_buffer, advance_cursor, drain_node_buffer_slot, finalize_node_rooted_windows,
-    node_buffer_spill_allowed, project_rows_to_buffer_schema, push_dlq,
-    record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
-    stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    project_rows_to_buffer_schema, push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of,
+    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
@@ -212,17 +211,12 @@ pub(crate) fn dispatch_aggregation(
             for (record, row_num) in &input {
                 let source_file_arc = source_file_arc_of(record);
                 let source_name_arc = source_name_arc_of(record);
-                let eval_ctx = EvalContext {
-                    stable: ctx.stable,
-                    source_file: &source_file_arc,
-                    source_row: *row_num,
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count_by_name(&source_name_arc),
-                    source_batch: ctx.source_batch_arc,
-                    ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &source_name_arc,
-                    doc_ctx: record.doc_ctx(),
-                };
+                let eval_ctx = ctx.eval_ctx_for_record(
+                    &source_file_arc,
+                    &source_name_arc,
+                    *row_num,
+                    record.doc_ctx(),
+                );
                 let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
                 if add_result.is_ok() {
                     advance_cursor(ctx, &source_name_arc, *row_num);
@@ -280,17 +274,7 @@ pub(crate) fn dispatch_aggregation(
         // instance that produced these rows. Strict aggregates
         // continue to consume-and-discard so non-relaxed
         // pipelines pay zero overhead.
-        let finalize_ctx = EvalContext {
-            stable: ctx.stable,
-            source_file: &MERGED_SOURCE_FILE,
-            source_row: 0,
-            source_path: &MERGED_SOURCE_FILE,
-            source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-            source_batch: ctx.source_batch_arc,
-            ingestion_timestamp: ctx.source_ingestion_timestamp,
-            source_name: &MERGED_SOURCE_NAME,
-            doc_ctx: clinker_record::synthetic_document_context_ref(),
-        };
+        let finalize_ctx = ctx.merged_eval_ctx();
         let agg_out = if is_relaxed {
             let mut hash_box = match stream.into_retained_hash() {
                 Some(b) => b,
@@ -947,17 +931,12 @@ fn run_time_windowed_aggregate(
                     };
                     let source_file_arc = source_file_arc_of(rec);
                     let source_name_arc = source_name_arc_of(rec);
-                    let eval_ctx = EvalContext {
-                        stable: ctx.stable,
-                        source_file: &source_file_arc,
-                        source_row: *rn,
-                        source_path: &source_file_arc,
-                        source_count: ctx.source_count_by_name(&source_name_arc),
-                        source_batch: ctx.source_batch_arc,
-                        ingestion_timestamp: ctx.source_ingestion_timestamp,
-                        source_name: &source_name_arc,
-                        doc_ctx: rec.doc_ctx(),
-                    };
+                    let eval_ctx = ctx.eval_ctx_for_record(
+                        &source_file_arc,
+                        &source_name_arc,
+                        *rn,
+                        rec.doc_ctx(),
+                    );
                     let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
                     if add_result.is_ok() {
                         advance_cursor(ctx, &source_name_arc, *rn);
@@ -984,17 +963,7 @@ fn run_time_windowed_aggregate(
                 let kb: Vec<String> = b.0.0.iter().map(|k| format!("{k:?}")).collect();
                 ka.cmp(&kb).then(a.0.1.cmp(&b.0.1))
             });
-            let finalize_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let finalize_ctx = ctx.merged_eval_ctx();
             for (_, (stream, consumer_id)) in entries {
                 // Finalize consumes this session's stream; unregister
                 // its wrapper unconditionally afterward so the session's
@@ -1070,17 +1039,12 @@ where
 {
     let source_file_arc = source_file_arc_of(record);
     let source_name_arc = source_name_arc_of(record);
-    let eval_ctx = EvalContext {
-        stable: ctx.stable,
-        source_file: &source_file_arc,
-        source_row: row_num,
-        source_path: &source_file_arc,
-        source_count: ctx.source_count_by_name(&source_name_arc),
-        source_batch: ctx.source_batch_arc,
-        ingestion_timestamp: ctx.source_ingestion_timestamp,
-        source_name: &source_name_arc,
-        doc_ctx: record.doc_ctx(),
-    };
+    let eval_ctx = ctx.eval_ctx_for_record(
+        &source_file_arc,
+        &source_name_arc,
+        row_num,
+        record.doc_ctx(),
+    );
     let (stream, _consumer_id) = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
@@ -1170,17 +1134,7 @@ fn finalize_windows(
         ),
     )> = per_window.into_iter().collect();
     entries.sort_by_key(|(start, _)| *start);
-    let finalize_ctx = EvalContext {
-        stable: ctx.stable,
-        source_file: &MERGED_SOURCE_FILE,
-        source_row: 0,
-        source_path: &MERGED_SOURCE_FILE,
-        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-        source_batch: ctx.source_batch_arc,
-        ingestion_timestamp: ctx.source_ingestion_timestamp,
-        source_name: &MERGED_SOURCE_NAME,
-        doc_ctx: clinker_record::synthetic_document_context_ref(),
-    };
+    let finalize_ctx = ctx.merged_eval_ctx();
     for (_, (stream, consumer_id)) in entries {
         // Finalize consumes this window's stream; unregister its
         // wrapper unconditionally afterward so the window's bytes leave

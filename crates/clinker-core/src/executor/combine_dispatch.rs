@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::{Record, Value};
-use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
+use cxl::eval::{EvalResult, ProgramEvaluator, SkipReason};
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
 use petgraph::Direction;
@@ -20,8 +20,8 @@ use petgraph::graph::NodeIndex;
 use crate::config::ErrorStrategy;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, MERGED_SOURCE_NAME, admit_node_buffer, advance_cursor,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
+    ExecutorContext, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
+    finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
     record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
@@ -403,17 +403,7 @@ pub(crate) fn dispatch_combine(
                 });
             let body_typed = ctx.artifacts.typed.get(name);
             let combine_output_schema_arc = combine_output_schema.clone();
-            let iejoin_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let iejoin_ctx = ctx.merged_eval_ctx();
             // CPU-bound IEJoin kernel — partition + range-walk +
             // materialize. The kernel owns its inputs
             // (`driver_buf`, `build_records`) and borrows only
@@ -521,17 +511,7 @@ pub(crate) fn dispatch_combine(
                 });
             let body_typed = ctx.artifacts.typed.get(name);
             let combine_output_schema_arc = combine_output_schema.clone();
-            let grace_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let grace_ctx = ctx.merged_eval_ctx();
             // CPU-bound grace-hash join kernel: partition build +
             // probe + spill I/O. The kernel owns its inputs and
             // borrows only `&ctx.memory_budget`, the local
@@ -646,17 +626,7 @@ pub(crate) fn dispatch_combine(
                 });
             let body_typed = ctx.artifacts.typed.get(name);
             let combine_output_schema_arc = combine_output_schema.clone();
-            let sm_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let sm_ctx = ctx.merged_eval_ctx();
             // CPU-bound sort-merge join kernel: two-cursor merge
             // over pre-sorted inputs. The kernel owns its inputs
             // and borrows only `&ctx.memory_budget`, the local
@@ -763,17 +733,7 @@ pub(crate) fn dispatch_combine(
     let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
     let build_records_in = build_records.len() as u64;
     let estimated_rows = Some(build_records.len());
-    let hash_table_ctx = EvalContext {
-        stable: ctx.stable,
-        source_file: &MERGED_SOURCE_FILE,
-        source_row: 0,
-        source_path: &MERGED_SOURCE_FILE,
-        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-        source_batch: ctx.source_batch_arc,
-        ingestion_timestamp: ctx.source_ingestion_timestamp,
-        source_name: &MERGED_SOURCE_NAME,
-        doc_ctx: clinker_record::synthetic_document_context_ref(),
-    };
+    let hash_table_ctx = ctx.merged_eval_ctx();
     let build_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
         name: name.clone(),
     });
@@ -827,17 +787,12 @@ pub(crate) fn dispatch_combine(
     'driver: for (probe_record, rn) in driver_buf {
         let source_file_arc = source_file_arc_of(&probe_record);
         let source_name_arc = source_name_arc_of(&probe_record);
-        let eval_ctx = EvalContext {
-            stable: ctx.stable,
-            source_file: &source_file_arc,
-            source_row: rn,
-            source_path: &source_file_arc,
-            source_count: ctx.source_count_by_name(&source_name_arc),
-            source_batch: ctx.source_batch_arc,
-            ingestion_timestamp: ctx.source_ingestion_timestamp,
-            source_name: &source_name_arc,
-            doc_ctx: probe_record.doc_ctx(),
-        };
+        let eval_ctx = ctx.eval_ctx_for_record(
+            &source_file_arc,
+            &source_name_arc,
+            rn,
+            probe_record.doc_ctx(),
+        );
 
         // Probe-side key extraction routes through the
         // shared `CombineResolver` so chain-buried

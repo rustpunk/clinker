@@ -391,17 +391,7 @@ pub(super) fn process_spilled_partition(
                 node: name.to_string(),
                 detail: format!("grace hash reload probe read failed: {e}"),
             })?;
-            let row_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: ctx.source_file,
-                source_row: row_seq,
-                source_path: ctx.source_path,
-                source_count: ctx.source_count,
-                source_batch: ctx.source_batch,
-                ingestion_timestamp: ctx.ingestion_timestamp,
-                source_name: ctx.source_name,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let row_ctx = ctx.with_row(row_seq);
             let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
             probe_keys_buf.clear();
             driver_extractor
@@ -555,17 +545,7 @@ pub(super) fn bnl_fallback(
                     node: name.to_string(),
                     detail: format!("grace hash bnl probe read failed: {e}"),
                 })?;
-                let row_ctx = EvalContext {
-                    stable: rc.ctx.stable,
-                    source_file: rc.ctx.source_file,
-                    source_row: row_seq,
-                    source_path: rc.ctx.source_path,
-                    source_count: rc.ctx.source_count,
-                    source_batch: rc.ctx.source_batch,
-                    ingestion_timestamp: rc.ctx.ingestion_timestamp,
-                    source_name: rc.ctx.source_name,
-                    doc_ctx: clinker_record::synthetic_document_context_ref(),
-                };
+                let row_ctx = rc.ctx.with_row(row_seq);
                 let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
                 probe_keys_buf.clear();
                 rc.driver_extractor

@@ -157,6 +157,11 @@ pub(crate) fn emit_post_recompute(
 ) -> Result<usize, HashAggError> {
     use cxl::eval::EvalContext;
 
+    // Disjoint-field borrow: the synthetic finalize context reads only
+    // the immutable provenance fields of `ctx` while `retained` holds a
+    // `&mut` into `ctx.relaxed_aggregator_states`. A `&self`
+    // `merged_eval_ctx` helper would borrow all of `ctx` and collide with
+    // that mutable borrow, so this finalize context stays inline.
     let merged_source_count =
         ctx.source_count_by_name(&crate::executor::dispatch::MERGED_SOURCE_NAME);
     let retained = ctx

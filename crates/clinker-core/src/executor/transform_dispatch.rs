@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use clinker_record::Record;
-use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason};
+use cxl::eval::{ProgramEvaluator, SkipReason};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
@@ -165,17 +165,8 @@ pub(crate) fn dispatch_transform(
         }
         let source_file_arc = source_file_arc_of(&record);
         let source_name_arc = source_name_arc_of(&record);
-        let eval_ctx = EvalContext {
-            stable: ctx.stable,
-            source_file: &source_file_arc,
-            source_row: rn,
-            source_path: &source_file_arc,
-            source_count: ctx.source_count_by_name(&source_name_arc),
-            source_batch: ctx.source_batch_arc,
-            ingestion_timestamp: ctx.source_ingestion_timestamp,
-            source_name: &source_name_arc,
-            doc_ctx: record.doc_ctx(),
-        };
+        let eval_ctx =
+            ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
 
         let target_schema = output_schema
             .as_ref()

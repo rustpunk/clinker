@@ -768,17 +768,7 @@ pub(crate) fn execute_combine_grace_hash(
     };
 
     for (probe_record, rn) in driver_records {
-        let row_ctx = EvalContext {
-            stable: ctx.stable,
-            source_file: ctx.source_file,
-            source_row: rn,
-            source_path: ctx.source_path,
-            source_count: ctx.source_count,
-            source_batch: ctx.source_batch,
-            ingestion_timestamp: ctx.ingestion_timestamp,
-            source_name: ctx.source_name,
-            doc_ctx: clinker_record::synthetic_document_context_ref(),
-        };
+        let row_ctx = ctx.with_row(rn);
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
         probe_keys_buf.clear();
         driver_extractor
