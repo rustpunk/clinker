@@ -231,7 +231,7 @@ pub(crate) fn dispatch_route(
                         ctx,
                         &record,
                         rn,
-                        crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                        clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
                         route_err.to_string(),
                         stage.clone(),
                         None,
@@ -244,7 +244,8 @@ pub(crate) fn dispatch_route(
                             ctx,
                             DlqEntry {
                                 source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                category:
+                                    clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
                                 error_message: route_err.to_string(),
                                 original_record: record,
                                 stage,

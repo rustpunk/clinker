@@ -167,7 +167,7 @@ nodes:
     for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
         assert_eq!(
             c.category,
-            clinker_core::dlq::DlqErrorCategory::Correlated,
+            clinker_core_types::dlq::DlqErrorCategory::Correlated,
             "body-output collateral carries the Correlated category"
         );
     }

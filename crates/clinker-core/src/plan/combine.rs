@@ -24,11 +24,11 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::execution::DependencyType;
 use crate::plan::row_type::{QualifiedField, Row};
 use crate::plan::types::JoinSide;
-use crate::span::Span;
+use clinker_core_types::span::Span;
+use clinker_core_types::{Diagnostic, LabeledSpan};
 use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
 use cxl::typecheck::Type;
 use cxl::typecheck::TypeDiagnostic;
@@ -2252,7 +2252,7 @@ mod tests {
         use crate::config::pipeline_node::{MatchMode, OnMiss};
         use crate::plan::bind_schema::CompileArtifacts;
         use crate::plan::execution::{ExecutionPlanDag, PlanNode};
-        use crate::span::Span;
+        use clinker_core_types::span::Span;
         use cxl::ast::{Expr, LiteralValue, NodeId};
         use cxl::lexer::Span as CxlSpan;
         use indexmap::IndexMap;
@@ -2508,7 +2508,7 @@ mod tests {
         // re-runs every existing lookup fixture test on every invocation.
         use crate::config::pipeline_node::{MatchMode, OnMiss, PropagateCkSpec};
         use crate::plan::execution::PlanNode;
-        use crate::span::Span;
+        use clinker_core_types::span::Span;
 
         let node = PlanNode::Combine {
             name: "test_combine".into(),
@@ -2550,7 +2550,7 @@ mod tests {
         use crate::config::pipeline_node::{MatchMode, OnMiss};
         use crate::plan::bind_schema::CompileArtifacts;
         use crate::plan::execution::{ExecutionPlanDag, PlanNode};
-        use crate::span::Span;
+        use clinker_core_types::span::Span;
         use cxl::ast::{Expr, LiteralValue, NodeId};
         use cxl::lexer::Span as CxlSpan;
 
@@ -2698,7 +2698,7 @@ mod tests {
         decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
         let errors: Vec<&Diagnostic> = diags
             .iter()
-            .filter(|d| matches!(d.severity, crate::error::Severity::Error))
+            .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
             .collect();
         assert!(errors.is_empty(), "no errors expected; got {errors:?}");
 
@@ -2741,7 +2741,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|d| matches!(d.severity, crate::error::Severity::Error)),
+                .any(|d| matches!(d.severity, clinker_core_types::Severity::Error)),
             "no errors on a connected 4-input chain"
         );
         let combines = collect_combines(&plan);

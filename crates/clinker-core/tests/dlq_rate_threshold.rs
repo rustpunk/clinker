@@ -297,8 +297,9 @@ fn per_source_path_partitions_dlq_entries() {
     use std::sync::Arc;
 
     use clinker_core::config::{DlqConfig, DlqPerSourceConfig};
-    use clinker_core::dlq::{DlqErrorCategory, partition_dlq_entries};
+    use clinker_core::dlq::partition_dlq_entries;
     use clinker_core::executor::DlqEntry;
+    use clinker_core_types::dlq::DlqErrorCategory;
     use clinker_record::{Record, Schema, Value};
 
     let schema = Arc::new(Schema::new(vec!["id".into()]));

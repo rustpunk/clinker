@@ -30,7 +30,7 @@
 //! Source set; window `[w_start, w_end)` is "closed" iff
 //! `min_across_sources >= w_end + allowed_lateness`. Records assigned
 //! to an already-closed window route to the DLQ as
-//! [`crate::dlq::DlqErrorCategory::LateRecord`].
+//! [`clinker_core_types::dlq::DlqErrorCategory::LateRecord`].
 
 use std::collections::HashSet;
 

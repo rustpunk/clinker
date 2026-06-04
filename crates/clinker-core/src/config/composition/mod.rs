@@ -68,9 +68,9 @@
 //! [`LayerKind`], [`ProvenanceDb`].
 
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
-use crate::error::{Diagnostic, LabeledSpan, Severity};
-use crate::span::{FileId, Span};
 use crate::yaml::{Spanned, YamlError};
+use clinker_core_types::span::{FileId, Span};
+use clinker_core_types::{Diagnostic, LabeledSpan, Severity};
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -195,7 +195,7 @@ pub struct OutputAlias {
 
 /// A span-carrying [`NodeRef`]. Inlined here (rather than reusing the
 /// serde-saphyr `Spanned<T>`) because the canonical span type is
-/// [`crate::span::Span`]; the serde-saphyr variant is converted at the
+/// [`clinker_core_types::span::Span`]; the serde-saphyr variant is converted at the
 /// yaml boundary.
 #[derive(Debug, Clone)]
 pub struct SpannedNodeRef {

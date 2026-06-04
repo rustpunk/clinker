@@ -141,7 +141,7 @@ nodes:
     let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
         .collect();
     assert_eq!(
         combine_dlq.len(),
@@ -191,7 +191,7 @@ nodes:
         !report
             .dlq_entries
             .iter()
-            .any(|e| e.category == clinker_core::dlq::DlqErrorCategory::Correlated),
+            .any(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::Correlated),
         "id=2 is the only member of its dirty group, so no collateral \
          (Correlated) entry is produced: {:?}",
         report

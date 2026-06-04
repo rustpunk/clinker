@@ -5,6 +5,7 @@ members = [
     "crates/cxl",
     "crates/cxl-cli",
     "crates/clinker-format",
+    "crates/clinker-core-types",
     "crates/clinker-core",
     "crates/clinker-net",
     "crates/clinker-channel",
@@ -23,6 +24,7 @@ license = "MIT"
 clinker-record = { path = "crates/clinker-record" }
 cxl = { path = "crates/cxl" }
 clinker-format = { path = "crates/clinker-format" }
+clinker-core-types = { path = "crates/clinker-core-types" }
 clinker-core = { path = "crates/clinker-core" }
 clinker-net = { path = "crates/clinker-net" }
 clinker-channel = { path = "crates/clinker-channel" }

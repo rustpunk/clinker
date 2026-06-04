@@ -33,13 +33,13 @@ use cxl::typecheck::pass::TypedProgram;
 pub(crate) fn resolve_composition_body_windows(
     parent_dag: &ExecutionPlanDag,
     artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
-    diags: &mut Vec<crate::error::Diagnostic>,
+    diags: &mut Vec<clinker_core_types::Diagnostic>,
 ) {
-    use crate::error::{Diagnostic, LabeledSpan};
     use crate::plan::index::{
         IndexSpec, PlanIndexRoot, RawIndexRequest, deduplicate_indices, find_index_for,
     };
-    use crate::span::Span as PlanSpan;
+    use clinker_core_types::span::Span as PlanSpan;
+    use clinker_core_types::{Diagnostic, LabeledSpan};
 
     // Two-step ownership shuffle: (1) compute every body's
     // (idx_specs, window_index_assignments) without holding a mutable

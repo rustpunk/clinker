@@ -4,7 +4,7 @@
 //! execution time. [`ResourceKind`](super::ResourceKind) remains the
 //! payload-free declaration-level tag in [`ResourceDecl`](super::ResourceDecl).
 
-use crate::span::Span;
+use clinker_core_types::span::Span;
 use std::path::PathBuf;
 
 /// A resolved resource reference with its runtime payload.

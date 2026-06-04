@@ -441,7 +441,7 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
 fn abort_on_overlay_errors(
     overlay: &clinker_channel::ChannelOverlayResult,
 ) -> Result<(), PipelineError> {
-    use clinker_core::error::Severity;
+    use clinker_core_types::Severity;
     let mut had_error = false;
     let mut messages: Vec<String> = Vec::new();
     for d in &overlay.diagnostics {

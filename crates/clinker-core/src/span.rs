@@ -1,122 +1,20 @@
-//! Source-span infrastructure for diagnostics.
+//! Source-database interner that resolves [`Span`]s to human-readable
+//! `(line, column)` positions.
 //!
-//! - [`FileId`]: 1-based index into a [`SourceDb`], niche-optimized via `NonZeroU32`.
-//! - [`Span`]: 12-byte `Copy` value (file + byte offset + length) pointing into
-//!   the owning `SourceDb`'s file contents.
-//! - [`SourceDb`]: interns loaded YAML (or in-memory buffers) and resolves
-//!   spans to 1-based (line, column) pairs for human-readable diagnostics.
+//! [`SourceDb`] interns loaded YAML (or in-memory buffers) keyed by
+//! [`FileId`] and walks their contents on demand to resolve spans. It lives
+//! here, above the leaf [`Span`]/[`FileId`] value types in
+//! [`clinker_core_types`], because loading a file from disk goes through this
+//! crate's path-security chokepoint ([`crate::security::ValidatedPath`]).
 //!
-//! `SourceDb` also implements [`miette::SourceCode`] so diagnostics can render
-//! with `miette`'s fancy reporter.
+//! `SourceDb` implements [`miette::SourceCode`] so diagnostics can render with
+//! `miette`'s fancy reporter.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// 1-based file identifier. `NonZeroU32` gives `Option<FileId>` the same size
-/// as `FileId`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct FileId(NonZeroU32);
-
-impl FileId {
-    /// Construct from a 1-based index. Primarily used by [`SourceDb`]; tests
-    /// may use this directly.
-    pub const fn new(raw: NonZeroU32) -> Self {
-        Self(raw)
-    }
-
-    /// Raw 1-based index.
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-/// A source-code span: 12 bytes, `Copy`, interpreted relative to its
-/// [`FileId`]'s contents in a [`SourceDb`].
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Span {
-    pub file: FileId,
-    pub start: u32,
-    pub len: u32,
-}
-
-impl Span {
-    /// Synthetic placeholder span for diagnostics produced *before* a file
-    /// has been loaded into a [`SourceDb`] (e.g. path-validation errors
-    /// reported against a raw `PathBuf`). Uses [`u32::MAX`] as the file id
-    /// so it cannot collide with any real [`FileId`] assigned by
-    /// `SourceDb::insert`.
-    ///
-    /// Callers that later learn the owning file and byte range should
-    /// replace the diagnostic's primary span with a real one.
-    pub const SYNTHETIC: Self = Self {
-        file: FileId(match NonZeroU32::new(u32::MAX) {
-            Some(v) => v,
-            None => unreachable!(),
-        }),
-        start: 0,
-        len: 0,
-    };
-
-    /// A zero-length span at `offset`.
-    pub const fn point(file: FileId, offset: u32) -> Self {
-        Self {
-            file,
-            start: offset,
-            len: 0,
-        }
-    }
-
-    /// Synthetic span carrying a known 1-based source line but no
-    /// interned `SourceDb`/byte-offset. Used by
-    /// `PipelineConfig::compile()` stage 5 so `--explain` can render
-    /// `(line:N)` annotations against each lowered node without
-    /// requiring a `SourceDb` to be threaded through the compile path.
-    ///
-    /// Encoded as: `file = SYNTHETIC_FILE_ID` (u32::MAX), `start = line`,
-    /// `len = 0`. Callers that want the embedded line number use
-    /// [`Span::synthetic_line_number`].
-    pub const fn line_only(line: u32) -> Self {
-        Self {
-            file: FileId(match NonZeroU32::new(u32::MAX) {
-                Some(v) => v,
-                None => unreachable!(),
-            }),
-            start: line,
-            len: 0,
-        }
-    }
-
-    /// If this span is a [`Span::line_only`]-flavored synthetic span,
-    /// return the embedded 1-based line number. Returns `None` for
-    /// real (file-backed) spans, for `Span::SYNTHETIC`, and for any
-    /// other non-line-only synthetic.
-    pub fn synthetic_line_number(self) -> Option<u32> {
-        if self.file.get() == u32::MAX && self.len == 0 && self.start > 0 {
-            Some(self.start)
-        } else {
-            None
-        }
-    }
-
-    /// Exclusive end byte offset.
-    pub const fn end(&self) -> u32 {
-        self.start + self.len
-    }
-
-    /// Convert a [`serde_saphyr::Span`] to a [`Span`] under a given [`FileId`].
-    ///
-    /// If the saphyr span has no byte-info attached (`byte_info == (0, 0)`,
-    /// e.g. it came from a non-string source or a tagged-enum / flatten
-    /// context), returns a zero-length span at offset 0 — equivalent to
-    /// "we know the file but not the byte position." Real byte ranges
-    /// flow through unchanged.
-    pub fn from_saphyr(file: FileId, span: serde_saphyr::Span) -> Self {
-        let start = span.byte_offset().unwrap_or(0) as u32;
-        let len = span.byte_len().unwrap_or(0) as u32;
-        Self { file, start, len }
-    }
-}
+use clinker_core_types::span::{FileId, Span};
 
 /// Owns loaded YAML files (and in-memory buffers) keyed by [`FileId`].
 ///
@@ -161,8 +59,7 @@ impl SourceDb {
 
     /// Intern an in-memory buffer as if it had been loaded from `path`.
     ///
-    /// Used by Kiln's unsaved-buffer workflow and by tests that want to avoid
-    /// touching the filesystem.
+    /// Used by tests that want to avoid touching the filesystem.
     pub fn insert_in_memory(&mut self, path: PathBuf, contents: String) -> FileId {
         self.insert(path, contents)
     }
@@ -173,7 +70,7 @@ impl SourceDb {
             path: Arc::new(path),
             contents,
         });
-        FileId(NonZeroU32::new(raw).expect("len+1 is non-zero"))
+        FileId::new(NonZeroU32::new(raw).expect("len+1 is non-zero"))
     }
 
     /// File contents for `file`.
@@ -203,7 +100,7 @@ impl SourceDb {
     }
 
     fn file(&self, file: FileId) -> &LoadedFile {
-        let idx = file.0.get() as usize - 1;
+        let idx = file.get() as usize - 1;
         self.files
             .get(idx)
             .expect("SourceDb::file: FileId out of range")
@@ -230,11 +127,6 @@ impl miette::SourceCode for SourceDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_span_size_is_12_bytes() {
-        assert_eq!(std::mem::size_of::<Span>(), 12);
-    }
 
     #[test]
     fn test_source_db_loads_and_resolves_line() {

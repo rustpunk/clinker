@@ -264,8 +264,8 @@ impl ExecutionPlanDag {
 pub(crate) fn diagnose_untagged_composition_edges(
     dag: &ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
-) -> Vec<crate::error::Diagnostic> {
-    use crate::error::{Diagnostic, LabeledSpan};
+) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::{Diagnostic, LabeledSpan};
     use petgraph::Direction;
     use petgraph::visit::EdgeRef;
     fn check(graph: &DiGraph<PlanNode, PlanEdge>, scope_label: &str, out: &mut Vec<Diagnostic>) {

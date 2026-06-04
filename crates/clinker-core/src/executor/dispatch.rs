@@ -309,7 +309,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
     ctx: &mut ExecutorContext<'_>,
     record: &Record,
     row_num: u64,
-    category: crate::dlq::DlqErrorCategory,
+    category: clinker_core_types::dlq::DlqErrorCategory,
     error_message: String,
     stage: Option<String>,
     route: Option<String>,
@@ -368,9 +368,9 @@ pub(crate) fn dispatch_transform_eval_error(
     // TypeCoercionFailure, matching the pre-existing classification.
     let category = match &eval_err.kind {
         cxl::eval::EvalErrorKind::ExpansionLimitExceeded { .. } => {
-            crate::dlq::DlqErrorCategory::ExpansionLimitExceeded
+            clinker_core_types::dlq::DlqErrorCategory::ExpansionLimitExceeded
         }
-        _ => crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        _ => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
     };
     let stage = Some(DlqEntry::stage_transform(&transform_name));
     let routed = record_error_to_buffer_if_grouped(
@@ -2566,7 +2566,7 @@ pub(crate) struct CorrelationRecordSlot {
 pub(crate) struct CorrelationErrorRecord {
     pub(crate) row_num: u64,
     pub(crate) original_record: Record,
-    pub(crate) category: crate::dlq::DlqErrorCategory,
+    pub(crate) category: clinker_core_types::dlq::DlqErrorCategory,
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,

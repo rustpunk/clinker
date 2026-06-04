@@ -8,7 +8,7 @@ use clinker_record::Record;
 #[derive(Debug, Clone)]
 pub struct DlqEntry {
     pub source_row: u64,
-    pub category: crate::dlq::DlqErrorCategory,
+    pub category: clinker_core_types::dlq::DlqErrorCategory,
     pub error_message: String,
     pub original_record: Record,
     /// Pipeline stage where error occurred.

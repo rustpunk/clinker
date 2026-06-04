@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::span::Span;
+use clinker_core_types::span::Span;
 
 // Keep ProvenanceLayer at or under 64 bytes — the provenance side-table
 // is sized for this footprint.

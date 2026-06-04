@@ -18,9 +18,10 @@
 mod tests {
     use clinker_bench_support::io::SharedBuffer;
     use clinker_core::config::{CompileContext, PipelineConfig};
-    use clinker_core::error::{Diagnostic, PipelineError};
+    use clinker_core::error::PipelineError;
     use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
     use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
+    use clinker_core_types::Diagnostic;
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use std::collections::HashMap;
@@ -155,7 +156,7 @@ mod tests {
         name: &str,
     ) -> (
         clinker_core::plan::bind_schema::CompileArtifacts,
-        Vec<clinker_core::error::Diagnostic>,
+        Vec<clinker_core_types::Diagnostic>,
     ) {
         let yaml = load_fixture(&format!("{name}.yaml"));
         let config = parse_fixture(&yaml);
@@ -323,7 +324,7 @@ mod tests {
         let (_artifacts, diags) = compile_combine_fixture("three_input_shared_key");
         let errors: Vec<&str> = diags
             .iter()
-            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
             .map(|d| d.code.as_str())
             .collect();
         assert!(
@@ -954,7 +955,7 @@ mod tests {
 
         let errors: Vec<&Diagnostic> = diags
             .iter()
-            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
             .collect();
         assert!(
             errors.is_empty(),
@@ -4240,7 +4241,7 @@ nodes:
         };
         use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
         use clinker_core::plan::row_type::{QualifiedField, Row};
-        use clinker_core::span::Span;
+        use clinker_core_types::span::Span;
         use cxl::ast::{Expr, LiteralValue, NodeId, Program};
         use cxl::lexer::Span as CxlSpan;
         use cxl::typecheck::Type;

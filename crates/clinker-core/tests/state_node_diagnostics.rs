@@ -13,7 +13,7 @@
 //!   * E175 — init-phase reader observes a runtime-only writer
 
 use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::error::Diagnostic;
+use clinker_core_types::Diagnostic;
 use std::path::PathBuf;
 
 fn fixture_root() -> PathBuf {

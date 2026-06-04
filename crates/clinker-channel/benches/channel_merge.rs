@@ -8,7 +8,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use clinker_channel::binding::ChannelBinding;
 use clinker_channel::overlay::apply_channel_overlay;
 use clinker_core::config::composition::{LayerKind, ResolvedValue};
-use clinker_core::span::Span;
+use clinker_core_types::Span;
 
 /// Build a synthetic channel binding with `n` config entries.
 fn synthetic_binding(n: usize) -> ChannelBinding {

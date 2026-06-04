@@ -455,7 +455,7 @@ nodes:
     let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
         .collect();
     assert_eq!(
         combine_dlq.len(),
@@ -520,7 +520,7 @@ fn assert_combine_output_row_recovered(
     let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
         .collect();
     assert_eq!(
         combine_dlq.len(),
@@ -840,7 +840,7 @@ nodes:
     let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
         .collect();
     assert_eq!(
         combine_dlq.len(),

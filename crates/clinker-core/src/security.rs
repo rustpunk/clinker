@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::PipelineConfig;
-use crate::error::{Diagnostic, LabeledSpan};
-use crate::span::Span;
+use clinker_core_types::span::Span;
+use clinker_core_types::{Diagnostic, LabeledSpan};
 
 /// A path that has passed [`validate_path`].
 ///

@@ -230,12 +230,12 @@ pub(crate) fn dispatch_aggregation(
                     match ctx.config.error_handling.strategy {
                         ErrorStrategy::FailFast => return Err(e.into()),
                         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            let stage = Some(crate::dlq::stage_aggregate(name));
+                            let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
                             let routed = record_error_to_buffer_if_grouped(
                                 ctx,
                                 record,
                                 *row_num,
-                                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                                 format!("aggregate {name}: {e}"),
                                 stage.clone(),
                                 None,
@@ -246,7 +246,7 @@ pub(crate) fn dispatch_aggregation(
                                     ctx,
                                     DlqEntry {
                                         source_row: *row_num,
-                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                                         error_message: format!("aggregate {name}: {e}"),
                                         original_record: record.clone(),
                                         stage,
@@ -347,12 +347,13 @@ pub(crate) fn dispatch_aggregation(
                             ctx,
                             DlqEntry {
                                 source_row: 0,
-                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                category:
+                                    clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                                 error_message: format!(
                                     "aggregate {transform}.{binding}: {source:?}"
                                 ),
                                 original_record: synthetic,
-                                stage: Some(crate::dlq::stage_aggregate(name)),
+                                stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
                                 route: None,
                                 trigger: true,
                                 source_name,
@@ -402,12 +403,13 @@ pub(crate) fn dispatch_aggregation(
                             ctx,
                             DlqEntry {
                                 source_row: 0,
-                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                category:
+                                    clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                                 error_message: format!(
                                     "aggregate {transform}.{binding}: {source:?}"
                                 ),
                                 original_record: synthetic,
-                                stage: Some(crate::dlq::stage_aggregate(name)),
+                                stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
                                 route: None,
                                 trigger: true,
                                 source_name,
@@ -1081,12 +1083,12 @@ fn handle_aggregate_add_error(
     match ctx.config.error_handling.strategy {
         ErrorStrategy::FailFast => Err(e.into()),
         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-            let stage = Some(crate::dlq::stage_aggregate(name));
+            let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
             let routed = record_error_to_buffer_if_grouped(
                 ctx,
                 record,
                 row_num,
-                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                 format!("aggregate {name}: {e}"),
                 stage.clone(),
                 None,
@@ -1097,7 +1099,7 @@ fn handle_aggregate_add_error(
                     ctx,
                     DlqEntry {
                         source_row: row_num,
-                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                        category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                         error_message: format!("aggregate {name}: {e}"),
                         original_record: record.clone(),
                         stage,
@@ -1197,14 +1199,14 @@ fn push_late_record(
         ctx,
         DlqEntry {
             source_row: row_num,
-            category: crate::dlq::DlqErrorCategory::LateRecord,
+            category: clinker_core_types::dlq::DlqErrorCategory::LateRecord,
             error_message: format!(
                 "time-window {transform}: record at event-time inside window \
                  [{}, {}) (nanos) which had already closed",
                 bounds.start, bounds.end
             ),
             original_record: record.clone(),
-            stage: Some(crate::dlq::stage_time_window(transform)),
+            stage: Some(clinker_core_types::dlq::stage_time_window(transform)),
             route: None,
             trigger: true,
             source_name,
@@ -1240,10 +1242,10 @@ fn emit_aggregate_finalize_dlq(
         ctx,
         DlqEntry {
             source_row: 0,
-            category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+            category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
             error_message: format!("aggregate {transform}.{binding}: {source:?}"),
             original_record: synthetic,
-            stage: Some(crate::dlq::stage_aggregate(name)),
+            stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
             route: None,
             trigger: true,
             source_name,
