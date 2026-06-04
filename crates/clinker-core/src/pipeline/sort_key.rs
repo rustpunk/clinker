@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 use chrono::NaiveDate;
 use clinker_record::{Record, Value};
 
-use crate::config::{NullOrder, SortField, SortOrder};
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
 /// Encode a record's sort fields as a memcomparable byte sequence.
 pub fn encode_sort_key(record: &Record, sort_by: &[SortField]) -> Vec<u8> {

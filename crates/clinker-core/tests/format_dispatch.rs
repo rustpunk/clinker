@@ -7,8 +7,8 @@
 mod common;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -60,7 +60,7 @@ fn run_format_test(
     input_name: &str,
     input_data: Cursor<Vec<u8>>,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let output_buf = SharedBuffer::new();
 
     let readers: clinker_core::executor::SourceReaders = HashMap::from([(

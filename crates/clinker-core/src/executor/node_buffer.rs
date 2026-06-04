@@ -21,9 +21,9 @@ use std::vec::IntoIter as VecIntoIter;
 
 use clinker_record::{Record, Value};
 
-use crate::error::PipelineError;
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 use crate::pipeline::spill::{SpillFile, SpillReader};
+use clinker_plan::error::PipelineError;
 
 /// Body records paired with the punctuations preserved from a buffer
 /// drain. Returned by [`NodeBuffer::drain_split`] and threaded through

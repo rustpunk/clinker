@@ -14,14 +14,14 @@ use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, MergeStreamHandoff, admit_node_buffer, drain_node_buffer_slot,
     finalize_node_rooted_windows, merge_fused_interleave, node_buffer_spill_allowed,
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Merge` arm for `node_idx`: concatenate predecessor buffers
 /// in declaration order (Concat), round-robin across them (Interleave), or —
@@ -66,11 +66,11 @@ pub(crate) fn dispatch_merge(
 
     let (declaration_order, mode, interleave_seed): (
         Vec<String>,
-        crate::config::MergeMode,
+        clinker_plan::config::MergeMode,
         Option<u64>,
     ) = {
-        use crate::config::PipelineNode;
-        use crate::config::node_header::NodeInput;
+        use clinker_plan::config::PipelineNode;
+        use clinker_plan::config::node_header::NodeInput;
         ctx.config
             .nodes
             .iter()
@@ -90,7 +90,7 @@ pub(crate) fn dispatch_merge(
                 }
                 _ => None,
             })
-            .unwrap_or_else(|| (Vec::new(), crate::config::MergeMode::Concat, None))
+            .unwrap_or_else(|| (Vec::new(), clinker_plan::config::MergeMode::Concat, None))
     };
 
     // Sort predecessors by declaration order
@@ -108,7 +108,7 @@ pub(crate) fn dispatch_merge(
     // name is in `ctx.fused_sources`. The pre-pass at executor
     // entry already validated mode == Interleave for these,
     // but we double-check here defensively.
-    let fused_mode = matches!(mode, crate::config::MergeMode::Interleave)
+    let fused_mode = matches!(mode, clinker_plan::config::MergeMode::Interleave)
         && sorted_preds.iter().all(|p| match &current_dag.graph[*p] {
             PlanNode::Source { name: src_name, .. } => {
                 ctx.fused_sources.contains(src_name.as_str())
@@ -204,7 +204,7 @@ pub(crate) fn dispatch_merge(
         // multiple-input duplicates so each `DocumentOpen` and
         // `DocumentClose` traverses downstream exactly once.
         match mode {
-            crate::config::MergeMode::Concat => {
+            clinker_plan::config::MergeMode::Concat => {
                 for pred in &sorted_preds {
                     let upstream_name = current_dag.graph[*pred].name().to_string();
                     if let Some(buf) = drain_node_buffer_slot(ctx, *pred) {
@@ -221,7 +221,7 @@ pub(crate) fn dispatch_merge(
                     }
                 }
             }
-            crate::config::MergeMode::Interleave => {
+            clinker_plan::config::MergeMode::Interleave => {
                 // Round-robin across pre-buffered predecessor
                 // outputs. Reached only when predecessors are
                 // not all Sources (the fused path took

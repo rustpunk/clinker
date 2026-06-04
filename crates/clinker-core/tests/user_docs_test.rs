@@ -18,7 +18,7 @@ fn test_user_docs_files_exist() {
 
     // 1. Composition authoring guide (7 bullets)
     let comp_mod =
-        std::fs::read_to_string(root.join("crates/clinker-core/src/config/composition/mod.rs"))
+        std::fs::read_to_string(root.join("crates/clinker-plan/src/config/composition/mod.rs"))
             .expect("composition mod.rs must exist");
     let comp_topics = [
         "Composition Authoring Guide",

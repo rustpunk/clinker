@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -341,7 +341,7 @@ nodes:
 /// silent-corruption topology matrix from #47 / umbrella #50.
 #[test]
 fn h3_merge_same_policy_auto_widen_carries_sidecar() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
 
     let yaml = r#"
 pipeline:

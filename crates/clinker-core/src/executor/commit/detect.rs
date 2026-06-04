@@ -14,7 +14,7 @@ use petgraph::graph::NodeIndex;
 
 use super::DlqEvent;
 use crate::executor::dispatch::ExecutorContext;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// One row-and-source pair carrying a relaxed-CK retract trigger.
 /// The source name pairs the source-local `row_num` with its
@@ -280,7 +280,10 @@ pub(crate) fn detect_retract_scope(
                 .and_then(|p| current_dag.node_properties.get(&p))
                 .map(|p| p.ck_set.clone())
                 .unwrap_or_default();
-            if crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
+            if clinker_plan::plan::execution::group_by_omits_any_ck_field(
+                &config.group_by,
+                &parent_ck,
+            ) {
                 scope.aggregates.push((
                     idx,
                     affected_row_pairs

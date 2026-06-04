@@ -10,9 +10,9 @@ mod common;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
-use clinker_core::config::parse_config;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, SourceReaders, single_file_reader};
+use clinker_plan::config::parse_config;
+use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 
 /// Run a single-source, single-output branching pipeline with the given

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use clinker_record::Schema;
 
-use crate::error::PipelineError;
+use clinker_plan::error::PipelineError;
 
 /// Validate that `actual` matches `expected`. Fast-path is `Arc::ptr_eq`;
 /// structural fallback compares the column-name lists. Any divergence

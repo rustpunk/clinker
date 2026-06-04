@@ -13,14 +13,14 @@ use std::sync::Arc;
 use clinker_record::Record;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, MERGED_SOURCE_FILE, admit_node_buffer, build_engine_stamped_tail,
     canonicalize_to_source_schema, drain_node_buffer_slot, finalize_node_rooted_windows,
     node_buffer_spill_allowed, seed_source_vars_for_record, source_file_arc_of,
     tee_emit_to_region_input_buffers,
 };
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Source` arm for `node_idx`: drain the source's records from
 /// its live receiver, body-port seed buffer, or fail loudly when the ingest

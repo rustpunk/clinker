@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::{CompileContext, parse_config};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -44,7 +44,7 @@ fn test_params() -> PipelineRunParams {
 
 fn run_single(yaml: &str, csv_input: &str) -> String {
     let config = parse_config(yaml).expect("parse_config");
-    let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
+    let plan = clinker_plan::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
     let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),
@@ -65,7 +65,7 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
 
 fn run_multi(yaml: &str, inputs: &[(&str, &str)]) -> String {
     let config = parse_config(yaml).expect("parse_config");
-    let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
+    let plan = clinker_plan::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
     let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
     for (name, data) in inputs {
@@ -280,7 +280,7 @@ fn state_composition_opt_in_pipeline_var_visible_in_body() {
     // `$pipeline.cutoff` via `_compose.scoped_vars.pipeline`. A parent
     // Transform declares `cutoff: { type: int, default: 99 }`; the
     // body reads the parent's value and emits it as `cutoff_seen`.
-    use clinker_core::config::CompileContext;
+    use clinker_plan::config::CompileContext;
     use std::path::PathBuf;
 
     let yaml = r#"
@@ -651,7 +651,7 @@ nodes:
 "#;
     let csv = "id,amount\n1,50\n2,150\n3,200\n";
     let config = parse_config(yaml).expect("parse_config");
-    let plan = clinker_core::config::PipelineConfig::compile(&config, &CompileContext::default())
+    let plan = clinker_plan::config::PipelineConfig::compile(&config, &CompileContext::default())
         .expect("compile");
     let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),

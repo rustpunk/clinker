@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
-use crate::plan::composition_body::CompositionBodyId;
-use crate::plan::index::PlanIndexRoot;
+use clinker_plan::plan::composition_body::CompositionBodyId;
+use clinker_plan::plan::index::PlanIndexRoot;
 
 /// Resolved arena + secondary index for one windowed Transform.
 ///
@@ -77,7 +77,7 @@ impl WindowRuntimeRegistry {
     /// `top` slots start `None`; operators populate them at their
     /// dispatch-arm finalize, including Source arms (which anchor
     /// their windows at the Source's own `NodeIndex`).
-    pub(crate) fn new(specs: &[crate::plan::index::IndexSpec]) -> Self {
+    pub(crate) fn new(specs: &[clinker_plan::plan::index::IndexSpec]) -> Self {
         Self {
             top: (0..specs.len()).map(|_| None).collect(),
             bodies: HashMap::new(),

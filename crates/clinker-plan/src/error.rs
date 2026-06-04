@@ -20,11 +20,11 @@ pub enum PipelineError {
         messages: Vec<String>,
     },
     Io(std::io::Error),
-    /// Spill-format I/O or decode failure surfaced by
-    /// `crate::pipeline::spill::SpillReader`. Distinct from `Io` so the
-    /// rendered diagnostic preserves postcard and JSON-schema decode
-    /// context that bare `std::io::Error` would lose.
-    Spill(crate::pipeline::spill::SpillError),
+    /// Spill-format I/O or decode failure surfaced by the execution
+    /// layer's spill reader. Distinct from `Io` so the rendered
+    /// diagnostic preserves postcard and JSON-schema decode context that
+    /// bare `std::io::Error` would lose.
+    Spill(crate::runtime_error::SpillError),
     ThreadPool(String),
     /// Multiple errors collected from parallel writer threads.
     /// DataFusion `Collection` pattern (PR #14439).
@@ -166,7 +166,7 @@ pub enum PipelineError {
         node: String,
         used: u64,
         limit: u64,
-        source: crate::pipeline::memory::BudgetCategory,
+        source: crate::runtime_error::BudgetCategory,
         detail: Option<String>,
     },
     /// E319 — a combine with `on_miss: error` saw a driver row that
@@ -190,7 +190,7 @@ pub enum PipelineError {
         total_count: u64,
     },
     /// A chunk-boundary shutdown poll tripped (SIGINT/SIGTERM or a
-    /// programmatic [`crate::pipeline::shutdown::ShutdownToken::request`]).
+    /// programmatic shutdown request from the execution layer).
     /// The dispatch unwinds so the executor can drop senders, join worker
     /// threads, and exit gracefully (the CLI maps this to exit code 130).
     Interrupted,
@@ -423,8 +423,8 @@ impl From<std::io::Error> for PipelineError {
     }
 }
 
-impl From<crate::pipeline::spill::SpillError> for PipelineError {
-    fn from(e: crate::pipeline::spill::SpillError) -> Self {
+impl From<crate::runtime_error::SpillError> for PipelineError {
+    fn from(e: crate::runtime_error::SpillError) -> Self {
         Self::Spill(e)
     }
 }

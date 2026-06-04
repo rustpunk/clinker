@@ -15,9 +15,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, PipelineConfig};
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_plan::config::{CompileContext, PipelineConfig};
+use clinker_plan::error::PipelineError;
 
 /// Run a parsed `config` resolving source/composition paths against an
 /// explicit compile anchor (a temp workspace root), returning the full
@@ -91,7 +91,7 @@ nodes:
 /// aggregate emit lands as a record on the sink.
 #[test]
 fn deferred_consumers_emit_through_commit_time_dispatch() {
-    let config = clinker_core::config::parse_config(DEFERRED_PIPELINE).expect("parse");
+    let config = clinker_plan::config::parse_config(DEFERRED_PIPELINE).expect("parse");
     let primary = "src".to_string();
     let csv = "\
 order_id,department,amount
@@ -240,7 +240,7 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     // The pipeline either errors at the producer's region tee (E310 from
     // `tee_emit_to_region_input_buffers`) or at the source's arena
     // build (E310 from the source-rooted Phase-0 arena). Either path
@@ -261,15 +261,15 @@ nodes:
     // when reachable and on the spill-fallback Compilation arm
     // otherwise.
     match &err {
-        clinker_core::error::PipelineError::MemoryBudgetExceeded {
-            source: clinker_core::pipeline::memory::BudgetCategory::Arena,
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
+            source: clinker_plan::BudgetCategory::Arena,
             ..
         } => {}
-        clinker_core::error::PipelineError::Compilation { messages, .. }
+        clinker_plan::error::PipelineError::Compilation { messages, .. }
             if messages
                 .iter()
                 .any(|m| m.contains("memory.limit too small")) => {}
-        clinker_core::error::PipelineError::Io(io_err)
+        clinker_plan::error::PipelineError::Io(io_err)
             if io_err.to_string().contains("memory.limit too small") => {}
         other => panic!(
             "memory-overflow surface must carry MemoryBudgetExceeded \
@@ -396,7 +396,7 @@ HR,100
 ENG,500
 ";
 
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let _primary = "orders".to_string();
     let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
@@ -603,8 +603,8 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path(),
         std::path::PathBuf::from("pipelines"),
     );
@@ -800,8 +800,8 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path(),
         std::path::PathBuf::from("pipelines"),
     );
@@ -979,8 +979,8 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path(),
         std::path::PathBuf::from("pipelines"),
     );
@@ -1159,7 +1159,7 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let report = common::run_config(&config, readers, writers, &params)
         .expect("fan-out pipeline must converge");
 

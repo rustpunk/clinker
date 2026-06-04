@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
-use clinker_core::config::{InputFormat, PipelineConfig, PipelineNode, SchemaSource, SourceConfig};
+use clinker_plan::config::{InputFormat, PipelineConfig, PipelineNode, SchemaSource, SourceConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -493,7 +493,7 @@ nodes:
     schema:
       - { name: id, type: string }
 "#;
-        let config = clinker_core::config::parse_config(yaml).unwrap();
+        let config = clinker_plan::config::parse_config(yaml).unwrap();
 
         let index = SchemaIndex::default();
         let warnings = validate_pipeline(&config, &index, Path::new("/tmp"));

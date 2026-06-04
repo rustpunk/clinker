@@ -14,8 +14,8 @@
 
 use std::path::PathBuf;
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
-use clinker_core::plan::execution::{
+use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_plan::plan::execution::{
     ExecutionPlanDag, NodeExecutionReqs, ParallelismClass, PlanNode,
 };
 
@@ -29,14 +29,14 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn compile_fixture(relative_yaml_path: &str) -> clinker_core::plan::CompiledPlan {
+fn compile_fixture(relative_yaml_path: &str) -> clinker_plan::plan::CompiledPlan {
     compile_fixture_with(relative_yaml_path, |_| {})
 }
 
 fn compile_fixture_with(
     relative_yaml_path: &str,
     tweak: impl FnOnce(&mut CompileContext),
-) -> clinker_core::plan::CompiledPlan {
+) -> clinker_plan::plan::CompiledPlan {
     let root = workspace_root();
     let full = root.join(relative_yaml_path);
     let text =

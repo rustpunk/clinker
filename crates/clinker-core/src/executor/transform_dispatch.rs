@@ -13,7 +13,6 @@ use cxl::eval::{ProgramEvaluator, SkipReason};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, advance_cursor, dispatch_transform_eval_error,
     drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
@@ -24,7 +23,8 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL
 /// evaluation (filter, projection, distinct, emit_each fan-out) over the

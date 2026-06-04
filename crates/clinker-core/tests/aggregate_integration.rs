@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 
 /// Thread-safe in-memory buffer for capturing output in integration tests.
 #[derive(Clone, Default)]
@@ -67,9 +67,9 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(
+        &clinker_plan::config::PipelineConfig::compile(
             &config,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("compile"),
         readers,
@@ -867,9 +867,9 @@ nodes:
       path: out.csv
 "#;
     let config = parse_config(yaml).expect("parse");
-    let result = clinker_core::config::PipelineConfig::compile(
+    let result = clinker_plan::config::PipelineConfig::compile(
         &config,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     );
     let diags = result.expect_err("aggregate with emit $pipeline.x should fail compile");
     let combined = diags

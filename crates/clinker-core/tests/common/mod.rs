@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use clinker_core::config::{CompileContext, PipelineConfig};
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_plan::config::{CompileContext, PipelineConfig};
+use clinker_plan::error::PipelineError;
 
 /// Run a parsed `config` to completion against the supplied readers and
 /// writers, returning the full [`ExecutionReport`].

@@ -9,7 +9,7 @@
 use clinker_record::accumulator::AccumulatorError;
 use cxl::eval::EvalError;
 
-use crate::error::PipelineError;
+use clinker_plan::error::PipelineError;
 
 /// Errors that can arise while evaluating a residual in aggregate
 /// scope.

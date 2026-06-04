@@ -16,13 +16,13 @@ use std::sync::Arc;
 
 use clinker_record::GroupByKey;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
     push_write_error, source_name_arc_of,
 };
 use crate::executor::{DlqEntry, build_format_writer};
-use crate::plan::execution::ExecutionPlanDag;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 
 /// Execute the `CorrelationCommit` arm: drive the relaxed-CK cascading
 /// retraction orchestrator (which, for strict pipelines, runs a single

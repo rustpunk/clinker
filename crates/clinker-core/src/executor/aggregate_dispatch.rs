@@ -15,8 +15,6 @@ use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
 use cxl::eval::ProgramEvaluator;
 use petgraph::graph::NodeIndex;
 
-use crate::config::ErrorStrategy;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
     drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
@@ -25,8 +23,10 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
-use crate::plan::types::AggregateStrategy;
+use clinker_plan::config::ErrorStrategy;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::types::AggregateStrategy;
 
 /// Execute the `Aggregation` arm for `node_idx`: select hash or streaming
 /// strategy, ingest the predecessor's records (per-record for hash, sorted
@@ -75,7 +75,12 @@ pub(crate) fn dispatch_aggregation(
     // match — internal invariants always abort.
     use crate::aggregation::{HashAggError, SortRow as AggSortRow};
 
-    let pred = crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
+    let pred = clinker_plan::plan::execution::single_predecessor(
+        current_dag,
+        node_idx,
+        "aggregation",
+        name,
+    )?;
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -646,19 +651,19 @@ fn run_time_windowed_aggregate(
     node_idx: NodeIndex,
     win_ctx: &WindowedAggContext<'_>,
     input: &[(Record, u64)],
-    spec: &crate::config::pipeline_node::TimeWindowSpec,
+    spec: &clinker_plan::config::pipeline_node::TimeWindowSpec,
     allowed_lateness: Option<std::time::Duration>,
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
     let name = win_ctx.name;
     let compiled = win_ctx.compiled;
     let output_schema = Arc::clone(&win_ctx.output_schema);
     use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
-    use crate::config::pipeline_node::TimeWindowSpec;
     use crate::executor::time_window::{
         WindowBounds, duration_to_nanos, hopping_windows, partition_into_sessions,
         record_event_time_nanos, session_is_closed, tumbling_window, upstream_source_names,
         window_is_closed,
     };
+    use clinker_plan::config::pipeline_node::TimeWindowSpec;
     use clinker_record::group_key::value_to_group_key;
     use std::collections::HashMap;
 

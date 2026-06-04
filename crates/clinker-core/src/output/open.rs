@@ -7,9 +7,9 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use crate::config::{ConfigError, IfExistsPolicy};
-use crate::error::PipelineError;
-use crate::security::check_overwrite;
+use clinker_plan::config::{ConfigError, IfExistsPolicy};
+use clinker_plan::error::PipelineError;
+use clinker_plan::security::check_overwrite;
 
 /// Open the next valid output sink given the active collision policy.
 ///

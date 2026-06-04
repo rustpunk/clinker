@@ -23,7 +23,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 /// `ValidatedPath` by value to force callers through the validator.
 ///
 /// ```compile_fail
-/// use clinker_core::security::ValidatedPath;
+/// use clinker_plan::security::ValidatedPath;
 /// use std::path::PathBuf;
 /// // Direct construction is rejected: the inner field is private.
 /// let _ = ValidatedPath(PathBuf::from("/etc/passwd"));
@@ -151,8 +151,8 @@ fn sec_diag(message: String) -> Diagnostic {
 /// Refuse to clobber an existing output file.
 ///
 /// Returns a `Diagnostic` if `path` already exists; otherwise `Ok(())`.
-/// Force/clobber-overrides are owned upstream by the
-/// [`crate::output::open::open_output`] policy layer — `--force` and
+/// Force/clobber-overrides are owned upstream by the execution layer's
+/// output-open policy — `--force` and
 /// `if_exists: overwrite` both downgrade to `Overwrite` *before* this
 /// function runs, so the parameter list stays minimal and the caller
 /// keeps a single decision point.
@@ -317,7 +317,7 @@ mod tests {
     /// If this ever starts compiling, the type-level guarantee has regressed.
     ///
     /// ```compile_fail
-    /// use clinker_core::span::SourceDb;
+    /// use clinker_plan::span::SourceDb;
     /// use std::path::PathBuf;
     /// let mut db = SourceDb::new();
     /// let _ = db.load(PathBuf::from("/etc/passwd"));

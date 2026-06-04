@@ -7,5 +7,4 @@
 //! without re-implementing the policy.
 
 pub mod open;
-pub mod path_template;
 pub mod sidecar;

@@ -16,7 +16,7 @@
 //! inversions, and the unit test below pins the predicate's behavior on
 //! a synthetically-constructed multi-tier `Vec<SourceTier>`.
 
-use clinker_core::plan::execution::{SourceTier, source_tier_index};
+use clinker_plan::plan::execution::{SourceTier, source_tier_index};
 
 /// `source_tier_index` returns the tier position of a source name in a
 /// multi-tier `Vec<SourceTier>`. Pin this on a synthetic graph: the

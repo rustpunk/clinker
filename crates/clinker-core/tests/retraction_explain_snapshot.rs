@@ -6,7 +6,7 @@
 //! body that flows through here is reviewed line-by-line in the
 //! `cargo insta review` diff before being accepted into the tree.
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
 fn render_explain(yaml: &str) -> String {
     let config: PipelineConfig = parse_config(yaml).expect("parse_config");

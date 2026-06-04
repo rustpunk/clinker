@@ -15,15 +15,15 @@ use clinker_record::{GroupByKey, Record};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
     push_write_error, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{build_format_writer, stage_metrics};
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 use crate::projection::project_output_from_record;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Output` arm for `node_idx`: open the writer(s), map records
 /// onto the declared output schema (passing unmapped fields through when
@@ -291,14 +291,14 @@ pub(crate) fn dispatch_output(
 /// state both write paths share. Bundling the four cross-branch borrows
 /// (error sink, the write / projection cumulative timers, and the
 /// stage-metric collector) with the per-call write descriptor (output
-/// name, resolved [`OutputConfig`](crate::config::OutputConfig), explicit
+/// name, resolved [`OutputConfig`](clinker_plan::config::OutputConfig), explicit
 /// CXL emit names, and the projected output schema) keeps the fan-out and
 /// single-writer helpers below clippy's argument threshold and gives them
 /// one shared shape — a change to how an Output write is attributed (e.g.
 /// a new metric guard) lands on the struct, not on two signatures.
 struct FanOutContext<'a> {
     name: &'a str,
-    out_cfg: &'a crate::config::OutputConfig,
+    out_cfg: &'a clinker_plan::config::OutputConfig,
     cxl_emit_names_opt: Option<&'a [String]>,
     output_schema: &'a Arc<clinker_record::Schema>,
     output_errors: &'a mut Vec<PipelineError>,

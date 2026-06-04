@@ -12,8 +12,6 @@ use clinker_record::{Record, Value};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::config::ErrorStrategy;
-use crate::error::PipelineError;
 use crate::executor::DlqEntry;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
@@ -21,8 +19,10 @@ use crate::executor::dispatch::{
     source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::pipeline::memory::BudgetCategory;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::BudgetCategory;
+use clinker_plan::config::ErrorStrategy;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Route` arm for `node_idx`: evaluate each branch predicate
 /// against every input record and emit matching records onto the
@@ -119,8 +119,8 @@ pub(crate) fn dispatch_route(
             }
         }
     } else {
-        use crate::config::PipelineNode;
-        use crate::config::node_header::NodeInput;
+        use clinker_plan::config::PipelineNode;
+        use clinker_plan::config::node_header::NodeInput;
         for spanned in &ctx.config.nodes {
             let (node_name, input_ref) = match &spanned.value {
                 PipelineNode::Transform { header, .. }
@@ -216,7 +216,7 @@ pub(crate) fn dispatch_route(
                                 .push((record.clone(), rn));
                         }
                         // Exclusive mode: stop after first match
-                        if mode == crate::config::RouteMode::Exclusive {
+                        if mode == clinker_plan::config::RouteMode::Exclusive {
                             break;
                         }
                     }

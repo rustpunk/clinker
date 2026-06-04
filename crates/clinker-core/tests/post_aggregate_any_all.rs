@@ -60,7 +60,7 @@ nodes:
 "#;
 
 fn run(csv: &str) -> String {
-    let config = clinker_core::config::parse_config(ANY_ALL_PIPELINE).expect("parse");
+    let config = clinker_plan::config::parse_config(ANY_ALL_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),

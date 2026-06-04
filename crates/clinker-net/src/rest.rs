@@ -21,13 +21,13 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clinker_core::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
-use clinker_core::config::{InputFormat, RestAuth, RestPagination, RestSourceConfig, SourceConfig};
 use clinker_core::pipeline::schema_coerce::CoercingReader;
 use clinker_core::pipeline::shutdown::ShutdownToken;
 use clinker_core::source::RecordSource;
 use clinker_format::traits::FormatReader;
 use clinker_format::{EnvelopeConfig, FormatError};
+use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
+use clinker_plan::config::{InputFormat, RestAuth, RestPagination, RestSourceConfig, SourceConfig};
 use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
@@ -46,7 +46,7 @@ pub(crate) struct RestRecordSource {
     agent: ureq::Agent,
     cfg: RestSourceConfig,
     format: InputFormat,
-    array_paths: Option<Vec<clinker_core::config::ArrayPathConfig>>,
+    array_paths: Option<Vec<clinker_plan::config::ArrayPathConfig>>,
     schema_decl: Vec<ColumnDecl>,
     on_unmapped: OnUnmapped,
     source_name: String,
@@ -475,7 +475,7 @@ fn build_output_schema(schema_decl: &[ColumnDecl], on_unmapped: &OnUnmapped) -> 
 /// the config validator (E220) rejects others before this runs.
 fn decode_body(
     format: &InputFormat,
-    array_paths: Option<&[clinker_core::config::ArrayPathConfig]>,
+    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
     body: Vec<u8>,
 ) -> Result<Box<dyn FormatReader>, FormatError> {
     let cursor = Cursor::new(body);
@@ -572,16 +572,16 @@ fn parse_next_link(header: &str) -> Option<String> {
 }
 
 fn build_json_config(
-    opts: Option<&clinker_core::config::JsonInputOptions>,
-    array_paths: Option<&[clinker_core::config::ArrayPathConfig]>,
+    opts: Option<&clinker_plan::config::JsonInputOptions>,
+    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
 ) -> clinker_format::json::reader::JsonReaderConfig {
     use clinker_format::json::reader::{ArrayPathMode, ArrayPathSpec, JsonMode, JsonReaderConfig};
     let mut config = JsonReaderConfig::default();
     if let Some(opts) = opts {
         config.format = opts.format.as_ref().map(|f| match f {
-            clinker_core::config::JsonFormat::Array => JsonMode::Array,
-            clinker_core::config::JsonFormat::Ndjson => JsonMode::Ndjson,
-            clinker_core::config::JsonFormat::Object => JsonMode::Object,
+            clinker_plan::config::JsonFormat::Array => JsonMode::Array,
+            clinker_plan::config::JsonFormat::Ndjson => JsonMode::Ndjson,
+            clinker_plan::config::JsonFormat::Object => JsonMode::Object,
         });
         config.record_path = opts.record_path.clone();
     }
@@ -591,8 +591,8 @@ fn build_json_config(
             .map(|p| ArrayPathSpec {
                 path: p.path.clone(),
                 mode: match p.mode {
-                    clinker_core::config::ArrayMode::Explode => ArrayPathMode::Explode,
-                    clinker_core::config::ArrayMode::Join => ArrayPathMode::Join,
+                    clinker_plan::config::ArrayMode::Explode => ArrayPathMode::Explode,
+                    clinker_plan::config::ArrayMode::Join => ArrayPathMode::Join,
                 },
                 separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
             })
@@ -602,8 +602,8 @@ fn build_json_config(
 }
 
 fn build_xml_config(
-    opts: Option<&clinker_core::config::XmlInputOptions>,
-    array_paths: Option<&[clinker_core::config::ArrayPathConfig]>,
+    opts: Option<&clinker_plan::config::XmlInputOptions>,
+    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
 ) -> clinker_format::xml::reader::XmlReaderConfig {
     use clinker_format::xml::reader::XmlReaderConfig;
     let mut config = XmlReaderConfig::default();

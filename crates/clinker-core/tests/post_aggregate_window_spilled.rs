@@ -78,7 +78,7 @@ nodes:
         }
     }
 
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),

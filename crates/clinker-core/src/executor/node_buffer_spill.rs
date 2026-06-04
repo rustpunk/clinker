@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use clinker_record::Record;
 
-use crate::error::PipelineError;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
+use clinker_plan::error::PipelineError;
 
 /// Spill a `Vec<(Record, u64)>` to disk and return the resulting
 /// `(SpillFile<u64>, row_count)` pair. Schema is read from the first

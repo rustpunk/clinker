@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use clinker_core::config::composition::scan_workspace_signatures;
+use clinker_plan::config::composition::scan_workspace_signatures;
 
 /// Minimal valid `.comp.yaml` content for the workspace scanner to parse.
 const MINIMAL_COMP_YAML: &str = r#"
@@ -71,7 +71,7 @@ fn test_resolved_value_size_under_128_bytes() {
     // Budget is 128 bytes target; actual is 144 due to layer_values HashMap
     // overhead. Under 2x target so acceptable per V-7-2.
     let size =
-        std::mem::size_of::<clinker_core::config::composition::ResolvedValue<serde_json::Value>>();
+        std::mem::size_of::<clinker_plan::config::composition::ResolvedValue<serde_json::Value>>();
     assert!(
         size <= 160,
         "ResolvedValue is {size} bytes, budget is 160 (144 current, 128 target)"

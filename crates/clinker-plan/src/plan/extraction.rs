@@ -614,8 +614,14 @@ mod tests {
     // ---- Writer tests ----
 
     /// Helper: build a PipelineConfig from a YAML fixture path.
+    ///
+    /// The pipeline fixture corpus is shared across the workspace and lives
+    /// under the execution crate's `tests/fixtures`; resolve against it so
+    /// the composition pipelines (and their sibling `.comp.yaml` bodies)
+    /// stay in one place rather than being duplicated per crate.
     fn load_fixture_config(fixture_name: &str) -> PipelineConfig {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../clinker-core/tests/fixtures");
         let yaml_path = root.join(fixture_name);
         let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
         crate::yaml::from_str(&yaml).expect("parse fixture")

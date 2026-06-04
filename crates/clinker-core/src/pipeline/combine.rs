@@ -4,7 +4,7 @@
 //! **Scope of this module:** runtime data structures consumed by the
 //! `PlanNode::Combine` executor arm. Plan-time vocabulary —
 //! `CombineStrategy`, `DecomposedPredicate`, `EqualityConjunct`,
-//! `CombineInput` — lives in `crate::plan::combine`. Do not cross-pollinate.
+//! `CombineInput` — lives in `clinker_plan::plan::combine`. Do not cross-pollinate.
 //!
 //! **Concurrency model (spec §Concurrency Model):** every public struct
 //! declared here is designed to be immutable after construction. `RandomState`

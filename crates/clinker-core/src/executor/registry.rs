@@ -7,8 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use clinker_record::Schema;
 
-use crate::config::{OutputConfig, OutputFormat};
-use crate::error::PipelineError;
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
@@ -16,6 +14,8 @@ use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig}
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::traits::FormatWriter;
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_plan::config::{OutputConfig, OutputFormat};
+use clinker_plan::error::PipelineError;
 
 /// Output writer registry. Holds two parallel maps:
 ///
@@ -46,7 +46,7 @@ impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
 
 /// Build a CsvWriterConfig from CSV output options and the top-level include_header flag.
 fn build_csv_writer_config(
-    opts: Option<&crate::config::CsvOutputOptions>,
+    opts: Option<&clinker_plan::config::CsvOutputOptions>,
     include_header: Option<bool>,
 ) -> CsvWriterConfig {
     let mut config = CsvWriterConfig::default();
@@ -63,13 +63,15 @@ fn build_csv_writer_config(
 }
 
 /// Build a JsonWriterConfig from JSON output options.
-fn build_json_writer_config(opts: Option<&crate::config::JsonOutputOptions>) -> JsonWriterConfig {
+fn build_json_writer_config(
+    opts: Option<&clinker_plan::config::JsonOutputOptions>,
+) -> JsonWriterConfig {
     let mut config = JsonWriterConfig::default();
     if let Some(opts) = opts {
         if let Some(ref fmt) = opts.format {
             config.format = match fmt {
-                crate::config::JsonOutputFormat::Array => JsonOutputMode::Array,
-                crate::config::JsonOutputFormat::Ndjson => JsonOutputMode::Ndjson,
+                clinker_plan::config::JsonOutputFormat::Array => JsonOutputMode::Array,
+                clinker_plan::config::JsonOutputFormat::Ndjson => JsonOutputMode::Ndjson,
             };
         }
         if let Some(pretty) = opts.pretty {
@@ -80,7 +82,9 @@ fn build_json_writer_config(opts: Option<&crate::config::JsonOutputOptions>) -> 
 }
 
 /// Build an XmlWriterConfig from XML output options.
-fn build_xml_writer_config(opts: Option<&crate::config::XmlOutputOptions>) -> XmlWriterConfig {
+fn build_xml_writer_config(
+    opts: Option<&clinker_plan::config::XmlOutputOptions>,
+) -> XmlWriterConfig {
     let mut config = XmlWriterConfig::default();
     if let Some(opts) = opts {
         if let Some(ref root) = opts.root_element {
@@ -94,7 +98,7 @@ fn build_xml_writer_config(opts: Option<&crate::config::XmlOutputOptions>) -> Xm
 }
 
 fn build_fw_writer_config(
-    opts: Option<&crate::config::FixedWidthOutputOptions>,
+    opts: Option<&clinker_plan::config::FixedWidthOutputOptions>,
 ) -> FixedWidthWriterConfig {
     let mut config = FixedWidthWriterConfig::default();
     if let Some(opts) = opts
@@ -113,22 +117,22 @@ fn extract_output_field_defs(
     output: &OutputConfig,
 ) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
     let schema_source = output.schema.as_ref().ok_or_else(|| {
-        PipelineError::Config(crate::config::ConfigError::Validation(
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width output format requires explicit schema with field definitions".into(),
         ))
     })?;
     let def = match schema_source {
-        crate::config::SchemaSource::Inline(def) => def.clone(),
-        crate::config::SchemaSource::FilePath(path) => {
-            crate::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
-                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+        clinker_plan::config::SchemaSource::Inline(def) => def.clone(),
+        clinker_plan::config::SchemaSource::FilePath(path) => {
+            clinker_plan::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                     "failed to load output schema from '{path}': {e}",
                 )))
             })?
         }
     };
     def.fields.ok_or_else(|| {
-        PipelineError::Config(crate::config::ConfigError::Validation(
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width output schema must have 'fields' defined".into(),
         ))
     })
@@ -258,20 +262,22 @@ pub(crate) fn build_format_writer(
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
                 let bare = std::path::PathBuf::from(apply_split_naming(&output_path, &naming, seq));
-                let path_for_n =
-                    |n: Option<u64>| -> Result<std::path::PathBuf, crate::config::ConfigError> {
-                        Ok(match n {
-                            None => bare.clone(),
-                            Some(k) => {
-                                let suffix = if unique_suffix_width == 0 {
-                                    format!("-{k}")
-                                } else {
-                                    format!("-{:0>width$}", k, width = unique_suffix_width as usize)
-                                };
-                                crate::output::open::append_suffix_before_ext(&bare, &suffix)
-                            }
-                        })
-                    };
+                let path_for_n = |n: Option<u64>| -> Result<
+                    std::path::PathBuf,
+                    clinker_plan::config::ConfigError,
+                > {
+                    Ok(match n {
+                        None => bare.clone(),
+                        Some(k) => {
+                            let suffix = if unique_suffix_width == 0 {
+                                format!("-{k}")
+                            } else {
+                                format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                            };
+                            crate::output::open::append_suffix_before_ext(&bare, &suffix)
+                        }
+                    })
+                };
                 let (_path, file) = crate::output::open::open_output(if_exists, false, path_for_n)
                     .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                 Ok(Box::new(BufWriter::with_capacity(65536, file)))
@@ -299,16 +305,16 @@ pub(crate) fn build_format_writer(
 }
 
 /// Convert serde `SplitConfig` to runtime `SplitPolicy`.
-fn build_split_policy(split: &crate::config::SplitConfig) -> SplitPolicy {
+fn build_split_policy(split: &clinker_plan::config::SplitConfig) -> SplitPolicy {
     SplitPolicy {
         max_records: split.max_records,
         max_bytes: split.max_bytes,
         group_key: split.group_key.clone(),
         repeat_header: split.repeat_header,
         oversize_group: match split.oversize_group {
-            crate::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
-            crate::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,
-            crate::config::SplitOversizeGroupPolicy::Allow => OversizeGroupPolicy::Allow,
+            clinker_plan::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
+            clinker_plan::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,
+            clinker_plan::config::SplitOversizeGroupPolicy::Allow => OversizeGroupPolicy::Allow,
         },
     }
 }

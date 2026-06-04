@@ -7,7 +7,7 @@ use std::sync::Arc;
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
 
-use crate::config::PipelineConfig;
+use clinker_plan::config::PipelineConfig;
 use cxl::eval::{StableEvalContext, WallClock};
 
 /// Build the pipeline-stable evaluation context.
@@ -30,7 +30,7 @@ pub(super) fn build_stable_eval_context(
     // Seed pipeline-scope vars with declared defaults from every
     // Transform's `declares:` entries; runtime injections (channel
     // overrides, test seeds) overlay on top.
-    let mut seeded = crate::config::collect_pipeline_var_defaults(&config.nodes);
+    let mut seeded = clinker_plan::config::collect_pipeline_var_defaults(&config.nodes);
     for (k, v) in pipeline_vars {
         seeded.insert(k.clone(), v.clone());
     }
@@ -59,7 +59,7 @@ fn build_static_vars(
         .pipeline
         .vars
         .as_ref()
-        .map(crate::config::convert_vars)
+        .map(clinker_plan::config::convert_vars)
         .unwrap_or_default();
     for (k, v) in overrides {
         out.insert(k.clone(), v.clone());
@@ -82,7 +82,7 @@ fn build_static_vars(
 fn compute_source_input_arcs(
     config: &PipelineConfig,
 ) -> std::collections::HashMap<String, Vec<Arc<str>>> {
-    use crate::config::pipeline_node::PipelineNode;
+    use clinker_plan::config::pipeline_node::PipelineNode;
     let mut by_name: HashMap<&str, &PipelineNode> = HashMap::new();
     for node in &config.nodes {
         by_name.insert(node.value.name(), &node.value);
@@ -124,10 +124,10 @@ fn compute_source_input_arcs(
 /// by walking the consumer-side `input:` chain back to its Source roots,
 /// fanning out through nested Merge / Combine inputs.
 fn arcs_reachable_from(
-    by_name: &HashMap<&str, &crate::config::pipeline_node::PipelineNode>,
+    by_name: &HashMap<&str, &clinker_plan::config::pipeline_node::PipelineNode>,
     start: &str,
 ) -> Vec<Arc<str>> {
-    use crate::config::pipeline_node::PipelineNode;
+    use clinker_plan::config::pipeline_node::PipelineNode;
     let mut out = Vec::new();
     let mut stack = vec![start.to_string()];
     let mut seen: HashSet<String> = HashSet::new();

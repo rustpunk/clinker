@@ -85,7 +85,7 @@ o3,ENG,100
         shutdown_token: None,
         ..Default::default()
     };
-    let config = clinker_core::config::parse_config(STRICT_PIPELINE).expect("parse");
+    let config = clinker_plan::config::parse_config(STRICT_PIPELINE).expect("parse");
     let report = common::run_config(&config, readers, writers, &params)
         .expect("strict pipeline must run on the FastPath without error");
 

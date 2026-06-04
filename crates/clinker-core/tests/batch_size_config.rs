@@ -3,7 +3,7 @@
 //! on a Transform's `config.batch_size`, and the shared "must be >= 1"
 //! validation guarding both against a never-flushing zero batch.
 
-use clinker_core::config::{PipelineNode, parse_config};
+use clinker_plan::config::{PipelineNode, parse_config};
 
 const PIPELINE_LEVEL: &str = r#"
 pipeline:

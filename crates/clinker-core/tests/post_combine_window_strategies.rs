@@ -101,9 +101,9 @@ ENG,5000
 
     use clinker_bench_support::io::SharedBuffer;
     use std::collections::HashMap;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile");
     let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
@@ -225,9 +225,9 @@ ENG,5000
 ";
     use clinker_bench_support::io::SharedBuffer;
     use std::collections::HashMap;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile");
     let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (

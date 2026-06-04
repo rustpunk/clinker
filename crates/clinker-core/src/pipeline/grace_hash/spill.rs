@@ -14,11 +14,12 @@ use cxl::eval::{EvalContext, ProgramEvaluator};
 
 use super::build::{BuildChunkIter, Hll, PartitionAssigner};
 use super::probe::{EmitArgs, GraceEmitSink, emit_for_probe};
-use crate::error::PipelineError;
 use crate::executor::combine::CombineResolver;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
-use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
+use crate::pipeline::memory::MemoryArbitrator;
+use clinker_plan::BudgetCategory;
+use clinker_plan::error::PipelineError;
 
 /// Number of result records the BNL fallback emits per output batch
 /// before polling [`MemoryArbitrator::should_abort`]. Output amplification

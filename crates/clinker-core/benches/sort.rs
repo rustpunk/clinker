@@ -1,6 +1,6 @@
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
-use clinker_core::config::{NullOrder, SortField, SortOrder};
 use clinker_core::pipeline::arena::Arena;
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 use clinker_record::{MinimalRecord, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;

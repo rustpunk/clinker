@@ -8,7 +8,7 @@
 //! the resulting partition is CK-aligned so `requires_buffer_recompute`
 //! stays false.
 
-use clinker_core::plan::execution::PlanNode;
+use clinker_plan::plan::execution::PlanNode;
 
 /// Compile a Source→Aggregate(relaxed)→Combine→Transform(window with
 /// synthetic-CK in partition_by) pipeline; assert the synthetic CK
@@ -83,9 +83,9 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("post-combine window referencing $ck.aggregate.<name> must compile");
 
     // Combine's output schema carries the synthetic CK column.

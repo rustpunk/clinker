@@ -1,6 +1,6 @@
 //! Source-side discovery and multi-file ingestion.
 //!
-//! [`discovery`] resolves a [`crate::config::SourceConfig`] matcher
+//! [`discovery`] resolves a [`clinker_plan::config::SourceConfig`] matcher
 //! (`path` / `glob` / `regex` / `paths`) into a concrete file set,
 //! applying the post-discovery filters (`exclude`, `modified_after/before`,
 //! `min_size`/`max_size`, `files.sort_by`/`take_first|last`,

@@ -11,6 +11,7 @@ bench-xlarge = []
 
 [dependencies]
 clinker-core = { workspace = true }
+clinker-plan = { workspace = true }
 clinker-bench-support = { workspace = true }
 cxl = { workspace = true }
 criterion = { workspace = true }

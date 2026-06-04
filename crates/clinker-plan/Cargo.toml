@@ -1,0 +1,27 @@
+[package]
+name = "clinker-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pipeline config parsing, schema resolution, and DAG planning for Clinker"
+
+[dependencies]
+clinker-core-types = { workspace = true }
+clinker-record = { workspace = true }
+cxl = { workspace = true }
+clinker-format = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
+indexmap = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+blake3 = { workspace = true }
+miette = { workspace = true }
+petgraph = { workspace = true }
+tracing = { workspace = true }
+walkdir = "2"
+fastrand = { workspace = true }
+tempfile = "3"
+postcard = { workspace = true }
+lz4_flex = "0.11"

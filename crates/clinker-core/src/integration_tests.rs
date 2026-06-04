@@ -2,10 +2,10 @@
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config;
-    use crate::error::PipelineError;
     use crate::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
     use clinker_bench_support::io::SharedBuffer;
+    use clinker_plan::config;
+    use clinker_plan::error::PipelineError;
 
     /// Helper: run executor with in-memory CSV input/output.
     fn run_pipeline(
@@ -982,7 +982,7 @@ nodes:
             PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
 
         match result {
-            Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
+            Err(PipelineError::Config(clinker_plan::config::ConfigError::Validation(msg))) => {
                 assert!(
                     msg.contains("no reader registered for source 'src'"),
                     "expected missing-reader message, got: {msg}"

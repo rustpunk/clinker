@@ -1,7 +1,7 @@
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::pipeline::arena::Arena;
 use clinker_core::pipeline::window_context::PartitionWindowContext;
+use clinker_plan::config::{CompileContext, parse_config};
 use clinker_record::{MinimalRecord, Schema, Value, WindowContext};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;

@@ -10,10 +10,10 @@ use std::path::Path;
 
 use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
-use clinker_core::config::pipeline_node::{PipelineNode, SourceBody};
-use clinker_core::config::{CompileContext, InputFormat, load_config};
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::pipeline_node::{PipelineNode, SourceBody};
+use clinker_plan::config::{CompileContext, InputFormat, load_config};
+use clinker_plan::error::PipelineError;
 use indexmap::IndexMap;
 use tempfile::TempDir;
 
@@ -121,7 +121,7 @@ impl BenchPipelineRunner {
 /// filesystem, so we rewrite them to a temp directory under `target/`.
 /// The returned `TempDir` must be kept alive for the duration of the pipeline run.
 fn rewrite_split_output_paths(
-    config: &mut clinker_core::config::PipelineConfig,
+    config: &mut clinker_plan::config::PipelineConfig,
 ) -> Option<TempDir> {
     let has_split = config.nodes.iter().any(|n| {
         matches!(&n.value, PipelineNode::Output { config: body, .. } if body.output.split.is_some())

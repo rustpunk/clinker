@@ -14,8 +14,8 @@ fn channel_fixtures_dir() -> PathBuf {
 }
 
 /// Build a symbol table from the test fixtures workspace.
-fn build_symbol_table() -> clinker_core::config::composition::CompositionSymbolTable {
-    use clinker_core::config::composition::scan_workspace_signatures;
+fn build_symbol_table() -> clinker_plan::config::composition::CompositionSymbolTable {
+    use clinker_plan::config::composition::scan_workspace_signatures;
     let ws_root = fixtures_dir();
     let table = scan_workspace_signatures(&ws_root).expect("fixture scan should succeed");
     std::sync::Arc::try_unwrap(table).unwrap_or_else(|arc| (*arc).clone())

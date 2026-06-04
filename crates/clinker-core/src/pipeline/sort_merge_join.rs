@@ -45,17 +45,18 @@ use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator, SkipReason
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
 
-use crate::config::pipeline_node::{MatchMode, OnMiss};
-use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
+use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
-use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use crate::plan::combine::{DecomposedPredicate, RangeOp};
+use clinker_plan::BudgetCategory;
+use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
 /// Mirrors the constant in `pipeline::combine`, `pipeline::iejoin`, and
@@ -357,7 +358,7 @@ pub(crate) struct SortMergeExec<'a> {
     /// Build-side `$ck.<field>` propagation policy. Threaded uniformly
     /// across every combine strategy and consumed by
     /// `copy_build_ck_columns` at each emit site.
-    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    pub propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
     /// Pipeline-scoped spill directory borrowed from
@@ -375,7 +376,7 @@ pub(crate) struct SortMergeExec<'a> {
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` / `BestEffort` the failing row is deferred to the
     /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
-    pub strategy: crate::config::ErrorStrategy,
+    pub strategy: clinker_plan::config::ErrorStrategy,
 }
 
 /// Snapshot of which phases ran during a sort-merge execution. Used by
@@ -775,7 +776,7 @@ fn execute_combine_sort_merge_with_stats(
                             });
                         }
                         Err(e) => {
-                            if strategy == crate::config::ErrorStrategy::FailFast {
+                            if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             output_eval_failures.push(CombineOutputEvalFailure {
@@ -836,9 +837,9 @@ fn sort_driver_pairs_externally(
     };
     let schema = Arc::clone(pairs[0].0.schema());
     let spill_threshold = spill_threshold_bytes(budget);
-    let sort_field = crate::config::SortField {
+    let sort_field = clinker_plan::config::SortField {
         field: field.clone(),
-        order: crate::config::SortOrder::Asc,
+        order: clinker_plan::config::SortOrder::Asc,
         null_order: None,
     };
     let mut buf: SortBuffer<RecordOrder> =
@@ -958,9 +959,9 @@ fn sort_build_pairs_externally(
     };
     let schema = Arc::clone(pairs[0].0.schema());
     let spill_threshold = spill_threshold_bytes(budget);
-    let sort_field = crate::config::SortField {
+    let sort_field = clinker_plan::config::SortField {
         field: field.clone(),
-        order: crate::config::SortOrder::Asc,
+        order: clinker_plan::config::SortOrder::Asc,
         null_order: None,
     };
     let mut buf: SortBuffer<()> = SortBuffer::new(vec![sort_field], spill_threshold, None, schema);
@@ -1059,7 +1060,7 @@ struct WalkArgs<'a, 'b, 'c> {
     output_schema: Option<&'a Arc<Schema>>,
     match_mode: MatchMode,
     build_qualifier: &'a str,
-    propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     ctx: &'a EvalContext<'a>,
     byte_limit: usize,
     spill_dir: &'a std::path::Path,
@@ -1070,7 +1071,7 @@ struct WalkArgs<'a, 'b, 'c> {
     emitted_since_check: &'b mut usize,
     budget: &'c MemoryArbitrator,
     consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
-    strategy: crate::config::ErrorStrategy,
+    strategy: clinker_plan::config::ErrorStrategy,
     failures: &'b mut Vec<CombineOutputEvalFailure>,
 }
 
@@ -1225,13 +1226,13 @@ struct EmitForRunArgs<'a, 'b> {
     output_schema: Option<&'a Arc<Schema>>,
     match_mode: MatchMode,
     build_qualifier: &'a str,
-    propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     ctx: &'a EvalContext<'a>,
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
     emitted_since_check: &'b mut usize,
     budget: &'b MemoryArbitrator,
-    strategy: crate::config::ErrorStrategy,
+    strategy: clinker_plan::config::ErrorStrategy,
     failures: &'b mut Vec<CombineOutputEvalFailure>,
 }
 
@@ -1280,7 +1281,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             });
                         }
                         Err(e) => {
-                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                            if args.strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             args.failures.push(CombineOutputEvalFailure {
@@ -1365,7 +1366,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             });
                         }
                         Err(e) => {
-                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                            if args.strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             args.failures.push(CombineOutputEvalFailure {
@@ -1435,7 +1436,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             });
                         }
                         Err(e) => {
-                            if args.strategy == crate::config::ErrorStrategy::FailFast {
+                            if args.strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             args.failures.push(CombineOutputEvalFailure {
@@ -1588,8 +1589,8 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
 mod tests {
     use super::*;
     use crate::executor::combine::CombineResolverMapping;
-    use crate::plan::combine::{CombineInput, RangeConjunct};
-    use crate::plan::types::JoinSide;
+    use clinker_plan::plan::combine::{CombineInput, RangeConjunct};
+    use clinker_plan::plan::types::JoinSide;
     use clinker_record::SchemaBuilder;
     use cxl::ast::Statement;
     use cxl::lexer::Span as CxlSpan;
@@ -1794,7 +1795,7 @@ mod tests {
         let mut budget = match rk.budget_bytes {
             Some(b) => MemoryArbitrator::with_policy(b, 0.80, Box::new(NoOpPolicy)),
             None => MemoryArbitrator::with_policy(
-                crate::pipeline::memory::parse_memory_limit_bytes(None),
+                clinker_plan::config::utils::parse_memory_limit_bytes(None),
                 0.80,
                 Box::new(NoOpPolicy),
             ),
@@ -1815,12 +1816,12 @@ mod tests {
             match_mode: rk.match_mode,
             on_miss: rk.on_miss,
             presorted: rk.presorted,
-            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-            strategy: crate::config::ErrorStrategy::FailFast,
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
         };
         let (output, stats) = execute_combine_sort_merge_with_stats(args)
             .expect("sort-merge kernel execution failed");

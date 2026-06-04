@@ -1,6 +1,6 @@
 use clinker_bench_support::{CsvPayload, MEDIUM};
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -126,9 +126,9 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let plan = clinker_core::config::PipelineConfig::compile(
+                    let plan = clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(
@@ -226,9 +226,9 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let plan = clinker_core::config::PipelineConfig::compile(
+                    let plan = clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(

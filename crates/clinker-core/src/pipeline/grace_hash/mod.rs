@@ -70,18 +70,19 @@ use cxl::eval::{EvalContext, ProgramEvaluator};
 use cxl::typecheck::TypedProgram;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::config::pipeline_node::{MatchMode, OnMiss};
-use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::pipeline::combine::{
     CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
     hash_composite_key,
 };
 use crate::pipeline::grace_spill::{GraceSpillWriter, SpillFilePath};
+use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
-use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
-use crate::plan::combine::DecomposedPredicate;
+use clinker_plan::BudgetCategory;
+use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::combine::DecomposedPredicate;
 
 use build::{Hll, PartitionAssigner, estimated_record_bytes};
 use probe::{EmitArgs, GraceEmitSink, ProbeOutcome, emit_for_probe};
@@ -90,12 +91,6 @@ use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 /// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
-
-/// Conservative per-record byte estimate when computing whether to fire
-/// GraceHash strategy. Underestimating biases toward HashBuildProbe;
-/// overestimating biases toward GraceHash. 1 KiB matches the
-/// production-record size we observe on enrich pipelines.
-pub(crate) const GRACE_RECORD_BYTES_ESTIMATE: u64 = 1024;
 
 /// Order-tracking sidecar carried alongside every record in the
 /// executor's `node_buffers`. Mirrors the alias in `iejoin`; the grace
@@ -182,7 +177,7 @@ pub(crate) struct GraceHashExec<'a> {
     /// Build-side `$ck.<field>` propagation policy. Threaded uniformly
     /// across every combine strategy and consumed by
     /// `copy_build_ck_columns` at each emit site.
-    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    pub propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
     /// Pipeline-scoped spill directory. Owned by the executor's
@@ -200,7 +195,7 @@ pub(crate) struct GraceHashExec<'a> {
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` / `BestEffort` the failing row is deferred to the
     /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
-    pub strategy: crate::config::ErrorStrategy,
+    pub strategy: clinker_plan::config::ErrorStrategy,
 }
 
 // ──────────────────────────────────────────────────────────────────────────

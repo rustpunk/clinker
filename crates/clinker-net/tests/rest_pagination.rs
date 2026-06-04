@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use clinker_core::config::{RestSourceConfig, SourceTransport, parse_config};
 use clinker_core::pipeline::shutdown::ShutdownToken;
 use clinker_core::source::RecordSource;
 use clinker_net::build_rest_source;
+use clinker_plan::config::{RestSourceConfig, SourceTransport, parse_config};
 
 /// Total rows the fixture serves. Paged so the reader must follow ≥2
 /// pages and detect the last one.

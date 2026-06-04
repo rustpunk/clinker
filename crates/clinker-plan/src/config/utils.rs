@@ -112,6 +112,28 @@ impl<'de> Deserialize<'de> for TimeBound {
     }
 }
 
+/// Parse the `memory.limit` knob into a byte count.
+///
+/// Binary units: a trailing `G`/`g`, `M`/`m`, or `K`/`k` multiplies by
+/// 1024^3 / 1024^2 / 1024; a bare integer is bytes. `None`, an empty
+/// value, or any unparseable input falls back to the 512 MB default that
+/// the arbitrator and the `--explain` renderers share.
+pub fn parse_memory_limit_bytes(s: Option<&str>) -> u64 {
+    s.and_then(|s| {
+        let s = s.trim();
+        if let Some(num) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+            num.parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
+        } else if let Some(num) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+            num.parse::<u64>().ok().map(|n| n * 1024 * 1024)
+        } else if let Some(num) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+            num.parse::<u64>().ok().map(|n| n * 1024)
+        } else {
+            s.parse::<u64>().ok()
+        }
+    })
+    .unwrap_or(512 * 1024 * 1024) // 512MB default
+}
+
 /// Byte size for `min_size` / `max_size`. Decimal units (1KB = 1000 bytes,
 /// 1MB = 1_000_000) — matches the convention used by `du`, `df`, AWS CLI,
 /// and most file-tooling. Plain `"1024"` (no unit) is interpreted as bytes.
@@ -186,4 +208,21 @@ pub(crate) fn default_true() -> bool {
 
 pub(crate) fn default_include_unmapped() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_limit_bytes;
+
+    #[test]
+    fn memory_limit_parses_unit_suffixes() {
+        assert_eq!(parse_memory_limit_bytes(Some("512M")), 536_870_912);
+        assert_eq!(parse_memory_limit_bytes(Some("512m")), 536_870_912);
+        assert_eq!(parse_memory_limit_bytes(Some("2G")), 2_147_483_648);
+        assert_eq!(parse_memory_limit_bytes(Some("2g")), 2_147_483_648);
+        assert_eq!(parse_memory_limit_bytes(Some("512K")), 524_288);
+        assert_eq!(parse_memory_limit_bytes(Some("1024")), 1024);
+        assert_eq!(parse_memory_limit_bytes(None), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_limit_bytes(Some("garbage")), 512 * 1024 * 1024);
+    }
 }

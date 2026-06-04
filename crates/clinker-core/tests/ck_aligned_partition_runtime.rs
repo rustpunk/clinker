@@ -66,7 +66,7 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
         clinker_core::executor::single_file_reader(

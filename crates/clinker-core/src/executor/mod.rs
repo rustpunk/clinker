@@ -40,10 +40,7 @@ pub use params::{ExecutionReport, PipelineRunParams};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::{CompiledRoute, CompiledRouteBranch};
-pub(crate) use streaming::{
-    StreamClass, StreamingOutputTaskOutput, classify_stream_nodes,
-    compute_merge_interleave_fused_sources, compute_transform_fused_sources,
-};
+pub(crate) use streaming::StreamingOutputTaskOutput;
 use streaming::{compute_streaming_output_specs, streaming_output};
 pub(crate) use transform::CompiledTransform;
 pub use transform::{TransformSpec, build_transform_specs};
@@ -52,8 +49,8 @@ pub(crate) use transform::{
 };
 use util::scheduled_pass_order;
 pub(crate) use util::{
-    build_arbitrator_from_config, compute_init_phase_node_set, copy_build_ck_columns,
-    parse_memory_limit, record_with_emitted_fields, single_predecessor, widen_record_to_schema,
+    build_arbitrator_from_config, copy_build_ck_columns, parse_memory_limit,
+    record_with_emitted_fields, widen_record_to_schema,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -64,10 +61,10 @@ use chrono::Utc;
 use clinker_record::{PipelineCounters, RecordStorage, Value};
 use indexmap::IndexMap;
 
-use crate::config::PipelineConfig;
-use crate::error::PipelineError;
 use crate::pipeline::memory::rss_bytes;
-use crate::plan::execution::ExecutionPlanDag;
+use clinker_plan::config::PipelineConfig;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 use cxl::eval::ProgramEvaluator;
 use cxl::typecheck::Type;
 
@@ -156,7 +153,7 @@ struct DagExecInputs<'a> {
     config: &'a PipelineConfig,
     /// Declared Source configs in declaration order. Borrowed for
     /// per-source seeding (watermark idle-timeouts, count slots).
-    source_configs: &'a [crate::config::SourceConfig],
+    source_configs: &'a [clinker_plan::config::SourceConfig],
     /// Compiled per-node CXL transform programs, looked up by name at
     /// each Transform / Aggregation dispatch arm.
     transforms: &'a [CompiledTransform],
@@ -164,7 +161,7 @@ struct DagExecInputs<'a> {
     plan: &'a ExecutionPlanDag,
     /// Compile artifacts (bound schemas, composition bodies) consulted
     /// by the dispatcher while walking the plan.
-    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    artifacts: &'a clinker_plan::plan::bind_schema::CompileArtifacts,
     /// Per-run parameters: execution / batch ids, channel variable
     /// overrides, shutdown token.
     params: &'a PipelineRunParams,
@@ -244,7 +241,7 @@ impl PipelineExecutor {
     /// `&CompiledPlan`-consuming public entry point.
     ///
     /// Accepts the typed `CompiledPlan` handle returned by
-    /// [`crate::config::PipelineConfig::compile`] and forwards to
+    /// [`clinker_plan::config::PipelineConfig::compile`] and forwards to
     /// [`Self::run_with_readers_writers`] using the plan's embedded
     /// [`PipelineConfig`]. Every declared Source is ingested through
     /// the same code path; there is no "primary" driving source. DAG
@@ -273,7 +270,7 @@ impl PipelineExecutor {
     /// blocks the calling thread on bounded crossbeam channels for
     /// back-pressure. No async runtime is required.
     pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
-        plan: &crate::plan::CompiledPlan,
+        plan: &clinker_plan::plan::CompiledPlan,
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
@@ -301,11 +298,11 @@ impl PipelineExecutor {
     /// Surfaces every failure of the underlying run: compilation diagnostics,
     /// reader/writer setup errors, and runtime operator failures.
     pub fn run_plan_with_readers_writers_in_context<W: Into<WriterRegistry>>(
-        plan: &crate::plan::CompiledPlan,
+        plan: &clinker_plan::plan::CompiledPlan,
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
-        compile_ctx: crate::config::CompileContext,
+        compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
         Self::run_with_readers_writers_in_context(
             plan.config(),
@@ -317,13 +314,13 @@ impl PipelineExecutor {
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
-    pub fn explain_plan(plan: &crate::plan::CompiledPlan) -> Result<String, PipelineError> {
+    pub fn explain_plan(plan: &clinker_plan::plan::CompiledPlan) -> Result<String, PipelineError> {
         Self::explain(plan.config())
     }
 
     /// `&CompiledPlan`-consuming `--explain` DAG entry.
     pub fn explain_plan_dag(
-        plan: &crate::plan::CompiledPlan,
+        plan: &clinker_plan::plan::CompiledPlan,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         Self::explain_dag(plan.config())
     }
@@ -348,12 +345,12 @@ impl PipelineExecutor {
             readers,
             writers,
             params,
-            crate::config::CompileContext::default(),
+            clinker_plan::config::CompileContext::default(),
         )
     }
 
     /// Variant of [`Self::run_with_readers_writers`] that accepts an
-    /// explicit [`crate::config::CompileContext`]. Tests use this to
+    /// explicit [`clinker_plan::config::CompileContext`]. Tests use this to
     /// supply a temp-dir workspace root without mutating CWD —
     /// `CompileContext::default()` reads CWD at call time, which is
     /// not thread-safe across parallel test runs that need different
@@ -371,7 +368,7 @@ impl PipelineExecutor {
         readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
-        compile_ctx: crate::config::CompileContext,
+        compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
         let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
         Self::run_with_readers_writers_with_arbitrator(
@@ -399,7 +396,7 @@ impl PipelineExecutor {
         mut readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
-        compile_ctx: crate::config::CompileContext,
+        compile_ctx: clinker_plan::config::CompileContext,
         memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
@@ -408,7 +405,7 @@ impl PipelineExecutor {
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         if source_configs.is_empty() {
             return Err(PipelineError::Config(
-                crate::config::ConfigError::Validation(
+                clinker_plan::config::ConfigError::Validation(
                     "pipeline declares no source nodes; nothing to execute".to_string(),
                 ),
             ));
@@ -442,7 +439,10 @@ impl PipelineExecutor {
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
         let scoped_vars: cxl::resolve::ScopedVarsRegistry =
-            crate::config::build_scoped_vars_registry(config.pipeline.vars.as_ref(), &config.nodes);
+            clinker_plan::config::build_scoped_vars_registry(
+                config.pipeline.vars.as_ref(),
+                &config.nodes,
+            );
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
@@ -481,8 +481,8 @@ impl PipelineExecutor {
                 let n = body_node.name();
                 if matches!(
                     body_node,
-                    crate::plan::execution::PlanNode::Transform { .. }
-                        | crate::plan::execution::PlanNode::Aggregation { .. }
+                    clinker_plan::plan::execution::PlanNode::Transform { .. }
+                        | clinker_plan::plan::execution::PlanNode::Aggregation { .. }
                 ) && !existing_names.contains(n)
                     && let Some(typed) = validated_plan.artifacts().typed.get(n)
                 {
@@ -579,15 +579,15 @@ impl PipelineExecutor {
                 // set — for body context the body's input port
                 // schema(s) plus everything emitted upstream within
                 // the body.
-                let conditions: Vec<crate::config::RouteBranch> = route_body
+                let conditions: Vec<clinker_plan::config::RouteBranch> = route_body
                     .conditions
                     .iter()
-                    .map(|(name, cxl)| crate::config::RouteBranch {
+                    .map(|(name, cxl)| clinker_plan::config::RouteBranch {
                         name: name.clone(),
                         condition: cxl.source.as_str().to_string(),
                     })
                     .collect();
-                let route_config = crate::config::RouteConfig {
+                let route_config = clinker_plan::config::RouteConfig {
                     mode: route_body.mode,
                     branches: conditions,
                     default: route_body.default.clone(),
@@ -635,7 +635,7 @@ impl PipelineExecutor {
                 || writers.fan_out.contains_key(&output.name);
             if !registered {
                 return Err(PipelineError::Config(
-                    crate::config::ConfigError::Validation(format!(
+                    clinker_plan::config::ConfigError::Validation(format!(
                         "no writer registered for output '{}'",
                         output.name
                     )),
@@ -699,7 +699,7 @@ impl PipelineExecutor {
                 watermarks.declare(&src_cfg.name);
             }
             let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
-                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                     "no reader registered for source '{}'",
                     src_cfg.name
                 )))
@@ -977,7 +977,7 @@ impl PipelineExecutor {
         // `declares: scope: record` defaults; existing per-record
         // entries (if any) are preserved by `seed_record_vars`.
         let record_var_seed: IndexMap<String, Value> = {
-            let mut seed = crate::config::collect_record_var_defaults(&config.nodes);
+            let mut seed = clinker_plan::config::collect_record_var_defaults(&config.nodes);
             for (k, v) in &params.record_vars {
                 seed.insert(k.clone(), v.clone());
             }
@@ -989,7 +989,8 @@ impl PipelineExecutor {
         // `stable.source_vars` per `(source, file)` Arc on first
         // observation; channel overrides from `params.source_vars`
         // layer atop the declared defaults.
-        let declared_source_defaults = crate::config::collect_source_var_defaults(&config.nodes);
+        let declared_source_defaults =
+            clinker_plan::config::collect_source_var_defaults(&config.nodes);
 
         // Per-source idle-timeout durations derived from each
         // `SourceConfig.watermark.idle_timeout`. Borrowed by the
@@ -1067,9 +1068,9 @@ impl PipelineExecutor {
         // blocks peer Sources' channels from filling — back-pressure
         // flows end-to-end. Per-Source arms detect membership in
         // `fused_sources` and return cleanly.
-        let init_phase_set = compute_init_phase_node_set(plan);
+        let init_phase_set = clinker_plan::plan::execution::compute_init_phase_node_set(plan);
         let mut fused_sources: HashSet<String> =
-            compute_merge_interleave_fused_sources(plan, config);
+            clinker_plan::plan::execution::compute_merge_interleave_fused_sources(plan, config);
         // Extend `fused_sources` with Source names whose receivers are
         // claimed by a downstream `PlanNode::Transform` running in
         // streaming mode (issue #74). `fused_transforms` carries the
@@ -1077,7 +1078,11 @@ impl PipelineExecutor {
         // dispatch into the streaming branch instead of consuming a
         // pre-drained Vec from `node_buffers`.
         let (extra_fused_sources, fused_transforms) =
-            compute_transform_fused_sources(plan, &fused_sources, &init_phase_set);
+            clinker_plan::plan::execution::compute_transform_fused_sources(
+                plan,
+                &fused_sources,
+                &init_phase_set,
+            );
         fused_sources.extend(extra_fused_sources);
 
         // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
@@ -1479,7 +1484,7 @@ impl PipelineExecutor {
     /// CXL program. The filter returns Emit if true (route matches), Skip(Filtered)
     /// if false (no match). This reuses the existing filter evaluation pattern.
     fn compile_route(
-        route_config: &crate::config::RouteConfig,
+        route_config: &clinker_plan::config::RouteConfig,
         emitted_fields: &[String],
         scoped_vars: &cxl::resolve::ScopedVarsRegistry,
     ) -> Result<CompiledRoute, PipelineError> {
@@ -1577,7 +1582,7 @@ impl PipelineExecutor {
         config: &PipelineConfig,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         let validated_plan = config
-            .compile(&crate::config::CompileContext::default())
+            .compile(&clinker_plan::config::CompileContext::default())
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),

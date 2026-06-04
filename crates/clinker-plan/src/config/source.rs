@@ -108,9 +108,9 @@ pub struct SourceConfig {
 /// `column` names a record field whose value is the source's event-
 /// time axis. At ingest, each record's value at this column is
 /// converted to an i64 nanosecond stamp, shifted earlier by `delay`,
-/// and folded into a per-(source, file) max via
-/// [`crate::executor::watermark::PerSourceWatermarks`]. The column
-/// type must coerce to [`clinker_record::Value::Timestamp`] or
+/// and folded into a per-(source, file) max by the executor's watermark
+/// tracking. The column type must coerce to
+/// [`clinker_record::Value::Timestamp`] or
 /// [`clinker_record::Value::Date`] (validated at plan time, see
 /// `crate::plan::bind_schema`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +119,7 @@ pub struct WatermarkConfig {
     /// Name of the event-time column on the source's declared schema.
     pub column: String,
     /// Duration the source's live mpsc receiver may stay quiet before
-    /// its partitions flip to [`crate::executor::watermark::WatermarkStatus::Idle`].
+    /// its partitions flip to the idle watermark state in the executor.
     /// `None` (default) means "never go idle" — preserves prior behavior
     /// for pipelines without a window-close consumer.
     ///

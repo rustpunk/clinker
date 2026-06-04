@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
 use clinker_core::source::multi_file::FileSlot;
+use clinker_plan::config::{CompileContext, parse_config};
 
 const YAML: &str = r#"
 pipeline:
@@ -133,7 +133,7 @@ fn fan_out_flag_set_when_template_uses_source_file_token() {
         .node_indices()
         .find(|i| dag.graph[*i].name() == "out")
         .expect("output node 'out' exists");
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let PlanNode::Output { resolved, .. } = &dag.graph[out_idx] else {
         panic!("expected Output variant");
     };

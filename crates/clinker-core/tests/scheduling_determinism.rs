@@ -30,10 +30,10 @@
 //! group rows and their values) from the aggregate's emission order.
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{
     PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader,
 };
+use clinker_plan::config::{CompileContext, parse_config};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -203,7 +203,7 @@ fn scheduling_reorder_does_not_change_output() {
         .unwrap()
         .compile(&CompileContext::with_pipeline_dir(empty.path(), ""))
         .unwrap();
-    let peak = |plan: &clinker_core::plan::compiled::CompiledPlan, node: &str| {
+    let peak = |plan: &clinker_plan::plan::compiled::CompiledPlan, node: &str| {
         let dag = plan.dag();
         let idx = dag
             .graph

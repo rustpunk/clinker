@@ -17,10 +17,10 @@
 //! and in `--explain --format json` under `node_properties.<name>`; the data
 //! goldens never move.
 
-use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::plan::compiled::CompiledPlan;
-use clinker_core::plan::execution::ExecutionPlanDag;
-use clinker_core::plan::properties::NodeProperties;
+use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::plan::compiled::CompiledPlan;
+use clinker_plan::plan::execution::ExecutionPlanDag;
+use clinker_plan::plan::properties::NodeProperties;
 use std::io::Write;
 use std::path::Path;
 

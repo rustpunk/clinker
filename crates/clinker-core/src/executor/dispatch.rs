@@ -25,8 +25,8 @@ use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason, StableEvalContext};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
-use crate::error::PipelineError;
+use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use clinker_plan::error::PipelineError;
 
 /// Re-export of the correlation-buffer commit entry point, relocated to
 /// [`crate::executor::correlation_dispatch`]. The commit subtree reaches it
@@ -178,7 +178,7 @@ fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), Pi
     };
     let pipeline_min = dlq
         .min_records
-        .unwrap_or(crate::config::DEFAULT_DLQ_MIN_RECORDS);
+        .unwrap_or(clinker_plan::config::DEFAULT_DLQ_MIN_RECORDS);
 
     if let Some(per) = dlq.per_source.get(source.as_ref())
         && let Some(max) = per.max_rate
@@ -424,9 +424,9 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     CompiledRoute, CompiledTransform, DlqEntry, evaluate_single_transform, stage_metrics,
 };
-use crate::pipeline::memory::BudgetCategory;
-use crate::plan::bind_schema::CompileArtifacts;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::BudgetCategory;
+use clinker_plan::plan::bind_schema::CompileArtifacts;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::Schema;
 
 /// Mutable per-walk and borrowed plan-time state passed to
@@ -878,7 +878,7 @@ pub(crate) struct ExecutorContext<'a> {
 /// each composition body has its own EdgeIndex namespace.
 type RegionInputBuffers = HashMap<
     (
-        Option<crate::plan::CompositionBodyId>,
+        Option<clinker_plan::plan::CompositionBodyId>,
         petgraph::graph::EdgeIndex,
     ),
     Vec<(Record, u64)>,
@@ -1037,7 +1037,7 @@ impl<'a> ExecutorContext<'a> {
             .nodes
             .iter()
             .find_map(|spanned| match &spanned.value {
-                crate::config::PipelineNode::Transform { header, config }
+                clinker_plan::config::PipelineNode::Transform { header, config }
                     if header.name == transform_name =>
                 {
                     config.batch_size
@@ -1649,7 +1649,7 @@ pub(crate) fn finalize_node_rooted_windows(
     use crate::executor::window_runtime::WindowRuntime;
     use crate::pipeline::arena::Arena;
     use crate::pipeline::index::SecondaryIndex;
-    use crate::plan::index::PlanIndexRoot;
+    use clinker_plan::plan::index::PlanIndexRoot;
     use clinker_record::RecordStorage;
 
     for (idx, spec) in current_dag.indices_to_build.iter().enumerate() {

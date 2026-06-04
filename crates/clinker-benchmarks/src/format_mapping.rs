@@ -1,7 +1,7 @@
-//! Maps `clinker_core::config::InputFormat` to `clinker_bench_support::cache::DataFormat`.
+//! Maps `clinker_plan::config::InputFormat` to `clinker_bench_support::cache::DataFormat`.
 
 use clinker_bench_support::cache::DataFormat;
-use clinker_core::config::{InputFormat, JsonFormat};
+use clinker_plan::config::{InputFormat, JsonFormat};
 
 /// Error when an `InputFormat` variant has no `DataFormat` equivalent.
 #[derive(Debug)]

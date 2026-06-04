@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use clinker_core::config::{CompileContext, LayerKind, ProvenanceLayer, ResolvedValue};
 use clinker_core_types::span::Span;
+use clinker_plan::config::{CompileContext, LayerKind, ProvenanceLayer, ResolvedValue};
 
 fn test_span() -> Span {
     Span::SYNTHETIC
@@ -15,8 +15,8 @@ fn fixture_workspace_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
-    clinker_core::yaml::from_str(yaml).expect("parse PipelineConfig")
+fn parse_pipeline(yaml: &str) -> clinker_plan::config::PipelineConfig {
+    clinker_plan::yaml::from_str(yaml).expect("parse PipelineConfig")
 }
 
 // ---------------------------------------------------------------------

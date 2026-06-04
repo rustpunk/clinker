@@ -26,10 +26,10 @@ use rest::RestRecordSource;
 /// node config. The caller (the CLI reader-build) registers the returned
 /// reader as a [`clinker_core::source::SourceInput::Records`].
 pub fn build_rest_source(
-    cfg: clinker_core::config::RestSourceConfig,
-    source: &clinker_core::config::SourceConfig,
-    schema_decl: &[clinker_core::config::pipeline_node::ColumnDecl],
-    on_unmapped: clinker_core::config::pipeline_node::OnUnmapped,
+    cfg: clinker_plan::config::RestSourceConfig,
+    source: &clinker_plan::config::SourceConfig,
+    schema_decl: &[clinker_plan::config::pipeline_node::ColumnDecl],
+    on_unmapped: clinker_plan::config::pipeline_node::OnUnmapped,
 ) -> Result<Box<dyn clinker_core::source::RecordSource>, FormatError> {
     let reader = RestRecordSource::new(cfg, source, schema_decl, on_unmapped)?;
     Ok(Box::new(reader))

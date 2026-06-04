@@ -1,7 +1,5 @@
 pub mod aggregation;
-pub mod config;
 pub mod dlq;
-pub mod error;
 pub mod executor;
 pub mod exit_codes;
 mod integration_tests;
@@ -13,23 +11,8 @@ pub mod modules;
 pub mod output;
 pub mod partial;
 pub mod pipeline;
-pub mod plan;
 pub mod progress;
 pub mod projection;
-pub mod schema;
-pub mod security;
 pub mod source;
-pub mod span;
-pub mod validation;
-pub mod yaml;
 
-pub use config::{
-    CompileContext, CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef,
-    OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind,
-    ResourceName, SourceMap, SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET,
-    scan_workspace_signatures, validate_signatures,
-};
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
-pub use plan::{
-    BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
-};

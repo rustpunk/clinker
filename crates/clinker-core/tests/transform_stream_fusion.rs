@@ -32,9 +32,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
+use clinker_plan::config::{CompileContext, parse_config};
 
 fn run_params() -> PipelineRunParams {
     PipelineRunParams {

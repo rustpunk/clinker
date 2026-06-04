@@ -9,10 +9,10 @@ mod tests {
 
     use clinker_record::{Record, Schema, Value};
 
-    use crate::config::{NullOrder, SortField, SortOrder};
     use crate::pipeline::loser_tree::{LoserTree, MergeEntry};
     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
     use crate::pipeline::sort_key::encode_sort_key;
+    use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
     fn schema_2() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["name".into(), "value".into()]))

@@ -6,7 +6,7 @@
 //! module in `src/config/composition/tests.rs` because the 5-fixture
 //! corpus lives in `tests/fixtures/compositions/`.
 
-use clinker_core::config::{WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures};
+use clinker_plan::config::{WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures};
 use std::path::PathBuf;
 
 fn manifest_dir() -> PathBuf {

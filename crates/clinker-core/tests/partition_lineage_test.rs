@@ -4,10 +4,10 @@
 //! tagging that consumes this lineage lands in §6; this test pins the
 //! plan-time data structure so §6 can build on it without re-deriving.
 
-use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::plan::compiled::CompiledPlan;
-use clinker_core::plan::execution::ExecutionPlanDag;
-use clinker_core::plan::properties::{NodeProperties, PartitioningKind, PartitioningProvenance};
+use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::plan::compiled::CompiledPlan;
+use clinker_plan::plan::execution::ExecutionPlanDag;
+use clinker_plan::plan::properties::{NodeProperties, PartitioningKind, PartitioningProvenance};
 
 fn compile(yaml: &str) -> CompiledPlan {
     let config = parse_config(yaml).expect("parse");

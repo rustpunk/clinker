@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, Schema, Value};
 
-use crate::config::DlqConfig;
 use crate::executor::DlqEntry;
+use clinker_plan::config::DlqConfig;
 
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
 ///
@@ -668,13 +668,13 @@ mod tests {
         let mut per_source = std::collections::BTreeMap::new();
         per_source.insert(
             "src_b".to_string(),
-            crate::config::DlqPerSourceConfig {
+            clinker_plan::config::DlqPerSourceConfig {
                 path: Some("dlq_b.csv".to_string()),
                 max_rate: None,
                 min_records: None,
             },
         );
-        let cfg = crate::config::DlqConfig {
+        let cfg = clinker_plan::config::DlqConfig {
             path: Some("dlq.csv".to_string()),
             include_reason: None,
             include_source_row: None,

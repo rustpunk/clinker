@@ -100,7 +100,7 @@ nodes:
 
 #[test]
 fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
-    let config = crate::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
 
     let mut csv = String::from("id,region\n");
     for i in 0..50 {
@@ -131,7 +131,7 @@ fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
         readers,
         writers.into(),
         &params,
-        crate::config::CompileContext::default(),
+        clinker_plan::config::CompileContext::default(),
         spill_tripped_arbitrator(),
     )
     .expect_err("one-byte spill quota must abort the first branch flush");
@@ -150,7 +150,7 @@ fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
                  to two consumers and cannot spill); got node {node:?}",
             );
             assert!(
-                matches!(source, crate::pipeline::memory::BudgetCategory::NodeBuffer),
+                matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
                 "node_buffers admission must surface under NodeBuffer; got {source:?}",
             );
             assert_eq!(

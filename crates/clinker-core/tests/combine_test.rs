@@ -17,11 +17,11 @@
 #[cfg(test)]
 mod tests {
     use clinker_bench_support::io::SharedBuffer;
-    use clinker_core::config::{CompileContext, PipelineConfig};
-    use clinker_core::error::PipelineError;
     use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
-    use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
     use clinker_core_types::Diagnostic;
+    use clinker_plan::config::{CompileContext, PipelineConfig};
+    use clinker_plan::error::PipelineError;
+    use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use std::collections::HashMap;
@@ -132,7 +132,7 @@ mod tests {
 
     /// Parse YAML into a `PipelineConfig`.
     fn parse_fixture(yaml: &str) -> PipelineConfig {
-        clinker_core::yaml::from_str::<PipelineConfig>(yaml)
+        clinker_plan::yaml::from_str::<PipelineConfig>(yaml)
             .unwrap_or_else(|e| panic!("parse failed: {e}"))
     }
 
@@ -155,15 +155,15 @@ mod tests {
     fn compile_combine_fixture(
         name: &str,
     ) -> (
-        clinker_core::plan::bind_schema::CompileArtifacts,
+        clinker_plan::plan::bind_schema::CompileArtifacts,
         Vec<clinker_core_types::Diagnostic>,
     ) {
         let yaml = load_fixture(&format!("{name}.yaml"));
         let config = parse_fixture(&yaml);
-        let ctx = clinker_core::config::CompileContext::default();
+        let ctx = clinker_plan::config::CompileContext::default();
         let symbol_table = indexmap::IndexMap::new();
         let mut diags = Vec::new();
-        let artifacts = clinker_core::plan::bind_schema::bind_schema(
+        let artifacts = clinker_plan::plan::bind_schema::bind_schema(
             &config.nodes,
             &mut diags,
             &ctx,
@@ -180,7 +180,7 @@ mod tests {
     /// `compile_combine_fixture` so the test surface is one-stop.
     #[allow(dead_code)] // Pre-existing helper retained for combine gate tests.
     fn assert_output_row(
-        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        artifacts: &clinker_plan::plan::bind_schema::CompileArtifacts,
         node_name: &str,
         expected_fields: &[&str],
     ) {
@@ -204,7 +204,7 @@ mod tests {
     /// availability.
     #[allow(dead_code)] // Exercised by C.1.2+ tests.
     fn assert_predicate_decomposition(
-        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        artifacts: &clinker_plan::plan::bind_schema::CompileArtifacts,
         node_name: &str,
         expected_equalities: usize,
         expected_ranges: usize,
@@ -282,7 +282,7 @@ mod tests {
             assert!(path.exists(), "missing C.1 fixture: {}", path.display());
             let yaml = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            clinker_core::yaml::from_str::<PipelineConfig>(&yaml)
+            clinker_plan::yaml::from_str::<PipelineConfig>(&yaml)
                 .unwrap_or_else(|e| panic!("fixture {name} failed to parse: {e}"));
         }
     }
@@ -466,7 +466,7 @@ mod tests {
     /// `classify_conjunct` maps `BinOp::Gte → RangeOp::Ge` correctly.
     #[test]
     fn test_combine_decompose_mixed() {
-        use clinker_core::plan::combine::RangeOp;
+        use clinker_plan::plan::combine::RangeOp;
 
         let (artifacts, diags) = compile_combine_fixture("two_input_mixed");
         assert!(
@@ -510,7 +510,7 @@ mod tests {
     /// the field's position within its declared input row.
     #[test]
     fn test_typecheck_combine_resolves_qualified_field_refs_to_indices() {
-        use clinker_core::plan::types::JoinSide;
+        use clinker_plan::plan::types::JoinSide;
         use cxl::typecheck::QualifiedField;
 
         let (artifacts, diags) = compile_combine_fixture("match_all");
@@ -879,7 +879,7 @@ mod tests {
         // scratch directory); opt in to absolute paths so E-SEC-001 does
         // not reject them here. Production CLI sets this via
         // `--allow-absolute-paths` / `CLINKER_ALLOW_ABSOLUTE_PATHS`.
-        let ctx = clinker_core::config::CompileContext {
+        let ctx = clinker_plan::config::CompileContext {
             allow_absolute_paths: true,
             ..Default::default()
         };
@@ -945,7 +945,7 @@ mod tests {
     fn test_combine_three_input_decomposes_to_binary_chain() {
         let yaml = load_fixture("three_input_shared_key.yaml");
         let config = parse_fixture(&yaml);
-        let ctx = clinker_core::config::CompileContext {
+        let ctx = clinker_plan::config::CompileContext {
             allow_absolute_paths: true,
             ..Default::default()
         };
@@ -1129,7 +1129,7 @@ mod tests {
         assert!(
             matches!(
                 combine,
-                clinker_core::plan::combine::CombineStrategy::IEJoin
+                clinker_plan::plan::combine::CombineStrategy::IEJoin
             ),
             "expected CombineStrategy::IEJoin for pure-range combine; got {combine:?}"
         );
@@ -1221,8 +1221,8 @@ mod tests {
     /// Compile a fixture and return the full `CompiledPlan` so tests can
     /// reach `.dag()`, `.config()`, and `.artifacts()` without re-running
     /// the lowering pipeline. Mirrors `compile_plan`'s scratch-path opt-in.
-    fn compile_full_plan(config: &PipelineConfig) -> clinker_core::plan::CompiledPlan {
-        let ctx = clinker_core::config::CompileContext {
+    fn compile_full_plan(config: &PipelineConfig) -> clinker_plan::plan::CompiledPlan {
+        let ctx = clinker_plan::config::CompileContext {
             allow_absolute_paths: true,
             ..Default::default()
         };
@@ -1326,7 +1326,7 @@ mod tests {
         let config = parse_fixture(&yaml);
         let plan = compile_full_plan(&config);
 
-        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
         let json: serde_json::Value =
             serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
 
@@ -1505,7 +1505,7 @@ mod tests {
         yaml.push_str("      name: joined8_out\n      type: csv\n      path: /tmp/joined8.csv\n");
 
         let config: PipelineConfig =
-            clinker_core::yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse failed: {e}"));
+            clinker_plan::yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse failed: {e}"));
         let plan = compile_full_plan(&config);
 
         let text = plan
@@ -1546,7 +1546,7 @@ mod tests {
             "match: collect must surface in the text explain block; got:\n{text}",
         );
 
-        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
         let json: serde_json::Value =
             serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
         let nodes = json["nodes"]
@@ -1583,7 +1583,7 @@ mod tests {
         ];
         // Combine fixture outputs live under /tmp/; opt in to absolute
         // paths so E-SEC-001 does not reject them in test.
-        let ctx = clinker_core::config::CompileContext {
+        let ctx = clinker_plan::config::CompileContext {
             allow_absolute_paths: true,
             ..Default::default()
         };
@@ -1626,8 +1626,8 @@ mod tests {
     /// `orders:` entry points at its actual line in the file.
     #[test]
     fn test_combine_input_carries_field_level_span() {
-        use clinker_core::config::PipelineNode;
-        use clinker_core::yaml::Location;
+        use clinker_plan::config::PipelineNode;
+        use clinker_plan::yaml::Location;
 
         let yaml = load_fixture("two_input_equi.yaml");
         let config = parse_fixture(&yaml);
@@ -1723,7 +1723,7 @@ nodes:
 "#;
         let config = parse_fixture(yaml);
         let diags = config
-            .compile(&clinker_core::config::CompileContext::default())
+            .compile(&clinker_plan::config::CompileContext::default())
             .expect_err("combine referencing undeclared upstream must fail");
         let e004 = diags
             .iter()
@@ -1809,7 +1809,7 @@ nodes:
 "#;
         let config = parse_fixture(yaml);
         let diags = config
-            .compile(&clinker_core::config::CompileContext::default())
+            .compile(&clinker_plan::config::CompileContext::default())
             .expect_err("fixture has E004 (undeclared combine input) — must fail");
 
         // The load-bearing assertion: combine-undeclared is visible
@@ -1844,8 +1844,8 @@ nodes:
     /// in a merge fixture carries a real span. Parity with Combine.
     #[test]
     fn test_nodeinput_span_preserved_for_merge_header() {
-        use clinker_core::config::PipelineNode;
-        use clinker_core::yaml::Location;
+        use clinker_plan::config::PipelineNode;
+        use clinker_plan::yaml::Location;
 
         let yaml = r#"
 pipeline:
@@ -1908,8 +1908,8 @@ nodes:
     /// Transform header carries a real span. Parity with Combine.
     #[test]
     fn test_nodeinput_span_preserved_for_transform_header() {
-        use clinker_core::config::PipelineNode;
-        use clinker_core::yaml::Location;
+        use clinker_plan::config::PipelineNode;
+        use clinker_plan::yaml::Location;
 
         let yaml = r#"
 pipeline:
@@ -2101,7 +2101,7 @@ nodes:
         inputs: &[(&str, &str)],
         _primary_override: Option<&str>,
     ) -> Result<CombineFixtureResult, CombineFixtureError> {
-        let config: PipelineConfig = clinker_core::yaml::from_str(yaml)
+        let config: PipelineConfig = clinker_plan::yaml::from_str(yaml)
             .map_err(|e| CombineFixtureError::Parse(e.to_string()))?;
         let ctx = CompileContext::default();
         let plan = config.compile(&ctx).map_err(CombineFixtureError::Compile)?;
@@ -3050,7 +3050,7 @@ nodes:
     /// `compute_node_properties` internally.
     #[test]
     fn test_combine_destroys_ordering() {
-        use clinker_core::plan::properties::{Confidence, OrderingProvenance};
+        use clinker_plan::plan::properties::{Confidence, OrderingProvenance};
 
         let yaml = load_fixture("two_input_equi.yaml");
         let config = parse_fixture(&yaml);
@@ -3488,7 +3488,7 @@ nodes:
         )
         .expect_err("on_miss:error must fail the pipeline on first unmatched row");
         match &err {
-            CombineFixtureError::Run(clinker_core::error::PipelineError::CombineMissingMatch {
+            CombineFixtureError::Run(clinker_plan::error::PipelineError::CombineMissingMatch {
                 combine,
                 ..
             }) => {
@@ -3573,9 +3573,9 @@ nodes:
         .expect_err("1-byte mem_limit must abort combine");
         match &err {
             CombineFixtureError::Run(
-                clinker_core::error::PipelineError::MemoryBudgetExceeded { node, source, .. },
+                clinker_plan::error::PipelineError::MemoryBudgetExceeded { node, source, .. },
             ) => {
-                use clinker_core::pipeline::memory::BudgetCategory;
+                use clinker_plan::BudgetCategory;
                 // Either the per-row Arena charge inside the Combine
                 // build/probe path or the per-Vec NodeBuffer admission
                 // charge at any upstream insert can be the first surface
@@ -4234,14 +4234,14 @@ nodes:
     /// `HashBuildProbe`.
     #[test]
     fn test_grace_hash_strategy_selected_for_large_build() {
-        use clinker_core::plan::bind_schema::CompileArtifacts;
-        use clinker_core::plan::combine::{
+        use clinker_core_types::span::Span;
+        use clinker_plan::plan::bind_schema::CompileArtifacts;
+        use clinker_plan::plan::combine::{
             CombineInput, CombinePredicateSummary, CombineStrategy, DecomposedPredicate,
             EqualityConjunct, select_combine_strategies,
         };
-        use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
-        use clinker_core::plan::row_type::{QualifiedField, Row};
-        use clinker_core_types::span::Span;
+        use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+        use clinker_plan::plan::row_type::{QualifiedField, Row};
         use cxl::ast::{Expr, LiteralValue, NodeId, Program};
         use cxl::lexer::Span as CxlSpan;
         use cxl::typecheck::Type;
@@ -4324,9 +4324,9 @@ nodes:
             driving_input: String::new(),
             build_inputs: Vec::new(),
             predicate_summary: CombinePredicateSummary::default(),
-            match_mode: clinker_core::config::pipeline_node::MatchMode::First,
-            on_miss: clinker_core::config::pipeline_node::OnMiss::NullFields,
-            propagate_ck: clinker_core::config::pipeline_node::PropagateCkSpec::Driver,
+            match_mode: clinker_plan::config::pipeline_node::MatchMode::First,
+            on_miss: clinker_plan::config::pipeline_node::OnMiss::NullFields,
+            propagate_ck: clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
@@ -4338,7 +4338,7 @@ nodes:
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            clinker_core::plan::execution::ParallelismProfile {
+            clinker_plan::plan::execution::ParallelismProfile {
                 per_transform: Vec::new(),
                 worker_threads: 1,
             },
@@ -4578,10 +4578,10 @@ nodes:
         // selection — a regression where the planner falls back to
         // HashBuildProbe would silently invalidate the bench's
         // throughput comparison.
-        let cfg = clinker_core::yaml::from_str::<PipelineConfig>(&yaml_spill)
+        let cfg = clinker_plan::yaml::from_str::<PipelineConfig>(&yaml_spill)
             .expect("spill YAML must parse");
         let plan = cfg
-            .compile(&clinker_core::config::CompileContext::default())
+            .compile(&clinker_plan::config::CompileContext::default())
             .expect("spill YAML must compile");
         let combine_node = plan
             .dag()
@@ -4593,7 +4593,7 @@ nodes:
             assert!(
                 matches!(
                     strategy,
-                    clinker_core::plan::combine::CombineStrategy::GraceHash { .. }
+                    clinker_plan::plan::combine::CombineStrategy::GraceHash { .. }
                 ),
                 "strategy: grace_hash hint must select CombineStrategy::GraceHash; got {strategy:?}",
             );

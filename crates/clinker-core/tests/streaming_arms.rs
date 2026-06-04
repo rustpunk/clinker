@@ -37,9 +37,9 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
 use clinker_bench_support::io::{SharedBuffer, fast_reader};
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
+use clinker_plan::config::{CompileContext, parse_config};
 
 fn run_params() -> PipelineRunParams {
     PipelineRunParams {
@@ -101,8 +101,8 @@ fn assert_streaming_to_output(explain: &str, producer_slug: &str, output_slug: &
 }
 
 fn explain_of(
-    config: &clinker_core::config::PipelineConfig,
-    plan: &clinker_core::plan::CompiledPlan,
+    config: &clinker_plan::config::PipelineConfig,
+    plan: &clinker_plan::plan::CompiledPlan,
 ) -> String {
     let (dag, _) = PipelineExecutor::explain_plan_dag(plan).expect("explain_dag");
     dag.explain_text(config)
