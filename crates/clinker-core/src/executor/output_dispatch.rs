@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    source_file_path_of,
+    push_write_error, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{build_format_writer, stage_metrics};
@@ -262,88 +262,110 @@ pub(crate) fn dispatch_output(
     // per-source-file routing, each record's source_file Arc
     // selects the right writer; the registry holds N writers
     // (one per discovered file).
-    if let Some(per_file) = ctx.fan_out_writers.remove(name) {
-        emit_fan_out(
-            name,
-            out_cfg,
-            cxl_emit_names_opt,
-            &output_schema,
-            &unbuffered,
-            per_file,
-            &mut ctx.output_errors,
-            &mut ctx.write_timer,
-            &mut ctx.projection_timer,
-            ctx.collector,
-            scan_timer,
-        );
-    } else if let Some(raw_writer) = ctx.writers.remove(name) {
-        match build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema)) {
-            Ok(mut csv_writer) => {
-                ctx.collector.record(scan_timer.finish(1, 1));
-                let mut write_failed = false;
-                for (record, _rn) in &unbuffered {
-                    let projected = {
-                        let _guard = ctx.projection_timer.guard();
-                        project_output_from_record(record, out_cfg, cxl_emit_names_opt)
-                    };
-                    let write_result = {
-                        let _guard = ctx.write_timer.guard();
-                        csv_writer.write_record(&projected)
-                    };
-                    if let Err(e) = write_result {
-                        ctx.output_errors.push(PipelineError::from(e));
-                        write_failed = true;
-                        break;
-                    }
-                }
-                if !write_failed {
-                    let flush_result = {
-                        let _guard = ctx.write_timer.guard();
-                        csv_writer.flush()
-                    };
-                    if let Err(e) = flush_result {
-                        ctx.output_errors.push(PipelineError::from(e));
-                    }
-                }
-            }
-            Err(e) => ctx.output_errors.push(e),
-        }
+    let fan_out_writers = ctx.fan_out_writers.remove(name);
+    let single_writer = if fan_out_writers.is_none() {
+        ctx.writers.remove(name)
+    } else {
+        None
+    };
+    let mut fan_ctx = FanOutContext {
+        name,
+        out_cfg,
+        cxl_emit_names_opt,
+        output_schema: &output_schema,
+        output_errors: &mut ctx.output_errors,
+        write_timer: &mut ctx.write_timer,
+        projection_timer: &mut ctx.projection_timer,
+        collector: &mut *ctx.collector,
+    };
+    if let Some(per_file) = fan_out_writers {
+        emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
+    } else if let Some(raw_writer) = single_writer {
+        emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
     }
 
     Ok(())
 }
 
-/// Project every record in `rows` onto the column set in
-/// `buffer_schema`, returning narrow `Record` instances on a fresh,
-/// per-call `Arc<Schema>` shared by every emitted Record.
-///
-/// Mirrors the column-pruning pattern at
-/// `pipeline::arena::project_records_into_minimal`. Invoked once at the
-/// deferred-region producer (a relaxed-CK Aggregate) so the emit buffer
-/// retains exactly the columns the deferred operators reach via
-/// `Expr::support_into`. Source row numbers carry through unchanged.
-///
-/// `pub(crate)` so the commit-time `recompute_aggregates` phase can
+/// The Output node's resolved write target plus the run-scoped writer
+/// state both write paths share. Bundling the four cross-branch borrows
+/// (error sink, the write / projection cumulative timers, and the
+/// stage-metric collector) with the per-call write descriptor (output
+/// name, resolved [`OutputConfig`](crate::config::OutputConfig), explicit
+/// CXL emit names, and the projected output schema) keeps the fan-out and
+/// single-writer helpers below clippy's argument threshold and gives them
+/// one shared shape — a change to how an Output write is attributed (e.g.
+/// a new metric guard) lands on the struct, not on two signatures.
+struct FanOutContext<'a> {
+    name: &'a str,
+    out_cfg: &'a crate::config::OutputConfig,
+    cxl_emit_names_opt: Option<&'a [String]>,
+    output_schema: &'a Arc<clinker_record::Schema>,
+    output_errors: &'a mut Vec<PipelineError>,
+    write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
+    projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
+    collector: &'a mut crate::executor::stage_metrics::StageCollector,
+}
+
+/// Write `unbuffered` through a single pre-opened writer. Errors from
+/// writer construction / `write_record` / `flush` land in the context's
+/// error sink rather than short-circuiting, so sibling Outputs still get
+/// their chance to fail.
+fn emit_single_writer(
+    fan_ctx: &mut FanOutContext<'_>,
+    raw_writer: Box<dyn Write + Send>,
+    unbuffered: &[(Record, u64)],
+    scan_timer: crate::executor::stage_metrics::StageTimer,
+) {
+    match build_format_writer(
+        fan_ctx.out_cfg,
+        raw_writer,
+        Arc::clone(fan_ctx.output_schema),
+    ) {
+        Ok(mut csv_writer) => {
+            fan_ctx.collector.record(scan_timer.finish(1, 1));
+            let mut write_failed = false;
+            for (record, _rn) in unbuffered {
+                let projected = {
+                    let _guard = fan_ctx.projection_timer.guard();
+                    project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
+                };
+                let write_result = {
+                    let _guard = fan_ctx.write_timer.guard();
+                    csv_writer.write_record(&projected)
+                };
+                if let Err(e) = write_result {
+                    push_write_error(fan_ctx.output_errors, e);
+                    write_failed = true;
+                    break;
+                }
+            }
+            if !write_failed {
+                let flush_result = {
+                    let _guard = fan_ctx.write_timer.guard();
+                    csv_writer.flush()
+                };
+                if let Err(e) = flush_result {
+                    push_write_error(fan_ctx.output_errors, e);
+                }
+            }
+        }
+        Err(e) => fan_ctx.output_errors.push(e),
+    }
+}
+
 /// Emit a buffered record stream to a fan-out output: one writer per
 /// source-file `Arc<str>`, route each record to the writer keyed by
 /// its `$source.file` Arc. Writers without any matched records still
 /// flush an empty file (preserving header and any per-file framing).
 ///
-/// All errors land in `output_errors` rather than short-circuiting so
-/// sibling writers in the same Output still get their chance to flush
-/// or report.
-#[allow(clippy::too_many_arguments)]
+/// All errors land in the context's error sink rather than
+/// short-circuiting so sibling writers in the same Output still get
+/// their chance to flush or report.
 fn emit_fan_out(
-    name: &str,
-    out_cfg: &crate::config::OutputConfig,
-    cxl_emit_names_opt: Option<&[String]>,
-    output_schema: &Arc<clinker_record::Schema>,
+    fan_ctx: &mut FanOutContext<'_>,
     unbuffered: &[(Record, u64)],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
-    output_errors: &mut Vec<PipelineError>,
-    write_timer: &mut crate::executor::stage_metrics::CumulativeTimer,
-    projection_timer: &mut crate::executor::stage_metrics::CumulativeTimer,
-    collector: &mut crate::executor::stage_metrics::StageCollector,
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
     use std::collections::HashMap as Hm;
@@ -353,20 +375,20 @@ fn emit_fan_out(
     // siblings still get their chance.
     let mut format_writers: Hm<Arc<str>, Box<dyn clinker_format::FormatWriter>> = Hm::new();
     for (file_arc, raw) in per_file {
-        match build_format_writer(out_cfg, raw, Arc::clone(output_schema)) {
+        match build_format_writer(fan_ctx.out_cfg, raw, Arc::clone(fan_ctx.output_schema)) {
             Ok(fw) => {
                 format_writers.insert(file_arc, fw);
             }
-            Err(e) => output_errors.push(e),
+            Err(e) => fan_ctx.output_errors.push(e),
         }
     }
-    collector.record(scan_timer.finish(1, 1));
+    fan_ctx.collector.record(scan_timer.finish(1, 1));
 
     for (record, rn) in unbuffered {
         let Some(file_path) = source_file_path_of(record) else {
-            output_errors.push(PipelineError::Internal {
+            fan_ctx.output_errors.push(PipelineError::Internal {
                 op: "fan_out",
-                node: name.to_string(),
+                node: fan_ctx.name.to_string(),
                 detail: format!(
                     "row {rn} has no `$source.file` stamp; fan-out output requires per-record source-file lineage",
                 ),
@@ -381,9 +403,9 @@ fn emit_fan_out(
             // Record's file isn't in the fan-out registry — typically
             // means the CLI's writer setup didn't pre-open one for
             // this file. Surface but keep going.
-            output_errors.push(PipelineError::Internal {
+            fan_ctx.output_errors.push(PipelineError::Internal {
                 op: "fan_out",
-                node: name.to_string(),
+                node: fan_ctx.name.to_string(),
                 detail: format!(
                     "no fan-out writer registered for source file {:?}",
                     file_arc
@@ -392,15 +414,15 @@ fn emit_fan_out(
             continue;
         };
         let projected = {
-            let _guard = projection_timer.guard();
-            project_output_from_record(record, out_cfg, cxl_emit_names_opt)
+            let _guard = fan_ctx.projection_timer.guard();
+            project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
         };
         let write_result = {
-            let _guard = write_timer.guard();
+            let _guard = fan_ctx.write_timer.guard();
             fw.write_record(&projected)
         };
         if let Err(e) = write_result {
-            output_errors.push(PipelineError::from(e));
+            push_write_error(fan_ctx.output_errors, e);
         }
     }
 
@@ -408,11 +430,11 @@ fn emit_fan_out(
     // outputs land on disk for inspection.
     for (_arc, mut fw) in format_writers {
         let flush_result = {
-            let _guard = write_timer.guard();
+            let _guard = fan_ctx.write_timer.guard();
             fw.flush()
         };
         if let Err(e) = flush_result {
-            output_errors.push(PipelineError::from(e));
+            push_write_error(fan_ctx.output_errors, e);
         }
     }
 }

@@ -12,18 +12,17 @@
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
-use cxl::eval::{EvalContext, ProgramEvaluator};
+use cxl::eval::ProgramEvaluator;
 use petgraph::graph::NodeIndex;
 
 use crate::aggregation::AggregateStrategy;
 use crate::config::ErrorStrategy;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, MERGED_SOURCE_NAME, RetainedAggregatorState,
-    admit_node_buffer, advance_cursor, drain_node_buffer_slot, finalize_node_rooted_windows,
-    node_buffer_spill_allowed, project_rows_to_buffer_schema, push_dlq,
-    record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
-    stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    project_rows_to_buffer_schema, push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of,
+    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
@@ -149,23 +148,26 @@ pub(crate) fn dispatch_aggregation(
         // contained at the cost of one extra evaluator clone per
         // window (the heavy `TypedProgram` lives behind an Arc).
         drop(evaluator);
+        let win_ctx = WindowedAggContext {
+            name,
+            compiled,
+            strategy: agg_strategy,
+            output_schema: Arc::clone(output_schema),
+            spill_schema,
+            mem_limit,
+            transform_idx,
+        };
         run_time_windowed_aggregate(
             ctx,
             current_dag,
             node_idx,
-            name,
-            compiled,
-            agg_strategy,
-            Arc::clone(output_schema),
-            spill_schema,
-            mem_limit,
+            &win_ctx,
             &input,
             config
                 .time_window
                 .as_ref()
                 .expect("guarded by is_time_windowed"),
             config.allowed_lateness,
-            transform_idx,
         )?
     } else {
         // Single ConsumerHandle shared between the
@@ -214,17 +216,12 @@ pub(crate) fn dispatch_aggregation(
             for (record, row_num) in &input {
                 let source_file_arc = source_file_arc_of(record);
                 let source_name_arc = source_name_arc_of(record);
-                let eval_ctx = EvalContext {
-                    stable: ctx.stable,
-                    source_file: &source_file_arc,
-                    source_row: *row_num,
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count_by_name(&source_name_arc),
-                    source_batch: ctx.source_batch_arc,
-                    ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &source_name_arc,
-                    doc_ctx: record.doc_ctx(),
-                };
+                let eval_ctx = ctx.eval_ctx_for_record(
+                    &source_file_arc,
+                    &source_name_arc,
+                    *row_num,
+                    record.doc_ctx(),
+                );
                 let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut emitted_rows);
                 if add_result.is_ok() {
                     advance_cursor(ctx, &source_name_arc, *row_num);
@@ -282,17 +279,7 @@ pub(crate) fn dispatch_aggregation(
         // instance that produced these rows. Strict aggregates
         // continue to consume-and-discard so non-relaxed
         // pipelines pay zero overhead.
-        let finalize_ctx = EvalContext {
-            stable: ctx.stable,
-            source_file: &MERGED_SOURCE_FILE,
-            source_row: 0,
-            source_path: &MERGED_SOURCE_FILE,
-            source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-            source_batch: ctx.source_batch_arc,
-            ingestion_timestamp: ctx.source_ingestion_timestamp,
-            source_name: &MERGED_SOURCE_NAME,
-            doc_ctx: clinker_record::synthetic_document_context_ref(),
-        };
+        let finalize_ctx = ctx.merged_eval_ctx();
         let agg_out = if is_relaxed {
             let mut hash_box = match stream.into_retained_hash() {
                 Some(b) => b,
@@ -563,6 +550,78 @@ pub(crate) fn dispatch_aggregation(
     Ok(())
 }
 
+/// Immutable build configuration for a time-windowed aggregate, shared
+/// by [`run_time_windowed_aggregate`] and its per-record [`add_to_window`]
+/// helper. Bundling the seven aggregate-build fields keeps both functions
+/// at their argument budget and gives the per-window stream factory one
+/// home — [`Self::make_stream`] replaces the closure both call sites
+/// previously threaded by reference.
+struct WindowedAggContext<'a> {
+    name: &'a str,
+    compiled: &'a Arc<cxl::plan::CompiledAggregate>,
+    strategy: AggregateStrategy,
+    output_schema: Arc<Schema>,
+    spill_schema: Arc<Schema>,
+    mem_limit: usize,
+    transform_idx: Option<usize>,
+}
+
+impl WindowedAggContext<'_> {
+    /// Build a fresh per-window [`crate::aggregation::AggregateStream`]
+    /// sharing this aggregate's compiled CXL, output schema, and spill
+    /// schema, and register its consumer with the pipeline-scoped
+    /// arbitrator. Returns the `ConsumerId` alongside the stream so the
+    /// caller can unregister the wrapper once the window finalizes —
+    /// leaving it registered would keep every finalized window's bytes in
+    /// `sum_consumer_usage` for the rest of the run. Building a new
+    /// `ProgramEvaluator` per window is cheap: the heavy CXL pipeline
+    /// lives behind `Arc<TypedProgram>`.
+    fn make_stream(
+        &self,
+        ctx: &ExecutorContext<'_>,
+    ) -> Result<
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    > {
+        let evaluator = match self.transform_idx {
+            Some(idx) => ProgramEvaluator::with_max_expansion(
+                Arc::clone(&ctx.compiled_transforms[idx].typed),
+                ctx.compiled_transforms[idx].has_distinct(),
+                ctx.compiled_transforms[idx].max_expansion,
+            ),
+            None => {
+                return Err(PipelineError::Internal {
+                    op: "time-windowed-aggregation",
+                    node: self.name.to_string(),
+                    detail: "no compiled transform found for time-windowed aggregate node"
+                        .to_string(),
+                });
+            }
+        };
+        let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+        let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
+            crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
+        ));
+        let stream = crate::aggregation::AggregateStream::for_node(
+            self.strategy,
+            crate::aggregation::AggregatorConfig {
+                compiled: Arc::clone(self.compiled),
+                evaluator,
+                output_schema: Arc::clone(&self.output_schema),
+                spill_schema: Arc::clone(&self.spill_schema),
+                memory_budget: self.mem_limit,
+                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+                transform_name: self.name.to_string(),
+                consumer_handle: agg_consumer_handle,
+            },
+        )?;
+        Ok((stream, agg_consumer_id))
+    }
+}
+
 /// Dispatch arm for time-windowed aggregates. Branches the existing
 /// strict `PlanNode::Aggregation` flow when `AggregateConfig.time_window`
 /// is `Some(_)`. Each window (tumbling / hopping window or per-key
@@ -579,22 +638,18 @@ pub(crate) fn dispatch_aggregation(
 /// in-order record; at end-of-input (drain-to-Vec batch model) every
 /// open window finalizes and contributes one emit row per
 /// (group-by-key) group it observed.
-#[allow(clippy::too_many_arguments)]
 fn run_time_windowed_aggregate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
-    name: &str,
-    compiled: &Arc<cxl::plan::CompiledAggregate>,
-    strategy: AggregateStrategy,
-    output_schema: Arc<Schema>,
-    spill_schema: Arc<Schema>,
-    mem_limit: usize,
+    win_ctx: &WindowedAggContext<'_>,
     input: &[(Record, u64)],
     spec: &crate::config::pipeline_node::TimeWindowSpec,
     allowed_lateness: Option<std::time::Duration>,
-    transform_idx: Option<usize>,
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
+    let name = win_ctx.name;
+    let compiled = win_ctx.compiled;
+    let output_schema = Arc::clone(&win_ctx.output_schema);
     use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
     use crate::config::pipeline_node::TimeWindowSpec;
     use crate::executor::time_window::{
@@ -629,59 +684,6 @@ fn run_time_windowed_aggregate(
                 .filter_map(|s| running.get(s.as_str()).copied())
                 .min()
         };
-
-    // Factory: each per-window aggregator is a fresh `AggregateStream`
-    // sharing the compiled CXL, the output schema, and the spill
-    // schema. Building a new `ProgramEvaluator` per window is cheap —
-    // the heavy CXL pipeline lives behind `Arc<TypedProgram>` inside
-    // `compiled_transforms`.
-    //
-    // Returns the registered `ConsumerId` alongside the stream so each
-    // per-window aggregator can unregister its wrapper once that window
-    // is finalized. A time-windowed aggregate fans out into one
-    // `AggregateStream` (and one registered consumer) per live window;
-    // leaving them registered past finalize would keep every finalized
-    // window's bytes in `sum_consumer_usage` for the rest of the run,
-    // inflating the reported peak well beyond the largest window that
-    // was ever concurrently live.
-    let make_stream = |ctx: &ExecutorContext<'_>| -> Result<
-        (AggregateStream, crate::pipeline::memory::ConsumerId),
-        PipelineError,
-    > {
-        let evaluator = match transform_idx {
-            Some(idx) => ProgramEvaluator::with_max_expansion(
-                Arc::clone(&ctx.compiled_transforms[idx].typed),
-                ctx.compiled_transforms[idx].has_distinct(),
-                ctx.compiled_transforms[idx].max_expansion,
-            ),
-            None => {
-                return Err(PipelineError::Internal {
-                    op: "time-windowed-aggregation",
-                    node: name.to_string(),
-                    detail: "no compiled transform found for time-windowed aggregate node"
-                        .to_string(),
-                });
-            }
-        };
-        let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-            crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
-        ));
-        let stream = AggregateStream::for_node(
-            strategy,
-            crate::aggregation::AggregatorConfig {
-                compiled: Arc::clone(compiled),
-                evaluator,
-                output_schema: Arc::clone(&output_schema),
-                spill_schema: Arc::clone(&spill_schema),
-                memory_budget: mem_limit,
-                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
-                transform_name: name.to_string(),
-                consumer_handle: agg_consumer_handle,
-            },
-        )?;
-        Ok((stream, agg_consumer_id))
-    };
 
     let mut out_rows: Vec<AggSortRow> = Vec::new();
     // Per-(group_by) key extraction for session bucketing: mirrors
@@ -765,12 +767,11 @@ fn run_time_windowed_aggregate(
                         .or_insert(t);
                     add_to_window(
                         ctx,
-                        name,
+                        win_ctx,
                         record,
                         *row_num,
                         w.start,
                         &mut per_window,
-                        &make_stream,
                         &mut out_rows,
                     )?;
                 }
@@ -819,12 +820,11 @@ fn run_time_windowed_aggregate(
                         }
                         add_to_window(
                             ctx,
-                            name,
+                            win_ctx,
                             record,
                             *row_num,
                             w.start,
                             &mut per_window,
-                            &make_stream,
                             &mut out_rows,
                         )?;
                         routed_to_any = true;
@@ -945,23 +945,18 @@ fn run_time_windowed_aggregate(
                     let (stream, _consumer_id) = match entry {
                         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            let fresh = make_stream(ctx)?;
+                            let fresh = win_ctx.make_stream(ctx)?;
                             v.insert(fresh)
                         }
                     };
                     let source_file_arc = source_file_arc_of(rec);
                     let source_name_arc = source_name_arc_of(rec);
-                    let eval_ctx = EvalContext {
-                        stable: ctx.stable,
-                        source_file: &source_file_arc,
-                        source_row: *rn,
-                        source_path: &source_file_arc,
-                        source_count: ctx.source_count_by_name(&source_name_arc),
-                        source_batch: ctx.source_batch_arc,
-                        ingestion_timestamp: ctx.source_ingestion_timestamp,
-                        source_name: &source_name_arc,
-                        doc_ctx: rec.doc_ctx(),
-                    };
+                    let eval_ctx = ctx.eval_ctx_for_record(
+                        &source_file_arc,
+                        &source_name_arc,
+                        *rn,
+                        rec.doc_ctx(),
+                    );
                     let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
                     if add_result.is_ok() {
                         advance_cursor(ctx, &source_name_arc, *rn);
@@ -988,17 +983,7 @@ fn run_time_windowed_aggregate(
                 let kb: Vec<String> = b.0.0.iter().map(|k| format!("{k:?}")).collect();
                 ka.cmp(&kb).then(a.0.1.cmp(&b.0.1))
             });
-            let finalize_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &MERGED_SOURCE_FILE,
-                source_row: 0,
-                source_path: &MERGED_SOURCE_FILE,
-                source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &MERGED_SOURCE_NAME,
-                doc_ctx: clinker_record::synthetic_document_context_ref(),
-            };
+            let finalize_ctx = ctx.merged_eval_ctx();
             for (_, (stream, consumer_id)) in entries {
                 // Finalize consumes this session's stream; unregister
                 // its wrapper unconditionally afterward so the session's
@@ -1044,10 +1029,9 @@ fn run_time_windowed_aggregate(
 /// Route a per-window add for tumbling/hopping. Wraps
 /// `AggregateStream::add_record` with the existing per-record DLQ /
 /// failfast policy.
-#[allow(clippy::too_many_arguments)]
-fn add_to_window<F>(
+fn add_to_window(
     ctx: &mut ExecutorContext<'_>,
-    name: &str,
+    win_ctx: &WindowedAggContext<'_>,
     record: &Record,
     row_num: u64,
     window_start: i64,
@@ -1058,37 +1042,20 @@ fn add_to_window<F>(
             crate::pipeline::memory::ConsumerId,
         ),
     >,
-    make_stream: &F,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
-) -> Result<(), PipelineError>
-where
-    F: Fn(
-        &ExecutorContext<'_>,
-    ) -> Result<
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-        PipelineError,
-    >,
-{
+) -> Result<(), PipelineError> {
     let source_file_arc = source_file_arc_of(record);
     let source_name_arc = source_name_arc_of(record);
-    let eval_ctx = EvalContext {
-        stable: ctx.stable,
-        source_file: &source_file_arc,
-        source_row: row_num,
-        source_path: &source_file_arc,
-        source_count: ctx.source_count_by_name(&source_name_arc),
-        source_batch: ctx.source_batch_arc,
-        ingestion_timestamp: ctx.source_ingestion_timestamp,
-        source_name: &source_name_arc,
-        doc_ctx: record.doc_ctx(),
-    };
+    let eval_ctx = ctx.eval_ctx_for_record(
+        &source_file_arc,
+        &source_name_arc,
+        row_num,
+        record.doc_ctx(),
+    );
     let (stream, _consumer_id) = match per_window.entry(window_start) {
         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
-            let fresh = make_stream(ctx)?;
+            let fresh = win_ctx.make_stream(ctx)?;
             v.insert(fresh)
         }
     };
@@ -1098,7 +1065,7 @@ where
         return Ok(());
     }
     let e = add_result.err().unwrap();
-    handle_aggregate_add_error(ctx, name, record, row_num, e)
+    handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
 }
 
 /// Shared per-record `add_record` error handler for both
@@ -1174,17 +1141,7 @@ fn finalize_windows(
         ),
     )> = per_window.into_iter().collect();
     entries.sort_by_key(|(start, _)| *start);
-    let finalize_ctx = EvalContext {
-        stable: ctx.stable,
-        source_file: &MERGED_SOURCE_FILE,
-        source_row: 0,
-        source_path: &MERGED_SOURCE_FILE,
-        source_count: ctx.source_count_by_name(&MERGED_SOURCE_NAME),
-        source_batch: ctx.source_batch_arc,
-        ingestion_timestamp: ctx.source_ingestion_timestamp,
-        source_name: &MERGED_SOURCE_NAME,
-        doc_ctx: clinker_record::synthetic_document_context_ref(),
-    };
+    let finalize_ctx = ctx.merged_eval_ctx();
     for (_, (stream, consumer_id)) in entries {
         // Finalize consumes this window's stream; unregister its
         // wrapper unconditionally afterward so the window's bytes leave

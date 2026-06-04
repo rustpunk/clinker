@@ -269,6 +269,25 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    /// Re-derive this context with a different `$source.row`, keeping every
+    /// other provenance field (including the envelope `doc_ctx`) borrowed
+    /// from `self`. Lets a reload/spill loop that re-emits rows under a
+    /// fresh row sequence reuse the surrounding finalize context without
+    /// re-spelling the nine-field literal per row.
+    pub fn with_row(&self, source_row: u64) -> EvalContext<'a> {
+        EvalContext {
+            stable: self.stable,
+            source_file: self.source_file,
+            source_row,
+            source_path: self.source_path,
+            source_count: self.source_count,
+            source_batch: self.source_batch,
+            ingestion_timestamp: self.ingestion_timestamp,
+            source_name: self.source_name,
+            doc_ctx: self.doc_ctx,
+        }
+    }
+
     /// Test helper: borrow a stable context to get a default view with
     /// `source_file = "test.csv"` and `source_row = 1`. Used by the ~30
     /// `EvalContext::test_default()` call sites in workspace tests.

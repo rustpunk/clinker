@@ -80,7 +80,7 @@ pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
 /// Read the per-record Source-node name from the record's
 /// [`FieldMetadata::SourceName`] engine-stamped column. Returns `None`
 /// when the column is absent (synthetic emits) or non-String.
-pub(crate) fn source_name_of(record: &Record) -> Option<&str> {
+fn source_name_of(record: &Record) -> Option<&str> {
     let schema = record.schema();
     for idx in 0..schema.column_count() {
         if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceName))
@@ -172,10 +172,7 @@ pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<st
 /// fraction exceeds it. Per-source thresholds win against pipeline-wide
 /// when set. Both branches honor `min_records` to avoid 1/1 = 100%
 /// false positives on the very first failure.
-pub(crate) fn check_dlq_rate(
-    ctx: &ExecutorContext<'_>,
-    source: &Arc<str>,
-) -> Result<(), PipelineError> {
+fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
     let Some(dlq) = ctx.config.error_handling.dlq.as_ref() else {
         return Ok(());
     };
@@ -406,6 +403,20 @@ pub(crate) fn dispatch_transform_eval_error(
             triggering_value,
         },
     )
+}
+
+/// Record a sink write/flush failure in `output_errors` instead of
+/// short-circuiting, so sibling writers in the same Output still get
+/// their chance to flush or report (the DataFusion collection-pattern,
+/// PR #14439). The single conversion point for every writer error path —
+/// both the single-writer arms (which push into `ctx.output_errors`) and
+/// `emit_fan_out` (which threads its own `output_errors` vec) — so a
+/// future change to how write errors are attributed lands here once.
+pub(crate) fn push_write_error(
+    output_errors: &mut Vec<PipelineError>,
+    e: impl Into<PipelineError>,
+) {
+    output_errors.push(e.into());
 }
 
 use crate::executor::node_buffer::NodeBuffer;
@@ -865,7 +876,7 @@ pub(crate) struct ExecutorContext<'a> {
 /// that crossed from a non-deferred upstream into a deferred-region
 /// consumer along that edge. The body id is `None` for top-level edges;
 /// each composition body has its own EdgeIndex namespace.
-pub(crate) type RegionInputBuffers = HashMap<
+type RegionInputBuffers = HashMap<
     (
         Option<crate::plan::CompositionBodyId>,
         petgraph::graph::EdgeIndex,
@@ -911,7 +922,7 @@ pub(crate) struct RetainedAggregatorState {
     pub(crate) consumer_id: crate::pipeline::memory::ConsumerId,
 }
 
-impl ExecutorContext<'_> {
+impl<'a> ExecutorContext<'a> {
     /// Borrow the pipeline-scoped TempDir handle. Held alongside
     /// the cached `spill_root_path` so every operator that prefers
     /// the owned form (e.g. `SortBuffer::new` taking
@@ -1062,6 +1073,64 @@ impl ExecutorContext<'_> {
                 .sum();
             self.source_count_per_source
                 .insert(Arc::clone(merged_key), Some(total));
+        }
+    }
+
+    /// Build the per-record [`EvalContext`] view from a record's
+    /// engine-stamped `source_file` / `source_name` and its envelope
+    /// `doc_ctx`, at `row_num`. The single construction point for every
+    /// record-driven dispatch arm (Transform, Route, hash probe,
+    /// per-record aggregate add). The returned view borrows only the
+    /// caller's argument references plus the context's `'a`-lifetime
+    /// stable / batch handles — it does NOT hold a `&self` borrow, so the
+    /// caller may mutate other `ExecutorContext` fields (timers, counters,
+    /// cursors) while the view is live.
+    pub(crate) fn eval_ctx_for_record<'r>(
+        &self,
+        source_file: &'r Arc<str>,
+        source_name: &'r Arc<str>,
+        row_num: u64,
+        doc_ctx: &'r Arc<clinker_record::DocumentContext>,
+    ) -> EvalContext<'r>
+    where
+        'a: 'r,
+    {
+        EvalContext {
+            stable: self.stable,
+            source_file,
+            source_row: row_num,
+            source_path: source_file,
+            source_count: self.source_count_by_name(source_name),
+            source_batch: self.source_batch_arc,
+            ingestion_timestamp: self.source_ingestion_timestamp,
+            source_name,
+            doc_ctx,
+        }
+    }
+
+    /// Build the synthetic-provenance [`EvalContext`] for a finalize /
+    /// post-blocking emit that has no per-record source attribution. Uses
+    /// the [`MERGED_SOURCE_FILE`] / [`MERGED_SOURCE_NAME`] sentinels,
+    /// row 0, the finalized `$source.count` total, and the synthetic
+    /// (empty-section) envelope so `$doc.*` resolves to `Null`. The single
+    /// construction point for every blocking-operator finalize arm
+    /// (aggregate / windowed-aggregate finalize, Combine kernel contexts).
+    /// The returned view borrows only `'a`-lifetime and `'static` data, so
+    /// it does not hold a `&self` borrow.
+    pub(crate) fn merged_eval_ctx<'r>(&self) -> EvalContext<'r>
+    where
+        'a: 'r,
+    {
+        EvalContext {
+            stable: self.stable,
+            source_file: &MERGED_SOURCE_FILE,
+            source_row: 0,
+            source_path: &MERGED_SOURCE_FILE,
+            source_count: self.source_count_by_name(&MERGED_SOURCE_NAME),
+            source_batch: self.source_batch_arc,
+            ingestion_timestamp: self.source_ingestion_timestamp,
+            source_name: &MERGED_SOURCE_NAME,
+            doc_ctx: clinker_record::synthetic_document_context_ref(),
         }
     }
 }

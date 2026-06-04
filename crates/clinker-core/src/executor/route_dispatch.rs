@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use clinker_record::{Record, Value};
-use cxl::eval::EvalContext;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
@@ -200,17 +199,8 @@ pub(crate) fn dispatch_route(
             }
             let source_file_arc = source_file_arc_of(&record);
             let source_name_arc = source_name_arc_of(&record);
-            let eval_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &source_file_arc,
-                source_row: rn,
-                source_path: &source_file_arc,
-                source_count: ctx.source_count_by_name(&source_name_arc),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &source_name_arc,
-                doc_ctx: record.doc_ctx(),
-            };
+            let eval_ctx =
+                ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
 
             let route_result = {
                 let _guard = ctx.route_timer.guard();
