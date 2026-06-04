@@ -1,7 +1,11 @@
 pub mod compile_context;
 pub mod composition;
+pub mod format;
 pub mod node_header;
 pub mod pipeline_node;
+pub mod route;
+pub mod sort;
+pub mod utils;
 
 pub use crate::plan::index::AnalyticWindowSpec;
 pub use compile_context::CompileContext;
@@ -11,17 +15,21 @@ pub use composition::{
     ResolvedValue, Resource, ResourceDecl, ResourceKind, ResourceName, ScopedVarsSchema, SourceMap,
     SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
 };
+pub use format::*;
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
     AggregateBody, MergeBody, OutputBody, Phase, PipelineNode, RouteBody, SourceBody,
     TransformBody, VarScope,
 };
+pub use route::*;
+pub use sort::*;
+pub use utils::*;
 
 use crate::yaml::Spanned;
-use clinker_record::schema_def::{FieldDef, LineSeparator, SchemaDefinition};
+use clinker_record::schema_def::{FieldDef, LineSeparator};
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -451,60 +459,6 @@ pub struct WatermarkConfig {
     pub delay: Option<std::time::Duration>,
 }
 
-/// Parse a duration string with an `ms` / `s` / `m` / `h` / `d` unit
-/// suffix into a [`std::time::Duration`].
-///
-/// `ms` is tested before the single-char `s` suffix so `"500ms"`
-/// doesn't read as 500 seconds with a stray `"m"`. Shared by
-/// [`WatermarkConfig::idle_timeout`], [`WatermarkConfig::delay`], and
-/// duration fields on `TimeWindowSpec` so YAML duration parsing is a
-/// single uniform contract across the schema.
-pub(crate) fn parse_duration_with_suffix(s: &str) -> Option<std::time::Duration> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_suffix("ms") {
-        let n: u64 = rest.trim().parse().ok()?;
-        return Some(std::time::Duration::from_millis(n));
-    }
-    let (num_str, unit) = s.split_at(s.len().checked_sub(1)?);
-    let n: u64 = num_str.trim().parse().ok()?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(60 * 60)?,
-        "d" => n.checked_mul(60 * 60 * 24)?,
-        _ => return None,
-    };
-    Some(std::time::Duration::from_secs(secs))
-}
-
-fn deserialize_optional_duration<'de, D: Deserializer<'de>>(
-    d: D,
-) -> Result<Option<std::time::Duration>, D::Error> {
-    let raw: Option<String> = Option::deserialize(d)?;
-    raw.map(|s| {
-        parse_duration_with_suffix(&s).ok_or_else(|| {
-            de::Error::custom(format!(
-                "expected duration like \"500ms\"/\"30s\"/\"5m\"/\"2h\"/\"3d\"; got {s:?}"
-            ))
-        })
-    })
-    .transpose()
-}
-
-fn serialize_optional_duration<S: serde::Serializer>(
-    v: &Option<std::time::Duration>,
-    s: S,
-) -> Result<S::Ok, S::Error> {
-    match v {
-        Some(d) => {
-            // Round-trip as milliseconds — the most precise unit the
-            // parser accepts.
-            s.serialize_str(&format!("{}ms", d.as_millis()))
-        }
-        None => s.serialize_none(),
-    }
-}
-
 /// File-listing controls — file-set ordering, take-N, recursion,
 /// no-match policy. Nested under `files:` to avoid colliding with the
 /// record-level `sort_order:` field at the SourceConfig top level.
@@ -568,121 +522,6 @@ pub enum NoMatchPolicy {
     Warn,
     /// Silently produce an empty record stream.
     Skip,
-}
-
-/// Time bound for `modified_after` / `modified_before`. Resolves to a
-/// concrete `SystemTime` at parse time. Two YAML forms:
-///
-/// - **Relative duration**: `"5m"`, `"2h"`, `"3d"`, `"30s"` — interpreted
-///   relative to the time of deserialization (effectively "now").
-/// - **Absolute timestamp**: any RFC3339 string (`"2026-05-01T00:00:00Z"`).
-#[derive(Debug, Clone, Copy)]
-pub struct TimeBound(pub std::time::SystemTime);
-
-impl TimeBound {
-    /// Parse `"<n><unit>"` with unit ∈ {s, m, h, d}. Returns `None` if the
-    /// string is not in this form.
-    fn parse_duration(s: &str) -> Option<std::time::Duration> {
-        let (num_str, unit) = s.split_at(s.len().checked_sub(1)?);
-        let n: u64 = num_str.parse().ok()?;
-        let secs = match unit {
-            "s" => n,
-            "m" => n.checked_mul(60)?,
-            "h" => n.checked_mul(60 * 60)?,
-            "d" => n.checked_mul(60 * 60 * 24)?,
-            _ => return None,
-        };
-        Some(std::time::Duration::from_secs(secs))
-    }
-}
-
-impl Serialize for TimeBound {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // Round-trip as RFC3339 — the relative form is parse-time only.
-        let dt: chrono::DateTime<chrono::Utc> = self.0.into();
-        s.serialize_str(&dt.to_rfc3339())
-    }
-}
-
-impl<'de> Deserialize<'de> for TimeBound {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        if let Some(dur) = Self::parse_duration(&raw) {
-            // Relative-to-now: clip rather than panic if the duration
-            // somehow underflows (it won't for any reasonable value).
-            let when = std::time::SystemTime::now()
-                .checked_sub(dur)
-                .unwrap_or(std::time::UNIX_EPOCH);
-            return Ok(TimeBound(when));
-        }
-        let dt = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|e| {
-            de::Error::custom(format!(
-                "expected duration like \"5m\"/\"2h\"/\"3d\" or RFC3339 timestamp; \
-                 got {raw:?}: {e}"
-            ))
-        })?;
-        Ok(TimeBound(dt.with_timezone(&chrono::Utc).into()))
-    }
-}
-
-/// Byte size for `min_size` / `max_size`. Decimal units (1KB = 1000 bytes,
-/// 1MB = 1_000_000) — matches the convention used by `du`, `df`, AWS CLI,
-/// and most file-tooling. Plain `"1024"` (no unit) is interpreted as bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteSize(pub u64);
-
-impl ByteSize {
-    fn parse(s: &str) -> Option<u64> {
-        let s = s.trim();
-        let (num_part, mult) = if let Some(rest) = s.strip_suffix("GB") {
-            (rest, 1_000_000_000)
-        } else if let Some(rest) = s.strip_suffix("MB") {
-            (rest, 1_000_000)
-        } else if let Some(rest) = s.strip_suffix("KB") {
-            (rest, 1_000)
-        } else if let Some(rest) = s.strip_suffix('B') {
-            (rest, 1)
-        } else {
-            (s, 1)
-        };
-        let n: u64 = num_part.trim().parse().ok()?;
-        n.checked_mul(mult)
-    }
-}
-
-impl Serialize for ByteSize {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}B", self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for ByteSize {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Accept either an integer (bytes) or a string with a unit suffix.
-        struct V;
-        impl<'de> de::Visitor<'de> for V {
-            type Value = ByteSize;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a byte size as integer or string like \"1KB\"/\"100MB\"")
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ByteSize, E> {
-                Ok(ByteSize(v))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ByteSize, E> {
-                u64::try_from(v)
-                    .map(ByteSize)
-                    .map_err(|_| de::Error::custom("byte size cannot be negative"))
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<ByteSize, E> {
-                ByteSize::parse(v).map(ByteSize).ok_or_else(|| {
-                    de::Error::custom(format!(
-                        "expected byte size like \"100\"/\"1KB\"/\"5MB\"/\"2GB\"; got {v:?}"
-                    ))
-                })
-            }
-        }
-        d.deserialize_any(V)
-    }
 }
 
 /// Transport selecting where a source's records originate, layered ABOVE
@@ -884,50 +723,6 @@ fn default_rest_timeout_secs() -> u64 {
     30
 }
 
-/// Adjacently tagged format enum for inputs.
-/// `type` selects the format, `options` provides format-specific settings.
-/// `options` is optional — `type: csv` with no `options:` key gives `Csv(None)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "options", rename_all = "snake_case")]
-pub enum InputFormat {
-    Csv(Option<CsvInputOptions>),
-    Json(Option<JsonInputOptions>),
-    Xml(Option<XmlInputOptions>),
-    FixedWidth(Option<FixedWidthInputOptions>),
-}
-
-impl InputFormat {
-    /// Short lowercase format name for display.
-    pub fn format_name(&self) -> &'static str {
-        match self {
-            InputFormat::Csv(_) => "csv",
-            InputFormat::Json(_) => "json",
-            InputFormat::Xml(_) => "xml",
-            InputFormat::FixedWidth(_) => "fixed_width",
-        }
-    }
-
-    /// Whether this format has a header row concept (CSV only).
-    pub fn has_header(&self) -> Option<bool> {
-        match self {
-            InputFormat::Csv(Some(opts)) => opts.has_header,
-            _ => None,
-        }
-    }
-}
-
-impl OutputFormat {
-    /// Short lowercase format name for display.
-    pub fn format_name(&self) -> &'static str {
-        match self {
-            OutputFormat::Csv(_) => "csv",
-            OutputFormat::Json(_) => "json",
-            OutputFormat::Xml(_) => "xml",
-            OutputFormat::FixedWidth(_) => "fixed_width",
-        }
-    }
-}
-
 /// CSV-specific input options.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1126,14 +921,6 @@ impl IfExistsPolicy {
     }
 }
 
-fn is_zero_u8(n: &u8) -> bool {
-    *n == 0
-}
-
-fn is_false_bool(b: &bool) -> bool {
-    !*b
-}
-
 /// Output file splitting configuration.
 ///
 /// When `group_key` is set, files are split only at key-group boundaries
@@ -1166,14 +953,6 @@ fn default_split_naming() -> String {
     "{stem}_{seq:04}.{ext}".to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_include_unmapped() -> bool {
-    true
-}
-
 /// Policy when a single key group exceeds split file limits.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1185,16 +964,6 @@ pub enum SplitOversizeGroupPolicy {
     Error,
     /// Silently allow.
     Allow,
-}
-
-/// Adjacently tagged format enum for outputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "options", rename_all = "snake_case")]
-pub enum OutputFormat {
-    Csv(Option<CsvOutputOptions>),
-    Json(Option<JsonOutputOptions>),
-    Xml(Option<XmlOutputOptions>),
-    FixedWidth(Option<FixedWidthOutputOptions>),
 }
 
 /// CSV-specific output options.
@@ -1248,275 +1017,6 @@ pub struct FixedWidthInputOptions {
 pub struct FixedWidthOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_separator: Option<LineSeparator>,
-}
-
-/// Sort field specification for output and window partition ordering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SortField {
-    pub field: String,
-    #[serde(default = "default_sort_order")]
-    pub order: SortOrder,
-    /// Null handling during sort. None for output sorting; Some(Last) default for windows.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub null_order: Option<NullOrder>,
-}
-
-/// Sort direction.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SortOrder {
-    Asc,
-    Desc,
-}
-
-/// Accepts either a plain string shorthand or a full SortField object in YAML.
-///
-/// Shorthand: `"field_name"` expands to `SortField { field: "field_name", order: Asc, null_order: None }`.
-/// Full: `{ field: "name", order: desc, null_order: first }` deserializes as SortField.
-///
-/// Custom Deserialize: visit_str -> Short, visit_map -> Full.
-/// This gives specific error messages instead of serde(untagged)'s generic "no variant matched".
-#[derive(Debug, Clone, Serialize)]
-pub enum SortFieldSpec {
-    Short(String),
-    Full(SortField),
-}
-
-impl<'de> Deserialize<'de> for SortFieldSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct SortFieldSpecVisitor;
-
-        impl<'de> Visitor<'de> for SortFieldSpecVisitor {
-            type Value = SortFieldSpec;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a field name (string) or a sort field object (map with 'field', 'order', 'null_order')")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(SortFieldSpec::Short(v.to_owned()))
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let sf = SortField::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(SortFieldSpec::Full(sf))
-            }
-        }
-
-        deserializer.deserialize_any(SortFieldSpecVisitor)
-    }
-}
-
-impl SortFieldSpec {
-    /// Resolve to a concrete SortField.
-    pub fn into_sort_field(self) -> SortField {
-        match self {
-            SortFieldSpec::Short(name) => SortField {
-                field: name,
-                order: SortOrder::Asc,
-                null_order: None,
-            },
-            SortFieldSpec::Full(sf) => sf,
-        }
-    }
-}
-
-fn default_sort_order() -> SortOrder {
-    SortOrder::Asc
-}
-
-/// Null handling in sort operations.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum NullOrder {
-    /// Nulls sort before all non-null values.
-    First,
-    /// Nulls sort after all non-null values (SQL convention default).
-    #[default]
-    Last,
-    /// Remove records with null sort keys from the partition.
-    Drop,
-}
-
-/// Supported format types.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FormatKind {
-    Csv,
-    Json,
-    Xml,
-    #[serde(rename = "fixed_width")]
-    FixedWidth,
-}
-
-/// Schema source -- file path or inline definition.
-/// Custom Deserialize: YAML string -> FilePath, YAML map -> Inline(SchemaDefinition).
-#[derive(Debug, Clone, Serialize)]
-#[allow(clippy::large_enum_variant)]
-pub enum SchemaSource {
-    FilePath(String),
-    Inline(SchemaDefinition),
-}
-
-impl<'de> Deserialize<'de> for SchemaSource {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct SchemaSourceVisitor;
-
-        impl<'de> Visitor<'de> for SchemaSourceVisitor {
-            type Value = SchemaSource;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter
-                    .write_str("a schema file path (string) or an inline schema definition (map)")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(SchemaSource::FilePath(v.to_owned()))
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let def =
-                    SchemaDefinition::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(SchemaSource::Inline(def))
-            }
-        }
-
-        deserializer.deserialize_any(SchemaSourceVisitor)
-    }
-}
-
-/// Routing mode for record dispatch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RouteMode {
-    /// First-match: evaluate predicates in order, first true wins.
-    #[default]
-    Exclusive,
-    /// All-match: evaluate all predicates, record sent to every matching branch.
-    Inclusive,
-}
-
-/// Merge ordering discipline across declared inputs.
-///
-/// `Concat` is the deterministic default: each predecessor's records
-/// drain in declaration order, in their per-source FIFO order. Output
-/// is reproducible run-to-run.
-///
-/// `Interleave` reads concurrently from every upstream channel,
-/// emitting records as they arrive. Per-source FIFO is preserved, but
-/// cross-source order follows wall-clock arrival and is therefore
-/// non-deterministic unless `interleave_seed` is set on
-/// [`MergeBody`](crate::config::pipeline_node::MergeBody).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeMode {
-    /// Drain each predecessor sequentially in declaration order.
-    #[default]
-    Concat,
-    /// Drain predecessors concurrently; first-ready-wins.
-    Interleave,
-}
-
-/// A named routing branch with a CXL boolean condition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteBranch {
-    pub name: String,
-    pub condition: String,
-}
-
-/// Route configuration for multi-output record dispatch.
-///
-/// Conditions are CXL boolean expressions evaluated per record.
-/// Mandatory `default` prevents silent record drops.
-#[derive(Debug, Clone, Serialize)]
-pub struct RouteConfig {
-    #[serde(default)]
-    pub mode: RouteMode,
-    pub branches: Vec<RouteBranch>,
-    pub default: String,
-}
-
-impl<'de> serde::Deserialize<'de> for RouteConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            #[serde(default)]
-            mode: RouteMode,
-            branches: Vec<RouteBranch>,
-            default: Option<String>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-
-        // Mandatory default
-        let default = raw
-            .default
-            .ok_or_else(|| serde::de::Error::custom("route must have a 'default' output name"))?;
-
-        // Non-empty branches
-        if raw.branches.is_empty() {
-            return Err(serde::de::Error::custom(
-                "route must have at least one branch",
-            ));
-        }
-
-        // Max 256 outputs
-        if raw.branches.len() > 256 {
-            return Err(serde::de::Error::custom(format!(
-                "route has {} branches, maximum is 256",
-                raw.branches.len()
-            )));
-        }
-
-        // Unique branch names
-        let mut seen = std::collections::HashSet::new();
-        for branch in &raw.branches {
-            if !seen.insert(&branch.name) {
-                return Err(serde::de::Error::custom(format!(
-                    "duplicate route branch name '{}'",
-                    branch.name
-                )));
-            }
-        }
-
-        // Default must not collide with a branch name
-        if seen.contains(&default) {
-            return Err(serde::de::Error::custom(format!(
-                "route default '{}' collides with a branch name",
-                default
-            )));
-        }
-
-        Ok(RouteConfig {
-            mode: raw.mode,
-            branches: raw.branches,
-            default,
-        })
-    }
 }
 
 /// Input wiring for a transform — specifies which upstream transform(s) feed records.
