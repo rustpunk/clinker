@@ -1,5 +1,0 @@
----
-source: crates/clinker-core/tests/state_node_diagnostics.rs
-expression: render_diags(&diags)
----
-E200: CXL name resolution failed in "read_var": [E173] composition body references parent-scope variable '$pipeline.cutoff' which is not opted into the body's `_compose.scoped_vars.pipeline` schema

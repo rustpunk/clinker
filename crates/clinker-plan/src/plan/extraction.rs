@@ -621,7 +621,7 @@ mod tests {
     /// stay in one place rather than being duplicated per crate.
     fn load_fixture_config(fixture_name: &str) -> PipelineConfig {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../clinker-core/tests/fixtures");
+            .join("../clinker-exec/tests/fixtures");
         let yaml_path = root.join(fixture_name);
         let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
         crate::yaml::from_str(&yaml).expect("parse fixture")

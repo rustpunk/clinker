@@ -16,7 +16,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("clinker-core/tests/fixtures")
+        .join("clinker-exec/tests/fixtures")
 }
 
 /// Compile the var-overlay fixture pipeline into (config, plan).

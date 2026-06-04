@@ -10,7 +10,7 @@ use std::path::Path;
 
 use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
-use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::pipeline_node::{PipelineNode, SourceBody};
 use clinker_plan::config::{CompileContext, InputFormat, load_config};
 use clinker_plan::error::PipelineError;
@@ -51,7 +51,7 @@ impl BenchPipelineRunner {
             .count();
 
         // Build a reader for each source node.
-        let mut readers: clinker_core::executor::SourceReaders = HashMap::new();
+        let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
 
         for spanned in &config.nodes {
             if let PipelineNode::Source {
@@ -85,7 +85,7 @@ impl BenchPipelineRunner {
                 let file = std::fs::File::open(&data_path).expect("cached data file must exist");
                 readers.insert(
                     body.source.name.clone(),
-                    clinker_core::executor::single_file_reader(
+                    clinker_exec::executor::single_file_reader(
                         data_path.clone(),
                         Box::new(BufReader::new(file)),
                     ),

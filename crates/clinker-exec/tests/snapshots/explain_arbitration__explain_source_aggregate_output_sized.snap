@@ -1,0 +1,71 @@
+---
+source: crates/clinker-exec/tests/explain_arbitration.rs
+expression: text
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 0
+Output projections: 1
+DAG nodes: 3
+arbitration: BackPressurePreferred -> Priority
+
+Source DAG:
+  Tier 0: orders
+
+=== Physical Properties ===
+
+source.orders:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=1K, predicted_freed=0B, predicted_subtree_reclaim=1K
+
+aggregation.dept_totals:
+  ordering: <none>
+  ordering_provenance: DestroyedByHashAggregate { at_node: "dept_totals", confidence: Proven }
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K, predicted_subtree_reclaim=1K
+
+output.out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=1K, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+=== Buffer Edges ===
+
+edge source.orders -> aggregation.dept_totals:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K (producer: source)
+
+edge aggregation.dept_totals -> output.out:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K (producer: aggregation)
+
+=== CXL Expressions ===
+
+Transform 'dept_totals':
+  emit department = department
+  emit total = sum(amount)
+
+=== Type Annotations ===
+
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] orders (line:5)
+  ◇ [aggregation:hash] dept_totals (line:15)
+  │ [output] out (line:24)

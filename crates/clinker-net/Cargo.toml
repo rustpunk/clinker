@@ -6,7 +6,7 @@ license.workspace = true
 description = "Network finite-pull Source readers (REST, SQL cursors) for Clinker"
 
 [dependencies]
-clinker-core = { workspace = true }
+clinker-exec = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-format = { workspace = true }
 clinker-record = { workspace = true }
@@ -16,5 +16,5 @@ tracing = { workspace = true }
 ureq = { workspace = true }
 
 [dev-dependencies]
-clinker-core = { workspace = true, features = ["test-utils"] }
+clinker-exec = { workspace = true, features = ["test-utils"] }
 clinker-bench-support = { workspace = true }

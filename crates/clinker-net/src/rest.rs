@@ -21,9 +21,9 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clinker_core::pipeline::schema_coerce::CoercingReader;
-use clinker_core::pipeline::shutdown::ShutdownToken;
-use clinker_core::source::RecordSource;
+use clinker_exec::pipeline::schema_coerce::CoercingReader;
+use clinker_exec::pipeline::shutdown::ShutdownToken;
+use clinker_exec::source::RecordSource;
 use clinker_format::traits::FormatReader;
 use clinker_format::{EnvelopeConfig, FormatError};
 use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};

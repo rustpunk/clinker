@@ -1,0 +1,5 @@
+---
+source: crates/clinker-exec/tests/state_node_diagnostics.rs
+expression: render_diags(&diags)
+---
+E174: composition "declares_type_mismatch": scoped_vars schema declares $pipeline.cutoff as String, but the parent pipeline declares it as Int — types must match

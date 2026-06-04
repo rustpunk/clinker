@@ -1,0 +1,5 @@
+---
+source: crates/clinker-exec/tests/state_node_diagnostics.rs
+expression: render_diags(&diags)
+---
+E171: node "sibling_reader" reads $pipeline.x but is not a DAG descendant of writer Transform "writer" — the read would observe the declaration default, not the written value (move the reader downstream of the writer or remove the read)

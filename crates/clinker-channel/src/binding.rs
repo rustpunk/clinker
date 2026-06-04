@@ -303,7 +303,7 @@ const WORKSPACE_CHANNEL_MAX_DEPTH: usize = 16;
 /// Scan a workspace root for `.channel.yaml` files and parse each into a
 /// [`ChannelBinding`].
 ///
-/// Companion to `scan_workspace_signatures` in clinker-core — uses the
+/// Companion to `scan_workspace_signatures` in clinker-plan — uses the
 /// same walkdir + budget pattern. Symlinks rejected, depth bounded.
 pub fn scan_workspace_channels(
     workspace_root: &Path,

@@ -3,8 +3,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use clinker_core::executor::PipelineExecutor;
-use clinker_core::metrics::{self, ExecutionMetrics};
+use clinker_exec::executor::PipelineExecutor;
+use clinker_exec::metrics::{self, ExecutionMetrics};
 use clinker_plan::config::utils::parse_memory_limit_bytes;
 use clinker_plan::error::PipelineError;
 
@@ -295,7 +295,7 @@ fn main() -> ExitCode {
             // Install the process-wide SIGINT/SIGTERM handler before the
             // run starts so an interrupt during a long pipeline trips the
             // run's shutdown token. Idempotent — the first call wins.
-            if let Err(e) = clinker_core::pipeline::shutdown::install_signal_handler() {
+            if let Err(e) = clinker_exec::pipeline::shutdown::install_signal_handler() {
                 eprintln!("clinker: failed to install signal handler: {e}");
             }
 
@@ -723,7 +723,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // discovery layer; every matched file becomes one `FileSlot` and
     // the executor's `MultiFileFormatReader` concatenates them into
     // a single record stream stamped with `$source.file` per record.
-    let mut readers: clinker_core::executor::SourceReaders = std::collections::HashMap::new();
+    let mut readers: clinker_exec::executor::SourceReaders = std::collections::HashMap::new();
     let workspace_root = args
         .config
         .parent()
@@ -739,9 +739,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let source = &body.source;
         match &source.transport {
             clinker_plan::config::SourceTransport::File => {
-                let outcome = clinker_core::source::discovery::discover(source, &workspace_root)
+                let outcome = clinker_exec::source::discovery::discover(source, &workspace_root)
                     .map_err(|e| {
-                        use clinker_core::source::discovery::DiscoveryError;
+                        use clinker_exec::source::discovery::DiscoveryError;
                         let code = match &e {
                             DiscoveryError::MultipleMatchers { .. } => "E210",
                             DiscoveryError::NoMatcher => "E211",
@@ -758,11 +758,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                             )),
                         )
                     })?;
-                let mut slots: Vec<clinker_core::source::multi_file::FileSlot> = Vec::new();
+                let mut slots: Vec<clinker_exec::source::multi_file::FileSlot> = Vec::new();
                 let mut paths: Vec<std::path::PathBuf> = Vec::new();
                 for f in outcome.files() {
                     let file = std::fs::File::open(&f.path)?;
-                    slots.push(clinker_core::source::multi_file::FileSlot::new(
+                    slots.push(clinker_exec::source::multi_file::FileSlot::new(
                         f.path.clone(),
                         Box::new(file),
                     ));
@@ -775,14 +775,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     // Stash a single empty reader so the executor's "missing
                     // reader" check passes. Records flow through as zero-row
                     // sources.
-                    slots.push(clinker_core::source::multi_file::FileSlot::new(
+                    slots.push(clinker_exec::source::multi_file::FileSlot::new(
                         "<empty>",
                         Box::new(std::io::empty()),
                     ));
                 }
                 readers.insert(
                     source.name.clone(),
-                    clinker_core::executor::SourceInput::Files(slots),
+                    clinker_exec::executor::SourceInput::Files(slots),
                 );
             }
             clinker_plan::config::SourceTransport::Rest(rest_cfg) => {
@@ -800,7 +800,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 source_files_by_name.insert(source.name.clone(), Vec::new());
                 readers.insert(
                     source.name.clone(),
-                    clinker_core::executor::SourceInput::Records(reader),
+                    clinker_exec::executor::SourceInput::Records(reader),
                 );
             }
         }
@@ -911,12 +911,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         } else {
                             format!("-{:0>width$}", k, width = unique_suffix_width as usize)
                         };
-                        clinker_core::output::open::append_suffix_before_ext(&bare, &suffix)
+                        clinker_exec::output::open::append_suffix_before_ext(&bare, &suffix)
                     }
                 })
             };
         let (final_path, reservation_file) =
-            clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
+            clinker_exec::output::open::open_output(output.if_exists, args.force, path_for_n)?;
         drop(reservation_file);
         let reservation = tempfile::TempPath::try_from_path(&final_path)?;
         let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -941,7 +941,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         });
     }
 
-    let registry = clinker_core::executor::WriterRegistry {
+    let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
     };
@@ -949,8 +949,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // with the process-wide signal-handler registry installed in `main`,
     // so a SIGINT/SIGTERM during the run trips it; the executor polls it
     // at operator chunk boundaries and unwinds gracefully.
-    let shutdown_token = clinker_core::pipeline::shutdown::ShutdownToken::new();
-    let run_params = clinker_core::executor::PipelineRunParams {
+    let shutdown_token = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+    let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
         pipeline_vars: channel_pipeline_vars,
@@ -1040,7 +1040,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     if !dlq_entries.is_empty()
         && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
     {
-        let buckets = clinker_core::dlq::partition_dlq_entries(dlq_entries, dlq_config);
+        let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
         if !buckets.is_empty() {
             // DLQ user-row columns come from the source's authored
             // `schema:` declaration, not from re-reading the input file.
@@ -1073,9 +1073,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 }
                 let dlq_temp = tempfile::NamedTempFile::new_in(&target_dir)?;
                 let dlq_temp_handle = dlq_temp.reopen()?;
-                let owned: Vec<clinker_core::executor::DlqEntry> =
+                let owned: Vec<clinker_exec::executor::DlqEntry> =
                     bucket_entries.iter().map(|e| (*e).clone()).collect();
-                clinker_core::dlq::write_dlq(
+                clinker_exec::dlq::write_dlq(
                     dlq_temp_handle,
                     &owned,
                     &input_schema,
@@ -1116,13 +1116,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let elapsed_ms = (report.finished_at - report.started_at)
             .num_milliseconds()
             .max(0) as u64;
-        let hash_full = clinker_core::output::sidecar::hash_to_hex(&pipeline_hash);
+        let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let hash_short = hash_full[..8.min(hash_full.len())].to_string();
         let target = resolved_output_paths
             .get(&output.name)
             .cloned()
             .unwrap_or_else(|| std::path::PathBuf::from(&output.path));
-        let sidecar = clinker_core::output::sidecar::OutputSidecar {
+        let sidecar = clinker_exec::output::sidecar::OutputSidecar {
             pipeline_path: args.config.to_string_lossy().into_owned(),
             pipeline_hash: hash_full,
             pipeline_hash_short: hash_short,
@@ -1141,7 +1141,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             route_counts: std::collections::BTreeMap::new(),
             node_timings_ms: std::collections::BTreeMap::new(),
         };
-        if let Err(e) = clinker_core::output::sidecar::write_sidecar(&target, &sidecar) {
+        if let Err(e) = clinker_exec::output::sidecar::write_sidecar(&target, &sidecar) {
             tracing::warn!(
                 "failed to write provenance sidecar for output {:?}: {e:?}",
                 output.name
@@ -1207,7 +1207,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .collect(),
             dlq_path,
             error: None,
-            retraction: clinker_core::metrics::RetractionMetrics::from(&counters.retraction),
+            retraction: clinker_exec::metrics::RetractionMetrics::from(&counters.retraction),
             per_source_record_counts: report.per_source_record_counts.clone(),
             per_source_dlq_counts: report.per_source_dlq_counts.clone(),
         };

@@ -1,11 +1,11 @@
 //! Trait for indexed record storage.
 //!
 //! Defined in the foundation crate so `RecordView` and `WindowContext`
-//! can reference it without depending on `clinker-core`.
+//! can reference it without depending on `clinker-exec`.
 
 use crate::Value;
 
-/// Indexed record storage backend. Arena implements this in `clinker-core`.
+/// Indexed record storage backend. Arena implements this in `clinker-exec`.
 ///
 /// Must be `Send + Sync` — the Arena is immutable after construction
 /// and shared across rayon workers during Phase 2.

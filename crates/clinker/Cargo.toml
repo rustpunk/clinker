@@ -6,7 +6,7 @@ license.workspace = true
 description = "CLI for the Clinker ETL engine"
 
 [dependencies]
-clinker-core = { workspace = true }
+clinker-exec = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-core-types = { workspace = true }
 clinker-net = { workspace = true }

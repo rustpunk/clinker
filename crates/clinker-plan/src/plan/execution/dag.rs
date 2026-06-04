@@ -21,7 +21,7 @@ impl ExecutionPlanDag {
     /// `node_properties` and `deferred_regions` are populated by later
     /// passes against the returned DAG via `&mut`. Test fixtures that
     /// drive a single planner pass against a hand-built graph (e.g. the
-    /// combine-strategy tests in `crates/clinker-core/tests/`) call this
+    /// combine-strategy tests in `crates/clinker-exec/tests/`) call this
     /// with empty topo / sources / output projections — every consumer
     /// they exercise reads only `graph` and the per-pass metadata.
     pub fn from_parts(

@@ -362,8 +362,8 @@ dependencies = [
  "chrono",
  "clap",
  "clinker-channel",
- "clinker-core",
  "clinker-core-types",
+ "clinker-exec",
  "clinker-format",
  "clinker-net",
  "clinker-plan",
@@ -401,7 +401,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clinker-bench-support",
- "clinker-core",
+ "clinker-exec",
  "clinker-plan",
  "criterion",
  "cxl",
@@ -432,7 +432,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "clinker-core"
+name = "clinker-core-types"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "petgraph",
+ "serde-saphyr",
+]
+
+[[package]]
+name = "clinker-exec"
 version = "0.1.0"
 dependencies = [
  "ahash",
@@ -478,15 +487,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clinker-core-types"
-version = "0.1.0"
-dependencies = [
- "miette",
- "petgraph",
- "serde-saphyr",
-]
-
-[[package]]
 name = "clinker-format"
 version = "0.1.0"
 dependencies = [
@@ -508,7 +508,7 @@ name = "clinker-net"
 version = "0.1.0"
 dependencies = [
  "clinker-bench-support",
- "clinker-core",
+ "clinker-exec",
  "clinker-format",
  "clinker-plan",
  "clinker-record",

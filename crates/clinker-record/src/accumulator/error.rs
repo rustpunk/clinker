@@ -2,7 +2,7 @@
 //!
 //! Leaf error type in the foundation crate, following the same convention as
 //! `clinker_format::FormatError` and `cxl::eval::EvalError`. Wrapped into
-//! `clinker_core::PipelineError` via a `From` impl at the integration point.
+//! `clinker_plan::PipelineError` via a `From` impl at the integration point.
 
 use std::fmt;
 

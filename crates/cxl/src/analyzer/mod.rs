@@ -2,7 +2,7 @@
 //!
 //! Walks a `TypedProgram` to extract window usage, field access patterns,
 //! and parallelism hints. Produces an `AnalysisReport` consumed by
-//! `clinker-core::plan` for Phases E and F.
+//! `clinker-plan::plan` for Phases E and F.
 
 use std::collections::HashSet;
 

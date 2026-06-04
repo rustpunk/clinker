@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
 use clinker_net::build_rest_source;
 use clinker_plan::config::{CompileContext, SourceTransport, parse_config};
 

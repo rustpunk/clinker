@@ -1,0 +1,67 @@
+---
+source: crates/clinker-exec/tests/pre_lift_baselines.rs
+expression: scrubbed
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 0
+Output projections: 1
+DAG nodes: 3
+arbitration: BackPressurePreferred -> Priority
+
+Source DAG:
+  Tier 0: ingest_src
+
+=== Physical Properties ===
+
+source.ingest_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+composition.enrich1:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+output.sink:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+=== Buffer Edges ===
+
+edge source.ingest_src -> composition.enrich1:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge composition.enrich1 -> output.sink:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: composition)
+
+=== CXL Expressions ===
+
+=== Type Annotations ===
+
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] ingest_src (line:7)
+  │ [composition:body=<ID>] enrich1 (line:18)
+  │ [output] sink (line:28)

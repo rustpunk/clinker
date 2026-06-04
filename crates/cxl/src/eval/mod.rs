@@ -20,7 +20,7 @@ pub use error::{EvalError, EvalErrorKind, extract_triggering_value};
 
 /// Default per-record fan-out ceiling for `emit each` blocks when the
 /// transform's YAML config does not set one explicitly. Matches the
-/// default in `clinker_core::config::pipeline_node::TransformBody`.
+/// default in `clinker_plan::config::pipeline_node::TransformBody`.
 pub const DEFAULT_MAX_EXPANSION: u64 = 10_000;
 
 /// Row disposition signal from CXL evaluation.
@@ -135,7 +135,7 @@ impl ProgramEvaluator {
 
     /// Create a new evaluator with an explicit `max_expansion` ceiling.
     /// Callers that thread the transform's YAML-configured cap (typically
-    /// `clinker-core::config::pipeline_node::TransformBody::max_expansion`)
+    /// `clinker-plan::config::pipeline_node::TransformBody::max_expansion`)
     /// use this constructor; tests and code paths that never use
     /// `emit each` may keep the default via [`Self::new`].
     pub fn with_max_expansion(
@@ -839,7 +839,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             // `$source.<input_name>.<field>` looks up the value an
             // upstream Transform writer set for records flowing
             // through Source `<input_name>`. The plan-time
-            // `source_input_arcs` map (built by clinker-core's
+            // `source_input_arcs` map (built by clinker-exec's
             // `build_stable_eval_context`) gives the source-file Arcs
             // for each input name; we scan them and return the first
             // matching `resolve_source_var` hit.

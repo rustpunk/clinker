@@ -300,8 +300,8 @@ nodes:
     #[test]
     fn test_cxl_source_newtype_captures_span() {
         // Top-level (non-variant) context: CxlSource should capture a
-        // non-zero span. This is the contract `clinker-core` relies on
-        // for non-tagged uses.
+        // non-zero span. This is the contract the span-annotated
+        // diagnostics rely on for non-tagged uses.
         let yaml = "cxl: \"upper(name)\"\n";
         let parsed: CxlHolder = from_str(yaml).expect("parse CxlHolder");
         assert_eq!(parsed.cxl.source, "upper(name)");
