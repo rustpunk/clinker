@@ -1,15 +1,25 @@
 pub mod stage_metrics;
 
+pub(crate) mod aggregate_dispatch;
 pub(crate) mod batch_handoff;
 pub mod combine;
+pub(crate) mod combine_dispatch;
 pub(crate) mod commit;
+pub(crate) mod composition_dispatch;
+pub(crate) mod correlation_dispatch;
 pub(crate) mod dispatch;
+pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
+pub(crate) mod output_dispatch;
+pub(crate) mod route_dispatch;
 mod schema_check;
+pub(crate) mod sort_dispatch;
+pub(crate) mod source_dispatch;
 pub mod source_stream;
 pub(crate) mod stream_event;
 pub(crate) mod time_window;
+pub(crate) mod transform_dispatch;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
