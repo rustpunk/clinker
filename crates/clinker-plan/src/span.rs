@@ -45,7 +45,7 @@ impl SourceDb {
     /// path:
     ///
     /// ```compile_fail
-    /// use clinker_core::span::SourceDb;
+    /// use clinker_plan::span::SourceDb;
     /// use std::path::PathBuf;
     /// let mut db = SourceDb::new();
     /// // Rejected: `load` will not accept a raw `PathBuf`.
