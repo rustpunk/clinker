@@ -3,6 +3,8 @@
 //! Tests in this module exercise the DAG executor's branch dispatch,
 //! merge semantics, record conservation, and per-node execution strategy.
 
+#[path = "common/branch_fixtures.rs"]
+mod branch_fixtures;
 mod common;
 
 use std::collections::HashMap;
@@ -50,28 +52,9 @@ fn run_branch_test(
 /// Diamond DAG: fork -> 2 branches -> merge: all records present in output.
 #[test]
 fn test_branch_diamond_dag() {
-    let yaml = r#"
-pipeline:
-  name: diamond
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "diamond",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -104,18 +87,11 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4, "all 4 records should be in output");
     assert!(dlq.is_empty(), "no DLQ entries expected");
@@ -134,28 +110,9 @@ nodes:
 /// Exclusive mode: input count = output count (no duplication, no loss).
 #[test]
 fn test_branch_exclusive_conservation() {
-    let yaml = r#"
-pipeline:
-  name: exclusive_conservation
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "exclusive_conservation",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -189,18 +146,11 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
-    let (counters, _, _) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, _) = run_branch_test(&yaml, csv).unwrap();
 
     // Exclusive mode: no duplication, no loss
     assert_eq!(
@@ -212,28 +162,9 @@ nodes:
 /// Inclusive mode: records in multiple branches, merge has more than input.
 #[test]
 fn test_branch_inclusive_duplication() {
-    let yaml = r#"
-pipeline:
-  name: inclusive_dup
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "inclusive_dup",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -276,18 +207,11 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     // id=1 (200): matches over_50 AND over_100 -> 2 writes
     // id=2 (50): matches nothing -> default (low) -> 1 write
@@ -308,28 +232,9 @@ nodes:
 /// Records within each branch maintain input order.
 #[test]
 fn test_branch_order_within_branch() {
-    let yaml = r#"
-pipeline:
-  name: order_test
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "order_test",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -362,19 +267,12 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,500\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 5, "all records should be in output");
 
@@ -402,28 +300,9 @@ nodes:
 /// Merge output: branch A records, then branch B records (declaration order).
 #[test]
 fn test_branch_merge_concatenation_order() {
-    let yaml = r#"
-pipeline:
-  name: merge_order
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "merge_order",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -456,18 +335,11 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (_, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     // enrich_high is declared first in the merge input, so high records come first
     let lines: Vec<&str> = output.lines().collect();
@@ -488,28 +360,9 @@ nodes:
 /// Route condition that never matches -> empty branch -> no error.
 #[test]
 fn test_branch_empty_branch_no_error() {
-    let yaml = r#"
-pipeline:
-  name: empty_branch
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "empty_branch",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -542,18 +395,11 @@ nodes:
     cxl: 'emit final = tag
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, dlq, output) = run_branch_test(&yaml, csv).unwrap();
 
     // All records go to 'normal' branch, 'impossible' is empty
     assert_eq!(counters.ok_count, 3);
@@ -565,28 +411,9 @@ nodes:
 /// 3 branches, each with different transforms.
 #[test]
 fn test_branch_three_way_fork() {
-    let yaml = r#"
-pipeline:
-  name: three_way
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "three_way",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -628,18 +455,11 @@ nodes:
     cxl: 'emit final = tier
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 6, "all 6 records in output");
     assert!(output.contains("HIGH"));
@@ -650,28 +470,9 @@ nodes:
 /// Branch A: enrichment, Branch B: filtering -- different transforms per branch.
 #[test]
 fn test_branch_different_transforms_per_branch() {
-    let yaml = r#"
-pipeline:
-  name: different_transforms
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "different_transforms",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -704,18 +505,11 @@ nodes:
     cxl: 'emit final = enriched
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(
@@ -844,28 +638,9 @@ nodes:
 #[test]
 fn test_branch_rayon_scope_deterministic_order() {
     // Run the three-way fork multiple times and verify deterministic output
-    let yaml = r#"
-pipeline:
-  name: deterministic
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "deterministic",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -907,22 +682,15 @@ nodes:
     cxl: 'emit final = tier
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
 
     // Run multiple times and check deterministic output
-    let (_, _, output1) = run_branch_test(yaml, csv).unwrap();
-    let (_, _, output2) = run_branch_test(yaml, csv).unwrap();
-    let (_, _, output3) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output1) = run_branch_test(&yaml, csv).unwrap();
+    let (_, _, output2) = run_branch_test(&yaml, csv).unwrap();
+    let (_, _, output3) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(output1, output2, "output must be deterministic");
     assert_eq!(output2, output3, "output must be deterministic");
@@ -931,28 +699,9 @@ nodes:
 /// Inclusive mode clones records -- mutations in one branch don't affect another.
 #[test]
 fn test_branch_inclusive_isolation() {
-    let yaml = r#"
-pipeline:
-  name: inclusive_isolation
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    type: csv
-    path: input.csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = branch_fixtures::branch_pipeline(
+        "inclusive_isolation",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -987,18 +736,11 @@ nodes:
     cxl: 'emit final = marker
 
       '
-- type: output
-  name: dest
-  input: combine
-  config:
-    name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,100\n";
-    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
 
     // id=1 matches both branches (inclusive) -> 2 writes from 1 input record.
     // Dual counters:

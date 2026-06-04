@@ -23,6 +23,8 @@
 //!   tests.
 
 mod common;
+#[path = "common/dlq_fixtures.rs"]
+mod dlq_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::error::PipelineError;
@@ -69,42 +71,13 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError>
 /// branch so the strict body emits the same DLQ shape as before.
 #[test]
 fn strict_pipeline_zero_overhead_short_circuits_to_fast_path() {
-    let yaml = r#"
-pipeline:
-  name: strict_test
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: employee_id
-    type: csv
-    schema:
-      - { name: employee_id, type: string }
-      - { name: value, type: string }
-- type: transform
-  name: validate
-  input: src
-  config:
-    cxl: 'emit emp_id = employee_id
-
-      emit val = value.to_int()
-
-      '
-- type: output
-  name: out
-  input: validate
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
+    let yaml = dlq_fixtures::dlq_validate_pipeline(
+        "strict_test",
+        "employee_id",
+        "      - { name: employee_id, type: string }\n      - { name: value, type: string }\n",
+    );
     let csv = "employee_id,value\nA,100\nA,bad\nB,200\n";
-    let (counters, dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
+    let (counters, dlq_entries, output) = run_pipeline(&yaml, csv).unwrap();
 
     // Group A is dirty (one bad record); group B is clean.
     assert_eq!(counters.dlq_count, 2, "group A DLQ'd as a unit (2 records)");

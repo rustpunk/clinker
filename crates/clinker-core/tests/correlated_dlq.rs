@@ -7,6 +7,8 @@
 //! preservation (F.1, F.2) cases that motivated the redesign.
 
 mod common;
+#[path = "common/dlq_fixtures.rs"]
+mod dlq_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core::error::PipelineError;
@@ -47,44 +49,10 @@ fn run_correlated_pipeline(
 }
 
 fn base_yaml(correlation_key: &str) -> String {
-    format!(
-        r#"
-pipeline:
-  name: correlated_test
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: {0}
-    type: csv
-    schema:
-      - {{ name: employee_id, type: string }}
-      - {{ name: value, type: string }}
-      - {{ name: dept, type: string }}
-
-- type: transform
-  name: validate
-  input: src
-  config:
-    cxl: 'emit emp_id = employee_id
-
-      emit val = value.to_int()
-
-      '
-- type: output
-  name: out
-  input: validate
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#,
-        correlation_key
+    dlq_fixtures::dlq_validate_pipeline(
+        "correlated_test",
+        correlation_key,
+        "      - { name: employee_id, type: string }\n      - { name: value, type: string }\n      - { name: dept, type: string }\n\n",
     )
 }
 

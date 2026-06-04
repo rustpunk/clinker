@@ -7,6 +7,8 @@
 //! seam) stay inline in `executor/tests/multi_output.rs`.
 
 mod common;
+#[path = "common/multi_output_fixtures.rs"]
+mod multi_output_fixtures;
 
 use std::collections::HashMap;
 
@@ -86,28 +88,9 @@ fn run_multi_output(yaml: &str, csv_input: &str) -> MultiOutputResult {
 
 #[test]
 fn test_multi_output_two_writers() {
-    let yaml = r#"
-pipeline:
-  name: test_two_outputs
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_two_outputs",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -130,10 +113,11 @@ nodes:
     path: low.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (counters, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4);
     let high = &outputs["high"];
@@ -155,28 +139,9 @@ nodes:
 
 #[test]
 fn test_multi_output_three_writers() {
-    let yaml = r#"
-pipeline:
-  name: test_three_outputs
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_three_outputs",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -208,10 +173,11 @@ nodes:
     path: low.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,5000\n2,500\n3,50\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (counters, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(outputs["high"].contains("1,5000"));
@@ -221,28 +187,9 @@ nodes:
 
 #[test]
 fn test_multi_output_record_counts() {
-    let yaml = r#"
-pipeline:
-  name: test_record_counts
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_record_counts",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -265,10 +212,11 @@ nodes:
     path: small.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n5,300\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (counters, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 5);
     assert_eq!(counters.total_count, 5);
@@ -283,28 +231,9 @@ nodes:
 
 #[test]
 fn test_multi_output_order_preserved() {
-    let yaml = r#"
-pipeline:
-  name: test_order
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_order",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -327,11 +256,12 @@ nodes:
     path: small.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     // All go to "big" — order must match input order
     let csv = "id,amount\n1,100\n2,200\n3,300\n4,400\n5,500\n";
-    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (_, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     let big_lines: Vec<&str> = outputs["big"].lines().skip(1).collect();
     assert_eq!(big_lines.len(), 5);
@@ -377,28 +307,9 @@ fn test_multi_output_writer_error_propagated() {
         }
     }
 
-    let yaml = r#"
-pipeline:
-  name: test_writer_error
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_writer_error",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -421,9 +332,10 @@ nodes:
     path: bad.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
@@ -453,28 +365,9 @@ nodes:
 
 #[test]
 fn test_multi_output_inclusive_duplicate() {
-    let yaml = r#"
-pipeline:
-  name: test_inclusive
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_inclusive",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -507,11 +400,12 @@ nodes:
     path: standard.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     // amount=500 matches both audit (>100) and report (>50)
     let csv = "id,amount\n1,500\n2,30\n";
-    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (counters, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     // Dual counters:
     //   ok_count = 2 (both input records reached at least one Output)
@@ -577,28 +471,9 @@ nodes:
 
 #[test]
 fn test_multi_output_empty_route() {
-    let yaml = r#"
-pipeline:
-  name: test_empty_route
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_empty_route",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -621,11 +496,12 @@ nodes:
     path: normal.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
     // No records match "special" (all < 99999)
     let csv = "id,amount\n1,100\n2,200\n";
-    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
+    let (_, _, outputs) = run_multi_output(&yaml, csv).unwrap();
 
     // Special output should have just a header (or be empty)
     let special_lines: Vec<&str> = outputs["special"]
@@ -667,28 +543,9 @@ fn test_multi_output_writer_panic_propagated() {
         }
     }
 
-    let yaml = r#"
-pipeline:
-  name: test_panic
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_panic",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -711,9 +568,10 @@ nodes:
     path: bad.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
@@ -845,28 +703,9 @@ fn test_multi_output_send_error_disconnected() {
         }
     }
 
-    let yaml = r#"
-pipeline:
-  name: test_disconnected
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_disconnected",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -889,9 +728,10 @@ nodes:
     path: b.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     // Enough records that "b" gets traffic and will error
@@ -937,28 +777,9 @@ fn test_multi_output_multiple_errors_collected() {
         }
     }
 
-    let yaml = r#"
-pipeline:
-  name: test_multiple_errors
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: string }
-      - { name: amount, type: string }
-
-- type: transform
-  name: classify_emit
-  input: src
-  config:
-    cxl: 'emit amount_val = amount.to_int()
-
-      '
-- type: route
+    let yaml = multi_output_fixtures::multi_output_pipeline(
+        "test_multiple_errors",
+        r#"- type: route
   name: classify
   input: classify_emit
   config:
@@ -981,9 +802,10 @@ nodes:
     path: b.csv
     type: csv
     include_unmapped: true
-"#;
+"#,
+    );
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
