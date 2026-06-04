@@ -38,7 +38,7 @@ pub enum Value {
 // Both Date and DateTime round-trip exactly through postcard. JSON output
 // (via serde_json::to_string) will produce externally-tagged form, e.g.
 // {"Integer":42}. Production JSON output uses the `clinker_to_json` helper
-// in clinker-format and clinker-core, which bypasses serde Value dispatch.
+// in clinker-format and clinker-exec, which bypasses serde Value dispatch.
 
 use serde::de::{self, Deserializer, EnumAccess, VariantAccess, Visitor};
 use serde::ser::Serializer;

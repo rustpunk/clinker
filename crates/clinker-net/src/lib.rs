@@ -5,8 +5,8 @@
 //! the finite-pull model. No async runtime is involved: the `rest`
 //! transport uses the blocking [`ureq`] client over rustls.
 //!
-//! The reader implements [`clinker_core::source::RecordSource`] and is
-//! handed to the executor as a [`clinker_core::source::SourceInput::Records`],
+//! The reader implements [`clinker_exec::source::RecordSource`] and is
+//! handed to the executor as a [`clinker_exec::source::SourceInput::Records`],
 //! so it feeds the identical crossbeam ingest channel as file sources with
 //! no special-case dispatch path. Per-row coercion is lenient at the reader
 //! (via the same `CoercingReader` the file arm uses), so per-row failures
@@ -24,13 +24,13 @@ use rest::RestRecordSource;
 
 /// Build the REST record source for a `rest` Source from its declared
 /// node config. The caller (the CLI reader-build) registers the returned
-/// reader as a [`clinker_core::source::SourceInput::Records`].
+/// reader as a [`clinker_exec::source::SourceInput::Records`].
 pub fn build_rest_source(
     cfg: clinker_plan::config::RestSourceConfig,
     source: &clinker_plan::config::SourceConfig,
     schema_decl: &[clinker_plan::config::pipeline_node::ColumnDecl],
     on_unmapped: clinker_plan::config::pipeline_node::OnUnmapped,
-) -> Result<Box<dyn clinker_core::source::RecordSource>, FormatError> {
+) -> Result<Box<dyn clinker_exec::source::RecordSource>, FormatError> {
     let reader = RestRecordSource::new(cfg, source, schema_decl, on_unmapped)?;
     Ok(Box::new(reader))
 }

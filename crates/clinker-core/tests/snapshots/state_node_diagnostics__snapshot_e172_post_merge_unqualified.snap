@@ -1,5 +1,0 @@
----
-source: crates/clinker-core/tests/state_node_diagnostics.rs
-expression: render_diags(&diags)
----
-E172: node "reader" reads user-declared $source.tag downstream of Merge/Combine node "m": post-merge cross-source access is ambiguous (each record carries its own source's value, but cross-source comparison requires explicit per-input qualification). Project the value into a record field before merging, or write a per-input value via a Transform with `declares:` placed upstream of the merge.

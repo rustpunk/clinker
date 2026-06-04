@@ -1,7 +1,8 @@
 //! GroupByKey and value_to_group_key for window partition and distinct dedup.
 //!
-//! Moved from `clinker-core::pipeline::index` to the foundation crate so
-//! `cxl::eval` can use it for distinct without depending on `clinker-core`.
+//! Lives in the foundation crate so `cxl::eval` can use it for distinct
+//! without depending on `clinker-exec`, where the pipeline index that
+//! groups on these keys lives.
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};

@@ -8,9 +8,9 @@
 //! The reader-side helpers ([`slow_reader`], [`fast_reader`]) build the
 //! `Box<dyn Read + Send>` payload a `FileSlot` expects. They return the
 //! reader rather than a fully-built `FileSlot` because constructing a
-//! slot requires `clinker_core::source::multi_file::FileSlot`, and
-//! `clinker-bench-support` sits beneath `clinker-core` in the workspace
-//! dep graph — a `clinker-core` import here would form a cycle.
+//! slot requires `clinker_exec::source::multi_file::FileSlot`, and
+//! `clinker-bench-support` sits beneath `clinker-exec` in the workspace
+//! dep graph — a `clinker-exec` import here would form a cycle.
 
 use std::io::{self, Cursor, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -120,7 +120,7 @@ impl Read for DelayedRowReader {
 /// Box up a [`DelayedRowReader`] as the `Box<dyn Read + Send>` payload
 /// a `FileSlot` expects. Callers pair the returned reader with their
 /// own synthetic path because the `FileSlot` type lives in
-/// `clinker-core`, which this crate cannot depend on.
+/// `clinker-exec`, which this crate cannot depend on.
 pub fn slow_reader(csv: &str, delay: Duration) -> Box<dyn Read + Send> {
     Box::new(DelayedRowReader::new(csv, delay))
 }

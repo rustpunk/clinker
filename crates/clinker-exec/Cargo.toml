@@ -1,0 +1,124 @@
+[package]
+name = "clinker-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DAG execution engine, operators, and runtime I/O for Clinker pipelines"
+
+[dependencies]
+clinker-core-types = { workspace = true }
+clinker-plan = { workspace = true }
+clinker-record = { workspace = true }
+cxl = { workspace = true }
+clinker-format = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
+indexmap = { workspace = true }
+rayon = "1"
+crossbeam-channel = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+ahash = { workspace = true }
+arc-swap = { workspace = true }
+hashbrown = "0.15"
+lz4_flex = "0.11"
+postcard = { workspace = true }
+tempfile = "3"
+thiserror = "2"
+tracing = { workspace = true }
+blake3 = { workspace = true }
+miette = { workspace = true }
+csv = "1"
+glob = "0.3"
+uuid = { version = "1", features = ["v7"] }
+num_cpus = "1"
+petgraph = { workspace = true }
+libc = "0.2"
+walkdir = "2"
+fastrand = { workspace = true }
+clinker-bench-support = { workspace = true, optional = true }
+
+# ctrlc installs a process-wide OS signal handler; it has no wasm32
+# backend, so the SIGINT/SIGTERM wiring is native-only. The wasm (web
+# Kiln) build leaves shutdown signaling a compile-time no-op.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ctrlc = { version = "3", features = ["termination"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
+[features]
+test-utils = []
+bench-alloc = ["dep:clinker-bench-support", "clinker-bench-support/bench-alloc"]
+
+[dev-dependencies]
+csv = "1"
+criterion = { workspace = true }
+clinker-bench-support = { workspace = true, features = [] }
+clinker-channel = { workspace = true }
+glob = "0.3"
+rayon = "1"
+insta = "1"
+serial_test = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "sort"
+harness = false
+
+[[bench]]
+name = "arena"
+harness = false
+
+[[bench]]
+name = "window"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "parallel"
+harness = false
+
+[[bench]]
+name = "provenance"
+harness = false
+
+[[bench]]
+name = "composition"
+harness = false
+
+[[bench]]
+name = "combine"
+harness = false
+
+[[bench]]
+name = "combine_iejoin"
+harness = false
+
+[[bench]]
+name = "combine_nary_3input"
+harness = false
+
+[[bench]]
+name = "combine_grace_hash"
+harness = false
+
+[[bench]]
+name = "deferred_buffer_pruning"
+harness = false
+
+[[bench]]
+name = "arbitration_poll"
+harness = false
+

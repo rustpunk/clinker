@@ -1,0 +1,69 @@
+---
+source: crates/clinker-exec/tests/pre_lift_baselines.rs
+expression: text
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 1
+Output projections: 1
+DAG nodes: 3
+arbitration: BackPressurePreferred -> Priority
+
+Source DAG:
+  Tier 0: employees
+
+Transform 'tier_flag':
+  Parallelism: Stateless
+  Window index: None
+  Partition lookup: None
+
+=== Physical Properties ===
+
+source.employees:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+transform.tier_flag:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+output.results:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+=== CXL Expressions ===
+
+Transform 'tier_flag':
+  emit id = id
+  emit name = name
+  emit salary = salary
+  emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
+
+=== Type Annotations ===
+
+Transform 'tier_flag': (types inferred at compile time)
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] employees (line:5)
+  │ [transform] tier_flag (line:18)
+  │ [output] results (line:28)

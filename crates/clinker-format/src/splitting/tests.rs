@@ -873,7 +873,7 @@ fn test_splitting_writer_xml_produces_valid_files() {
 }
 
 // Helper for test_split_naming_pattern — wraps the executor's apply_split_naming logic
-// (we duplicate it here since the original is in clinker-core and we're in clinker-format)
+// (we duplicate it here since the original is in clinker-exec and we're in clinker-format)
 pub(crate) fn apply_split_naming_wrapper(base_path: &str, naming: &str, seq: u32) -> String {
     let path = std::path::Path::new(base_path);
     let stem = path

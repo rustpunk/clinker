@@ -10,7 +10,7 @@
 //!
 //! The authoritative definition lives here in the `cxl` crate because the
 //! CXL typechecker is the primary consumer (preserves the existing
-//! `clinker-core → cxl` dependency direction). `clinker-core` re-exports
+//! `clinker-plan → cxl` dependency direction). `clinker-plan` re-exports
 //! via `plan::row_type`.
 //!
 //! # QualifiedField

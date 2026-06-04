@@ -4,9 +4,9 @@
 //! unioning the flat `vars:` block (`$vars.<key>` static config) with
 //! every Transform's `declares:` entries (`$pipeline` / `$source` /
 //! `$record` producer-declared state); see
-//! `clinker_core::config::build_scoped_vars_registry`. The result is
+//! `clinker_plan::config::build_scoped_vars_registry`. The result is
 //! threaded into [`resolve_program_with_modules_and_vars`] /
-//! [`type_check_with_vars`]. CXL doesn't depend on `clinker-core`, so
+//! [`type_check_with_vars`]. CXL doesn't depend on `clinker-plan`, so
 //! the types here mirror — rather than re-export — the config-side
 //! definitions.
 //!
@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 
 /// Scoped-variable primitive type set.
 ///
-/// Mirrors `clinker_core::config::ScopedVarType`. Conversion to the CXL
+/// Mirrors `clinker_plan::config::ScopedVarType`. Conversion to the CXL
 /// [`crate::typecheck::types::Type`] happens at typecheck-time lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopedVarType {

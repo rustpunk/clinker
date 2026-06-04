@@ -1,7 +1,7 @@
 /// Pipeline-wide counters for record-level outcomes.
 ///
 /// Lives in clinker-record so the cxl evaluator can reference it
-/// without depending on clinker-core. Updated at chunk boundaries —
+/// without depending on clinker-exec. Updated at chunk boundaries —
 /// all records within a chunk see the same counter values
 /// (snapshotted at chunk start).
 ///

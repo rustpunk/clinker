@@ -10,7 +10,7 @@ bench-alloc = ["clinker-bench-support/bench-alloc"]
 bench-xlarge = []
 
 [dependencies]
-clinker-core = { workspace = true }
+clinker-exec = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-bench-support = { workspace = true }
 cxl = { workspace = true }

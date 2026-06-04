@@ -52,8 +52,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo check --target x86_64-pc-windows-msvc -p clinker-core
-      - run: cargo check --target aarch64-apple-darwin -p clinker-core
+      - run: cargo check --target x86_64-pc-windows-msvc -p clinker-exec -p clinker-plan
+      - run: cargo check --target aarch64-apple-darwin -p clinker-exec -p clinker-plan
 
   deny:
     runs-on: ubuntu-latest

@@ -7,7 +7,7 @@ use std::fmt::Write as FmtWrite;
 use std::path::Path;
 
 use clinker_bench_support::ConfigEntry;
-use clinker_core::executor::ExecutionReport;
+use clinker_exec::executor::ExecutionReport;
 use serde::Serialize;
 
 // ── Summary table ────────────────────────────────────────────────
@@ -389,7 +389,7 @@ fn format_count(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_core::executor::stage_metrics::{StageMetrics, StageName};
+    use clinker_exec::executor::stage_metrics::{StageMetrics, StageName};
     use std::time::Duration;
 
     fn mock_report() -> ExecutionReport {

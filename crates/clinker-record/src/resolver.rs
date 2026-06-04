@@ -124,7 +124,7 @@ const _: () = {
 };
 
 // Note: WindowContext<'a, S> is object-safe when S is concrete (e.g. dyn WindowContext<'a, Arena>).
-// The assertion is tested in clinker-core where Arena is available.
+// The assertion is tested in clinker-exec where Arena is available.
 
 /// HashMap-backed FieldResolver for route condition evaluation and testing.
 ///

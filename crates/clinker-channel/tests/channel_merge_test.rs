@@ -8,7 +8,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("clinker-core/tests/fixtures")
+        .join("clinker-exec/tests/fixtures")
 }
 
 fn channel_fixtures_dir() -> PathBuf {

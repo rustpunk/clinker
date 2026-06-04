@@ -33,7 +33,7 @@ fn bench_channel_merge(c: &mut Criterion) {
                 let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .parent()
                     .unwrap()
-                    .join("clinker-core/tests/fixtures");
+                    .join("clinker-exec/tests/fixtures");
                 let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
                 let yaml = std::fs::read_to_string(&yaml_path).unwrap();
                 let config: clinker_plan::config::PipelineConfig =

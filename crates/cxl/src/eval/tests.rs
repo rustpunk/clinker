@@ -902,8 +902,8 @@ mod window_typecheck {
 //
 // Unit-level shape tests against a minimal in-memory implementation that
 // keys ranks off a synthetic `k` column. End-to-end coverage with an
-// Arena partition lives in
-// `clinker_core::executor::tests::post_aggregate_window_ranking`.
+// Arena partition lives in clinker-exec's
+// `tests/post_aggregate_window_ranking.rs` integration test.
 // ---------------------------------------------------------------------------
 
 mod ranking_and_value {

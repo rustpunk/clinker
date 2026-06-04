@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use clinker_core::pipeline::shutdown::ShutdownToken;
-use clinker_core::source::RecordSource;
+use clinker_exec::pipeline::shutdown::ShutdownToken;
+use clinker_exec::source::RecordSource;
 use clinker_net::build_rest_source;
 use clinker_plan::config::{RestSourceConfig, SourceTransport, parse_config};
 

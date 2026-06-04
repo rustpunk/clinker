@@ -14,7 +14,7 @@ fn clinker_bin() -> &'static str {
 /// Fixture workspace root for composition/channel tests.
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../clinker-core/tests/fixtures")
+        .join("../clinker-exec/tests/fixtures")
         .canonicalize()
         .expect("fixture root must exist")
 }
