@@ -408,6 +408,20 @@ pub(crate) fn dispatch_transform_eval_error(
     )
 }
 
+/// Record a sink write/flush failure in `output_errors` instead of
+/// short-circuiting, so sibling writers in the same Output still get
+/// their chance to flush or report (the DataFusion collection-pattern,
+/// PR #14439). The single conversion point for every writer error path —
+/// both the single-writer arms (which push into `ctx.output_errors`) and
+/// `emit_fan_out` (which threads its own `output_errors` vec) — so a
+/// future change to how write errors are attributed lands here once.
+pub(crate) fn push_write_error(
+    output_errors: &mut Vec<PipelineError>,
+    e: impl Into<PipelineError>,
+) {
+    output_errors.push(e.into());
+}
+
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{

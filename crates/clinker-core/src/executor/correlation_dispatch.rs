@@ -19,7 +19,7 @@ use clinker_record::GroupByKey;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
-    source_name_arc_of,
+    push_write_error, source_name_arc_of,
 };
 use crate::executor::{DlqEntry, build_format_writer};
 use crate::plan::execution::ExecutionPlanDag;
@@ -369,7 +369,7 @@ fn flush_clean_records_to_writers(
                         writer.write_record(&slot.projected)
                     };
                     if let Err(e) = write_result {
-                        ctx.output_errors.push(PipelineError::from(e));
+                        push_write_error(&mut ctx.output_errors, e);
                         write_failed = true;
                         break;
                     }
@@ -380,7 +380,7 @@ fn flush_clean_records_to_writers(
                         writer.flush()
                     };
                     if let Err(e) = flush_result {
-                        ctx.output_errors.push(PipelineError::from(e));
+                        push_write_error(&mut ctx.output_errors, e);
                     }
                 }
             }

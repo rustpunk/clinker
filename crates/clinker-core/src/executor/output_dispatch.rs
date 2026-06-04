@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    source_file_path_of,
+    push_write_error, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{build_format_writer, stage_metrics};
@@ -291,7 +291,7 @@ pub(crate) fn dispatch_output(
                         csv_writer.write_record(&projected)
                     };
                     if let Err(e) = write_result {
-                        ctx.output_errors.push(PipelineError::from(e));
+                        push_write_error(&mut ctx.output_errors, e);
                         write_failed = true;
                         break;
                     }
@@ -302,7 +302,7 @@ pub(crate) fn dispatch_output(
                         csv_writer.flush()
                     };
                     if let Err(e) = flush_result {
-                        ctx.output_errors.push(PipelineError::from(e));
+                        push_write_error(&mut ctx.output_errors, e);
                     }
                 }
             }
@@ -400,7 +400,7 @@ fn emit_fan_out(
             fw.write_record(&projected)
         };
         if let Err(e) = write_result {
-            output_errors.push(PipelineError::from(e));
+            push_write_error(output_errors, e);
         }
     }
 
@@ -412,7 +412,7 @@ fn emit_fan_out(
             fw.flush()
         };
         if let Err(e) = flush_result {
-            output_errors.push(PipelineError::from(e));
+            push_write_error(output_errors, e);
         }
     }
 }
