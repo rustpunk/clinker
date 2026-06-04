@@ -1,0 +1,182 @@
+//! Output node configuration: split policy and per-format output options.
+
+use super::*;
+use clinker_record::schema_def::LineSeparator;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
+/// Output destination configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub name: String,
+    pub path: String,
+    /// When `true` (default), every input field not explicitly emitted
+    /// passes through to the output unchanged. When `false`, only
+    /// explicitly emitted fields appear in the output. Also the path
+    /// that surfaces `OnUnmapped::AutoWiden`-discovered columns at the
+    /// sink by expanding the `$widened` sidecar payload back to
+    /// top-level fields.
+    #[serde(default = "default_include_unmapped")]
+    pub include_unmapped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<IndexMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<Vec<SortFieldSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preserve_nulls: Option<bool>,
+    /// Controls whether engine-stamped correlation snapshot columns
+    /// (`$ck.<field>`) appear in the default writer output. The shadow
+    /// columns preserve correlation-group identity through Transforms
+    /// that may rewrite the user-declared field; they are an internal
+    /// engine namespace and are stripped from output unless this flag
+    /// is set. Defaults to `false`.
+    #[serde(default)]
+    pub include_correlation_keys: bool,
+    /// Explicit schema for output formats that require field definitions
+    /// (e.g., fixed-width output needs field names, widths, and positions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaSource>,
+    /// File splitting configuration. When present, output is split into
+    /// multiple files based on record count or byte size limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitConfig>,
+    /// Optional per-Output override for the correlation fan-out policy.
+    /// Wins against the per-Combine override and the per-pipeline default
+    /// because the sink has the most context for whether collateral
+    /// rollback is acceptable (audit-style sinks typically opt down to
+    /// `Primary` or `All`; integrity-style sinks keep the default `Any`).
+    /// Additive opt-in: `None` defers to upstream resolution, preserving
+    /// today's behavior unchanged for every existing pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
+    /// Collision policy when the resolved output path already exists.
+    /// Defaults to `Overwrite` to preserve today's `File::create` behavior.
+    #[serde(default, skip_serializing_if = "IfExistsPolicy::is_default")]
+    pub if_exists: IfExistsPolicy,
+    /// Zero-pad width for the `{n}` collision counter when
+    /// `if_exists = unique_suffix`. `0` (default) emits the bare integer.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub unique_suffix_width: u8,
+    /// Write a `<resolved_path>.meta.json` provenance sidecar after the
+    /// output stream is flushed. Opt-in.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub write_meta: bool,
+    #[serde(flatten)]
+    pub format: OutputFormat,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
+}
+
+/// Collision policy when an Output node's resolved path already exists.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExistsPolicy {
+    /// Truncate and overwrite. Today's `File::create` behavior.
+    #[default]
+    Overwrite,
+    /// Refuse to clobber; emit a diagnostic. `--force` downgrades to `Overwrite`.
+    Error,
+    /// Walk integer suffixes via `OpenOptions::create_new` until one succeeds.
+    UniqueSuffix,
+}
+
+impl IfExistsPolicy {
+    pub fn is_default(&self) -> bool {
+        matches!(self, IfExistsPolicy::Overwrite)
+    }
+}
+
+/// Output file splitting configuration.
+///
+/// When `group_key` is set, files are split only at key-group boundaries
+/// (greedy: first boundary after threshold). Without `group_key`, mechanical
+/// split at exact limit (like `split -l`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitConfig {
+    /// Soft record count limit per file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+    /// Soft byte size limit per file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Optional key field — never split mid-group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
+    /// File naming pattern. Default: `"{stem}_{seq:04}.{ext}"`.
+    #[serde(default = "default_split_naming")]
+    pub naming: String,
+    /// CSV: repeat header row in each split file. Default: true.
+    #[serde(default = "default_true")]
+    pub repeat_header: bool,
+    /// Behavior when a single key group exceeds file limits.
+    #[serde(default)]
+    pub oversize_group: SplitOversizeGroupPolicy,
+}
+
+fn default_split_naming() -> String {
+    "{stem}_{seq:04}.{ext}".to_string()
+}
+
+/// Policy when a single key group exceeds split file limits.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitOversizeGroupPolicy {
+    /// Log a warning and allow the oversized file.
+    #[default]
+    Warn,
+    /// Error — pipeline stops.
+    Error,
+    /// Silently allow.
+    Allow,
+}
+
+/// CSV-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CsvOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+}
+
+/// JSON-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JsonOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<JsonOutputFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pretty: Option<bool>,
+}
+
+/// JSON output format mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonOutputFormat {
+    #[default]
+    Array,
+    Ndjson,
+}
+
+/// XML-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct XmlOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_element: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_element: Option<String>,
+}
+
+/// Fixed-width output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FixedWidthOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_separator: Option<LineSeparator>,
+}
