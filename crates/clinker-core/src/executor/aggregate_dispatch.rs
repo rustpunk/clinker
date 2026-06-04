@@ -194,15 +194,17 @@ pub(crate) fn dispatch_aggregation(
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
         ));
         let mut stream = crate::aggregation::AggregateStream::for_node(
-            Arc::clone(compiled),
-            evaluator,
             agg_strategy,
-            Arc::clone(output_schema),
-            spill_schema,
-            mem_limit,
-            Some(ctx.spill_root_path.to_path_buf()),
-            name.clone(),
-            agg_consumer_handle,
+            crate::aggregation::AggregatorConfig {
+                compiled: Arc::clone(compiled),
+                evaluator,
+                output_schema: Arc::clone(output_schema),
+                spill_schema,
+                memory_budget: mem_limit,
+                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+                transform_name: name.clone(),
+                consumer_handle: agg_consumer_handle,
+            },
         )?;
 
         // Per-record accumulator updates + spill I/O. The loop
@@ -604,15 +606,17 @@ impl WindowedAggContext<'_> {
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
         ));
         let stream = crate::aggregation::AggregateStream::for_node(
-            Arc::clone(self.compiled),
-            evaluator,
             self.strategy,
-            Arc::clone(&self.output_schema),
-            Arc::clone(&self.spill_schema),
-            self.mem_limit,
-            Some(ctx.spill_root_path.to_path_buf()),
-            self.name.to_string(),
-            agg_consumer_handle,
+            crate::aggregation::AggregatorConfig {
+                compiled: Arc::clone(self.compiled),
+                evaluator,
+                output_schema: Arc::clone(&self.output_schema),
+                spill_schema: Arc::clone(&self.spill_schema),
+                memory_budget: self.mem_limit,
+                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+                transform_name: self.name.to_string(),
+                consumer_handle: agg_consumer_handle,
+            },
         )?;
         Ok((stream, agg_consumer_id))
     }

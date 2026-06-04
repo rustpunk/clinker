@@ -1,6 +1,3 @@
-use clinker_record::Value;
-use indexmap::IndexMap;
-
 use crate::config::{LogDirective, LogLevel, LogTiming};
 use crate::log_template::{self, LogTemplateContext};
 
@@ -132,42 +129,60 @@ fn emit_log(
     }
 }
 
-/// Create a LogTemplateContext from executor state.
-#[allow(clippy::too_many_arguments)]
-pub fn make_template_context<'a>(
-    record_fields: &'a IndexMap<String, Value>,
-    transform_name: &'a str,
-    transform_duration_ms: Option<u64>,
-    source_file: &'a str,
-    source_row: u64,
-    pipeline_ok_count: u64,
-    pipeline_dlq_count: u64,
-    pipeline_total_count: u64,
-    pipeline_name: &'a str,
-    pipeline_execution_id: &'a str,
-    dlq_error_category: Option<&'a str>,
-    dlq_error_detail: Option<&'a str>,
-) -> LogTemplateContext<'a> {
-    LogTemplateContext {
-        record_fields,
-        transform_name,
-        transform_duration_ms,
-        source_file,
-        source_row,
-        pipeline_ok_count,
-        pipeline_dlq_count,
-        pipeline_total_count,
-        pipeline_name,
-        pipeline_execution_id,
-        dlq_error_category,
-        dlq_error_detail,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use clinker_record::Value;
+    use indexmap::IndexMap;
+
     use super::*;
     use crate::config::{LogLevel, LogTiming};
+
+    /// Run-stable logging context: everything available to a log template
+    /// except the current record's fields, which vary per record and are
+    /// supplied separately at context-build time.
+    ///
+    /// Test-only: production builds [`LogTemplateContext`] directly along the
+    /// `LogDispatcher::fire_*` path; this argument-grouping struct exists solely
+    /// to keep the test helper's constructor below the clippy argument-count
+    /// threshold without a suppression attribute.
+    struct LogContext<'a> {
+        transform_name: &'a str,
+        /// Only available in after_transform.
+        transform_duration_ms: Option<u64>,
+        source_file: &'a str,
+        source_row: u64,
+        pipeline_ok_count: u64,
+        pipeline_dlq_count: u64,
+        pipeline_total_count: u64,
+        pipeline_name: &'a str,
+        pipeline_execution_id: &'a str,
+        /// Only available in on_error.
+        dlq_error_category: Option<&'a str>,
+        /// Only available in on_error.
+        dlq_error_detail: Option<&'a str>,
+    }
+
+    /// Merges the current record's fields with the run-stable [`LogContext`]
+    /// into a [`LogTemplateContext`] for the test helpers below.
+    fn make_template_context<'a>(
+        record_fields: &'a IndexMap<String, Value>,
+        ctx: &LogContext<'a>,
+    ) -> LogTemplateContext<'a> {
+        LogTemplateContext {
+            record_fields,
+            transform_name: ctx.transform_name,
+            transform_duration_ms: ctx.transform_duration_ms,
+            source_file: ctx.source_file,
+            source_row: ctx.source_row,
+            pipeline_ok_count: ctx.pipeline_ok_count,
+            pipeline_dlq_count: ctx.pipeline_dlq_count,
+            pipeline_total_count: ctx.pipeline_total_count,
+            pipeline_name: ctx.pipeline_name,
+            pipeline_execution_id: ctx.pipeline_execution_id,
+            dlq_error_category: ctx.dlq_error_category,
+            dlq_error_detail: ctx.dlq_error_detail,
+        }
+    }
 
     fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
         LogDirective {
@@ -188,17 +203,19 @@ mod tests {
     fn test_ctx(fields: &IndexMap<String, Value>) -> LogTemplateContext<'_> {
         make_template_context(
             fields,
-            "test",
-            None,
-            "input.csv",
-            1,
-            0,
-            0,
-            0,
-            "pipeline",
-            "exec-id",
-            None,
-            None,
+            &LogContext {
+                transform_name: "test",
+                transform_duration_ms: None,
+                source_file: "input.csv",
+                source_row: 1,
+                pipeline_ok_count: 0,
+                pipeline_dlq_count: 0,
+                pipeline_total_count: 0,
+                pipeline_name: "pipeline",
+                pipeline_execution_id: "exec-id",
+                dlq_error_category: None,
+                dlq_error_detail: None,
+            },
         )
     }
 
@@ -256,7 +273,20 @@ mod tests {
         let mut fire_count = 0;
         for i in 1..=300 {
             let _ctx = make_template_context(
-                &fields, "t", None, "f.csv", i, 0, 0, 0, "p", "e", None, None,
+                &fields,
+                &LogContext {
+                    transform_name: "t",
+                    transform_duration_ms: None,
+                    source_file: "f.csv",
+                    source_row: i,
+                    pipeline_ok_count: 0,
+                    pipeline_dlq_count: 0,
+                    pipeline_total_count: 0,
+                    pipeline_name: "p",
+                    pipeline_execution_id: "e",
+                    dlq_error_category: None,
+                    dlq_error_detail: None,
+                },
             );
             // We can't easily count tracing events, so we test the counter logic
             let d = &dispatcher.directives[0];

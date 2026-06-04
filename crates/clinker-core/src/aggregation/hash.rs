@@ -187,23 +187,59 @@ pub struct HashAggregator {
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
+/// Construction parameters shared by [`HashAggregator::new`] and
+/// [`AggregateStream::for_node`].
+///
+/// Groups the compiled plan, its evaluator, the output and spill
+/// schemas, the memory budget, the spill directory, the node's
+/// transform name, and the arbitrator-facing consumer handle into one
+/// value so neither constructor carries a long positional argument list.
+/// `spill_schema` and `spill_dir` feed the spill path; the hot loop
+/// only consults them through the `value_heap_bytes` budget check.
+///
+/// [`AggregateStream::for_node`]: super::AggregateStream::for_node
+pub struct AggregatorConfig {
+    /// Compiled aggregate plan — bindings, group-by projection, and
+    /// retraction-strategy flags.
+    pub compiled: Arc<CompiledAggregate>,
+    /// Evaluator for pre-aggregation filters and expression bindings.
+    pub evaluator: ProgramEvaluator,
+    /// Schema of finalized output rows.
+    pub output_schema: Arc<Schema>,
+    /// Schema of spilled partition rows (group-by columns ++
+    /// `__acc_state`).
+    pub spill_schema: Arc<Schema>,
+    /// RSS budget in bytes that gates the spill trigger. Zero disables
+    /// the group-count cap (`max_groups` becomes `usize::MAX`).
+    pub memory_budget: usize,
+    /// Directory for spill files; `None` keeps the aggregator
+    /// in-memory-only.
+    pub spill_dir: Option<PathBuf>,
+    /// Node name, used for diagnostics and the synthetic
+    /// `$ck.aggregate.<name>` lineage column.
+    pub transform_name: String,
+    /// Shared handle mirroring `value_heap_bytes` into the
+    /// pipeline-scoped arbitrator's pull-mode accounting.
+    pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
 impl HashAggregator {
-    /// Construct a new aggregator from a compiled aggregate plan.
+    /// Construct a new aggregator from an [`AggregatorConfig`].
     ///
-    /// `spill_schema` and `spill_dir` are wired for the spill path that
-    /// lands in 16.3.10. The 16.3.8 hot loop only touches them through
-    /// the `value_heap_bytes` budget check.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        compiled: Arc<CompiledAggregate>,
-        evaluator: ProgramEvaluator,
-        output_schema: Arc<Schema>,
-        spill_schema: Arc<Schema>,
-        memory_budget: usize,
-        spill_dir: Option<PathBuf>,
-        transform_name: impl Into<String>,
-        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-    ) -> Self {
+    /// `spill_schema` and `spill_dir` are wired for the spill path; the
+    /// hot loop only touches them through the `value_heap_bytes` budget
+    /// check.
+    pub fn new(config: AggregatorConfig) -> Self {
+        let AggregatorConfig {
+            compiled,
+            evaluator,
+            output_schema,
+            spill_schema,
+            memory_budget,
+            spill_dir,
+            transform_name,
+            consumer_handle,
+        } = config;
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
         let pre_agg_filter = compiled.pre_agg_filter.clone();
@@ -249,7 +285,7 @@ impl HashAggregator {
             spill_schema,
             spill_dir,
             output_schema,
-            transform_name: transform_name.into(),
+            transform_name,
             evaluator,
             rows_seen: 0,
             max_groups,
@@ -1536,16 +1572,16 @@ mod spill_trigger_tests {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
             spill_dir,
-            "test_agg",
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            transform_name: "test_agg".to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
@@ -2805,16 +2841,16 @@ mod spill_trigger_tests {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
             spill_dir,
-            transform_name,
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     #[test]

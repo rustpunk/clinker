@@ -21,7 +21,9 @@ use crate::executor::dispatch::{
     transform_fused_consume,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{evaluate_single_transform, evaluate_single_transform_windowed};
+use crate::executor::{
+    WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
+};
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL
@@ -208,10 +210,12 @@ pub(crate) fn dispatch_transform(
                     name,
                     &mut evaluator,
                     &eval_ctx,
-                    current_dag,
-                    idx_num,
-                    runtime,
-                    record_pos,
+                    &WindowedEvalCtx {
+                        plan: current_dag,
+                        window_index: idx_num,
+                        runtime,
+                        record_pos,
+                    },
                 )
             } else {
                 evaluate_single_transform(&record, name, &mut evaluator, &eval_ctx, &target_schema)

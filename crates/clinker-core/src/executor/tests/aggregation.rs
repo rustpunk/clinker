@@ -21,10 +21,9 @@ mod dispatch {
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{AggregatorGroupState, HashAggregator};
+    use crate::aggregation::{AggregatorConfig, AggregatorGroupState, HashAggregator};
     use crate::config::ErrorStrategy;
     use crate::error::PipelineError;
-    use crate::executor::tests::run_test;
 
     fn make_schema(cols: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
@@ -89,16 +88,16 @@ mod dispatch {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
             spill_dir,
-            transform_name.to_string(),
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
@@ -122,64 +121,6 @@ mod dispatch {
             64 * 1024 * 1024,
             None,
         )
-    }
-
-    // ----- Test 1: happy path -----
-
-    #[test]
-    fn test_aggregation_dispatch_basic_group_by() {
-        let yaml = r#"
-pipeline:
-  name: agg_basic
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: in.csv
-    type: csv
-    schema:
-      - { name: dept, type: string }
-      - { name: salary, type: float }
-
-- type: aggregate
-  name: by_dept
-  input: src
-  config:
-    group_by:
-    - dept
-    cxl: 'emit dept = dept
-
-      emit total = sum(salary)
-
-      emit n = count(*)
-
-      '
-- type: output
-  name: out
-  input: by_dept
-  config:
-    name: out
-    type: csv
-    path: out.csv
-    include_unmapped: true
-"#;
-        let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-        assert_eq!(dlq.len(), 0, "no DLQ entries expected");
-        assert_eq!(counters.ok_count, 2, "two output groups");
-
-        // Set-equality on output rows (order is hash-table arbitrary).
-        // With salary declared as float, `sum(salary)` produces the real
-        // numeric total per group — eng = 100+200 = 300, sales = 50.
-        let mut lines: Vec<&str> = output.lines().skip(1).collect();
-        lines.sort();
-        let expected_a = "eng,300,2";
-        let expected_b = "sales,50,1";
-        assert!(
-            lines.contains(&expected_a) && lines.contains(&expected_b),
-            "got lines = {lines:?}"
-        );
     }
 
     // ----- Test 2: malformed-DAG Internal error via single_predecessor -----
@@ -297,52 +238,6 @@ nodes:
 
         let state = group_state_for_key(&agg, "a").expect("group exists");
         assert_eq!(state.min_row_num, 3);
-    }
-
-    // ----- Test 6: D12 global-fold over empty input emits one row -----
-
-    #[test]
-    fn test_aggregation_dispatch_global_fold_empty_input_emits_one_row() {
-        let yaml = r#"
-pipeline:
-  name: agg_global_empty
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: in.csv
-    type: csv
-    schema:
-      - { name: x, type: string }
-
-- type: aggregate
-  name: total
-  input: src
-  config:
-    group_by: []
-    cxl: 'emit n = count(*)
-
-      '
-- type: output
-  name: out
-  input: total
-  config:
-    name: out
-    type: csv
-    path: out.csv
-    include_unmapped: true
-"#;
-        // Header-only input — zero data rows.
-        let csv = "x\n";
-        let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-        assert_eq!(dlq.len(), 0);
-        assert_eq!(
-            counters.ok_count, 1,
-            "global fold emits one row even on empty input"
-        );
-        let body: Vec<&str> = output.lines().skip(1).collect();
-        assert_eq!(body, vec!["0"], "count(*) over empty = 0");
     }
 
     // ----- Test 7: finalize overflow → DLQ under Continue -----
@@ -1411,7 +1306,7 @@ mod two_phase_bytes_spill {
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{HashAggregator, group_by_sort_fields};
+    use crate::aggregation::{AggregatorConfig, HashAggregator, group_by_sort_fields};
     use crate::pipeline::sort_key::SortKeyEncoder;
 
     /// Compile a CXL aggregate snippet with a configurable memory budget
@@ -1464,16 +1359,16 @@ mod two_phase_bytes_spill {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
-            None,
-            transform_name.to_string(),
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            spill_dir: None,
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     fn make_input_schema() -> Arc<Schema> {

@@ -47,7 +47,9 @@ pub(crate) use streaming::{
 use streaming::{compute_streaming_output_specs, streaming_output};
 pub(crate) use transform::CompiledTransform;
 pub use transform::{TransformSpec, build_transform_specs};
-pub(crate) use transform::{evaluate_single_transform, evaluate_single_transform_windowed};
+pub(crate) use transform::{
+    WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
+};
 use util::scheduled_pass_order;
 pub(crate) use util::{
     build_arbitrator_from_config, compute_init_phase_node_set, copy_build_ck_columns,
@@ -140,6 +142,64 @@ pub(crate) struct DispatchOutcome {
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
     pub(crate) interrupted: bool,
+}
+
+/// Borrowed, read-only inputs threaded through `execute_dag` and
+/// `execute_dag_branching`: the compiled program, the bound plan, and
+/// the per-run parameters. Grouped so both entry points share one
+/// `&` argument instead of six positional borrows, and so the owned
+/// run-scoped resources in [`DagExecResources`] stay visually distinct
+/// from the inputs that outlive the call.
+struct DagExecInputs<'a> {
+    /// Pipeline configuration: node list, error-handling policy,
+    /// concurrency knobs, output configs.
+    config: &'a PipelineConfig,
+    /// Declared Source configs in declaration order. Borrowed for
+    /// per-source seeding (watermark idle-timeouts, count slots).
+    source_configs: &'a [crate::config::SourceConfig],
+    /// Compiled per-node CXL transform programs, looked up by name at
+    /// each Transform / Aggregation dispatch arm.
+    transforms: &'a [CompiledTransform],
+    /// Topologically-sorted execution DAG walked by the dispatcher.
+    plan: &'a ExecutionPlanDag,
+    /// Compile artifacts (bound schemas, composition bodies) consulted
+    /// by the dispatcher while walking the plan.
+    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    /// Per-run parameters: execution / batch ids, channel variable
+    /// overrides, shutdown token.
+    params: &'a PipelineRunParams,
+}
+
+/// Owned, run-scoped resources moved through `execute_dag` into
+/// `execute_dag_branching`, where they are consumed when the dispatch
+/// [`dispatch::ExecutorContext`] is built. Distinct from
+/// [`DagExecInputs`] because every field here transfers ownership into
+/// the walk rather than being borrowed for its duration.
+struct DagExecResources {
+    /// One live crossbeam `Receiver` per declared Source, drained by
+    /// the Source dispatch arm.
+    source_records:
+        HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+    /// Single + fan-out output writers, split into the dispatcher's
+    /// `writers` / `fan_out_writers` maps at context construction.
+    writers: WriterRegistry,
+    /// Compiled top-level route, if the pipeline declares one Route node.
+    compiled_route: Option<CompiledRoute>,
+    /// Compiled routes keyed by node name, for nested / composition-body
+    /// Route nodes resolved during the walk.
+    compiled_routes_by_name: HashMap<String, CompiledRoute>,
+    /// Pipeline-scoped spill `TempDir`, held until the walk drains so
+    /// operator-side spill files survive the topo loop.
+    spill_root: Arc<tempfile::TempDir>,
+    /// Cached path of `spill_root`, handed to each spill site without
+    /// re-borrowing the `TempDir`.
+    spill_root_path: Arc<std::path::Path>,
+    /// Per-source / per-file event-time watermarks, carried through and
+    /// returned in the [`DispatchOutcome`] for report roll-up.
+    watermarks: crate::executor::watermark::PerSourceWatermarks,
+    /// Pipeline-scoped memory arbitrator that envelopes every spill /
+    /// back-pressure decision across the run.
+    memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
 }
 
 /// Helper for callers (mostly tests and benchmarks) that have a single
@@ -701,22 +761,26 @@ impl PipelineExecutor {
             peak_consumer_usage_bytes,
             interrupted,
         } = Self::execute_dag(
-            config,
-            source_records,
-            &source_configs,
-            writers,
-            &compiled_transforms,
-            compiled_route,
-            compiled_routes_by_name,
-            plan,
-            validated_plan.artifacts(),
-            params,
+            &DagExecInputs {
+                config,
+                source_configs: &source_configs,
+                transforms: &compiled_transforms,
+                plan,
+                artifacts: validated_plan.artifacts(),
+                params,
+            },
+            DagExecResources {
+                source_records,
+                writers,
+                compiled_route,
+                compiled_routes_by_name,
+                spill_root,
+                spill_root_path,
+                watermarks,
+                memory_budget,
+            },
             &mut collector,
-            spill_root,
-            spill_root_path,
             counters,
-            watermarks,
-            memory_budget,
         )?;
 
         // Collect ingest-task outcomes: per-source row counts and the
@@ -815,27 +879,11 @@ impl PipelineExecutor {
     /// directly.
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
-    #[allow(clippy::too_many_arguments)]
     fn execute_dag(
-        config: &PipelineConfig,
-        source_records: HashMap<
-            String,
-            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-        >,
-        source_configs: &[crate::config::SourceConfig],
-        writers: WriterRegistry,
-        transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
-        compiled_routes_by_name: HashMap<String, CompiledRoute>,
-        plan: &ExecutionPlanDag,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
-        params: &PipelineRunParams,
+        inputs: &DagExecInputs<'_>,
+        resources: DagExecResources,
         collector: &mut stage_metrics::StageCollector,
-        spill_root: Arc<tempfile::TempDir>,
-        spill_root_path: Arc<std::path::Path>,
         mut counters: PipelineCounters,
-        watermarks: crate::executor::watermark::PerSourceWatermarks,
-        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<DispatchOutcome, PipelineError> {
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
@@ -855,28 +903,17 @@ impl PipelineExecutor {
         // dispatches the Aggregate node even when its upstream Source
         // produced zero records, so the special case still emits the
         // single global-fold row.
-        let window_runtime =
-            crate::executor::window_runtime::WindowRuntimeRegistry::new(&plan.indices_to_build);
+        let window_runtime = crate::executor::window_runtime::WindowRuntimeRegistry::new(
+            &inputs.plan.indices_to_build,
+        );
 
         Self::execute_dag_branching(
-            config,
-            source_records,
-            source_configs,
-            writers,
-            transforms,
-            compiled_route,
-            compiled_routes_by_name,
-            plan,
-            artifacts,
-            params,
+            inputs,
+            resources,
             &mut counters,
             &mut dlq_entries,
             collector,
             window_runtime,
-            memory_budget,
-            spill_root,
-            spill_root_path,
-            watermarks,
         )
     }
 
@@ -892,30 +929,33 @@ impl PipelineExecutor {
     /// is partition-level parallelism (par_iter_mut on chunks), not
     /// branch-level fork-join — scheduling overhead exceeds benefit at
     /// typical ETL branch sizes (2-4 branches, millisecond chains).
-    #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
-        config: &PipelineConfig,
-        source_records: HashMap<
-            String,
-            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-        >,
-        source_configs: &[crate::config::SourceConfig],
-        mut writers: WriterRegistry,
-        transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
-        compiled_routes_by_name: HashMap<String, CompiledRoute>,
-        plan: &ExecutionPlanDag,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
-        params: &PipelineRunParams,
+        inputs: &DagExecInputs<'_>,
+        resources: DagExecResources,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
-        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
-        spill_root: Arc<tempfile::TempDir>,
-        spill_root_path: Arc<std::path::Path>,
-        watermarks: crate::executor::watermark::PerSourceWatermarks,
     ) -> Result<DispatchOutcome, PipelineError> {
+        let &DagExecInputs {
+            config,
+            source_configs,
+            transforms,
+            plan,
+            artifacts,
+            params,
+        } = inputs;
+        let DagExecResources {
+            source_records,
+            mut writers,
+            compiled_route,
+            compiled_routes_by_name,
+            spill_root,
+            spill_root_path,
+            watermarks,
+            memory_budget,
+        } = resources;
+
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1548,86 +1588,28 @@ impl PipelineExecutor {
 
 #[cfg(test)]
 mod tests {
-    //! Executor-level tests — submodules below each target a specific
-    //! executor concern (aggregation dispatch, multi-output routing,
-    //! branching/DAG, format dispatch, correlated DLQ).
+    //! Executor white-box tests — submodules below each read a crate-private
+    //! executor seam the public API does not surface (the pre-seeded
+    //! `MemoryArbitrator` run entry, `scheduled_pass_order`,
+    //! `single_predecessor`, `compile_route` / `CompiledRoute`,
+    //! `commit::with_test_loop_cap`, `ExecutionPlanDag::deferred_region_at`),
+    //! so they cannot live in the `tests/` integration directory.
     //!
-    //! Each submodule starts with `use super::*;` and expects the
-    //! executor's public-in-crate symbols (`PipelineExecutor`,
-    //! `PipelineRunParams`, `DlqEntry`, `CompiledRoute`, `PipelineError`,
-    //! etc.) plus a shared `run_test(yaml, csv)` helper (defined here).
-
-    use std::io::Write;
+    //! The pure-integration executor tests — those that drive a pipeline
+    //! end-to-end through the public `&CompiledPlan` entry point — live in
+    //! `crates/clinker-core/tests/` and share the `run_config` helper in
+    //! `tests/common/mod.rs`.
+    //!
+    //! Each submodule starts with `use super::*;` for the executor's
+    //! in-crate symbols.
 
     use super::*;
 
-    /// Run a single-source, single-output pipeline with the given YAML
-    /// config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
-    ///
-    /// This mirrors `integration_tests::run_pipeline` but lives inside
-    /// the `executor` module so submodules can reference it via
-    /// `crate::executor::tests::run_test`.
-    pub(super) fn run_test(
-        yaml: &str,
-        csv_input: &str,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = clinker_bench_support::io::SharedBuffer::new();
-
-        let primary = config.source_configs().next().unwrap().name.clone();
-        let readers: crate::executor::SourceReaders = HashMap::from([(
-            primary.clone(),
-            crate::executor::single_file_reader(
-                "test.csv",
-                Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
-            ),
-        )]);
-        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
-        )]);
-
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars: IndexMap::new(),
-            shutdown_token: None,
-            ..Default::default()
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
-
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
-    }
-
     mod aggregation;
-    mod branching;
-    mod ck_aligned_partition_runtime;
     mod composition_port_admission_overshoot;
-    mod correlated_dlq;
-    mod correlated_dlq_retract;
-    mod correlated_post_aggregate_retract;
-    mod correlated_window_after_aggregate_retract;
-    mod correlated_window_retract;
-    mod cross_source_window_topology;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
-    mod format_dispatch;
     mod multi_output;
     mod nested_composition_overshoot;
-    mod post_aggregate_any_all;
-    mod post_aggregate_lag_lead;
-    mod post_aggregate_recompute_determinism;
-    mod post_aggregate_window;
-    mod post_aggregate_window_ranking;
-    mod post_aggregate_window_spilled;
-    mod post_combine_array_field;
-    mod post_combine_synthetic_ck;
-    mod post_combine_window_strategies;
-    mod record_source_transport;
     mod scheduling;
-    mod strict_pipeline_zero_overhead;
-    mod window_recompute_correctness;
 }
