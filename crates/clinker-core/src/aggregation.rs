@@ -172,40 +172,23 @@ pub struct AggregateEvalScope<'a> {
 
 /// Errors that can arise while evaluating a residual in aggregate
 /// scope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AggregateEvalError {
     /// `Expr::AggSlot { slot }` referenced a slot index outside the
     /// finalized slot vector. Indicates an extractor / executor
     /// mismatch — should be unreachable in a correctly compiled plan.
+    #[error("AggSlot {{ slot: {slot} }} out of range (slot_count: {slot_count})")]
     SlotOutOfRange { slot: u32, slot_count: usize },
     /// `Expr::GroupKey { slot }` referenced a group-key column outside
     /// the key tuple.
+    #[error("GroupKey {{ slot: {slot} }} out of range (key_count: {key_count})")]
     GroupKeyOutOfRange { slot: u32, key_count: usize },
     /// A residual contained a construct that the finalize-time
     /// evaluator does not yet support. Unsupported expressions are
     /// reported via this variant rather than panicking.
+    #[error("unsupported aggregate residual construct: {what}")]
     UnsupportedResidual { what: &'static str },
 }
-
-impl std::fmt::Display for AggregateEvalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AggregateEvalError::SlotOutOfRange { slot, slot_count } => write!(
-                f,
-                "AggSlot {{ slot: {slot} }} out of range (slot_count: {slot_count})"
-            ),
-            AggregateEvalError::GroupKeyOutOfRange { slot, key_count } => write!(
-                f,
-                "GroupKey {{ slot: {slot} }} out of range (key_count: {key_count})"
-            ),
-            AggregateEvalError::UnsupportedResidual { what } => {
-                write!(f, "unsupported aggregate residual construct: {what}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AggregateEvalError {}
 
 /// Evaluate a post-extraction residual expression in aggregate scope.
 ///
@@ -492,13 +475,15 @@ pub type SortRow = (Record, u64);
 /// arm wraps these into `PipelineError` for DLQ routing; until then the
 /// engine surfaces them via this dedicated enum so the runtime stays
 /// decoupled from the executor's error taxonomy.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HashAggError {
     /// A `BindingArg::Expr` failed to evaluate against the input record.
-    EvalFailed(EvalError),
+    #[error("binding expression eval failed: {0:?}")]
+    EvalFailed(#[from] EvalError),
     /// `value_to_group_key` rejected an input value (NaN, unsupported
     /// type, etc.). Carries the field name and row number for routing
     /// in the executor dispatch path.
+    #[error("group-key extraction failed for `{field}` at row {row}: {message}")]
     GroupKey {
         field: String,
         row: u64,
@@ -506,9 +491,11 @@ pub enum HashAggError {
     },
     /// Spill path raised an I/O error. Stub until 16.3.10 lands the
     /// real spill writer integration.
+    #[error("spill failed: {0}")]
     Spill(String),
     /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). Routed
     /// to `PipelineError::Accumulator` by the 16.3.13 dispatch arm.
+    #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source:?}")]
     Accumulator {
         transform: String,
         binding: String,
@@ -517,6 +504,7 @@ pub enum HashAggError {
     /// A post-extraction emit residual failed to evaluate in
     /// `AggregateEvalScope`. Indicates an extractor/executor mismatch or
     /// an unsupported residual construct.
+    #[error("aggregate residual eval failed: {0}")]
     Residual(AggregateEvalError),
     /// Streaming aggregation observed an input record whose group-by key
     /// sorts strictly before the currently-open group, violating the
@@ -529,64 +517,22 @@ pub enum HashAggError {
     /// diagnostics. The user-input vs spill-merge distinction is
     /// captured in two separate variants because the two cases route
     /// differently through `From<HashAggError> for PipelineError`.
+    #[error(
+        "streaming aggregate sort-order violation: prev={prev_key_debug} next={next_key_debug}"
+    )]
     SortOrderViolation {
         prev_key_debug: String,
         next_key_debug: String,
     },
     /// Spill-merge produced an out-of-order key — Clinker bug, not a
     /// user data error. Always hard-aborts.
+    #[error(
+        "spill-merge sort-order violation (Clinker bug): prev={prev_key_debug} next={next_key_debug}"
+    )]
     MergeSortOrderViolation {
         prev_key_debug: String,
         next_key_debug: String,
     },
-}
-
-impl std::fmt::Display for HashAggError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HashAggError::EvalFailed(e) => write!(f, "binding expression eval failed: {e:?}"),
-            HashAggError::GroupKey {
-                field,
-                row,
-                message,
-            } => write!(
-                f,
-                "group-key extraction failed for `{field}` at row {row}: {message}"
-            ),
-            HashAggError::Spill(msg) => write!(f, "spill failed: {msg}"),
-            HashAggError::Accumulator {
-                transform,
-                binding,
-                source,
-            } => write!(
-                f,
-                "aggregate {transform}.{binding}: accumulator finalize failed: {source:?}"
-            ),
-            HashAggError::Residual(e) => write!(f, "aggregate residual eval failed: {e}"),
-            HashAggError::SortOrderViolation {
-                prev_key_debug,
-                next_key_debug,
-            } => write!(
-                f,
-                "streaming aggregate sort-order violation: prev={prev_key_debug} next={next_key_debug}"
-            ),
-            HashAggError::MergeSortOrderViolation {
-                prev_key_debug,
-                next_key_debug,
-            } => write!(
-                f,
-                "spill-merge sort-order violation (Clinker bug): prev={prev_key_debug} next={next_key_debug}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for HashAggError {}
-
-impl From<EvalError> for HashAggError {
-    fn from(e: EvalError) -> Self {
-        HashAggError::EvalFailed(e)
-    }
 }
 
 /// Map a `HashAggError` to a `PipelineError` for the executor dispatch

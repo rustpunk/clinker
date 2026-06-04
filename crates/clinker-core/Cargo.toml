@@ -23,6 +23,7 @@ hashbrown = "0.15"
 lz4_flex = "0.11"
 postcard = { workspace = true }
 tempfile = "3"
+thiserror = "2"
 tracing = { workspace = true }
 blake3 = { workspace = true }
 miette = { workspace = true }
