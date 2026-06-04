@@ -1483,11 +1483,6 @@ mod tests {
         type_check(resolved, schema).expect_err("Expected type errors but got Ok")
     }
 
-    #[allow(dead_code)]
-    fn node_type(typed: &TypedProgram, idx: usize) -> &Type {
-        typed.types[idx].as_ref().unwrap_or(&Type::Any)
-    }
-
     // Find the type of the first expression in the first emit statement
     fn first_emit_expr_type(typed: &TypedProgram) -> Type {
         for stmt in &typed.program.statements {

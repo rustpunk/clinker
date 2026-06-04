@@ -4093,19 +4093,6 @@ fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
     )
 }
 
-/// E201 diagnostic for a Source with no `schema:` field.
-#[allow(dead_code)]
-pub fn e201_missing_schema(source_name: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        "E201",
-        format!("source {source_name:?} is missing required `schema:` field"),
-        LabeledSpan::primary(span, String::new()),
-    )
-    .with_help(
-        "declare the source columns inline:\n  schema:\n    - { name: col1, type: string }\n    - { name: col2, type: int }",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

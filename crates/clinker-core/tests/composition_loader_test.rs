@@ -13,6 +13,27 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Counts `.comp.yaml` files under `dir`, recursing into subdirectories —
+/// mirrors the directory walk `scan_workspace_signatures` performs, so the
+/// loaded-table length can be checked against the on-disk corpus without
+/// hard-coding a count that every new fixture would force a test edit on.
+fn count_comp_fixtures(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).expect("read fixture dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            count += count_comp_fixtures(&path);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".comp.yaml"))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Path to the committed 5-fixture corpus.
 fn fixture_workspace_root() -> PathBuf {
     manifest_dir().join("tests").join("fixtures")
@@ -39,10 +60,14 @@ fn test_phase1_scanner_loads_all_fixtures() {
     let table = scan_workspace_signatures(&root)
         .expect("composition fixture corpus must load without errors");
 
+    // The scanner must find one signature per on-disk `.comp.yaml`; counting
+    // the corpus dynamically keeps this from breaking every time a fixture is
+    // added.
+    let expected = count_comp_fixtures(&root);
     assert_eq!(
         table.len(),
-        23,
-        "expected 23 composition signatures, got {}: {:?}",
+        expected,
+        "expected {expected} composition signatures (one per `.comp.yaml`), got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );
