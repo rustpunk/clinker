@@ -142,13 +142,13 @@ fn commit_one_group(
             let (category, trigger, error_message) = if !emitted_trigger {
                 emitted_trigger = true;
                 (
-                    crate::dlq::DlqErrorCategory::GroupSizeExceeded,
+                    clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
                     true,
                     overflow_msg.clone(),
                 )
             } else {
                 (
-                    crate::dlq::DlqErrorCategory::Correlated,
+                    clinker_core_types::dlq::DlqErrorCategory::Correlated,
                     false,
                     format!("correlated with failure in group: {overflow_msg}"),
                 )
@@ -326,7 +326,7 @@ fn commit_one_group(
             ctx,
             DlqEntry {
                 source_row: slot.row_num,
-                category: crate::dlq::DlqErrorCategory::Correlated,
+                category: clinker_core_types::dlq::DlqErrorCategory::Correlated,
                 error_message: format!("correlated with failure in group: {first_err_message}"),
                 original_record: slot.original_record.clone(),
                 stage: Some("correlation_commit".to_string()),

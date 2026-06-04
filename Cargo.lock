@@ -363,6 +363,7 @@ dependencies = [
  "clap",
  "clinker-channel",
  "clinker-core",
+ "clinker-core-types",
  "clinker-format",
  "clinker-net",
  "clinker-record",
@@ -414,6 +415,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clinker-core",
+ "clinker-core-types",
  "clinker-record",
  "criterion",
  "indexmap",
@@ -437,6 +439,7 @@ dependencies = [
  "chrono",
  "clinker-bench-support",
  "clinker-channel",
+ "clinker-core-types",
  "clinker-format",
  "clinker-record",
  "criterion",
@@ -469,6 +472,15 @@ dependencies = [
  "uuid",
  "walkdir",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "clinker-core-types"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "petgraph",
+ "serde-saphyr",
 ]
 
 [[package]]

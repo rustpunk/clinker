@@ -208,7 +208,7 @@ fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
         let errors: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
             .collect();
         assert!(
             errors.is_empty(),

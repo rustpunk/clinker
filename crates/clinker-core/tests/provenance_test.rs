@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clinker_core::config::{CompileContext, LayerKind, ProvenanceLayer, ResolvedValue};
-use clinker_core::span::Span;
+use clinker_core_types::span::Span;
 
 fn test_span() -> Span {
     Span::SYNTHETIC

@@ -130,7 +130,7 @@ nodes:
     let trigger_count = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::GroupSizeExceeded)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded)
         .count();
     assert_eq!(
         trigger_count,
@@ -283,7 +283,7 @@ nodes:
     let trigger_count = report
         .dlq_entries
         .iter()
-        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::GroupSizeExceeded)
+        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded)
         .count();
     assert_eq!(trigger_count, 1, "only group id=7 overflows");
 

@@ -2,7 +2,7 @@
 //!
 //! Separated from the canonical public types in `mod.rs` because the canonical
 //! [`crate::config::composition::CompositionSignature`] holds
-//! [`crate::span::Span`] values. serde-saphyr natively produces
+//! [`clinker_core_types::span::Span`] values. serde-saphyr natively produces
 //! [`serde_saphyr::Span`], so we deserialize into this raw layer, capture
 //! saphyr spans via [`serde_saphyr::Spanned`], then convert to the canonical
 //! form via [`Span::from_saphyr`] at the YAML chokepoint boundary.
@@ -14,8 +14,8 @@ use super::{
     ResourceDecl, ResourceKind, SourceMap, SpannedNodeRef,
 };
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
-use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
+use clinker_core_types::span::{FileId, Span};
 use indexmap::IndexMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};

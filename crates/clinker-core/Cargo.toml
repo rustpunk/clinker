@@ -6,6 +6,7 @@ license.workspace = true
 description = "Pipeline orchestration, config parsing, and execution engine for Clinker"
 
 [dependencies]
+clinker-core-types = { workspace = true }
 clinker-record = { workspace = true }
 cxl = { workspace = true }
 clinker-format = { workspace = true }

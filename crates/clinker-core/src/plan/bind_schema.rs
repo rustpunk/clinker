@@ -35,14 +35,14 @@ use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
     CombineBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, SchemaDecl,
 };
-use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::types::JoinSide;
-use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
+use clinker_core_types::span::{FileId, Span};
+use clinker_core_types::{Diagnostic, LabeledSpan};
 
 /// Maximum composition nesting depth.
 ///
@@ -1744,9 +1744,9 @@ fn bind_composition(
     for spanned in &body_file.nodes {
         let saphyr_line = spanned.referenced.line();
         let body_span = if saphyr_line > 0 {
-            crate::span::Span::line_only(saphyr_line as u32)
+            clinker_core_types::span::Span::line_only(saphyr_line as u32)
         } else {
-            crate::span::Span::SYNTHETIC
+            clinker_core_types::span::Span::SYNTHETIC
         };
         let n = &spanned.value;
         let n_name = n.name().to_string();

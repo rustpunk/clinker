@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use clinker_core::config::ScopedVarDecl;
 use clinker_core::config::composition::CompositionSymbolTable;
-use clinker_core::error::{Diagnostic, LabeledSpan};
-use clinker_core::span::Span;
+use clinker_core_types::Span;
+use clinker_core_types::{Diagnostic, LabeledSpan};
 
 use crate::error::ChannelError;
 

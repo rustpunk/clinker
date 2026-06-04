@@ -853,7 +853,7 @@ fn test_dlq_stage_source() {
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
         source_row: 1,
-        category: clinker_core::dlq::DlqErrorCategory::TypeCoercionFailure,
+        category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "source read error".to_string(),
         original_record: record,
         stage: Some(DlqEntry::stage_source()),
@@ -1014,7 +1014,7 @@ fn test_dlq_stage_output() {
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
         source_row: 1,
-        category: clinker_core::dlq::DlqErrorCategory::TypeCoercionFailure,
+        category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "write error".to_string(),
         original_record: record,
         stage: Some(DlqEntry::stage_output("results")),
@@ -1102,7 +1102,7 @@ fn test_dlq_columns_in_csv() {
     let record = clinker_record::Record::new(schema.clone(), vec![Value::String("Alice".into())]);
     let entries = vec![DlqEntry {
         source_row: 1,
-        category: clinker_core::dlq::DlqErrorCategory::TypeCoercionFailure,
+        category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "eval error".to_string(),
         original_record: record,
         stage: Some(DlqEntry::stage_transform("my_transform")),

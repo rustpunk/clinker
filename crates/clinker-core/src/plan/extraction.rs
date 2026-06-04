@@ -405,7 +405,7 @@ mod tests {
         DependencyType, ExecutionPlanDag, NodeExecutionReqs, ParallelismClass, PlanEdge, PlanNode,
         SourceTier,
     };
-    use crate::span::Span;
+    use clinker_core_types::span::Span;
     use petgraph::graph::DiGraph;
     use std::collections::BTreeSet;
 

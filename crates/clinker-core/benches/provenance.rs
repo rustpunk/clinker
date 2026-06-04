@@ -1,5 +1,5 @@
 use clinker_core::config::{LayerKind, ProvenanceDb, ResolvedValue};
-use clinker_core::span::Span;
+use clinker_core_types::span::Span;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn test_span() -> Span {

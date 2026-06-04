@@ -341,10 +341,13 @@ impl PipelineConfig {
     /// matching the rustc `Session::has_errors` pattern. Self-loops
     /// are routed to the dedicated E002 check before general cycle
     /// detection so the diagnostic message is more actionable.
-    pub fn compile_topology_only(&self, ctx: &CompileContext) -> Vec<crate::error::Diagnostic> {
-        use crate::error::{Diagnostic, LabeledSpan};
-        use crate::graph::NameGraph;
-        use crate::span::Span;
+    pub fn compile_topology_only(
+        &self,
+        ctx: &CompileContext,
+    ) -> Vec<clinker_core_types::Diagnostic> {
+        use clinker_core_types::graph::NameGraph;
+        use clinker_core_types::span::Span;
+        use clinker_core_types::{Diagnostic, LabeledSpan};
         use std::collections::BTreeMap;
 
         let mut diags = Vec::new();
@@ -537,7 +540,7 @@ impl PipelineConfig {
     pub fn compile(
         &self,
         ctx: &CompileContext,
-    ) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+    ) -> Result<crate::plan::CompiledPlan, Vec<clinker_core_types::Diagnostic>> {
         let (plan, _warnings) = self.compile_with_diagnostics(ctx)?;
         Ok(plan)
     }
@@ -549,16 +552,19 @@ impl PipelineConfig {
         &self,
         ctx: &CompileContext,
     ) -> Result<
-        (crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>),
-        Vec<crate::error::Diagnostic>,
+        (
+            crate::plan::CompiledPlan,
+            Vec<clinker_core_types::Diagnostic>,
+        ),
+        Vec<clinker_core_types::Diagnostic>,
     > {
         use crate::config::composition::scan_workspace_signatures;
-        use crate::error::{Diagnostic, LabeledSpan};
         use crate::plan::CompiledPlan;
         use crate::plan::execution::{
             DependencyType, ExecutionPlanDag, ParallelismProfile, PlanEdge, PlanNode,
         };
-        use crate::span::Span;
+        use clinker_core_types::span::Span;
+        use clinker_core_types::{Diagnostic, LabeledSpan};
         use petgraph::graph::{DiGraph, NodeIndex};
         use std::collections::HashMap;
 
@@ -568,7 +574,7 @@ impl PipelineConfig {
         // refuses to lower if any error-severity diagnostic is present.
         let has_errors = diags
             .iter()
-            .any(|d| matches!(d.severity, crate::error::Severity::Error));
+            .any(|d| matches!(d.severity, clinker_core_types::Severity::Error));
         if has_errors {
             return Err(diags);
         }
@@ -594,7 +600,7 @@ impl PipelineConfig {
                     diags.append(&mut scan_diags);
                     let has_errors = diags
                         .iter()
-                        .any(|d| matches!(d.severity, crate::error::Severity::Error));
+                        .any(|d| matches!(d.severity, clinker_core_types::Severity::Error));
                     if has_errors {
                         return Err(diags);
                     }
@@ -635,7 +641,7 @@ impl PipelineConfig {
         // errors (E102–E109) are non-fatal for the rest of the pipeline
         // — the composition node is omitted from the DAG.
         let has_cxl_errors = diags.iter().any(|d| {
-            matches!(d.severity, crate::error::Severity::Error)
+            matches!(d.severity, clinker_core_types::Severity::Error)
                 && matches!(d.code.as_str(), "E200" | "E201" | "E153" | "E317" | "E318")
         });
         if has_cxl_errors {
@@ -1389,7 +1395,7 @@ impl PipelineConfig {
         crate::plan::execution::resolve_composition_body_windows(&dag, &mut artifacts, &mut diags);
         if diags[pre_pass_diag_count..]
             .iter()
-            .any(|d| matches!(d.severity, crate::error::Severity::Error))
+            .any(|d| matches!(d.severity, clinker_core_types::Severity::Error))
         {
             return Err(diags);
         }
@@ -1737,7 +1743,7 @@ impl PipelineConfig {
         // (E102–E109) are non-fatal — the composition node is silently
         // omitted from the DAG. Warnings do not block.
         let has_fatal_errors = diags.iter().any(|d| {
-            matches!(d.severity, crate::error::Severity::Error) && !d.code.starts_with("E10")
+            matches!(d.severity, clinker_core_types::Severity::Error) && !d.code.starts_with("E10")
         });
         if has_fatal_errors {
             return Err(diags);
@@ -1761,7 +1767,7 @@ fn input_full_reference(input: &node_header::NodeInput) -> String {
 
 /// Unified input-reference resolution pass. Walks every node's
 /// declared input(s) and emits [`Diagnostic`] code `E004` with a
-/// structured [`crate::error::DiagnosticPayload::InputRefUndeclared`]
+/// structured [`clinker_core_types::DiagnosticPayload::InputRefUndeclared`]
 /// payload for each reference that doesn't resolve to a declared node
 /// name — covering both standalone-node `input:` references and
 /// combine-arm per-port references with a single code.
@@ -1772,10 +1778,10 @@ fn input_full_reference(input: &node_header::NodeInput) -> String {
 /// emitted diagnostic so span-level assertions can verify placement.
 fn resolve_all_input_references(
     nodes: &[Spanned<PipelineNode>],
-    diags: &mut Vec<crate::error::Diagnostic>,
+    diags: &mut Vec<clinker_core_types::Diagnostic>,
 ) {
-    use crate::error::{Diagnostic, DiagnosticPayload, LabeledSpan};
-    use crate::span::Span;
+    use clinker_core_types::span::Span;
+    use clinker_core_types::{Diagnostic, DiagnosticPayload, LabeledSpan};
 
     let declared_names: std::collections::HashSet<String> =
         nodes.iter().map(|s| s.value.name().to_string()).collect();
@@ -1875,12 +1881,11 @@ pub(crate) struct LoweringCtx<'a> {
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
     name: &str,
-    span: crate::span::Span,
+    span: clinker_core_types::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     ctx: &LoweringCtx<'_>,
-    diags: &mut Vec<crate::error::Diagnostic>,
+    diags: &mut Vec<clinker_core_types::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
-    use crate::error::{Diagnostic, LabeledSpan};
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
         NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
@@ -1888,6 +1893,7 @@ pub(crate) fn lower_node_to_plan_node(
         extract_write_set,
     };
     use crate::plan::types::AggregateStrategy;
+    use clinker_core_types::{Diagnostic, LabeledSpan};
     use clinker_record::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
 

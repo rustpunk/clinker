@@ -1295,7 +1295,7 @@ fn dispatch_combine_output_error(
     combine_name: &str,
     eval_err: cxl::eval::EvalError,
 ) -> Result<(), PipelineError> {
-    let category = crate::dlq::DlqErrorCategory::CombineOutputRow;
+    let category = clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow;
     let stage = Some(DlqEntry::stage_combine(combine_name));
     let message = eval_err.to_string();
 

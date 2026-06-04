@@ -9,7 +9,7 @@ use petgraph::visit::EdgeRef;
 
 use crate::config::{SortField, SourceConfig};
 use crate::error::PipelineError;
-use crate::span::Span;
+use clinker_core_types::span::Span;
 
 /// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes
 /// inserted by [`ExecutionPlanDag::insert_enforcer_sorts`] to satisfy a

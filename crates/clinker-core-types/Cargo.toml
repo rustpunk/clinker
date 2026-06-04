@@ -1,0 +1,11 @@
+[package]
+name = "clinker-core-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Leaf vocabulary types (spans, diagnostics, DAG graph, DLQ categories) shared across the Clinker pipeline crates"
+
+[dependencies]
+miette = { workspace = true }
+serde-saphyr = { workspace = true }
+petgraph = { workspace = true }

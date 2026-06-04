@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::plan::CompiledPlan;
-use crate::span::Span;
+use clinker_core_types::span::Span;
 
 /// Error returned when field provenance cannot be resolved.
 #[derive(Debug)]
@@ -235,7 +235,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::config::composition::{LayerKind, ResolvedValue};
-    use crate::span::Span;
+    use clinker_core_types::span::Span;
 
     #[test]
     fn test_parse_dotted_path_valid() {

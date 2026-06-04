@@ -166,7 +166,7 @@ nodes:
     // Verify: no fatal diagnostics from bind_schema.
     let errors: Vec<_> = diags
         .iter()
-        .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+        .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
         .collect();
     assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 }
@@ -1073,7 +1073,7 @@ fn test_composition_node_preserves_callsite_span() {
     // source node, so its line must be > 1.
     assert_ne!(
         span,
-        clinker_core::span::Span::SYNTHETIC,
+        clinker_core_types::span::Span::SYNTHETIC,
         "composition node span should not be SYNTHETIC"
     );
     // Span::line_only sets start = line (1-based). For a composition

@@ -123,7 +123,7 @@ fn collateral_carries_correlated_category() {
     let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
     assert_eq!(
         collateral.category,
-        clinker_core::dlq::DlqErrorCategory::Correlated,
+        clinker_core_types::dlq::DlqErrorCategory::Correlated,
         "collateral should carry the Correlated category"
     );
     assert!(
@@ -269,14 +269,14 @@ nodes:
     let trigger_entry = dlq_entries.iter().find(|e| e.trigger).unwrap();
     assert_eq!(
         trigger_entry.category,
-        clinker_core::dlq::DlqErrorCategory::GroupSizeExceeded,
+        clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
     );
     let collateral_count = dlq_entries.iter().filter(|e| !e.trigger).count();
     assert_eq!(collateral_count, 4);
     for collateral in dlq_entries.iter().filter(|e| !e.trigger) {
         assert_eq!(
             collateral.category,
-            clinker_core::dlq::DlqErrorCategory::Correlated,
+            clinker_core_types::dlq::DlqErrorCategory::Correlated,
         );
     }
 }
@@ -604,7 +604,7 @@ nodes:
     let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
     assert_eq!(
         collateral.category,
-        clinker_core::dlq::DlqErrorCategory::Correlated,
+        clinker_core_types::dlq::DlqErrorCategory::Correlated,
         "aggregate-output collateral carries the Correlated category"
     );
 
@@ -906,7 +906,7 @@ nodes:
     for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
         assert_eq!(
             c.category,
-            clinker_core::dlq::DlqErrorCategory::Correlated,
+            clinker_core_types::dlq::DlqErrorCategory::Correlated,
             "combined-output collateral carries the Correlated category"
         );
     }

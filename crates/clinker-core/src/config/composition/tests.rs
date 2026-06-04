@@ -4,8 +4,8 @@
 //! fixture-driven tests that need on-disk `.comp.yaml` files.
 
 use super::*;
-use crate::span::{FileId, Span};
 use crate::yaml;
+use clinker_core_types::span::{FileId, Span};
 use indexmap::IndexMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;

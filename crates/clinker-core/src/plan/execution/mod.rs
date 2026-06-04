@@ -30,7 +30,7 @@ use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 use crate::plan::row_type::QualifiedField;
 use crate::plan::types::{AggregateStrategy, JoinSide};
-use crate::span::Span;
+use clinker_core_types::span::Span;
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;
 

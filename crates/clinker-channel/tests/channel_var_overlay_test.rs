@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use clinker_channel::binding::ChannelBinding;
 use clinker_channel::overlay::apply_channel_overlay;
-use clinker_core::error::Severity;
+use clinker_core_types::Severity;
 use clinker_record::Value;
 
 fn fixtures_dir() -> PathBuf {
@@ -41,9 +41,9 @@ fn binding(yaml: &[u8]) -> ChannelBinding {
 }
 
 fn errors_with_code<'a>(
-    diags: &'a [clinker_core::error::Diagnostic],
+    diags: &'a [clinker_core_types::Diagnostic],
     code: &str,
-) -> Vec<&'a clinker_core::error::Diagnostic> {
+) -> Vec<&'a clinker_core_types::Diagnostic> {
     diags
         .iter()
         .filter(|d| matches!(d.severity, Severity::Error) && d.code == code)

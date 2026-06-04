@@ -15,9 +15,9 @@ use clinker_core::config::{
     PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
     coerce_scoped_var_default, reserved_names_for,
 };
-use clinker_core::error::{Diagnostic, LabeledSpan};
 use clinker_core::plan::{ChannelIdentity, CompiledPlan};
-use clinker_core::span::Span;
+use clinker_core_types::Span;
+use clinker_core_types::{Diagnostic, LabeledSpan};
 use clinker_record::Value;
 
 use crate::binding::{ChannelBinding, ChannelTarget, DottedPath};
