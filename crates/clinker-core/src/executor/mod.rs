@@ -1,5 +1,6 @@
 pub mod stage_metrics;
 
+pub(crate) mod aggregate_dispatch;
 pub(crate) mod batch_handoff;
 pub mod combine;
 pub(crate) mod combine_dispatch;
