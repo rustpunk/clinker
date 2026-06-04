@@ -347,11 +347,10 @@ impl ExecutionPlanDag {
     /// input, via the rustc-shaped walker
     /// `render_unordered_streaming_error`.
     pub(crate) fn select_aggregation_strategies(&mut self) -> Result<(), PipelineError> {
-        use crate::aggregation::{
-            AggregateStrategy, StreamingEligibility, qualifies_for_streaming,
-        };
+        use crate::aggregation::{StreamingEligibility, qualifies_for_streaming};
         use crate::config::AggregateStrategyHint;
         use crate::plan::properties::{Confidence, render_unordered_streaming_error};
+        use crate::plan::types::AggregateStrategy;
 
         // Collect target indices first to avoid holding a borrow on `graph`
         // while mutating `node_properties`.
@@ -553,7 +552,7 @@ impl crate::pipeline::memory::SchedulingHint for ExecutionPlanDag {
 
 /// Internal carrier for `select_aggregation_strategies` resolution result.
 struct ResolvedStrategy {
-    strategy: crate::aggregation::AggregateStrategy,
+    strategy: crate::plan::types::AggregateStrategy,
     fallback_reason: Option<String>,
     skipped_streaming_available: bool,
     qualified_sort_order: Option<Vec<SortField>>,

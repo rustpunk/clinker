@@ -29,19 +29,7 @@ use indexmap::IndexMap;
 
 use crate::plan::combine::CombineInput;
 use crate::plan::row_type::QualifiedField;
-
-/// Which side of a combine a matched record came from.
-///
-/// `Probe` is the driver (streaming) side; `Build` is the materialized
-/// hash-table side. A combine has exactly one probe qualifier and one
-/// build qualifier — N-ary user-authored combines are rewritten by the
-/// plan-time decomposition pass into a chain of binary combines, so by
-/// the time this enum is consulted every combine in the DAG is binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum JoinSide {
-    Build,
-    Probe,
-}
+use crate::plan::types::JoinSide;
 
 /// Compile-time resolution table built once per combine node.
 ///

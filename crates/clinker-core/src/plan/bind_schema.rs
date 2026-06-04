@@ -40,6 +40,7 @@ use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
+use crate::plan::types::JoinSide;
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
 
@@ -3066,8 +3067,7 @@ fn bind_combine(
         // where-clause — collect mode has no body, but the residual
         // predicate (if any) still drives a `CombineResolver` at
         // probe time.
-        let mut resolved_map: HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> =
-            HashMap::new();
+        let mut resolved_map: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
         for stmt in &typed_where.program.statements {
             for sub in statement_exprs(stmt) {
                 walk_expr_for_qualified_refs(Some(sub), inputs, Some(&driving), &mut resolved_map);
@@ -3246,9 +3246,7 @@ fn resolve_combine_body_columns(
     typed: &TypedProgram,
     inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
     driver_qualifier: Option<&str>,
-) -> HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> {
-    use crate::executor::combine::JoinSide;
-
+) -> HashMap<QualifiedField, (JoinSide, u32)> {
     let mut out: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
     for stmt in &typed.program.statements {
         for sub in statement_exprs(stmt) {
@@ -3299,10 +3297,8 @@ fn walk_expr_for_qualified_refs(
     expr: Option<&Expr>,
     inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
     driver_qualifier: Option<&str>,
-    out: &mut HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)>,
+    out: &mut HashMap<QualifiedField, (JoinSide, u32)>,
 ) {
-    use crate::executor::combine::JoinSide;
-
     let Some(expr) = expr else {
         return;
     };

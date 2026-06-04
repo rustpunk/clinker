@@ -15,7 +15,6 @@ use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
 use cxl::eval::ProgramEvaluator;
 use petgraph::graph::NodeIndex;
 
-use crate::aggregation::AggregateStrategy;
 use crate::config::ErrorStrategy;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{
@@ -27,6 +26,7 @@ use crate::executor::dispatch::{
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use crate::plan::types::AggregateStrategy;
 
 /// Execute the `Aggregation` arm for `node_idx`: select hash or streaming
 /// strategy, ingest the predecessor's records (per-record for hash, sorted

@@ -9,10 +9,12 @@ pub mod extraction;
 pub mod index;
 pub mod properties;
 pub mod row_type;
+pub mod types;
 
 pub use compiled::{ChannelIdentity, CompiledPlan};
 pub use composition_body::{BoundBody, CompositionBodyId};
 pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};
+pub use types::{AggregateStrategy, JoinSide};
 
 pub use properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,

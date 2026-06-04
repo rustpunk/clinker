@@ -25,12 +25,11 @@ use serde::Serialize;
 
 use std::sync::Arc;
 
-use crate::aggregation::AggregateStrategy;
 use crate::config::{AggregateConfig, OutputConfig, RouteMode, SortField, SourceConfig};
-use crate::executor::combine::JoinSide;
 use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 use crate::plan::row_type::QualifiedField;
+use crate::plan::types::{AggregateStrategy, JoinSide};
 use crate::span::Span;
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;

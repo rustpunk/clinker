@@ -1,7 +1,6 @@
-//! Plan-time aggregation strategy and the aggregation error taxonomy.
+//! The aggregation error taxonomy.
 //!
-//! Holds the lowest layer of the aggregation engine: the
-//! [`AggregateStrategy`] plan enum, the finalize-time
+//! Holds the lowest layer of the aggregation engine: the finalize-time
 //! [`AggregateEvalError`], the hot-loop [`HashAggError`], and the
 //! `HashAggError → PipelineError` mapping consumed by the executor
 //! dispatch arm. Every other aggregation submodule depends on these
@@ -9,21 +8,8 @@
 
 use clinker_record::accumulator::AccumulatorError;
 use cxl::eval::EvalError;
-use serde::{Deserialize, Serialize};
 
 use crate::error::PipelineError;
-
-/// Aggregation strategy selected at plan-compile time.
-///
-/// `Hash` is the universal default. `Streaming` is used when the input
-/// is provably sorted on the full group-by prefix — allowing a
-/// one-group-at-a-time fold that never materializes a hash table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AggregateStrategy {
-    Hash,
-    Streaming,
-}
 
 /// Errors that can arise while evaluating a residual in aggregate
 /// scope.
