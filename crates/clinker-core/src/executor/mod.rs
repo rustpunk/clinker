@@ -1643,31 +1643,10 @@ mod tests {
     }
 
     mod aggregation;
-    mod branching;
-    mod ck_aligned_partition_runtime;
     mod composition_port_admission_overshoot;
-    mod correlated_dlq;
-    mod correlated_dlq_retract;
-    mod correlated_post_aggregate_retract;
-    mod correlated_window_after_aggregate_retract;
-    mod correlated_window_retract;
-    mod cross_source_window_topology;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
-    mod format_dispatch;
     mod multi_output;
     mod nested_composition_overshoot;
-    mod post_aggregate_any_all;
-    mod post_aggregate_lag_lead;
-    mod post_aggregate_recompute_determinism;
-    mod post_aggregate_window;
-    mod post_aggregate_window_ranking;
-    mod post_aggregate_window_spilled;
-    mod post_combine_array_field;
-    mod post_combine_synthetic_ck;
-    mod post_combine_window_strategies;
-    mod record_source_transport;
     mod scheduling;
-    mod strict_pipeline_zero_overhead;
-    mod window_recompute_correctness;
 }

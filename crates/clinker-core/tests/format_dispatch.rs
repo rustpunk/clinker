@@ -4,8 +4,13 @@
 //! format reader/writer based on `InputFormat`/`OutputFormat` config enums.
 //! Uses small in-memory payloads (5-10 records) for correctness, not benchmarks.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::error::PipelineError;
+use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_record::PipelineCounters;
+use std::collections::HashMap;
 use std::io::Cursor;
 
 /// Construct a minimal NDJSON input as in-memory bytes.
@@ -55,12 +60,12 @@ fn run_format_test(
     input_name: &str,
     input_data: Cursor<Vec<u8>>,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let output_buf = SharedBuffer::new();
 
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         input_name.to_string(),
-        crate::executor::single_file_reader("test.csv", Box::new(input_data)),
+        clinker_core::executor::single_file_reader("test.csv", Box::new(input_data)),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         config.output_configs().next().unwrap().name.clone(),
@@ -68,8 +73,7 @@ fn run_format_test(
     )]);
 
     let params = test_params();
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+    let report = common::run_config(&config, readers, writers, &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))

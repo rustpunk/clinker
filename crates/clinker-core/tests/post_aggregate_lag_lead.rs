@@ -9,8 +9,10 @@
 //! `prev_total` column populated via `$window.lag(1).total` must
 //! reference the prior row in the partition's `sort_by` order.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::HashMap;
 
 const LAG_LEAD_PIPELINE: &str = r#"
@@ -63,7 +65,7 @@ nodes:
 "#;
 
 fn run_once(csv: &str) -> String {
-    let config = crate::config::parse_config(LAG_LEAD_PIPELINE).expect("parse");
+    let config = clinker_core::config::parse_config(LAG_LEAD_PIPELINE).expect("parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
@@ -71,9 +73,9 @@ fn run_once(csv: &str) -> String {
         shutdown_token: None,
         ..Default::default()
     };
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -83,8 +85,7 @@ fn run_once(csv: &str) -> String {
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-        .expect("pipeline must run");
+    common::run_config(&config, readers, writers, &params).expect("pipeline must run");
     buf.as_string()
 }
 

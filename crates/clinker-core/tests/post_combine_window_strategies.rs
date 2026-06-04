@@ -19,7 +19,7 @@
 //! emit-order non-determinism is fully absorbed by the partition-sort
 //! step, so window output values are stable.
 
-use super::*;
+use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
 /// HashBuildProbe combine + downstream window. Window's `partition_by`
 /// is the join key; `$window.sum(matched_amount)` over the join output
@@ -101,21 +101,21 @@ ENG,5000
 
     use clinker_bench_support::io::SharedBuffer;
     use std::collections::HashMap;
-    let config = crate::config::parse_config(yaml).expect("parse");
+    let config = clinker_core::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&crate::config::CompileContext::default())
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("compile");
-    let readers: crate::executor::SourceReaders = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
             ),
         ),
         (
             "depts".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(depts.as_bytes().to_vec())),
             ),
@@ -225,21 +225,21 @@ ENG,5000
 ";
     use clinker_bench_support::io::SharedBuffer;
     use std::collections::HashMap;
-    let config = crate::config::parse_config(yaml).expect("parse");
+    let config = clinker_core::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&crate::config::CompileContext::default())
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("compile");
-    let readers: crate::executor::SourceReaders = HashMap::from([
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
             ),
         ),
         (
             "depts".to_string(),
-            crate::executor::single_file_reader(
+            clinker_core::executor::single_file_reader(
                 "test.csv",
                 Box::new(std::io::Cursor::new(depts.as_bytes().to_vec())),
             ),

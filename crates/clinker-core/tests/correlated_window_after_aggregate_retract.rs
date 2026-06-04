@@ -17,15 +17,19 @@
 //! `correlated_post_aggregate_retract.rs` covers the no-window case
 //! for the same Aggregate (relaxed) lattice.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::error::PipelineError;
+use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 
 fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = crate::config::parse_config(yaml).unwrap();
+    let config = clinker_core::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -35,9 +39,9 @@ fn run_pipeline(
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
         ),
@@ -49,8 +53,7 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+    let report = common::run_config(&config, readers, writers, &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -118,8 +121,8 @@ nodes:
 ///    window's partition.
 #[test]
 fn aggregate_relaxed_then_window_compiles_without_e150() {
-    use crate::config::{CompileContext, parse_config};
-    use crate::plan::execution::PlanNode;
+    use clinker_core::config::{CompileContext, parse_config};
+    use clinker_core::plan::execution::PlanNode;
 
     let config = parse_config(D7_PIPELINE).expect("parse");
     let plan = config

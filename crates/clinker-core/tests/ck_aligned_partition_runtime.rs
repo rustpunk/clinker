@@ -4,8 +4,10 @@
 //! `partitions_dispatched` stays at zero even when a downstream
 //! Transform DLQs records.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::HashMap;
 
 /// Source → Transform(divide-by-zero on a known row) → Output. Without
@@ -64,10 +66,10 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
         ),
@@ -84,9 +86,7 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .expect("pipeline must run");
+    let report = common::run_config(&config, readers, writers, &params).expect("pipeline must run");
     let counters = report.counters;
 
     // o3 (HR, 30) hits divide-by-zero → 1 DLQ. Other rows reach the

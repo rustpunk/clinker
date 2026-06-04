@@ -7,8 +7,10 @@
 //! construction; any value churn surfaces HashMap-iteration leakage into
 //! the counter, a silent-partial-behavior smell.
 
-use super::*;
+mod common;
+
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core::executor::PipelineRunParams;
 use std::collections::{HashMap, HashSet};
 
 const PIPELINE: &str = r#"
@@ -70,7 +72,7 @@ O6,ENG,300
 ";
 
 fn run_once() -> u64 {
-    let config = crate::config::parse_config(PIPELINE).unwrap();
+    let config = clinker_core::config::parse_config(PIPELINE).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -79,9 +81,9 @@ fn run_once() -> u64 {
         ..Default::default()
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    let readers: clinker_core::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        crate::executor::single_file_reader(
+        clinker_core::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(CSV.as_bytes().to_vec())),
         ),
@@ -91,9 +93,8 @@ fn run_once() -> u64 {
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)
-            .expect("buffer-recompute pipeline must execute");
+    let report = common::run_config(&config, readers, writers, &params)
+        .expect("buffer-recompute pipeline must execute");
     report.counters.retraction.partitions_dispatched
 }
 
