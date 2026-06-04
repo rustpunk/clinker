@@ -1,0 +1,332 @@
+//! Output writer registry and the format-writer builders that back it.
+
+use std::collections::HashMap;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
+
+use clinker_record::Schema;
+
+use crate::config::{OutputConfig, OutputFormat};
+use crate::error::PipelineError;
+use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
+use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
+use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
+use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
+use clinker_format::traits::FormatWriter;
+use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+
+/// Output writer registry. Holds two parallel maps:
+///
+/// - `single`: one writer per output name (the legacy shape; matches
+///   one-Output-to-one-file pipelines).
+/// - `fan_out`: per-source-file writers for outputs flagged
+///   `fan_out_per_source_file` in the plan. Outer key is the output
+///   name; inner key is the source-file `Arc<str>` (matching the
+///   per-record path read from each record's `$source.file` engine-
+///   stamped column).
+///
+/// Auto-converts from `HashMap<String, Box<dyn Write + Send>>` so
+/// existing callers that don't need fan-out keep the simpler shape.
+#[derive(Default)]
+pub struct WriterRegistry {
+    pub single: HashMap<String, Box<dyn Write + Send>>,
+    pub fan_out: HashMap<String, HashMap<std::sync::Arc<str>, Box<dyn Write + Send>>>,
+}
+
+impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
+    fn from(single: HashMap<String, Box<dyn Write + Send>>) -> Self {
+        Self {
+            single,
+            fan_out: HashMap::new(),
+        }
+    }
+}
+
+/// Build a CsvWriterConfig from CSV output options and the top-level include_header flag.
+fn build_csv_writer_config(
+    opts: Option<&crate::config::CsvOutputOptions>,
+    include_header: Option<bool>,
+) -> CsvWriterConfig {
+    let mut config = CsvWriterConfig::default();
+    if let Some(h) = include_header {
+        config.include_header = h;
+    }
+    if let Some(opts) = opts
+        && let Some(ref d) = opts.delimiter
+        && let Some(b) = d.as_bytes().first()
+    {
+        config.delimiter = *b;
+    }
+    config
+}
+
+/// Build a JsonWriterConfig from JSON output options.
+fn build_json_writer_config(opts: Option<&crate::config::JsonOutputOptions>) -> JsonWriterConfig {
+    let mut config = JsonWriterConfig::default();
+    if let Some(opts) = opts {
+        if let Some(ref fmt) = opts.format {
+            config.format = match fmt {
+                crate::config::JsonOutputFormat::Array => JsonOutputMode::Array,
+                crate::config::JsonOutputFormat::Ndjson => JsonOutputMode::Ndjson,
+            };
+        }
+        if let Some(pretty) = opts.pretty {
+            config.pretty = pretty;
+        }
+    }
+    config
+}
+
+/// Build an XmlWriterConfig from XML output options.
+fn build_xml_writer_config(opts: Option<&crate::config::XmlOutputOptions>) -> XmlWriterConfig {
+    let mut config = XmlWriterConfig::default();
+    if let Some(opts) = opts {
+        if let Some(ref root) = opts.root_element {
+            config.root_element = root.clone();
+        }
+        if let Some(ref rec) = opts.record_element {
+            config.record_element = rec.clone();
+        }
+    }
+    config
+}
+
+fn build_fw_writer_config(
+    opts: Option<&crate::config::FixedWidthOutputOptions>,
+) -> FixedWidthWriterConfig {
+    let mut config = FixedWidthWriterConfig::default();
+    if let Some(opts) = opts
+        && let Some(ref sep) = opts.line_separator
+    {
+        config.line_separator = sep.clone();
+    }
+    config
+}
+
+/// Extract `Vec<FieldDef>` from an output config's schema for fixed-width format.
+///
+/// Fixed-width output requires explicit schema with field definitions specifying
+/// field names, widths, and optionally start positions, justification, and padding.
+fn extract_output_field_defs(
+    output: &OutputConfig,
+) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
+    let schema_source = output.schema.as_ref().ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width output format requires explicit schema with field definitions".into(),
+        ))
+    })?;
+    let def = match schema_source {
+        crate::config::SchemaSource::Inline(def) => def.clone(),
+        crate::config::SchemaSource::FilePath(path) => {
+            crate::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "failed to load output schema from '{path}': {e}",
+                )))
+            })?
+        }
+    };
+    def.fields.ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width output schema must have 'fields' defined".into(),
+        ))
+    })
+}
+
+/// Build a writer factory closure for the given output format.
+///
+/// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
+/// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
+/// and subsequent calls replay the captured header via `write_preset_header`.
+/// For fixed-width, the factory captures pre-resolved `FieldDef`s from the output schema.
+fn build_writer_factory(
+    format: &OutputFormat,
+    include_header: Option<bool>,
+    repeat_header: bool,
+    field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
+    include_engine_stamped: bool,
+) -> WriterFactory {
+    match format {
+        OutputFormat::Csv(opts) => {
+            let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            csv_config.include_engine_stamped = include_engine_stamped;
+            if repeat_header {
+                let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
+                let call_count = Arc::new(AtomicU32::new(0));
+                Box::new(move |counting_writer, schema| {
+                    let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let inner_csv =
+                        CsvWriter::new(counting_writer, schema.clone(), csv_config.clone());
+                    if seq == 0 {
+                        // First file: capture header from first record
+                        Ok(Box::new(HeaderCapturingCsvWriter::new(
+                            inner_csv,
+                            schema,
+                            Arc::clone(&shared_header),
+                        )))
+                    } else {
+                        // Subsequent files: replay captured header
+                        let mut csv = inner_csv;
+                        if let Some(header) = shared_header.lock().unwrap().as_ref() {
+                            csv.write_preset_header(header)?;
+                        }
+                        Ok(Box::new(csv))
+                    }
+                })
+            } else {
+                Box::new(move |counting_writer, schema| {
+                    Ok(Box::new(CsvWriter::new(
+                        counting_writer,
+                        schema,
+                        csv_config.clone(),
+                    )))
+                })
+            }
+        }
+        OutputFormat::Json(opts) => {
+            let mut json_config = build_json_writer_config(opts.as_ref());
+            json_config.include_engine_stamped = include_engine_stamped;
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(JsonWriter::new(
+                    counting_writer,
+                    schema,
+                    json_config.clone(),
+                )))
+            })
+        }
+        OutputFormat::Xml(opts) => {
+            let mut xml_config = build_xml_writer_config(opts.as_ref());
+            xml_config.include_engine_stamped = include_engine_stamped;
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(XmlWriter::new(
+                    counting_writer,
+                    schema,
+                    xml_config.clone(),
+                )))
+            })
+        }
+        OutputFormat::FixedWidth(opts) => {
+            let fw_config = build_fw_writer_config(opts.as_ref());
+            let fields = field_defs.expect(
+                "fixed-width writer factory requires field_defs — \
+                 build_format_writer must validate schema before calling",
+            );
+            Box::new(move |counting_writer, _schema| {
+                Ok(Box::new(FixedWidthWriter::new(
+                    counting_writer,
+                    fields.clone(),
+                    fw_config.clone(),
+                )?))
+            })
+        }
+    }
+}
+
+/// Build a format writer for an output config, handling both split and non-split paths.
+///
+/// For split outputs: creates a `SplittingWriter` with a file factory and writer factory.
+/// For non-split outputs: creates a single writer wrapped in `CountedFormatWriter`.
+pub(crate) fn build_format_writer(
+    output: &OutputConfig,
+    raw_writer: Box<dyn Write + Send>,
+    schema: Arc<Schema>,
+) -> Result<Box<dyn FormatWriter>, PipelineError> {
+    // Extract field definitions for fixed-width output (requires explicit schema).
+    let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
+        Some(extract_output_field_defs(output)?)
+    } else {
+        None
+    };
+
+    let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
+    let writer_factory = build_writer_factory(
+        &output.format,
+        output.include_header,
+        repeat_header,
+        field_defs,
+        output.include_correlation_keys,
+    );
+
+    if let Some(ref split) = output.split {
+        let policy = build_split_policy(split);
+        let output_path = output.path.clone();
+        let naming = split.naming.clone();
+        let if_exists = output.if_exists;
+        let unique_suffix_width = output.unique_suffix_width;
+
+        let file_factory: clinker_format::splitting::FileFactory =
+            Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                let bare = std::path::PathBuf::from(apply_split_naming(&output_path, &naming, seq));
+                let path_for_n =
+                    |n: Option<u64>| -> Result<std::path::PathBuf, crate::config::ConfigError> {
+                        Ok(match n {
+                            None => bare.clone(),
+                            Some(k) => {
+                                let suffix = if unique_suffix_width == 0 {
+                                    format!("-{k}")
+                                } else {
+                                    format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                                };
+                                crate::output::open::append_suffix_before_ext(&bare, &suffix)
+                            }
+                        })
+                    };
+                let (_path, file) = crate::output::open::open_output(if_exists, false, path_for_n)
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+                Ok(Box::new(BufWriter::with_capacity(65536, file)))
+            });
+
+        // SplittingWriter creates its own files; don't use raw_writer.
+        drop(raw_writer);
+
+        Ok(Box::new(SplittingWriter::new(
+            file_factory,
+            writer_factory,
+            schema,
+            policy,
+        )))
+    } else {
+        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+        let counter = SharedByteCounter::new();
+        let counting_writer = CountingWriter::new(
+            Box::new(buf_writer) as Box<dyn Write + Send>,
+            counter.clone(),
+        );
+        let inner = writer_factory(counting_writer, schema).map_err(PipelineError::Format)?;
+        Ok(Box::new(CountedFormatWriter::new(inner, counter)))
+    }
+}
+
+/// Convert serde `SplitConfig` to runtime `SplitPolicy`.
+fn build_split_policy(split: &crate::config::SplitConfig) -> SplitPolicy {
+    SplitPolicy {
+        max_records: split.max_records,
+        max_bytes: split.max_bytes,
+        group_key: split.group_key.clone(),
+        repeat_header: split.repeat_header,
+        oversize_group: match split.oversize_group {
+            crate::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
+            crate::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,
+            crate::config::SplitOversizeGroupPolicy::Allow => OversizeGroupPolicy::Allow,
+        },
+    }
+}
+
+/// Apply `{stem}_{seq:04}.{ext}` naming pattern to an output path.
+fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
+    let path = std::path::Path::new(base_path);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("dat");
+    let parent = path.parent().unwrap_or(std::path::Path::new(""));
+
+    let filename = naming
+        .replace("{stem}", stem)
+        .replace("{ext}", ext)
+        .replace("{seq:04}", &format!("{seq:04}"));
+
+    parent.join(filename).to_string_lossy().into_owned()
+}
