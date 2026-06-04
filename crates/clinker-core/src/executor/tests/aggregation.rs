@@ -21,7 +21,7 @@ mod dispatch {
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{AggregatorGroupState, HashAggregator};
+    use crate::aggregation::{AggregatorConfig, AggregatorGroupState, HashAggregator};
     use crate::config::ErrorStrategy;
     use crate::error::PipelineError;
     use crate::executor::tests::run_test;
@@ -89,16 +89,16 @@ mod dispatch {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
             spill_dir,
-            transform_name.to_string(),
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
@@ -1411,7 +1411,7 @@ mod two_phase_bytes_spill {
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{HashAggregator, group_by_sort_fields};
+    use crate::aggregation::{AggregatorConfig, HashAggregator, group_by_sort_fields};
     use crate::pipeline::sort_key::SortKeyEncoder;
 
     /// Compile a CXL aggregate snippet with a configurable memory budget
@@ -1464,16 +1464,16 @@ mod two_phase_bytes_spill {
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-        HashAggregator::new(
-            Arc::new(compiled),
+        HashAggregator::new(AggregatorConfig {
+            compiled: Arc::new(compiled),
             evaluator,
             output_schema,
             spill_schema,
             memory_budget,
-            None,
-            transform_name.to_string(),
-            crate::pipeline::memory::ConsumerHandle::new(),
-        )
+            spill_dir: None,
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        })
     }
 
     fn make_input_schema() -> Arc<Schema> {

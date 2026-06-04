@@ -38,14 +38,13 @@ mod hash;
 mod spill;
 
 pub use error::{AggregateEvalError, AggregateStrategy, HashAggError};
-pub use hash::{AccumulatorFactory, AggregateConsumer, HashAggregator};
+pub use hash::{AccumulatorFactory, AggregateConsumer, AggregatorConfig, HashAggregator};
 pub use spill::{AggSpillFile, SpillState};
 
 use hash::NullStorage;
 pub(crate) use hash::{empty_global_fold_row, finalize_group_inner, group_by_sort_fields};
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -395,31 +394,25 @@ impl AggregateStream {
     /// `PipelineError::Internal` (NOT `todo!()` / `unreachable!()`) per
     /// the DataFusion #12086 lesson on unreachable arms in long-lived
     /// executor dispatch tables.
-    #[allow(clippy::too_many_arguments)]
     pub fn for_node(
-        compiled: Arc<CompiledAggregate>,
-        evaluator: ProgramEvaluator,
         strategy: AggregateStrategy,
-        output_schema: Arc<Schema>,
-        spill_schema: Arc<Schema>,
-        memory_budget: usize,
-        spill_dir: Option<PathBuf>,
-        transform_name: String,
-        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+        config: AggregatorConfig,
     ) -> Result<Self, PipelineError> {
-        let _ = (&spill_schema, memory_budget, &spill_dir);
         match strategy {
-            AggregateStrategy::Hash => Ok(Self::Hash(Box::new(HashAggregator::new(
-                compiled,
-                evaluator,
-                output_schema,
-                spill_schema,
-                memory_budget,
-                spill_dir,
-                transform_name,
-                consumer_handle,
-            )))),
+            AggregateStrategy::Hash => Ok(Self::Hash(Box::new(HashAggregator::new(config)))),
             AggregateStrategy::Streaming => {
+                // The streaming path ignores the spill schema, memory
+                // budget, spill directory, and consumer handle: it folds
+                // a pre-sorted upstream key-by-key without accumulating an
+                // in-memory hash table, so there is nothing to spill or
+                // charge into the arbitrator.
+                let AggregatorConfig {
+                    compiled,
+                    evaluator,
+                    output_schema,
+                    transform_name,
+                    ..
+                } = config;
                 Ok(Self::Streaming(Box::new(StreamingAggregator::new_for_raw(
                     compiled,
                     evaluator,
