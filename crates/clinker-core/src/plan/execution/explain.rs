@@ -1,0 +1,1581 @@
+//! `--explain` rendering and JSON serialization for the execution plan DAG.
+//!
+//! Text/DOT/JSON views over [`ExecutionPlanDag`], plus the combine-aware
+//! [`ExplainJson`] wrapper. Plan-only: no executor, no I/O.
+
+use super::*;
+
+use std::collections::HashMap;
+
+use indexmap::IndexMap;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
+
+use crate::config::{PipelineConfig, RouteMode};
+
+/// Human-readable strategy label for the multi-line `--explain` block.
+/// `HashPartitionIEJoin` and `GraceHash` append their `1 << partition_bits`
+/// partition count so the planner's bucket choice surfaces without making
+/// the reader compute it. The bare-tag form is used elsewhere (header
+/// line, JSON tag), the spelled-out form here.
+fn combine_strategy_display(s: &crate::plan::combine::CombineStrategy) -> String {
+    use crate::plan::combine::CombineStrategy;
+    match s {
+        CombineStrategy::HashBuildProbe => "HashBuildProbe".to_string(),
+        CombineStrategy::InMemoryHash => "InMemoryHash".to_string(),
+        CombineStrategy::HashPartitionIEJoin { partition_bits } => {
+            format!(
+                "HashPartitionIEJoin ({} partitions)",
+                1u32 << *partition_bits
+            )
+        }
+        CombineStrategy::IEJoin => "IEJoin".to_string(),
+        CombineStrategy::SortMerge => "SortMerge".to_string(),
+        CombineStrategy::GraceHash { partition_bits } => {
+            format!("GraceHash ({} partitions)", 1u32 << *partition_bits)
+        }
+        CombineStrategy::BlockNestedLoop => "BlockNestedLoop".to_string(),
+    }
+}
+
+/// Compact predicate-shape label for N-ary step lines: `"equi"`,
+/// `"range"`, `"mixed"`, or `"residual"`. Each step in a decomposed
+/// chain renders one of these so the reader sees what kind of conjuncts
+/// the planner peeled off at that depth without having to count the
+/// summary fields by eye.
+fn format_predicate_kind(s: &crate::plan::combine::CombinePredicateSummary) -> &'static str {
+    match (s.equalities > 0, s.ranges > 0, s.has_residual) {
+        (true, false, false) => "equi",
+        (false, true, false) => "range",
+        (true, true, _) => "mixed",
+        (false, false, true) => "residual",
+        (true, false, true) => "equi+residual",
+        (false, true, true) => "range+residual",
+        (false, false, false) => "<empty>",
+    }
+}
+
+/// Human-readable label for `MatchMode`. Lowercase to match the YAML
+/// surface syntax (`match: first`, `match: all`, `match: collect`).
+fn format_match_mode(m: crate::config::pipeline_node::MatchMode) -> &'static str {
+    use crate::config::pipeline_node::MatchMode;
+    match m {
+        MatchMode::First => "first",
+        MatchMode::All => "all",
+        MatchMode::Collect => "collect",
+    }
+}
+
+/// Human-readable label for `OnMiss`. Lowercase to match the YAML
+/// surface syntax (`on_miss: null_fields | skip | error`).
+fn format_on_miss(o: crate::config::pipeline_node::OnMiss) -> &'static str {
+    use crate::config::pipeline_node::OnMiss;
+    match o {
+        OnMiss::NullFields => "null_fields",
+        OnMiss::Skip => "skip",
+        OnMiss::Error => "error",
+    }
+}
+
+/// Format a row count with comma thousands separators (e.g. `1,000,000`),
+/// returning the literal string `"null"` when the cardinality is unknown.
+/// Honest output (V-8-2): the planner only fills `estimated_cardinality`
+/// at sources that carry an explicit hint, so most inputs render `null` —
+/// matching DataFusion / Spark / DuckDB behavior when statistics are
+/// absent.
+fn format_estimated_rows(input: Option<&crate::plan::combine::CombineInput>) -> String {
+    match input.and_then(|ci| ci.estimated_cardinality) {
+        Some(n) => {
+            // Comma thousands separator, manually formatted (no
+            // dependency on `num-format` for one call site).
+            let s = n.to_string();
+            let mut out = String::with_capacity(s.len() + s.len() / 3);
+            let bytes = s.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if i > 0 && (bytes.len() - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(b as char);
+            }
+            out
+        }
+        None => "null".to_string(),
+    }
+}
+
+/// Format a byte count with the largest binary-prefix unit that keeps
+/// the magnitude under 1024. `64M` / `2G` style — matches the surface
+/// syntax of `pipeline.memory.limit` so users see the value back in the
+/// units they wrote.
+fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if n >= GIB && n.is_multiple_of(GIB) {
+        format!("{}G", n / GIB)
+    } else if n >= MIB && n.is_multiple_of(MIB) {
+        format!("{}M", n / MIB)
+    } else if n >= KIB && n.is_multiple_of(KIB) {
+        format!("{}K", n / KIB)
+    } else if n >= GIB {
+        format!("{:.2}G", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.2}M", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.2}K", n as f64 / KIB as f64)
+    } else {
+        format!("{}B", n)
+    }
+}
+
+/// Per-combine planned share of the pipeline-level memory limit. The
+/// runtime executor uses one shared `MemoryArbitrator`; the rendering
+/// divides the limit equally across the combine nodes visible in the
+/// DAG so a reader can predict a single combine's working-set
+/// allocation. `combine_count_total.max(1)` (V-8-1) guards against a
+/// zero divisor if the renderer is ever called for a DAG with no
+/// combines (e.g., a future API that surfaces this helper standalone).
+fn memory_budget_per_combine(total_limit_bytes: u64, combine_count_total: usize) -> u64 {
+    let combine_count = combine_count_total.max(1) as u64;
+    total_limit_bytes / combine_count
+}
+
+/// Render the planned-share memory budget line for a combine node. The
+/// `(planned share)` qualifier disambiguates the displayed value from a
+/// per-operator ceiling — without it, users read the displayed budget
+/// as a hard cap and report it as a bug when one combine's working set
+/// consumes the full pipeline limit. Soft limit follows the dual-
+/// threshold model on `MemoryArbitrator` (default 80%).
+fn format_memory_budget_line(planned_bytes: u64) -> String {
+    let soft_pct = 0.80_f64;
+    let soft_bytes = (planned_bytes as f64 * soft_pct) as u64;
+    format!(
+        "{} (soft: {}, hard: {})",
+        format_bytes(planned_bytes),
+        format_bytes(soft_bytes),
+        format_bytes(planned_bytes),
+    )
+}
+
+/// Describe a build input's role under the chosen strategy. Most
+/// strategies tag the build side as a plain `"build"`; sort-merge
+/// inputs are symmetric (both sides scan in lock-step) so the label
+/// reads `"build (sorted scan)"` to match the operator's own naming.
+fn describe_build_role(
+    s: &crate::plan::combine::CombineStrategy,
+    _build_name: &str,
+) -> &'static str {
+    use crate::plan::combine::CombineStrategy;
+    match s {
+        CombineStrategy::SortMerge => "build (sorted scan)",
+        _ => "build",
+    }
+}
+
+///
+/// Mirrors the runtime distinction visible in
+/// [`crate::executor::dispatch`]: nodes whose output bypasses
+/// `ctx.node_buffers` (fused Source / Transform chains and sink Outputs)
+/// charge no inter-stage memory against [`crate::pipeline::memory::MemoryArbitrator`];
+/// every other node materializes an intermediate buffer and is spill-eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferClass {
+    /// No `ctx.node_buffers` slot is admitted for this stage's output —
+    /// no `MemoryArbitrator` charge for this stage, no spill eligibility.
+    /// Today this covers fused Sources (their receiver is consumed
+    /// directly by the downstream fused arm) and every Output (sinks
+    /// write to their configured writer and never admit a buffer).
+    Streaming,
+    /// Records pass through a `ctx.node_buffers` slot between dispatch
+    /// arms. Each admission registers a `NodeBufferConsumer` whose
+    /// pull-mode `current_usage` reflects the slot's live footprint;
+    /// a soft-threshold trip spills the slot to disk.
+    Materialized,
+}
+
+impl BufferClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::Materialized => "materialized",
+        }
+    }
+}
+
+impl ExecutionPlanDag {
+    fn classify_node_buffers(&self, config: &PipelineConfig) -> HashMap<NodeIndex, BufferClass> {
+        // Delegate to the fusion classifier whose streaming verdict is
+        // decided by the same `streaming_output_producer` predicate the
+        // runtime sender install consults, so the `--explain` annotation
+        // can never drift from what the dispatcher actually streams.
+        // `StreamClass` is the verdict; `BufferClass` is this surface's
+        // render-time wrapper.
+        crate::executor::classify_stream_nodes(self, config)
+            .into_iter()
+            .map(|(idx, class)| {
+                let buffer_class = match class {
+                    crate::executor::StreamClass::Streaming => BufferClass::Streaming,
+                    crate::executor::StreamClass::Materialized => BufferClass::Materialized,
+                };
+                (idx, buffer_class)
+            })
+            .collect()
+    }
+
+    /// Format the execution plan for `--explain` display.
+    ///
+    /// `buffer_classes` carries the `streaming` / `materialized`
+    /// verdict per node so the **Physical Properties** section can
+    /// append a `buffer:` line — the pre-runtime signal that pipeline
+    /// authors use to see which stages will charge `MemoryArbitrator`.
+    /// Build it with [`Self::classify_node_buffers`] when a
+    /// `PipelineConfig` is in hand.
+    fn explain(
+        &self,
+        buffer_classes: &HashMap<NodeIndex, BufferClass>,
+        arbitration_policy_name: &str,
+    ) -> String {
+        let mut out = String::new();
+        out.push_str("=== Execution Plan ===\n\n");
+
+        out.push_str(&format!("Mode: {}\n", self.execution_summary()));
+        out.push_str(&format!(
+            "Indices to build: {}\n",
+            self.indices_to_build.len()
+        ));
+        let transform_count = self
+            .graph
+            .node_weights()
+            .filter(|n| matches!(n, PlanNode::Transform { .. }))
+            .count();
+        out.push_str(&format!("Transforms: {}\n", transform_count));
+        out.push_str(&format!(
+            "Output projections: {}\n",
+            self.output_projections.len()
+        ));
+        out.push_str(&format!("DAG nodes: {}\n", self.graph.node_count()));
+        // Pipeline-level arbitration policy. The active policy is the
+        // one `pipeline.memory.backpressure` selects (default `pause`
+        // → `BackPressurePreferred -> Priority`); rendering it here
+        // lets pipeline authors see the spill/pause posture before
+        // runtime.
+        out.push_str(&format!("arbitration: {}\n\n", arbitration_policy_name));
+
+        if !self.source_dag.is_empty() {
+            out.push_str("Source DAG:\n");
+            for (tier_idx, tier) in self.source_dag.iter().enumerate() {
+                out.push_str(&format!(
+                    "  Tier {}: {}\n",
+                    tier_idx,
+                    tier.sources.join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
+        for (i, spec) in self.indices_to_build.iter().enumerate() {
+            out.push_str(&format!("Index [{}]:\n", i));
+            out.push_str(&format!("  Root: {}\n", format_index_root(&spec.root)));
+            out.push_str(&format!("  Group by: {:?}\n", spec.group_by));
+            out.push_str(&format!(
+                "  Sort by: {:?}\n",
+                spec.sort_by.iter().map(|s| &s.field).collect::<Vec<_>>()
+            ));
+            out.push_str(&format!("  Arena fields: {:?}\n", spec.arena_fields));
+            out.push_str(&format!("  Already sorted: {}\n", spec.already_sorted));
+            if spec.requires_buffer_recompute {
+                out.push_str(
+                    "  Buffer recompute on commit: yes (worst-case memory = O(largest partition × per-row-size))\n",
+                );
+            }
+            out.push('\n');
+        }
+
+        for node in self.graph.node_weights() {
+            if let PlanNode::Transform {
+                name,
+                parallelism_class,
+                window_index,
+                partition_lookup,
+                ..
+            } = node
+            {
+                out.push_str(&format!("Transform '{name}':\n"));
+                out.push_str(&format!("  Parallelism: {parallelism_class:?}\n"));
+                out.push_str(&format!("  Window index: {window_index:?}\n"));
+                out.push_str(&format!("  Partition lookup: {partition_lookup:?}\n\n"));
+            }
+        }
+
+        // Show planner-synthesized Sort nodes.
+        for &idx in &self.topo_order {
+            if let PlanNode::Sort {
+                name, sort_fields, ..
+            } = &self.graph[idx]
+            {
+                out.push_str(&format!("[sort] {name}\n"));
+                out.push_str("  sort_fields:\n");
+                for sf in sort_fields {
+                    out.push_str(&format!(
+                        "    - {} {:?} (nulls {:?})\n",
+                        sf.field, sf.order, sf.null_order
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+
+        // Physical Properties (NodeProperties side-table). Only emitted
+        // when the property pass has run (post-compile DAGs).
+        if !self.node_properties.is_empty() {
+            out.push_str("=== Physical Properties ===\n\n");
+            for &idx in &self.topo_order {
+                let node = &self.graph[idx];
+                let Some(props) = self.node_properties.get(&idx) else {
+                    continue;
+                };
+                out.push_str(&format!("{}:\n", node.id_slug()));
+                match &props.ordering.sort_order {
+                    Some(order) => {
+                        let fields: Vec<String> = order.iter().map(|s| s.field.clone()).collect();
+                        out.push_str(&format!("  ordering: {}\n", fields.join(", ")));
+                    }
+                    None => out.push_str("  ordering: <none>\n"),
+                }
+                out.push_str(&format!(
+                    "  ordering_provenance: {:?}\n",
+                    props.ordering.provenance
+                ));
+                out.push_str(&format!("  partitioning: {:?}\n", props.partitioning.kind));
+                out.push_str(&format!(
+                    "  partitioning_provenance: {:?}\n",
+                    props.partitioning.provenance
+                ));
+                if let Some(class) = buffer_classes.get(&idx) {
+                    out.push_str(&format!("  buffer: {}\n", class.label()));
+                }
+                // Per-node arbitration parameters, derived at plan time
+                // from the runtime `MemoryConsumer` impls (see
+                // `arbitration_class`). Lower `spill_priority` = elected
+                // for spill first; `N/A` = the stage holds no spillable
+                // state. The three `predicted_*` values are the scheduler's
+                // inputs: `predicted_peak` is the live volume this node is
+                // expected to hold at its peak, `predicted_freed` is what it
+                // returns to the budget the instant it drains, and
+                // `predicted_subtree_reclaim` is the largest reclaim its
+                // whole downstream subtree eventually unlocks — the same
+                // numbers `next_runnable` weighs (headroom-fit on peak, then
+                // immediate-freed, then subtree-reclaim tiebreaks). All
+                // render `0B` when no file-size seed reached this node.
+                // Two-space indent so the buffer-class slicers (which stop at
+                // the first non-indented line) keep reading the stanza.
+                let ac = arbitration_class(node);
+                out.push_str(&format!(
+                    "  arbitration: spill_priority={}, can_back_pressure={}, \
+                     predicted_peak={}, predicted_freed={}, predicted_subtree_reclaim={}\n",
+                    ac.spill_priority
+                        .map_or_else(|| "N/A".to_string(), |p| p.to_string()),
+                    ac.can_back_pressure,
+                    format_bytes(props.predicted_peak_bytes),
+                    format_bytes(props.predicted_freed_bytes_on_complete),
+                    format_bytes(props.predicted_subtree_reclaim_bytes),
+                ));
+                out.push('\n');
+            }
+
+            // Buffer-edge pseudo-nodes: one entry per `node_buffers` slot
+            // between non-fused stages. The runtime keys `ctx.node_buffers`
+            // by the producer's `NodeIndex`, so the slot number printed
+            // here is that index — stable and identical to the slot the
+            // executor admits into. Every slot registers a
+            // `NodeBufferConsumer` (priority 0, the cheapest spill victim);
+            // its `can_back_pressure` is the slot's own flag, today always
+            // false at the admit site, so the producer-variant suffix is
+            // informational context only — it does not flip the flag.
+            let materialized_edges: Vec<(NodeIndex, NodeIndex)> = self
+                .topo_order
+                .iter()
+                .filter(|&&idx| buffer_classes.get(&idx) == Some(&BufferClass::Materialized))
+                .flat_map(|&producer| {
+                    self.graph
+                        .edges(producer)
+                        .map(move |edge| (producer, edge.target()))
+                })
+                .collect();
+            if !materialized_edges.is_empty() {
+                out.push_str("=== Buffer Edges ===\n\n");
+                for (producer, target) in materialized_edges {
+                    let producer_node = &self.graph[producer];
+                    let target_node = &self.graph[target];
+                    out.push_str(&format!(
+                        "edge {} -> {}:\n",
+                        producer_node.id_slug(),
+                        target_node.id_slug()
+                    ));
+                    out.push_str(&format!(
+                        "  buffer: node_buffer (slot={})\n",
+                        producer.index()
+                    ));
+                    // A node_buffer slot holds the producer's materialized
+                    // output, so its predicted peak is the producer's own
+                    // predicted volume; it frees that whole buffer once the
+                    // consumer has drained it. Both render `0B` when the
+                    // producer carried no volume seed.
+                    let producer_peak = self
+                        .node_properties
+                        .get(&producer)
+                        .map_or(0, |p| p.predicted_peak_bytes);
+                    out.push_str(&format!(
+                        "  arbitration: spill_priority=0, can_back_pressure=false, \
+                         predicted_peak={}, predicted_freed={} (producer: {})\n",
+                        format_bytes(producer_peak),
+                        format_bytes(producer_peak),
+                        producer_node.type_tag()
+                    ));
+                    out.push('\n');
+                }
+            }
+        }
+
+        // Show route info from graph nodes
+        for node in self.graph.node_weights() {
+            if let PlanNode::Route {
+                name,
+                mode,
+                branches,
+                default,
+                ..
+            } = node
+            {
+                out.push_str(&format!(
+                    "Route '{}' (mode: {}):\n",
+                    name,
+                    match mode {
+                        RouteMode::Exclusive => "exclusive",
+                        RouteMode::Inclusive => "inclusive",
+                    }
+                ));
+                for branch_name in branches {
+                    out.push_str(&format!(
+                        "  Branch '{}' → output '{}'\n",
+                        branch_name, branch_name
+                    ));
+                }
+                out.push_str(&format!(
+                    "  Default: '{}' → output '{}'\n\n",
+                    default, default
+                ));
+            }
+        }
+
+        // Combine blocks render only when artifacts are threaded through
+        // (`explain_with_artifacts` / `explain_full_with_artifacts`).
+        // Without artifacts, `combine_predicates` is unreachable and the
+        // detail block degrades to the summary line embedded in
+        // `display_name()`'s header. The memory-limit argument is ignored
+        // when artifacts is `None`; pass `0` rather than re-reading the
+        // default to avoid a config-coupling cycle here.
+        self.render_combine_section(&mut out, None, 0);
+
+        self.render_retraction_section(&mut out, None);
+
+        out
+    }
+
+    /// Render the retraction-cost block for content-relaxed aggregates
+    /// and buffer-mode windows.
+    ///
+    /// `config` is `Some` when the caller went through one of the
+    /// artifacts-aware entry points and can read the pipeline-level
+    /// `correlation_fanout_policy` default plus the `correlation_key`
+    /// used to classify aggregates. Without it the block still emits
+    /// per-window detail; aggregate detection requires the correlation
+    /// key, so the per-aggregate section is silent on the no-config
+    /// rendering and the policy line degrades to "unknown at this
+    /// rendering".
+    ///
+    /// The block is silent on pipelines whose every aggregate has
+    /// `group_by ⊇ correlation_key` so strict-correlation and
+    /// non-correlated `--explain` output stays identical to today's
+    /// text.
+    fn render_retraction_section(&self, out: &mut String, config: Option<&PipelineConfig>) {
+        let mut relaxed_aggregates: Vec<(&str, &PlanNode)> = Vec::new();
+        for &idx in &self.topo_order {
+            if let PlanNode::Aggregation {
+                name,
+                config: agg_cfg,
+                ..
+            } = &self.graph[idx]
+            {
+                let parent_ck = self
+                    .graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .next()
+                    .and_then(|p| self.node_properties.get(&p))
+                    .map(|p| p.ck_set.clone())
+                    .unwrap_or_default();
+                if group_by_omits_any_ck_field(&agg_cfg.group_by, &parent_ck) {
+                    relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
+                }
+            }
+        }
+        let buffer_mode_index_count = self
+            .indices_to_build
+            .iter()
+            .filter(|s| s.requires_buffer_recompute)
+            .count();
+
+        if relaxed_aggregates.is_empty() && buffer_mode_index_count == 0 {
+            return;
+        }
+
+        out.push_str("=== Retraction ===\n\n");
+
+        let policy_line = match config.and_then(|c| c.error_handling.correlation_fanout_policy) {
+            Some(p) => format!("{p:?}").to_lowercase(),
+            None => {
+                if config.is_some() {
+                    "any (default)".to_string()
+                } else {
+                    "unknown at this rendering (config not threaded)".to_string()
+                }
+            }
+        };
+        out.push_str(&format!(
+            "retraction enabled — {} relaxed aggregates, {} buffer-mode windows, fanout policy: {}.\n\n",
+            relaxed_aggregates.len(),
+            buffer_mode_index_count,
+            policy_line,
+        ));
+
+        for (name, node) in &relaxed_aggregates {
+            let PlanNode::Aggregation { compiled, .. } = node else {
+                continue;
+            };
+            let path_label = if compiled.requires_buffer_mode {
+                "BufferRequired"
+            } else if compiled.requires_lineage {
+                "Reversible"
+            } else {
+                // Unreachable on relaxed aggregates because the planner
+                // sets exactly one of the two flags; surface the
+                // inconsistency rather than fall back silently.
+                "unclassified"
+            };
+            // Cardinality estimate is honest: today's planner has no
+            // group-cardinality side-table to consult before the run,
+            // so the lineage memory ceiling is expressed as a per-row
+            // cost rather than a total. The `(input_row_id → group_index)`
+            // pair is `(u32, u32)` = 8 bytes; per-group `input_rows` Vec
+            // overhead is tracked alongside but its sum scales with the
+            // unknown group cardinality.
+            let lineage_per_row_bytes = if compiled.requires_lineage {
+                "~8 bytes/row"
+            } else {
+                "n/a (buffer-mode holds raw contributions)"
+            };
+            out.push_str(&format!("Aggregate '{name}':\n"));
+            out.push_str(&format!(
+                "  retraction: relaxed-CK enabled, {path_label} accumulator path, lineage memory {lineage_per_row_bytes} (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.\n",
+            ));
+            // Per-output-row cost of the synthetic shadow column the
+            // relaxed aggregate emits. ~16 B is the Value::Integer
+            // discriminant + the 8-byte i64 payload + the Vec slot
+            // overhead per row; the column lives at the tail of every
+            // emitted record and lifts the post-aggregate retract
+            // fan-out path for downstream failures.
+            out.push_str(&format!(
+                "  synthetic CK: $ck.aggregate.{name} (engine-stamped, +16 B/output-row, hidden from default writers)\n",
+            ));
+            out.push('\n');
+        }
+
+        for (i, spec) in self.indices_to_build.iter().enumerate() {
+            if !spec.requires_buffer_recompute {
+                continue;
+            }
+            // Per-row buffer cost = sum of arena-field value sizes; the
+            // arena uses `Value` so worst case is the per-row union of
+            // `arena_fields` sizes. Surface the field count and the
+            // `Value`-size order without a fake byte total because
+            // partition cardinality is also unknown at plan time. The
+            // arena field set itself appears in the upstream `Index`
+            // block above; not duplicated here because its ordering is
+            // deduplication-pass dependent and would be a noisy
+            // snapshot diff target.
+            let row_field_count = spec.arena_fields.len();
+            out.push_str(&format!(
+                "Window index [{i}] (root {}, partition_by {:?}):\n",
+                format_index_root(&spec.root),
+                spec.group_by,
+            ));
+            out.push_str(&format!(
+                "  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~{row_field_count}× sizeof(Value).\n",
+            ));
+            out.push_str(
+                "  worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.\n",
+            );
+            out.push('\n');
+        }
+
+        // Deferred regions: every relaxed-CK aggregate's commit-time
+        // sub-DAG. Sorted by producer name for deterministic snapshot
+        // output. Walk the per-producer view (each region keys every
+        // participating NodeIndex back to the same struct, so dedup
+        // by producer).
+        if !self.deferred_regions.is_empty() {
+            let mut by_producer: std::collections::BTreeMap<
+                String,
+                &crate::plan::deferred_region::DeferredRegion,
+            > = std::collections::BTreeMap::new();
+            for region in self.deferred_regions.values() {
+                let producer_name = self.graph[region.producer].name().to_string();
+                by_producer.entry(producer_name).or_insert(region);
+            }
+            for (producer_name, region) in by_producer {
+                let mut output_names: Vec<&str> = region
+                    .outputs
+                    .iter()
+                    .map(|idx| self.graph[*idx].name())
+                    .collect();
+                output_names.sort();
+                out.push_str(&format!(
+                    "Deferred Region: {producer_name} → [{}]\n",
+                    output_names.join(", ")
+                ));
+                out.push_str(&format!("  buffer_schema: {:?}\n", region.buffer_schema,));
+                out.push('\n');
+            }
+        }
+    }
+
+    /// `--explain` text with combine multi-line blocks. Identical to
+    /// [`Self::explain`] except that combine nodes — when paired with
+    /// the `CompileArtifacts` that produced this DAG — render a full
+    /// per-node block (strategy, inputs + roles, predicate decomposition
+    /// detail, match/on-miss policy, planned-share memory budget). N-ary
+    /// chains (`decomposed_from = Some(_)`) group under their original
+    /// user-declared name with numbered step lines.
+    pub fn explain_with_artifacts(
+        &self,
+        config: &PipelineConfig,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        total_memory_limit_bytes: u64,
+    ) -> String {
+        // Build the base block (everything except combines) by reusing
+        // `explain()` and then overwriting the combine section with the
+        // artifacts-aware render. `explain()` calls
+        // `render_combine_section(.., None, ..)` which is a no-op for
+        // every combine node when artifacts are absent — so the output
+        // of `explain()` already has no combine block to dedupe.
+        let classes = self.classify_node_buffers(config);
+        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy_name = policy.policy_name();
+        let mut out = self.explain(&classes, &policy_name);
+        self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
+        out
+    }
+
+    /// Render every combine node's multi-line block into `out`.
+    ///
+    /// Walks `topo_order` and groups nodes by `decomposed_from` so an
+    /// N-ary chain — N>2 user inputs, decomposed at plan time into a
+    /// chain of binary combines that share the original user-declared
+    /// name in `decomposed_from` — emits one group header followed by
+    /// numbered `Step N:` lines. Singleton combines render their own
+    /// block. Without `artifacts`, the function returns immediately
+    /// (predicate detail is unreachable; the header line on
+    /// `display_name()` is the only signal).
+    fn render_combine_section(
+        &self,
+        out: &mut String,
+        artifacts: Option<&crate::plan::bind_schema::CompileArtifacts>,
+        total_memory_limit_bytes: u64,
+    ) {
+        let Some(artifacts) = artifacts else {
+            return;
+        };
+
+        // Group decomposed combines under the original user-declared
+        // name; singleton combines key by their own name.
+        let mut combine_groups: IndexMap<String, Vec<NodeIndex>> = IndexMap::new();
+        for &idx in &self.topo_order {
+            if let PlanNode::Combine {
+                name,
+                decomposed_from,
+                ..
+            } = &self.graph[idx]
+            {
+                let key = decomposed_from.as_deref().unwrap_or(name).to_string();
+                combine_groups.entry(key).or_default().push(idx);
+            }
+        }
+
+        if combine_groups.is_empty() {
+            return;
+        }
+
+        let combine_count_total: usize = combine_groups.values().map(|v| v.len()).sum();
+        let planned_share =
+            memory_budget_per_combine(total_memory_limit_bytes, combine_count_total);
+
+        for (group_name, indices) in &combine_groups {
+            if indices.len() > 1 {
+                self.render_combine_group(out, group_name, indices, artifacts, planned_share);
+            } else {
+                self.render_combine_single(out, indices[0], artifacts, planned_share);
+            }
+        }
+    }
+
+    /// Render a singleton combine block (1:1 between user declaration
+    /// and plan node). The full multi-line block: strategy, driving
+    /// input + estimated rows, build inputs + roles, predicate
+    /// summary + per-bucket detail (PostgreSQL 3-tier), match mode,
+    /// on-miss policy, planned-share memory budget. Defensive paths
+    /// handle a combine whose `combine_predicates` entry is missing
+    /// (E303 fired at compile time) by rendering `<unselected>` /
+    /// summary-only — mirrors `display_name()`'s `<unselected>`
+    /// fallback for an unset driving input.
+    fn render_combine_single(
+        &self,
+        out: &mut String,
+        idx: NodeIndex,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        planned_share: u64,
+    ) {
+        let PlanNode::Combine {
+            name,
+            strategy,
+            driving_input,
+            build_inputs,
+            predicate_summary,
+            match_mode,
+            on_miss,
+            ..
+        } = &self.graph[idx]
+        else {
+            return;
+        };
+
+        let inputs_for_node = artifacts.combine_inputs.get(name);
+
+        out.push_str(&format!("Combine '{name}':\n"));
+        out.push_str(&format!(
+            "  Strategy: {}\n",
+            combine_strategy_display(strategy)
+        ));
+
+        let drive_label = if driving_input.is_empty() {
+            "<unselected>"
+        } else {
+            driving_input.as_str()
+        };
+        let drive_rows = format_estimated_rows(inputs_for_node.and_then(|m| m.get(drive_label)));
+        out.push_str(&format!(
+            "  Driving input: {drive_label} (probe, est. {drive_rows} rows)\n",
+        ));
+
+        for build_name in build_inputs {
+            let role = describe_build_role(strategy, build_name);
+            let rows =
+                format_estimated_rows(inputs_for_node.and_then(|m| m.get(build_name.as_str())));
+            out.push_str(&format!(
+                "  Build input: {build_name} ({role}, est. {rows} rows)\n",
+            ));
+        }
+
+        out.push_str(&format!(
+            "  Predicate: equalities={}, ranges={}, residual={}\n",
+            predicate_summary.equalities,
+            predicate_summary.ranges,
+            if predicate_summary.has_residual {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        if let Some(decomposed) = artifacts.combine_predicates.get(name) {
+            out.push_str(&decomposed.format_text());
+        }
+
+        out.push_str(&format!("  Match: {}\n", format_match_mode(*match_mode)));
+        out.push_str(&format!("  On miss: {}\n", format_on_miss(*on_miss)));
+        out.push_str(&format!(
+            "  Memory budget (planned share): {}\n",
+            format_memory_budget_line(planned_share),
+        ));
+        out.push('\n');
+    }
+
+    /// Render an N-ary decomposition group. The header reads
+    /// `Combine '<original>' (N inputs, binary decomposition):`
+    /// followed by one `Step k:` line per binary node in the chain.
+    /// The full input set is recovered by walking the first step's
+    /// `combine_inputs` entry (driver + build_inputs); subsequent
+    /// steps re-use the previous step's output as a virtual input,
+    /// so the visible "user input count" is `nodes.len() + 1`.
+    fn render_combine_group(
+        &self,
+        out: &mut String,
+        group_name: &str,
+        indices: &[NodeIndex],
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        planned_share: u64,
+    ) {
+        let nary_inputs = indices.len() + 1;
+        out.push_str(&format!(
+            "Combine '{group_name}' ({nary_inputs} inputs, binary decomposition):\n",
+        ));
+
+        for (i, &idx) in indices.iter().enumerate() {
+            let PlanNode::Combine {
+                name: step_name,
+                strategy,
+                driving_input,
+                build_inputs,
+                predicate_summary,
+                ..
+            } = &self.graph[idx]
+            else {
+                continue;
+            };
+
+            let drive = if driving_input.is_empty() {
+                "<unselected>"
+            } else {
+                driving_input.as_str()
+            };
+            let builds = if build_inputs.is_empty() {
+                "<none>".to_string()
+            } else {
+                build_inputs.join(", ")
+            };
+            out.push_str(&format!(
+                "  Step {}: {} ({} x {} ON {}) -> {}\n",
+                i + 1,
+                combine_strategy_tag(strategy),
+                drive,
+                builds,
+                format_predicate_kind(predicate_summary),
+                step_name,
+            ));
+
+            // Per-step predicate detail under the step line. The
+            // detail is indented one more level than a singleton
+            // block because each step is already nested under the
+            // group header.
+            if let Some(decomposed) = artifacts.combine_predicates.get(step_name) {
+                let detail = decomposed.format_text();
+                for line in detail.lines() {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+
+        // Shared planned-share memory budget for the group.
+        out.push_str(&format!(
+            "  Memory budget (planned share, per step): {}\n",
+            format_memory_budget_line(planned_share),
+        ));
+        out.push('\n');
+    }
+
+    /// Like [`Self::explain_full`] but emits the artifacts-aware
+    /// per-combine multi-line block alongside the existing transform /
+    /// sort / route blocks. Intended for the CLI `--explain` path
+    /// where the caller already holds the [`crate::plan::CompiledPlan`]
+    /// that produced this DAG.
+    pub fn explain_full_with_artifacts(
+        &self,
+        config: &PipelineConfig,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    ) -> String {
+        let total_limit = crate::pipeline::memory::parse_memory_limit_bytes(
+            config.pipeline.memory.limit.as_deref(),
+        );
+        let mut out = self.explain_with_artifacts(config, artifacts, total_limit);
+        // Re-render the retraction section with the pipeline config in
+        // scope so the fanout-policy line resolves to the user-visible
+        // setting. `explain()` (called inside `explain_with_artifacts`)
+        // already emitted a config-less variant; strip it before
+        // re-rendering to avoid duplicate blocks.
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
+        self.append_full_sections(&mut out, config);
+        out
+    }
+
+    /// Like [`Self::explain_text`] but routes through the artifacts-
+    /// aware text formatter so combine blocks render with full per-
+    /// node detail.
+    pub fn explain_text_with_artifacts(
+        &self,
+        config: &PipelineConfig,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    ) -> String {
+        let mut out = self.explain_full_with_artifacts(config, artifacts);
+        self.append_topology_section(&mut out);
+        out
+    }
+
+    /// Append the `CXL Expressions`, `Type Annotations`, `Memory Budget`
+    /// trailing sections that `explain_full` adds onto a base
+    /// `explain()` body. Factored so the artifacts-aware variant can
+    /// reuse them.
+    fn append_full_sections(&self, out: &mut String, config: &PipelineConfig) {
+        // CXL AST (reformatted expressions from config)
+        out.push_str("=== CXL Expressions ===\n\n");
+        for t in crate::executor::build_transform_specs(config) {
+            out.push_str(&format!("Transform '{}':\n", t.name));
+            for line in t.cxl_source().lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("  {}\n", trimmed));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Type annotations (inferred types per output field)
+        out.push_str("=== Type Annotations ===\n\n");
+        for node in self.graph.node_weights() {
+            if let PlanNode::Transform { name, .. } = node {
+                out.push_str(&format!(
+                    "Transform '{name}': (types inferred at compile time)\n"
+                ));
+            }
+        }
+        out.push('\n');
+
+        // Memory budget
+        out.push_str("=== Memory Budget ===\n\n");
+        let limit_status = config
+            .pipeline
+            .concurrency
+            .as_ref()
+            .and_then(|c| c.threads)
+            .map(|_| "configured")
+            .unwrap_or("default");
+        out.push_str(&format!("Memory limit: {}\n", limit_status));
+        out.push_str(&format!(
+            "Worker threads: {}\n",
+            self.parallelism.worker_threads
+        ));
+        out.push('\n');
+    }
+
+    /// Append the `DAG Topology` section that `explain_text` adds onto
+    /// a base `explain_full` body. Factored so the artifacts-aware
+    /// variant can reuse it without duplicating the topology walk.
+    fn append_topology_section(&self, out: &mut String) {
+        out.push_str("=== DAG Topology ===\n\n");
+        for &idx in &self.topo_order {
+            let node = &self.graph[idx];
+            let line_suffix = match node.span().synthetic_line_number() {
+                Some(line) => format!(" (line:{line})"),
+                None => String::new(),
+            };
+            match node {
+                PlanNode::Route {
+                    name,
+                    mode,
+                    branches,
+                    default,
+                    ..
+                } => {
+                    let mode_str = match mode {
+                        RouteMode::Exclusive => "exclusive",
+                        RouteMode::Inclusive => "inclusive",
+                    };
+                    out.push_str(&format!(
+                        "  ◆ FORK [route:{mode_str}] '{name}'{line_suffix}\n"
+                    ));
+                    for branch in branches {
+                        out.push_str(&format!("  ├──> {branch} → {branch}\n"));
+                    }
+                    out.push_str(&format!("  ├──> default → {default}\n"));
+                }
+                PlanNode::Merge { name, .. } => {
+                    out.push_str(&format!("  └──< MERGE '{name}'{line_suffix}\n"));
+                }
+                PlanNode::Aggregation { .. } => {
+                    out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Combine { .. } => {
+                    out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Source { .. }
+                | PlanNode::Transform { .. }
+                | PlanNode::Output { .. }
+                | PlanNode::Sort { .. }
+                | PlanNode::Composition { .. }
+                | PlanNode::CorrelationCommit { .. } => {
+                    let deps: Vec<String> = self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| self.graph[pred].name().to_string())
+                        .collect();
+                    if deps.is_empty() {
+                        out.push_str(&format!("  ● {}{line_suffix}\n", node.display_name()));
+                    } else {
+                        out.push_str(&format!("  │ {}{line_suffix}\n", node.display_name()));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    /// Full `--explain` output combining execution plan with config context.
+    pub fn explain_full(&self, config: &PipelineConfig) -> String {
+        let classes = self.classify_node_buffers(config);
+        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy_name = policy.policy_name();
+        let mut out = self.explain(&classes, &policy_name);
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
+
+        // CXL AST (reformatted expressions from config)
+        out.push_str("=== CXL Expressions ===\n\n");
+        for t in crate::executor::build_transform_specs(config) {
+            out.push_str(&format!("Transform '{}':\n", t.name));
+            for line in t.cxl_source().lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("  {}\n", trimmed));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Type annotations (inferred types per output field)
+        out.push_str("=== Type Annotations ===\n\n");
+        for node in self.graph.node_weights() {
+            if let PlanNode::Transform { name, .. } = node {
+                out.push_str(&format!(
+                    "Transform '{name}': (types inferred at compile time)\n"
+                ));
+            }
+        }
+        out.push('\n');
+
+        // Memory budget
+        out.push_str("=== Memory Budget ===\n\n");
+        let limit_status = config
+            .pipeline
+            .concurrency
+            .as_ref()
+            .and_then(|c| c.threads)
+            .map(|_| "configured")
+            .unwrap_or("default");
+        out.push_str(&format!("Memory limit: {}\n", limit_status));
+        out.push_str(&format!(
+            "Worker threads: {}\n",
+            self.parallelism.worker_threads
+        ));
+        out.push('\n');
+
+        out
+    }
+
+    pub fn explain_text(&self, config: &PipelineConfig) -> String {
+        let mut out = self.explain_full(config);
+
+        out.push_str("=== DAG Topology ===\n\n");
+        for &idx in &self.topo_order {
+            let node = &self.graph[idx];
+            let line_suffix = match node.span().synthetic_line_number() {
+                Some(line) => format!(" (line:{line})"),
+                None => String::new(),
+            };
+            match node {
+                PlanNode::Route {
+                    name,
+                    mode,
+                    branches,
+                    default,
+                    ..
+                } => {
+                    let mode_str = match mode {
+                        RouteMode::Exclusive => "exclusive",
+                        RouteMode::Inclusive => "inclusive",
+                    };
+                    out.push_str(&format!(
+                        "  ◆ FORK [route:{mode_str}] '{name}'{line_suffix}\n"
+                    ));
+                    for branch in branches {
+                        out.push_str(&format!("  ├──> {branch} → {branch}\n"));
+                    }
+                    out.push_str(&format!("  ├──> default → {default}\n"));
+                }
+                PlanNode::Merge { name, .. } => {
+                    out.push_str(&format!("  └──< MERGE '{name}'{line_suffix}\n"));
+                }
+                PlanNode::Aggregation { .. } => {
+                    // Sibling rendering: Aggregation gets its own topo
+                    // line, not nested inside an upstream Transform.
+                    out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Combine { .. } => {
+                    // Sibling rendering: combine appears on its own topo
+                    // line; the `◈` glyph distinguishes it from Aggregate
+                    // (`◇`), Route fork (`◆`), and Merge collector (`└──<`).
+                    // `display_name()` carries the strategy/drive/build
+                    // and predicate-shape suffix.
+                    out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Source { .. }
+                | PlanNode::Transform { .. }
+                | PlanNode::Output { .. }
+                | PlanNode::Sort { .. }
+                | PlanNode::Composition { .. }
+                | PlanNode::CorrelationCommit { .. } => {
+                    let deps: Vec<String> = self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| self.graph[pred].name().to_string())
+                        .collect();
+                    if deps.is_empty() {
+                        out.push_str(&format!("  ● {}{line_suffix}\n", node.display_name()));
+                    } else {
+                        out.push_str(&format!("  │ {}{line_suffix}\n", node.display_name()));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+        out
+    }
+
+    /// Render the DAG as Graphviz DOT.
+    pub fn explain_dot(&self) -> String {
+        format!(
+            "{:?}",
+            petgraph::dot::Dot::with_attr_getters(
+                &self.graph,
+                &[
+                    petgraph::dot::Config::EdgeNoLabel,
+                    petgraph::dot::Config::NodeNoLabel,
+                ],
+                &|_, edge| { format!(r#"label="{}""#, edge.weight().dependency_type.as_str()) },
+                &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
+            )
+        )
+    }
+}
+
+/// Render a [`PlanIndexRoot`] for `--explain` output. Source-rooted
+/// Node-rooted indices show as `node(<idx>)`, parent-node-rooted as
+/// `parent_node(<idx>)`. Windows whose upstream is a Source render
+/// as `node(<source_node_idx>)` — there is no separate
+/// source-rooted category at runtime.
+fn format_index_root(root: &crate::plan::index::PlanIndexRoot) -> String {
+    match root {
+        crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
+            format!("node({})", upstream.index())
+        }
+        crate::plan::index::PlanIndexRoot::ParentNode { upstream, .. } => {
+            format!("parent_node({})", upstream.index())
+        }
+    }
+}
+
+/// Escape a string for Graphviz DOT attribute values.
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Custom Serialize: flat node-list with schema_version, id slugs, depends_on.
+///
+/// Includes a `node_properties` map keyed by node *name* (not `NodeIndex`),
+/// ordered by topo position. Keying by name keeps the JSON contract stable
+/// for downstream consumers (Kiln canvas, debugger, third-party tooling)
+/// across recompiles where `NodeIndex` values change.
+impl Serialize for ExecutionPlanDag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("schema_version", "1")?;
+
+        // Build node list in topo order
+        struct NodeList<'a>(&'a ExecutionPlanDag);
+        impl<'a> Serialize for NodeList<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.0;
+                let mut seq = serializer.serialize_seq(Some(dag.topo_order.len()))?;
+                for &idx in &dag.topo_order {
+                    let node = &dag.graph[idx];
+                    // Collect depends_on from incoming edges
+                    let depends_on: Vec<String> = dag
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| dag.graph[pred].id_slug())
+                        .collect();
+
+                    let entry = NodeEntry {
+                        node,
+                        depends_on: &depends_on,
+                    };
+                    seq.serialize_element(&entry)?;
+                }
+                seq.end()
+            }
+        }
+
+        map.serialize_entry("nodes", &NodeList(self))?;
+
+        // node_properties keyed by node name, in topo order. Built as an
+        // IndexMap so the JSON object preserves topo iteration order.
+        struct PropsMap<'a>(&'a ExecutionPlanDag);
+        impl<'a> Serialize for PropsMap<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.0;
+                let mut m = serializer.serialize_map(Some(dag.topo_order.len()))?;
+                for &idx in &dag.topo_order {
+                    let name = dag.graph[idx].name();
+                    if let Some(props) = dag.node_properties.get(&idx) {
+                        m.serialize_entry(name, props)?;
+                    }
+                }
+                m.end()
+            }
+        }
+        map.serialize_entry("node_properties", &PropsMap(self))?;
+        map.end()
+    }
+}
+
+/// Helper for JSON node serialization.
+#[derive(Serialize)]
+struct NodeEntry<'a> {
+    #[serde(flatten)]
+    node: &'a PlanNode,
+    depends_on: &'a Vec<String>,
+}
+
+/// `--explain --format json` view: pairs an [`ExecutionPlanDag`] with
+/// the [`crate::plan::bind_schema::CompileArtifacts`] that produced it
+/// so each combine node serializes with full predicate detail
+/// (`equalities[].left/.right`, `ranges[].left/.op/.right`, residual
+/// flag), per-input role + estimated row count, and the planned-share
+/// memory budget bytes. Round-trips strictly through `serde::Serialize`
+/// (no `Deserialize`) — the JSON channel is consumer-only (Kiln canvas,
+/// third-party tooling).
+///
+/// Keeping the wrapper out of `ExecutionPlanDag` itself preserves the
+/// existing `serde_json::to_value(&dag)` / `to_string_pretty(&dag)`
+/// callers (which neither receive nor want artifacts) without bumping
+/// the JSON `schema_version`.
+pub struct ExplainJson<'a> {
+    dag: &'a ExecutionPlanDag,
+    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+}
+
+impl<'a> ExplainJson<'a> {
+    /// Build an artifacts-aware JSON view of an execution plan.
+    pub fn new(
+        dag: &'a ExecutionPlanDag,
+        artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    ) -> Self {
+        Self { dag, artifacts }
+    }
+}
+
+impl<'a> Serialize for ExplainJson<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("schema_version", "1")?;
+
+        // Combine-aware node list. Walks `topo_order` and emits a
+        // `CombineNodeEntry` for combine variants (carrying the
+        // artifacts-derived fields), falling back to the plain
+        // `NodeEntry` for everything else.
+        struct EnrichedNodeList<'a> {
+            dag: &'a ExecutionPlanDag,
+            artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+            combine_count_total: usize,
+            total_memory_limit: u64,
+        }
+        impl<'a> Serialize for EnrichedNodeList<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.dag;
+                let mut seq = serializer.serialize_seq(Some(dag.topo_order.len()))?;
+                let planned_share =
+                    memory_budget_per_combine(self.total_memory_limit, self.combine_count_total);
+                for &idx in &dag.topo_order {
+                    let node = &dag.graph[idx];
+                    let depends_on: Vec<String> = dag
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| dag.graph[pred].id_slug())
+                        .collect();
+                    if matches!(node, PlanNode::Combine { .. }) {
+                        let entry = CombineNodeEntry {
+                            node,
+                            depends_on: &depends_on,
+                            artifacts: self.artifacts,
+                            memory_budget_bytes: planned_share,
+                        };
+                        seq.serialize_element(&entry)?;
+                    } else {
+                        let entry = NodeEntry {
+                            node,
+                            depends_on: &depends_on,
+                        };
+                        seq.serialize_element(&entry)?;
+                    }
+                }
+                seq.end()
+            }
+        }
+
+        let combine_count_total = self
+            .dag
+            .graph
+            .node_weights()
+            .filter(|n| matches!(n, PlanNode::Combine { .. }))
+            .count();
+        // The pipeline-level memory limit is not threaded into the
+        // serializer; the JSON view always emits the per-combine
+        // share derived from the global default (512MB) divided by
+        // the combine count. Callers that have already overridden
+        // the limit see the correct share through the text path.
+        let total_memory_limit = crate::pipeline::memory::parse_memory_limit_bytes(None);
+
+        map.serialize_entry(
+            "nodes",
+            &EnrichedNodeList {
+                dag: self.dag,
+                artifacts: self.artifacts,
+                combine_count_total,
+                total_memory_limit,
+            },
+        )?;
+
+        // node_properties keyed by node name, in topo order. Mirrors
+        // the plain `ExecutionPlanDag` Serialize body.
+        struct PropsMap<'a>(&'a ExecutionPlanDag);
+        impl<'a> Serialize for PropsMap<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.0;
+                let mut m = serializer.serialize_map(Some(dag.topo_order.len()))?;
+                for &idx in &dag.topo_order {
+                    let name = dag.graph[idx].name();
+                    if let Some(props) = dag.node_properties.get(&idx) {
+                        m.serialize_entry(name, props)?;
+                    }
+                }
+                m.end()
+            }
+        }
+        map.serialize_entry("node_properties", &PropsMap(self.dag))?;
+        map.end()
+    }
+}
+
+/// Per-Combine-node JSON entry carrying the artifacts-derived
+/// predicate detail (`equalities[].left/.right`, `ranges[]`,
+/// `has_residual`), per-input role + cardinality, and the
+/// planned-share `memory_budget_bytes`. Flattens the underlying
+/// `PlanNode::Combine` shape to preserve every field the plain
+/// `ExecutionPlanDag` Serialize emits (strategy, driving_input,
+/// build_inputs, predicate_summary, match_mode, on_miss,
+/// decomposed_from) — extension only, no replacement.
+struct CombineNodeEntry<'a> {
+    node: &'a PlanNode,
+    depends_on: &'a Vec<String>,
+    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    memory_budget_bytes: u64,
+}
+
+impl<'a> Serialize for CombineNodeEntry<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Re-serialize the underlying PlanNode to a serde_json::Value
+        // so we can then layer the combine-specific extras on top.
+        // Going through Value here is the only way to mix derived-
+        // Serialize fields with manually-emitted ones without
+        // duplicating the variant's field list (which would drift
+        // the moment a new field is added to PlanNode::Combine).
+        let mut base = serde_json::to_value(self.node).map_err(serde::ser::Error::custom)?;
+        let obj = base.as_object_mut().ok_or_else(|| {
+            serde::ser::Error::custom("PlanNode::Combine did not serialize as a JSON object")
+        })?;
+
+        // depends_on (matches NodeEntry behavior).
+        obj.insert(
+            "depends_on".to_string(),
+            serde_json::Value::Array(
+                self.depends_on
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+
+        // Combine-specific extras. Pull from the variant fields plus
+        // the artifacts side-table.
+        if let PlanNode::Combine {
+            name,
+            strategy,
+            driving_input,
+            build_inputs,
+            ..
+        } = self.node
+        {
+            // Rich predicate detail.
+            let predicate_value = build_predicate_json(self.artifacts.combine_predicates.get(name));
+            obj.insert("predicate".to_string(), predicate_value);
+
+            // Per-input role + estimated rows.
+            let inputs_value = build_inputs_json(
+                self.artifacts.combine_inputs.get(name),
+                driving_input,
+                build_inputs,
+                strategy,
+            );
+            obj.insert("inputs".to_string(), inputs_value);
+
+            // Memory budget (planned share).
+            obj.insert(
+                "memory_budget_bytes".to_string(),
+                serde_json::Value::Number(self.memory_budget_bytes.into()),
+            );
+        }
+
+        base.serialize(serializer)
+    }
+}
+
+/// Build the rich `predicate` JSON object for a combine node:
+/// `{ equalities: [{left, right}], ranges: [{left, op, right}], has_residual }`.
+/// Returns the empty-shape object when `decomposed` is `None` (combine
+/// whose decomposition failed at compile time — E303 / E308).
+fn build_predicate_json(
+    decomposed: Option<&crate::plan::combine::DecomposedPredicate>,
+) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let mut obj = Map::new();
+    let (eqs, ranges, has_residual) = match decomposed {
+        Some(d) => {
+            let eqs: Vec<Value> = d
+                .equalities
+                .iter()
+                .map(|eq| {
+                    let mut m = Map::new();
+                    m.insert(
+                        "left".to_string(),
+                        Value::String(combine_operand_qualified(&eq.left_expr, &eq.left_input)),
+                    );
+                    m.insert(
+                        "right".to_string(),
+                        Value::String(combine_operand_qualified(&eq.right_expr, &eq.right_input)),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            let ranges: Vec<Value> = d
+                .ranges
+                .iter()
+                .map(|r| {
+                    let mut m = Map::new();
+                    m.insert(
+                        "left".to_string(),
+                        Value::String(combine_operand_qualified(&r.left_expr, &r.left_input)),
+                    );
+                    m.insert(
+                        "op".to_string(),
+                        Value::String(range_op_label(r.op).to_string()),
+                    );
+                    m.insert(
+                        "right".to_string(),
+                        Value::String(combine_operand_qualified(&r.right_expr, &r.right_input)),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            (eqs, ranges, d.residual.is_some())
+        }
+        None => (Vec::new(), Vec::new(), false),
+    };
+    obj.insert("equalities".to_string(), Value::Array(eqs));
+    obj.insert("ranges".to_string(), Value::Array(ranges));
+    obj.insert("has_residual".to_string(), Value::Bool(has_residual));
+    Value::Object(obj)
+}
+
+/// Build the `inputs` JSON map for a combine node:
+/// `{ <qualifier>: { role, estimated_rows } }`. `role` is `"probe"`
+/// for the driver, `"build"` (or `"build (sorted scan)"` for sort-merge)
+/// for the rest. `estimated_rows` is JSON `null` when the planner has
+/// no cardinality estimate — V-8-2 honest output, matching every
+/// surveyed engine's behavior in absence of statistics.
+fn build_inputs_json(
+    inputs_for_node: Option<&IndexMap<String, crate::plan::combine::CombineInput>>,
+    driving_input: &str,
+    build_inputs: &[String],
+    strategy: &crate::plan::combine::CombineStrategy,
+) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let mut obj = Map::new();
+
+    let mut emit_one = |name: &str, role: &str| {
+        let est = inputs_for_node
+            .and_then(|m| m.get(name))
+            .and_then(|ci| ci.estimated_cardinality);
+        let est_value = match est {
+            Some(n) => Value::Number(n.into()),
+            None => Value::Null,
+        };
+        let mut entry = Map::new();
+        entry.insert("role".to_string(), Value::String(role.to_string()));
+        entry.insert("estimated_rows".to_string(), est_value);
+        obj.insert(name.to_string(), Value::Object(entry));
+    };
+
+    if !driving_input.is_empty() {
+        emit_one(driving_input, "probe");
+    }
+    let build_role = describe_build_role(strategy, "");
+    for build in build_inputs {
+        emit_one(build.as_str(), build_role);
+    }
+    Value::Object(obj)
+}
+
+/// Stable string label for a `RangeOp` in JSON output.
+fn range_op_label(op: crate::plan::combine::RangeOp) -> &'static str {
+    use crate::plan::combine::RangeOp;
+    match op {
+        RangeOp::Lt => "lt",
+        RangeOp::Le => "le",
+        RangeOp::Gt => "gt",
+        RangeOp::Ge => "ge",
+    }
+}
+
+/// Render a conjunct operand `Expr` as a fully-qualified
+/// `<input>.<field>` string for JSON output. Non-trivial expressions
+/// (function calls, arithmetic) render as `"<input>.<expr>"` so the
+/// consumer can still bucket the operand by its driving input even
+/// when the underlying expression is opaque.
+fn combine_operand_qualified(expr: &cxl::ast::Expr, input: &std::sync::Arc<str>) -> String {
+    use cxl::ast::Expr;
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => parts
+            .iter()
+            .map(|p| p.as_ref())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => format!("{}.<expr>", input),
+    }
+}
