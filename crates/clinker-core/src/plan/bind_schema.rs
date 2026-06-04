@@ -1477,14 +1477,16 @@ fn bind_schema_inner(
             // actively migrating away from.
             PipelineNode::Combine { header, config } => {
                 bind_combine(
-                    &name,
-                    header,
-                    config,
-                    span,
+                    &CombineNodeBinding {
+                        name: &name,
+                        header,
+                        config,
+                        span,
+                        scoped_vars: &bind_ctx.scoped_vars,
+                    },
                     diags,
                     artifacts,
                     schema_by_name,
-                    &bind_ctx.scoped_vars,
                 );
             }
             PipelineNode::Composition {
@@ -1496,13 +1498,15 @@ fn bind_schema_inner(
                 ..
             } => {
                 bind_composition(
-                    &name,
-                    r#use,
-                    inputs,
-                    outputs,
-                    config,
-                    resources,
-                    span,
+                    &CompositionBindParams {
+                        node_name: &name,
+                        use_path: r#use,
+                        call_inputs: inputs,
+                        call_outputs: outputs,
+                        call_config: config,
+                        call_resources: resources,
+                        span,
+                    },
                     diags,
                     bind_ctx,
                     artifacts,
@@ -1515,25 +1519,44 @@ fn bind_schema_inner(
 
 // ─── Composition binding ────────────────────────────────────────────
 
+/// Immutable call-site inputs to [`bind_composition`]: the node's name and
+/// `use:` path, plus the four call-site override maps (`inputs:`,
+/// `outputs:`, `config:`, `resources:`) read off the
+/// `PipelineNode::Composition` variant. Grouped so the mutable binding
+/// accumulators (`diags`, `bind_ctx`, `artifacts`, parent scope) stay
+/// visually distinct from the read-only call-site data the function
+/// validates against the resolved signature.
+struct CompositionBindParams<'a> {
+    node_name: &'a str,
+    use_path: &'a Path,
+    call_inputs: &'a IndexMap<String, String>,
+    call_outputs: &'a IndexMap<String, String>,
+    call_config: &'a IndexMap<String, serde_json::Value>,
+    call_resources: &'a IndexMap<String, serde_json::Value>,
+    span: Span,
+}
+
 /// Bind a composition body at its call-site boundary.
 ///
 /// This is the `PipelineNode::Composition` arm of `bind_schema_inner`.
 /// It recursively binds the body as a sub-problem within a nested scope
 /// (preserve-and-recurse, not flatten-and-splice).
-#[allow(clippy::too_many_arguments)]
 fn bind_composition(
-    node_name: &str,
-    use_path: &Path,
-    call_inputs: &IndexMap<String, String>,
-    call_outputs: &IndexMap<String, String>,
-    call_config: &IndexMap<String, serde_json::Value>,
-    call_resources: &IndexMap<String, serde_json::Value>,
-    span: Span,
+    params: &CompositionBindParams<'_>,
     diags: &mut Vec<Diagnostic>,
     bind_ctx: &mut BindContext<'_>,
     artifacts: &mut CompileArtifacts,
     parent_schema_by_name: &mut HashMap<String, Row>,
 ) {
+    let &CompositionBindParams {
+        node_name,
+        use_path,
+        call_inputs,
+        call_outputs,
+        call_config,
+        call_resources,
+        span,
+    } = params;
     // 1. Resolve use_path to workspace-relative key and look up in symbol_table.
     let resolved_path = resolve_use_path(
         use_path,
@@ -2878,6 +2901,19 @@ fn propagate_aggregate(
 
 // ─── Combine arm (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────────────
 
+/// Immutable inputs describing the `PipelineNode::Combine` being bound:
+/// its node name, header (input qualifiers), body config, call-site
+/// span, and the enclosing scoped-vars registry. Grouped so
+/// [`bind_combine`]'s read-only node description stays separate from its
+/// mutable accumulators (`diags`, `artifacts`, the parent schema map).
+struct CombineNodeBinding<'a> {
+    name: &'a str,
+    header: &'a CombineHeader,
+    config: &'a CombineBody,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
 /// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
 ///
 /// Architecture: a single pass does merged-schema construction (C.1.1),
@@ -2902,17 +2938,19 @@ fn propagate_aggregate(
 ///
 /// E307 (undeclared upstream reference) is NOT emitted here — it fires
 /// from `ExecutionPlanDag::compile` during DAG wiring.
-#[allow(clippy::too_many_arguments)]
 fn bind_combine(
-    name: &str,
-    header: &CombineHeader,
-    config: &CombineBody,
-    span: Span,
+    node: &CombineNodeBinding<'_>,
     diags: &mut Vec<Diagnostic>,
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) {
+    let &CombineNodeBinding {
+        name,
+        header,
+        config,
+        span,
+        scoped_vars,
+    } = node;
     // E300: combine requires at least 2 inputs.
     if header.input.len() < 2 {
         diags.push(combine_e300(name, header.input.len(), span));
@@ -3015,11 +3053,13 @@ fn bind_combine(
     if let Some(Statement::Filter { predicate, .. }) = typed_where.program.statements.first() {
         walk_for_unknown_refs(
             predicate,
-            &merged_row,
-            name,
-            "E304",
-            "where-clause",
-            span,
+            CombineWalkContext {
+                merged_row: &merged_row,
+                combine_name: name,
+                err_code: "E304",
+                context: "where-clause",
+                combine_span: span,
+            },
             diags,
         );
     }
@@ -3195,8 +3235,15 @@ fn bind_combine(
     };
 
     // Post-walk for E308 (unknown / 3-part qualified refs in body).
+    let body_walk_cx = CombineWalkContext {
+        merged_row: &merged_row,
+        combine_name: name,
+        err_code: "E308",
+        context: "cxl body",
+        combine_span: span,
+    };
     for stmt in &body_typed.program.statements {
-        walk_statement_exprs(stmt, &merged_row, name, "E308", "cxl body", span, diags);
+        walk_statement_exprs(stmt, body_walk_cx, diags);
     }
 
     // E309: combine must produce at least one non-meta emit. Unlike
@@ -3504,6 +3551,22 @@ fn typecheck_combine_where(
     }
 }
 
+/// Immutable per-walk context shared by [`walk_for_unknown_refs`] and
+/// [`walk_statement_exprs`]: the merged combine row to resolve qualified
+/// refs against, plus the diagnostic-shaping fields (`combine_name`,
+/// `err_code`, `context`, `combine_span`) that every emitted E304/E308
+/// carries. `Copy` so the recursive walk threads it by value without a
+/// per-node borrow; the mutable `diags` accumulator stays a separate
+/// parameter because it cannot live in a `Copy` value.
+#[derive(Clone, Copy)]
+struct CombineWalkContext<'a> {
+    merged_row: &'a Row,
+    combine_name: &'a str,
+    err_code: &'a str,
+    context: &'a str,
+    combine_span: Span,
+}
+
 /// Emit E304/E308 for `QualifiedFieldRef`s that don't match the merged
 /// row, or that have 3+ parts (unsupported in combine context).
 ///
@@ -3511,31 +3574,24 @@ fn typecheck_combine_where(
 /// (which emits a loud `Ambiguous` error for multi-match bare refs in
 /// a qualified merged row). This walker only visits the qualified-ref
 /// forms.
-#[allow(clippy::too_many_arguments)]
-fn walk_for_unknown_refs(
-    expr: &Expr,
-    merged_row: &Row,
-    combine_name: &str,
-    err_code: &str,
-    context: &str,
-    combine_span: Span,
-    diags: &mut Vec<Diagnostic>,
-) {
+fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Vec<Diagnostic>) {
     match expr {
         Expr::QualifiedFieldRef { parts, .. } => {
             if parts.len() > 2 {
                 let joined: Vec<&str> = parts.iter().map(|s| s.as_ref()).collect();
                 diags.push(
                     Diagnostic::error(
-                        err_code.to_string(),
+                        cx.err_code.to_string(),
                         format!(
-                            "combine {combine_name:?} {context} references {:?} ({} parts); \
+                            "combine {:?} {} references {:?} ({} parts); \
                              combine supports only 2-part qualified references \
                              (`qualifier.field`)",
+                            cx.combine_name,
+                            cx.context,
                             joined.join("."),
                             parts.len()
                         ),
-                        LabeledSpan::primary(combine_span, String::new()),
+                        LabeledSpan::primary(cx.combine_span, String::new()),
                     )
                     .with_help(
                         "drop the extra path segment, or move multi-record logic into a \
@@ -3544,19 +3600,19 @@ fn walk_for_unknown_refs(
                 );
             } else if parts.len() == 2
                 && matches!(
-                    merged_row.lookup_qualified(&parts[0], &parts[1]),
+                    cx.merged_row.lookup_qualified(&parts[0], &parts[1]),
                     ColumnLookup::Unknown
                 )
             {
                 diags.push(
                     Diagnostic::error(
-                        err_code.to_string(),
+                        cx.err_code.to_string(),
                         format!(
-                            "combine {combine_name:?} {context} references unknown field \
+                            "combine {:?} {} references unknown field \
                              `{}.{}`",
-                            parts[0], parts[1]
+                            cx.combine_name, cx.context, parts[0], parts[1]
                         ),
-                        LabeledSpan::primary(combine_span, String::new()),
+                        LabeledSpan::primary(cx.combine_span, String::new()),
                     )
                     .with_help(
                         "declare the field in the upstream source's `schema:` block, or \
@@ -3566,53 +3622,13 @@ fn walk_for_unknown_refs(
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            walk_for_unknown_refs(
-                lhs,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
-            walk_for_unknown_refs(
-                rhs,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(lhs, cx, diags);
+            walk_for_unknown_refs(rhs, cx, diags);
         }
-        Expr::Unary { operand, .. } => walk_for_unknown_refs(
-            operand,
-            merged_row,
-            combine_name,
-            err_code,
-            context,
-            combine_span,
-            diags,
-        ),
+        Expr::Unary { operand, .. } => walk_for_unknown_refs(operand, cx, diags),
         Expr::Coalesce { lhs, rhs, .. } => {
-            walk_for_unknown_refs(
-                lhs,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
-            walk_for_unknown_refs(
-                rhs,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(lhs, cx, diags);
+            walk_for_unknown_refs(rhs, cx, diags);
         }
         Expr::IfThenElse {
             condition,
@@ -3620,136 +3636,40 @@ fn walk_for_unknown_refs(
             else_branch,
             ..
         } => {
-            walk_for_unknown_refs(
-                condition,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
-            walk_for_unknown_refs(
-                then_branch,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(condition, cx, diags);
+            walk_for_unknown_refs(then_branch, cx, diags);
             if let Some(eb) = else_branch {
-                walk_for_unknown_refs(
-                    eb,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(eb, cx, diags);
             }
         }
         Expr::Match { subject, arms, .. } => {
             if let Some(s) = subject {
-                walk_for_unknown_refs(
-                    s,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(s, cx, diags);
             }
             for arm in arms {
-                walk_for_unknown_refs(
-                    &arm.pattern,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
-                walk_for_unknown_refs(
-                    &arm.body,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(&arm.pattern, cx, diags);
+                walk_for_unknown_refs(&arm.body, cx, diags);
             }
         }
         Expr::MethodCall { receiver, args, .. } => {
-            walk_for_unknown_refs(
-                receiver,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(receiver, cx, diags);
             for a in args {
-                walk_for_unknown_refs(
-                    a,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(a, cx, diags);
             }
         }
         Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
             for a in args {
-                walk_for_unknown_refs(
-                    a,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(a, cx, diags);
             }
         }
         Expr::IndexAccess {
             receiver, index, ..
         } => {
-            walk_for_unknown_refs(
-                receiver,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
-            walk_for_unknown_refs(
-                index,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(receiver, cx, diags);
+            walk_for_unknown_refs(index, cx, diags);
         }
         Expr::Closure { body, .. } => {
-            walk_for_unknown_refs(
-                body,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(body, cx, diags);
         }
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
@@ -3769,84 +3689,27 @@ fn walk_for_unknown_refs(
 /// Walk every `Expr` inside a `Statement` and apply the unknown-ref
 /// check. Used for the body post-walk where statements may be Emit,
 /// Let, ExprStmt, Filter, or Trace.
-#[allow(clippy::too_many_arguments)]
-fn walk_statement_exprs(
-    stmt: &Statement,
-    merged_row: &Row,
-    combine_name: &str,
-    err_code: &str,
-    context: &str,
-    combine_span: Span,
-    diags: &mut Vec<Diagnostic>,
-) {
+fn walk_statement_exprs(stmt: &Statement, cx: CombineWalkContext<'_>, diags: &mut Vec<Diagnostic>) {
     match stmt {
         Statement::Emit { expr, .. }
         | Statement::Let { expr, .. }
         | Statement::ExprStmt { expr, .. } => {
-            walk_for_unknown_refs(
-                expr,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(expr, cx, diags);
         }
         Statement::Filter { predicate, .. } => {
-            walk_for_unknown_refs(
-                predicate,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(predicate, cx, diags);
         }
         Statement::Trace { guard, message, .. } => {
             if let Some(g) = guard {
-                walk_for_unknown_refs(
-                    g,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_for_unknown_refs(g, cx, diags);
             }
-            walk_for_unknown_refs(
-                message,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(message, cx, diags);
         }
         Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
         Statement::EmitEach { source, body, .. } => {
-            walk_for_unknown_refs(
-                source,
-                merged_row,
-                combine_name,
-                err_code,
-                context,
-                combine_span,
-                diags,
-            );
+            walk_for_unknown_refs(source, cx, diags);
             for inner in body {
-                walk_statement_exprs(
-                    inner,
-                    merged_row,
-                    combine_name,
-                    err_code,
-                    context,
-                    combine_span,
-                    diags,
-                );
+                walk_statement_exprs(inner, cx, diags);
             }
         }
     }
