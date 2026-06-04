@@ -132,35 +132,51 @@ fn emit_log(
     }
 }
 
-/// Create a LogTemplateContext from executor state.
-#[allow(clippy::too_many_arguments)]
+/// Run-stable logging context: everything available to a log template
+/// except the current record's fields, which vary per record and are
+/// supplied separately at context-build time.
+pub struct LogContext<'a> {
+    /// Transform name.
+    pub transform_name: &'a str,
+    /// Transform duration in milliseconds (only available in after_transform).
+    pub transform_duration_ms: Option<u64>,
+    /// Source file path.
+    pub source_file: &'a str,
+    /// Source row number.
+    pub source_row: u64,
+    /// Pipeline counters.
+    pub pipeline_ok_count: u64,
+    pub pipeline_dlq_count: u64,
+    pub pipeline_total_count: u64,
+    /// Pipeline name.
+    pub pipeline_name: &'a str,
+    /// Pipeline execution ID.
+    pub pipeline_execution_id: &'a str,
+    /// DLQ error category (only available in on_error).
+    pub dlq_error_category: Option<&'a str>,
+    /// DLQ error detail (only available in on_error).
+    pub dlq_error_detail: Option<&'a str>,
+}
+
+/// Create a LogTemplateContext by merging the current record's fields with
+/// the run-stable [`LogContext`].
 pub fn make_template_context<'a>(
     record_fields: &'a IndexMap<String, Value>,
-    transform_name: &'a str,
-    transform_duration_ms: Option<u64>,
-    source_file: &'a str,
-    source_row: u64,
-    pipeline_ok_count: u64,
-    pipeline_dlq_count: u64,
-    pipeline_total_count: u64,
-    pipeline_name: &'a str,
-    pipeline_execution_id: &'a str,
-    dlq_error_category: Option<&'a str>,
-    dlq_error_detail: Option<&'a str>,
+    ctx: &LogContext<'a>,
 ) -> LogTemplateContext<'a> {
     LogTemplateContext {
         record_fields,
-        transform_name,
-        transform_duration_ms,
-        source_file,
-        source_row,
-        pipeline_ok_count,
-        pipeline_dlq_count,
-        pipeline_total_count,
-        pipeline_name,
-        pipeline_execution_id,
-        dlq_error_category,
-        dlq_error_detail,
+        transform_name: ctx.transform_name,
+        transform_duration_ms: ctx.transform_duration_ms,
+        source_file: ctx.source_file,
+        source_row: ctx.source_row,
+        pipeline_ok_count: ctx.pipeline_ok_count,
+        pipeline_dlq_count: ctx.pipeline_dlq_count,
+        pipeline_total_count: ctx.pipeline_total_count,
+        pipeline_name: ctx.pipeline_name,
+        pipeline_execution_id: ctx.pipeline_execution_id,
+        dlq_error_category: ctx.dlq_error_category,
+        dlq_error_detail: ctx.dlq_error_detail,
     }
 }
 
@@ -188,17 +204,19 @@ mod tests {
     fn test_ctx(fields: &IndexMap<String, Value>) -> LogTemplateContext<'_> {
         make_template_context(
             fields,
-            "test",
-            None,
-            "input.csv",
-            1,
-            0,
-            0,
-            0,
-            "pipeline",
-            "exec-id",
-            None,
-            None,
+            &LogContext {
+                transform_name: "test",
+                transform_duration_ms: None,
+                source_file: "input.csv",
+                source_row: 1,
+                pipeline_ok_count: 0,
+                pipeline_dlq_count: 0,
+                pipeline_total_count: 0,
+                pipeline_name: "pipeline",
+                pipeline_execution_id: "exec-id",
+                dlq_error_category: None,
+                dlq_error_detail: None,
+            },
         )
     }
 
@@ -256,7 +274,20 @@ mod tests {
         let mut fire_count = 0;
         for i in 1..=300 {
             let _ctx = make_template_context(
-                &fields, "t", None, "f.csv", i, 0, 0, 0, "p", "e", None, None,
+                &fields,
+                &LogContext {
+                    transform_name: "t",
+                    transform_duration_ms: None,
+                    source_file: "f.csv",
+                    source_row: i,
+                    pipeline_ok_count: 0,
+                    pipeline_dlq_count: 0,
+                    pipeline_total_count: 0,
+                    pipeline_name: "p",
+                    pipeline_execution_id: "e",
+                    dlq_error_category: None,
+                    dlq_error_detail: None,
+                },
             );
             // We can't easily count tracing events, so we test the counter logic
             let d = &dispatcher.directives[0];
