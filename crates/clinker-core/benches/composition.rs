@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use clinker_core::config::{CompileContext, PipelineConfig};
-use clinker_core::yaml;
+use clinker_plan::config::{CompileContext, PipelineConfig};
+use clinker_plan::yaml;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

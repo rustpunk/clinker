@@ -163,7 +163,7 @@ pub struct BoundBody {
     /// (producer + members + outputs) is keyed to a clone of the
     /// region so dispatcher arms get O(1) lookup. Empty for bodies
     /// without a relaxed-CK Aggregate.
-    pub(crate) deferred_regions: HashMap<NodeIndex, DeferredRegion>,
+    pub deferred_regions: HashMap<NodeIndex, DeferredRegion>,
 
     /// Parent-continuation metadata for nested Composition nodes whose
     /// inner body (transitively) carries a deferred region. Keyed by
@@ -174,7 +174,7 @@ pub struct BoundBody {
     /// continuation surface as the parent dispatcher does. Empty for
     /// bodies that contain no nested Composition with a deferred
     /// region somewhere below.
-    pub(crate) parent_continuations: HashMap<NodeIndex, ParentContinuation>,
+    pub parent_continuations: HashMap<NodeIndex, ParentContinuation>,
 }
 
 impl BoundBody {
@@ -215,7 +215,7 @@ impl BoundBody {
 /// continuation worth recording. Centralized here so the three sites
 /// stay synchronized; a divergent answer between plan and runtime
 /// would silently strand commit-time work.
-pub(crate) fn body_or_descendants_have_deferred_region(
+pub fn body_or_descendants_have_deferred_region(
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     body: &BoundBody,
 ) -> bool {

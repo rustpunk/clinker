@@ -1,22 +1,29 @@
-//! Phase F: Execution plan emission.
+//! Execution plan emission.
 //!
 //! Compiles a `PipelineConfig` + CXL programs into an `ExecutionPlanDag`
 //! that orchestrates the pipeline via a petgraph DAG.
 
 // Decomposed into focused submodules; this hub holds the shared type layer
-// (PlanNode, PlanEdge, ExecutionPlanDag, PlanError) and re-exports each
-// submodule's surface so `crate::plan::execution::*` paths resolve unchanged.
+// (PlanNode, PlanEdge, ExecutionPlanDag) and re-exports each submodule's
+// surface so `crate::plan::execution::*` paths resolve unchanged.
 
 mod composition;
 mod dag;
 mod enforcer;
 mod explain;
+mod graph_util;
 mod scheduling;
+mod streaming_class;
 
 pub use composition::*;
 pub use dag::*;
 pub use enforcer::*;
 pub use explain::*;
+pub use graph_util::{compute_init_phase_node_set, single_predecessor};
+pub use streaming_class::{
+    StreamClass, classify_stream_nodes, compute_merge_interleave_fused_sources,
+    compute_transform_fused_sources, streaming_output_producer,
+};
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -323,8 +330,8 @@ pub enum PlanNode {
 /// Pre-resolved `(side, column-index)` map for combine body references.
 ///
 /// Produced by the CXL typechecker during combine body typechecking,
-/// consumed by [`crate::executor::combine::CombineResolverMapping::from_pre_resolved`]
-/// at executor start-up. One entry per qualified field the body reads.
+/// consumed by the executor's combine resolver mapping at executor
+/// start-up. One entry per qualified field the body reads.
 pub type ResolvedColumnMap = Arc<HashMap<QualifiedField, (JoinSide, u32)>>;
 
 /// Fully-resolved Source payload, populated by the
@@ -834,7 +841,7 @@ pub struct ExecutionPlanDag {
     /// the window-buffer-recompute pass in compile Stage 5. Keyed by
     /// every `NodeIndex` participating in a region (producer + members
     /// + outputs) so dispatch-arm lookup is O(1).
-    pub(crate) deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
+    pub deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
     /// Parent-continuation metadata per Composition node whose body
     /// (transitively) carries a deferred region. Keyed by the
     /// Composition's `NodeIndex` in this DAG. Populated alongside
@@ -842,8 +849,7 @@ pub struct ExecutionPlanDag {
     /// dispatcher consults this map after harvesting body output
     /// records to drive the parent's downstream chain on
     /// post-recompute data.
-    pub(crate) parent_continuations:
-        HashMap<NodeIndex, crate::plan::deferred_region::ParentContinuation>,
+    pub parent_continuations: HashMap<NodeIndex, crate::plan::deferred_region::ParentContinuation>,
 }
 
 /// Errors from execution plan compilation.

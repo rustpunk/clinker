@@ -1,7 +1,7 @@
-use clinker_core::CompositionBodyId;
-use clinker_core::config::CompileContext;
-use clinker_core::plan::bind_schema::CompileArtifacts;
-use clinker_core::plan::execution::PlanNode;
+use clinker_plan::CompositionBodyId;
+use clinker_plan::config::CompileContext;
+use clinker_plan::plan::bind_schema::CompileArtifacts;
+use clinker_plan::plan::execution::PlanNode;
 use std::path::PathBuf;
 
 fn manifest_dir() -> PathBuf {
@@ -14,8 +14,8 @@ fn fixture_workspace_root() -> PathBuf {
 }
 
 /// Parse a pipeline YAML string into a PipelineConfig.
-fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
-    clinker_core::yaml::from_str(yaml).expect("parse PipelineConfig")
+fn parse_pipeline(yaml: &str) -> clinker_plan::config::PipelineConfig {
+    clinker_plan::yaml::from_str(yaml).expect("parse PipelineConfig")
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
 
 #[test]
 fn scaffold_compiles() {
-    let _ = std::any::type_name::<clinker_core::plan::compiled::CompiledPlan>();
+    let _ = std::any::type_name::<clinker_plan::plan::compiled::CompiledPlan>();
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn test_compile_artifacts_fresh_body_id_monotonic() {
 
 #[test]
 fn test_compile_artifacts_insert_body_and_lookup() {
-    use clinker_core::BoundBody;
+    use clinker_plan::BoundBody;
 
     let mut artifacts = CompileArtifacts::default();
     let id = artifacts.fresh_body_id();
@@ -68,12 +68,12 @@ fn test_pipeline_node_composition_serde_skips_body_field() {
   inputs:
     data: source_node
 "#;
-    let nodes: Vec<clinker_core::yaml::Spanned<clinker_core::config::pipeline_node::PipelineNode>> =
+    let nodes: Vec<clinker_plan::yaml::Spanned<clinker_plan::config::pipeline_node::PipelineNode>> =
         serde_saphyr::from_str(yaml).expect("should deserialize");
 
     assert_eq!(nodes.len(), 1);
     match &nodes[0].value {
-        clinker_core::config::pipeline_node::PipelineNode::Composition { body, .. } => {
+        clinker_plan::config::pipeline_node::PipelineNode::Composition { body, .. } => {
             assert_eq!(*body, CompositionBodyId::SENTINEL);
         }
         other => panic!("expected Composition, got {:?}", other.type_tag()),
@@ -129,9 +129,9 @@ nodes:
 
     // Call bind_schema directly to inspect artifacts.
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -211,9 +211,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -292,9 +292,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -358,9 +358,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -424,9 +424,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -510,10 +510,10 @@ nodes:
 "#;
     let cfg = parse_pipeline(pipeline_yaml);
     let symbol_table =
-        clinker_core::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
+        clinker_plan::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
     let ctx = CompileContext::with_pipeline_dir(tmp.path(), PathBuf::new());
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -582,9 +582,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -679,10 +679,10 @@ nodes:
 "#;
     let cfg = parse_pipeline(pipeline_yaml);
     let symbol_table =
-        clinker_core::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
+        clinker_plan::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
     let ctx = CompileContext::with_pipeline_dir(tmp.path(), PathBuf::new());
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -760,10 +760,10 @@ nodes:
 "#;
     let cfg = parse_pipeline(pipeline_yaml);
     let symbol_table =
-        clinker_core::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
+        clinker_plan::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
     let ctx = CompileContext::with_pipeline_dir(tmp.path(), PathBuf::new());
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -830,9 +830,9 @@ nodes:
     let cfg = parse_pipeline(yaml);
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let symbol_table =
-        clinker_core::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
+        clinker_plan::scan_workspace_signatures(root.as_path()).expect("fixture corpus must load");
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -936,10 +936,10 @@ nodes:
 "#;
     let cfg = parse_pipeline(pipeline_yaml);
     let symbol_table =
-        clinker_core::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
+        clinker_plan::scan_workspace_signatures(tmp.path()).expect("temp corpus must load");
     let ctx = CompileContext::with_pipeline_dir(tmp.path(), PathBuf::new());
     let mut diags = Vec::new();
-    let _artifacts = clinker_core::plan::bind_schema::bind_schema(
+    let _artifacts = clinker_plan::plan::bind_schema::bind_schema(
         &cfg.nodes,
         &mut diags,
         &ctx,
@@ -965,23 +965,16 @@ nodes:
 // E100 eradication gate tests
 // ─────────────────────────────────────────────────────────────────────
 
-/// Gate 1: No "E100" string literal anywhere in crates/.
+/// Gate 1: No "E100" string literal in the node-taxonomy test corpus.
+/// The planning crate carries the matching gate over its own config and
+/// error sources.
 #[test]
 fn test_no_e100_in_codebase() {
-    let config_mod = include_str!("../src/config/mod.rs");
-    let error_rs = include_str!("../src/error.rs");
     let taxonomy_test = include_str!("node_taxonomy_lift_test.rs");
-
-    for (name, src) in [
-        ("config/mod.rs", config_mod),
-        ("error.rs", error_rs),
-        ("node_taxonomy_lift_test.rs", taxonomy_test),
-    ] {
-        assert!(
-            !src.contains("\"E100\""),
-            "found \"E100\" string literal in {name} — E100 should be fully retired"
-        );
-    }
+    assert!(
+        !taxonomy_test.contains("\"E100\""),
+        "found \"E100\" string literal in node_taxonomy_lift_test.rs — E100 should be fully retired"
+    );
 }
 
 /// Gate 2: End-to-end compile of a composition pipeline produces
@@ -1021,10 +1014,10 @@ fn test_pipeline_compile_with_workspace_root_binds_compositions() {
             );
             // Verify the body exists in artifacts via bind_schema.
             // We re-run bind_schema to get direct access to CompileArtifacts.
-            let symbol_table = clinker_core::scan_workspace_signatures(root.as_path())
+            let symbol_table = clinker_plan::scan_workspace_signatures(root.as_path())
                 .expect("fixture corpus must load");
             let mut diags = Vec::new();
-            let artifacts = clinker_core::plan::bind_schema::bind_schema(
+            let artifacts = clinker_plan::plan::bind_schema::bind_schema(
                 &cfg.nodes,
                 &mut diags,
                 &ctx,

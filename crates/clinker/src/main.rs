@@ -3,10 +3,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
 use clinker_core::metrics::{self, ExecutionMetrics};
-use clinker_core::pipeline::memory::parse_memory_limit_bytes;
+use clinker_plan::config::utils::parse_memory_limit_bytes;
+use clinker_plan::error::PipelineError;
 
 /// CXL streaming ETL engine.
 #[derive(Parser, Debug)]
@@ -516,7 +516,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    let mut pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
+    let mut pipeline_config = clinker_plan::config::load_config_with_vars(&args.config, &[])
         .map_err(PipelineError::Config)?;
 
     // Load the channel binding once if `--channel` was supplied. The
@@ -524,7 +524,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // binding is borrowed by the `--explain` arm and the main run.
     let channel_binding = match args.channel.as_deref() {
         Some(path) => Some(clinker_channel::ChannelBinding::load(path).map_err(|e| {
-            PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                 "channel '{}': {e}",
                 path.display(),
             )))
@@ -561,7 +561,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let (workspace_root, pipeline_dir) =
         resolve_compile_anchor(&args.config, args.base_dir.as_deref());
     let mut compile_ctx =
-        clinker_core::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
+        clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
 
     // Run identity values flow through Output path templates and the
@@ -599,7 +599,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     .and_then(|st| st.to_str().map(|s| s.to_string()))
             }
         });
-    let template_ctx = clinker_core::output::path_template::TemplateContext {
+    let template_ctx = clinker_plan::config::path_template::TemplateContext {
         source_name_default: source_name_default.as_deref(),
         source_name_by_node: source_name_by_node.clone(),
         channel: channel_binding.as_ref().map(|b| b.name.as_str()),
@@ -610,7 +610,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         n: None,
         unique_suffix_width: 0,
     };
-    clinker_core::output::path_template::resolve_output_path_templates_in_place(
+    clinker_plan::config::path_template::resolve_output_path_templates_in_place(
         &mut pipeline_config,
         &template_ctx,
     )
@@ -646,9 +646,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 );
             }
             ExplainFormat::Json => {
-                let view = clinker_core::plan::execution::ExplainJson::new(dag, artifacts);
+                let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts);
                 let json = serde_json::to_string_pretty(&view).map_err(|e| {
-                    PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                         "JSON serialization failed: {e}"
                     )))
                 })?;
@@ -664,7 +664,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Validate -n only valid with --dry-run
     if args.dry_run_n.is_some() && !args.dry_run {
         return Err(PipelineError::Config(
-            clinker_core::config::ConfigError::Validation(
+            clinker_plan::config::ConfigError::Validation(
                 "-n/--dry-run-n requires --dry-run flag".to_string(),
             ),
         ));
@@ -738,7 +738,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     for body in pipeline_config.source_bodies() {
         let source = &body.source;
         match &source.transport {
-            clinker_core::config::SourceTransport::File => {
+            clinker_plan::config::SourceTransport::File => {
                 let outcome = clinker_core::source::discovery::discover(source, &workspace_root)
                     .map_err(|e| {
                         use clinker_core::source::discovery::DiscoveryError;
@@ -751,8 +751,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                             DiscoveryError::TakeBothSpecified => "E218",
                             DiscoveryError::Io(_) => "E216",
                         };
-                        clinker_core::error::PipelineError::Config(
-                            clinker_core::config::ConfigError::Validation(format!(
+                        clinker_plan::error::PipelineError::Config(
+                            clinker_plan::config::ConfigError::Validation(format!(
                                 "[{code}] source '{}' discovery failed: {e}",
                                 source.name
                             )),
@@ -785,7 +785,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     clinker_core::executor::SourceInput::Files(slots),
                 );
             }
-            clinker_core::config::SourceTransport::Rest(rest_cfg) => {
+            clinker_plan::config::SourceTransport::Rest(rest_cfg) => {
                 // The rest transport bypasses fs discovery entirely. The
                 // reader is a row yielder driven on the ingest thread; the
                 // `{source_file}` fan-out side-table gets no file paths, so
@@ -796,7 +796,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     &body.schema.columns,
                     body.on_unmapped.clone(),
                 )
-                .map_err(clinker_core::error::PipelineError::Format)?;
+                .map_err(clinker_plan::error::PipelineError::Format)?;
                 source_files_by_name.insert(source.name.clone(), Vec::new());
                 readers.insert(
                     source.name.clone(),
@@ -902,7 +902,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let bare = std::path::PathBuf::from(&output.path);
         let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
-            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
+            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_plan::config::ConfigError> {
                 Ok(match n {
                     None => bare.clone(),
                     Some(k) => {
@@ -1237,10 +1237,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 /// outputs whose template lacks per-record tokens or whose input is
 /// `Single`-partitioned.
 fn output_is_fan_out(
-    dag: &clinker_core::plan::execution::ExecutionPlanDag,
+    dag: &clinker_plan::plan::execution::ExecutionPlanDag,
     output_name: &str,
 ) -> bool {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     dag.graph
         .node_indices()
         .find(|i| dag.graph[*i].name() == output_name)
@@ -1260,11 +1260,11 @@ fn output_is_fan_out(
 /// so we pick whichever parent is FilePartitioned. Returns `None`
 /// when the chain runs through a Merge that consumed partitioning.
 fn upstream_source_for_output(
-    dag: &clinker_core::plan::execution::ExecutionPlanDag,
+    dag: &clinker_plan::plan::execution::ExecutionPlanDag,
     output_name: &str,
 ) -> Option<String> {
-    use clinker_core::plan::execution::PlanNode;
-    use clinker_core::plan::properties::PartitioningKind;
+    use clinker_plan::plan::execution::PlanNode;
+    use clinker_plan::plan::properties::PartitioningKind;
     let start = dag
         .graph
         .node_indices()
@@ -1386,8 +1386,8 @@ fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
 /// `{n}` is shown literally (not expanded) when the policy is
 /// `unique_suffix` so the user can see where the collision counter
 /// would land at runtime.
-fn print_resolved_outputs(config: &clinker_core::config::PipelineConfig) {
-    use clinker_core::config::IfExistsPolicy;
+fn print_resolved_outputs(config: &clinker_plan::config::PipelineConfig) {
+    use clinker_plan::config::IfExistsPolicy;
     println!("=== Resolved Outputs ===");
     println!();
     for output in config.output_configs() {
@@ -1432,7 +1432,7 @@ fn hostname_string() -> String {
 fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Mode 1: --code — look up error/warning code documentation.
     if let Some(ref code) = args.code {
-        match clinker_core::plan::explain_provenance::explain_code(code) {
+        match clinker_plan::plan::explain_provenance::explain_code(code) {
             Some(doc) => {
                 print!("{doc}");
                 return Ok(());
@@ -1457,10 +1457,10 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let yaml = std::fs::read_to_string(config_path)?;
-    let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[])
+    let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
         .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
-    let pipeline_config: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(&interpolated)
+    let pipeline_config: clinker_plan::config::PipelineConfig =
+        clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
 
     // Resolve workspace root and pipeline_dir so composition `use:` paths
@@ -1476,7 +1476,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| std::path::Path::new(""))
         .to_path_buf();
     let compile_ctx =
-        clinker_core::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
+        clinker_plan::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|diags| {
         let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
@@ -1484,7 +1484,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let output =
-        clinker_core::plan::explain_provenance::explain_field_provenance(&compiled_plan, field)
+        clinker_plan::plan::explain_provenance::explain_field_provenance(&compiled_plan, field)
             .map_err(|e| format!("{e}"))?;
 
     print!("{output}");

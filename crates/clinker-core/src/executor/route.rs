@@ -15,7 +15,7 @@ pub(crate) struct CompiledRouteBranch {
 pub(crate) struct CompiledRoute {
     pub(super) branches: Vec<CompiledRouteBranch>,
     pub(super) default: String,
-    pub(super) mode: crate::config::RouteMode,
+    pub(super) mode: clinker_plan::config::RouteMode,
 }
 
 impl CompiledRoute {
@@ -34,7 +34,7 @@ impl CompiledRoute {
         ctx: &EvalContext,
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
         match self.mode {
-            crate::config::RouteMode::Exclusive => {
+            clinker_plan::config::RouteMode::Exclusive => {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
@@ -48,7 +48,7 @@ impl CompiledRoute {
                 }
                 Ok(vec![self.default.clone()])
             }
-            crate::config::RouteMode::Inclusive => {
+            clinker_plan::config::RouteMode::Inclusive => {
                 let mut matched = Vec::new();
                 for branch in &mut self.branches {
                     match branch

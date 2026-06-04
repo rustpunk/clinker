@@ -366,6 +366,7 @@ dependencies = [
  "clinker-core-types",
  "clinker-format",
  "clinker-net",
+ "clinker-plan",
  "clinker-record",
  "indexmap",
  "miette",
@@ -401,6 +402,7 @@ dependencies = [
  "chrono",
  "clinker-bench-support",
  "clinker-core",
+ "clinker-plan",
  "criterion",
  "cxl",
  "indexmap",
@@ -414,8 +416,8 @@ name = "clinker-channel"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "clinker-core",
  "clinker-core-types",
+ "clinker-plan",
  "clinker-record",
  "criterion",
  "indexmap",
@@ -441,6 +443,7 @@ dependencies = [
  "clinker-channel",
  "clinker-core-types",
  "clinker-format",
+ "clinker-plan",
  "clinker-record",
  "criterion",
  "crossbeam-channel",
@@ -507,11 +510,37 @@ dependencies = [
  "clinker-bench-support",
  "clinker-core",
  "clinker-format",
+ "clinker-plan",
  "clinker-record",
  "indexmap",
  "serde_json",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "clinker-plan"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "clinker-core-types",
+ "clinker-format",
+ "clinker-record",
+ "cxl",
+ "fastrand",
+ "indexmap",
+ "lz4_flex",
+ "miette",
+ "petgraph",
+ "postcard",
+ "regex",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -533,7 +562,7 @@ name = "clinker-schema"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "clinker-core",
+ "clinker-plan",
  "serde",
  "serde-saphyr",
  "serde_json",

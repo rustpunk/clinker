@@ -7,8 +7,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use clinker_channel::binding::ChannelBinding;
 use clinker_channel::overlay::apply_channel_overlay;
-use clinker_core::config::composition::{LayerKind, ResolvedValue};
 use clinker_core_types::Span;
+use clinker_plan::config::composition::{LayerKind, ResolvedValue};
 
 /// Build a synthetic channel binding with `n` config entries.
 fn synthetic_binding(n: usize) -> ChannelBinding {
@@ -36,14 +36,14 @@ fn bench_channel_merge(c: &mut Criterion) {
                     .join("clinker-core/tests/fixtures");
                 let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
                 let yaml = std::fs::read_to_string(&yaml_path).unwrap();
-                let config: clinker_core::config::PipelineConfig =
-                    clinker_core::yaml::from_str(&yaml).unwrap();
-                let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+                let config: clinker_plan::config::PipelineConfig =
+                    clinker_plan::yaml::from_str(&yaml).unwrap();
+                let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
                     &root,
                     PathBuf::from("pipelines"),
                 );
                 let mut plan =
-                    clinker_core::config::PipelineConfig::compile(&config, &ctx).unwrap();
+                    clinker_plan::config::PipelineConfig::compile(&config, &ctx).unwrap();
 
                 // Seed 100 provenance entries matching the binding's keys.
                 let prov = plan.provenance_mut();

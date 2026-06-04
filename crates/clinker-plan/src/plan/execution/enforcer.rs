@@ -297,8 +297,8 @@ impl ExecutionPlanDag {
     ///
     /// One commit node is created and every existing [`PlanNode::Output`]
     /// gains an outgoing edge to it. Output writes from the dispatcher
-    /// arm route into [`crate::executor::dispatch::CorrelationGroupBuffer`]s
-    /// keyed by group; the commit arm walks those buffers at end-of-DAG.
+    /// arm route into per-group correlation buffers keyed by group; the
+    /// commit arm walks those buffers at end-of-DAG.
     /// Idempotent — calling twice with a commit already present is a
     /// no-op.
     ///

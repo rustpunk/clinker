@@ -12,7 +12,7 @@
 //! - the Source→Aggregate edge renders a priority-0, non-back-pressureable
 //!   `node_buffer` slot.
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 use std::io::Write;
 use std::path::Path;
 

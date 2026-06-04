@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::PipelineError;
+use clinker_plan::error::PipelineError;
 
 /// Provenance metadata written alongside an output file.
 ///

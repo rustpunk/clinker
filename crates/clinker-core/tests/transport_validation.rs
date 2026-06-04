@@ -6,7 +6,7 @@
 //! the rule is enforced at parse/validate time so a misconfigured source
 //! fails before discovery runs.
 
-use clinker_core::config::parse_config;
+use clinker_plan::config::parse_config;
 
 fn pipeline_with_source(source_body: &str) -> String {
     format!(
@@ -40,7 +40,7 @@ fn explicit_file_transport_with_one_matcher_parses() {
     let src = config.source_configs().next().unwrap();
     assert!(matches!(
         src.transport,
-        clinker_core::config::SourceTransport::File
+        clinker_plan::config::SourceTransport::File
     ));
     assert_eq!(src.path.as_deref(), Some("./data/in.csv"));
 }
@@ -61,7 +61,7 @@ fn omitted_transport_defaults_to_file_and_parses_byte_identically() {
     assert_eq!(s_with.transport, s_without.transport);
     assert!(matches!(
         s_without.transport,
-        clinker_core::config::SourceTransport::File
+        clinker_plan::config::SourceTransport::File
     ));
 }
 
@@ -91,12 +91,12 @@ fn rest_transport_parses_with_nested_kind_and_pagination() {
     let config = parse_config(&pipeline_with_source(body)).expect("rest transport must parse");
     let src = config.source_configs().next().unwrap();
     match &src.transport {
-        clinker_core::config::SourceTransport::Rest(c) => {
+        clinker_plan::config::SourceTransport::Rest(c) => {
             assert_eq!(c.url, "https://api.example.com/v1/rows");
             assert_eq!(c.max_pages, 25);
             assert!(matches!(
                 c.pagination,
-                clinker_core::config::RestPagination::LinkHeader
+                clinker_plan::config::RestPagination::LinkHeader
             ));
         }
         other => panic!("expected rest transport, got {other:?}"),

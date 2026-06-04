@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, SourceTransport, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
 use clinker_net::build_rest_source;
+use clinker_plan::config::{CompileContext, SourceTransport, parse_config};
 
 const TOTAL_ROWS: usize = 5;
 const PAGE_SIZE: usize = 2;

@@ -933,8 +933,14 @@ fn grace_hash_should_fire(
     inputs: &IndexMap<String, CombineInput>,
     mem_limit_str: Option<&str>,
 ) -> bool {
-    use crate::pipeline::grace_hash::GRACE_RECORD_BYTES_ESTIMATE;
-    use crate::pipeline::memory::parse_memory_limit_bytes;
+    use crate::config::utils::parse_memory_limit_bytes;
+
+    // Conservative per-record byte estimate when computing whether to fire
+    // GraceHash strategy. Underestimating biases toward HashBuildProbe;
+    // overestimating biases toward GraceHash. 1 KiB matches the
+    // production-record size observed on enrich pipelines.
+    const GRACE_RECORD_BYTES_ESTIMATE: u64 = 1024;
+
     let estimates: Vec<u64> = inputs
         .values()
         .filter_map(|ci| ci.estimated_cardinality)

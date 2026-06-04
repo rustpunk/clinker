@@ -20,6 +20,7 @@
 //! react-only behavior pass `Box::new(NoOpPolicy)` explicitly.
 
 use arc_swap::ArcSwap;
+use clinker_plan::plan::scheduling_hint::SchedulingHint;
 use petgraph::graph::NodeIndex;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -105,36 +106,6 @@ fn rss_bytes_impl() -> Option<u64> {
     None
 }
 
-/// Discriminant tag carried on every arbitrator charge so a budget
-/// overflow can name which surface tripped the hard limit. Sources are
-/// summed against the single `limit` counter; the tag is for
-/// diagnostics and downstream routing only.
-///
-/// Append-only. Removing a variant is a breaking change for any
-/// `MemoryBudgetExceeded` consumer that destructures `source`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BudgetCategory {
-    /// Source-rooted arenas, node-rooted arenas, deferred-region
-    /// admission buffers, grace-hash build/probe accounting, and the
-    /// disk-spill quota counter. Every budget-tracked allocation that
-    /// is not `ctx.node_buffers` falls under this tag.
-    Arena,
-    /// `ctx.node_buffers` — the inter-stage handoff layer between
-    /// non-fused operators. Each slot registers a `NodeBufferConsumer`
-    /// wrapper; the arbitrator's pull-mode `current_usage` reads the
-    /// slot's live footprint at every policy poll.
-    NodeBuffer,
-}
-
-impl std::fmt::Display for BudgetCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Arena => f.write_str("arena"),
-            Self::NodeBuffer => f.write_str("node_buffer"),
-        }
-    }
-}
-
 /// Stable identifier for a memory consumer registered with the
 /// arbitrator. Assigned by `MemoryArbitrator` at registration time and
 /// referenced by every subsequent arbitration decision.
@@ -144,8 +115,8 @@ pub struct ConsumerId(u32);
 /// Reason a `MemoryConsumer::try_spill` call could not free the
 /// requested number of bytes.
 ///
-/// Distinct from `crate::pipeline::spill::SpillError`, which models
-/// disk-write and serialization failures. `ConsumerSpillError` is the
+/// Distinct from [`clinker_plan::SpillError`], which models disk-write
+/// and serialization failures. `ConsumerSpillError` is the
 /// arbitrator-facing signal that a victim either failed to write or
 /// could not free enough state to satisfy the target.
 #[derive(Debug)]
@@ -419,59 +390,6 @@ pub trait MemoryConsumer: Send + Sync {
     fn resume(&self) {}
 }
 
-/// Per-node memory predictions plus a stable ordering key, supplied to
-/// [`MemoryArbitrator::next_runnable`] so it can choose which of several
-/// currently-runnable nodes to dispatch by predicted memory impact.
-///
-/// The plan is the natural implementer: the byte predictions are the
-/// plan-time volume estimates carried on each node's `NodeProperties`,
-/// and the stable index is the node's position in the plan's canonical
-/// topological order. `next_runnable` treats this as a read-only view —
-/// it never mutates the plan and calls each method at most once per
-/// candidate per invocation.
-///
-/// All three methods key off [`NodeIndex`]. The caller guarantees the
-/// hint knows every index in the `runnable` slice it passes; an unknown
-/// index is the caller's contract violation, and an implementer should
-/// answer `0` / a stable fallback rather than panic.
-pub trait SchedulingHint: Send + Sync {
-    /// Predicted peak live bytes for `id` — the volume the node holds at
-    /// once at its peak, in the same units as [`MemoryArbitrator::soft_limit`].
-    /// `0` means "unknown" (no file-size seed reached the node); an
-    /// unknown node participates normally in the tiebreaks but never
-    /// trips the headroom filter, which is what keeps behavior unchanged
-    /// when no statistics are available.
-    fn predicted_peak_bytes(&self, id: NodeIndex) -> u64;
-
-    /// Predicted bytes `id` releases back to the budget when it finishes
-    /// draining (a blocking operator drops its accumulated state on its
-    /// last emit; a streaming node frees nothing). Used as the higher-
-    /// priority freed tiebreak: a node that frees memory the instant it
-    /// completes (a ready blocking operator) reclaims headroom *now*, so
-    /// it is preferred over one that merely unlocks an eventual reclaim.
-    fn predicted_freed_bytes_on_complete(&self, id: NodeIndex) -> u64;
-
-    /// Predicted largest reclaimable footprint anywhere in the subtree
-    /// rooted at `id` — the headroom that running this node's chain to
-    /// completion eventually unlocks (for a fresh Source, its downstream
-    /// blocking operator's accumulated state). The lower-priority freed
-    /// tiebreak: it distinguishes candidates that free nothing *now* but
-    /// whose chains differ in eventual reclaim, so the scheduler launches
-    /// the independent chain whose completion frees the most first. `0`
-    /// when nothing downstream accumulates, so it never disturbs the
-    /// "no-estimates == today's order" floor.
-    fn predicted_subtree_reclaim_bytes(&self, id: NodeIndex) -> u64;
-
-    /// Position of `id` in the plan's canonical topological order — the
-    /// deterministic final tiebreak. This must be the SAME order the
-    /// executor walks today (front-to-back over `topo_order`), so that
-    /// when every candidate's `predicted_peak_bytes` is `0` the chosen
-    /// node is exactly the one a plain topo walk would dispatch first.
-    /// That equivalence is the load-bearing "no-estimates == today's
-    /// order" invariant the downstream dispatch integration relies on.
-    fn stable_index(&self, id: NodeIndex) -> usize;
-}
-
 /// Policy that selects which `MemoryConsumer` gives up memory when
 /// the arbitrator reports pressure.
 ///
@@ -628,7 +546,7 @@ impl ArbitrationPolicy for BackPressurePreferred {
 /// Keeps the concrete policy types ([`Priority`], [`LargestFirst`],
 /// [`BackPressurePreferred`]) and their wiring inside the memory
 /// subsystem: the config layer carries only the plain
-/// [`BackpressureKnob`](crate::config::BackpressureKnob) selector and
+/// [`BackpressureKnob`](clinker_plan::config::BackpressureKnob) selector and
 /// never names a policy type. Called by every production path that turns
 /// parsed config into a live arbitrator.
 ///
@@ -638,8 +556,8 @@ impl ArbitrationPolicy for BackPressurePreferred {
 ///   otherwise spill cheapest first. This is the runtime default.
 /// - `both` → `BackPressurePreferred -> LargestFirst`: prefer pausing,
 ///   otherwise force the largest holder regardless of priority.
-pub fn build_policy(knob: crate::config::BackpressureKnob) -> Box<dyn ArbitrationPolicy> {
-    use crate::config::BackpressureKnob;
+pub fn build_policy(knob: clinker_plan::config::BackpressureKnob) -> Box<dyn ArbitrationPolicy> {
+    use clinker_plan::config::BackpressureKnob;
     match knob {
         BackpressureKnob::Spill => Box::new(Priority),
         BackpressureKnob::Pause => MemoryArbitrator::default_policy(),
@@ -1146,28 +1064,10 @@ impl MemoryArbitrator {
     }
 }
 
-/// Parse memory limit string to bytes. Supports "512M", "2G",
-/// "512m", "2g", raw integer string. Returns 512MB default if
-/// `None` or unparseable.
-pub fn parse_memory_limit_bytes(s: Option<&str>) -> u64 {
-    s.and_then(|s| {
-        let s = s.trim();
-        if let Some(num) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-            num.parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
-        } else if let Some(num) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-            num.parse::<u64>().ok().map(|n| n * 1024 * 1024)
-        } else if let Some(num) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-            num.parse::<u64>().ok().map(|n| n * 1024)
-        } else {
-            s.parse::<u64>().ok()
-        }
-    })
-    .unwrap_or(512 * 1024 * 1024) // 512MB default
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_plan::BudgetCategory;
 
     #[test]
     fn pause_signal_fast_path_when_not_paused() {
@@ -1276,7 +1176,7 @@ mod tests {
 
     #[test]
     fn test_parse_memory_limit_default_512mb() {
-        let limit = parse_memory_limit_bytes(None);
+        let limit = clinker_plan::config::utils::parse_memory_limit_bytes(None);
         let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.limit(), 512 * 1024 * 1024);
         assert!((arbitrator.spill_threshold_pct() - 0.80).abs() < f64::EPSILON);
@@ -1330,18 +1230,6 @@ mod tests {
     fn test_budget_category_display_shape() {
         assert_eq!(BudgetCategory::Arena.to_string(), "arena");
         assert_eq!(BudgetCategory::NodeBuffer.to_string(), "node_buffer");
-    }
-
-    #[test]
-    fn test_memory_limit_cli_parse_suffixes() {
-        assert_eq!(parse_memory_limit_bytes(Some("512M")), 536_870_912);
-        assert_eq!(parse_memory_limit_bytes(Some("512m")), 536_870_912);
-        assert_eq!(parse_memory_limit_bytes(Some("2G")), 2_147_483_648);
-        assert_eq!(parse_memory_limit_bytes(Some("2g")), 2_147_483_648);
-        assert_eq!(parse_memory_limit_bytes(Some("512K")), 524_288);
-        assert_eq!(parse_memory_limit_bytes(Some("1024")), 1024);
-        assert_eq!(parse_memory_limit_bytes(None), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_limit_bytes(Some("garbage")), 512 * 1024 * 1024);
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface

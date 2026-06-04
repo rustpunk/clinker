@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::config::{ConfigError, LogDirective, LogLevel, LogTiming};
+use clinker_plan::config::{ConfigError, LogDirective, LogLevel, LogTiming};
 
 /// A named log rule from an external YAML file.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -24,7 +24,7 @@ pub struct LogRulesFile {
 /// Load external log rules from a YAML file.
 pub fn load_log_rules(path: &Path) -> Result<LogRulesFile, ConfigError> {
     let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-    let rules: LogRulesFile = crate::yaml::from_str(&content)?;
+    let rules: LogRulesFile = clinker_plan::yaml::from_str(&content)?;
     Ok(rules)
 }
 

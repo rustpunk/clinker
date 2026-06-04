@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_core_types::dlq::DlqErrorCategory;
+use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);

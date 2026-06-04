@@ -10,13 +10,13 @@ use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
     tee_emit_to_region_input_buffers,
 };
 use crate::executor::{parse_memory_limit, stage_metrics};
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Sort` arm for `node_idx`: buffer the predecessor's records,
 /// sort by the enforced `sort_fields` key (carrying each record's `row_num`

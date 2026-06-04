@@ -78,8 +78,8 @@ fn fixture_workspace_root() -> PathBuf {
 
 #[test]
 fn body_interior_overshoot_is_wrapped_under_the_call_site() {
-    let config = crate::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
-    let ctx = crate::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         fixture_workspace_root(),
         PathBuf::from("pipelines"),
     );
@@ -141,7 +141,7 @@ fn body_interior_overshoot_is_wrapped_under_the_call_site() {
                         "the inner error must name the body-internal node that overflowed",
                     );
                     assert!(
-                        matches!(source, crate::pipeline::memory::BudgetCategory::NodeBuffer),
+                        matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
                         "the inner overflow must surface under NodeBuffer; got {source:?}",
                     );
                     assert_eq!(

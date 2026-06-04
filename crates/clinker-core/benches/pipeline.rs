@@ -1,6 +1,6 @@
 use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -103,9 +103,9 @@ nodes:
                     Box::new(buf.clone()) as Box<dyn Write + Send>,
                 )]);
                 let report = PipelineExecutor::run_plan_with_readers_writers(
-                    &clinker_core::config::PipelineConfig::compile(
+                    &clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile"),
                     readers,
@@ -192,9 +192,9 @@ nodes:
                     Box::new(buf.clone()) as Box<dyn Write + Send>,
                 )]);
                 let report = PipelineExecutor::run_plan_with_readers_writers(
-                    &clinker_core::config::PipelineConfig::compile(
+                    &clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile"),
                     readers,
@@ -307,9 +307,9 @@ nodes:
                     ),
                 ]);
                 let report = PipelineExecutor::run_plan_with_readers_writers(
-                    &clinker_core::config::PipelineConfig::compile(
+                    &clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile"),
                     readers,
@@ -395,9 +395,9 @@ nodes:
                     Box::new(buf.clone()) as Box<dyn Write + Send>,
                 )]);
                 let report = PipelineExecutor::run_plan_with_readers_writers(
-                    &clinker_core::config::PipelineConfig::compile(
+                    &clinker_plan::config::PipelineConfig::compile(
                         &config,
-                        &clinker_core::config::CompileContext::default(),
+                        &clinker_plan::config::CompileContext::default(),
                     )
                     .expect("compile"),
                     readers,

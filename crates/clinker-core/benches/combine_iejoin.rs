@@ -32,8 +32,8 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 use clinker_record::{Record, SchemaBuilder, Value};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
@@ -292,7 +292,7 @@ fn bench_params() -> PipelineRunParams {
 /// plan is reused across iterations to keep planner overhead out of
 /// the timed loop.
 fn run_iejoin_executor(
-    plan: &clinker_core::plan::CompiledPlan,
+    plan: &clinker_plan::plan::CompiledPlan,
     employees_csv: &[u8],
     brackets_csv: &[u8],
     params: &PipelineRunParams,
@@ -358,9 +358,9 @@ fn bench_combine_iejoin(c: &mut Criterion) {
     let small = generate_workload(50, 10, 20, 0xC0FFEE);
     let nlj_count = nested_loop_baseline(&small.employees, &small.brackets);
     let small_config = parse_config(COMBINE_IEJOIN_YAML).expect("bench yaml must parse");
-    let small_plan = clinker_core::config::PipelineConfig::compile(
+    let small_plan = clinker_plan::config::PipelineConfig::compile(
         &small_config,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("bench yaml must compile");
     let small_params = bench_params();
@@ -384,9 +384,9 @@ fn bench_combine_iejoin(c: &mut Criterion) {
     // realistic ETL sweet spot.
     let workload = generate_workload(500, 100, 2_000, 0xDEAD_BEEF);
     let config = parse_config(COMBINE_IEJOIN_YAML).expect("bench yaml must parse");
-    let plan = clinker_core::config::PipelineConfig::compile(
+    let plan = clinker_plan::config::PipelineConfig::compile(
         &config,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("bench yaml must compile");
     let params = bench_params();

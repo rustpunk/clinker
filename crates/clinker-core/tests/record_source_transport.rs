@@ -97,20 +97,20 @@ nodes:
 
 #[test]
 fn non_file_transport_emits_into_shared_channel_with_synthetic_id() {
-    let mut config = clinker_core::config::parse_config(PIPELINE).unwrap();
+    let mut config = clinker_plan::config::parse_config(PIPELINE).unwrap();
 
     // Strip the placeholder matcher so the source is pathless, the shape
     // a non-file transport carries. `path_str()` then returns empty and
     // the ingest loop stamps the stable `<source:ledger>` synthetic id.
     for spanned in &mut config.nodes {
-        if let clinker_core::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
+        if let clinker_plan::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
         {
             body.source.path = None;
         }
     }
 
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile pathless-source pipeline");
 
     let stub = StubRecordSource::new(

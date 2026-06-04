@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use clinker_core::config::ScopedVarDecl;
-use clinker_core::config::composition::CompositionSymbolTable;
 use clinker_core_types::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_plan::config::ScopedVarDecl;
+use clinker_plan::config::composition::CompositionSymbolTable;
 
 use crate::error::ChannelError;
 
@@ -149,7 +149,7 @@ impl ChannelBinding {
             source: e,
         })?;
         let raw: RawChannelFile =
-            clinker_core::yaml::from_str(text).map_err(|e| ChannelError::Yaml {
+            clinker_plan::yaml::from_str(text).map_err(|e| ChannelError::Yaml {
                 path: source_path.clone(),
                 source: Box::new(e.0),
             })?;
@@ -442,7 +442,7 @@ pub fn validate_channel_bindings(
 /// declared `config_schema`. Emits E105 for undeclared keys.
 fn validate_config_keys(
     config: &IndexMap<DottedPath, serde_json::Value>,
-    signature: &clinker_core::config::composition::CompositionSignature,
+    signature: &clinker_plan::config::composition::CompositionSignature,
     channel_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {

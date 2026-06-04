@@ -18,9 +18,9 @@ use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
-use clinker_core::plan::index::PlanIndexRoot;
+use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::plan::index::PlanIndexRoot;
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);

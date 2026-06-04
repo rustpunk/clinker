@@ -271,8 +271,8 @@ fn lazy_probe_spill_routes_to_partition_file() {
 #[test]
 fn execute_grace_hash_partition_pair_correct() {
     use crate::executor::combine::CombineResolverMapping;
-    use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
-    use crate::plan::types::JoinSide;
+    use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use clinker_plan::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     // Driver and build schemas use distinct bare names for the
@@ -326,65 +326,65 @@ fn execute_grace_hash_partition_pair_correct() {
     // build col 1. Bare names `dk`, `v`, `bk`, `name` are
     // unambiguous because each appears on exactly one side.
     let mut mapping_q: std::collections::HashMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         (JoinSide, u32),
     > = std::collections::HashMap::new();
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "dk"),
         (JoinSide::Probe, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "v"),
         (JoinSide::Probe, 1),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "bk"),
         (JoinSide::Build, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "name"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "name"),
         (JoinSide::Build, 1),
     );
 
-    let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+    let mut combine_inputs: indexmap::IndexMap<String, clinker_plan::plan::combine::CombineInput> =
         indexmap::IndexMap::new();
     let mut driver_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("dk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("dk"),
         cxl::typecheck::Type::Int,
     );
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("v"),
+        clinker_plan::plan::row_type::QualifiedField::bare("v"),
         cxl::typecheck::Type::String,
     );
     let mut build_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("bk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("bk"),
         cxl::typecheck::Type::Int,
     );
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("name"),
+        clinker_plan::plan::row_type::QualifiedField::bare("name"),
         cxl::typecheck::Type::String,
     );
     combine_inputs.insert(
         "orders".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
-            row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
         "products".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
-            row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
@@ -420,15 +420,15 @@ fn execute_grace_hash_partition_pair_correct() {
         body_program: None,
         resolver_mapping: &resolver_mapping,
         output_schema: Some(&combined_schema),
-        match_mode: crate::config::pipeline_node::MatchMode::All,
-        on_miss: crate::config::pipeline_node::OnMiss::Skip,
+        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
         partition_bits: 4,
-        propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: crate::config::ErrorStrategy::FailFast,
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
     })
     .expect("grace hash E2E")
     .records;
@@ -469,8 +469,8 @@ fn execute_grace_hash_partition_pair_correct() {
 #[test]
 fn execute_grace_hash_spill_then_reload_correct() {
     use crate::executor::combine::CombineResolverMapping;
-    use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
-    use crate::plan::types::JoinSide;
+    use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use clinker_plan::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     let driver_schema = schema_with(&["dk", "v"]);
@@ -514,65 +514,65 @@ fn execute_grace_hash_spill_then_reload_correct() {
     };
 
     let mut mapping_q: std::collections::HashMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         (JoinSide, u32),
     > = std::collections::HashMap::new();
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "dk"),
         (JoinSide::Probe, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "v"),
         (JoinSide::Probe, 1),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "bk"),
         (JoinSide::Build, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "name"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "name"),
         (JoinSide::Build, 1),
     );
 
-    let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+    let mut combine_inputs: indexmap::IndexMap<String, clinker_plan::plan::combine::CombineInput> =
         indexmap::IndexMap::new();
     let mut driver_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("dk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("dk"),
         cxl::typecheck::Type::Int,
     );
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("v"),
+        clinker_plan::plan::row_type::QualifiedField::bare("v"),
         cxl::typecheck::Type::String,
     );
     let mut build_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("bk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("bk"),
         cxl::typecheck::Type::Int,
     );
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("name"),
+        clinker_plan::plan::row_type::QualifiedField::bare("name"),
         cxl::typecheck::Type::String,
     );
     combine_inputs.insert(
         "orders".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
-            row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
         "products".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
-            row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
@@ -610,15 +610,15 @@ fn execute_grace_hash_spill_then_reload_correct() {
         body_program: None,
         resolver_mapping: &resolver_mapping,
         output_schema: Some(&combined_schema),
-        match_mode: crate::config::pipeline_node::MatchMode::All,
-        on_miss: crate::config::pipeline_node::OnMiss::Skip,
+        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
         partition_bits: 4,
-        propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: crate::config::ErrorStrategy::FailFast,
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
     })
     .expect("grace hash spill E2E")
     .records;
@@ -647,8 +647,8 @@ fn execute_grace_hash_spill_then_reload_correct() {
 #[test]
 fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     use crate::executor::combine::CombineResolverMapping;
-    use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
-    use crate::plan::types::JoinSide;
+    use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use clinker_plan::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     let driver_schema = schema_with(&["dk", "v"]);
@@ -697,65 +697,65 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     };
 
     let mut mapping_q: std::collections::HashMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         (JoinSide, u32),
     > = std::collections::HashMap::new();
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "dk"),
         (JoinSide::Probe, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "v"),
         (JoinSide::Probe, 1),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "bk"),
         (JoinSide::Build, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "name"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "name"),
         (JoinSide::Build, 1),
     );
 
-    let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+    let mut combine_inputs: indexmap::IndexMap<String, clinker_plan::plan::combine::CombineInput> =
         indexmap::IndexMap::new();
     let mut driver_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("dk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("dk"),
         cxl::typecheck::Type::Int,
     );
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("v"),
+        clinker_plan::plan::row_type::QualifiedField::bare("v"),
         cxl::typecheck::Type::String,
     );
     let mut build_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("bk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("bk"),
         cxl::typecheck::Type::Int,
     );
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("name"),
+        clinker_plan::plan::row_type::QualifiedField::bare("name"),
         cxl::typecheck::Type::String,
     );
     combine_inputs.insert(
         "orders".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
-            row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
         "products".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
-            row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
@@ -793,15 +793,15 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         body_program: None,
         resolver_mapping: &resolver_mapping,
         output_schema: Some(&combined_schema),
-        match_mode: crate::config::pipeline_node::MatchMode::All,
-        on_miss: crate::config::pipeline_node::OnMiss::Skip,
+        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
         partition_bits: 4,
-        propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: crate::config::ErrorStrategy::FailFast,
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
     });
 
     let err = result.expect_err("disk quota must abort the combine");
@@ -906,7 +906,7 @@ fn build_spill_reload_records_match() {
 /// each BNL test can drive [`bnl_fallback`] without re-typing the
 /// `CombineResolverMapping` boilerplate.
 struct BnlHarness {
-    decomposed: crate::plan::combine::DecomposedPredicate,
+    decomposed: clinker_plan::plan::combine::DecomposedPredicate,
     resolver_mapping: crate::executor::combine::CombineResolverMapping,
     build_extractor: KeyExtractor,
     driver_extractor: KeyExtractor,
@@ -932,8 +932,8 @@ struct EmitArgsOwned {
 
 fn build_bnl_harness() -> BnlHarness {
     use crate::executor::combine::CombineResolverMapping;
-    use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
-    use crate::plan::types::JoinSide;
+    use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use clinker_plan::plan::types::JoinSide;
     use cxl::eval::StableEvalContext;
 
     let driver_schema = schema_with(&["dk", "v"]);
@@ -958,65 +958,65 @@ fn build_bnl_harness() -> BnlHarness {
     };
 
     let mut mapping_q: std::collections::HashMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         (JoinSide, u32),
     > = std::collections::HashMap::new();
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "dk"),
         (JoinSide::Probe, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("orders", "v"),
         (JoinSide::Probe, 1),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "bk"),
         (JoinSide::Build, 0),
     );
     mapping_q.insert(
-        crate::plan::row_type::QualifiedField::qualified("products", "name"),
+        clinker_plan::plan::row_type::QualifiedField::qualified("products", "name"),
         (JoinSide::Build, 1),
     );
 
-    let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+    let mut combine_inputs: indexmap::IndexMap<String, clinker_plan::plan::combine::CombineInput> =
         indexmap::IndexMap::new();
     let mut driver_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("dk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("dk"),
         cxl::typecheck::Type::Int,
     );
     driver_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("v"),
+        clinker_plan::plan::row_type::QualifiedField::bare("v"),
         cxl::typecheck::Type::String,
     );
     let mut build_row_cols: indexmap::IndexMap<
-        crate::plan::row_type::QualifiedField,
+        clinker_plan::plan::row_type::QualifiedField,
         cxl::typecheck::Type,
     > = indexmap::IndexMap::new();
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("bk"),
+        clinker_plan::plan::row_type::QualifiedField::bare("bk"),
         cxl::typecheck::Type::Int,
     );
     build_row_cols.insert(
-        crate::plan::row_type::QualifiedField::bare("name"),
+        clinker_plan::plan::row_type::QualifiedField::bare("name"),
         cxl::typecheck::Type::String,
     );
     combine_inputs.insert(
         "orders".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
-            row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
         "products".to_string(),
-        crate::plan::combine::CombineInput {
+        clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
-            row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         },
     );
@@ -1070,8 +1070,8 @@ fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> 
         match_mode: h.emit.match_mode,
         on_miss: h.emit.on_miss,
         build_qualifier: &h.emit.build_qualifier,
-        propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
-        strategy: crate::config::ErrorStrategy::FailFast,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
     };
     let eval_ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
     let rc = ReloadContext {

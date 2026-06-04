@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clinker_bench_support::CombineDataGen;
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
 
@@ -219,7 +219,7 @@ fn bench_params() -> PipelineRunParams {
 /// Drive the 3-input chained combine end-to-end through the executor.
 /// Returns the data-row count of the output stream.
 fn run_3input(
-    plan: &clinker_core::plan::CompiledPlan,
+    plan: &clinker_plan::plan::CompiledPlan,
     a_csv: &[u8],
     b_csv: &[u8],
     c_csv: &[u8],
@@ -266,7 +266,7 @@ fn run_3input(
 /// Drive the 2-input baseline end-to-end. Same shape as `run_3input`
 /// but with one fewer source.
 fn run_2input(
-    plan: &clinker_core::plan::CompiledPlan,
+    plan: &clinker_plan::plan::CompiledPlan,
     a_csv: &[u8],
     b_csv: &[u8],
     params: &PipelineRunParams,
@@ -321,9 +321,9 @@ fn bench_combine_nary_3input(c: &mut Criterion) {
         let small_params = bench_params();
 
         let cfg3 = parse_config(COMBINE_NARY_3INPUT_YAML).expect("3-input YAML must parse");
-        let plan3 = clinker_core::config::PipelineConfig::compile(
+        let plan3 = clinker_plan::config::PipelineConfig::compile(
             &cfg3,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("3-input YAML must compile");
         let three_count = run_3input(&plan3, &a_small, &b_small, &c_small, &small_params);
@@ -334,9 +334,9 @@ fn bench_combine_nary_3input(c: &mut Criterion) {
         // (small_rows/groups)^3 for the 3-way join, and the chained
         // binary expression has the same membership.
         let cfg2 = parse_config(COMBINE_BINARY_BASELINE_YAML).expect("2-input YAML must parse");
-        let plan2 = clinker_core::config::PipelineConfig::compile(
+        let plan2 = clinker_plan::config::PipelineConfig::compile(
             &cfg2,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("2-input YAML must compile");
         // Closed-form check: per-group output is rows_per_group^3 × groups.
@@ -382,16 +382,16 @@ fn bench_combine_nary_3input(c: &mut Criterion) {
     let params = bench_params();
 
     let cfg3 = parse_config(COMBINE_NARY_3INPUT_YAML).expect("3-input YAML must parse");
-    let plan3 = clinker_core::config::PipelineConfig::compile(
+    let plan3 = clinker_plan::config::PipelineConfig::compile(
         &cfg3,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("3-input YAML must compile");
 
     let cfg2 = parse_config(COMBINE_BINARY_BASELINE_YAML).expect("2-input YAML must parse");
-    let plan2 = clinker_core::config::PipelineConfig::compile(
+    let plan2 = clinker_plan::config::PipelineConfig::compile(
         &cfg2,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("2-input YAML must compile");
 

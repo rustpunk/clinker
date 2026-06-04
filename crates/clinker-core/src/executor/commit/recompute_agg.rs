@@ -16,12 +16,12 @@
 
 use super::detect::RetractScope;
 use crate::aggregation::HashAggError;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, finalize_node_rooted_windows,
     node_buffer_spill_allowed, project_rows_to_buffer_schema,
 };
-use crate::plan::execution::ExecutionPlanDag;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 
 /// Drive each affected aggregate through retract + refinalize, then
 /// re-seed the producer's `node_buffers` slot with the post-recompute

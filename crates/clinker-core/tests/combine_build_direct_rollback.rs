@@ -26,10 +26,10 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{DlqEntry, PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
 use clinker_core_types::dlq::DlqErrorCategory;
+use clinker_plan::config::{CompileContext, parse_config};
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(

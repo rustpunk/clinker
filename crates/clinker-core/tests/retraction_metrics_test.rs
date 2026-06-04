@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::metrics::RetractionMetrics;
+use clinker_plan::config::{CompileContext, parse_config};
 use clinker_record::PipelineCounters;
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> PipelineCounters {

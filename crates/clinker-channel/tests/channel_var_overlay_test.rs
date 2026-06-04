@@ -21,17 +21,17 @@ fn fixtures_dir() -> PathBuf {
 
 /// Compile the var-overlay fixture pipeline into (config, plan).
 fn compile_vars_fixture() -> (
-    clinker_core::config::PipelineConfig,
-    clinker_core::plan::CompiledPlan,
+    clinker_plan::config::PipelineConfig,
+    clinker_plan::plan::CompiledPlan,
 ) {
     let root = fixtures_dir();
     let yaml_path = root.join("pipelines/channel_vars_pipeline.yaml");
     let yaml = std::fs::read_to_string(&yaml_path).unwrap();
-    let config: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(&yaml).expect("parse vars fixture");
+    let config: clinker_plan::config::PipelineConfig =
+        clinker_plan::yaml::from_str(&yaml).expect("parse vars fixture");
     let ctx =
-        clinker_core::config::CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
-    let plan = clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+        clinker_plan::config::CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let plan = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
     (config, plan)
 }
 

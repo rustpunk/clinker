@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, PipelineConfig};
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
-use clinker_core::plan::execution::PlanNode;
+use clinker_plan::config::{CompileContext, PipelineConfig};
+use clinker_plan::plan::execution::PlanNode;
 
 /// Run a pipeline end-to-end against in-memory CSV inputs and
 /// returns the captured output bytes for the named output. Used by
@@ -28,7 +28,7 @@ fn run_with_output(
     output_name: &str,
 ) -> (ExecutionReport, String) {
     let config: PipelineConfig =
-        clinker_core::yaml::from_str(yaml).expect("fixture YAML must parse");
+        clinker_plan::yaml::from_str(yaml).expect("fixture YAML must parse");
     let plan = config
         .compile(&CompileContext::default())
         .expect("fixture must compile cleanly");
@@ -68,7 +68,7 @@ fn run_with_output(
 /// widening helper produced at plan time.
 fn combine_output_columns(yaml: &str, combine_name: &str) -> Vec<String> {
     let config: PipelineConfig =
-        clinker_core::yaml::from_str(yaml).expect("fixture YAML must parse");
+        clinker_plan::yaml::from_str(yaml).expect("fixture YAML must parse");
     let plan = config
         .compile(&CompileContext::default())
         .expect("fixture must compile cleanly");

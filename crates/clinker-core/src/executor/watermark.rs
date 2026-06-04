@@ -10,7 +10,7 @@
 //! that `fan_out_per_source_file` outputs rely on.
 //!
 //! Sources declare their event-time column via `watermark:` on
-//! [`crate::config::SourceConfig`] (column applies to every file the
+//! [`clinker_plan::config::SourceConfig`] (column applies to every file the
 //! source pulls in). `ingest_source_into_stream` observes per record
 //! using the reader's `current_source_file()` as the file key and
 //! folds the column value into an i64-nanos max for that pair.
@@ -87,7 +87,7 @@ pub(crate) struct SourcePartitionWatermark {
 /// Two tables kept in sync at the executor boundary:
 ///
 /// - `declared`: set of source names that declared
-///   [`crate::config::SourceConfig::watermark`]. The
+///   [`clinker_plan::config::SourceConfig::watermark`]. The
 ///   [`ExecutionReport`] uses this to emit a per-source rollup entry
 ///   even when ingest observed zero records for that source.
 /// - `by_source`: per-(source, file) max-event-time. Populated by

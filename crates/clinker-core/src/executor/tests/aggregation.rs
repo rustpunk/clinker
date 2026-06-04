@@ -22,8 +22,8 @@ mod dispatch {
     use indexmap::IndexMap;
 
     use crate::aggregation::{AggregatorConfig, AggregatorGroupState, HashAggregator};
-    use crate::config::ErrorStrategy;
-    use crate::error::PipelineError;
+    use clinker_plan::config::ErrorStrategy;
+    use clinker_plan::error::PipelineError;
 
     fn make_schema(cols: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
@@ -131,8 +131,8 @@ mod dispatch {
         // resulting DAG to introduce a SECOND incoming edge into the
         // aggregation node. `single_predecessor` must reject this with
         // `PipelineError::Internal { op: "aggregation", .. }`.
-        use crate::executor::single_predecessor;
-        use crate::plan::execution::{DependencyType, PlanEdge, PlanNode};
+        use clinker_plan::plan::execution::single_predecessor;
+        use clinker_plan::plan::execution::{DependencyType, PlanEdge, PlanNode};
 
         let yaml = r#"
 pipeline:
@@ -167,13 +167,13 @@ nodes:
     path: out.csv
     include_unmapped: true
 "#;
-        let config = crate::config::parse_config(yaml).expect("config parses");
+        let config = clinker_plan::config::parse_config(yaml).expect("config parses");
         // The canonical compile entry point lowers via `bind_schema` +
         // stage-5, so no hand-rolled typed-program slice is needed.
         // Clone the resulting DAG so the test can synthesize a malformed
         // two-predecessor shape below.
         let mut plan = config
-            .compile(&crate::config::CompileContext::default())
+            .compile(&clinker_plan::config::CompileContext::default())
             .expect("plan compiles")
             .dag()
             .clone();
@@ -939,9 +939,9 @@ mod two_phase_bytes_encoder {
     use clinker_record::{Record, Schema, Value};
 
     use crate::aggregation::{AggregatorGroupState, HashAggError, group_by_sort_fields};
-    use crate::error::PipelineError;
     use crate::pipeline::sort_key::SortKeyEncoder;
     use crate::pipeline::streaming_merge::{GroupBoundary, StreamingErrorMode};
+    use clinker_plan::error::PipelineError;
 
     fn schema(cols: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))

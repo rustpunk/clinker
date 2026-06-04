@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef};
 use clinker_record::{MinimalRecord, SchemaBuilder, Value};
 
-use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
-use crate::schema::SchemaError;
+use clinker_plan::error::PipelineError;
+use clinker_plan::schema::SchemaError;
 
 /// Multi-record dispatcher — reads one file, produces N arenas.
 pub struct MultiRecordDispatcher {

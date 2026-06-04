@@ -16,14 +16,14 @@ use indexmap::IndexMap;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
     finalize_node_rooted_windows, node_buffer_spill_allowed, tee_emit_to_region_input_buffers,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Composition` arm for `node_idx`: collect parent-scope
 /// records per declared input port, swap `current_dag` to the body's
@@ -51,7 +51,7 @@ pub(crate) fn dispatch_composition(
     // loop with a different plan.
     debug_assert_ne!(
         body,
-        crate::plan::composition_body::CompositionBodyId::SENTINEL,
+        clinker_plan::plan::composition_body::CompositionBodyId::SENTINEL,
         "composition {name:?}: body_id is sentinel — bind_composition did not run"
     );
 
@@ -101,7 +101,7 @@ pub(crate) fn dispatch_composition(
     // Depth guard before recursion — same constant the
     // compile-time IsolatedFromAbove check uses, distinct
     // emission code for log greppability.
-    if ctx.recursion_depth >= crate::plan::bind_schema::MAX_COMPOSITION_DEPTH {
+    if ctx.recursion_depth >= clinker_plan::plan::bind_schema::MAX_COMPOSITION_DEPTH {
         return Err(PipelineError::compose_depth_exceeded(
             name.clone(),
             ctx.recursion_depth,
@@ -245,11 +245,11 @@ fn collect_port_records(
 /// errors can't leak the counter.
 fn execute_composition_body(
     ctx: &mut ExecutorContext<'_>,
-    body_id: crate::plan::composition_body::CompositionBodyId,
+    body_id: clinker_plan::plan::composition_body::CompositionBodyId,
     port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
     composition_name: &str,
 ) -> Result<Vec<(clinker_record::Record, u64)>, PipelineError> {
-    use crate::plan::index::PlanIndexRoot;
+    use clinker_plan::plan::index::PlanIndexRoot;
 
     // Resolve body and pre-compute everything that needs the
     // bound_body borrow before the swap so the body_dag clone is
@@ -259,7 +259,7 @@ fn execute_composition_body(
         .body_of(body_id)
         .ok_or_else(|| PipelineError::compose_body_missing(composition_name.to_string()))?;
 
-    let body_dag = crate::plan::execution::ExecutionPlanDag::from_body(bound_body);
+    let body_dag = clinker_plan::plan::execution::ExecutionPlanDag::from_body(bound_body);
 
     // Window runtime entry: install a fresh per-body vec sized to
     // `body_indices_to_build.len()`. ParentNode-rooted slots inherit

@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use clinker_record::{Record, RecordStorage, Value};
 
-use crate::config::{NullOrder, SortField, SortOrder};
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
 /// Sort a partition's position vector in-place by sort_by fields.
 ///

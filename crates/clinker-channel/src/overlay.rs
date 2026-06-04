@@ -9,15 +9,15 @@
 
 use indexmap::IndexMap;
 
-use clinker_core::config::composition::LayerKind;
-use clinker_core::config::pipeline_node::{PipelineNode, VarScope};
-use clinker_core::config::{
+use clinker_core_types::Span;
+use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_plan::config::composition::LayerKind;
+use clinker_plan::config::pipeline_node::{PipelineNode, VarScope};
+use clinker_plan::config::{
     PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
     coerce_scoped_var_default, reserved_names_for,
 };
-use clinker_core::plan::{ChannelIdentity, CompiledPlan};
-use clinker_core_types::Span;
-use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_plan::plan::{ChannelIdentity, CompiledPlan};
 use clinker_record::Value;
 
 use crate::binding::{ChannelBinding, ChannelTarget, DottedPath};

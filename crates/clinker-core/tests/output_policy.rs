@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use clinker_core::config::IfExistsPolicy;
 use clinker_core::output::open::{append_suffix_before_ext, open_output};
-use clinker_core::output::path_template::{
+use clinker_plan::config::IfExistsPolicy;
+use clinker_plan::config::path_template::{
     PathTemplate, TemplateContext, resolve_output_path_templates_in_place,
 };
 
@@ -197,7 +197,7 @@ nodes:
 error_handling:
   strategy: fail_fast
 "#;
-    let mut config = clinker_core::config::parse_config(yaml).unwrap();
+    let mut config = clinker_plan::config::parse_config(yaml).unwrap();
     let ctx = TemplateContext::default();
     let err = resolve_output_path_templates_in_place(&mut config, &ctx).unwrap_err();
     let msg = format!("{err:?}");
@@ -237,7 +237,7 @@ nodes:
 error_handling:
   strategy: fail_fast
 "#;
-    let mut config = clinker_core::config::parse_config(yaml).unwrap();
+    let mut config = clinker_plan::config::parse_config(yaml).unwrap();
     let ctx = TemplateContext::default();
     let err = resolve_output_path_templates_in_place(&mut config, &ctx).unwrap_err();
     let msg = format!("{err:?}");
@@ -273,7 +273,7 @@ nodes:
 error_handling:
   strategy: fail_fast
 "#;
-    let mut config = clinker_core::config::parse_config(yaml).unwrap();
+    let mut config = clinker_plan::config::parse_config(yaml).unwrap();
     let ctx = TemplateContext::default();
     resolve_output_path_templates_in_place(&mut config, &ctx).unwrap();
     let resolved = config.output_configs().next().unwrap().path.clone();

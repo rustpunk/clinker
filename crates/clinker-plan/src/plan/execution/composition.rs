@@ -410,10 +410,7 @@ pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
 /// the user already lists the corresponding bare field, so the
 /// bare-name check below sees the post-extension shape and stays
 /// stable across the rewrite.
-pub(crate) fn group_by_omits_any_ck_field(
-    group_by: &[String],
-    parent_ck_set: &BTreeSet<String>,
-) -> bool {
+pub fn group_by_omits_any_ck_field(group_by: &[String], parent_ck_set: &BTreeSet<String>) -> bool {
     parent_ck_set
         .iter()
         .any(|f| !group_by.iter().any(|g| g.as_str() == f.as_str()))

@@ -6,7 +6,7 @@ license.workspace = true
 description = "Source schema parsing, indexing, and validation for Clinker pipelines"
 
 [dependencies]
-clinker-core.workspace = true
+clinker-plan.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true

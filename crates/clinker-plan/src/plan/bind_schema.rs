@@ -50,7 +50,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 /// The runtime composition-body executor reuses this same constant as
 /// its recursion-depth guard and emits a distinct E112 on overflow,
 /// so log-grep on either code finds exactly one emission site.
-pub(crate) const MAX_COMPOSITION_DEPTH: u32 = 50;
+pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 
 /// Compile artifacts produced by `bind_schema` — one entry per node name
 /// whose CXL body successfully type-checked, plus per-node row types.

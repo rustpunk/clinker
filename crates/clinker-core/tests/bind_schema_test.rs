@@ -7,7 +7,7 @@
 //!   `CompiledPlan::typed_output_row` for every bound node
 //! - The module rename from cxl_compile is complete
 
-use clinker_core::config::{CompileContext, PipelineConfig};
+use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_record::FieldMetadata;
 
 /// Returns `Some(source_field)` if `meta` is a [`FieldMetadata::SourceCorrelation`],
@@ -20,8 +20,8 @@ fn source_correlation_field(meta: Option<&FieldMetadata>) -> Option<&str> {
     }
 }
 
-fn compile_yaml(yaml: &str) -> clinker_core::plan::CompiledPlan {
-    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+fn compile_yaml(yaml: &str) -> clinker_plan::plan::CompiledPlan {
+    let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture must parse");
     config
         .compile(&CompileContext::default())
         .expect("fixture must compile")
@@ -170,30 +170,14 @@ nodes:
     );
 }
 
-/// Gate test: `grep -r 'cxl_compile' crates/ --include="*.rs"` returns
-/// empty (no code references to the old module name, only comments).
-#[test]
-fn test_module_rename_cxl_compile_absent() {
-    let source = include_str!("../src/config/mod.rs");
-    assert!(
-        !source.contains("pub mod cxl_compile"),
-        "config/mod.rs must not declare pub mod cxl_compile"
-    );
-    let compiled = include_str!("../src/plan/compiled.rs");
-    assert!(
-        !compiled.contains("config::cxl_compile"),
-        "compiled.rs must not reference config::cxl_compile"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Frozen-identity ($ck.<field>) shadow column widening.
 // ─────────────────────────────────────────────────────────────────────
 
-use clinker_core::plan::execution::PlanNode;
+use clinker_plan::plan::execution::PlanNode;
 
 /// Locate a Source node by name in the compiled plan's DAG.
-fn source_node<'a>(plan: &'a clinker_core::plan::CompiledPlan, name: &str) -> &'a PlanNode {
+fn source_node<'a>(plan: &'a clinker_plan::plan::CompiledPlan, name: &str) -> &'a PlanNode {
     plan.dag()
         .graph
         .node_weights()
@@ -202,7 +186,7 @@ fn source_node<'a>(plan: &'a clinker_core::plan::CompiledPlan, name: &str) -> &'
 }
 
 fn source_output_schema<'a>(
-    plan: &'a clinker_core::plan::CompiledPlan,
+    plan: &'a clinker_plan::plan::CompiledPlan,
     name: &str,
 ) -> &'a std::sync::Arc<clinker_record::Schema> {
     match source_node(plan, name) {
@@ -503,7 +487,7 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+    let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture must parse");
     let diags = config
         .compile(&CompileContext::default())
         .expect_err("E315 must reject merge of disagreeing on_unmapped policies");
@@ -631,7 +615,7 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+    let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture must parse");
     let diags = config
         .compile(&CompileContext::default())
         .expect_err("E153 must reject CK field absent from source schema");
@@ -688,8 +672,8 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let cfg: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(yaml).expect("parse pipeline");
+    let cfg: clinker_plan::config::PipelineConfig =
+        clinker_plan::yaml::from_str(yaml).expect("parse pipeline");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures");
@@ -834,7 +818,7 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let err = clinker_core::yaml::from_str::<PipelineConfig>(yaml)
+    let err = clinker_plan::yaml::from_str::<PipelineConfig>(yaml)
         .expect_err("legacy pipeline-level correlation_key must fail parse");
     let msg = format!("{err:?}");
     assert!(

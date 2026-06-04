@@ -7,6 +7,7 @@ description = "Network finite-pull Source readers (REST, SQL cursors) for Clinke
 
 [dependencies]
 clinker-core = { workspace = true }
+clinker-plan = { workspace = true }
 clinker-format = { workspace = true }
 clinker-record = { workspace = true }
 serde_json = { workspace = true }

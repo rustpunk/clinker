@@ -48,8 +48,8 @@ pub struct PipelineMeta {
     /// how many records (plus document-boundary punctuations) a
     /// streaming-eligible stage accumulates before charging and handing
     /// off one batch, so peak inter-stage memory is one batch rather than
-    /// the whole stage. `None` (omitted) falls back to
-    /// [`crate::executor::batch_handoff::DEFAULT_BATCH_SIZE`]; an explicit
+    /// the whole stage. `None` (omitted) falls back to the executor's
+    /// default batch size; an explicit
     /// `0` is rejected at config validation (a zero batch never flushes).
     /// A per-Transform `batch_size` on `TransformBody` overrides this for
     /// that one stage.
@@ -149,6 +149,19 @@ impl BackpressureKnob {
     /// rather than re-emitted as redundant noise.
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Pause)
+    }
+
+    /// Display name of the arbitration policy this knob selects.
+    ///
+    /// Matches the `policy_name()` the corresponding boxed policy reports
+    /// at runtime, so the `--explain` plan-time renderer can label the
+    /// policy without constructing the runtime arbitrator.
+    pub fn policy_name(&self) -> &'static str {
+        match self {
+            Self::Spill => "Priority",
+            Self::Pause => "BackPressurePreferred -> Priority",
+            Self::Both => "BackPressurePreferred -> LargestFirst",
+        }
     }
 }
 

@@ -20,8 +20,8 @@
 mod common;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 
@@ -29,7 +29,7 @@ fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -121,8 +121,8 @@ nodes:
 ///    window's partition.
 #[test]
 fn aggregate_relaxed_then_window_compiles_without_e150() {
-    use clinker_core::config::{CompileContext, parse_config};
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::config::{CompileContext, parse_config};
+    use clinker_plan::plan::execution::PlanNode;
 
     let config = parse_config(D7_PIPELINE).expect("parse");
     let plan = config

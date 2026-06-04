@@ -5,8 +5,6 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use crate::config::PipelineConfig;
-use crate::error::PipelineError;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
 use clinker_format::json::reader::{
@@ -16,6 +14,8 @@ use clinker_format::traits::FormatReader;
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
 };
+use clinker_plan::config::PipelineConfig;
+use clinker_plan::error::PipelineError;
 
 /// Build a format-specific reader from input config and raw reader.
 ///
@@ -23,23 +23,23 @@ use clinker_format::xml::reader::{
 /// Returns `Box<dyn FormatReader>` — all downstream code uses trait methods
 /// (`schema()`, `next_record()`).
 fn build_format_reader(
-    input: &crate::config::SourceConfig,
+    input: &clinker_plan::config::SourceConfig,
     reader: Box<dyn Read + Send>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     match &input.format {
-        crate::config::InputFormat::Csv(opts) => {
+        clinker_plan::config::InputFormat::Csv(opts) => {
             let config = build_csv_reader_config(opts.as_ref());
             Ok(Box::new(CsvReader::from_reader(reader, config)))
         }
-        crate::config::InputFormat::Json(opts) => {
+        clinker_plan::config::InputFormat::Json(opts) => {
             let config = build_json_reader_config(opts.as_ref(), input.array_paths.as_deref());
             Ok(Box::new(JsonReader::from_reader(reader, config)?))
         }
-        crate::config::InputFormat::Xml(opts) => {
+        clinker_plan::config::InputFormat::Xml(opts) => {
             let config = build_xml_reader_config(opts.as_ref(), input.array_paths.as_deref());
             Ok(Box::new(XmlReader::new(reader, config)?))
         }
-        crate::config::InputFormat::FixedWidth(opts) => {
+        clinker_plan::config::InputFormat::FixedWidth(opts) => {
             let fields = extract_field_defs(input)?;
             let config = build_fw_reader_config(opts.as_ref());
             Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
@@ -52,7 +52,7 @@ fn build_format_reader(
 /// same path with a one-element slot list — the wrapper short-circuits
 /// transparently.
 fn build_multi_file_reader(
-    input: &crate::config::SourceConfig,
+    input: &clinker_plan::config::SourceConfig,
     files: Vec<crate::source::multi_file::FileSlot>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::source::multi_file::{FactoryFn, MultiFileFormatReader};
@@ -84,8 +84,8 @@ fn wrap_with_schema_coercion(
     config: &PipelineConfig,
     source_name: &str,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    use crate::config::PipelineNode;
-    use crate::config::pipeline_node::OnUnmapped;
+    use clinker_plan::config::PipelineNode;
+    use clinker_plan::config::pipeline_node::OnUnmapped;
 
     // Find the source node's schema declaration + on_unmapped policy
     // + format. Format is needed for the auto_widen-on-fixed-width
@@ -121,7 +121,7 @@ fn wrap_with_schema_coercion(
             // honest scalar policies for fixed-width) or accept the
             // empty sidecar.
             if matches!(policy, OnUnmapped::AutoWiden)
-                && matches!(format, crate::config::InputFormat::FixedWidth(_))
+                && matches!(format, clinker_plan::config::InputFormat::FixedWidth(_))
             {
                 tracing::info!(
                     source = source_name,
@@ -203,7 +203,7 @@ pub(super) struct IngestTaskOutcome {
 /// increments per record so every source contributes to the
 /// pipeline-wide total.
 pub(super) fn ingest_source(
-    src_cfg: crate::config::SourceConfig,
+    src_cfg: clinker_plan::config::SourceConfig,
     input: crate::source::SourceInput,
     config: PipelineConfig,
     stream: crate::executor::source_stream::SourceIngestChannel,
@@ -221,7 +221,7 @@ pub(super) fn ingest_source(
         crate::source::SourceInput::Files(files) => {
             if files.is_empty() {
                 return Err(PipelineError::Config(
-                    crate::config::ConfigError::Validation(format!(
+                    clinker_plan::config::ConfigError::Validation(format!(
                         "source '{}' has empty file list",
                         src_cfg.name
                     )),
@@ -245,7 +245,7 @@ pub(super) fn ingest_source(
 /// event-time watermarks, and pushing into `stream`. Shared by both the
 /// file and non-file ingest arms — see [`ingest_source`].
 fn drive_record_source(
-    src_cfg: crate::config::SourceConfig,
+    src_cfg: clinker_plan::config::SourceConfig,
     src_reader: Box<dyn crate::source::RecordSource>,
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
@@ -281,15 +281,15 @@ fn drive_record_source(
         }
         let widened_schema = widened_builder
             .with_field_meta(
-                crate::config::pipeline_node::SOURCE_FILE_COLUMN,
+                clinker_plan::config::pipeline_node::SOURCE_FILE_COLUMN,
                 clinker_record::FieldMetadata::source_file(),
             )
             .with_field_meta(
-                crate::config::pipeline_node::SOURCE_NAME_COLUMN,
+                clinker_plan::config::pipeline_node::SOURCE_NAME_COLUMN,
                 clinker_record::FieldMetadata::source_name(),
             )
             .with_field_meta(
-                crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN,
+                clinker_plan::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN,
                 clinker_record::FieldMetadata::source_event_time(),
             )
             .build();
@@ -309,29 +309,31 @@ fn drive_record_source(
         };
         let source_name_arc: Arc<str> = Arc::from(src_cfg.name.as_str());
 
-        let (watermark_column_idx, delay_nanos): (Option<usize>, i64) =
-            match src_cfg.watermark.as_ref() {
-                None => (None, 0),
-                Some(wm) => {
-                    let idx = widened_schema.index(wm.column.as_str()).ok_or_else(|| {
-                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                            "source '{}' declares watermark.column = '{}' but no such column \
+        let (watermark_column_idx, delay_nanos): (Option<usize>, i64) = match src_cfg
+            .watermark
+            .as_ref()
+        {
+            None => (None, 0),
+            Some(wm) => {
+                let idx = widened_schema.index(wm.column.as_str()).ok_or_else(|| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "source '{}' declares watermark.column = '{}' but no such column \
                          exists on the runtime schema (declared columns: {:?})",
-                            src_cfg.name,
-                            wm.column,
-                            widened_schema.columns(),
-                        )))
-                    })?;
-                    // Saturating i64 nanos — a 292-year `Duration` is the
-                    // theoretical ceiling. Anything beyond saturates to
-                    // `i64::MAX` and stays a useful (if extreme) shift.
-                    let delay_nanos = wm
-                        .delay
-                        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-                        .unwrap_or(0);
-                    (Some(idx), delay_nanos)
-                }
-            };
+                        src_cfg.name,
+                        wm.column,
+                        widened_schema.columns(),
+                    )))
+                })?;
+                // Saturating i64 nanos — a 292-year `Duration` is the
+                // theoretical ceiling. Anything beyond saturates to
+                // `i64::MAX` and stays a useful (if extreme) shift.
+                let delay_nanos = wm
+                    .delay
+                    .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                (Some(idx), delay_nanos)
+            }
+        };
 
         let mut stream = stream;
         let mut rn: u64 = 0;
@@ -473,32 +475,34 @@ fn drive_record_source(
 /// Returns a config validation error if schema is `None` (fixed-width requires
 /// explicit schema with field definitions).
 fn extract_field_defs(
-    input: &crate::config::SourceConfig,
+    input: &clinker_plan::config::SourceConfig,
 ) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
     let schema_source = input.schema.as_ref().ok_or_else(|| {
-        PipelineError::Config(crate::config::ConfigError::Validation(
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width format requires explicit schema with field definitions".into(),
         ))
     })?;
     let def = match schema_source {
-        crate::config::SchemaSource::Inline(def) => def.clone(),
-        crate::config::SchemaSource::FilePath(path) => {
-            crate::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
-                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+        clinker_plan::config::SchemaSource::Inline(def) => def.clone(),
+        clinker_plan::config::SchemaSource::FilePath(path) => {
+            clinker_plan::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                     "failed to load schema from '{path}': {e}",
                 )))
             })?
         }
     };
     def.fields.ok_or_else(|| {
-        PipelineError::Config(crate::config::ConfigError::Validation(
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width schema must have 'fields' defined".into(),
         ))
     })
 }
 
 /// Build CSV reader config from optional CSV input options.
-fn build_csv_reader_config(opts: Option<&crate::config::CsvInputOptions>) -> CsvReaderConfig {
+fn build_csv_reader_config(
+    opts: Option<&clinker_plan::config::CsvInputOptions>,
+) -> CsvReaderConfig {
     let mut config = CsvReaderConfig::default();
     if let Some(opts) = opts {
         if let Some(ref d) = opts.delimiter
@@ -520,15 +524,15 @@ fn build_csv_reader_config(opts: Option<&crate::config::CsvInputOptions>) -> Csv
 
 /// Build JSON reader config from optional JSON input options and array paths.
 fn build_json_reader_config(
-    opts: Option<&crate::config::JsonInputOptions>,
-    array_paths: Option<&[crate::config::ArrayPathConfig]>,
+    opts: Option<&clinker_plan::config::JsonInputOptions>,
+    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
 ) -> JsonReaderConfig {
     let mut config = JsonReaderConfig::default();
     if let Some(opts) = opts {
         config.format = opts.format.as_ref().map(|f| match f {
-            crate::config::JsonFormat::Array => JsonMode::Array,
-            crate::config::JsonFormat::Ndjson => JsonMode::Ndjson,
-            crate::config::JsonFormat::Object => JsonMode::Object,
+            clinker_plan::config::JsonFormat::Array => JsonMode::Array,
+            clinker_plan::config::JsonFormat::Ndjson => JsonMode::Ndjson,
+            clinker_plan::config::JsonFormat::Object => JsonMode::Object,
         });
         config.record_path = opts.record_path.clone();
     }
@@ -538,8 +542,8 @@ fn build_json_reader_config(
             .map(|p| ArrayPathSpec {
                 path: p.path.clone(),
                 mode: match p.mode {
-                    crate::config::ArrayMode::Explode => ArrayPathMode::Explode,
-                    crate::config::ArrayMode::Join => ArrayPathMode::Join,
+                    clinker_plan::config::ArrayMode::Explode => ArrayPathMode::Explode,
+                    clinker_plan::config::ArrayMode::Join => ArrayPathMode::Join,
                 },
                 separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
             })
@@ -550,8 +554,8 @@ fn build_json_reader_config(
 
 /// Build XML reader config from optional XML input options and array paths.
 fn build_xml_reader_config(
-    opts: Option<&crate::config::XmlInputOptions>,
-    array_paths: Option<&[crate::config::ArrayPathConfig]>,
+    opts: Option<&clinker_plan::config::XmlInputOptions>,
+    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
 ) -> XmlReaderConfig {
     let mut config = XmlReaderConfig::default();
     if let Some(opts) = opts {
@@ -560,7 +564,7 @@ fn build_xml_reader_config(
             config.attribute_prefix = prefix.clone();
         }
         config.namespace_handling = match opts.namespace_handling {
-            Some(crate::config::NamespaceHandling::Qualify) => NamespaceMode::Qualify,
+            Some(clinker_plan::config::NamespaceHandling::Qualify) => NamespaceMode::Qualify,
             _ => NamespaceMode::Strip,
         };
     }
@@ -570,8 +574,8 @@ fn build_xml_reader_config(
             .map(|p| XmlArrayPath {
                 path: p.path.clone(),
                 mode: match p.mode {
-                    crate::config::ArrayMode::Explode => XmlArrayMode::Explode,
-                    crate::config::ArrayMode::Join => XmlArrayMode::Join,
+                    clinker_plan::config::ArrayMode::Explode => XmlArrayMode::Explode,
+                    clinker_plan::config::ArrayMode::Join => XmlArrayMode::Join,
                 },
                 separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
             })
@@ -582,7 +586,7 @@ fn build_xml_reader_config(
 
 /// Build fixed-width reader config from optional fixed-width input options.
 fn build_fw_reader_config(
-    opts: Option<&crate::config::FixedWidthInputOptions>,
+    opts: Option<&clinker_plan::config::FixedWidthInputOptions>,
 ) -> FixedWidthReaderConfig {
     let mut config = FixedWidthReaderConfig::default();
     if let Some(opts) = opts

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use clinker_record::{Record, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use crate::config::OutputConfig;
+use clinker_plan::config::OutputConfig;
 
 /// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
@@ -135,11 +135,11 @@ pub fn project_output_from_record(
     // opt-in path (default-on per the new passthrough semantic).
     if config.include_unmapped {
         let sidecar_payload = input_record
-            .get(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+            .get(clinker_plan::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
             .cloned();
         // Strip the sidecar slot itself — its payload is being
         // expanded; the slot name should never appear in output.
-        fields.swap_remove(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN);
+        fields.swap_remove(clinker_plan::config::pipeline_node::WIDENED_SIDECAR_COLUMN);
         if let Some(Value::Map(map)) = sidecar_payload {
             for (k, v) in map.iter() {
                 fields.entry(k.to_string()).or_insert_with(|| v.clone());
@@ -222,7 +222,7 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
@@ -262,7 +262,7 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
@@ -295,7 +295,7 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
@@ -342,7 +342,7 @@ mod tests {
     fn fast_path_output_config(include_correlation_keys: bool) -> OutputConfig {
         OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: false,
             include_header: None,
@@ -435,7 +435,7 @@ mod tests {
         // Slow path: same flags, but force rewrite via mapping.
         let config_slow = OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: false,
             include_header: None,
@@ -498,7 +498,7 @@ mod tests {
         );
         let config = OutputConfig {
             name: "out".into(),
-            format: crate::config::OutputFormat::Csv(None),
+            format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,

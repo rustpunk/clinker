@@ -35,7 +35,7 @@ use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coerci
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use crate::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
+use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
 
 /// Wraps a `FormatReader` and reprojects every record onto the
 /// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped

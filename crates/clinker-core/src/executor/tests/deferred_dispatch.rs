@@ -66,8 +66,8 @@ nodes:
 /// is reachable from `dag.deferred_region_at` for every participant.
 #[test]
 fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
-    use crate::config::{CompileContext, parse_config};
-    use crate::plan::execution::PlanNode;
+    use clinker_plan::config::{CompileContext, parse_config};
+    use clinker_plan::plan::execution::PlanNode;
 
     let config = parse_config(DEFERRED_PIPELINE).expect("parse");
     let plan = config
@@ -265,7 +265,7 @@ nodes:
     let orders_csv = "order_id,department,amount\no1,HR,10\no2,HR,20\no3,ENG,100\no4,ENG,200\n";
     let lookup_csv = "department,budget\nHR,100\nENG,500\n";
 
-    let config = crate::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -309,14 +309,14 @@ nodes:
         readers,
         writers.into(),
         &params,
-        crate::config::CompileContext::default(),
+        clinker_plan::config::CompileContext::default(),
         arbitrator,
     )
     .expect_err("peak RSS above the hard limit must abort the deferred-region Combine");
 
     match err {
-        crate::error::PipelineError::MemoryBudgetExceeded {
-            source: crate::pipeline::memory::BudgetCategory::Arena,
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
+            source: clinker_plan::BudgetCategory::Arena,
             used,
             limit,
             ..
@@ -429,7 +429,7 @@ o3,HR,30
         shutdown_token: None,
         ..Default::default()
     };
-    let config = crate::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     with_test_loop_cap(0, || {
         let _ =
             PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params);
@@ -537,8 +537,8 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let ctx = crate::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path(),
         std::path::PathBuf::from("pipelines"),
     );
@@ -783,8 +783,8 @@ o4,ENG,100
 o5,ENG,200
 o6,ENG,300
 ";
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let ctx = crate::config::CompileContext::with_pipeline_dir(
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path(),
         std::path::PathBuf::from("pipelines"),
     );

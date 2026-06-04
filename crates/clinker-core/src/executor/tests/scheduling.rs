@@ -20,8 +20,8 @@
 //!   Each is a genuine reorder away from stable topo index.
 
 use super::*;
-use crate::config::{CompileContext, parse_config};
 use crate::pipeline::memory::MemoryArbitrator;
+use clinker_plan::config::{CompileContext, parse_config};
 use petgraph::graph::NodeIndex;
 use std::collections::HashSet;
 use std::io::{Cursor, Write};
@@ -100,13 +100,13 @@ fn write_csv(dir: &Path, name: &str, rows: usize) -> u64 {
     len
 }
 
-fn compile_dag(yaml: &str, anchor: &Path) -> crate::plan::compiled::CompiledPlan {
+fn compile_dag(yaml: &str, anchor: &Path) -> clinker_plan::plan::compiled::CompiledPlan {
     let config = parse_config(yaml).expect("parse");
     let ctx = CompileContext::with_pipeline_dir(anchor, "");
     config.compile(&ctx).expect("compile")
 }
 
-fn node_idx(dag: &crate::plan::execution::ExecutionPlanDag, name: &str) -> NodeIndex {
+fn node_idx(dag: &clinker_plan::plan::execution::ExecutionPlanDag, name: &str) -> NodeIndex {
     dag.graph
         .node_indices()
         .find(|i| dag.graph[*i].name() == name)
@@ -211,7 +211,7 @@ fn immediate_freed_outranks_larger_subtree_reclaim_of_a_fresh_source() {
     let frontier = [src_large, agg_small];
     let chosen = arbitrator.next_runnable(
         &frontier,
-        dag as &dyn crate::pipeline::memory::SchedulingHint,
+        dag as &dyn clinker_plan::plan::scheduling_hint::SchedulingHint,
     );
 
     assert_eq!(
@@ -396,7 +396,7 @@ fn headroom_fit_prefers_fitting_node_over_lower_index() {
     let frontier = [src_large, src_small];
     let chosen = arbitrator.next_runnable(
         &frontier,
-        dag as &dyn crate::pipeline::memory::SchedulingHint,
+        dag as &dyn clinker_plan::plan::scheduling_hint::SchedulingHint,
     );
     assert_eq!(
         chosen, src_small,

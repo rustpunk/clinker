@@ -6,7 +6,7 @@ license.workspace = true
 description = "Channel binding, validation, and overlay merge for Clinker"
 
 [dependencies]
-clinker-core = { workspace = true }
+clinker-plan = { workspace = true }
 clinker-core-types = { workspace = true }
 clinker-record = { workspace = true }
 serde-saphyr = { workspace = true }

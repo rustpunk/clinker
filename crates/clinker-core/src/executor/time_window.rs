@@ -1,7 +1,7 @@
 //! Time-windowed aggregate execution helpers.
 //!
 //! The event-time window operator lives on
-//! [`crate::config::AggregateConfig::time_window`]; see
+//! [`clinker_plan::config::AggregateConfig::time_window`]; see
 //! <https://github.com/rustpunk/clinker/issues/61> for the design.
 //! The dispatch arm at [`crate::executor::dispatch`] keeps its
 //! existing positional-aggregate fast path and branches into the
@@ -37,10 +37,10 @@ use std::collections::HashSet;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN;
+use clinker_plan::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN;
 #[cfg(test)]
-use crate::config::pipeline_node::TimeWindowSpec;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::config::pipeline_node::TimeWindowSpec;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::{Record, Value};
 
 /// Per-window bounds in i64 nanoseconds since the Unix epoch. The

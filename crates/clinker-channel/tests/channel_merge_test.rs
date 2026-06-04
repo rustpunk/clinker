@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clinker_channel::binding::ChannelBinding;
 use clinker_channel::overlay::apply_channel_overlay;
-use clinker_core::config::composition::LayerKind;
+use clinker_plan::config::composition::LayerKind;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -19,22 +19,22 @@ fn channel_fixtures_dir() -> PathBuf {
 fn compile_fixture(
     rel_pipeline_path: &str,
 ) -> (
-    clinker_core::config::PipelineConfig,
-    clinker_core::plan::CompiledPlan,
+    clinker_plan::config::PipelineConfig,
+    clinker_plan::plan::CompiledPlan,
 ) {
     let root = fixtures_dir();
     let yaml_path = root.join(rel_pipeline_path);
     let yaml = std::fs::read_to_string(&yaml_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", yaml_path.display()));
-    let config: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(&yaml).expect("parse pipeline YAML");
+    let config: clinker_plan::config::PipelineConfig =
+        clinker_plan::yaml::from_str(&yaml).expect("parse pipeline YAML");
     let pipeline_dir = PathBuf::from(rel_pipeline_path)
         .parent()
         .unwrap_or(std::path::Path::new(""))
         .to_path_buf();
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
     let plan =
-        clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile fixture");
+        clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile fixture");
     (config, plan)
 }
 

@@ -13,8 +13,8 @@ mod multi_output_fixtures;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_plan::error::PipelineError;
 use clinker_record::{PipelineCounters, Value};
 
 /// Counters, DLQ entries, and per-output CSV bodies keyed by output name —
@@ -30,10 +30,10 @@ type MultiOutputResult =
 fn multi_output_fixture(
     yaml: &str,
 ) -> (
-    clinker_core::config::PipelineConfig,
+    clinker_plan::config::PipelineConfig,
     HashMap<String, SharedBuffer>,
 ) {
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let buffers: HashMap<String, SharedBuffer> = config
         .output_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
@@ -335,7 +335,7 @@ fn test_multi_output_writer_error_propagated() {
 "#,
     );
 
-    let config = clinker_core::config::parse_config(&yaml).unwrap();
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
@@ -571,7 +571,7 @@ fn test_multi_output_writer_panic_propagated() {
 "#,
     );
 
-    let config = clinker_core::config::parse_config(&yaml).unwrap();
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";
@@ -731,7 +731,7 @@ fn test_multi_output_send_error_disconnected() {
 "#,
     );
 
-    let config = clinker_core::config::parse_config(&yaml).unwrap();
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     // Enough records that "b" gets traffic and will error
@@ -805,7 +805,7 @@ fn test_multi_output_multiple_errors_collected() {
 "#,
     );
 
-    let config = clinker_core::config::parse_config(&yaml).unwrap();
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
     let params = test_params();
 
     let csv = "id,amount\n1,100\n2,10\n";

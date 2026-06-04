@@ -5,6 +5,7 @@ pub mod error;
 pub mod format;
 pub mod node_header;
 pub mod output;
+pub mod path_template;
 pub mod pipeline;
 pub mod pipeline_node;
 pub mod route;

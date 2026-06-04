@@ -19,7 +19,7 @@
 //!    rooted at the producer so a windowed-Transform member finds its
 //!    runtime slot populated.
 //! 3. [`dispatch::dispatch_deferred_subdag`] re-feeds every
-//!    [`crate::plan::deferred_region::DeferredRegion`] through the same
+//!    [`clinker_plan::plan::deferred_region::DeferredRegion`] through the same
 //!    operator arms `dispatch.rs` runs on the forward pass — flipping
 //!    `ExecutorContext::in_deferred_dispatch` is the only
 //!    forward/commit-pass distinction.
@@ -63,13 +63,13 @@ use std::collections::HashMap;
 
 use clinker_record::GroupByKey;
 
-use crate::config::CorrelationFanoutPolicy;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     CommitStepPath, CorrelationErrorRecord, CorrelationGroupBuffer, ExecutorContext,
     commit_correlation_buffers,
 };
-use crate::plan::execution::ExecutionPlanDag;
+use clinker_plan::config::CorrelationFanoutPolicy;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 
 pub(crate) mod detect;
 pub(crate) mod dispatch;
@@ -342,7 +342,8 @@ fn restore_baseline(
 /// by the deferred-region detector.
 fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag) -> bool {
     let parent_relaxed = current_dag.graph.node_indices().any(|idx| {
-        let crate::plan::execution::PlanNode::Aggregation { config, .. } = &current_dag.graph[idx]
+        let clinker_plan::plan::execution::PlanNode::Aggregation { config, .. } =
+            &current_dag.graph[idx]
         else {
             return false;
         };
@@ -353,7 +354,7 @@ fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag
             .and_then(|p| current_dag.node_properties.get(&p))
             .map(|p| p.ck_set.clone())
             .unwrap_or_default();
-        crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck)
+        clinker_plan::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck)
     });
     if parent_relaxed {
         return true;
@@ -365,12 +366,13 @@ fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag
     // deferred region. The recursion mirrors the dispatcher's nested-
     // body walk in `recurse_into_body`.
     current_dag.graph.node_indices().any(|idx| {
-        let crate::plan::execution::PlanNode::Composition { body, .. } = &current_dag.graph[idx]
+        let clinker_plan::plan::execution::PlanNode::Composition { body, .. } =
+            &current_dag.graph[idx]
         else {
             return false;
         };
         ctx.artifacts.body_of(*body).is_some_and(|b| {
-            crate::plan::composition_body::body_or_descendants_have_deferred_region(
+            clinker_plan::plan::composition_body::body_or_descendants_have_deferred_region(
                 ctx.artifacts,
                 b,
             )

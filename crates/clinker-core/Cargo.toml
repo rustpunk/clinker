@@ -7,6 +7,7 @@ description = "Pipeline orchestration, config parsing, and execution engine for 
 
 [dependencies]
 clinker-core-types = { workspace = true }
+clinker-plan = { workspace = true }
 clinker-record = { workspace = true }
 cxl = { workspace = true }
 clinker-format = { workspace = true }

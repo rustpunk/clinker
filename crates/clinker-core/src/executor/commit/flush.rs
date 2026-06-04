@@ -2,7 +2,7 @@
 //!
 //! Drains `correlation_buffers` to writers (clean groups) or the DLQ
 //! (dirty groups) per the resolved
-//! [`crate::config::CorrelationFanoutPolicy`]. The buffer state at
+//! [`clinker_plan::config::CorrelationFanoutPolicy`]. The buffer state at
 //! entry is the converged set: forward-pass strict-Output admissions
 //! plus the FINAL cascading-retraction iteration's deferred-Output
 //! admissions (earlier iterations' deferred records were wiped at the
@@ -12,8 +12,8 @@
 //! is shared; only the path that populates the buffer differs.
 
 use super::detect::RetractScope;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{ExecutorContext, commit_correlation_buffers};
+use clinker_plan::error::PipelineError;
 
 /// Drain the converged correlation buffer to writers and DLQ.
 ///

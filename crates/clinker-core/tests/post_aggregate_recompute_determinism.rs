@@ -72,7 +72,7 @@ O6,ENG,300
 ";
 
 fn run_once() -> u64 {
-    let config = clinker_core::config::parse_config(PIPELINE).unwrap();
+    let config = clinker_plan::config::parse_config(PIPELINE).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),

@@ -7,9 +7,9 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_core::source::multi_file::FileSlot;
+use clinker_plan::config::{CompileContext, parse_config};
 
 const YAML_SOURCE_FILE_PROJECTED: &str = r#"
 pipeline:

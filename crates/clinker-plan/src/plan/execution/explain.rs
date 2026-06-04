@@ -15,6 +15,32 @@ use serde::{Serialize, Serializer};
 
 use crate::config::{PipelineConfig, RouteMode};
 
+/// Walk `config.nodes` in declaration order and yield each
+/// expression-bearing node's `(name, cxl_source)` pair for the
+/// `--explain` "CXL Expressions" section. Transform nodes contribute
+/// their projection CXL, Aggregate nodes their reduction CXL, and Route
+/// nodes an empty body (their predicates render in the plan block, not
+/// here). Other node kinds carry no CXL source and are skipped.
+fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
+    use crate::config::PipelineNode;
+    let mut out = Vec::new();
+    for spanned in &config.nodes {
+        match &spanned.value {
+            PipelineNode::Transform { header, config } => {
+                out.push((header.name.clone(), config.cxl.as_ref().to_string()));
+            }
+            PipelineNode::Aggregate { header, config } => {
+                out.push((header.name.clone(), config.cxl.as_ref().to_string()));
+            }
+            PipelineNode::Route { header, .. } => {
+                out.push((header.name.clone(), String::new()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Human-readable strategy label for the multi-line `--explain` block.
 /// `HashPartitionIEJoin` and `GraceHash` append their `1 << partition_bits`
 /// partition count so the planner's bucket choice surfaces without making
@@ -175,11 +201,11 @@ fn describe_build_role(
 }
 
 ///
-/// Mirrors the runtime distinction visible in
-/// [`crate::executor::dispatch`]: nodes whose output bypasses
-/// `ctx.node_buffers` (fused Source / Transform chains and sink Outputs)
-/// charge no inter-stage memory against [`crate::pipeline::memory::MemoryArbitrator`];
-/// every other node materializes an intermediate buffer and is spill-eligible.
+/// Mirrors the runtime distinction the executor's dispatch makes: nodes
+/// whose output bypasses `ctx.node_buffers` (fused Source / Transform
+/// chains and sink Outputs) charge no inter-stage memory against the
+/// memory arbitrator; every other node materializes an intermediate
+/// buffer and is spill-eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferClass {
     /// No `ctx.node_buffers` slot is admitted for this stage's output —
@@ -212,12 +238,12 @@ impl ExecutionPlanDag {
         // can never drift from what the dispatcher actually streams.
         // `StreamClass` is the verdict; `BufferClass` is this surface's
         // render-time wrapper.
-        crate::executor::classify_stream_nodes(self, config)
+        crate::plan::execution::classify_stream_nodes(self, config)
             .into_iter()
             .map(|(idx, class)| {
                 let buffer_class = match class {
-                    crate::executor::StreamClass::Streaming => BufferClass::Streaming,
-                    crate::executor::StreamClass::Materialized => BufferClass::Materialized,
+                    crate::plan::execution::StreamClass::Streaming => BufferClass::Streaming,
+                    crate::plan::execution::StreamClass::Materialized => BufferClass::Materialized,
                 };
                 (idx, buffer_class)
             })
@@ -671,9 +697,8 @@ impl ExecutionPlanDag {
         // every combine node when artifacts are absent — so the output
         // of `explain()` already has no combine block to dedupe.
         let classes = self.classify_node_buffers(config);
-        let policy = crate::pipeline::memory::build_policy(config.pipeline.memory.backpressure);
-        let policy_name = policy.policy_name();
-        let mut out = self.explain(&classes, &policy_name);
+        let policy_name = config.pipeline.memory.backpressure.policy_name();
+        let mut out = self.explain(&classes, policy_name);
         self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
         out
     }
@@ -895,9 +920,8 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
     ) -> String {
-        let total_limit = crate::pipeline::memory::parse_memory_limit_bytes(
-            config.pipeline.memory.limit.as_deref(),
-        );
+        let total_limit =
+            crate::config::utils::parse_memory_limit_bytes(config.pipeline.memory.limit.as_deref());
         let mut out = self.explain_with_artifacts(config, artifacts, total_limit);
         // Re-render the retraction section with the pipeline config in
         // scope so the fanout-policy line resolves to the user-visible
@@ -932,9 +956,9 @@ impl ExecutionPlanDag {
     fn append_full_sections(&self, out: &mut String, config: &PipelineConfig) {
         // CXL AST (reformatted expressions from config)
         out.push_str("=== CXL Expressions ===\n\n");
-        for t in crate::executor::build_transform_specs(config) {
-            out.push_str(&format!("Transform '{}':\n", t.name));
-            for line in t.cxl_source().lines() {
+        for (name, cxl) in transform_cxl_sources(config) {
+            out.push_str(&format!("Transform '{}':\n", name));
+            for line in cxl.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     out.push_str(&format!("  {}\n", trimmed));
@@ -1036,9 +1060,8 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let classes = self.classify_node_buffers(config);
-        let policy = crate::pipeline::memory::build_policy(config.pipeline.memory.backpressure);
-        let policy_name = policy.policy_name();
-        let mut out = self.explain(&classes, &policy_name);
+        let policy_name = config.pipeline.memory.backpressure.policy_name();
+        let mut out = self.explain(&classes, policy_name);
         if let Some(start) = out.find("=== Retraction ===\n") {
             out.truncate(start);
         }
@@ -1046,9 +1069,9 @@ impl ExecutionPlanDag {
 
         // CXL AST (reformatted expressions from config)
         out.push_str("=== CXL Expressions ===\n\n");
-        for t in crate::executor::build_transform_specs(config) {
-            out.push_str(&format!("Transform '{}':\n", t.name));
-            for line in t.cxl_source().lines() {
+        for (name, cxl) in transform_cxl_sources(config) {
+            out.push_str(&format!("Transform '{}':\n", name));
+            for line in cxl.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     out.push_str(&format!("  {}\n", trimmed));
@@ -1350,7 +1373,7 @@ impl<'a> Serialize for ExplainJson<'a> {
         // share derived from the global default (512MB) divided by
         // the combine count. Callers that have already overridden
         // the limit see the correct share through the text path.
-        let total_memory_limit = crate::pipeline::memory::parse_memory_limit_bytes(None);
+        let total_memory_limit = crate::config::utils::parse_memory_limit_bytes(None);
 
         map.serialize_entry(
             "nodes",

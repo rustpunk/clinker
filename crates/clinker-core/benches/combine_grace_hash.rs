@@ -61,8 +61,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clinker_bench_support::CombineDataGen;
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
 
@@ -232,7 +232,7 @@ fn make_workload(build_rows: usize, probe_rows: usize, key_card: usize) -> (Vec<
 /// Drive the pipeline end-to-end and return the canonical output CSV
 /// bytes (so the correctness gate can compare two paths' results).
 fn run_grace(
-    plan: &clinker_core::plan::CompiledPlan,
+    plan: &clinker_plan::plan::CompiledPlan,
     build_csv: &[u8],
     probe_csv: &[u8],
     params: &PipelineRunParams,
@@ -293,14 +293,14 @@ fn bench_combine_grace_hash(c: &mut Criterion) {
         let cfg_spill = parse_config(COMBINE_GRACE_HASH_SPILL_YAML).expect("spill YAML must parse");
         let cfg_inmem =
             parse_config(COMBINE_GRACE_HASH_IN_MEMORY_YAML).expect("in-memory YAML must parse");
-        let plan_spill = clinker_core::config::PipelineConfig::compile(
+        let plan_spill = clinker_plan::config::PipelineConfig::compile(
             &cfg_spill,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("spill YAML must compile");
-        let plan_inmem = clinker_core::config::PipelineConfig::compile(
+        let plan_inmem = clinker_plan::config::PipelineConfig::compile(
             &cfg_inmem,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("in-memory YAML must compile");
         let params = bench_params();
@@ -335,17 +335,17 @@ fn bench_combine_grace_hash(c: &mut Criterion) {
     let params = bench_params();
 
     let cfg_spill = parse_config(COMBINE_GRACE_HASH_SPILL_YAML).expect("spill YAML must parse");
-    let plan_spill = clinker_core::config::PipelineConfig::compile(
+    let plan_spill = clinker_plan::config::PipelineConfig::compile(
         &cfg_spill,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("spill YAML must compile");
 
     let cfg_inmem =
         parse_config(COMBINE_GRACE_HASH_IN_MEMORY_YAML).expect("in-memory YAML must parse");
-    let plan_inmem = clinker_core::config::PipelineConfig::compile(
+    let plan_inmem = clinker_plan::config::PipelineConfig::compile(
         &cfg_inmem,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("in-memory YAML must compile");
 

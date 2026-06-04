@@ -27,9 +27,9 @@ use std::sync::Arc;
 use clinker_record::{FieldResolver, Record, Value};
 use indexmap::IndexMap;
 
-use crate::plan::combine::CombineInput;
-use crate::plan::row_type::QualifiedField;
-use crate::plan::types::JoinSide;
+use clinker_plan::plan::combine::CombineInput;
+use clinker_plan::plan::row_type::QualifiedField;
+use clinker_plan::plan::types::JoinSide;
 
 /// Compile-time resolution table built once per combine node.
 ///
@@ -50,7 +50,7 @@ use crate::plan::types::JoinSide;
 /// Rationale for indexing bare names here rather than deferring to a
 /// linear scan: the typechecker already rejects ambiguous bare
 /// references at compile time via
-/// [`crate::plan::row_type::ColumnLookup::Ambiguous`], so a runtime
+/// [`clinker_plan::plan::row_type::ColumnLookup::Ambiguous`], so a runtime
 /// bare lookup hitting an ambiguous name is a typechecker bug.
 /// Returning `None` surfaces the bug as a missing value rather than a
 /// silent side-preference choice.
@@ -86,7 +86,7 @@ impl CombineResolverMapping {
     /// chain-intermediate driver entry is the synthetic step name
     /// (`__combine_X_step_0`).
     pub(crate) fn from_pre_resolved(
-        resolved_column_map: &crate::plan::execution::ResolvedColumnMap,
+        resolved_column_map: &clinker_plan::plan::execution::ResolvedColumnMap,
         combine_inputs: &IndexMap<String, CombineInput>,
     ) -> Self {
         // Count occurrences of each bare name across inputs; only
@@ -252,7 +252,7 @@ mod tests {
         }
         CombineInput {
             upstream_name: Arc::from(name),
-            row: crate::plan::row_type::Row::closed(declared, CxlSpan::new(0, 0)),
+            row: clinker_plan::plan::row_type::Row::closed(declared, CxlSpan::new(0, 0)),
             estimated_cardinality: None,
         }
     }
@@ -279,7 +279,7 @@ mod tests {
     fn resolved_map_for(
         inputs: &IndexMap<String, CombineInput>,
         driver_qualifier: &str,
-    ) -> crate::plan::execution::ResolvedColumnMap {
+    ) -> clinker_plan::plan::execution::ResolvedColumnMap {
         let mut map: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
         for (qualifier, input) in inputs {
             let side = if qualifier == driver_qualifier {

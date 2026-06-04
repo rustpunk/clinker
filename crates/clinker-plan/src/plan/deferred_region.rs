@@ -48,17 +48,17 @@ use crate::plan::properties::NodeProperties;
 /// buffer carries `buffer_schema` — exactly the columns the deferred
 /// operators reach via `Expr::support_into`.
 #[derive(Clone, Debug)]
-pub(crate) struct DeferredRegion {
+pub struct DeferredRegion {
     /// `NodeIndex` of the relaxed-CK Aggregate that seeds this region.
     /// For body-internal Aggregates, this is the body's local index;
     /// the parent-level flatten in `config/mod.rs` keys regions only
     /// by parent-graph indices, so consumers inside body executors
     /// must look up by their body-local map.
-    pub(crate) producer: NodeIndex,
+    pub producer: NodeIndex,
     /// Every non-producer, non-output operator inside the region.
-    pub(crate) members: HashSet<NodeIndex>,
+    pub members: HashSet<NodeIndex>,
     /// Correlation-buffered Outputs at the region's exit boundary.
-    pub(crate) outputs: HashSet<NodeIndex>,
+    pub outputs: HashSet<NodeIndex>,
     /// Minimum set of producer-emitted columns that the deferred
     /// operators consume, ordered to match the producer's
     /// `output_schema`. Producer-order is required because every
@@ -67,7 +67,7 @@ pub(crate) struct DeferredRegion {
     /// stamped `output_schema`; reordering the columns (e.g.
     /// alphabetical) trips a `SchemaMismatch` at the first
     /// downstream consumer.
-    pub(crate) buffer_schema: Vec<String>,
+    pub buffer_schema: Vec<String>,
 }
 
 /// Plan-time continuation metadata for a Composition node whose
@@ -87,15 +87,15 @@ pub(crate) struct DeferredRegion {
 /// Composition node whose post-harvest buffer slot acts as the
 /// producer-equivalent. The two surfaces are disjoint by construction.
 #[derive(Clone, Debug)]
-pub(crate) struct ParentContinuation {
+pub struct ParentContinuation {
     /// `NodeIndex` of the Composition node in the containing DAG. The
     /// post-harvest seed lands in `node_buffers[composition_idx]`.
-    pub(crate) composition_idx: NodeIndex,
+    pub composition_idx: NodeIndex,
     /// Operators between the Composition and the continuation's exit
     /// boundary. Excludes the seed Composition itself.
-    pub(crate) members: HashSet<NodeIndex>,
+    pub members: HashSet<NodeIndex>,
     /// Outputs at the continuation's exit boundary.
-    pub(crate) outputs: HashSet<NodeIndex>,
+    pub outputs: HashSet<NodeIndex>,
 }
 
 /// One call site of a composition body — a `PlanNode::Composition`

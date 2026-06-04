@@ -17,8 +17,6 @@ use indexmap::IndexMap;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::config::ErrorStrategy;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
     finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
@@ -27,11 +25,13 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, NullStorage, stage_metrics, widen_record_to_schema};
-use crate::pipeline::memory::BudgetCategory;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::BudgetCategory;
+use clinker_plan::config::ErrorStrategy;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Execute the `Combine` arm for `node_idx`: dispatch on the planner-
-/// selected [`crate::plan::combine::CombineStrategy`], drive the build and
+/// selected [`clinker_plan::plan::combine::CombineStrategy`], drive the build and
 /// probe sides, emit combined rows onto the node's widened output schema,
 /// and route recoverable per-row failures through the DLQ. Blocking on the
 /// build side; the probe side streams. Charges build-side state against the
@@ -55,13 +55,13 @@ pub(crate) fn dispatch_combine(
     else {
         unreachable!("dispatch_combine called with non-Combine node");
     };
-    use crate::config::pipeline_node::{MatchMode, OnMiss};
     use crate::executor::combine::{CombineResolver, CombineResolverMapping};
     use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
     use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
     use crate::pipeline::iejoin::{IEJoinExec, execute_combine_iejoin};
     use crate::pipeline::sort_merge_join::{SortMergeExec, execute_combine_sort_merge};
-    use crate::plan::combine::CombineStrategy;
+    use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+    use clinker_plan::plan::combine::CombineStrategy;
 
     // Strategy dispatch up front. HashBuildProbe stays
     // inline below (the long-standing path);
@@ -189,7 +189,8 @@ pub(crate) fn dispatch_combine(
         if pname == target {
             return true;
         }
-        if let Some(stripped) = pname.strip_prefix(crate::plan::execution::CORRELATION_SORT_PREFIX)
+        if let Some(stripped) =
+            pname.strip_prefix(clinker_plan::plan::execution::CORRELATION_SORT_PREFIX)
         {
             return stripped == target;
         }

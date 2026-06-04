@@ -33,51 +33,7 @@ use tempfile::NamedTempFile;
 
 use clinker_record::{Record, RecordPayload, Schema};
 
-/// Error type for spill operations.
-#[derive(Debug)]
-pub enum SpillError {
-    Io(std::io::Error),
-    Json(serde_json::Error),
-    Postcard(postcard::Error),
-    InvalidSchema(String),
-}
-
-impl std::fmt::Display for SpillError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SpillError::Io(e) => write!(f, "spill I/O error: {e}"),
-            SpillError::Json(e) => write!(f, "spill JSON header error: {e}"),
-            SpillError::Postcard(e) => write!(f, "spill postcard error: {e}"),
-            SpillError::InvalidSchema(msg) => write!(f, "spill schema error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for SpillError {}
-
-impl From<std::io::Error> for SpillError {
-    fn from(e: std::io::Error) -> Self {
-        SpillError::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for SpillError {
-    fn from(e: serde_json::Error) -> Self {
-        SpillError::Json(e)
-    }
-}
-
-impl From<postcard::Error> for SpillError {
-    fn from(e: postcard::Error) -> Self {
-        SpillError::Postcard(e)
-    }
-}
-
-impl From<lz4_flex::frame::Error> for SpillError {
-    fn from(e: lz4_flex::frame::Error) -> Self {
-        SpillError::Io(std::io::Error::other(e.to_string()))
-    }
-}
+use clinker_plan::SpillError;
 
 /// Writes (record, payload) pairs to an LZ4-compressed spill file.
 ///

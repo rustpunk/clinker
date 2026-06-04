@@ -1,5 +1,5 @@
 use clinker_bench_support::workspace_root;
-use clinker_core::config::{
+use clinker_plan::config::{
     AggregateStrategyHint, CompileContext, InputFormat, NodeInput, OutputFormat, PipelineNode,
     SchemaSource, parse_config,
 };

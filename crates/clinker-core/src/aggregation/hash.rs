@@ -18,8 +18,8 @@ use cxl::ast::Expr;
 use cxl::eval::{EvalContext, ProgramEvaluator, eval_expr};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
-use crate::config::{NullOrder, SortField, SortOrder};
 use crate::pipeline::loser_tree::LoserTree;
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
 use super::error::HashAggError;
 use super::spill::{

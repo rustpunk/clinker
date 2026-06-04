@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
 
-use crate::config::PipelineConfig;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, value_to_group_key};
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::ExecutionPlanDag;
+use clinker_plan::config::PipelineConfig;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 use cxl::typecheck::TypedProgram;
@@ -27,9 +27,9 @@ use super::{NullStorage, record_with_emitted_fields};
 pub struct TransformSpec {
     pub name: String,
     pub cxl: Option<String>,
-    pub aggregate: Option<crate::config::AggregateConfig>,
-    pub route: Option<crate::config::RouteConfig>,
-    pub input: Option<crate::config::TransformInput>,
+    pub aggregate: Option<clinker_plan::config::AggregateConfig>,
+    pub route: Option<clinker_plan::config::RouteConfig>,
+    pub input: Option<clinker_plan::config::TransformInput>,
     /// Per-record fan-out ceiling for `emit each` blocks inside this
     /// transform. Threaded to the evaluator at construction time and
     /// surfaces as a typed DLQ entry on overflow.
@@ -53,8 +53,10 @@ impl TransformSpec {
 /// nodes referenced by a transform's input are expanded back into
 /// `TransformInput::Multiple(list)` to match the legacy executor wire shape.
 pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
-    use crate::config::node_header::NodeInput;
-    use crate::config::{AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput};
+    use clinker_plan::config::node_header::NodeInput;
+    use clinker_plan::config::{
+        AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput,
+    };
 
     let merge_by_name: std::collections::HashMap<&str, Vec<String>> = config
         .nodes

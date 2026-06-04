@@ -13,10 +13,10 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, parse_config};
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_core::source::multi_file::FileSlot;
+use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::error::PipelineError;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -296,10 +296,10 @@ fn per_source_path_partitions_dlq_entries() {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use clinker_core::config::{DlqConfig, DlqPerSourceConfig};
     use clinker_core::dlq::partition_dlq_entries;
     use clinker_core::executor::DlqEntry;
     use clinker_core_types::dlq::DlqErrorCategory;
+    use clinker_plan::config::{DlqConfig, DlqPerSourceConfig};
     use clinker_record::{Record, Schema, Value};
 
     let schema = Arc::new(Schema::new(vec!["id".into()]));

@@ -10,12 +10,12 @@ use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 
 use super::RecordOrder;
-use crate::config::pipeline_node::{MatchMode, OnMiss};
-use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineOutputEvalFailure, ProbeIter};
-use crate::plan::combine::DecomposedPredicate;
+use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::combine::DecomposedPredicate;
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
 /// Mirrors the constant in `pipeline::combine` and `pipeline::iejoin` so
@@ -52,8 +52,8 @@ pub(super) struct EmitArgs<'a> {
     pub(super) match_mode: MatchMode,
     pub(super) on_miss: OnMiss,
     pub(super) build_qualifier: &'a str,
-    pub(super) propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
-    pub(super) strategy: crate::config::ErrorStrategy,
+    pub(super) propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
+    pub(super) strategy: clinker_plan::config::ErrorStrategy,
 }
 
 /// Per-probe emission. Walks the probe iterator, applies the residual
@@ -101,7 +101,7 @@ pub(super) fn emit_for_probe<'a>(
                             });
                         }
                         Err(e) => {
-                            if strategy == crate::config::ErrorStrategy::FailFast {
+                            if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             sink.failures.push(CombineOutputEvalFailure {
@@ -175,7 +175,7 @@ pub(super) fn emit_for_probe<'a>(
                                 });
                             }
                             Err(e) => {
-                                if strategy == crate::config::ErrorStrategy::FailFast {
+                                if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                     return Err(PipelineError::from(e));
                                 }
                                 sink.failures.push(CombineOutputEvalFailure {
@@ -241,7 +241,7 @@ pub(super) fn emit_for_probe<'a>(
                                 });
                             }
                             Err(e) => {
-                                if strategy == crate::config::ErrorStrategy::FailFast {
+                                if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                     return Err(PipelineError::from(e));
                                 }
                                 sink.failures.push(CombineOutputEvalFailure {
@@ -286,7 +286,7 @@ pub(super) fn emit_for_probe<'a>(
                             });
                         }
                         Err(e) => {
-                            if strategy == crate::config::ErrorStrategy::FailFast {
+                            if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             sink.failures.push(CombineOutputEvalFailure {

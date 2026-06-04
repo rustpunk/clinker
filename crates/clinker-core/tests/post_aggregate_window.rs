@@ -13,8 +13,8 @@
 mod common;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ fn run_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -551,8 +551,8 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
-    let result = config.compile(&clinker_core::config::CompileContext::default());
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let result = config.compile(&clinker_plan::config::CompileContext::default());
     let diags = result.expect_err("E150b expected on missing partition_by field");
     let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
     assert!(
@@ -565,8 +565,8 @@ nodes:
 
 #[test]
 fn post_aggregate_window_walks_through_sort_to_root_at_aggregate() {
-    use clinker_core::plan::execution::PlanNode;
-    use clinker_core::plan::index::PlanIndexRoot;
+    use clinker_plan::plan::execution::PlanNode;
+    use clinker_plan::plan::index::PlanIndexRoot;
     let yaml = r#"
 pipeline:
   name: post_agg_sort_walkthrough
@@ -610,9 +610,9 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile must succeed");
     let dag = plan.dag();
 
@@ -698,8 +698,8 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).expect("parse");
-    let result = config.compile(&clinker_core::config::CompileContext::default());
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let result = config.compile(&clinker_plan::config::CompileContext::default());
     let diags = result.expect_err("E150d expected on Merge upstream of windowed transform");
     let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
     assert!(

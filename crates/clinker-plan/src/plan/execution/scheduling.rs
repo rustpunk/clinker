@@ -244,7 +244,7 @@ impl ExecutionPlanDag {
     /// emitted single file just concatenates records from every source
     /// file into one writer in arrival order.
     fn populate_fan_out_flags(&mut self) {
-        use crate::output::path_template::PathTemplate;
+        use crate::config::path_template::PathTemplate;
 
         // Snapshot indices and partitioning so we can mutate plan
         // payloads without holding the immutable borrow on
@@ -347,9 +347,9 @@ impl ExecutionPlanDag {
     /// input, via the rustc-shaped walker
     /// `render_unordered_streaming_error`.
     pub(crate) fn select_aggregation_strategies(&mut self) -> Result<(), PipelineError> {
-        use crate::aggregation::{StreamingEligibility, qualifies_for_streaming};
         use crate::config::AggregateStrategyHint;
         use crate::plan::properties::{Confidence, render_unordered_streaming_error};
+        use crate::plan::streaming_eligibility::{StreamingEligibility, qualifies_for_streaming};
         use crate::plan::types::AggregateStrategy;
 
         // Collect target indices first to avoid holding a borrow on `graph`
@@ -369,7 +369,8 @@ impl ExecutionPlanDag {
                 _ => unreachable!(),
             };
 
-            let parent_idx = crate::executor::single_predecessor(self, idx, "aggregation", &name)?;
+            let parent_idx =
+                crate::plan::execution::single_predecessor(self, idx, "aggregation", &name)?;
             let parent_props = self
                 .node_properties
                 .get(&parent_idx)
@@ -506,7 +507,7 @@ impl ExecutionPlanDag {
 }
 
 /// Exposes the plan's per-node volume predictions and topological order to
-/// [`MemoryArbitrator::next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable).
+/// the memory arbitrator's runnable-node selection.
 ///
 /// The byte predictions — peak, immediate freed-on-complete, and downstream
 /// subtree reclaim — are the plan-time estimates `derive_volume_estimates`
@@ -515,7 +516,7 @@ impl ExecutionPlanDag {
 /// order the executor walks the DAG. A node absent from `node_properties`
 /// (e.g. a synthetic combine-chain step that never received a base row)
 /// predicts `0` bytes, matching how `derive_volume_estimates` treats it.
-impl crate::pipeline::memory::SchedulingHint for ExecutionPlanDag {
+impl crate::plan::scheduling_hint::SchedulingHint for ExecutionPlanDag {
     fn predicted_peak_bytes(&self, id: NodeIndex) -> u64 {
         self.node_properties
             .get(&id)

@@ -35,9 +35,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::error::PipelineError;
 use crate::executor::stream_event::{Punctuation, StreamEvent};
-use crate::pipeline::memory::{BudgetCategory, ConsumerHandle, MemoryArbitrator};
+use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
+use clinker_plan::BudgetCategory;
+use clinker_plan::error::PipelineError;
 
 /// Default per-batch event count when no `pipeline.batch_size` knob and
 /// no per-Transform override is set.

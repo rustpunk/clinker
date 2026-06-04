@@ -58,7 +58,7 @@ impl ExecutionPlanDag {
     /// cloned because the dispatcher needs to own its `current_dag`
     /// borrow target via a stack-local; the graph itself is small
     /// relative to the record stream.
-    pub(crate) fn from_body(body: &crate::plan::composition_body::BoundBody) -> Self {
+    pub fn from_body(body: &crate::plan::composition_body::BoundBody) -> Self {
         Self {
             graph: body.graph.clone(),
             topo_order: body.topo_order.clone(),
@@ -88,7 +88,7 @@ impl ExecutionPlanDag {
     /// this DAG (producer, member, or output). Dispatcher arms call
     /// this at the top of every operator branch to decide whether to
     /// short-circuit to the deferred buffer.
-    pub(crate) fn deferred_region_at(
+    pub fn deferred_region_at(
         &self,
         idx: NodeIndex,
     ) -> Option<&crate::plan::deferred_region::DeferredRegion> {
@@ -101,7 +101,7 @@ impl ExecutionPlanDag {
     /// forward pass — the commit-time deferred dispatch will run the
     /// operator on post-recompute data (aggregate emits or harvested
     /// body output records, depending on the surface).
-    pub(crate) fn is_deferred_consumer(&self, idx: NodeIndex) -> bool {
+    pub fn is_deferred_consumer(&self, idx: NodeIndex) -> bool {
         self.deferred_regions
             .get(&idx)
             .is_some_and(|r| r.producer != idx)
@@ -114,7 +114,7 @@ impl ExecutionPlanDag {
     /// `Some(region)` iff `idx` is the producer of a deferred region.
     /// The Aggregation arm uses this to project emits to
     /// `region.buffer_schema` before parking them in `node_buffers`.
-    pub(crate) fn deferred_region_at_producer(
+    pub fn deferred_region_at_producer(
         &self,
         idx: NodeIndex,
     ) -> Option<&crate::plan::deferred_region::DeferredRegion> {

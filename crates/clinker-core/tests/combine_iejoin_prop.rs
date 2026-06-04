@@ -12,7 +12,7 @@
 //! covered separately by the IEJoin executor commit.
 use std::collections::HashSet;
 
-use clinker_core::config::PipelineConfig;
+use clinker_plan::config::PipelineConfig;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
 
@@ -162,7 +162,7 @@ fn test_iejoin_fixtures_exist() {
         let path = fixture_dir.join(format!("{stem}.yaml"));
         let yaml = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()));
-        clinker_core::yaml::from_str::<PipelineConfig>(&yaml)
+        clinker_plan::yaml::from_str::<PipelineConfig>(&yaml)
             .unwrap_or_else(|e| panic!("fixture parse error for {stem}: {e}"));
     }
 }

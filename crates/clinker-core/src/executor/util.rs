@@ -1,6 +1,6 @@
-//! Cross-cutting executor utilities: dispatch-order scheduling, the
-//! init-phase closure, record-schema reshaping, correlation-key copy, and
-//! small config/plan lookups shared across the dispatch arms.
+//! Cross-cutting executor utilities: dispatch-order scheduling,
+//! record-schema reshaping, correlation-key copy, and small config/plan
+//! lookups shared across the dispatch arms.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,10 +8,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
 
-use crate::config::PipelineConfig;
-use crate::error::PipelineError;
-use crate::plan::execution::ExecutionPlanDag;
-use petgraph::Direction;
+use clinker_plan::config::PipelineConfig;
 
 /// Resolve the dispatch order for a topological pass via the memory
 /// arbitrator's [`next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable)
@@ -46,11 +43,11 @@ use petgraph::Direction;
 /// distinguish the candidates, and never changes record output, which is
 /// independent of dispatch order.
 pub(super) fn scheduled_pass_order(
-    plan: &crate::plan::execution::ExecutionPlanDag,
+    plan: &clinker_plan::plan::execution::ExecutionPlanDag,
     arbitrator: &crate::pipeline::memory::MemoryArbitrator,
     candidates: &HashSet<petgraph::graph::NodeIndex>,
 ) -> Vec<petgraph::graph::NodeIndex> {
-    use crate::pipeline::memory::SchedulingHint;
+    use clinker_plan::plan::scheduling_hint::SchedulingHint;
 
     let mut emitted: HashSet<petgraph::graph::NodeIndex> = HashSet::with_capacity(candidates.len());
     let mut order: Vec<petgraph::graph::NodeIndex> = Vec::with_capacity(candidates.len());
@@ -87,51 +84,6 @@ pub(super) fn scheduled_pass_order(
     }
 
     order
-}
-
-/// Compute the init-phase ancestor closure for a compiled plan.
-///
-/// Walks every `PlanNode::Transform` whose payload phase is
-/// [`crate::config::Phase::Init`] and unions their transitive
-/// upstream ancestors via reverse-BFS along the graph's incoming
-/// edges. The init-phase transforms themselves are included.
-///
-/// Returns an empty set when no init-phase transforms exist — the
-/// caller then falls through to a single-pass topo walk.
-///
-/// E164 validation guarantees init-phase Transforms are terminal
-/// (no runtime descendants), so the closure forms a well-bounded
-/// init sub-DAG that Pass 1 can run to completion before Pass 2
-/// starts.
-pub(crate) fn compute_init_phase_node_set(
-    plan: &crate::plan::execution::ExecutionPlanDag,
-) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
-    use crate::config::Phase as ConfPhase;
-    use crate::plan::execution::PlanNode;
-    let mut set: std::collections::HashSet<petgraph::graph::NodeIndex> =
-        std::collections::HashSet::new();
-    let mut stack: Vec<petgraph::graph::NodeIndex> = plan
-        .graph
-        .node_indices()
-        .filter(|&idx| match &plan.graph[idx] {
-            PlanNode::Transform {
-                resolved: Some(p), ..
-            } => p.phase == ConfPhase::Init,
-            _ => false,
-        })
-        .collect();
-    while let Some(idx) = stack.pop() {
-        if !set.insert(idx) {
-            continue;
-        }
-        for parent in plan
-            .graph
-            .neighbors_directed(idx, petgraph::Direction::Incoming)
-        {
-            stack.push(parent);
-        }
-    }
-    set
 }
 
 /// Re-project `input` onto `target`: allocate a fresh `Record` whose
@@ -220,9 +172,9 @@ fn recover_engine_stamped_value(
 pub(crate) fn copy_build_ck_columns(
     out: &mut Record,
     build: &Record,
-    spec: &crate::config::pipeline_node::PropagateCkSpec,
+    spec: &clinker_plan::config::pipeline_node::PropagateCkSpec,
 ) {
-    use crate::config::pipeline_node::PropagateCkSpec;
+    use clinker_plan::config::pipeline_node::PropagateCkSpec;
     let build_schema = Arc::clone(build.schema());
     for (idx, col) in build_schema.columns().iter().enumerate() {
         let Some(field_name) = col.strip_prefix("$ck.") else {
@@ -308,30 +260,6 @@ pub(crate) fn record_with_emitted_fields(
     widen_record_to_schema(input, &widened)
 }
 
-/// Plan-invariant predecessor lookup for nodes that require exactly one
-/// upstream input (currently `PlanNode::Aggregation`). Returns
-/// `PipelineError::Internal` on misshapen plans — never panics. Mirrors
-/// DataFusion's `internal_err!` macro.
-pub(crate) fn single_predecessor(
-    plan: &ExecutionPlanDag,
-    node_idx: petgraph::graph::NodeIndex,
-    op: &'static str,
-    node_name: &str,
-) -> Result<petgraph::graph::NodeIndex, PipelineError> {
-    let preds: Vec<_> = plan
-        .graph
-        .neighbors_directed(node_idx, Direction::Incoming)
-        .collect();
-    match preds.as_slice() {
-        [p] => Ok(*p),
-        _ => Err(PipelineError::Internal {
-            op,
-            node: node_name.to_string(),
-            detail: format!("expected exactly 1 predecessor, got {}", preds.len()),
-        }),
-    }
-}
-
 /// Parse memory limit from config (default 512MB).
 pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
     config
@@ -362,7 +290,7 @@ pub(crate) fn build_arbitrator_from_config(
     config: &PipelineConfig,
 ) -> crate::pipeline::memory::MemoryArbitrator {
     let mem = &config.pipeline.memory;
-    let limit = crate::pipeline::memory::parse_memory_limit_bytes(mem.limit.as_deref());
+    let limit = clinker_plan::config::utils::parse_memory_limit_bytes(mem.limit.as_deref());
     crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
         0.80,

@@ -96,11 +96,11 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
         .expect("write composition body fixture");
     std::fs::create_dir_all(workspace.path().join("pipelines")).expect("mkdir pipelines");
 
-    let ctx = crate::config::CompileContext::with_pipeline_dir(
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         workspace.path().to_path_buf(),
         PathBuf::from("pipelines"),
     );
-    let config = crate::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
 
     let mut csv = String::from("id\n");
     for i in 0..30 {
@@ -158,7 +158,7 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
                         "the boundary overflow must name the body's port-source node",
                     );
                     assert!(
-                        matches!(source, crate::pipeline::memory::BudgetCategory::NodeBuffer),
+                        matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
                         "port admission must surface under NodeBuffer; got {source:?}",
                     );
                     assert_eq!(

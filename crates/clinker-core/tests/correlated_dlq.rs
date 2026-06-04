@@ -11,8 +11,8 @@ mod common;
 mod dlq_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::error::PipelineError;
 use clinker_core::executor::{DlqEntry, PipelineRunParams};
+use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
 
@@ -20,7 +20,7 @@ fn run_correlated_pipeline(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -345,7 +345,7 @@ nodes:
     // grouping we'd see double-count; with correlation grouping the
     // DLQ entry count is one per source row, not per (row, output).
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -432,8 +432,8 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).unwrap();
-    let result = config.compile(&clinker_core::config::CompileContext::default());
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
+    let result = config.compile(&clinker_plan::config::CompileContext::default());
     let diags = result.expect_err("E150 should reject correlation_key + arena");
     assert!(
         diags.iter().any(|d| d.code == "E150"),
@@ -489,16 +489,16 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let plan = config
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("retraction-mode aggregate must compile, not error");
     let agg_node = plan
         .dag()
         .graph
         .node_weights()
         .find_map(|n| match n {
-            clinker_core::plan::execution::PlanNode::Aggregation { name, compiled, .. }
+            clinker_plan::plan::execution::PlanNode::Aggregation { name, compiled, .. }
                 if name == "agg" =>
             {
                 Some(compiled.clone())
@@ -845,7 +845,7 @@ nodes:
     let orders_csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,7\n";
     let departments_csv = "employee_id,dept\nA,HR\nB,ENG\n";
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -1025,7 +1025,7 @@ nodes:
     let products_csv = "product_id,name,category_id\nP1,Widget,C1\nP2,Gadget,C2\n";
     let categories_csv = "category_id,category_name\nC1,Hardware\nC2,Software\n";
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
@@ -1249,7 +1249,7 @@ nodes:
     let orders_csv = "employee_id,amount,event_time\nA,1,5\nA,bad,10\nA,3,15\nB,4,25\n";
     let sessions_csv = "employee_id,session_start,session_end\nA,0,20\nB,20,30\n";
 
-    let config = clinker_core::config::parse_config(yaml).unwrap();
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),

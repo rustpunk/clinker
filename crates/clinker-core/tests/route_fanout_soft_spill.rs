@@ -27,8 +27,8 @@
 //! and the test would assert against a counter that never moves.
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_core::config::{CompileContext, PipelineConfig};
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::{CompileContext, PipelineConfig};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -116,7 +116,7 @@ fn route_fanout_emits_spill_under_one_megabyte_budget() {
 
     let csv = build_events_csv();
     let config: PipelineConfig =
-        clinker_core::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");

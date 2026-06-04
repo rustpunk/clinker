@@ -22,8 +22,8 @@ use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::parse_config;
 
 // ───────────────────────── tiered policy ─────────────────────────
 
@@ -300,9 +300,9 @@ fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, Str
         .collect();
 
     PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(
+        &clinker_plan::config::PipelineConfig::compile(
             &config,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("compile"),
         readers,
@@ -347,9 +347,9 @@ fn fixture_io(name: &str) -> (Vec<SourceInput>, Vec<BaselineAssertion>) {
 fn snapshot_explain(snap_name: &str, yaml: &str) {
     let config = parse_config(yaml).expect("parse_config");
     let (dag, _) = PipelineExecutor::explain_plan_dag(
-        &clinker_core::config::PipelineConfig::compile(
+        &clinker_plan::config::PipelineConfig::compile(
             &config,
-            &clinker_core::config::CompileContext::default(),
+            &clinker_plan::config::CompileContext::default(),
         )
         .expect("compile"),
     )
@@ -448,7 +448,7 @@ fn test_composition_fixture_corpus_well_formed() {
             });
         } else {
             // Non-pipeline fixtures must be valid YAML (structural check only)
-            let _value: serde_json::Value = clinker_core::yaml::from_str(&content)
+            let _value: serde_json::Value = clinker_plan::yaml::from_str(&content)
                 .unwrap_or_else(|e| panic!("fixture {} is not valid YAML: {e}", fx.name));
         }
     }
@@ -536,8 +536,8 @@ fn snapshot_composition_pipeline(snap_name: &str, rel_path: &str) {
         .parent()
         .unwrap_or(std::path::Path::new(""))
         .to_path_buf();
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
-    let compiled = clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
+    let compiled = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
     let (dag, _) =
         clinker_core::executor::PipelineExecutor::explain_plan_dag(&compiled).expect("explain_dag");
     let text = dag.explain_text(&config);
@@ -596,9 +596,9 @@ fn test_forward_only_pipeline_fixtures_have_baseline() {
             .parent()
             .unwrap_or(std::path::Path::new(""))
             .to_path_buf();
-        let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
+        let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
         let _compiled =
-            clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+            clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
     }
     // Verify the insta snapshots exist
     snapshot_composition_pipeline(
@@ -653,12 +653,12 @@ nodes:
       path: data/o.csv
 "#;
     let config = parse_config(yaml).expect("parse_config");
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         &root,
         std::path::PathBuf::from("pipelines"),
     );
     let (_plan, diags) =
-        clinker_core::config::PipelineConfig::compile_with_diagnostics(&config, &ctx)
+        clinker_plan::config::PipelineConfig::compile_with_diagnostics(&config, &ctx)
             .expect("compile should succeed (W101 is a warning, not error)");
 
     let w101: Vec<_> = diags.iter().filter(|d| d.code == "W101").collect();
@@ -690,9 +690,9 @@ fn test_insta_baselines_are_tail_var_stable() {
     let mut outputs = Vec::new();
     for _ in 0..2 {
         let ctx =
-            clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir.clone());
+            clinker_plan::config::CompileContext::with_pipeline_dir(&root, pipeline_dir.clone());
         let compiled =
-            clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+            clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
         let (dag, _) = clinker_core::executor::PipelineExecutor::explain_plan_dag(&compiled)
             .expect("explain_dag");
         let text = dag.explain_text(&config);
@@ -730,17 +730,17 @@ fn test_all_14_fixtures_have_baseline() {
 fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
     use clinker_channel::binding::ChannelBinding;
     use clinker_channel::overlay::apply_channel_overlay;
-    use clinker_core::config::composition::LayerKind;
+    use clinker_plan::config::composition::LayerKind;
 
     let root = composition_fixture_root();
     let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
     let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
     let config = parse_config(&yaml).expect("parse_config");
-    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
         &root,
         std::path::PathBuf::from("pipelines"),
     );
-    let mut plan = clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+    let mut plan = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
 
     // Apply the acme_prod channel (which has ChannelFixed bindings) but
     // adapted to target this pipeline's provenance entries.

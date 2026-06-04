@@ -20,9 +20,10 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
-use crate::config::SortField;
 use crate::pipeline::sort::compare_records_by_fields;
-use crate::pipeline::spill::{SpillError, SpillFile, SpillWriter};
+use crate::pipeline::spill::{SpillFile, SpillWriter};
+use clinker_plan::SpillError;
+use clinker_plan::config::SortField;
 
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
@@ -200,7 +201,7 @@ mod tests {
     fn sort_by_value_asc() -> Vec<SortField> {
         vec![SortField {
             field: "value".into(),
-            order: crate::config::SortOrder::Asc,
+            order: clinker_plan::config::SortOrder::Asc,
             null_order: None,
         }]
     }

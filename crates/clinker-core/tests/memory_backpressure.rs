@@ -7,8 +7,8 @@
 //! victim-selection coverage) and the `pre_lift_baselines` snapshot
 //! suite (default-case explain output).
 
-use clinker_core::config::{BackpressureKnob, parse_config};
 use clinker_core::executor::PipelineExecutor;
+use clinker_plan::config::{BackpressureKnob, parse_config};
 
 const FIXTURE_BASE: &str = r#"
 pipeline:
@@ -37,9 +37,9 @@ nodes:
 fn explain_text_with(memory_block: &str) -> String {
     let yaml = FIXTURE_BASE.replace("  __MEMORY__\n", memory_block);
     let config = parse_config(&yaml).expect("parse_config");
-    let compiled = clinker_core::config::PipelineConfig::compile(
+    let compiled = clinker_plan::config::PipelineConfig::compile(
         &config,
-        &clinker_core::config::CompileContext::default(),
+        &clinker_plan::config::CompileContext::default(),
     )
     .expect("compile");
     let (dag, _) = PipelineExecutor::explain_plan_dag(&compiled).expect("explain_dag");

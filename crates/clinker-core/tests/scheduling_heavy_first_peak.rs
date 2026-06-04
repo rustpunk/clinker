@@ -27,8 +27,8 @@
 //! actually processes come from the cursors, so the two runs are identical
 //! workloads dispatched in two orders.
 
-use clinker_core::config::CompileContext;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_plan::config::CompileContext;
 use std::io::Write;
 use std::path::Path;
 
@@ -166,7 +166,7 @@ fn write_file(dir: &Path, name: &str, bytes_len: usize) {
 /// the run's `peak_consumer_usage_bytes` high-water mark.
 fn run_peak(anchor: &Path, heavy_csv: &str, light_csv: &str, limit: &str) -> u64 {
     let yaml = two_chain_combine_yaml(limit);
-    let config = clinker_core::config::parse_config(&yaml).expect("parse");
+    let config = clinker_plan::config::parse_config(&yaml).expect("parse");
     let ctx = CompileContext::with_pipeline_dir(anchor, "");
     let plan = config.compile(&ctx).expect("compile");
 

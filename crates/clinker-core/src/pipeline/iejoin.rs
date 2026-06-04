@@ -49,16 +49,17 @@ use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::config::pipeline_node::{MatchMode, OnMiss};
-use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{
     CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor, hash_composite_key,
     keys_equal_canonicalized,
 };
-use crate::pipeline::memory::{BudgetCategory, MemoryArbitrator};
-use crate::plan::combine::{DecomposedPredicate, RangeOp};
+use crate::pipeline::memory::MemoryArbitrator;
+use clinker_plan::BudgetCategory;
+use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
 /// Mirrors `pipeline::combine::COLLECT_PER_GROUP_CAP` so both code paths
@@ -425,14 +426,14 @@ pub(crate) struct IEJoinExec<'a> {
     /// Build-side `$ck.<field>` propagation policy. Mirrors the
     /// HashBuildProbe arm — every strategy threads the same spec to
     /// the shared `copy_build_ck_columns` helper at every emit site.
-    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    pub propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` / `BestEffort` the failing row is deferred to the
     /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
-    pub strategy: crate::config::ErrorStrategy,
+    pub strategy: clinker_plan::config::ErrorStrategy,
 }
 
 pub(crate) fn execute_combine_iejoin(
@@ -769,7 +770,7 @@ pub(crate) fn execute_combine_iejoin(
                             });
                         }
                         Err(e) => {
-                            if strategy == crate::config::ErrorStrategy::FailFast {
+                            if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                 return Err(PipelineError::from(e));
                             }
                             output_eval_failures.push(CombineOutputEvalFailure {
@@ -880,7 +881,7 @@ pub(crate) fn execute_combine_iejoin(
                                     });
                                 }
                                 Err(e) => {
-                                    if strategy == crate::config::ErrorStrategy::FailFast {
+                                    if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                                         return Err(PipelineError::from(e));
                                     }
                                     output_eval_failures.push(CombineOutputEvalFailure {
@@ -1049,7 +1050,7 @@ pub(crate) fn execute_combine_iejoin(
                         });
                     }
                     Err(e) => {
-                        if strategy == crate::config::ErrorStrategy::FailFast {
+                        if strategy == clinker_plan::config::ErrorStrategy::FailFast {
                             return Err(PipelineError::from(e));
                         }
                         output_eval_failures.push(CombineOutputEvalFailure {

@@ -43,12 +43,12 @@ use petgraph::visit::{EdgeRef, Topo};
 
 use super::DlqEvent;
 use super::detect::RetractScope;
-use crate::error::PipelineError;
 use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node, drain_node_buffer_slot};
 use crate::executor::node_buffer::NodeBuffer;
-use crate::plan::CompositionBodyId;
-use crate::plan::deferred_region::{DeferredRegion, ParentContinuation};
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::CompositionBodyId;
+use clinker_plan::plan::deferred_region::{DeferredRegion, ParentContinuation};
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Walk every [`DeferredRegion`] reachable from `current_dag` (top-level
 /// regions plus body-internal regions surfaced through the
@@ -164,7 +164,7 @@ fn dispatch_deferred_inner(
         // continuation walker uses to decide whether to record a
         // continuation in the first place).
         let needs_recurse = ctx.artifacts.body_of(body_id).is_some_and(|b| {
-            crate::plan::composition_body::body_or_descendants_have_deferred_region(
+            clinker_plan::plan::composition_body::body_or_descendants_have_deferred_region(
                 ctx.artifacts,
                 b,
             )

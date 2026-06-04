@@ -1,5 +1,5 @@
-use crate::config::{LogDirective, LogLevel, LogTiming};
 use crate::log_template::{self, LogTemplateContext};
+use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
 
 /// Runtime state for log directive execution.
 pub struct LogDispatcher {
@@ -135,7 +135,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::config::{LogLevel, LogTiming};
+    use clinker_plan::config::{LogLevel, LogTiming};
 
     /// Run-stable logging context: everything available to a log template
     /// except the current record's fields, which vary per record and are

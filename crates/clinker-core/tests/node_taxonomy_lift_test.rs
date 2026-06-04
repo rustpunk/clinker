@@ -4,8 +4,8 @@
 //! `compile_topology_only()` topology stages 1–4 (duplicates, self-loops,
 //! cycles, path validation).
 
-use clinker_core::config::{PipelineConfig, PipelineNode};
-use clinker_core::yaml::{Spanned, from_str};
+use clinker_plan::config::{PipelineConfig, PipelineNode};
+use clinker_plan::yaml::{Spanned, from_str};
 
 #[test]
 fn test_node_taxonomy_smoke() {
@@ -166,7 +166,7 @@ nodes:
     config:
       cxl: "emit a = 1"
 "#;
-    let result = clinker_core::yaml::from_str::<PipelineConfig>(yaml);
+    let result = clinker_plan::yaml::from_str::<PipelineConfig>(yaml);
     assert!(
         result.is_err(),
         "transform missing `input:` must be a parse error"
@@ -178,7 +178,7 @@ nodes:
 // ---------------------------------------------------------------------
 
 fn parse_pipeline(yaml: &str) -> PipelineConfig {
-    clinker_core::yaml::from_str::<PipelineConfig>(yaml).expect("parse PipelineConfig")
+    clinker_plan::yaml::from_str::<PipelineConfig>(yaml).expect("parse PipelineConfig")
 }
 
 #[test]
@@ -396,7 +396,7 @@ config:
 "#;
     let parsed = parse_node(yaml);
     let json = serde_json::to_string(&parsed.value).expect("serialize");
-    let round_tripped: clinker_core::config::PipelineNode =
+    let round_tripped: clinker_plan::config::PipelineNode =
         serde_json::from_str(&json).expect("round-trip deserialize");
     assert_eq!(round_tripped.name(), "clean");
     assert_eq!(round_tripped.type_tag(), "transform");
@@ -457,7 +457,7 @@ transformations:
     input: in
     cxl: "emit x = 1"
 "#;
-    let res = clinker_core::yaml::from_str::<PipelineConfig>(yaml);
+    let res = clinker_plan::yaml::from_str::<PipelineConfig>(yaml);
     assert!(
         res.is_err(),
         "legacy `transformations:` shape must no longer parse"
@@ -507,7 +507,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile must succeed");
     assert_eq!(plan.dag().graph.node_count(), 3);
     assert_eq!(plan.dag().graph.edge_count(), 2);
@@ -515,7 +515,7 @@ nodes:
 
 #[test]
 fn test_compile_lowered_source_carries_resolved_payload() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
   name: src_payload
@@ -539,7 +539,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     let src = plan
         .dag()
@@ -555,7 +555,7 @@ nodes:
 
 #[test]
 fn test_compile_lowered_transform_carries_resolved_payload() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
   name: t_payload
@@ -577,7 +577,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
@@ -593,7 +593,7 @@ nodes:
 
 #[test]
 fn test_compile_lowered_output_carries_resolved_payload() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
   name: o_payload
@@ -617,7 +617,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
@@ -633,7 +633,7 @@ nodes:
 
 #[test]
 fn test_compile_lowers_route_with_branches_and_default() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
   name: rt
@@ -659,7 +659,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     let route = plan
         .dag()
@@ -678,7 +678,7 @@ nodes:
 
 #[test]
 fn test_compile_lowers_merge_wires_multiple_inputs() {
-    use clinker_core::plan::execution::PlanNode;
+    use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
   name: mg
@@ -709,7 +709,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     let merge_idx = plan
         .dag()
@@ -750,7 +750,7 @@ nodes:
         - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile(&clinker_core::config::CompileContext::default());
+    let res = cfg.compile(&clinker_plan::config::CompileContext::default());
     assert!(res.is_err());
     let diags = res.err().unwrap();
     assert!(diags.iter().any(|d| d.code == "E001"));
@@ -791,7 +791,7 @@ nodes:
       path: data/out_nonexistent.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile(&clinker_core::config::CompileContext::default());
+    let res = cfg.compile(&clinker_plan::config::CompileContext::default());
     assert!(res.is_err(), "compile must fail on CXL type error");
     let diags = res.err().unwrap();
     assert!(
@@ -818,7 +818,7 @@ nodes:
       type: csv
       path: data/in.csv
 "#;
-    let res = clinker_core::yaml::from_str::<PipelineConfig>(yaml);
+    let res = clinker_plan::yaml::from_str::<PipelineConfig>(yaml);
     assert!(
         res.is_err(),
         "source missing `schema:` must be a parse error"
@@ -858,7 +858,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .expect("compile must succeed without touching disk");
     assert_eq!(plan.dag().graph.node_count(), 3);
 }
@@ -880,7 +880,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile(&clinker_core::config::CompileContext::default())
+        .compile(&clinker_plan::config::CompileContext::default())
         .unwrap();
     assert_eq!(plan.dag().graph.node_count(), 1);
 }
