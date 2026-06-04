@@ -67,6 +67,13 @@ const COLLECT_PER_GROUP_CAP: usize = 10_000;
 /// polls during the merge walk.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
+/// Per-side external-sort spill threshold in bytes: half the soft RSS limit,
+/// floored at 16 KiB so tests with tiny budgets still exercise the spill path.
+/// Shared by both the driver- and build-side external sorts.
+fn spill_threshold_bytes(budget: &MemoryArbitrator) -> usize {
+    std::cmp::max(16 * 1024, budget.soft_limit() as usize / 2)
+}
+
 /// Order-tracking sidecar carried alongside every record in the
 /// executor's `node_buffers`. Same alias the IEJoin and grace-hash
 /// kernels expose; spelled out here so the public exec entry point's
@@ -828,7 +835,7 @@ fn sort_driver_pairs_externally(
         });
     };
     let schema = Arc::clone(pairs[0].0.schema());
-    let spill_threshold = std::cmp::max(16 * 1024, budget.soft_limit() as usize / 2);
+    let spill_threshold = spill_threshold_bytes(budget);
     let sort_field = crate::config::SortField {
         field: field.clone(),
         order: crate::config::SortOrder::Asc,
@@ -950,7 +957,7 @@ fn sort_build_pairs_externally(
         });
     };
     let schema = Arc::clone(pairs[0].0.schema());
-    let spill_threshold = std::cmp::max(16 * 1024, budget.soft_limit() as usize / 2);
+    let spill_threshold = spill_threshold_bytes(budget);
     let sort_field = crate::config::SortField {
         field: field.clone(),
         order: crate::config::SortOrder::Asc,
