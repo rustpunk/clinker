@@ -77,19 +77,6 @@ pub fn resolve_log_rules(
 mod tests {
     use super::*;
 
-    #[allow(dead_code)]
-    fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
-        LogDirective {
-            level,
-            when,
-            condition: None,
-            message: message.to_string(),
-            fields: None,
-            every: None,
-            log_rule: None,
-        }
-    }
-
     fn make_rule() -> LogRule {
         LogRule {
             level: Some(LogLevel::Info),
