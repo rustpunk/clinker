@@ -2,6 +2,7 @@ pub mod stage_metrics;
 
 pub(crate) mod batch_handoff;
 pub mod combine;
+pub(crate) mod combine_dispatch;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
 pub mod node_buffer;
