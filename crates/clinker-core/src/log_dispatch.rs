@@ -1,6 +1,3 @@
-use clinker_record::Value;
-use indexmap::IndexMap;
-
 use crate::config::{LogDirective, LogLevel, LogTiming};
 use crate::log_template::{self, LogTemplateContext};
 
@@ -132,58 +129,60 @@ fn emit_log(
     }
 }
 
-/// Run-stable logging context: everything available to a log template
-/// except the current record's fields, which vary per record and are
-/// supplied separately at context-build time.
-pub struct LogContext<'a> {
-    /// Transform name.
-    pub transform_name: &'a str,
-    /// Transform duration in milliseconds (only available in after_transform).
-    pub transform_duration_ms: Option<u64>,
-    /// Source file path.
-    pub source_file: &'a str,
-    /// Source row number.
-    pub source_row: u64,
-    /// Pipeline counters.
-    pub pipeline_ok_count: u64,
-    pub pipeline_dlq_count: u64,
-    pub pipeline_total_count: u64,
-    /// Pipeline name.
-    pub pipeline_name: &'a str,
-    /// Pipeline execution ID.
-    pub pipeline_execution_id: &'a str,
-    /// DLQ error category (only available in on_error).
-    pub dlq_error_category: Option<&'a str>,
-    /// DLQ error detail (only available in on_error).
-    pub dlq_error_detail: Option<&'a str>,
-}
-
-/// Create a LogTemplateContext by merging the current record's fields with
-/// the run-stable [`LogContext`].
-pub fn make_template_context<'a>(
-    record_fields: &'a IndexMap<String, Value>,
-    ctx: &LogContext<'a>,
-) -> LogTemplateContext<'a> {
-    LogTemplateContext {
-        record_fields,
-        transform_name: ctx.transform_name,
-        transform_duration_ms: ctx.transform_duration_ms,
-        source_file: ctx.source_file,
-        source_row: ctx.source_row,
-        pipeline_ok_count: ctx.pipeline_ok_count,
-        pipeline_dlq_count: ctx.pipeline_dlq_count,
-        pipeline_total_count: ctx.pipeline_total_count,
-        pipeline_name: ctx.pipeline_name,
-        pipeline_execution_id: ctx.pipeline_execution_id,
-        dlq_error_category: ctx.dlq_error_category,
-        dlq_error_detail: ctx.dlq_error_detail,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use clinker_record::Value;
+    use indexmap::IndexMap;
+
     use super::*;
     use crate::config::{LogLevel, LogTiming};
+
+    /// Run-stable logging context: everything available to a log template
+    /// except the current record's fields, which vary per record and are
+    /// supplied separately at context-build time.
+    ///
+    /// Test-only: production builds [`LogTemplateContext`] directly along the
+    /// `LogDispatcher::fire_*` path; this argument-grouping struct exists solely
+    /// to keep the test helper's constructor below the clippy argument-count
+    /// threshold without a suppression attribute.
+    struct LogContext<'a> {
+        transform_name: &'a str,
+        /// Only available in after_transform.
+        transform_duration_ms: Option<u64>,
+        source_file: &'a str,
+        source_row: u64,
+        pipeline_ok_count: u64,
+        pipeline_dlq_count: u64,
+        pipeline_total_count: u64,
+        pipeline_name: &'a str,
+        pipeline_execution_id: &'a str,
+        /// Only available in on_error.
+        dlq_error_category: Option<&'a str>,
+        /// Only available in on_error.
+        dlq_error_detail: Option<&'a str>,
+    }
+
+    /// Merges the current record's fields with the run-stable [`LogContext`]
+    /// into a [`LogTemplateContext`] for the test helpers below.
+    fn make_template_context<'a>(
+        record_fields: &'a IndexMap<String, Value>,
+        ctx: &LogContext<'a>,
+    ) -> LogTemplateContext<'a> {
+        LogTemplateContext {
+            record_fields,
+            transform_name: ctx.transform_name,
+            transform_duration_ms: ctx.transform_duration_ms,
+            source_file: ctx.source_file,
+            source_row: ctx.source_row,
+            pipeline_ok_count: ctx.pipeline_ok_count,
+            pipeline_dlq_count: ctx.pipeline_dlq_count,
+            pipeline_total_count: ctx.pipeline_total_count,
+            pipeline_name: ctx.pipeline_name,
+            pipeline_execution_id: ctx.pipeline_execution_id,
+            dlq_error_category: ctx.dlq_error_category,
+            dlq_error_detail: ctx.dlq_error_detail,
+        }
+    }
 
     fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
         LogDirective {
