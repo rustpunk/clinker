@@ -8,10 +8,13 @@ pub(crate) mod commit;
 pub(crate) mod composition_dispatch;
 pub(crate) mod correlation_dispatch;
 pub(crate) mod dispatch;
+mod dlq;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
 pub(crate) mod output_dispatch;
+mod params;
+mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;
 pub(crate) mod sort_dispatch;
@@ -19,16 +22,24 @@ pub(crate) mod source_dispatch;
 pub mod source_stream;
 pub(crate) mod stream_event;
 pub(crate) mod time_window;
+pub(crate) mod transform;
 pub(crate) mod transform_dispatch;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
+
+pub use dlq::DlqEntry;
+use params::sum_cpu_io_totals;
+pub use params::{ExecutionReport, PipelineRunParams};
+pub(crate) use route::{CompiledRoute, CompiledRouteBranch};
+pub(crate) use transform::CompiledTransform;
+pub use transform::{TransformSpec, build_transform_specs};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
@@ -54,152 +65,11 @@ use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
 };
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
-use cxl::ast::Statement;
 use cxl::eval::{
     EvalContext, EvalResult, ProgramEvaluator, SkipReason, StableEvalContext, WallClock,
 };
-use cxl::typecheck::{Type, TypedProgram};
+use cxl::typecheck::Type;
 use petgraph::Direction;
-
-/// Executor-internal transform spec.
-///
-/// Produced by walking `PipelineConfig::nodes` directly and matching on
-/// `PipelineNode::{Transform, Aggregate, Route}` variants. Used by
-/// executor read paths that still consume a flat Vec-of-transforms view.
-/// The fields are the superset that executor sites read from; see
-/// `build_transform_specs`.
-#[derive(Debug, Clone)]
-pub struct TransformSpec {
-    pub name: String,
-    pub cxl: Option<String>,
-    pub aggregate: Option<crate::config::AggregateConfig>,
-    pub route: Option<crate::config::RouteConfig>,
-    pub input: Option<crate::config::TransformInput>,
-    /// Per-record fan-out ceiling for `emit each` blocks inside this
-    /// transform. Threaded to the evaluator at construction time and
-    /// surfaces as a typed DLQ entry on overflow.
-    pub max_expansion: u64,
-}
-
-impl TransformSpec {
-    pub fn cxl_source(&self) -> &str {
-        if let Some(agg) = &self.aggregate {
-            agg.cxl.as_str()
-        } else if let Some(s) = &self.cxl {
-            s.as_str()
-        } else {
-            ""
-        }
-    }
-}
-
-/// Walk `PipelineConfig::nodes` and materialize a flat `Vec<TransformSpec>`
-/// from the Transform/Aggregate/Route variants in declaration order. Merge
-/// nodes referenced by a transform's input are expanded back into
-/// `TransformInput::Multiple(list)` to match the legacy executor wire shape.
-pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
-    use crate::config::node_header::NodeInput;
-    use crate::config::{AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput};
-
-    let merge_by_name: std::collections::HashMap<&str, Vec<String>> = config
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.value {
-            PipelineNode::Merge { header, .. } => {
-                let upstreams: Vec<String> = header
-                    .inputs
-                    .iter()
-                    .map(|spanned_ni| match &spanned_ni.value {
-                        NodeInput::Single(s) => s.clone(),
-                        NodeInput::Port { node, port } => format!("{node}.{port}"),
-                    })
-                    .collect();
-                Some((header.name.as_str(), upstreams))
-            }
-            _ => None,
-        })
-        .collect();
-
-    let project_input = |ni: &NodeInput| -> Option<TransformInput> {
-        match ni {
-            NodeInput::Single(s) => {
-                if let Some(upstreams) = merge_by_name.get(s.as_str()) {
-                    Some(TransformInput::Multiple(upstreams.clone()))
-                } else {
-                    Some(TransformInput::Single(s.clone()))
-                }
-            }
-            NodeInput::Port { node, port } => {
-                Some(TransformInput::Single(format!("{node}.{port}")))
-            }
-        }
-    };
-
-    let mut out = Vec::new();
-    for spanned in &config.nodes {
-        match &spanned.value {
-            PipelineNode::Transform {
-                header,
-                config: body,
-            } => {
-                out.push(TransformSpec {
-                    name: header.name.clone(),
-                    cxl: Some(body.cxl.as_ref().to_string()),
-                    aggregate: None,
-                    route: None,
-                    input: project_input(&header.input.value),
-                    max_expansion: body.max_expansion,
-                });
-            }
-            PipelineNode::Aggregate {
-                header,
-                config: body,
-            } => {
-                out.push(TransformSpec {
-                    name: header.name.clone(),
-                    cxl: None,
-                    aggregate: Some(AggregateConfig {
-                        group_by: body.group_by.clone(),
-                        cxl: body.cxl.as_ref().to_string(),
-                        strategy: body.strategy,
-                        time_window: body.time_window.clone(),
-                        allowed_lateness: body.allowed_lateness,
-                    }),
-                    route: None,
-                    input: project_input(&header.input.value),
-                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
-                });
-            }
-            PipelineNode::Route {
-                header,
-                config: body,
-            } => {
-                let branches: Vec<RouteBranch> = body
-                    .conditions
-                    .iter()
-                    .map(|(name, cxl)| RouteBranch {
-                        name: name.clone(),
-                        condition: cxl.as_ref().to_string(),
-                    })
-                    .collect();
-                out.push(TransformSpec {
-                    name: header.name.clone(),
-                    cxl: Some(String::new()),
-                    aggregate: None,
-                    route: Some(RouteConfig {
-                        mode: body.mode,
-                        branches,
-                        default: body.default.clone(),
-                    }),
-                    input: project_input(&header.input.value),
-                    max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
-                });
-            }
-            _ => {}
-        }
-    }
-    out
-}
 
 /// Map from source-node name to the input feeding that source.
 ///
@@ -316,160 +186,6 @@ pub fn single_file_reader(
     }])
 }
 
-/// Runtime parameters for a pipeline execution (not derived from config YAML).
-#[derive(Default)]
-pub struct PipelineRunParams {
-    /// UUID v7 execution ID, unique per run.
-    pub execution_id: String,
-    /// Batch ID from --batch-id CLI flag or auto UUID v7.
-    pub batch_id: String,
-    /// Channel-supplied overrides/adds for `$pipeline.*`. Layered atop
-    /// `collect_pipeline_var_defaults` at executor init; channel wins.
-    pub pipeline_vars: IndexMap<String, Value>,
-    /// Channel-supplied overrides/adds for `$vars.*`. Layered atop
-    /// `convert_vars(config.pipeline.vars)`; channel wins.
-    pub static_vars: IndexMap<String, Value>,
-    /// Channel-supplied overrides/adds for `$source.<src>.<var>`. Outer
-    /// key is source-node name; inner key is var name. Layered atop
-    /// `collect_source_var_defaults` per file Arc at materialization.
-    pub source_vars: IndexMap<String, IndexMap<String, Value>>,
-    /// Channel-supplied overrides/adds for `$record.*`. Pre-seeded into
-    /// every Record's `record_vars` map at materialization, layered
-    /// atop `collect_record_var_defaults`.
-    pub record_vars: IndexMap<String, Value>,
-    /// Per-run shutdown handle. The executor checks this at chunk boundaries
-    /// and inside `Arena::build`. `None` disables shutdown signaling for this
-    /// run; production callers typically construct one via
-    /// `crate::pipeline::shutdown::ShutdownToken::new()` so SIGINT/SIGTERM
-    /// can trip it.
-    pub shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
-}
-
-/// Summary returned after a pipeline execution completes (success or partial).
-///
-/// Replaces the previous `(PipelineCounters, Vec<DlqEntry>)` tuple. Callers
-/// that previously destructured the tuple should access `report.counters` and
-/// `report.dlq_entries` instead.
-#[derive(Debug)]
-pub struct ExecutionReport {
-    /// Record counts: total, ok, dlq.
-    pub counters: PipelineCounters,
-    /// Records that were routed to the dead-letter queue.
-    pub dlq_entries: Vec<DlqEntry>,
-    /// Human-readable execution summary (e.g., "Streaming", "TwoPass").
-    pub execution_summary: String,
-    /// Whether any transform required arena allocation (window functions).
-    pub required_arena: bool,
-    /// Peak process RSS observed across chunk boundaries. `None` only on
-    /// platforms where RSS measurement is unavailable (e.g., FreeBSD).
-    pub peak_rss_bytes: Option<u64>,
-    /// Total user CPU time across all stages with capture (nanoseconds).
-    /// `None` if no stage captured CPU times. Process-wide; sums across rayon workers.
-    pub total_cpu_user_ns: Option<u64>,
-    /// Total system CPU time across all stages with capture (nanoseconds).
-    pub total_cpu_sys_ns: Option<u64>,
-    /// Total disk bytes read across all stages with capture.
-    /// Excludes page-cache hits — cold-cache mode required for meaningful numbers.
-    pub total_io_read_bytes: Option<u64>,
-    /// Total disk bytes written across all stages with capture.
-    pub total_io_write_bytes: Option<u64>,
-    /// Wall-clock time when `run_with_readers_writers` was entered.
-    pub started_at: DateTime<Utc>,
-    /// Wall-clock time immediately after the last write and flush completed.
-    pub finished_at: DateTime<Utc>,
-    /// Per-stage instrumentation metrics, ordered by execution sequence.
-    pub stages: Vec<stage_metrics::StageMetrics>,
-    /// Per-(source, file) event-time watermarks observed at ingest,
-    /// keyed by `(source_name, source_file_path)`. The max event-time
-    /// seen for that pair in i64 nanoseconds, or `None` when the
-    /// partition had no observations. Finest granularity; drives the
-    /// `fan_out_per_source_file` 1:1 source-file → sink case where
-    /// each file's watermark is independently meaningful.
-    pub per_source_file_watermarks: BTreeMap<(String, String), Option<i64>>,
-    /// Per-source rollup = `min` across the source's per-file
-    /// watermarks. One entry per declared source (sources whose
-    /// `SourceConfig.watermark.column` is set). A glob source with one
-    /// lagging file holds its source-level watermark back to that
-    /// file's max — matching the Flink/Arroyo per-partition + min
-    /// reducer pattern.
-    pub per_source_watermarks: BTreeMap<String, Option<i64>>,
-    /// Cross-source rollup = `min` across rolled-up source values.
-    /// The reducer a time-windowed aggregate's close decision reads
-    /// (future consumer). `None` when every declared source rolls up
-    /// to `None`.
-    pub effective_watermark: Option<i64>,
-    /// Per-source rollback cursor at run completion. Keyed by
-    /// Source-node name; the value is the highest source row number
-    /// that cleanly exited a forward operator. Sources that never
-    /// emitted a clean record (every record DLQ'd, or the source had
-    /// zero records) are absent from the map. Combine-rooted rewinds
-    /// reflect into this map via the `combine_input_snapshots`
-    /// restore path. Surfaces as both the per-source replay anchor
-    /// for the live mpsc-channel executor and the diagnostic counter
-    /// that per-source-rollback tests assert against.
-    pub per_source_rollback_cursors: BTreeMap<String, u64>,
-    /// Finalized per-source ingest record counts, keyed by
-    /// Source-node name. Equals each source's `total_count`
-    /// contribution to the aggregate `counters.total_count`. Sources
-    /// whose ingest thread never finalized (e.g. fatal abort before
-    /// the crossbeam `Receiver` disconnected) are absent rather than
-    /// reported as zero — distinguishes "stream closed with zero records"
-    /// from
-    /// "never finished". The synthetic pipeline-wide rollup slot
-    /// stamped internally under `<merged>` is filtered out before
-    /// surfacing here.
-    pub per_source_record_counts: BTreeMap<String, u64>,
-    /// Per-source DLQ entry counts, keyed by Source-node name. A
-    /// source with no DLQ entries is absent from the map, matching
-    /// the "absent = none landed" precedent on
-    /// `per_source_rollback_cursors`. Sums across this map equal
-    /// `counters.dlq_count` minus any entries the executor failed to
-    /// attribute to a declared source.
-    pub per_source_dlq_counts: BTreeMap<String, u64>,
-    /// Saturating sum of bytes committed to spill files across every
-    /// spill site (`node_buffers` admission, grace-hash partition
-    /// flush, sort-merge external sort). Sourced from
-    /// `MemoryArbitrator`'s running total at dispatch close; an aborted
-    /// run still surfaces the last committed value.
-    pub cumulative_spill_bytes: u64,
-    /// High-water mark of the arbitrator's summed pull-mode charged bytes
-    /// observed across streaming per-batch charges. For a streaming stage
-    /// this stays bounded to one in-flight batch (plus the bounded
-    /// channel's capacity) rather than the whole stage output — the
-    /// observable that proves the per-batch admit/discharge model. `0`
-    /// when no streaming charge fired (a fully materialized pipeline).
-    pub peak_consumer_usage_bytes: u64,
-    /// `true` when the run unwound early because a shutdown signal
-    /// (SIGINT/SIGTERM, or a programmatic request) tripped the run's
-    /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to
-    /// the interrupted exit code (130). A clean run leaves it `false`.
-    pub interrupted: bool,
-}
-
-/// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
-/// (e.g. cumulative timers) are skipped. Returns `None` per metric if no stage
-/// reported a value, otherwise `Some(sum)`.
-fn sum_cpu_io_totals(
-    stages: &[stage_metrics::StageMetrics],
-) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
-    let mut cpu_user: Option<u64> = None;
-    let mut cpu_sys: Option<u64> = None;
-    let mut io_read: Option<u64> = None;
-    let mut io_write: Option<u64> = None;
-    fn add(acc: &mut Option<u64>, v: Option<u64>) {
-        if let Some(x) = v {
-            *acc = Some(acc.unwrap_or(0).saturating_add(x));
-        }
-    }
-    for s in stages {
-        add(&mut cpu_user, s.cpu_user_delta_ns);
-        add(&mut cpu_sys, s.cpu_sys_delta_ns);
-        add(&mut io_read, s.io_read_delta);
-        add(&mut io_write, s.io_write_delta);
-    }
-    (cpu_user, cpu_sys, io_read, io_write)
-}
-
 /// Dummy storage type for streaming (no-window) evaluation.
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
 pub(crate) struct NullStorage;
@@ -485,152 +201,6 @@ impl RecordStorage for NullStorage {
     }
     fn record_count(&self) -> u64 {
         0
-    }
-}
-
-/// Compiled transform: CXL source compiled once, evaluated per record.
-#[derive(Debug)]
-pub struct CompiledTransform {
-    pub(crate) name: String,
-    pub(crate) typed: Arc<TypedProgram>,
-    pub(crate) max_expansion: u64,
-}
-
-impl CompiledTransform {
-    pub(crate) fn has_distinct(&self) -> bool {
-        self.typed
-            .program
-            .statements
-            .iter()
-            .any(|s| matches!(s, Statement::Distinct { .. }))
-    }
-}
-
-/// Compiled route branch: a named CXL boolean condition evaluator.
-pub(crate) struct CompiledRouteBranch {
-    name: String,
-    evaluator: ProgramEvaluator,
-}
-
-/// Compiled route configuration for multi-output dispatch.
-pub(crate) struct CompiledRoute {
-    branches: Vec<CompiledRouteBranch>,
-    default: String,
-    mode: crate::config::RouteMode,
-}
-
-impl CompiledRoute {
-    /// Evaluate route conditions against the authoritative Record.
-    ///
-    /// Returns the list of output names the record should be dispatched to.
-    /// In Exclusive mode: first matching branch (or default).
-    /// In Inclusive mode: all matching branches (or default if none match).
-    ///
-    /// Branch predicates resolve field references through the Record's
-    /// own [`FieldResolver`] impl — schema + overflow for bare names.
-    /// No parallel bookkeeping map is required (Invariant 3).
-    pub(crate) fn evaluate(
-        &mut self,
-        record: &Record,
-        ctx: &EvalContext,
-    ) -> Result<Vec<String>, cxl::eval::EvalError> {
-        match self.mode {
-            crate::config::RouteMode::Exclusive => {
-                for branch in &mut self.branches {
-                    match branch
-                        .evaluator
-                        .eval_record::<NullStorage>(ctx, record, None)?
-                    {
-                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
-                            return Ok(vec![branch.name.clone()]);
-                        }
-                        EvalResult::Skip(_) => continue,
-                    }
-                }
-                Ok(vec![self.default.clone()])
-            }
-            crate::config::RouteMode::Inclusive => {
-                let mut matched = Vec::new();
-                for branch in &mut self.branches {
-                    match branch
-                        .evaluator
-                        .eval_record::<NullStorage>(ctx, record, None)?
-                    {
-                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
-                            matched.push(branch.name.clone());
-                        }
-                        EvalResult::Skip(_) => {}
-                    }
-                }
-                if matched.is_empty() {
-                    matched.push(self.default.clone());
-                }
-                Ok(matched)
-            }
-        }
-    }
-}
-
-/// Record that failed evaluation, queued for DLQ output.
-#[derive(Debug, Clone)]
-pub struct DlqEntry {
-    pub source_row: u64,
-    pub category: crate::dlq::DlqErrorCategory,
-    pub error_message: String,
-    pub original_record: Record,
-    /// Pipeline stage where error occurred.
-    /// Convention: "source", "transform:{name}", "route_eval", "output:{name}"
-    pub stage: Option<String>,
-    /// Route branch name if error occurred during or after routing.
-    /// None for pre-routing errors.
-    pub route: Option<String>,
-    /// `true` if this record's own evaluation caused the DLQ entry.
-    /// Serialized as `_cxl_dlq_trigger` column in DLQ CSV.
-    pub trigger: bool,
-    /// Originating Source-node name. Read from the failing record's
-    /// `FieldMetadata::SourceName` engine-stamp at the push site so a
-    /// post-Merge / post-Combine DLQ entry still identifies which
-    /// upstream Source produced the record. Serialized as
-    /// `_cxl_dlq_source_name` in DLQ CSV.
-    pub source_name: Arc<str>,
-    /// Output field the evaluator was computing when the error fired,
-    /// captured at the emit-statement boundary. `None` for collateral
-    /// entries that were not directly eval-triggered (correlation
-    /// fan-out, group-size overflow, etc.). Serialized as
-    /// `_cxl_dlq_triggering_field`.
-    pub triggering_field: Option<Arc<str>>,
-    /// Value carried by the failing `EvalErrorKind` payload, when the
-    /// variant exposes one (conversion source string, out-of-bounds
-    /// index, mismatched arity). `None` otherwise. Serialized as
-    /// `_cxl_dlq_triggering_value`.
-    pub triggering_value: Option<clinker_record::Value>,
-}
-
-impl DlqEntry {
-    /// Stage: source read error.
-    pub fn stage_source() -> String {
-        "source".into()
-    }
-
-    /// Stage: transform evaluation error.
-    pub fn stage_transform(name: &str) -> String {
-        format!("transform:{name}")
-    }
-
-    /// Stage: route condition evaluation error.
-    pub fn stage_route_eval() -> String {
-        "route_eval".into()
-    }
-
-    /// Stage: output write error.
-    pub fn stage_output(name: &str) -> String {
-        format!("output:{name}")
-    }
-
-    /// Stage: Combine output-stage evaluation error (probe-key, residual,
-    /// or body eval for one driver row).
-    pub fn stage_combine(name: &str) -> String {
-        format!("combine:{name}")
     }
 }
 
