@@ -80,7 +80,7 @@ pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
 /// Read the per-record Source-node name from the record's
 /// [`FieldMetadata::SourceName`] engine-stamped column. Returns `None`
 /// when the column is absent (synthetic emits) or non-String.
-pub(crate) fn source_name_of(record: &Record) -> Option<&str> {
+fn source_name_of(record: &Record) -> Option<&str> {
     let schema = record.schema();
     for idx in 0..schema.column_count() {
         if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceName))
@@ -172,10 +172,7 @@ pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<st
 /// fraction exceeds it. Per-source thresholds win against pipeline-wide
 /// when set. Both branches honor `min_records` to avoid 1/1 = 100%
 /// false positives on the very first failure.
-pub(crate) fn check_dlq_rate(
-    ctx: &ExecutorContext<'_>,
-    source: &Arc<str>,
-) -> Result<(), PipelineError> {
+fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
     let Some(dlq) = ctx.config.error_handling.dlq.as_ref() else {
         return Ok(());
     };
@@ -879,7 +876,7 @@ pub(crate) struct ExecutorContext<'a> {
 /// that crossed from a non-deferred upstream into a deferred-region
 /// consumer along that edge. The body id is `None` for top-level edges;
 /// each composition body has its own EdgeIndex namespace.
-pub(crate) type RegionInputBuffers = HashMap<
+type RegionInputBuffers = HashMap<
     (
         Option<crate::plan::CompositionBodyId>,
         petgraph::graph::EdgeIndex,
