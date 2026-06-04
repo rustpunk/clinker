@@ -254,25 +254,31 @@ fn dispatch_one_region(
         if is_windowed_transform {
             ctx.counters.retraction.partitions_dispatched += 1;
         }
-        // Aggregate-finalize and similar non-buffer-routed arms push
-        // directly to `dlq_entries`; harvest those into events so the
-        // orchestrator's loop sees them. Buffer-routed errors (per-
-        // record Transform / Route eval failures) carry richer lineage
-        // through the synthetic-CK column on the buffered cell — the
-        // orchestrator re-runs `detect_retract_scope` against the live
-        // buffer after each dispatch to recover the contributing source
-        // rows from that lineage.
-        if ctx.dlq_entries.len() > dlq_len_before {
-            for entry in &ctx.dlq_entries[dlq_len_before..] {
-                events.push(DlqEvent {
-                    source_row: entry.source_row,
-                    source_name: std::sync::Arc::clone(&entry.source_name),
-                });
-            }
-        }
+        harvest_dlq_events(ctx, dlq_len_before, events);
     }
 
     Ok(())
+}
+
+/// Append a [`DlqEvent`] for every entry pushed onto `ctx.dlq_entries`
+/// since `dlq_len_before` was snapshotted (the length captured just
+/// before a `dispatch_plan_node` call). Aggregate-finalize and similar
+/// non-buffer-routed arms push directly to `dlq_entries`; this lifts the
+/// newly-appended tail into the orchestrator's event stream so its
+/// outer loop can widen the retract scope. Buffer-routed errors carry
+/// richer lineage through the buffered cell's synthetic-CK column and are
+/// recovered separately by `detect_retract_scope`.
+fn harvest_dlq_events(
+    ctx: &ExecutorContext<'_>,
+    dlq_len_before: usize,
+    events: &mut Vec<DlqEvent>,
+) {
+    for entry in &ctx.dlq_entries[dlq_len_before..] {
+        events.push(DlqEvent {
+            source_row: entry.source_row,
+            source_name: std::sync::Arc::clone(&entry.source_name),
+        });
+    }
 }
 
 /// For each in-edge of `consumer_idx` whose source is OUTSIDE the
@@ -607,14 +613,7 @@ fn dispatch_continuation(
         }
         let dlq_len_before = ctx.dlq_entries.len();
         dispatch_plan_node(ctx, parent_dag, idx)?;
-        if ctx.dlq_entries.len() > dlq_len_before {
-            for entry in &ctx.dlq_entries[dlq_len_before..] {
-                events.push(DlqEvent {
-                    source_row: entry.source_row,
-                    source_name: std::sync::Arc::clone(&entry.source_name),
-                });
-            }
-        }
+        harvest_dlq_events(ctx, dlq_len_before, events);
     }
 
     Ok(())
