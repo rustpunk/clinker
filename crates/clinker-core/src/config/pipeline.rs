@@ -82,11 +82,10 @@ pub struct PipelineMeta {
 
 /// Memory-arbitrator tuning, nested under `pipeline.memory`.
 ///
-/// `limit` accepts the same suffix grammar as the pre-#157 flat
-/// `memory.limit` field: `"512M"`, `"2G"`, `"1024K"`, or a raw
-/// integer byte count. When omitted, the arbitrator falls back to
-/// a 512 MiB hard ceiling (resolved at construction time through
-/// `crate::pipeline::memory::parse_memory_limit_bytes`).
+/// `limit` accepts a byte-size suffix grammar: `"512M"`, `"2G"`,
+/// `"1024K"`, or a raw integer byte count. When omitted, the
+/// arbitrator falls back to a 512 MiB hard ceiling, resolved at
+/// construction time by the memory subsystem rather than here.
 ///
 /// `backpressure` selects the active arbitration policy. The
 /// default `pause` installs `BackPressurePreferred -> Priority`:
@@ -150,20 +149,6 @@ impl BackpressureKnob {
     /// rather than re-emitted as redundant noise.
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Pause)
-    }
-
-    /// Construct the boxed `ArbitrationPolicy` this knob selects.
-    /// Called by every production callsite that builds a
-    /// `MemoryArbitrator` from parsed config.
-    pub fn build_policy(self) -> Box<dyn crate::pipeline::memory::ArbitrationPolicy> {
-        use crate::pipeline::memory::{
-            BackPressurePreferred, LargestFirst, MemoryArbitrator, Priority,
-        };
-        match self {
-            Self::Spill => Box::new(Priority),
-            Self::Pause => MemoryArbitrator::default_policy(),
-            Self::Both => Box::new(BackPressurePreferred::wrapping(LargestFirst)),
-        }
     }
 }
 

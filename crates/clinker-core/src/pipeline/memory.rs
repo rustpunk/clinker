@@ -622,6 +622,31 @@ impl ArbitrationPolicy for BackPressurePreferred {
     }
 }
 
+/// Build the boxed [`ArbitrationPolicy`] a `pipeline.memory.backpressure`
+/// knob selects.
+///
+/// Keeps the concrete policy types ([`Priority`], [`LargestFirst`],
+/// [`BackPressurePreferred`]) and their wiring inside the memory
+/// subsystem: the config layer carries only the plain
+/// [`BackpressureKnob`](crate::config::BackpressureKnob) selector and
+/// never names a policy type. Called by every production path that turns
+/// parsed config into a live arbitrator.
+///
+/// - `spill` → bare [`Priority`]: react-only, cheapest-to-spill-first.
+/// - `pause` → [`MemoryArbitrator::default_policy`]
+///   (`BackPressurePreferred -> Priority`): prefer pausing a producer,
+///   otherwise spill cheapest first. This is the runtime default.
+/// - `both` → `BackPressurePreferred -> LargestFirst`: prefer pausing,
+///   otherwise force the largest holder regardless of priority.
+pub fn build_policy(knob: crate::config::BackpressureKnob) -> Box<dyn ArbitrationPolicy> {
+    use crate::config::BackpressureKnob;
+    match knob {
+        BackpressureKnob::Spill => Box::new(Priority),
+        BackpressureKnob::Pause => MemoryArbitrator::default_policy(),
+        BackpressureKnob::Both => Box::new(BackPressurePreferred::wrapping(LargestFirst)),
+    }
+}
+
 /// Central memory arbitrator. Owns the RSS hard / soft limits, the
 /// per-category byte counters (arena, node-buffer, disk spill), and
 /// the policy + consumer registry used to elect spill victims.
@@ -704,8 +729,7 @@ impl MemoryArbitrator {
     /// `ArbitrationPolicy`. Ships with no registered consumers.
     ///
     /// Production paths construct via this constructor with the
-    /// policy chosen by `memory.backpressure` (see
-    /// `BackpressureKnob::build_policy` in `crate::config`).
+    /// policy chosen by `memory.backpressure` (see [`build_policy`]).
     /// Tests that want pre-policy react-only behavior pass
     /// `Box::new(NoOpPolicy)`; tests that want the production
     /// default pass `Self::default_policy()`.

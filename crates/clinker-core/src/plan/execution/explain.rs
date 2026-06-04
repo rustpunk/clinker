@@ -671,7 +671,7 @@ impl ExecutionPlanDag {
         // every combine node when artifacts are absent — so the output
         // of `explain()` already has no combine block to dedupe.
         let classes = self.classify_node_buffers(config);
-        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy = crate::pipeline::memory::build_policy(config.pipeline.memory.backpressure);
         let policy_name = policy.policy_name();
         let mut out = self.explain(&classes, &policy_name);
         self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
@@ -1036,7 +1036,7 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let classes = self.classify_node_buffers(config);
-        let policy = config.pipeline.memory.backpressure.build_policy();
+        let policy = crate::pipeline::memory::build_policy(config.pipeline.memory.backpressure);
         let policy_name = policy.policy_name();
         let mut out = self.explain(&classes, &policy_name);
         if let Some(start) = out.find("=== Retraction ===\n") {
