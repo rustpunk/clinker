@@ -304,7 +304,6 @@ fn source_ancestors_of(
     output_name: &str,
 ) -> Vec<SourceAncestor> {
     use crate::config::PipelineNode;
-    use crate::config::node_header::NodeInput;
     use std::collections::{HashSet, VecDeque};
 
     let by_name: HashMap<&str, &PipelineNode> = config
@@ -316,13 +315,6 @@ fn source_ancestors_of(
     let mut visited: HashSet<String> = HashSet::new();
     let mut sources: Vec<SourceAncestor> = Vec::new();
     let mut queue: VecDeque<String> = VecDeque::from([output_name.to_string()]);
-
-    let target_name_of = |inp: &NodeInput| -> String {
-        match inp {
-            NodeInput::Single(s) => s.clone(),
-            NodeInput::Port { node, .. } => node.clone(),
-        }
-    };
 
     while let Some(name) = queue.pop_front() {
         if !visited.insert(name.clone()) {
@@ -343,21 +335,11 @@ fn source_ancestors_of(
                     stem,
                 });
             }
-            PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::Composition { header, .. } => {
-                queue.push_back(target_name_of(&header.input.value));
-            }
-            PipelineNode::Merge { header, .. } => {
-                for inp in &header.inputs {
-                    queue.push_back(target_name_of(&inp.value));
-                }
-            }
-            PipelineNode::Combine { header, .. } => {
-                for inp in header.input.values() {
-                    queue.push_back(target_name_of(&inp.value));
+            // Every non-Source ancestor enqueues each of its direct
+            // upstream inputs (port suffix stripped to the node name).
+            other => {
+                for input in other.direct_input_names() {
+                    queue.push_back(input.to_string());
                 }
             }
         }

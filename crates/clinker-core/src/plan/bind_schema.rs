@@ -384,29 +384,12 @@ fn validate_post_merge_source_reads(
     for spanned in nodes {
         let name = spanned.value.name().to_string();
         let span = span_for_node(spanned);
-        let direct_inputs: Vec<String> = match &spanned.value {
-            PipelineNode::Source { .. } => Vec::new(),
-            PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            PipelineNode::Merge { header, .. } => header
-                .inputs
-                .iter()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .map(String::from)
-                .collect(),
-            PipelineNode::Combine { header, .. } => header
-                .input
-                .values()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .map(String::from)
-                .collect(),
-        };
+        let direct_inputs: Vec<String> = spanned
+            .value
+            .direct_input_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
         // A Merge or Combine node IS the merge ancestor for everything
         // downstream — including itself in the lookup so its own
         // direct descendants pick it up.
@@ -433,15 +416,8 @@ fn validate_post_merge_source_reads(
             continue;
         };
         let mut typed_keys: Vec<String> = Vec::new();
-        match &spanned.value {
-            PipelineNode::Transform { .. }
-            | PipelineNode::Aggregate { .. }
-            | PipelineNode::Combine { .. } => {
-                if artifacts.typed.contains_key(&reader_name) {
-                    typed_keys.push(reader_name.clone());
-                }
-            }
-            _ => {}
+        if spanned.value.reads_scope_vars_in_cxl() && artifacts.typed.contains_key(&reader_name) {
+            typed_keys.push(reader_name.clone());
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
@@ -541,29 +517,12 @@ fn validate_read_after_write(
     for spanned in nodes {
         let name = spanned.value.name().to_string();
         let mut anc: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let direct: Vec<String> = match &spanned.value {
-            PipelineNode::Source { .. } => Vec::new(),
-            PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            PipelineNode::Merge { header, .. } => header
-                .inputs
-                .iter()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .map(String::from)
-                .collect(),
-            PipelineNode::Combine { header, .. } => header
-                .input
-                .values()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .map(String::from)
-                .collect(),
-        };
+        let direct: Vec<String> = spanned
+            .value
+            .direct_input_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
         for parent in direct {
             anc.insert(parent.clone());
             if let Some(parent_anc) = ancestors.get(&parent) {
@@ -579,15 +538,8 @@ fn validate_read_after_write(
     for spanned in nodes {
         let reader_name = spanned.value.name().to_string();
         let mut typed_keys: Vec<String> = Vec::new();
-        match &spanned.value {
-            PipelineNode::Transform { .. }
-            | PipelineNode::Aggregate { .. }
-            | PipelineNode::Combine { .. } => {
-                if artifacts.typed.contains_key(&reader_name) {
-                    typed_keys.push(reader_name.clone());
-                }
-            }
-            _ => {}
+        if spanned.value.reads_scope_vars_in_cxl() && artifacts.typed.contains_key(&reader_name) {
+            typed_keys.push(reader_name.clone());
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
@@ -923,26 +875,7 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
         // set. Each input declared on a node implies a downstream
         // dependency on that input, so an init node showing up as an
         // input means it has a non-init descendant.
-        let inputs: Vec<&str> = match &spanned.value {
-            PipelineNode::Source { .. } => Vec::new(),
-            PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::Composition { header, .. } => {
-                vec![upstream_target_name(&header.input.value).unwrap_or("")]
-            }
-            PipelineNode::Merge { header, .. } => header
-                .inputs
-                .iter()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .collect(),
-            PipelineNode::Combine { header, .. } => header
-                .input
-                .values()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .collect(),
-        };
+        let inputs: Vec<&str> = spanned.value.direct_input_names();
         let consumer_name = spanned.value.name();
         let consumer_span = span_for(spanned);
         // Init-phase consumers (State or Transform) are fine — the
@@ -1142,24 +1075,11 @@ fn bind_schema_inner(
                 s.insert(name.clone());
                 s
             }
-            PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
-            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
-                .and_then(|n| upstream_sources.get(n).cloned())
-                .unwrap_or_default(),
-            PipelineNode::Merge { header, .. } => header
-                .inputs
-                .iter()
-                .filter_map(|i| upstream_target_name(&i.value))
-                .filter_map(|n| upstream_sources.get(n))
-                .flat_map(|s| s.iter().cloned())
-                .collect(),
-            PipelineNode::Combine { header, .. } => header
-                .input
-                .values()
-                .filter_map(|i| upstream_target_name(&i.value))
+            // Every non-Source variant inherits the union of its direct
+            // inputs' upstream-source sets.
+            _ => node
+                .direct_input_names()
+                .into_iter()
                 .filter_map(|n| upstream_sources.get(n))
                 .flat_map(|s| s.iter().cloned())
                 .collect(),

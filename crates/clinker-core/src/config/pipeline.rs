@@ -419,34 +419,7 @@ impl PipelineConfig {
         for spanned in &self.nodes {
             let node = &spanned.value;
             let name = node.name();
-            let mut self_ref = false;
-            match node {
-                PipelineNode::Source { .. } => {}
-                PipelineNode::Transform { header, .. }
-                | PipelineNode::Aggregate { header, .. }
-                | PipelineNode::Route { header, .. }
-                | PipelineNode::Output { header, .. }
-                | PipelineNode::Composition { header, .. } => {
-                    if input_target(&header.input.value) == name {
-                        self_ref = true;
-                    }
-                }
-                PipelineNode::Merge { header, .. } => {
-                    if header.inputs.iter().any(|i| input_target(&i.value) == name) {
-                        self_ref = true;
-                    }
-                }
-                PipelineNode::Combine { header, .. } => {
-                    if header
-                        .input
-                        .values()
-                        .any(|i| input_target(&i.value) == name)
-                    {
-                        self_ref = true;
-                    }
-                }
-            }
-            if self_ref {
+            if node.direct_input_names().contains(&name) {
                 diags.push(Diagnostic::error(
                     "E002",
                     format!("node {name:?} lists itself as an input"),
@@ -463,33 +436,9 @@ impl PipelineConfig {
         for spanned in &self.nodes {
             let node = &spanned.value;
             let consumer = node.name();
-            match node {
-                PipelineNode::Source { .. } => {}
-                PipelineNode::Transform { header, .. }
-                | PipelineNode::Aggregate { header, .. }
-                | PipelineNode::Route { header, .. }
-                | PipelineNode::Output { header, .. }
-                | PipelineNode::Composition { header, .. } => {
-                    let producer = input_target(&header.input.value);
-                    if producer != consumer && graph.index_of(producer).is_some() {
-                        graph.add_edge(producer, consumer);
-                    }
-                }
-                PipelineNode::Merge { header, .. } => {
-                    for i in &header.inputs {
-                        let producer = input_target(&i.value);
-                        if producer != consumer && graph.index_of(producer).is_some() {
-                            graph.add_edge(producer, consumer);
-                        }
-                    }
-                }
-                PipelineNode::Combine { header, .. } => {
-                    for i in header.input.values() {
-                        let producer = input_target(&i.value);
-                        if producer != consumer && graph.index_of(producer).is_some() {
-                            graph.add_edge(producer, consumer);
-                        }
-                    }
+            for producer in node.direct_input_names() {
+                if producer != consumer && graph.index_of(producer).is_some() {
+                    graph.add_edge(producer, consumer);
                 }
             }
         }
@@ -1811,13 +1760,6 @@ impl PipelineConfig {
 
         let plan = CompiledPlan::new(dag, self.clone(), artifacts);
         Ok((plan, diags))
-    }
-}
-
-fn input_target(input: &node_header::NodeInput) -> &str {
-    match input {
-        node_header::NodeInput::Single(s) => s.as_str(),
-        node_header::NodeInput::Port { node, .. } => node.as_str(),
     }
 }
 

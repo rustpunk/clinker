@@ -646,6 +646,58 @@ impl PipelineNode {
         }
     }
 
+    /// Names of every node this variant declares as a direct upstream
+    /// input, in declaration order. Each entry is the producer's node
+    /// name with any `.port` suffix stripped (the connectivity target,
+    /// not the branch qualifier).
+    ///
+    /// `Source` has no inputs and yields an empty vector. The
+    /// single-input consumer variants (`Transform`, `Aggregate`,
+    /// `Route`, `Output`, `Composition`) yield their one `input:`. The
+    /// multi-input variants yield each entry of their input collection:
+    /// `Merge` walks its ordered `inputs:` list, `Combine` walks its
+    /// named `input:` map in insertion order.
+    ///
+    /// This is the connectivity view shared by the DAG-edge, cycle,
+    /// self-loop, and source-reachability walks; it intentionally drops
+    /// the per-input span and the Combine qualifier — callers needing
+    /// those match the variant directly.
+    pub fn direct_input_names(&self) -> Vec<&str> {
+        match self {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => vec![header.input.value.name()],
+            PipelineNode::Merge { header, .. } => {
+                header.inputs.iter().map(|i| i.value.name()).collect()
+            }
+            PipelineNode::Combine { header, .. } => {
+                header.input.values().map(|i| i.value.name()).collect()
+            }
+        }
+    }
+
+    /// Whether this variant carries a user-authored CXL body whose
+    /// statements can read scoped variables (`$pipeline.*` / `$source.*`
+    /// / `$record.*`). True for `Transform`, `Aggregate`, and `Combine`
+    /// — the three variants whose `cxl:` source the read-after-write and
+    /// post-merge-source-read validators walk for scope reads.
+    ///
+    /// `Route` and `Source` carry typed programs too, but those are
+    /// engine-synthesized (an empty Route predicate program, a synthetic
+    /// Source schema program) and never hold author scope reads, so they
+    /// are excluded.
+    pub fn reads_scope_vars_in_cxl(&self) -> bool {
+        matches!(
+            self,
+            PipelineNode::Transform { .. }
+                | PipelineNode::Aggregate { .. }
+                | PipelineNode::Combine { .. }
+        )
+    }
+
     /// String tag of the variant for display.
     pub fn type_tag(&self) -> &'static str {
         match self {
