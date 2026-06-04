@@ -55,10 +55,10 @@ pub enum DlqErrorCategory {
     /// rollback cursor to the captured pre-fold floor so a downstream
     /// resume reprocesses both the driver and the matched build row.
     /// Routed only under `Continue` / `BestEffort`; `FailFast` propagates
-    /// the eval error unchanged. Recovery is implemented for the hash
-    /// build-probe (inline) Combine arm; the IEJoin, grace-hash, and
-    /// sort-merge kernels propagate an output-eval failure as fail-fast
-    /// regardless of strategy.
+    /// the eval error unchanged. Recovery is uniform across every Combine
+    /// join mode — the inline hash build-probe arm and the IEJoin,
+    /// grace-hash, and sort-merge kernels all route an output-eval failure
+    /// here under `Continue` / `BestEffort`.
     CombineOutputRow,
 }
 

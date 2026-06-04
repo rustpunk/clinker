@@ -88,7 +88,11 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `aggregate_type_error` | An aggregate function received an incompatible type |
 | `validation_failure` | A declarative validation check failed |
 | `aggregate_finalize` | An aggregate function failed during finalization |
-| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Recovery applies to the hash build-probe (inline) Combine arm only; IEJoin, grace-hash, and sort-merge output-eval failures stay fail-fast |
+| `correlated` | A non-failing record was DLQ'd as collateral because another record in its correlation group failed |
+| `group_size_exceeded` | A correlation-key group exceeded the configured `max_group_buffer` limit |
+| `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
+| `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
+| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` / `best_effort` across every Combine join mode; `fail_fast` propagates the eval error |
 
 ## Advanced options
 

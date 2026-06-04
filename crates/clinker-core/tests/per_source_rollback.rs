@@ -508,3 +508,371 @@ nodes:
         "the surviving row is id=1: {output}"
     );
 }
+
+/// Asserts the standard `combine_output_row` recovery shape: a clean run
+/// (no abort), exactly the driver + matched-build DLQ pair attributed to
+/// the contributing sources, both contributing sources rewound to their
+/// pre-fold floor of 0, and exactly the clean `id=1` row at the output.
+fn assert_combine_output_row_recovered(
+    report: &clinker_core::executor::ExecutionReport,
+    buf: &SharedBuffer,
+) {
+    let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
+        .dlq_entries
+        .iter()
+        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .collect();
+    assert_eq!(
+        combine_dlq.len(),
+        2,
+        "one trigger (driver) + one build-side entry for the failing row: {:?}",
+        report
+            .dlq_entries
+            .iter()
+            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+        "driver row is the attributed trigger on src_drv: {:?}",
+        combine_dlq
+            .iter()
+            .map(|e| (e.source_name.as_ref(), e.trigger))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+        "matched build row is attributed to src_bld, not the merged source"
+    );
+
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_drv"),
+        Some(&0),
+        "driver source rewinds to its pre-fold snapshot floor of 0"
+    );
+    assert_eq!(
+        report.per_source_rollback_cursors.get("src_bld"),
+        Some(&0),
+        "build source rewinds to its pre-fold snapshot floor of 0"
+    );
+
+    let output = buf.as_string();
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        1,
+        "only the clean id=1 row reaches the output: {output}"
+    );
+    assert!(
+        body[0].starts_with("1,"),
+        "the surviving row is id=1: {output}"
+    );
+}
+
+/// A recoverable Combine output-row eval failure under `strategy: continue`
+/// recovers the same way through the IEJoin kernel as through the inline
+/// hash build-probe arm: the failing driver row routes to the DLQ with
+/// category `combine_output_row`, attributes to the contributing sources,
+/// and rewinds both their cursors to the pre-fold floor.
+///
+/// A pure-range two-conjunct predicate (`d.lo <= b.x AND d.hi >= b.x`,
+/// no equality) routes the combine through the IEJoin kernel. The
+/// matched-body `d.amt / b.factor` eval divides by zero for the row whose
+/// matched build carries `factor=0`. Inputs are kept tiny so no spill
+/// occurs and the driver row number is exact.
+#[test]
+fn iejoin_combine_output_row_recoverable_dlq() {
+    let yaml = r#"
+pipeline:
+  name: iejoin_combine_output_row_recoverable
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_drv
+    config:
+      name: src_drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+        - { name: amt, type: int }
+  - type: source
+    name: src_bld
+    config:
+      name: src_bld
+      type: csv
+      path: bld.csv
+      schema:
+        - { name: x, type: int }
+        - { name: factor, type: int }
+  - type: combine
+    name: enriched
+    input:
+      d: src_drv
+      b: src_bld
+    config:
+      where: 'd.lo <= b.x and d.hi >= b.x'
+      match: first
+      on_miss: skip
+      cxl: |
+        emit x = b.x
+        emit ratio = d.amt / b.factor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    // Driver row 1 (lo=1,hi=5) brackets build x=1 (factor=2) → clean.
+    // Driver row 2 (lo=6,hi=10) brackets build x=8 (factor=0) → the
+    // matched-body division by zero fires for that driver row only.
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_drv".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot(
+                "drv",
+                "lo,hi,amt\n1,5,10\n6,10,20\n",
+            )]),
+        ),
+        (
+            "src_bld".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "x,factor\n1,2\n8,0\n")]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .unwrap();
+
+    assert_combine_output_row_recovered(&report, &buf);
+    // The surviving IEJoin row carries the matched build x=1.
+    assert!(
+        buf.as_string()
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.starts_with("1,")),
+        "surviving row carries the clean matched build x=1: {}",
+        buf.as_string()
+    );
+}
+
+/// A recoverable Combine output-row eval failure recovers the same way
+/// through the grace-hash kernel as through the inline arm.
+///
+/// An equality predicate with the `strategy: grace_hash` hint routes the
+/// combine through the grace-hash kernel. Inputs are tiny so the failing
+/// probe stays in the in-memory partition (no spill), keeping the
+/// driver's row number exact for attribution. The matched-body
+/// `d.amt / b.factor` divides by zero where the matched build carries
+/// `factor=0`.
+#[test]
+fn grace_hash_combine_output_row_recoverable_dlq() {
+    let yaml = r#"
+pipeline:
+  name: grace_hash_combine_output_row_recoverable
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_drv
+    config:
+      name: src_drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amt, type: int }
+  - type: source
+    name: src_bld
+    config:
+      name: src_bld
+      type: csv
+      path: bld.csv
+      schema:
+        - { name: id, type: int }
+        - { name: factor, type: int }
+  - type: combine
+    name: enriched
+    input:
+      d: src_drv
+      b: src_bld
+    config:
+      where: 'd.id == b.id'
+      match: first
+      on_miss: skip
+      strategy: grace_hash
+      cxl: |
+        emit id = d.id
+        emit ratio = d.amt / b.factor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    // Build row id=2 carries factor=0, so the matched-body
+    // `d.amt / b.factor` eval divides by zero for driver row id=2 only.
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_drv".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("drv", "id,amt\n1,10\n2,20\n")]),
+        ),
+        (
+            "src_bld".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "id,factor\n1,2\n2,0\n")]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .unwrap();
+
+    assert_combine_output_row_recovered(&report, &buf);
+}
+
+/// A recoverable Combine output-row eval failure recovers the same way
+/// through the sort-merge kernel as through the inline arm.
+///
+/// A single pure-range inequality (`d.k <= b.k`) with both sources
+/// declaring `sort_order` on the range key routes the combine through the
+/// sort-merge kernel (single range conjunct, presorted inputs). The
+/// matched-body `d.amt / b.factor` divides by zero where the matched
+/// build carries `factor=0`.
+#[test]
+fn sort_merge_combine_output_row_recoverable_dlq() {
+    let yaml = r#"
+pipeline:
+  name: sort_merge_combine_output_row_recoverable
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_drv
+    config:
+      name: src_drv
+      type: csv
+      path: drv.csv
+      sort_order:
+        - field: k
+      schema:
+        - { name: k, type: int }
+        - { name: amt, type: int }
+  - type: source
+    name: src_bld
+    config:
+      name: src_bld
+      type: csv
+      path: bld.csv
+      sort_order:
+        - field: k
+      schema:
+        - { name: k, type: int }
+        - { name: factor, type: int }
+  - type: combine
+    name: enriched
+    input:
+      src_drv: src_drv
+      src_bld: src_bld
+    config:
+      where: 'src_drv.k <= src_bld.k'
+      match: first
+      on_miss: skip
+      cxl: |
+        emit k = src_drv.k
+        emit ratio = src_drv.amt / src_bld.factor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).unwrap();
+    // Driver row k=1 (amt=10) matches the first build (k=5, factor=2)
+    // under `match: first` → clean. Driver row k=6 (amt=20) matches the
+    // first build with k>=6 (k=8, factor=0) → division by zero fires for
+    // that driver row only. Both inputs are ascending on `k`.
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_drv".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("drv", "k,amt\n1,10\n6,20\n")]),
+        ),
+        (
+            "src_bld".to_string(),
+            clinker_core::executor::SourceInput::Files(vec![slot("bld", "k,factor\n5,2\n8,0\n")]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .unwrap();
+
+    // The clean driver row k=1 reaches the output; the failing k=6 row is
+    // routed to the DLQ with both contributing sources rewound.
+    let combine_dlq: Vec<&clinker_core::executor::DlqEntry> = report
+        .dlq_entries
+        .iter()
+        .filter(|e| e.category == clinker_core::dlq::DlqErrorCategory::CombineOutputRow)
+        .collect();
+    assert_eq!(
+        combine_dlq.len(),
+        2,
+        "one trigger (driver) + one build-side entry for the failing row: {:?}",
+        report
+            .dlq_entries
+            .iter()
+            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+        "driver row is the attributed trigger on src_drv"
+    );
+    assert!(
+        combine_dlq
+            .iter()
+            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+        "matched build row is attributed to src_bld, not the merged source"
+    );
+    let output = buf.as_string();
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        1,
+        "only the clean k=1 row reaches the output: {output}"
+    );
+    assert!(
+        body[0].starts_with("1,"),
+        "the surviving row is k=1: {output}"
+    );
+}

@@ -62,7 +62,10 @@ use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
+use crate::pipeline::combine::{
+    CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
+    hash_composite_key,
+};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -369,6 +372,11 @@ pub(crate) struct GraceHashExec<'a> {
     /// partition bytes mirror into the arbitrator's pull-mode
     /// `current_usage` surface.
     pub consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Error strategy governing output-stage eval failures. Under
+    /// `FailFast` a residual / body eval error propagates immediately;
+    /// under `Continue` / `BestEffort` the failing row is deferred to the
+    /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
+    pub strategy: crate::config::ErrorStrategy,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -800,7 +808,7 @@ fn estimated_record_bytes(record: &Record) -> usize {
 /// is the caller's responsibility (matches the IEJoin contract).
 pub(crate) fn execute_combine_grace_hash(
     args: GraceHashExec<'_>,
-) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+) -> Result<CombineKernelOutput, PipelineError> {
     let GraceHashExec {
         name,
         build_qualifier,
@@ -818,6 +826,7 @@ pub(crate) fn execute_combine_grace_hash(
         budget,
         spill_dir,
         consumer_handle,
+        strategy,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -941,6 +950,11 @@ pub(crate) fn execute_combine_grace_hash(
 
     // ── Probe phase ───────────────────────────────────────────────────
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
+    // Recoverable output-stage eval failures deferred to the dispatcher.
+    // Threaded by `&mut` through every emit path (in-memory, spilled
+    // reload, and BNL fallback) so a failure on any path is routed
+    // uniformly. Always empty under `FailFast`.
+    let mut output_eval_failures: Vec<CombineOutputEvalFailure> = Vec::new();
     let mut body_evaluator = body_program.map(|bp| ProgramEvaluator::new(Arc::clone(bp), false));
     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(driver_extractor.len());
     let mut emitted_since_check = 0usize;
@@ -954,6 +968,7 @@ pub(crate) fn execute_combine_grace_hash(
         on_miss,
         build_qualifier,
         propagate_ck,
+        strategy,
     };
 
     for (probe_record, rn) in driver_records {
@@ -995,7 +1010,10 @@ pub(crate) fn execute_combine_grace_hash(
                     probe_iter,
                     body_evaluator.as_mut(),
                     &row_ctx,
-                    &mut output_records,
+                    &mut GraceEmitSink {
+                        records: &mut output_records,
+                        failures: &mut output_eval_failures,
+                    },
                 )?;
             }
             ProbeOutcome::Spilled => {
@@ -1057,14 +1075,26 @@ pub(crate) fn execute_combine_grace_hash(
         hash_state: &hash_state,
     };
     for sp in spilled {
-        process_spilled_partition(&rc, sp, &mut body_evaluator, budget, &mut output_records)?;
+        process_spilled_partition(
+            &rc,
+            sp,
+            &mut body_evaluator,
+            budget,
+            &mut GraceEmitSink {
+                records: &mut output_records,
+                failures: &mut output_eval_failures,
+            },
+        )?;
     }
 
     // Keep the executor alive until reload finishes — its TempDir owns
     // every spill file path threaded through the reload loop.
     drop(executor);
 
-    Ok(output_records)
+    Ok(CombineKernelOutput {
+        records: output_records,
+        output_eval_failures,
+    })
 }
 
 /// Bundle of reload-phase context shared across recursive
@@ -1092,7 +1122,7 @@ fn process_spilled_partition(
     sp: SpilledPartition,
     body_evaluator: &mut Option<ProgramEvaluator>,
     budget: &MemoryArbitrator,
-    output: &mut Vec<(Record, RecordOrder)>,
+    sink: &mut GraceEmitSink<'_>,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
     let build_extractor = rc.build_extractor;
@@ -1225,7 +1255,7 @@ fn process_spilled_partition(
                 combined,
                 body_evaluator,
                 budget,
-                output,
+                sink,
                 &mut BnlStats::default(),
             );
         }
@@ -1347,7 +1377,7 @@ fn process_spilled_partition(
                 hash_bits: child_assigner.hash_bits(),
                 distinct_sketch: child_sketch,
             };
-            process_spilled_partition(rc, child_sp, body_evaluator, budget, output)?;
+            process_spilled_partition(rc, child_sp, body_evaluator, budget, sink)?;
         }
         return Ok(());
     }
@@ -1363,7 +1393,7 @@ fn process_spilled_partition(
             build_records,
             body_evaluator,
             budget,
-            output,
+            sink,
             &mut BnlStats::default(),
         );
     }
@@ -1428,7 +1458,7 @@ fn process_spilled_partition(
                 probe_iter,
                 body_evaluator.as_mut(),
                 &row_ctx,
-                output,
+                sink,
             )?;
             row_seq += 1;
         }
@@ -1542,7 +1572,7 @@ fn bnl_fallback(
     build_records: Vec<Record>,
     body_evaluator: &mut Option<ProgramEvaluator>,
     budget: &MemoryArbitrator,
-    output: &mut Vec<(Record, RecordOrder)>,
+    sink: &mut GraceEmitSink<'_>,
     stats: &mut BnlStats,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
@@ -1636,7 +1666,7 @@ fn bnl_fallback(
                         messages: vec![format!("grace hash bnl probe key eval: {e}")],
                     })?;
                 let probe_iter = table.probe(&probe_keys_buf);
-                let pre = output.len();
+                let pre = sink.records.len();
                 emit_for_probe(
                     rc.emit,
                     &probe_record,
@@ -1644,9 +1674,9 @@ fn bnl_fallback(
                     probe_iter,
                     body_evaluator.as_mut(),
                     &row_ctx,
-                    output,
+                    sink,
                 )?;
-                let added = output.len() - pre;
+                let added = sink.records.len() - pre;
                 emitted_in_batch += added;
                 row_seq += 1;
 
@@ -1706,6 +1736,16 @@ fn combine_e310_partition_aborted(
     }
 }
 
+/// Mutable emission targets threaded through every grace-hash emit path
+/// (in-memory probe, spilled reload, BNL fallback). `records` accumulates
+/// emitted output rows; `failures` accumulates recoverable output-stage
+/// eval failures the dispatcher routes to the dead-letter queue. Bundled
+/// so the emit helpers stay under clippy's too-many-arguments cap.
+struct GraceEmitSink<'a> {
+    records: &'a mut Vec<(Record, RecordOrder)>,
+    failures: &'a mut Vec<CombineOutputEvalFailure>,
+}
+
 /// Shape-stable bundle for [`emit_for_probe`]. Bundling the per-call
 /// arguments keeps the function signature under clippy's
 /// too-many-arguments cap and lets call sites update one field
@@ -1719,6 +1759,7 @@ struct EmitArgs<'a> {
     on_miss: OnMiss,
     build_qualifier: &'a str,
     propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
+    strategy: crate::config::ErrorStrategy,
 }
 
 /// Per-probe emission. Walks the probe iterator, applies the residual
@@ -1732,7 +1773,7 @@ fn emit_for_probe<'a>(
     probe_iter: crate::pipeline::combine::ProbeIter<'a>,
     body_evaluator: Option<&mut ProgramEvaluator>,
     ctx: &EvalContext<'_>,
-    output: &mut Vec<(Record, RecordOrder)>,
+    sink: &mut GraceEmitSink<'_>,
 ) -> Result<(), PipelineError> {
     let EmitArgs {
         name,
@@ -1743,6 +1784,7 @@ fn emit_for_probe<'a>(
         on_miss,
         build_qualifier,
         propagate_ck,
+        strategy,
     } = *args;
     match match_mode {
         MatchMode::Collect => {
@@ -1764,7 +1806,18 @@ fn emit_for_probe<'a>(
                                 detail: "emit_each fan-out is not supported in a combine residual filter".into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            sink.failures.push(CombineOutputEvalFailure {
+                                probe_record: probe_record.clone(),
+                                row: rn,
+                                matched_build: Some(cand.record.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
                 if arr.len() >= COLLECT_PER_GROUP_CAP {
@@ -1807,7 +1860,7 @@ fn emit_for_probe<'a>(
                 crate::executor::copy_build_ck_columns(&mut rec, b, propagate_ck);
             }
             rec.set(build_qualifier, Value::Array(arr));
-            output.push((rec, rn));
+            sink.records.push((rec, rn));
         }
         MatchMode::First | MatchMode::All => {
             let matched: Vec<Record> = {
@@ -1827,7 +1880,18 @@ fn emit_for_probe<'a>(
                                     detail: "emit_each fan-out is not supported in a combine residual filter".into(),
                                 });
                             }
-                            Err(e) => return Err(PipelineError::from(e)),
+                            Err(e) => {
+                                if strategy == crate::config::ErrorStrategy::FailFast {
+                                    return Err(PipelineError::from(e));
+                                }
+                                sink.failures.push(CombineOutputEvalFailure {
+                                    probe_record: probe_record.clone(),
+                                    row: rn,
+                                    matched_build: Some(cand.record.clone()),
+                                    error: e,
+                                });
+                                continue;
+                            }
                         }
                     }
                     acc.push(cand.record.clone());
@@ -1870,7 +1934,7 @@ fn emit_for_probe<'a>(
                                 for (k, v) in *record_vars {
                                     let _ = rec.set_record_var(&k, v);
                                 }
-                                output.push((rec, rn));
+                                sink.records.push((rec, rn));
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
                             Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
@@ -1882,7 +1946,17 @@ fn emit_for_probe<'a>(
                                         .into(),
                                 });
                             }
-                            Err(e) => return Err(PipelineError::from(e)),
+                            Err(e) => {
+                                if strategy == crate::config::ErrorStrategy::FailFast {
+                                    return Err(PipelineError::from(e));
+                                }
+                                sink.failures.push(CombineOutputEvalFailure {
+                                    probe_record: probe_record.clone(),
+                                    row: rn,
+                                    matched_build: None,
+                                    error: e,
+                                });
+                            }
                         }
                     }
                 }
@@ -1906,7 +1980,7 @@ fn emit_for_probe<'a>(
                                 let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(&mut rec, m, propagate_ck);
-                            output.push((rec, rn));
+                            sink.records.push((rec, rn));
                         }
                         Ok(EvalResult::Skip(_)) => {}
                         Ok(EvalResult::EmitMany { .. }) => {
@@ -1917,7 +1991,18 @@ fn emit_for_probe<'a>(
                                     .into(),
                             });
                         }
-                        Err(e) => return Err(PipelineError::from(e)),
+                        Err(e) => {
+                            if strategy == crate::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            sink.failures.push(CombineOutputEvalFailure {
+                                probe_record: probe_record.clone(),
+                                row: rn,
+                                matched_build: Some(m.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -1946,7 +2031,7 @@ fn emit_for_probe<'a>(
                         });
                     }
                     let rec = Record::new(Arc::clone(target_schema), values);
-                    output.push((rec, rn));
+                    sink.records.push((rec, rn));
                 }
             }
         }
@@ -2450,8 +2535,10 @@ mod tests {
             budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: crate::config::ErrorStrategy::FailFast,
         })
-        .expect("grace hash E2E");
+        .expect("grace hash E2E")
+        .records;
 
         assert_eq!(result.len(), 10, "every driver matches one build by k");
         // Verify membership: each (k, v, k, name) tuple is present.
@@ -2637,8 +2724,10 @@ mod tests {
             budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: crate::config::ErrorStrategy::FailFast,
         })
-        .expect("grace hash spill E2E");
+        .expect("grace hash spill E2E")
+        .records;
 
         assert_eq!(
             result.len(),
@@ -2817,6 +2906,7 @@ mod tests {
             budget: &budget,
             spill_dir: dir.path(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: crate::config::ErrorStrategy::FailFast,
         });
 
         let err = result.expect_err("disk quota must abort the combine");
@@ -3085,6 +3175,7 @@ mod tests {
             on_miss: h.emit.on_miss,
             build_qualifier: &h.emit.build_qualifier,
             propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
+            strategy: crate::config::ErrorStrategy::FailFast,
         };
         let eval_ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
         let rc = ReloadContext {
@@ -3222,7 +3313,10 @@ mod tests {
                 builds,
                 &mut body_eval,
                 &budget,
-                &mut output,
+                &mut GraceEmitSink {
+                    records: &mut output,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats,
             )
             .expect("BNL fallback must run on irreducible partition");
@@ -3277,7 +3371,10 @@ mod tests {
                 builds,
                 &mut body_eval,
                 &budget,
-                &mut output,
+                &mut GraceEmitSink {
+                    records: &mut output,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats,
             )
             .expect("BNL must succeed on non-skewed input");
@@ -3362,7 +3459,10 @@ mod tests {
                 builds,
                 &mut body_eval,
                 &budget,
-                &mut output,
+                &mut GraceEmitSink {
+                    records: &mut output,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats,
             )
             .expect("BNL must succeed with bounded chunks");
@@ -3426,7 +3526,10 @@ mod tests {
                 builds2,
                 &mut body_eval2,
                 &big_budget,
-                &mut output2,
+                &mut GraceEmitSink {
+                    records: &mut output2,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats2,
             )
             .unwrap();
@@ -3488,7 +3591,10 @@ mod tests {
                 builds,
                 &mut body_eval,
                 &budget,
-                &mut output,
+                &mut GraceEmitSink {
+                    records: &mut output,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats,
             )
             .expect("BNL must produce output for hot-key test");
@@ -3550,7 +3656,10 @@ mod tests {
                 builds,
                 &mut body_eval,
                 &budget,
-                &mut output,
+                &mut GraceEmitSink {
+                    records: &mut output,
+                    failures: &mut Vec::new(),
+                },
                 &mut stats,
             )
             .expect_err("1-byte hard limit must abort BNL")
