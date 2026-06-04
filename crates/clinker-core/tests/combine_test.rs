@@ -509,7 +509,7 @@ mod tests {
     /// the field's position within its declared input row.
     #[test]
     fn test_typecheck_combine_resolves_qualified_field_refs_to_indices() {
-        use clinker_core::executor::combine::JoinSide;
+        use clinker_core::plan::types::JoinSide;
         use cxl::typecheck::QualifiedField;
 
         let (artifacts, diags) = compile_combine_fixture("match_all");

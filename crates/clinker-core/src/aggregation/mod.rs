@@ -2,9 +2,8 @@
 //!
 //! This module is split into focused submodules:
 //!
-//! * [`error`] — the plan-time [`AggregateStrategy`] enum and the
-//!   [`AggregateEvalError`] / [`HashAggError`] taxonomy plus its
-//!   `PipelineError` mapping.
+//! * [`error`] — the finalize-time [`AggregateEvalError`] /
+//!   [`HashAggError`] taxonomy plus its `PipelineError` mapping.
 //! * [`hash`] — the [`HashAggregator`] per-group hash table, the
 //!   [`AccumulatorFactory`] prototype clone factory, the
 //!   [`AggregateConsumer`] arbitrator hook, and the shared group
@@ -20,9 +19,9 @@
 //!
 //! Runtime types referenced by `PlanNode::Aggregation`'s executor dispatch:
 //!
-//! * [`AggregateStrategy`] — plan-time enum (also surfaced on the plan
-//!   node) selecting the per-group hash table or the streaming
-//!   single-group fold.
+//! * [`crate::plan::types::AggregateStrategy`] — plan-time enum (also
+//!   surfaced on the plan node) selecting the per-group hash table or
+//!   the streaming single-group fold.
 //! * [`AggregateInput`] — dual input mode: a freshly read input record
 //!   or a previously spilled per-group state being recovered.
 //! * [`AccumulatorFactory`] — clones a per-group prototype
@@ -37,7 +36,7 @@ mod error;
 mod hash;
 mod spill;
 
-pub use error::{AggregateEvalError, AggregateStrategy, HashAggError};
+pub use error::{AggregateEvalError, HashAggError};
 pub use hash::{AccumulatorFactory, AggregateConsumer, AggregatorConfig, HashAggregator};
 pub use spill::{AggSpillFile, SpillState};
 
@@ -59,6 +58,7 @@ use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
 use crate::config::SortField;
 use crate::error::PipelineError;
+use crate::plan::types::AggregateStrategy;
 
 /// Input to an aggregator's `add` path. Live input records and
 /// recovered spilled state both flow through the same dispatch so the

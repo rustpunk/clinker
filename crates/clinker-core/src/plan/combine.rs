@@ -27,6 +27,7 @@ use serde::Serialize;
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::execution::DependencyType;
 use crate::plan::row_type::{QualifiedField, Row};
+use crate::plan::types::JoinSide;
 use crate::span::Span;
 use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
 use cxl::typecheck::Type;
@@ -1837,12 +1838,10 @@ pub(crate) fn decompose_nary_combines(
         // input's source schema. The `CombineResolver` consumes this
         // map at runtime via
         // `CombineResolverMapping::from_pre_resolved`.
-        let mut step_resolved_maps: Vec<
-            HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)>,
-        > = Vec::with_capacity(steps.len());
+        let mut step_resolved_maps: Vec<HashMap<QualifiedField, (JoinSide, u32)>> =
+            Vec::with_capacity(steps.len());
         for (i, step) in steps.iter().enumerate() {
-            let mut step_map: HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> =
-                HashMap::new();
+            let mut step_map: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
             // Probe-side qualifiers: every original qualifier that's
             // already in the joined chain at the start of this step.
             // For step 0 the chain has only the original driving
@@ -1859,7 +1858,7 @@ pub(crate) fn decompose_nary_combines(
                 for (idx, (qf, _ty)) in driver_input.row.fields().enumerate() {
                     let resolve_qual = qf.qualifier.as_deref().unwrap_or(driving.as_str());
                     let key = QualifiedField::qualified(resolve_qual, qf.name.clone());
-                    step_map.insert(key, (crate::executor::combine::JoinSide::Probe, idx as u32));
+                    step_map.insert(key, (JoinSide::Probe, idx as u32));
                 }
             } else {
                 let prev_intermediate = &steps[i - 1].intermediate_row;
@@ -1869,7 +1868,7 @@ pub(crate) fn decompose_nary_combines(
                         .as_deref()
                         .expect("intermediate_row fields are qualified by construction");
                     let key = QualifiedField::qualified(resolve_qual, qf.name.clone());
-                    step_map.insert(key, (crate::executor::combine::JoinSide::Probe, idx as u32));
+                    step_map.insert(key, (JoinSide::Probe, idx as u32));
                 }
             }
             // Build-side qualifier: the single input newly joined at
@@ -1882,7 +1881,7 @@ pub(crate) fn decompose_nary_combines(
                 .expect("step.build_input qualifier was selected from inputs.keys()");
             for (idx, (qf, _ty)) in build_input_meta.row.fields().enumerate() {
                 let key = QualifiedField::qualified(step.build_input.as_str(), qf.name.clone());
-                step_map.insert(key, (crate::executor::combine::JoinSide::Build, idx as u32));
+                step_map.insert(key, (JoinSide::Build, idx as u32));
             }
             step_resolved_maps.push(step_map);
         }

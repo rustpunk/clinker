@@ -361,7 +361,7 @@ pub(crate) fn classify_stream_nodes(
 ///
 /// Producer = streaming-strategy `Aggregate`:
 ///
-/// - The aggregate resolved to [`AggregateStrategy::Streaming`] (the
+/// - The aggregate resolved to [`crate::plan::types::AggregateStrategy::Streaming`] (the
 ///   planner certified pre-sorted input), feeds only this Output, and
 ///   roots no window arena. Hash aggregation stays blocking: it must
 ///   accumulate every group before emitting, so it cannot stream.
@@ -389,9 +389,9 @@ fn streaming_output_producer(
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
 ) -> Option<petgraph::graph::NodeIndex> {
-    use crate::aggregation::AggregateStrategy;
     use crate::plan::combine::CombineStrategy;
     use crate::plan::execution::PlanNode;
+    use crate::plan::types::AggregateStrategy;
 
     let PlanNode::Output { resolved, .. } = &plan.graph[output_idx] else {
         return None;

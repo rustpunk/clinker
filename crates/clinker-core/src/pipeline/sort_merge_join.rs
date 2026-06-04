@@ -1587,8 +1587,9 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::combine::{CombineResolverMapping, JoinSide};
+    use crate::executor::combine::CombineResolverMapping;
     use crate::plan::combine::{CombineInput, RangeConjunct};
+    use crate::plan::types::JoinSide;
     use clinker_record::SchemaBuilder;
     use cxl::ast::Statement;
     use cxl::lexer::Span as CxlSpan;

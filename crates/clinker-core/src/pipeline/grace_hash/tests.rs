@@ -270,8 +270,9 @@ fn lazy_probe_spill_routes_to_partition_file() {
 /// of which partitions get spilled.
 #[test]
 fn execute_grace_hash_partition_pair_correct() {
-    use crate::executor::combine::{CombineResolverMapping, JoinSide};
+    use crate::executor::combine::CombineResolverMapping;
     use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use crate::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     // Driver and build schemas use distinct bare names for the
@@ -467,8 +468,9 @@ fn execute_grace_hash_partition_pair_correct() {
 /// emits the same join membership the in-memory path would.
 #[test]
 fn execute_grace_hash_spill_then_reload_correct() {
-    use crate::executor::combine::{CombineResolverMapping, JoinSide};
+    use crate::executor::combine::CombineResolverMapping;
     use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use crate::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     let driver_schema = schema_with(&["dk", "v"]);
@@ -644,8 +646,9 @@ fn execute_grace_hash_spill_then_reload_correct() {
 /// cause this combine to fail.
 #[test]
 fn execute_grace_hash_aborts_on_disk_quota_overflow() {
-    use crate::executor::combine::{CombineResolverMapping, JoinSide};
+    use crate::executor::combine::CombineResolverMapping;
     use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use crate::plan::types::JoinSide;
     use cxl::eval::{EvalContext, StableEvalContext};
 
     let driver_schema = schema_with(&["dk", "v"]);
@@ -928,8 +931,9 @@ struct EmitArgsOwned {
 }
 
 fn build_bnl_harness() -> BnlHarness {
-    use crate::executor::combine::{CombineResolverMapping, JoinSide};
+    use crate::executor::combine::CombineResolverMapping;
     use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use crate::plan::types::JoinSide;
     use cxl::eval::StableEvalContext;
 
     let driver_schema = schema_with(&["dk", "v"]);

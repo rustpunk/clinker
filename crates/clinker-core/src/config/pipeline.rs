@@ -1895,7 +1895,6 @@ pub(crate) fn lower_node_to_plan_node(
     ctx: &LoweringCtx<'_>,
     diags: &mut Vec<crate::error::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
-    use crate::aggregation::AggregateStrategy;
     use crate::error::{Diagnostic, LabeledSpan};
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
@@ -1903,6 +1902,7 @@ pub(crate) fn lower_node_to_plan_node(
         PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
         extract_write_set,
     };
+    use crate::plan::types::AggregateStrategy;
     use clinker_record::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
 
