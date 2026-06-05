@@ -29,7 +29,53 @@ use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 
+use clinker_plan::SpillError;
+use clinker_plan::error::PipelineError;
 use clinker_record::{Record, RecordPayload, Schema};
+
+/// Failure raised while writing a grace-hash partition spill.
+///
+/// Splits a directory-level fault from a byte-level one so the executor
+/// can route them differently. A `DirUnavailable` means the spill root
+/// itself went bad mid-run (removed, unmounted, remounted read-only) and
+/// renders with the dedicated directory diagnostic shared with the
+/// node-buffer, sort, and aggregate spill paths; `Io` is a genuine
+/// byte-stream fault (`ENOSPC`, a short write, an encoder finalize error)
+/// or an internal state-machine violation.
+#[derive(Debug)]
+pub(crate) enum GraceSpillError {
+    /// The spill root directory became unusable while creating a
+    /// partition file. Carries the classified [`SpillError::DirUnavailable`].
+    DirUnavailable(SpillError),
+    /// A byte-stream fault during write/finalize, or an internal
+    /// state-machine violation surfaced as an `io::Error`.
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for GraceSpillError {
+    fn from(e: std::io::Error) -> Self {
+        GraceSpillError::Io(e)
+    }
+}
+
+/// Map a [`GraceSpillError`] to a [`PipelineError`] for the combine node
+/// `node`, tagging the failing stage with `detail` (e.g. "build write",
+/// "probe writer").
+///
+/// A mid-run directory fault becomes `PipelineError::Spill`, so it renders
+/// with the same `DirUnavailable` diagnostic the node-buffer, sort, and
+/// aggregate spill paths emit; a genuine byte fault or state-machine
+/// violation becomes `PipelineError::Internal`.
+pub(crate) fn grace_spill_error(e: GraceSpillError, node: &str, detail: &str) -> PipelineError {
+    match e {
+        GraceSpillError::DirUnavailable(spill) => PipelineError::Spill(spill),
+        GraceSpillError::Io(io) => PipelineError::Internal {
+            op: "combine",
+            node: node.to_string(),
+            detail: format!("grace hash {detail}: {io}"),
+        },
+    }
+}
 
 /// File-format magic bytes, written little-endian. Not a printable ASCII
 /// constant on purpose — readers do an exact `u32::from_le_bytes` match,
@@ -81,14 +127,37 @@ impl GraceSpillWriter {
     /// `partition_id` plus a per-process monotonic sequence so a
     /// single partition that fans out across multiple spill flushes
     /// doesn't overwrite earlier files.
-    pub(crate) fn new(dir: &Path, hash_bits: u8, partition_id: u16) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        dir: &Path,
+        hash_bits: u8,
+        partition_id: u16,
+    ) -> Result<Self, GraceSpillError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
             "grace-p{partition_id:05}-b{hash_bits:02}-s{seq:08}.spill"
         ));
-        let file = File::create(&path)?;
+        // A create failure in a spill dir the run validated at startup means
+        // the directory went bad mid-run. Classify it through the shared
+        // `from_spill_dir_io` helper so the grace path surfaces the same
+        // `DirUnavailable` diagnostic the node-buffer, sort, and aggregate
+        // spill paths do, rather than rendering as a generic internal error.
+        // `from_spill_dir_io` only lifts directory-kind faults (NotFound,
+        // PermissionDenied, ReadOnlyFilesystem); a genuine byte fault on
+        // create (e.g. ENOSPC) stays `SpillError::Io` and is re-narrowed to
+        // `GraceSpillError::Io` so only true directory faults carry the
+        // `DirUnavailable` diagnostic.
+        let file =
+            File::create(&path).map_err(|e| match SpillError::from_spill_dir_io(dir, e) {
+                dir_err @ SpillError::DirUnavailable { .. } => {
+                    GraceSpillError::DirUnavailable(dir_err)
+                }
+                SpillError::Io(io) => GraceSpillError::Io(io),
+                // `from_spill_dir_io` returns only `DirUnavailable` or `Io`; any
+                // other variant would be an unreachable classifier regression.
+                other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
+            })?;
         let buf = BufWriter::new(file);
         let encoder = FrameEncoder::new(buf);
         Ok(Self {
@@ -101,7 +170,7 @@ impl GraceSpillWriter {
     }
 
     /// Append one record to the partition body.
-    pub(crate) fn write_record(&mut self, record: &Record) -> std::io::Result<()> {
+    pub(crate) fn write_record(&mut self, record: &Record) -> Result<(), GraceSpillError> {
         let rv = record.record_var_pairs();
         let payload = RecordPayload {
             values: record.values().to_vec(),
@@ -123,7 +192,7 @@ impl GraceSpillWriter {
     /// The byte length feeds [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`]
     /// so the disk-quota poll can tally cumulative on-disk usage
     /// without re-stat'ing each finalized file.
-    pub(crate) fn finish(self) -> std::io::Result<(SpillFilePath, u64)> {
+    pub(crate) fn finish(self) -> Result<(SpillFilePath, u64), GraceSpillError> {
         let Self {
             encoder,
             path,
@@ -409,5 +478,50 @@ mod tests {
         drop(f);
 
         assert!(GraceSpillReader::open(&path, s).is_err());
+    }
+
+    #[test]
+    fn spill_dir_removed_mid_run_yields_distinct_diagnostic() {
+        // Mirror of the node-buffer/sort spill regression: a grace-hash
+        // partition spill into a dir that vanished after startup
+        // validation must surface the distinct `DirUnavailable`
+        // classification, not a bare `io::Error` that the executor would
+        // fold into a generic internal error. This is the grace-hash half
+        // of the documented "Aggregate, sort, and grace-hash Combine all
+        // surface the directory-level cause" guarantee.
+        let scratch = TempDir::new().unwrap();
+        let spill_dir = scratch.path().join("grace-spill-root");
+        std::fs::create_dir(&spill_dir).unwrap();
+        std::fs::remove_dir(&spill_dir).unwrap();
+
+        let err = match GraceSpillWriter::new(&spill_dir, 4, 0) {
+            Ok(_) => panic!("GraceSpillWriter::new should fail when the dir is gone"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                &err,
+                GraceSpillError::DirUnavailable(SpillError::DirUnavailable { .. })
+            ),
+            "expected DirUnavailable, got {err:?}"
+        );
+
+        // The shared boundary helper must route a directory fault to the
+        // spill arm so it renders with the directory-level message, not a
+        // generic `Internal`.
+        let pipeline_err = grace_spill_error(err, "join1", "build write");
+        assert!(
+            matches!(
+                pipeline_err,
+                PipelineError::Spill(SpillError::DirUnavailable { .. })
+            ),
+            "expected PipelineError::Spill(DirUnavailable), got {pipeline_err:?}"
+        );
+        assert!(
+            pipeline_err
+                .to_string()
+                .contains("became unavailable mid-run"),
+            "{pipeline_err}"
+        );
     }
 }

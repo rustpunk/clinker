@@ -75,7 +75,9 @@ use crate::pipeline::combine::{
     CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
     hash_composite_key,
 };
-use crate::pipeline::grace_spill::{GraceSpillWriter, SpillFilePath};
+use crate::pipeline::grace_spill::{
+    GraceSpillError, GraceSpillWriter, SpillFilePath, grace_spill_error,
+};
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -293,7 +295,7 @@ impl GraceHashExecutor {
         record: Record,
         hash: u64,
         budget: &MemoryArbitrator,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
         let bytes = estimated_record_bytes(&record);
 
@@ -308,9 +310,9 @@ impl GraceHashExecutor {
                 // Build phase only adds to Building or OnDisk; arriving
                 // in Ready/Done indicates the caller invoked
                 // `finish_build` before the build stream completed.
-                return Err(std::io::Error::other(format!(
+                return Err(GraceSpillError::Io(std::io::Error::other(format!(
                     "grace hash: add_build_record on partition {p} in finished state",
-                )));
+                ))));
             }
         };
 
@@ -358,7 +360,7 @@ impl GraceHashExecutor {
 
     /// Force-spill the largest Building partition. Returns Ok(()) when
     /// no Building partition remains (everything is already on disk).
-    fn spill_largest_building(&mut self, budget: &MemoryArbitrator) -> std::io::Result<()> {
+    fn spill_largest_building(&mut self, budget: &MemoryArbitrator) -> Result<(), GraceSpillError> {
         // Iterate until RSS drops below soft limit OR no Building
         // partition is left to evict. The soft limit is checked through
         // `should_spill` rather than `should_abort`: we want to catch
@@ -386,7 +388,7 @@ impl GraceHashExecutor {
     /// in-memory record to a fresh spill file. The HLL sketch is
     /// preserved verbatim across the transition so the reload-phase
     /// BNL branch can read partition cardinality without rebuilding.
-    fn spill_partition(&mut self, idx: usize) -> std::io::Result<()> {
+    fn spill_partition(&mut self, idx: usize) -> Result<(), GraceSpillError> {
         let assigner_bits = self.assigner.hash_bits();
         let hash_bits = assigner_bits;
         let partition_id = idx as u16;
@@ -489,7 +491,7 @@ impl GraceHashExecutor {
         record: &Record,
         probe_keys: &'a [Value],
         hash: u64,
-    ) -> std::io::Result<ProbeOutcome<'a>> {
+    ) -> Result<ProbeOutcome<'a>, GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
         match &mut self.partitions[p] {
             PartitionState::Ready { hash_table } => {
@@ -524,9 +526,9 @@ impl GraceHashExecutor {
                 // Building means finish_build was not called; Done
                 // means a partition was already reloaded. Both are
                 // executor-side bugs, not user-visible failures.
-                Err(std::io::Error::other(format!(
+                Err(GraceSpillError::Io(std::io::Error::other(format!(
                     "grace hash probe_record on partition {p} in invalid state"
-                )))
+                ))))
             }
         }
     }
@@ -534,7 +536,7 @@ impl GraceHashExecutor {
     /// Finalize any open probe writers so their LZ4 frames are valid
     /// before the reload phase reopens them. Build-side writers were
     /// already finalized in `spill_partition`.
-    pub(crate) fn finalize_probe_spills(&mut self) -> std::io::Result<()> {
+    pub(crate) fn finalize_probe_spills(&mut self) -> Result<(), GraceSpillError> {
         let mut written_total: u64 = 0;
         for state in &mut self.partitions {
             if let PartitionState::OnDisk {
@@ -722,11 +724,7 @@ pub(crate) fn execute_combine_grace_hash(
     for (record, hash) in hashed_build {
         executor
             .add_build_record(record, hash, budget)
-            .map_err(|e| PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash build add failed: {e}"),
-            })?;
+            .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
     if budget.record_spill_bytes(executor.take_spilled_bytes()) {
@@ -776,11 +774,7 @@ pub(crate) fn execute_combine_grace_hash(
 
         let outcome = executor
             .probe_record(&probe_record, &probe_keys_buf, hash)
-            .map_err(|e| PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash probe failed: {e}"),
-            })?;
+            .map_err(|e| grace_spill_error(e, name, "probe failed"))?;
 
         match outcome {
             ProbeOutcome::InMemory(probe_iter) => {
@@ -822,11 +816,7 @@ pub(crate) fn execute_combine_grace_hash(
 
     executor
         .finalize_probe_spills()
-        .map_err(|e| PipelineError::Internal {
-            op: "combine",
-            node: name.to_string(),
-            detail: format!("grace hash probe finalize failed: {e}"),
-        })?;
+        .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
     if budget.record_spill_bytes(executor.take_spilled_bytes()) {
         return Err(PipelineError::MemoryBudgetExceeded {
             node: name.to_string(),

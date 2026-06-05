@@ -36,6 +36,14 @@ pub struct PipelineRunParams {
     /// `crate::pipeline::shutdown::ShutdownToken::new()` so SIGINT/SIGTERM
     /// can trip it.
     pub shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    /// Root directory for the per-run `clinker-spill-*` directory, resolved
+    /// from the workspace `clinker.toml` `[storage.spill] dir` setting. `None`
+    /// (no setting, or no `clinker.toml`) → the OS temp dir, the historical
+    /// default. The caller validates the directory exists and is writable
+    /// before the run starts, so the executor treats `Some(dir)` as a vetted
+    /// path: a failure to create the spill root under it is an internal error,
+    /// not a config error.
+    pub spill_root_dir: Option<std::path::PathBuf>,
 }
 
 /// Summary returned after a pipeline execution completes (success or partial).

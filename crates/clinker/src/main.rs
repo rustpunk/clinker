@@ -506,6 +506,18 @@ fn resolve_compile_anchor(
     (workspace_root, pipeline_dir)
 }
 
+/// Map a workspace `[storage]` configuration failure onto the top-level
+/// `PipelineError::Config` so it renders through the same miette path as a
+/// pipeline-YAML validation error and exits with the config status code.
+///
+/// The `StorageConfigError` Display already names the offending
+/// `storage.spill.dir` path and the underlying OS reason, so no span is
+/// attached — the failing setting lives in `clinker.toml`, not the pipeline
+/// YAML the diagnostic renderer carries as its `NamedSource`.
+fn storage_config_error(e: clinker_plan::config::StorageConfigError) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -560,6 +572,23 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // time names the same bytes the run actually reads.
     let (workspace_root, pipeline_dir) =
         resolve_compile_anchor(&args.config, args.base_dir.as_deref());
+
+    // Workspace `[storage]` config (clinker.toml at the workspace root).
+    // Loaded and validated here, before compile and before any reader or
+    // writer is opened, so a misconfigured spill volume fails the run at
+    // startup with a clear message rather than at the first spill — the trap
+    // DuckDB fell into when its temp-directory setting was honored only
+    // lazily (duckdb/duckdb#9401). The validated directory threads into the
+    // run via `PipelineRunParams.spill_root_dir`; absent config keeps the
+    // historical OS-temp-dir default.
+    let storage_config = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(storage_config_error)?
+        .storage;
+    let spill_root_dir = storage_config
+        .spill
+        .resolve()
+        .map_err(storage_config_error)?;
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -643,6 +672,22 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 print!(
                     "{}",
                     dag.explain_text_with_artifacts(&pipeline_config, artifacts)
+                );
+                // Resolved spill root: the directory under which the per-run
+                // `clinker-spill-*` directory is created. Shows the configured
+                // `storage.spill.dir` when set, the OS temp dir otherwise, so
+                // an operator can confirm where blocking operators will spill
+                // before committing to the run.
+                let spill_root_display = spill_root_dir.clone().unwrap_or_else(std::env::temp_dir);
+                let spill_root_source = if spill_root_dir.is_some() {
+                    "storage.spill.dir"
+                } else {
+                    "OS temp dir (default)"
+                };
+                println!(
+                    "Spill root: {} [{}]",
+                    spill_root_display.display(),
+                    spill_root_source
                 );
             }
             ExplainFormat::Json => {
@@ -958,6 +1003,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         source_vars: channel_source_vars,
         record_vars: channel_record_vars,
         shutdown_token: Some(shutdown_token),
+        spill_root_dir: spill_root_dir.clone(),
     };
     let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,

@@ -50,8 +50,12 @@ impl<P: Serialize> SpillWriter<P> {
     /// Create a new SpillWriter. Writes schema header immediately.
     /// Files are created in `spill_dir` or the system temp directory.
     pub fn new(schema: Arc<Schema>, spill_dir: Option<&Path>) -> Result<Self, SpillError> {
+        // A create failure in a spill dir the run validated at startup means
+        // the directory went bad mid-run (unmounted, removed, remounted
+        // read-only). `from_spill_dir_io` lifts those into the distinct
+        // `DirUnavailable` diagnostic rather than a generic spill I/O error.
         let temp_file = if let Some(dir) = spill_dir {
-            NamedTempFile::new_in(dir)?
+            NamedTempFile::new_in(dir).map_err(|e| SpillError::from_spill_dir_io(dir, e))?
         } else {
             NamedTempFile::new()?
         };
@@ -430,6 +434,36 @@ mod tests {
             "Spill file {:?} should be in custom dir {:?}",
             spill_file.path(),
             custom_dir.path()
+        );
+    }
+
+    #[test]
+    fn spill_dir_removed_mid_run_yields_distinct_diagnostic() {
+        // Simulate the spill dir vanishing after startup validation: create a
+        // dir, hand its path to the writer, then delete it before the first
+        // spill. The writer must surface `DirUnavailable`, not a generic
+        // `Io`, so the operator sees a directory-level cause rather than an
+        // opaque byte-stream failure.
+        let scratch = tempfile::tempdir().unwrap();
+        let spill_dir = scratch.path().join("spill-root");
+        std::fs::create_dir(&spill_dir).unwrap();
+        let schema = test_schema();
+        std::fs::remove_dir(&spill_dir).unwrap();
+
+        let err = match SpillWriter::<()>::new(Arc::clone(&schema), Some(&spill_dir)) {
+            Ok(_) => panic!("spill writer creation should fail when the dir is gone"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SpillError::DirUnavailable { .. }),
+            "expected DirUnavailable, got {err:?}"
+        );
+        // The rendered message names the directory and is distinct from the
+        // generic spill I/O wording.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("became unavailable mid-run"),
+            "{rendered}"
         );
     }
 }
