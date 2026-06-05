@@ -176,6 +176,25 @@ pub enum PipelineError {
         combine: String,
         driver_row: u64,
     },
+    /// E320 — the cumulative on-disk size of the run's spill files crossed
+    /// the configured `storage.spill.disk_cap_bytes` quota. Deliberately
+    /// distinct from E310 (`MemoryBudgetExceeded`): a run can sit well
+    /// inside its RSS envelope yet still exhaust local disk through an
+    /// unbounded stream of spill files, and conflating the two reproduces
+    /// the duckdb/duckdb#14142 trap where a disk-cap hit rendered as an
+    /// out-of-memory message and operators wrongly concluded the engine was
+    /// broken. Also distinct from E321 (`SpillDiskFull`): the cap is a
+    /// configured policy ceiling the run chose to stop at, not the physical
+    /// volume running out of space. `node` names the spilling operator;
+    /// `cap` is the configured quota; `attempted` is the byte count of the
+    /// flush that would have crossed it; `current` is the cumulative total
+    /// after that flush. Always aborts the run.
+    SpillCapExceeded {
+        node: String,
+        cap: u64,
+        attempted: u64,
+        current: u64,
+    },
     /// E315 (pipeline-wide, `source: None`) or E316 (per-source,
     /// `source: Some(name)`) — the cumulative DLQ fraction crossed
     /// the configured `max_rate` after at least `min_records` rows
@@ -325,6 +344,20 @@ impl fmt::Display for PipelineError {
                 "E319 combine '{combine}': on_miss: error — no matching build row \
                  for driver row {driver_row}"
             ),
+            Self::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => write!(
+                f,
+                "E320 {node}: spill disk cap exceeded — the configured \
+                 storage.spill.disk_cap_bytes of {cap} bytes was crossed by a \
+                 {attempted}-byte flush ({current} bytes spilled in total). This \
+                 is a disk-cap stop, not an out-of-memory condition and not a \
+                 full volume; raise storage.spill.disk_cap_bytes, reduce input \
+                 size, or point storage.spill.dir at a larger volume."
+            ),
             Self::DlqRateExceeded {
                 source,
                 observed_rate,
@@ -389,6 +422,27 @@ impl PipelineError {
             inner,
         }
     }
+
+    /// E320 — the run crossed its configured `storage.spill.disk_cap_bytes`
+    /// quota. Built at every spill site the moment a flush would push the
+    /// cumulative spilled total past the cap, so the cap-exceeded surface
+    /// stays uniform across the node-buffer, streaming-handoff, grace-hash,
+    /// and sort-merge spill paths. Kept distinct from
+    /// [`PipelineError::MemoryBudgetExceeded`] (E310) on purpose — see the
+    /// variant docs.
+    pub fn spill_cap_exceeded(
+        node: impl Into<String>,
+        cap: u64,
+        attempted: u64,
+        current: u64,
+    ) -> Self {
+        Self::SpillCapExceeded {
+            node: node.into(),
+            cap,
+            attempted,
+            current,
+        }
+    }
 }
 
 impl std::error::Error for PipelineError {}
@@ -426,5 +480,44 @@ impl From<std::io::Error> for PipelineError {
 impl From<crate::runtime_error::SpillError> for PipelineError {
     fn from(e: crate::runtime_error::SpillError) -> Self {
         Self::Spill(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_cap_exceeded_renders_e320_distinct_from_oom() {
+        let e =
+            PipelineError::spill_cap_exceeded("sort_orders", 104_857_600, 8_388_608, 109_051_904);
+        let rendered = e.to_string();
+        assert!(rendered.contains("E320"), "{rendered}");
+        assert!(rendered.contains("spill disk cap exceeded"), "{rendered}");
+        assert!(rendered.contains("104857600"), "{rendered}");
+        assert!(rendered.contains("109051904"), "{rendered}");
+        // The message must steer the reader away from reading this as an OOM.
+        assert!(
+            rendered.contains("not an out-of-memory condition"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn spill_cap_exceeded_carries_structured_fields() {
+        match PipelineError::spill_cap_exceeded("n", 100, 200, 300) {
+            PipelineError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "n");
+                assert_eq!(cap, 100);
+                assert_eq!(attempted, 200);
+                assert_eq!(current, 300);
+            }
+            other => panic!("constructor must build SpillCapExceeded; got {other:?}"),
+        }
     }
 }

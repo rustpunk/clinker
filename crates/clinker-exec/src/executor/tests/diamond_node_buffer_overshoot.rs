@@ -1,18 +1,18 @@
 //! Hard-limit overshoot coverage for the `node_buffers` admission's
-//! disk-spill-quota gate, surfacing the bare
-//! `PipelineError::MemoryBudgetExceeded { source: BudgetCategory::NodeBuffer }`
-//! shape on a diamond topology.
+//! disk-spill-quota gate, surfacing the dedicated
+//! `PipelineError::SpillCapExceeded` (E320) shape on a diamond topology.
 //!
 //! Under the RSS-based arbitration model a `node_buffers` slot only
-//! raises E310 through the disk-spill-quota path in `admit_node_buffer`:
-//! when the soft limit has tripped (`should_spill()` true) the slot
-//! flushes to a spill file, and an over-quota cumulative disk total
-//! (`record_spill_bytes` past `max_spill_bytes`) returns the structured
-//! error with `detail: "spill quota exceeded"`. Producer-side spill is
-//! gated to single-consumer slots (`node_buffer_spill_allowed`), so the
-//! diamond's `stage_split` producer — which fans out to two branches —
-//! stays in memory; the spillable slot is a single-consumer branch
-//! feeding the Merge.
+//! raises the disk-cap error through the disk-spill-quota path in
+//! `admit_node_buffer`: when the soft limit has tripped (`should_spill()`
+//! true) the slot flushes to a spill file, and an over-quota cumulative
+//! disk total (`record_spill_bytes` past `max_spill_bytes`) returns the
+//! structured `SpillCapExceeded` error — deliberately distinct from the
+//! memory-budget E310 so a spilled-out volume never reads as OOM.
+//! Producer-side spill is gated to single-consumer slots
+//! (`node_buffer_spill_allowed`), so the diamond's `stage_split`
+//! producer — which fans out to two branches — stays in memory; the
+//! spillable slot is a single-consumer branch feeding the Merge.
 //!
 //! The arbitrator is seeded deterministically: `peak_rss` above the soft
 //! limit (so `should_spill` trips) but below the hard limit (so no
@@ -137,32 +137,24 @@ fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
     .expect_err("one-byte spill quota must abort the first branch flush");
 
     match err {
-        PipelineError::MemoryBudgetExceeded {
+        PipelineError::SpillCapExceeded {
             node,
-            source,
-            used,
-            limit,
-            detail,
+            cap,
+            attempted,
+            current,
         } => {
             assert!(
                 node == "branch_a" || node == "branch_b",
                 "the spillable slot is a single-consumer branch (stage_split fans out \
                  to two consumers and cannot spill); got node {node:?}",
             );
+            assert_eq!(cap, 1, "reported cap must equal the one-byte quota");
+            assert!(attempted > 0, "the overflowing flush must report its size");
             assert!(
-                matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
-                "node_buffers admission must surface under NodeBuffer; got {source:?}",
-            );
-            assert_eq!(
-                detail.as_deref(),
-                Some("spill quota exceeded"),
-                "the disk-spill-quota path is the only node_buffers E310 surface",
-            );
-            assert!(
-                used > limit,
-                "reported used ({used}) must exceed the spill quota ({limit})",
+                current > cap,
+                "reported cumulative spilled ({current}) must exceed the cap ({cap})",
             );
         }
-        other => panic!("expected bare MemoryBudgetExceeded; got: {other:?}"),
+        other => panic!("expected SpillCapExceeded; got: {other:?}"),
     }
 }

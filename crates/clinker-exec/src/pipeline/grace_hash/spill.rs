@@ -274,16 +274,12 @@ pub(super) fn process_spilled_partition(
                 .finish()
                 .map_err(|e| grace_spill_error(e, name, "repartition build finalize"))?;
             if budget.record_spill_bytes(b_written) {
-                return Err(PipelineError::MemoryBudgetExceeded {
-                    node: name.to_string(),
-                    used: budget.cumulative_spill_bytes(),
-                    limit: budget.disk_quota(),
-                    source: BudgetCategory::Arena,
-                    detail: Some(format!(
-                        "grace hash repartition build exceeded disk-spill quota \
-                         (partition_id={child_id})"
-                    )),
-                });
+                return Err(PipelineError::spill_cap_exceeded(
+                    name,
+                    budget.disk_quota(),
+                    b_written,
+                    budget.cumulative_spill_bytes(),
+                ));
             }
             let mut probe_files: Vec<SpillFilePath> = Vec::new();
             if !child_probe.is_empty() {
@@ -301,16 +297,12 @@ pub(super) fn process_spilled_partition(
                     .finish()
                     .map_err(|e| grace_spill_error(e, name, "repartition probe finalize"))?;
                 if budget.record_spill_bytes(p_written) {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: budget.cumulative_spill_bytes(),
-                        limit: budget.disk_quota(),
-                        source: BudgetCategory::Arena,
-                        detail: Some(format!(
-                            "grace hash repartition probe exceeded disk-spill quota \
-                             (partition_id={child_id})"
-                        )),
-                    });
+                    return Err(PipelineError::spill_cap_exceeded(
+                        name,
+                        budget.disk_quota(),
+                        p_written,
+                        budget.cumulative_spill_bytes(),
+                    ));
                 }
                 probe_files.push(p);
             }

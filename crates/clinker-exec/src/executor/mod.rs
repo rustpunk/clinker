@@ -370,7 +370,18 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
-        let memory_budget = std::sync::Arc::new(build_arbitrator_from_config(config));
+        let arbitrator = build_arbitrator_from_config(config);
+        // Fold the workspace `storage.spill.disk_cap_bytes` quota into the
+        // arbitrator's disk-spill ceiling. Absent config leaves the cap at
+        // its `u64::MAX` (unlimited) default, so behavior is unchanged when
+        // no `clinker.toml` opts in. Set here — not inside
+        // `build_arbitrator_from_config` — because the cap lives in the
+        // workspace `clinker.toml` (a runtime parameter), not the per-pipeline
+        // `memory:` block the arbitrator builder reads.
+        if let Some(cap) = params.spill_disk_cap_bytes {
+            arbitrator.set_max_spill_bytes(cap);
+        }
+        let memory_budget = std::sync::Arc::new(arbitrator);
         Self::run_with_readers_writers_with_arbitrator(
             config,
             readers,

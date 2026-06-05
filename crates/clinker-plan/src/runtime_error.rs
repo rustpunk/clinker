@@ -29,6 +29,21 @@ pub enum SpillError {
         dir: String,
         source: String,
     },
+    /// E321 — a spill write failed because the spill volume ran out of
+    /// space (`std::io::ErrorKind::StorageFull`, i.e. `ENOSPC`). Distinct
+    /// from both [`SpillError::Io`] (so the rendered diagnostic names the
+    /// volume and the disk-full cause rather than reading as a generic
+    /// byte-stream fault) and from the cap-exceeded surface
+    /// (`PipelineError::SpillCapExceeded`): the disk physically filled,
+    /// the run did not merely cross its configured spill quota. Keeping
+    /// the two apart is the point of duckdb/duckdb#14142, where a cap hit
+    /// rendered as an out-of-memory message and operators inspected `df`
+    /// only to find free space. Carries the offending directory path and
+    /// the underlying OS message.
+    DiskFull {
+        dir: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for SpillError {
@@ -44,6 +59,13 @@ impl std::fmt::Display for SpillError {
                  (the directory may have been unmounted, remounted read-only, \
                  deleted by an external cleaner, or had its permissions revoked)"
             ),
+            SpillError::DiskFull { dir, source } => write!(
+                f,
+                "E321 spill volume at {dir} is out of space: {source} \
+                 (the disk physically filled — this is not the configured \
+                 spill cap and not an out-of-memory condition; free space on \
+                 the volume or point storage.spill.dir at a larger one)"
+            ),
         }
     }
 }
@@ -52,13 +74,18 @@ impl SpillError {
     /// Classify an [`std::io::Error`] raised while creating a spill file in
     /// the spill root directory.
     ///
-    /// A failure to create a temp file in a directory the run validated as
-    /// writable at startup means the directory itself went bad mid-run
-    /// (`NotFound` → removed/unmounted, `PermissionDenied`/`ReadOnlyFilesystem`
-    /// → permissions revoked or read-only remount). Those map to the distinct
-    /// [`SpillError::DirUnavailable`] so the operator sees a directory-level
-    /// cause rather than a generic I/O error. Any other kind (a genuine
-    /// byte-stream fault, `ENOSPC`, etc.) stays [`SpillError::Io`].
+    /// A failure to create or write a spill file in a directory the run
+    /// validated as writable at startup falls into three buckets, each with
+    /// its own diagnostic so the operator's remediation is unambiguous:
+    ///
+    /// - The directory itself went bad mid-run (`NotFound` →
+    ///   removed/unmounted, `PermissionDenied`/`ReadOnlyFilesystem` →
+    ///   permissions revoked or read-only remount) → [`SpillError::DirUnavailable`].
+    /// - The volume ran out of space (`StorageFull`, i.e. `ENOSPC`) →
+    ///   [`SpillError::DiskFull`], kept distinct from the configured spill
+    ///   cap so a full disk never renders as a cap-exceeded or OOM message.
+    /// - Any other kind (a genuine byte-stream fault, a short write) stays
+    ///   [`SpillError::Io`].
     pub fn from_spill_dir_io(dir: &std::path::Path, e: std::io::Error) -> Self {
         use std::io::ErrorKind;
         match e.kind() {
@@ -68,6 +95,10 @@ impl SpillError {
                     source: e.to_string(),
                 }
             }
+            ErrorKind::StorageFull => SpillError::DiskFull {
+                dir: dir.display().to_string(),
+                source: e.to_string(),
+            },
             _ => SpillError::Io(e),
         }
     }
@@ -127,5 +158,67 @@ impl std::fmt::Display for BudgetCategory {
             Self::Arena => f.write_str("arena"),
             Self::NodeBuffer => f.write_str("node_buffer"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+    use std::path::Path;
+
+    #[test]
+    fn storage_full_classifies_as_disk_full() {
+        let dir = Path::new("/mnt/spill");
+        let e = Error::new(ErrorKind::StorageFull, "No space left on device");
+        match SpillError::from_spill_dir_io(dir, e) {
+            SpillError::DiskFull { dir, .. } => assert_eq!(dir, "/mnt/spill"),
+            other => panic!("ENOSPC must classify as DiskFull; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_full_render_distinguishes_from_oom_and_cap() {
+        let e = SpillError::DiskFull {
+            dir: "/mnt/spill".to_string(),
+            source: "No space left on device (os error 28)".to_string(),
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("E321"), "{rendered}");
+        assert!(rendered.contains("out of space"), "{rendered}");
+        // Must not read as an OOM or a cap stop.
+        assert!(rendered.contains("not an out-of-memory"), "{rendered}");
+        assert!(
+            rendered.contains("not the configured spill cap"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn directory_faults_still_classify_as_dir_unavailable() {
+        // The DiskFull addition must not steal the directory-level faults.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ReadOnlyFilesystem,
+        ] {
+            let e = Error::new(kind, "boom");
+            assert!(
+                matches!(
+                    SpillError::from_spill_dir_io(Path::new("/d"), e),
+                    SpillError::DirUnavailable { .. }
+                ),
+                "{kind:?} must stay DirUnavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_io_stays_io() {
+        let e = Error::new(ErrorKind::BrokenPipe, "pipe");
+        assert!(matches!(
+            SpillError::from_spill_dir_io(Path::new("/d"), e),
+            SpillError::Io(_)
+        ));
     }
 }

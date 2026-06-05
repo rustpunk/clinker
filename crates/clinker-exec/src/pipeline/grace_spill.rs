@@ -47,6 +47,11 @@ pub(crate) enum GraceSpillError {
     /// The spill root directory became unusable while creating a
     /// partition file. Carries the classified [`SpillError::DirUnavailable`].
     DirUnavailable(SpillError),
+    /// The spill volume ran out of space (`ENOSPC`) while creating, writing,
+    /// or finalizing a partition file. Carries the classified
+    /// [`SpillError::DiskFull`] so the combine path surfaces the same E321
+    /// disk-full diagnostic the node-buffer and sort spill paths do.
+    DiskFull(SpillError),
     /// A byte-stream fault during write/finalize, or an internal
     /// state-machine violation surfaced as an `io::Error`.
     Io(std::io::Error),
@@ -58,17 +63,37 @@ impl From<std::io::Error> for GraceSpillError {
     }
 }
 
+impl GraceSpillWriter {
+    /// Classify a write/finalize `io::Error` against the partition file's
+    /// parent directory: an `ENOSPC` becomes [`GraceSpillError::DiskFull`]
+    /// and a directory-level fault becomes [`GraceSpillError::DirUnavailable`],
+    /// matching the create-time classification so a disk filling mid-write
+    /// renders as E321 rather than an opaque internal error.
+    fn classify_io(&self, e: std::io::Error) -> GraceSpillError {
+        let dir = self.path.parent().unwrap_or(&self.path);
+        match SpillError::from_spill_dir_io(dir, e) {
+            dir_err @ SpillError::DirUnavailable { .. } => GraceSpillError::DirUnavailable(dir_err),
+            disk_err @ SpillError::DiskFull { .. } => GraceSpillError::DiskFull(disk_err),
+            SpillError::Io(io) => GraceSpillError::Io(io),
+            other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
 /// Map a [`GraceSpillError`] to a [`PipelineError`] for the combine node
 /// `node`, tagging the failing stage with `detail` (e.g. "build write",
 /// "probe writer").
 ///
-/// A mid-run directory fault becomes `PipelineError::Spill`, so it renders
-/// with the same `DirUnavailable` diagnostic the node-buffer, sort, and
-/// aggregate spill paths emit; a genuine byte fault or state-machine
-/// violation becomes `PipelineError::Internal`.
+/// A mid-run directory fault or a full-volume fault becomes
+/// `PipelineError::Spill`, so it renders with the same `DirUnavailable` /
+/// `DiskFull` diagnostic the node-buffer, sort, and aggregate spill paths
+/// emit; a genuine byte fault or state-machine violation becomes
+/// `PipelineError::Internal`.
 pub(crate) fn grace_spill_error(e: GraceSpillError, node: &str, detail: &str) -> PipelineError {
     match e {
-        GraceSpillError::DirUnavailable(spill) => PipelineError::Spill(spill),
+        GraceSpillError::DirUnavailable(spill) | GraceSpillError::DiskFull(spill) => {
+            PipelineError::Spill(spill)
+        }
         GraceSpillError::Io(io) => PipelineError::Internal {
             op: "combine",
             node: node.to_string(),
@@ -139,23 +164,22 @@ impl GraceSpillWriter {
             "grace-p{partition_id:05}-b{hash_bits:02}-s{seq:08}.spill"
         ));
         // A create failure in a spill dir the run validated at startup means
-        // the directory went bad mid-run. Classify it through the shared
-        // `from_spill_dir_io` helper so the grace path surfaces the same
-        // `DirUnavailable` diagnostic the node-buffer, sort, and aggregate
-        // spill paths do, rather than rendering as a generic internal error.
-        // `from_spill_dir_io` only lifts directory-kind faults (NotFound,
-        // PermissionDenied, ReadOnlyFilesystem); a genuine byte fault on
-        // create (e.g. ENOSPC) stays `SpillError::Io` and is re-narrowed to
-        // `GraceSpillError::Io` so only true directory faults carry the
-        // `DirUnavailable` diagnostic.
+        // the directory went bad mid-run (removed/unmounted/read-only) or the
+        // volume filled. Classify it through the shared `from_spill_dir_io`
+        // helper so the grace path surfaces the same `DirUnavailable` /
+        // `DiskFull` diagnostics the node-buffer, sort, and aggregate spill
+        // paths do, rather than rendering as a generic internal error. A
+        // genuine byte fault on create stays `SpillError::Io` and re-narrows
+        // to `GraceSpillError::Io`.
         let file =
             File::create(&path).map_err(|e| match SpillError::from_spill_dir_io(dir, e) {
                 dir_err @ SpillError::DirUnavailable { .. } => {
                     GraceSpillError::DirUnavailable(dir_err)
                 }
+                disk_err @ SpillError::DiskFull { .. } => GraceSpillError::DiskFull(disk_err),
                 SpillError::Io(io) => GraceSpillError::Io(io),
-                // `from_spill_dir_io` returns only `DirUnavailable` or `Io`; any
-                // other variant would be an unreachable classifier regression.
+                // `from_spill_dir_io` returns only `DirUnavailable`, `DiskFull`,
+                // or `Io`; any other variant would be a classifier regression.
                 other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
             })?;
         let buf = BufWriter::new(file);
@@ -180,8 +204,14 @@ impl GraceSpillWriter {
             postcard::to_stdvec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
         let len = u32::try_from(bytes.len())
             .map_err(|_| std::io::Error::other("grace spill: record exceeds u32 byte length"))?;
-        self.encoder.write_all(&len.to_le_bytes())?;
-        self.encoder.write_all(&bytes)?;
+        // Classify a write fault against the partition directory so an
+        // `ENOSPC` mid-stream surfaces as `DiskFull` (E321), not internal Io.
+        if let Err(e) = self.encoder.write_all(&len.to_le_bytes()) {
+            return Err(self.classify_io(e));
+        }
+        if let Err(e) = self.encoder.write_all(&bytes) {
+            return Err(self.classify_io(e));
+        }
         self.record_count += 1;
         Ok(())
     }
@@ -193,6 +223,23 @@ impl GraceSpillWriter {
     /// so the disk-quota poll can tally cumulative on-disk usage
     /// without re-stat'ing each finalized file.
     pub(crate) fn finish(self) -> Result<(SpillFilePath, u64), GraceSpillError> {
+        // Classify every finalize-time io fault against the partition's
+        // directory before `self` is consumed, so an `ENOSPC` flushing the
+        // last block or footer surfaces as `DiskFull` (E321) — the disk
+        // filling — rather than an opaque internal byte-stream error. The lz4
+        // frame error preserves its inner `io::Error` (and its `StorageFull`
+        // kind) through `Into<io::Error>`.
+        let dir = self.path.parent().unwrap_or(&self.path).to_path_buf();
+        let classify = |e: std::io::Error| -> GraceSpillError {
+            match SpillError::from_spill_dir_io(&dir, e) {
+                dir_err @ SpillError::DirUnavailable { .. } => {
+                    GraceSpillError::DirUnavailable(dir_err)
+                }
+                disk_err @ SpillError::DiskFull { .. } => GraceSpillError::DiskFull(disk_err),
+                SpillError::Io(io) => GraceSpillError::Io(io),
+                other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
+            }
+        };
         let Self {
             encoder,
             path,
@@ -202,20 +249,18 @@ impl GraceSpillWriter {
         } = self;
         let buf = encoder
             .finish()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let mut file = buf
-            .into_inner()
-            .map_err(|e| std::io::Error::other(e.into_error().to_string()))?;
+            .map_err(|e| classify(std::io::Error::from(e)))?;
+        let mut file = buf.into_inner().map_err(|e| classify(e.into_error()))?;
         // Seek to current end and append footer; LZ4 frame is closed.
-        let body_end = file.seek(SeekFrom::End(0))?;
+        let body_end = file.seek(SeekFrom::End(0)).map_err(&classify)?;
         let mut footer = [0u8; FOOTER_SIZE];
         footer[0..4].copy_from_slice(&GRACE_SPILL_MAGIC.to_le_bytes());
         footer[4..6].copy_from_slice(&GRACE_SPILL_VERSION.to_le_bytes());
         footer[6] = hash_bits;
         footer[7..9].copy_from_slice(&partition_id.to_le_bytes());
         footer[9..17].copy_from_slice(&record_count.to_le_bytes());
-        file.write_all(&footer)?;
-        file.flush()?;
+        file.write_all(&footer).map_err(&classify)?;
+        file.flush().map_err(&classify)?;
         let total_bytes = body_end + FOOTER_SIZE as u64;
         Ok((Arc::from(path.as_path()), total_bytes))
     }

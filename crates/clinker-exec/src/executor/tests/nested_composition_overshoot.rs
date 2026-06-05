@@ -10,8 +10,8 @@
 //! user-visible failure location is the `Composition` node they wrote,
 //! not a body-internal operator they never named in their YAML. The
 //! test destructures both layers: the wrapper carries the call-site
-//! name, the inner carries the body-internal node, the `NodeBuffer`
-//! category, and the `"spill quota exceeded"` detail.
+//! name, the inner carries the body-internal node and the dedicated
+//! `SpillCapExceeded` (E320) disk-cap surface.
 //!
 //! Reuses the multi-node body fixture
 //! `tests/fixtures/compositions/issue_123_nested_hard_fail.comp.yaml`,
@@ -129,32 +129,24 @@ fn body_interior_overshoot_is_wrapped_under_the_call_site() {
                 "the wrapper must name the call-site, not the body interior",
             );
             match *inner {
-                PipelineError::MemoryBudgetExceeded {
+                PipelineError::SpillCapExceeded {
                     node,
-                    source,
-                    used,
-                    limit,
-                    detail,
+                    cap,
+                    attempted,
+                    current,
                 } => {
                     assert!(
                         !node.is_empty(),
                         "the inner error must name the body-internal node that overflowed",
                     );
+                    assert_eq!(cap, 1, "reported cap must equal the one-byte quota");
+                    assert!(attempted > 0, "the overflowing flush must report its size");
                     assert!(
-                        matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
-                        "the inner overflow must surface under NodeBuffer; got {source:?}",
-                    );
-                    assert_eq!(
-                        detail.as_deref(),
-                        Some("spill quota exceeded"),
-                        "the body admission uses the same disk-spill-quota gate as every slot",
-                    );
-                    assert!(
-                        used > limit,
-                        "reported used ({used}) must exceed the spill quota ({limit})",
+                        current > cap,
+                        "reported cumulative spilled ({current}) must exceed the cap ({cap})",
                     );
                 }
-                other => panic!("expected inner MemoryBudgetExceeded; got: {other:?}"),
+                other => panic!("expected inner SpillCapExceeded; got: {other:?}"),
             }
         }
         other => panic!("expected outer CompositionBodyError; got: {other:?}"),

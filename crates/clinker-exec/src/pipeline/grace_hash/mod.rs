@@ -727,14 +727,14 @@ pub(crate) fn execute_combine_grace_hash(
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
-    if budget.record_spill_bytes(executor.take_spilled_bytes()) {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: name.to_string(),
-            used: budget.cumulative_spill_bytes(),
-            limit: budget.disk_quota(),
-            source: BudgetCategory::Arena,
-            detail: Some("grace hash build exceeded disk-spill quota".to_string()),
-        });
+    let build_spilled = executor.take_spilled_bytes();
+    if budget.record_spill_bytes(build_spilled) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            build_spilled,
+            budget.cumulative_spill_bytes(),
+        ));
     }
 
     // ── Probe phase ───────────────────────────────────────────────────
@@ -817,14 +817,14 @@ pub(crate) fn execute_combine_grace_hash(
     executor
         .finalize_probe_spills()
         .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
-    if budget.record_spill_bytes(executor.take_spilled_bytes()) {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: name.to_string(),
-            used: budget.cumulative_spill_bytes(),
-            limit: budget.disk_quota(),
-            source: BudgetCategory::Arena,
-            detail: Some("grace hash probe exceeded disk-spill quota".to_string()),
-        });
+    let probe_spilled = executor.take_spilled_bytes();
+    if budget.record_spill_bytes(probe_spilled) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            probe_spilled,
+            budget.cumulative_spill_bytes(),
+        ));
     }
 
     // ── Reload phase ──────────────────────────────────────────────────

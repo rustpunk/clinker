@@ -318,7 +318,15 @@ fn main() -> ExitCode {
                         | PipelineError::CompositionBodyError { .. }
                         | PipelineError::MemoryBudgetExceeded { .. }
                         | PipelineError::CombineMissingMatch { .. } => ExitCode::from(1),
-                        PipelineError::Io(_) | PipelineError::Spill(_) => ExitCode::from(4),
+                        // Disk-cap exceedance (E320) is a resource-exhaustion
+                        // halt — the run filled its configured spill budget.
+                        // Group it with the other infrastructure failures
+                        // (I/O, spill, full-volume) at exit 4 rather than the
+                        // config exit 1: the pipeline is valid, the host ran
+                        // out of the disk headroom the cap allotted.
+                        PipelineError::Io(_)
+                        | PipelineError::Spill(_)
+                        | PipelineError::SpillCapExceeded { .. } => ExitCode::from(4),
                         PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
                             ExitCode::from(3)
                         }
@@ -588,6 +596,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .spill
         .resolve()
         .map_err(storage_config_error)?;
+    // Cumulative disk-spill quota (`storage.spill.disk_cap_bytes`). `None`
+    // leaves the run's spill budget unlimited, the historical default; a
+    // configured cap is folded into the arbitrator so a run that fills the
+    // spill volume aborts with a dedicated cap diagnostic instead of an
+    // out-of-memory message (the duckdb/duckdb#14142 trap).
+    let spill_disk_cap_bytes = storage_config.spill.disk_cap();
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -689,6 +703,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     spill_root_display.display(),
                     spill_root_source
                 );
+                // Resolved disk-spill cap: the cumulative on-disk spill budget
+                // (`storage.spill.disk_cap_bytes`), or unlimited when unset. An
+                // operator can confirm the cap before a run that might fill the
+                // spill volume — a cap hit aborts with E320, distinct from an
+                // out-of-memory (E310) or a full volume (E321).
+                match spill_disk_cap_bytes {
+                    Some(cap) => {
+                        println!("Spill disk cap: {cap} bytes [storage.spill.disk_cap_bytes]")
+                    }
+                    None => println!("Spill disk cap: unlimited (default)"),
+                }
             }
             ExplainFormat::Json => {
                 let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts);
@@ -1004,6 +1029,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         record_vars: channel_record_vars,
         shutdown_token: Some(shutdown_token),
         spill_root_dir: spill_root_dir.clone(),
+        spill_disk_cap_bytes,
     };
     let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,

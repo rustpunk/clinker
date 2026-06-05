@@ -80,6 +80,7 @@ mod tests {
             Err(
                 PipelineError::Io(_)
                 | PipelineError::Spill(_)
+                | PipelineError::SpillCapExceeded { .. }
                 | PipelineError::Format(_)
                 | PipelineError::ThreadPool(_)
                 | PipelineError::Multiple(_)

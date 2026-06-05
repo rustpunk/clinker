@@ -1308,9 +1308,9 @@ pub(crate) fn node_buffer_spill_allowed(
 ///    `SpillFile<u64>` via [`node_buffer_spill::spill_node_buffer`].
 ///    The in-memory charge is discharged immediately and the file size
 ///    is added to `cumulative_spill_bytes`; an over-quota disk total
-///    surfaces the same structured `MemoryBudgetExceeded` shape with
-///    `detail: "spill quota exceeded"` so existing diagnostics tooling
-///    handles both surfaces uniformly.
+///    surfaces `PipelineError::SpillCapExceeded` (E320) — a disk-cap
+///    surface deliberately distinct from the memory-budget E310 so a
+///    spilled-out volume never reads as an out-of-memory failure.
 /// 4. Otherwise rows stay in memory as `NodeBuffer::Memory(rows)`.
 ///
 /// `spill_allowed` should be computed via [`node_buffer_spill_allowed`]
@@ -1391,13 +1391,12 @@ pub(crate) fn admit_node_buffer(
             handle.set_bytes(0);
             let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
             if ctx.memory_budget.record_spill_bytes(file_bytes) {
-                return Err(PipelineError::MemoryBudgetExceeded {
-                    node: node_name.to_string(),
-                    used: ctx.memory_budget.cumulative_spill_bytes(),
-                    limit: ctx.memory_budget.max_spill_bytes(),
-                    source: BudgetCategory::NodeBuffer,
-                    detail: Some("spill quota exceeded".to_string()),
-                });
+                return Err(PipelineError::spill_cap_exceeded(
+                    node_name,
+                    ctx.memory_budget.max_spill_bytes(),
+                    file_bytes,
+                    ctx.memory_budget.cumulative_spill_bytes(),
+                ));
             }
             Ok(NodeBuffer::Spilled {
                 chunks: vec![(file, count)],

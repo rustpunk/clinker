@@ -13,6 +13,7 @@
 //! Parsing it now keeps `clinker.toml` files that opt into staging from
 //! tripping `deny_unknown_fields` before the feature exists.
 
+use crate::config::utils::ByteSize;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -94,6 +95,36 @@ pub struct SpillConfig {
     /// spill to a mounted volume are expected to give an absolute path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
+    /// Cumulative disk-spill quota for the run, in bytes. `None` (key
+    /// omitted) → unlimited, preserving the historical default. Accepts a
+    /// bare integer (bytes) or a human-readable string (`"500MB"`, `"2GB"`)
+    /// through the same [`ByteSize`] parser the source-filter size knobs use,
+    /// so a `clinker.toml` author writes one unit grammar across the file.
+    ///
+    /// When the summed on-disk size of every spill file a run writes crosses
+    /// this cap, the run aborts with a dedicated cap-exceeded diagnostic
+    /// rather than continuing to fill the volume. The cap is deliberately
+    /// distinct from the RSS `memory.limit`: a run can sit comfortably inside
+    /// its memory envelope yet still exhaust local disk through an unbounded
+    /// stream of spill files, and the operator needs to see "you hit the disk
+    /// cap" — not an out-of-memory message — when that happens (the confusing
+    /// surface DuckDB hit in duckdb/duckdb#14142, where a temp-dir cap
+    /// rendered as "OOM with 187 GiB available").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_cap_bytes: Option<ByteSize>,
+}
+
+impl SpillConfig {
+    /// Cumulative spill-quota cap in bytes, or `None` when no
+    /// `disk_cap_bytes` was configured (unlimited spill).
+    ///
+    /// The executor folds `Some(cap)` into the run's memory arbitrator as
+    /// the disk-spill quota; `None` leaves the quota at its unlimited
+    /// default. Returns a plain `u64` so the executor stays free of the
+    /// `ByteSize` newtype.
+    pub fn disk_cap(&self) -> Option<u64> {
+        self.disk_cap_bytes.map(|ByteSize(n)| n)
+    }
 }
 
 impl SpillConfig {
@@ -267,6 +298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = SpillConfig {
             dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
         };
         let resolved = cfg.resolve().unwrap();
         assert_eq!(resolved.as_deref(), Some(dir.path()));
@@ -276,7 +308,10 @@ mod tests {
     fn resolve_errors_for_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        let cfg = SpillConfig { dir: Some(missing) };
+        let cfg = SpillConfig {
+            dir: Some(missing),
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.resolve().unwrap_err(),
             StorageConfigError::SpillDirMissing { .. }
@@ -288,10 +323,61 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let cfg = SpillConfig {
             dir: Some(file.path().to_path_buf()),
+            ..Default::default()
         };
         assert!(matches!(
             cfg.resolve().unwrap_err(),
             StorageConfigError::SpillDirNotADirectory { .. }
         ));
+    }
+
+    #[test]
+    fn disk_cap_absent_yields_none() {
+        let doc = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            dir = "/var/clinker/spill"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(doc.storage.spill.disk_cap(), None);
+    }
+
+    #[test]
+    fn disk_cap_parses_human_readable_string() {
+        let doc = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            disk_cap_bytes = "10GB"
+            "#,
+        )
+        .unwrap();
+        // Decimal units, matching the ByteSize grammar used elsewhere:
+        // 10 GB = 10_000_000_000 bytes.
+        assert_eq!(doc.storage.spill.disk_cap(), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn disk_cap_parses_bare_integer_as_bytes() {
+        let doc = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            disk_cap_bytes = 1048576
+            "#,
+        )
+        .unwrap();
+        assert_eq!(doc.storage.spill.disk_cap(), Some(1_048_576));
+    }
+
+    #[test]
+    fn disk_cap_rejects_unparseable_size() {
+        let err = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            disk_cap_bytes = "ten gigabytes"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
     }
 }
