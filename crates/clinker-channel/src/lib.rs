@@ -53,6 +53,7 @@
 pub mod binding;
 pub mod error;
 pub mod overlay;
+pub mod staging;
 
 // Explicit re-exports at crate root.
 pub use binding::{
@@ -60,3 +61,4 @@ pub use binding::{
 };
 pub use error::ChannelError;
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
+pub use staging::{resolve_source, validate_staging};

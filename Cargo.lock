@@ -529,6 +529,7 @@ dependencies = [
  "clinker-record",
  "cxl",
  "fastrand",
+ "glob",
  "indexmap",
  "lz4_flex",
  "miette",
@@ -542,6 +543,7 @@ dependencies = [
  "toml",
  "tracing",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

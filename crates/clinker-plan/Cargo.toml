@@ -26,3 +26,16 @@ fastrand = { workspace = true }
 tempfile = "3"
 postcard = { workspace = true }
 lz4_flex = "0.11"
+# Staging-pattern matching reuses the same glob matcher the source-discovery
+# `exclude:` list uses (clinker-exec), so a `clinker.toml` pattern and a
+# pipeline `exclude:` pattern share one grammar.
+glob = "0.3"
+
+# GetVolumePathNameW backs the Windows same-volume check that refuses a
+# staging dir on the source's own volume; the Unix path uses libstd's
+# MetadataExt and needs no extra crate.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }

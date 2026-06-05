@@ -19,7 +19,9 @@ disk_cap_bytes = "10GB"      # optional; default = unlimited
 compress = "auto"            # optional; auto | off | on   (default = auto)
 
 [storage.staging]
-enabled = false              # parsed but inactive — staging is not yet implemented
+enabled  = false             # opt-in; default off
+dir      = "/var/clinker/staging"   # required when enabled
+patterns = ["/mnt/nfs/data/**"]     # which sources to stage
 ```
 
 The whole block is optional. With no `clinker.toml`, or a `clinker.toml` that
@@ -201,13 +203,77 @@ external cleaner, or had its permissions revoked)
 This surfaces the directory-level cause directly, so the fix (remount the
 volume, stop the cleaner, restore permissions) is obvious from the message.
 
-## `storage.staging` — not yet active
+## `storage.staging` — opt-in source staging
 
-The `[storage.staging]` block parses and round-trips today but performs no
-work: source-file staging (copying inputs from a network share to local disk
-before execution) is not yet implemented. The block exists now so a
-`clinker.toml` that pre-declares staging intent is accepted rather than
-rejected as an unknown key.
+Reading source files directly from a network share (NFS, SMB) couples every
+run to the share's availability and quirks: a soft-mount can silently truncate
+a read, and latency multiplies across many small files. **Source staging**
+copies matched source files to a local volume before the pipeline reads them,
+so the run works from stable local copies. It is **off by default** and
+activated per workspace by pattern match — pipelines that don't opt in behave
+exactly as before.
+
+```toml
+[storage.staging]
+enabled        = true
+dir            = "/var/clinker/staging"   # required when enabled
+patterns       = [
+    "/mnt/nfs/data/**",
+    "//fileserver/share/**",
+]
+disk_cap_bytes = "50GB"   # optional; cap on bytes copied per run (default unlimited)
+verify         = "blake3" # optional; blake3 | none   (default blake3)
+on_existing    = "overwrite" # optional; overwrite | reuse | error (default overwrite)
+cleanup        = "on_success" # optional; on_success | always | never (default on_success)
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch. When `false`, `patterns` is ignored and every source reads in place. |
+| `dir` | — | Local directory the copies are written under. **Required** when `enabled`. |
+| `patterns` | `[]` | Glob patterns selecting which source paths to stage. A source is staged only when `enabled` and its path matches at least one pattern. Empty ⇒ nothing is staged. |
+| `disk_cap_bytes` | unlimited | Cumulative cap on bytes copied per run. Same byte-size grammar as the spill cap (`"50GB"`, bare integers are bytes). |
+| `verify` | `blake3` | Post-copy integrity check. `blake3` hashes source and copy and requires a match — the only check that catches a soft-mount's silent truncation. `none` skips the check. |
+| `on_existing` | `overwrite` | What to do when a copy with the target name already exists (e.g. from a crashed run): `overwrite` (replace — a partial copy can't be trusted), `reuse` (keep it — only safe with `verify`), or `error`. |
+| `cleanup` | `on_success` | When staged copies are deleted: `on_success` (delete after a clean run, keep after a failure so the inputs can be inspected), `always`, or `never`. |
+
+### Pattern matching
+
+`patterns` uses the same glob grammar as a source's `exclude:` list. Each
+pattern is tested against both the **full path** and the **basename**, so
+`/mnt/nfs/**` matches a deep path by its full path while `*.csv` matches any
+CSV by basename. `**` crosses directory boundaries; `*` does not.
+
+### Startup validation
+
+When `enabled`, staging is **validated once at startup**, before any input is
+opened, so a misconfiguration fails the run immediately rather than at the
+first copy. The run is refused when:
+
+- `dir` is unset.
+- `dir` does not exist, is a file, or is not writable (probed with a real
+  create-and-delete, so a read-only mount or restrictive ACL is caught).
+- a `patterns` entry is not a valid glob.
+- `dir` sits on the **same volume** as a matched source. Staging within one
+  volume copies bytes without moving I/O off the slow share — a
+  well-documented anti-pattern — so it is refused up front rather than left to
+  surface as a confusingly slow pipeline. The check compares the source's and
+  the staging dir's storage volume (the device id on Linux/macOS, the volume
+  mount root on Windows); point `dir` at a local disk on a different volume.
+
+The same-volume rule applies only to **matched** sources: a source the
+patterns don't select reads in place, so its volume is irrelevant.
+
+### Current status: decision wired, copy pending
+
+This release lands the staging **decision and validation** surface but not the
+file copy itself: a matched source is recognized and validated, but still
+reads in place (`enabled = true` behaves identically to an in-place read).
+This deliberately mirrors NiFi's `ListFile` + `FetchFile` split — deciding
+*what* to stage is separated from doing the copy — so the copy step can be
+added without re-touching the decision or validation surface. Until it lands,
+`enabled = true` is safe to set: it validates the configuration and selects
+the right sources without changing where bytes are read from.
 
 [`std::env::temp_dir`]: https://doc.rust-lang.org/std/env/fn.temp_dir.html
 [duckdb/duckdb#9401]: https://github.com/duckdb/duckdb/issues/9401
