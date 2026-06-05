@@ -603,6 +603,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // out-of-memory message (the duckdb/duckdb#14142 trap).
     let spill_disk_cap_bytes = storage_config.spill.disk_cap();
 
+    // Workspace `[storage.staging]` policy. Off by default; when enabled it
+    // copies matched source files to a local volume before the run reads
+    // them. Validated below against the discovered file set, then consulted
+    // per file at reader-open. The copy itself is not wired yet, so a matched
+    // source still reads in place.
+    let staging_policy = storage_config.staging.clone();
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -840,10 +847,27 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                             )),
                         )
                     })?;
+                // Staging is validated against the actually-discovered file
+                // set, before any reader for this source is opened, so a
+                // staging dir on the matched source's own volume (or a typo'd
+                // pattern) fails the run at startup rather than at the first
+                // copy.
+                let discovered_paths: Vec<std::path::PathBuf> =
+                    outcome.files().iter().map(|f| f.path.clone()).collect();
+                clinker_channel::validate_staging(&staging_policy, &discovered_paths)
+                    .map_err(storage_config_error)?;
+
                 let mut slots: Vec<clinker_exec::source::multi_file::FileSlot> = Vec::new();
                 let mut paths: Vec<std::path::PathBuf> = Vec::new();
                 for f in outcome.files() {
-                    let file = std::fs::File::open(&f.path)?;
+                    // Resolve each discovered file against the staging policy.
+                    // The reader opens `read_path()`, which is the original
+                    // path until the copy step is wired — so an enabled policy
+                    // leaves the read identical to an in-place read today while
+                    // making the resolution hook a live part of the open path.
+                    let staged = clinker_channel::resolve_source(&staging_policy, f.path.clone());
+                    let read_path = staged.read_path().to_path_buf();
+                    let file = std::fs::File::open(&read_path)?;
                     slots.push(clinker_exec::source::multi_file::FileSlot::new(
                         f.path.clone(),
                         Box::new(file),

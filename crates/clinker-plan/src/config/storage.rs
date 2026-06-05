@@ -8,10 +8,12 @@
 //! threaded into the run as runtime parameters rather than as part of the
 //! compiled plan.
 //!
-//! Today only the spill root directory is honored at runtime; the staging
-//! block parses but stays inert until the source-staging skeleton lands.
-//! Parsing it now keeps `clinker.toml` files that opt into staging from
-//! tripping `deny_unknown_fields` before the feature exists.
+//! Today only the spill root directory is honored at runtime. The staging
+//! block parses and is validated at startup, and the resolution layer
+//! decides per source whether a path would be staged — but no copy runs
+//! yet: a matched source still reads in place (`StagedPath::staged == None`),
+//! so the file-copy step can be plugged in without re-touching the decision
+//! or validation surface.
 
 use crate::config::utils::ByteSize;
 use serde::{Deserialize, Serialize};
@@ -77,9 +79,10 @@ pub struct StorageConfig {
     #[serde(default)]
     pub spill: SpillConfig,
     /// `[storage.staging]` — opt-in copy of source files to local disk
-    /// before execution. Parsed but inert until the staging skeleton lands.
+    /// before execution. Off by default; activated per-pipeline by pattern
+    /// match. Validated at startup; the copy itself is not wired yet.
     #[serde(default)]
-    pub staging: StagingConfig,
+    pub staging: StagingPolicy,
 }
 
 /// How spill files are compressed: `auto` (the default), `off`, or `on`.
@@ -268,15 +271,343 @@ impl SpillConfig {
 
 /// `[storage.staging]` — source-file staging policy.
 ///
-/// Inert in the current engine: `enabled` parses and round-trips but no
-/// staging copy runs yet. The block exists now so `clinker.toml` files that
-/// pre-declare staging intent parse cleanly before the feature ships.
+/// When `enabled`, source files whose path matches one of `patterns` are
+/// copied to local disk under `dir` before the pipeline reads them, so a
+/// run over a flaky network share (NFS soft-mount, SMB) reads from a stable
+/// local copy instead. This mirrors the NiFi `FetchFile` / Airbyte
+/// `smart_open` posture: decide-what-to-stage is separated from do-the-copy.
+///
+/// The current engine performs the *decision* and *validation* but not the
+/// copy. [`StagingPolicy::resolve_one`] reports whether a path would be
+/// staged; until the copy lands it always returns `staged == None` (read in
+/// place). Off by default — an empty or absent block leaves every source
+/// reading in place exactly as before.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StagingConfig {
-    /// Whether source-file staging is enabled. Defaults to `false`.
+pub struct StagingPolicy {
+    /// Whether source-file staging is enabled. Defaults to `false`, in which
+    /// case `patterns` is ignored and every source reads in place.
     #[serde(default)]
     pub enabled: bool,
+    /// Local directory the staged copies are written under. Required when
+    /// `enabled` — validated at startup to exist, be writable, and sit on a
+    /// different volume than every matched source (see
+    /// [`StagingPolicy::validate`]). `None` with `enabled = true` is a
+    /// startup error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    /// Cumulative cap on bytes copied into the staging dir for one run, in
+    /// bytes. `None` (omitted) → unlimited. Accepts a bare integer or a
+    /// human-readable size (`"50GB"`) through the same [`ByteSize`] grammar
+    /// the spill cap uses. Honored by the copy step (not yet wired); parsed
+    /// and surfaced now so a `clinker.toml` author declares it once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_cap_bytes: Option<ByteSize>,
+    /// Whether a staged copy is integrity-checked against its source after
+    /// the copy. Defaults to [`StagingVerify::Blake3`] — a BLAKE3 digest of
+    /// source and copy must match, catching the silent truncation an NFS
+    /// soft-mount can produce. Consumed by the copy step (not yet wired).
+    #[serde(default)]
+    pub verify: StagingVerify,
+    /// What to do when a staging-dir copy with the target name already
+    /// exists (e.g. a prior crashed run). Defaults to
+    /// [`OnExisting::Overwrite`]. Consumed by the copy step (not yet wired).
+    #[serde(default)]
+    pub on_existing: OnExisting,
+    /// Whether staged copies are removed when the run finishes. Defaults to
+    /// [`Cleanup::OnSuccess`] — keep copies after a failure so a re-run can
+    /// inspect them, delete them after a clean run. Consumed by the copy
+    /// step (not yet wired).
+    #[serde(default)]
+    pub cleanup: Cleanup,
+    /// Glob patterns selecting which source paths are staged. A source is
+    /// staged only when `enabled` and its path matches at least one pattern.
+    /// Matched with POSIX/gitignore semantics via the `glob` crate — the
+    /// same matcher the source-discovery `exclude:` list uses — against both
+    /// the full path and its basename. Empty (the default) ⇒ no source
+    /// matches, so `enabled = true` with no patterns stages nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+}
+
+/// Post-copy integrity check applied to a staged file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingVerify {
+    /// Hash source and copy with BLAKE3 and require the digests to match.
+    /// The default: an NFS soft-mount can silently truncate a read, and a
+    /// content digest is the only check that catches it (a size match does
+    /// not). `blake3` reuses the workspace's existing BLAKE3 dependency.
+    #[default]
+    Blake3,
+    /// Skip the post-copy check. Faster, but a truncated or corrupted copy
+    /// passes unnoticed — only sensible on a transport already trusted to
+    /// deliver complete bytes.
+    None,
+}
+
+/// What to do when the staging destination already holds a file with the
+/// target name (typically left by an earlier crashed run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExisting {
+    /// Replace the existing file with a fresh copy. The default: a partial
+    /// copy from a crashed run must not be trusted, so it is overwritten.
+    #[default]
+    Overwrite,
+    /// Reuse the existing file without re-copying. Trades a re-copy for the
+    /// risk of reusing a partial file; only safe when paired with a
+    /// post-copy `verify`.
+    Reuse,
+    /// Fail the run rather than touch an existing destination.
+    Error,
+}
+
+/// When staged copies are deleted relative to run outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cleanup {
+    /// Delete staged copies after a successful run; keep them after a
+    /// failure so the inputs a failed run saw can be inspected and re-run
+    /// without re-fetching. The default.
+    #[default]
+    OnSuccess,
+    /// Always delete staged copies when the run ends, success or failure.
+    Always,
+    /// Never delete staged copies; the operator reclaims the staging dir.
+    Never,
+}
+
+/// A source path after staging resolution.
+///
+/// `original` is the path the pipeline author wrote; `staged` is the local
+/// copy the reader should open instead, or `None` when the source reads in
+/// place (staging disabled, no pattern match, or — for now — always, since
+/// the copy step is not yet wired). Threading this through the reader keeps
+/// the read side agnostic to whether staging happened: it opens
+/// [`StagedPath::read_path`] regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedPath {
+    /// The path declared in the pipeline (the network-share path when
+    /// staging is in play).
+    pub original: PathBuf,
+    /// The local staged copy to read instead, or `None` to read `original`
+    /// in place.
+    pub staged: Option<PathBuf>,
+}
+
+impl StagedPath {
+    /// A path that reads in place — `staged` is `None`, so the reader opens
+    /// `original` directly.
+    pub fn in_place(original: PathBuf) -> Self {
+        Self {
+            original,
+            staged: None,
+        }
+    }
+
+    /// The path the reader should actually open: the staged copy when one
+    /// exists, otherwise the original.
+    pub fn read_path(&self) -> &Path {
+        self.staged.as_deref().unwrap_or(&self.original)
+    }
+}
+
+impl StagingPolicy {
+    /// Whether `path` matches at least one staging pattern.
+    ///
+    /// Returns `false` when staging is disabled or no pattern is configured.
+    /// Patterns are matched against both the full path string and the
+    /// basename (gitignore-style), mirroring the source-discovery
+    /// `exclude:` matcher, so `*.csv` matches a deep path by basename while
+    /// `/mnt/nfs/**` matches by full path. An unparseable pattern never
+    /// matches — pattern validity is reported separately by
+    /// [`StagingPolicy::validate`] so a typo fails the run at startup rather
+    /// than silently disabling staging here.
+    pub fn pattern_matches(&self, path: &Path) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let path_str = path.to_string_lossy();
+        let basename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.patterns.iter().any(|p| match glob::Pattern::new(p) {
+            Ok(pat) => pat.matches(&path_str) || pat.matches(&basename),
+            Err(_) => false,
+        })
+    }
+
+    /// Decide how a single source path resolves under this policy.
+    ///
+    /// When staging is enabled and `original` matches a pattern, the source
+    /// is *selected* for staging — but the copy step is not yet wired, so
+    /// the returned [`StagedPath`] still carries `staged == None` (read in
+    /// place). Plugging the copy in means producing `Some(local_copy)` here
+    /// for the matched arm; nothing else on the read side changes.
+    pub fn resolve_one(&self, original: PathBuf) -> StagedPath {
+        // The copy is intentionally absent: this scaffold lands the
+        // decision + validation surface so the file-copy step can be added
+        // without re-touching either. A matched source reads in place until
+        // the copy is wired, leaving `enabled = true` behavior identical to
+        // today's in-place read for every existing pipeline.
+        if self.pattern_matches(&original) {
+            return StagedPath::in_place(original);
+        }
+        StagedPath::in_place(original)
+    }
+
+    /// Validate staging configuration at startup against the set of source
+    /// paths a run will read.
+    ///
+    /// Validation runs once before any input is opened so a misconfigured
+    /// staging dir fails the run immediately rather than at the first copy.
+    /// When staging is disabled this is a no-op. When enabled it requires
+    /// `dir` to be set, to exist as a writable directory, and to sit on a
+    /// different volume than every *matched* source — staging onto the same
+    /// volume copies bytes without moving I/O off the slow share, a
+    /// well-documented anti-pattern. It also rejects an unparseable pattern
+    /// so a glob typo surfaces here rather than silently matching nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageConfigError::StagingDirUnset`] when enabled without a
+    /// `dir`; [`StorageConfigError::StagingDirMissing`] /
+    /// [`StorageConfigError::StagingDirNotADirectory`] /
+    /// [`StorageConfigError::StagingDirNotWritable`] for a bad dir;
+    /// [`StorageConfigError::StagingPatternInvalid`] for an unparseable
+    /// pattern; and [`StorageConfigError::StagingSameVolume`] when the
+    /// staging dir shares a volume with a matched source.
+    pub fn validate(&self, source_paths: &[PathBuf]) -> Result<(), StorageConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        for p in &self.patterns {
+            glob::Pattern::new(p).map_err(|e| StorageConfigError::StagingPatternInvalid {
+                pattern: p.clone(),
+                source: e.to_string(),
+            })?;
+        }
+
+        let dir = self
+            .dir
+            .as_ref()
+            .ok_or(StorageConfigError::StagingDirUnset)?;
+
+        let meta = std::fs::metadata(dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageConfigError::StagingDirMissing { path: dir.clone() }
+            } else {
+                StorageConfigError::StagingDirNotWritable {
+                    path: dir.clone(),
+                    source: e.to_string(),
+                }
+            }
+        })?;
+        if !meta.is_dir() {
+            return Err(StorageConfigError::StagingDirNotADirectory { path: dir.clone() });
+        }
+        // Probe writability with a real create-and-delete: directory mode
+        // bits alone do not prove a write succeeds (read-only mount, ACLs).
+        let probe = tempfile::Builder::new()
+            .prefix(".clinker-staging-probe-")
+            .tempfile_in(dir)
+            .map_err(|e| StorageConfigError::StagingDirNotWritable {
+                path: dir.clone(),
+                source: e.to_string(),
+            })?;
+        drop(probe);
+
+        // Same-volume refusal applies only to matched sources: a source the
+        // patterns do not select is read in place regardless of where it
+        // lives, so its volume is irrelevant.
+        for src in source_paths {
+            if !self.pattern_matches(src) {
+                continue;
+            }
+            if same_volume(dir, src)? {
+                return Err(StorageConfigError::StagingSameVolume {
+                    staging_dir: dir.clone(),
+                    source: src.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Whether two existing paths reside on the same storage volume.
+///
+/// Used to refuse a staging dir on the same volume as a matched source:
+/// copying within one volume moves no I/O off the slow share. On Unix,
+/// compares the device id (`st_dev`) of each path. On Windows, compares the
+/// volume mount root (`GetVolumePathNameW`). On any other target, falls back
+/// to a path-prefix comparison.
+///
+/// # Errors
+///
+/// Returns [`StorageConfigError::StagingDirNotWritable`] when a path's
+/// volume cannot be determined (it could not be stat'd / queried), naming
+/// the offending path so the operator can correct it.
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| -> Result<u64, StorageConfigError> {
+        std::fs::metadata(p).map(|m| m.dev()).map_err(|e| {
+            StorageConfigError::StagingDirNotWritable {
+                path: p.to_path_buf(),
+                source: e.to_string(),
+            }
+        })
+    };
+    Ok(dev(a)? == dev(b)?)
+}
+
+/// Windows volume comparison via `GetVolumePathNameW`, which maps a path to
+/// the mount root of the volume that contains it. Two paths share a volume
+/// exactly when their mount roots are equal — this distinguishes distinct
+/// mount points that share a drive letter, which a prefix compare cannot.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
+    Ok(volume_root(a)? == volume_root(b)?)
+}
+
+#[cfg(windows)]
+fn volume_root(path: &Path) -> Result<std::ffi::OsString, StorageConfigError> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // MAX_PATH is the documented ceiling for a volume mount-point string.
+    let mut buf = vec![0u16; 260];
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; `buf` is a writable
+    // u16 buffer whose length is passed as the capacity, exactly as the
+    // GetVolumePathNameW contract requires.
+    let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if ok == 0 {
+        return Err(StorageConfigError::StagingDirNotWritable {
+            path: path.to_path_buf(),
+            source: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Ok(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
+/// Fallback volume comparison for targets that are neither Unix nor Windows:
+/// compares the path's root prefix component. Coarser than the device-id /
+/// mount-root checks above, but every currently-supported target hits one of
+/// those, so this arm only exists to keep the function total.
+#[cfg(not(any(unix, windows)))]
+fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
+    Ok(a.components().next() == b.components().next())
 }
 
 /// Failure modes when loading or validating `[storage]` configuration.
@@ -297,6 +628,23 @@ pub enum StorageConfigError {
     /// `storage.spill.dir` exists and is a directory but cannot be written
     /// (permissions, read-only mount).
     SpillDirNotWritable { path: PathBuf, source: String },
+    /// `storage.staging.enabled = true` but no `storage.staging.dir` was set.
+    StagingDirUnset,
+    /// `storage.staging.dir` points at a path that does not exist.
+    StagingDirMissing { path: PathBuf },
+    /// `storage.staging.dir` exists but is a file, not a directory.
+    StagingDirNotADirectory { path: PathBuf },
+    /// `storage.staging.dir` exists and is a directory but cannot be written,
+    /// or a path's storage volume could not be determined.
+    StagingDirNotWritable { path: PathBuf, source: String },
+    /// A `storage.staging.patterns` entry is not a valid glob.
+    StagingPatternInvalid { pattern: String, source: String },
+    /// `storage.staging.dir` sits on the same volume as a matched source, so
+    /// staging would copy bytes without moving I/O off the slow volume.
+    StagingSameVolume {
+        staging_dir: PathBuf,
+        source: PathBuf,
+    },
 }
 
 impl std::fmt::Display for StorageConfigError {
@@ -320,6 +668,41 @@ impl std::fmt::Display for StorageConfigError {
                 f,
                 "storage.spill.dir {} is not writable: {source}",
                 path.display()
+            ),
+            Self::StagingDirUnset => write!(
+                f,
+                "storage.staging.enabled is true but storage.staging.dir is not set; \
+                 set it to a local directory on a different volume than the staged sources"
+            ),
+            Self::StagingDirMissing { path } => write!(
+                f,
+                "storage.staging.dir {} does not exist; create it or point at an existing volume",
+                path.display()
+            ),
+            Self::StagingDirNotADirectory { path } => write!(
+                f,
+                "storage.staging.dir {} is a file, not a directory",
+                path.display()
+            ),
+            Self::StagingDirNotWritable { path, source } => write!(
+                f,
+                "storage.staging.dir {} is not writable: {source}",
+                path.display()
+            ),
+            Self::StagingPatternInvalid { pattern, source } => write!(
+                f,
+                "storage.staging.patterns entry {pattern:?} is not a valid glob: {source}"
+            ),
+            Self::StagingSameVolume {
+                staging_dir,
+                source,
+            } => write!(
+                f,
+                "storage.staging.dir {} is on the same volume as source {}; \
+                 staging onto the same volume copies bytes without moving I/O off the \
+                 source volume — point storage.staging.dir at a local disk on a different volume",
+                staging_dir.display(),
+                source.display()
             ),
         }
     }
@@ -527,5 +910,203 @@ mod tests {
         // 8 columns × 32 B/col × 16 rows = 4 KiB of bytes but only 16 rows →
         // below the row threshold, so no compression.
         assert!(!CompressMode::Auto.resolve_for_schema(8, 16));
+    }
+
+    #[test]
+    fn staging_defaults_are_off_and_safe() {
+        let p = StagingPolicy::default();
+        assert!(!p.enabled);
+        assert!(p.dir.is_none());
+        assert!(p.patterns.is_empty());
+        assert_eq!(p.verify, StagingVerify::Blake3);
+        assert_eq!(p.on_existing, OnExisting::Overwrite);
+        assert_eq!(p.cleanup, Cleanup::OnSuccess);
+    }
+
+    #[test]
+    fn staging_block_parses_all_knobs() {
+        let doc = ClinkerToml::parse(
+            r#"
+            [storage.staging]
+            enabled = true
+            dir = "/var/clinker/staging"
+            disk_cap_bytes = "50GB"
+            verify = "none"
+            on_existing = "reuse"
+            cleanup = "always"
+            patterns = ["/mnt/nfs/data/**", "*.csv"]
+            "#,
+        )
+        .unwrap();
+        let s = &doc.storage.staging;
+        assert!(s.enabled);
+        assert_eq!(s.dir.as_deref(), Some(Path::new("/var/clinker/staging")));
+        assert_eq!(s.disk_cap_bytes.map(|ByteSize(n)| n), Some(50_000_000_000));
+        assert_eq!(s.verify, StagingVerify::None);
+        assert_eq!(s.on_existing, OnExisting::Reuse);
+        assert_eq!(s.cleanup, Cleanup::Always);
+        assert_eq!(s.patterns, vec!["/mnt/nfs/data/**", "*.csv"]);
+    }
+
+    #[test]
+    fn unknown_staging_key_is_rejected() {
+        let err = ClinkerToml::parse(
+            r#"
+            [storage.staging]
+            enabledx = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn pattern_matches_full_path_and_basename() {
+        let p = StagingPolicy {
+            enabled: true,
+            patterns: vec!["/mnt/nfs/**".into(), "*.csv".into()],
+            ..Default::default()
+        };
+        // Full-path match.
+        assert!(p.pattern_matches(Path::new("/mnt/nfs/data/orders.json")));
+        // Basename match on a path the full-path glob does not cover.
+        assert!(p.pattern_matches(Path::new("/local/data/orders.csv")));
+        // No match.
+        assert!(!p.pattern_matches(Path::new("/local/data/orders.json")));
+    }
+
+    #[test]
+    fn pattern_matches_is_false_when_disabled() {
+        let p = StagingPolicy {
+            enabled: false,
+            patterns: vec!["**".into()],
+            ..Default::default()
+        };
+        assert!(!p.pattern_matches(Path::new("/anything")));
+    }
+
+    #[test]
+    fn resolve_one_reads_in_place_until_copy_lands() {
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(PathBuf::from("/tmp")),
+            patterns: vec!["/mnt/nfs/**".into()],
+            ..Default::default()
+        };
+        let matched = p.resolve_one(PathBuf::from("/mnt/nfs/data/x.csv"));
+        assert_eq!(matched.staged, None);
+        assert_eq!(matched.read_path(), Path::new("/mnt/nfs/data/x.csv"));
+        let unmatched = p.resolve_one(PathBuf::from("/local/x.csv"));
+        assert_eq!(unmatched.staged, None);
+    }
+
+    #[test]
+    fn staged_path_read_path_prefers_staged_copy() {
+        let in_place = StagedPath::in_place(PathBuf::from("/a/b.csv"));
+        assert_eq!(in_place.read_path(), Path::new("/a/b.csv"));
+        let copied = StagedPath {
+            original: PathBuf::from("/mnt/nfs/b.csv"),
+            staged: Some(PathBuf::from("/local/b.csv")),
+        };
+        assert_eq!(copied.read_path(), Path::new("/local/b.csv"));
+    }
+
+    #[test]
+    fn validate_noop_when_disabled() {
+        let p = StagingPolicy::default();
+        assert!(p.validate(&[PathBuf::from("/mnt/nfs/x.csv")]).is_ok());
+    }
+
+    #[test]
+    fn validate_requires_dir_when_enabled() {
+        let p = StagingPolicy {
+            enabled: true,
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.validate(&[]).unwrap_err(),
+            StorageConfigError::StagingDirUnset
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(dir.path().join("nope")),
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.validate(&[]).unwrap_err(),
+            StorageConfigError::StagingDirMissing { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_dir_that_is_a_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(file.path().to_path_buf()),
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.validate(&[]).unwrap_err(),
+            StorageConfigError::StagingDirNotADirectory { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(dir.path().to_path_buf()),
+            patterns: vec!["[".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.validate(&[]).unwrap_err(),
+            StorageConfigError::StagingPatternInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_same_volume_matched_source() {
+        // A matched source on the staging dir's own volume is refused (both
+        // live under the same tempdir, hence the same device).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("orders.csv");
+        std::fs::write(&src, b"a,b\n").unwrap();
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(dir.path().to_path_buf()),
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.validate(&[src]).unwrap_err(),
+            StorageConfigError::StagingSameVolume { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_ignores_same_volume_unmatched_source() {
+        // An unmatched source on the same volume is fine: it reads in place,
+        // so the same-volume rule does not apply to it.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("orders.json");
+        std::fs::write(&src, b"{}").unwrap();
+        let p = StagingPolicy {
+            enabled: true,
+            dir: Some(dir.path().to_path_buf()),
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        assert!(p.validate(&[src]).is_ok());
     }
 }
