@@ -32,6 +32,7 @@ mod util;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
+pub use batch_handoff::DEFAULT_BATCH_SIZE;
 use context::build_stable_eval_context;
 pub use dlq::DlqEntry;
 use ingest::{IngestTaskOutcome, ingest_source};
@@ -1270,6 +1271,7 @@ impl PipelineExecutor {
                 .pipeline
                 .batch_size
                 .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+            spill_compress: params.spill_compress,
         };
 
         // Resolve dispatch order through the memory arbitrator rather

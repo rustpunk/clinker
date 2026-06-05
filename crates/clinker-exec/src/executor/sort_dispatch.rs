@@ -78,10 +78,16 @@ pub(crate) fn dispatch_sort(
 
     let schema = input_records[0].0.schema().clone();
     let mem_limit = parse_memory_limit(ctx.config);
+    // Resolve the spill compression mode against this sort's schema width and
+    // the run's batch size, so spilled runs match what `--explain` projects.
+    let spill_compress = ctx
+        .spill_compress
+        .resolve_for_schema(schema.column_count(), ctx.batch_size as u64);
     let mut buf: SortBuffer<u64> = SortBuffer::new(
         sort_fields.clone(),
         mem_limit,
         Some(ctx.spill_root_path.to_path_buf()),
+        spill_compress,
         schema,
     );
 

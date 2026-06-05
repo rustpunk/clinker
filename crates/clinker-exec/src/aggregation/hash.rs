@@ -140,6 +140,11 @@ pub struct HashAggregator {
     spill_files: Vec<AggSpillFile>,
     spill_schema: Arc<Schema>,
     spill_dir: Option<PathBuf>,
+    /// Whether spill files are LZ4-compressed. Resolved by the dispatcher
+    /// from the workspace `[storage.spill] compress` knob against this
+    /// aggregate's output-schema width and the run's batch size, so the
+    /// on-disk format matches what `--explain` reports for the operator.
+    spill_compress: bool,
     output_schema: Arc<Schema>,
     transform_name: String,
     evaluator: ProgramEvaluator,
@@ -215,6 +220,13 @@ pub struct AggregatorConfig {
     /// Directory for spill files; `None` keeps the aggregator
     /// in-memory-only.
     pub spill_dir: Option<PathBuf>,
+    /// Whether spill files are LZ4-compressed, resolved from the workspace
+    /// `[storage.spill] compress` knob (see
+    /// [`clinker_plan::config::CompressMode`]) against this aggregate's
+    /// output-schema width and the run's batch size. Recorded in each spill
+    /// file's leading format tag so the on-disk format matches what
+    /// `--explain` reports for the operator.
+    pub spill_compress: bool,
     /// Node name, used for diagnostics and the synthetic
     /// `$ck.aggregate.<name>` lineage column.
     pub transform_name: String,
@@ -237,6 +249,7 @@ impl HashAggregator {
             spill_schema,
             memory_budget,
             spill_dir,
+            spill_compress,
             transform_name,
             consumer_handle,
         } = config;
@@ -284,6 +297,7 @@ impl HashAggregator {
             spill_files: Vec::new(),
             spill_schema,
             spill_dir,
+            spill_compress,
             output_schema,
             transform_name,
             evaluator,
@@ -1013,17 +1027,18 @@ impl HashAggregator {
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk as postcard + LZ4.
+    /// Spill the in-memory groups to disk as postcard, optionally LZ4.
     ///
     /// 1. Drain `self.groups` (fold-mode) or `self.buffered_groups`
     ///    (buffer-mode) into a Vec, wrapping each state in `SpillState`.
     /// 2. Encode sort keys and sort by memcmp bytes so the k-way merge
     ///    can walk entries in group-key order.
     /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) as a
-    ///    length-prefixed postcard record into an LZ4 frame-compressed
-    ///    temp file. Postcard is a compact binary format with no
-    ///    self-describing framing of its own; the explicit length prefix
-    ///    delimits records inside the LZ4 frame.
+    ///    length-prefixed postcard record into a temp file — raw or inside
+    ///    an LZ4 frame per the resolved `[storage.spill] compress` decision.
+    ///    Postcard is a compact binary format with no self-describing
+    ///    framing of its own; the explicit length prefix delimits records
+    ///    inside the (optionally framed) record stream.
     /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
     /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
@@ -1071,8 +1086,9 @@ impl HashAggregator {
         }
         prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // 3. Write sorted entries as postcard + LZ4.
-        let mut writer = AggSpillWriter::new(self.spill_dir.as_deref())?;
+        // 3. Write sorted entries as postcard, raw or LZ4-framed per the
+        //    resolved `[storage.spill] compress` decision.
+        let mut writer = AggSpillWriter::new(self.spill_dir.as_deref(), self.spill_compress)?;
         for (sort_key, idx) in prepared {
             let (key, state) = &drained[idx];
             let entry = AggSpillEntry {
@@ -1579,6 +1595,7 @@ mod spill_trigger_tests {
             spill_schema,
             memory_budget,
             spill_dir,
+            spill_compress: true,
             transform_name: "test_agg".to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })
@@ -2848,6 +2865,7 @@ mod spill_trigger_tests {
             spill_schema,
             memory_budget,
             spill_dir,
+            spill_compress: true,
             transform_name: transform_name.to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         })

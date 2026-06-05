@@ -3,24 +3,32 @@
 //! Format per file:
 //!
 //! ```text
-//! [body: LZ4 frame containing
-//!        a stream of records, each prefixed by a 4-byte LE length and
-//!        encoded as a postcard-serialized `Record` (RecordPayload shape)]
+//! [tag:  format byte — 0x00 uncompressed, 0x01 LZ4 frame]
+//! [body: a stream of records, each prefixed by a 4-byte LE length and
+//!        encoded as a postcard-serialized `Record` (RecordPayload shape);
+//!        raw when the tag is 0x00, inside an LZ4 frame when 0x01]
 //! [footer: magic u32 LE | version u16 LE | hash_bits u8 |
 //!          partition_id u16 LE | record_count u64 LE]
 //! ```
 //!
+//! The leading format tag records the workspace `[storage.spill] compress`
+//! decision (see [`clinker_plan::config::CompressMode`]) so the reader
+//! dispatches on the on-disk format without the writer's choice having to
+//! travel out of band — the same posture the inter-stage
+//! [`SpillWriter`](crate::pipeline::spill::SpillWriter) uses. `off` skips
+//! the LZ4 frame so small partition spills avoid LZ4's per-frame fixed cost.
+//!
 //! The footer-trailing layout sidesteps the LZ4 frame finalization
 //! problem: an LZ4 frame cannot be reopened to overwrite a prefix
 //! without rewriting it, and seeking inside a partially-flushed frame
-//! corrupts the encoder state. By writing the LZ4 frame first and then
+//! corrupts the encoder state. By writing the body first and then
 //! appending a fixed-size raw footer, we get an exact `record_count`
 //! at finish-time without juggling encoder buffers.
 //!
-//! Reader path validates the footer magic and version, then opens an
-//! LZ4 decode stream over the body and yields records via postcard.
-//! A 64MB per-record byte budget bounds reader allocations against
-//! malformed input.
+//! Reader path validates the footer magic and version, then opens a
+//! decode stream over the body (matching the format tag) and yields
+//! records via postcard. A 64MB per-record byte budget bounds reader
+//! allocations against malformed input.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -32,6 +40,77 @@ use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use clinker_plan::SpillError;
 use clinker_plan::error::PipelineError;
 use clinker_record::{Record, RecordPayload, Schema};
+
+/// On-disk format tag for an uncompressed grace spill body: the postcard
+/// record stream is written raw, with no LZ4 frame.
+const FORMAT_TAG_UNCOMPRESSED: u8 = 0x00;
+/// On-disk format tag for an LZ4-frame-compressed grace spill body.
+const FORMAT_TAG_LZ4: u8 = 0x01;
+/// Byte length of the leading format tag.
+const TAG_SIZE: u64 = 1;
+
+/// Record-stream sink for a grace spill body: either a raw buffered file
+/// writer (uncompressed) or an LZ4 frame encoder wrapping one. Mirrors the
+/// inter-stage spill path's `SpillSink`; the variant is chosen at
+/// construction from the resolved compression decision and recorded in the
+/// file's leading format tag.
+enum GraceSpillSink {
+    /// Uncompressed: postcard records written straight to the buffered file.
+    Uncompressed(BufWriter<File>),
+    /// LZ4-frame-compressed: the historical default for large partition spills.
+    Lz4(FrameEncoder<BufWriter<File>>),
+}
+
+impl Write for GraceSpillSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            GraceSpillSink::Uncompressed(w) => w.write(buf),
+            GraceSpillSink::Lz4(e) => e.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            GraceSpillSink::Uncompressed(w) => w.flush(),
+            GraceSpillSink::Lz4(e) => e.flush(),
+        }
+    }
+}
+
+impl GraceSpillSink {
+    /// Finalize the body stream and recover the underlying file. For LZ4
+    /// this flushes the frame's buffered tail (its `Into<io::Error>`
+    /// conversion preserves the inner `io::Error` and its `StorageFull`
+    /// kind for the classifier); for the uncompressed sink it flushes the
+    /// `BufWriter`.
+    fn into_file(self) -> std::io::Result<File> {
+        let buf_writer = match self {
+            GraceSpillSink::Uncompressed(w) => w,
+            GraceSpillSink::Lz4(e) => e.finish().map_err(std::io::Error::from)?,
+        };
+        buf_writer.into_inner().map_err(|e| e.into_error())
+    }
+}
+
+/// Record-stream source for a grace spill body, mirroring [`GraceSpillSink`]:
+/// either a raw bounded file (uncompressed) or an LZ4 decoder over one. The
+/// variant is selected from the file's leading format tag at
+/// [`GraceSpillReader::open`].
+enum GraceSpillSource {
+    /// Uncompressed: postcard records read straight from the bounded body.
+    Uncompressed(BoundedRead),
+    /// LZ4-frame-compressed.
+    Lz4(FrameDecoder<BoundedRead>),
+}
+
+impl Read for GraceSpillSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            GraceSpillSource::Uncompressed(r) => r.read(buf),
+            GraceSpillSource::Lz4(r) => r.read(buf),
+        }
+    }
+}
 
 /// Failure raised while writing a grace-hash partition spill.
 ///
@@ -134,13 +213,14 @@ pub(crate) struct SpillHeader {
 
 /// Streaming writer for one partition's worth of records.
 ///
-/// Owns a temp file handle plus an LZ4 frame encoder over a buffered
-/// writer. `write_record` postcard-encodes the record and emits a
-/// length-prefixed body chunk. `finish` finalizes the LZ4 frame, appends
-/// the raw footer, and returns the file path; the caller takes ownership
-/// of cleanup via the surrounding `tempfile::TempDir`.
+/// Owns a body sink — a raw buffered file writer or an LZ4 frame encoder
+/// over one, chosen from the resolved compression decision and recorded in
+/// the leading format tag. `write_record` postcard-encodes the record and
+/// emits a length-prefixed body chunk. `finish` finalizes the body, appends
+/// the raw footer, and returns the file path; the caller takes ownership of
+/// cleanup via the surrounding `tempfile::TempDir`.
 pub(crate) struct GraceSpillWriter {
-    encoder: FrameEncoder<BufWriter<File>>,
+    sink: GraceSpillSink,
     path: PathBuf,
     hash_bits: u8,
     partition_id: u16,
@@ -152,10 +232,18 @@ impl GraceSpillWriter {
     /// `partition_id` plus a per-process monotonic sequence so a
     /// single partition that fans out across multiple spill flushes
     /// doesn't overwrite earlier files.
+    ///
+    /// `compress` selects the body encoding: `true` wraps the postcard
+    /// record stream in an LZ4 frame, `false` writes it raw. The caller
+    /// resolves it from the workspace `[storage.spill] compress` knob (see
+    /// [`clinker_plan::config::CompressMode`]); the choice is recorded in
+    /// the file's leading format tag so the reader dispatches without
+    /// out-of-band state.
     pub(crate) fn new(
         dir: &Path,
         hash_bits: u8,
         partition_id: u16,
+        compress: bool,
     ) -> Result<Self, GraceSpillError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -171,21 +259,32 @@ impl GraceSpillWriter {
         // paths do, rather than rendering as a generic internal error. A
         // genuine byte fault on create stays `SpillError::Io` and re-narrows
         // to `GraceSpillError::Io`.
-        let file =
-            File::create(&path).map_err(|e| match SpillError::from_spill_dir_io(dir, e) {
-                dir_err @ SpillError::DirUnavailable { .. } => {
-                    GraceSpillError::DirUnavailable(dir_err)
-                }
-                disk_err @ SpillError::DiskFull { .. } => GraceSpillError::DiskFull(disk_err),
-                SpillError::Io(io) => GraceSpillError::Io(io),
-                // `from_spill_dir_io` returns only `DirUnavailable`, `DiskFull`,
-                // or `Io`; any other variant would be a classifier regression.
-                other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
-            })?;
+        let classify_create = |e: std::io::Error| match SpillError::from_spill_dir_io(dir, e) {
+            dir_err @ SpillError::DirUnavailable { .. } => GraceSpillError::DirUnavailable(dir_err),
+            disk_err @ SpillError::DiskFull { .. } => GraceSpillError::DiskFull(disk_err),
+            SpillError::Io(io) => GraceSpillError::Io(io),
+            // `from_spill_dir_io` returns only `DirUnavailable`, `DiskFull`,
+            // or `Io`; any other variant would be a classifier regression.
+            other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
+        };
+        let mut file = File::create(&path).map_err(classify_create)?;
+        // The format tag is the very first on-disk byte and sits ahead of the
+        // (optionally framed) body so the reader can dispatch before opening a
+        // decoder.
+        let tag = if compress {
+            FORMAT_TAG_LZ4
+        } else {
+            FORMAT_TAG_UNCOMPRESSED
+        };
+        file.write_all(&[tag]).map_err(classify_create)?;
         let buf = BufWriter::new(file);
-        let encoder = FrameEncoder::new(buf);
+        let sink = if compress {
+            GraceSpillSink::Lz4(FrameEncoder::new(buf))
+        } else {
+            GraceSpillSink::Uncompressed(buf)
+        };
         Ok(Self {
-            encoder,
+            sink,
             path,
             hash_bits,
             partition_id,
@@ -206,18 +305,19 @@ impl GraceSpillWriter {
             .map_err(|_| std::io::Error::other("grace spill: record exceeds u32 byte length"))?;
         // Classify a write fault against the partition directory so an
         // `ENOSPC` mid-stream surfaces as `DiskFull` (E321), not internal Io.
-        if let Err(e) = self.encoder.write_all(&len.to_le_bytes()) {
+        if let Err(e) = self.sink.write_all(&len.to_le_bytes()) {
             return Err(self.classify_io(e));
         }
-        if let Err(e) = self.encoder.write_all(&bytes) {
+        if let Err(e) = self.sink.write_all(&bytes) {
             return Err(self.classify_io(e));
         }
         self.record_count += 1;
         Ok(())
     }
 
-    /// Finalize the LZ4 frame, append the footer, return the file
-    /// path along with the byte length of the finished file.
+    /// Finalize the body (LZ4 frame when compressed, a flush when raw),
+    /// append the footer, and return the file path along with the byte
+    /// length of the finished file.
     ///
     /// The byte length feeds [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`]
     /// so the disk-quota poll can tally cumulative on-disk usage
@@ -241,17 +341,15 @@ impl GraceSpillWriter {
             }
         };
         let Self {
-            encoder,
+            sink,
             path,
             hash_bits,
             partition_id,
             record_count,
         } = self;
-        let buf = encoder
-            .finish()
-            .map_err(|e| classify(std::io::Error::from(e)))?;
-        let mut file = buf.into_inner().map_err(|e| classify(e.into_error()))?;
-        // Seek to current end and append footer; LZ4 frame is closed.
+        let mut file = sink.into_file().map_err(&classify)?;
+        // Seek to current end and append footer; the body (raw or LZ4 frame)
+        // is closed, and the leading format tag is already on disk.
         let body_end = file.seek(SeekFrom::End(0)).map_err(&classify)?;
         let mut footer = [0u8; FOOTER_SIZE];
         footer[0..4].copy_from_slice(&GRACE_SPILL_MAGIC.to_le_bytes());
@@ -268,11 +366,12 @@ impl GraceSpillWriter {
 
 /// Streaming reader for a finalized spill file.
 ///
-/// Validates the footer magic + version on `open`. Yields records via
-/// `Iterator` until either the LZ4 stream returns EOF mid-frame or the
-/// recorded `record_count` is exhausted.
+/// Validates the footer magic + version on `open`, then dispatches the body
+/// source on the leading format tag (raw vs LZ4). Yields records via
+/// `Iterator` until either the body stream returns EOF or the recorded
+/// `record_count` is exhausted.
 pub(crate) struct GraceSpillReader {
-    decoder: FrameDecoder<BoundedRead>,
+    source: GraceSpillSource,
     schema: Arc<Schema>,
     header: SpillHeader,
     records_read: u64,
@@ -280,21 +379,26 @@ pub(crate) struct GraceSpillReader {
 }
 
 impl GraceSpillReader {
-    /// Open a spill file and validate its footer. The schema is supplied
-    /// by the caller and reattached to each record on read; the file does
-    /// not embed schema.
+    /// Open a spill file, validate its footer, and select the body source
+    /// from the leading format tag. The schema is supplied by the caller and
+    /// reattached to each record on read; the file does not embed schema.
     pub(crate) fn open(path: &Path, schema: Arc<Schema>) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let total_len = file.metadata()?.len();
-        if total_len < FOOTER_SIZE as u64 {
+        // The on-disk layout is `tag (1) ++ body ++ footer`; a file shorter
+        // than tag + footer cannot hold even an empty body.
+        let min_len = TAG_SIZE + FOOTER_SIZE as u64;
+        if total_len < min_len {
             return Err(std::io::Error::other(format!(
-                "grace spill {} too short ({total_len} bytes < {FOOTER_SIZE} footer bytes)",
+                "grace spill {} too short ({total_len} bytes < {min_len} tag+footer bytes)",
                 path.display()
             )));
         }
-        let body_len = total_len - FOOTER_SIZE as u64;
+        // Footer sits at the file tail; the body spans `[TAG_SIZE, footer)`.
+        let footer_start = total_len - FOOTER_SIZE as u64;
+        let body_len = footer_start - TAG_SIZE;
         // Read footer.
-        file.seek(SeekFrom::Start(body_len))?;
+        file.seek(SeekFrom::Start(footer_start))?;
         let mut footer = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer)?;
         let header = SpillHeader {
@@ -320,13 +424,26 @@ impl GraceSpillReader {
                 GRACE_SPILL_VERSION
             )));
         }
-        // Rewind for body read; bound the read at body_len so the LZ4
-        // decoder never advances past the body into the footer.
+        // Read the format tag at offset 0, then position the body read at
+        // offset TAG_SIZE bounded by `body_len` so the decoder never advances
+        // past the body into the footer.
         file.seek(SeekFrom::Start(0))?;
+        let mut tag = [0u8; 1];
+        file.read_exact(&mut tag)?;
+        file.seek(SeekFrom::Start(TAG_SIZE))?;
         let bounded = BoundedRead::new(file, body_len);
-        let decoder = FrameDecoder::new(bounded);
+        let source = match tag[0] {
+            FORMAT_TAG_LZ4 => GraceSpillSource::Lz4(FrameDecoder::new(bounded)),
+            FORMAT_TAG_UNCOMPRESSED => GraceSpillSource::Uncompressed(bounded),
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "grace spill {}: unknown format tag {other:#04x}; file is corrupt",
+                    path.display()
+                )));
+            }
+        };
         Ok(Self {
-            decoder,
+            source,
             schema,
             header,
             records_read: 0,
@@ -346,7 +463,7 @@ impl Iterator for GraceSpillReader {
         if self.records_read >= self.header.record_count {
             return None;
         }
-        match self.decoder.read_exact(&mut self.len_buf) {
+        match self.source.read_exact(&mut self.len_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Stream ended before the recorded record_count was
@@ -367,7 +484,7 @@ impl Iterator for GraceSpillReader {
             ))));
         }
         let mut buf = vec![0u8; len];
-        if let Err(e) = self.decoder.read_exact(&mut buf) {
+        if let Err(e) = self.source.read_exact(&mut buf) {
             return Some(Err(e));
         }
         let payload: RecordPayload = match postcard::from_bytes(&buf) {
@@ -380,7 +497,8 @@ impl Iterator for GraceSpillReader {
 }
 
 /// `Read` adapter that surfaces EOF after `limit` bytes. Wraps the
-/// spill file so the LZ4 decoder cannot stray into the trailing footer.
+/// spill file's body region so neither the raw record reader nor the LZ4
+/// decoder strays into the trailing footer.
 struct BoundedRead {
     inner: File,
     remaining: u64,
@@ -424,47 +542,99 @@ mod tests {
         )
     }
 
+    /// LZ4 frame magic number, little-endian `0x184D2204` — the four bytes a
+    /// compressed grace body opens with right after the 1-byte format tag.
+    const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+
     #[test]
     fn writer_reader_roundtrip() {
+        // Round-trip through both the compressed and the uncompressed body
+        // format; the knob changes only on-disk bytes, never the records.
+        for compress in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let s = schema();
+            let mut w = GraceSpillWriter::new(dir.path(), 4, 7, compress).unwrap();
+            for i in 0..50 {
+                w.write_record(&record(&s, i, &format!("row-{i}"))).unwrap();
+            }
+            let (path, bytes) = w.finish().unwrap();
+            let on_disk = std::fs::metadata(&*path).unwrap().len();
+            assert_eq!(
+                bytes, on_disk,
+                "reported byte count must match file size (compress={compress})"
+            );
+
+            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            assert_eq!(reader.header().record_count, 50);
+            assert_eq!(reader.header().hash_bits, 4);
+            assert_eq!(reader.header().partition_id, 7);
+            let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+            assert_eq!(recs.len(), 50, "compress={compress}");
+            for (i, r) in recs.iter().enumerate() {
+                assert_eq!(r.get("id"), Some(&Value::Integer(i as i64)));
+                assert_eq!(r.get("v"), Some(&Value::String(format!("row-{i}").into())));
+            }
+        }
+    }
+
+    // The leading format tag must record the writer's compression choice and
+    // the body must honor it: an `off` grace spill is byte-raw (no LZ4 frame
+    // magic after the tag) and an `on` one is LZ4-framed. This is the grace
+    // half of the `[storage.spill] compress` knob guarantee — without it the
+    // `--explain` per-operator compress line is a falsehood for grace-hash
+    // Combine and SortMerge Phase B.
+    #[test]
+    fn format_tag_and_body_honor_compress_knob() {
         let dir = TempDir::new().unwrap();
         let s = schema();
-        let mut w = GraceSpillWriter::new(dir.path(), 4, 7).unwrap();
-        for i in 0..50 {
-            w.write_record(&record(&s, i, &format!("row-{i}"))).unwrap();
-        }
-        let (path, bytes) = w.finish().unwrap();
-        let on_disk = std::fs::metadata(&*path).unwrap().len();
-        assert_eq!(bytes, on_disk, "reported byte count must match file size");
-
-        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
-        assert_eq!(reader.header().record_count, 50);
-        assert_eq!(reader.header().hash_bits, 4);
-        assert_eq!(reader.header().partition_id, 7);
-        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
-        assert_eq!(recs.len(), 50);
-        for (i, r) in recs.iter().enumerate() {
-            assert_eq!(r.get("id"), Some(&Value::Integer(i as i64)));
-            assert_eq!(r.get("v"), Some(&Value::String(format!("row-{i}").into())));
+        for (compress, expected_tag) in [(true, FORMAT_TAG_LZ4), (false, FORMAT_TAG_UNCOMPRESSED)] {
+            let mut w = GraceSpillWriter::new(dir.path(), 4, 3, compress).unwrap();
+            for i in 0..8 {
+                w.write_record(&record(&s, i, "x")).unwrap();
+            }
+            let (path, _bytes) = w.finish().unwrap();
+            let raw = std::fs::read(&*path).unwrap();
+            assert_eq!(
+                raw[0], expected_tag,
+                "compress={compress} must write tag {expected_tag:#04x}"
+            );
+            // The four bytes after the tag are the LZ4 frame magic only when
+            // compressed; an `off` body opens straight into the first
+            // length-prefixed postcard record, never the frame magic.
+            let body_head = &raw[1..5];
+            if compress {
+                assert_eq!(
+                    body_head, &LZ4_FRAME_MAGIC,
+                    "on-mode body must be LZ4-framed"
+                );
+            } else {
+                assert_ne!(
+                    body_head, &LZ4_FRAME_MAGIC,
+                    "off-mode body must be byte-raw, with no LZ4 frame magic"
+                );
+            }
         }
     }
 
     #[test]
     fn empty_partition_iterates_cleanly() {
-        let dir = TempDir::new().unwrap();
-        let s = schema();
-        let w = GraceSpillWriter::new(dir.path(), 4, 0).unwrap();
-        let (path, _bytes) = w.finish().unwrap();
-        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
-        assert_eq!(reader.header().record_count, 0);
-        let recs: Vec<_> = reader.collect();
-        assert!(recs.is_empty());
+        for compress in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let s = schema();
+            let w = GraceSpillWriter::new(dir.path(), 4, 0, compress).unwrap();
+            let (path, _bytes) = w.finish().unwrap();
+            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            assert_eq!(reader.header().record_count, 0);
+            let recs: Vec<_> = reader.collect();
+            assert!(recs.is_empty(), "compress={compress}");
+        }
     }
 
     #[test]
     fn truncated_body_returns_error() {
         let dir = TempDir::new().unwrap();
         let s = schema();
-        let mut w = GraceSpillWriter::new(dir.path(), 4, 1).unwrap();
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 1, true).unwrap();
         for i in 0..10 {
             w.write_record(&record(&s, i, "x")).unwrap();
         }
@@ -507,7 +677,7 @@ mod tests {
     fn bad_magic_rejected() {
         let dir = TempDir::new().unwrap();
         let s = schema();
-        let mut w = GraceSpillWriter::new(dir.path(), 4, 0).unwrap();
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
         w.write_record(&record(&s, 1, "a")).unwrap();
         let (path, _bytes) = w.finish().unwrap();
 
@@ -539,7 +709,7 @@ mod tests {
         std::fs::create_dir(&spill_dir).unwrap();
         std::fs::remove_dir(&spill_dir).unwrap();
 
-        let err = match GraceSpillWriter::new(&spill_dir, 4, 0) {
+        let err = match GraceSpillWriter::new(&spill_dir, 4, 0, true) {
             Ok(_) => panic!("GraceSpillWriter::new should fail when the dir is gone"),
             Err(e) => e,
         };

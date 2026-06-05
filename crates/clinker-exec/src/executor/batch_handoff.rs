@@ -47,7 +47,7 @@ use clinker_plan::error::PipelineError;
 /// streaming channel's in-flight bound) is a negligible fraction of the
 /// default 512 MiB budget for typical record widths, large enough that
 /// the per-flush handoff cost is amortized over thousands of records.
-pub(crate) const DEFAULT_BATCH_SIZE: usize = 2048;
+pub const DEFAULT_BATCH_SIZE: usize = 2048;
 
 /// One bounded slice of a streaming stage's output.
 ///
@@ -258,6 +258,13 @@ pub(crate) struct StreamingChargeHandle {
     spill_root_path: Arc<Path>,
     node_name: String,
     spill_allowed: bool,
+    /// Workspace `[storage.spill] compress` policy, resolved per spilled run
+    /// against the run's schema width and `batch_size` so `auto` skips LZ4 on
+    /// narrow streaming spills where the per-frame fixed cost outweighs the
+    /// savings.
+    spill_compress: clinker_plan::config::CompressMode,
+    /// Run-wide batch size, the `auto` heuristic's rows-per-batch projection.
+    batch_size: usize,
 }
 
 impl StreamingChargeHandle {
@@ -267,13 +274,16 @@ impl StreamingChargeHandle {
     /// the arbitrator as a `NodeBufferConsumer`; the same `Arc` is cloned
     /// into the writer thread so the discharge side subtracts from the
     /// counter this side adds to. `spill_allowed` mirrors
-    /// `dispatch::node_buffer_spill_allowed` for the slot.
+    /// `dispatch::node_buffer_spill_allowed` for the slot. `spill_compress`
+    /// and `batch_size` resolve the spill-file compression mode per run.
     pub(crate) fn new(
         handle: Arc<ConsumerHandle>,
         arbitrator: Arc<MemoryArbitrator>,
         spill_root_path: Arc<Path>,
         node_name: String,
         spill_allowed: bool,
+        spill_compress: clinker_plan::config::CompressMode,
+        batch_size: usize,
     ) -> Self {
         Self {
             handle,
@@ -281,6 +291,8 @@ impl StreamingChargeHandle {
             spill_root_path,
             node_name,
             spill_allowed,
+            spill_compress,
+            batch_size,
         }
     }
 
@@ -353,9 +365,20 @@ impl StreamingChargeHandle {
         run: Vec<(clinker_record::Record, u64)>,
         send: &mut impl FnMut(StreamEvent) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
+        // Resolve the compression mode against this run's schema width and the
+        // run-wide batch size, so the streaming spill file matches what
+        // `--explain` projects for the slot.
+        let column_count = run
+            .first()
+            .map(|(r, _)| r.schema().column_count())
+            .unwrap_or(0);
+        let compress = self
+            .spill_compress
+            .resolve_for_schema(column_count, self.batch_size as u64);
         let Some((file, _count)) = crate::executor::node_buffer_spill::spill_node_buffer(
             run,
             Some(self.spill_root_path.as_ref()),
+            compress,
         )?
         else {
             return Ok(());
@@ -599,6 +622,8 @@ mod tests {
             spill_root,
             "stream-spill-test".to_string(),
             true,
+            clinker_plan::config::CompressMode::On,
+            2,
         );
 
         // One document: open, three records, close — at this batch size
@@ -700,6 +725,8 @@ mod tests {
             spill_root,
             "stream-spill-two-docs".to_string(),
             true,
+            clinker_plan::config::CompressMode::On,
+            2,
         );
 
         // [Open(A), r0, r1, Close(A), Open(B), r2, Close(B)] — two record

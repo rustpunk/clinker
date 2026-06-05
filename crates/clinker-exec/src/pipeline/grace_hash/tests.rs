@@ -118,6 +118,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
         4,
         pipeline_dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
+        true,
     )
     .unwrap();
     let schema = schema_with(&["k"]);
@@ -156,6 +157,7 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
             4,
             pipeline_dir.path(),
             crate::pipeline::memory::ConsumerHandle::new(),
+            true,
         )
         .unwrap();
         let schema = schema_with(&["k"]);
@@ -186,6 +188,7 @@ fn spill_activates_under_tiny_budget() {
         4,
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
+        true,
     )
     .unwrap();
     let budget = tiny_budget();
@@ -223,6 +226,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
         4,
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
+        true,
     )
     .unwrap();
     let budget = tiny_budget();
@@ -427,6 +431,7 @@ fn execute_grace_hash_partition_pair_correct() {
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
+        spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
     })
@@ -617,6 +622,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
+        spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
     })
@@ -802,6 +808,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         ctx: &ctx,
         budget: &budget,
         spill_dir: dir.path(),
+        spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
     });
@@ -844,6 +851,7 @@ fn build_spill_reload_records_match() {
         2,
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
+        true,
     )
     .unwrap();
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
@@ -1085,6 +1093,7 @@ fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> 
         build_schema: Arc::clone(&h.build_schema),
         driver_schema: Arc::clone(&h.driver_schema),
         spill_dir: h.spill_dir.path(),
+        spill_compress: true,
         hash_state: &h.hash_state,
     };
     f(&rc)
@@ -1100,7 +1109,7 @@ fn spill_for_bnl(
     partition_id: u16,
     hash_bits: u8,
 ) -> SpilledPartition {
-    let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id).unwrap();
+    let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
     let mut sketch = Hll::new();
     for r in build_records {
         bw.write_record(r).unwrap();
@@ -1115,7 +1124,8 @@ fn spill_for_bnl(
     let mut probe_files: Vec<SpillFilePath> = Vec::new();
     if !probe_records.is_empty() {
         let mut pw =
-            GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id | 0x8000).unwrap();
+            GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id | 0x8000, true)
+                .unwrap();
         for r in probe_records {
             pw.write_record(r).unwrap();
         }

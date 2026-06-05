@@ -949,6 +949,50 @@ impl ExecutionPlanDag {
         out
     }
 
+    /// Render the per-blocking-operator spill-compression decision for the
+    /// `--explain` text output.
+    ///
+    /// Each operator that can spill (Aggregate, sort, grace-hash Combine —
+    /// the nodes that register a spillable consumer at runtime) gets one line
+    /// resolving `compress` against that operator's output-schema width and
+    /// the run's `batch_size`. Under [`CompressMode::Auto`] the decision
+    /// varies per operator because a wide operator clears the per-batch byte
+    /// threshold a narrow one does not; `On` / `Off` report the same forced
+    /// choice for every operator. The header line names the configured mode so
+    /// an operator can confirm both the policy and its resolved effect before
+    /// a run. Returns an empty string when the plan has no spill-eligible
+    /// operator.
+    pub fn spill_compression_explain(
+        &self,
+        compress: crate::config::CompressMode,
+        batch_size: usize,
+    ) -> String {
+        let blocking: Vec<NodeIndex> = self
+            .topo_order
+            .iter()
+            .copied()
+            .filter(|&idx| arbitration_class(&self.graph[idx]).spill_priority.is_some())
+            .collect();
+        if blocking.is_empty() {
+            return String::new();
+        }
+        let mut out = format!("Spill compression: {compress:?} [storage.spill.compress]\n");
+        for idx in blocking {
+            let node = &self.graph[idx];
+            let column_count = node
+                .stored_output_schema()
+                .map(|s| s.column_count())
+                .unwrap_or(0);
+            let chosen = if compress.resolve_for_schema(column_count, batch_size as u64) {
+                "lz4"
+            } else {
+                "off"
+            };
+            out.push_str(&format!("  {} → {chosen}\n", node.display_name()));
+        }
+        out
+    }
+
     /// Append the `CXL Expressions`, `Type Annotations`, `Memory Budget`
     /// trailing sections that `explain_full` adds onto a base
     /// `explain()` body. Factored so the artifacts-aware variant can

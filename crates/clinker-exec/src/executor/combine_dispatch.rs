@@ -512,6 +512,18 @@ pub(crate) fn dispatch_combine(
                 });
             let body_typed = ctx.artifacts.typed.get(name);
             let combine_output_schema_arc = combine_output_schema.clone();
+            // Resolve the spill compression mode against the combine's output
+            // schema width and the run's batch size, so the grace-hash
+            // partition spill files match what `--explain` projects. `auto`
+            // skips LZ4 on narrow combines where the per-frame fixed cost
+            // outweighs the savings.
+            let grace_column_count = combine_output_schema_arc
+                .as_ref()
+                .map(|s| s.column_count())
+                .unwrap_or(0);
+            let grace_spill_compress = ctx
+                .spill_compress
+                .resolve_for_schema(grace_column_count, ctx.batch_size as u64);
             let grace_ctx = ctx.merged_eval_ctx();
             // CPU-bound grace-hash join kernel: partition build +
             // probe + spill I/O. The kernel owns its inputs and
@@ -536,6 +548,7 @@ pub(crate) fn dispatch_combine(
                     ctx: &grace_ctx,
                     budget: &ctx.memory_budget,
                     spill_dir: ctx.spill_root_path.as_ref(),
+                    spill_compress: grace_spill_compress,
                     consumer_handle: grace_consumer_handle,
                     strategy: ctx.strategy,
                 })
@@ -627,6 +640,17 @@ pub(crate) fn dispatch_combine(
                 });
             let body_typed = ctx.artifacts.typed.get(name);
             let combine_output_schema_arc = combine_output_schema.clone();
+            // Resolve the spill compression mode against the combine's output
+            // schema width and the run's batch size, so Phase A spill runs
+            // match what `--explain` projects. `auto` skips LZ4 on narrow
+            // combines where the per-frame fixed cost outweighs the savings.
+            let sm_column_count = combine_output_schema_arc
+                .as_ref()
+                .map(|s| s.column_count())
+                .unwrap_or(0);
+            let sm_spill_compress = ctx
+                .spill_compress
+                .resolve_for_schema(sm_column_count, ctx.batch_size as u64);
             let sm_ctx = ctx.merged_eval_ctx();
             // CPU-bound sort-merge join kernel: two-cursor merge
             // over pre-sorted inputs. The kernel owns its inputs
@@ -651,6 +675,7 @@ pub(crate) fn dispatch_combine(
                     ctx: &sm_ctx,
                     budget: &ctx.memory_budget,
                     spill_dir: ctx.spill_root_path.as_ref(),
+                    spill_compress: sm_spill_compress,
                     consumer_handle: sm_consumer_handle,
                     strategy: ctx.strategy,
                 })

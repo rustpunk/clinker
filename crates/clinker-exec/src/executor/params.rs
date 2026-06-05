@@ -53,6 +53,13 @@ pub struct PipelineRunParams {
     /// `PipelineError::SpillCapExceeded` (E320) — a disk-cap surface kept
     /// distinct from both the RSS budget (E310) and a full volume (E321).
     pub spill_disk_cap_bytes: Option<u64>,
+    /// Spill-file compression policy, resolved from the workspace
+    /// `clinker.toml` `[storage.spill] compress` setting. Defaults to
+    /// [`clinker_plan::config::CompressMode::Auto`] (the `Default`), which
+    /// compresses only when a spilled batch is projected large enough to
+    /// amortize LZ4's per-frame fixed cost. Threaded into the dispatch
+    /// context and resolved per blocking operator at each spill site.
+    pub spill_compress: clinker_plan::config::CompressMode,
 }
 
 /// Summary returned after a pipeline execution completes (success or partial).

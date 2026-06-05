@@ -82,6 +82,89 @@ pub struct StorageConfig {
     pub staging: StagingConfig,
 }
 
+/// How spill files are compressed: `auto` (the default), `off`, or `on`.
+///
+/// Spill bodies are postcard-encoded record streams. LZ4 frame compression
+/// shrinks large spilled runs, but on small spills the per-frame fixed cost
+/// — clearing the compressor's internal state on every frame reset — can
+/// dominate the byte savings. The LZ4 v1.8.2 release notes call this out
+/// directly, and Pentaho Kettle ships explicit guidance to disable spill
+/// compression for small rows. `Auto` encodes that guidance as a heuristic
+/// so the common case needs no tuning; `Off` / `On` force the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressMode {
+    /// Compress only when the projected spill is large enough that LZ4's
+    /// per-frame fixed cost is amortized (see [`CompressMode::resolve`]).
+    #[default]
+    Auto,
+    /// Never compress: postcard records are written straight to disk with no
+    /// LZ4 frame wrapping. Cheapest for small spills; largest on-disk size.
+    Off,
+    /// Always compress with an LZ4 frame, regardless of projected size. The
+    /// pre-knob behavior, kept for spills of large, compressible rows.
+    On,
+}
+
+/// Minimum projected bytes-per-batch at which `auto` enables compression.
+///
+/// Below ~4 KiB a spilled batch fits inside a single LZ4 block, so the frame
+/// reset cost the v1.8.2 release notes flag is paid with little compressible
+/// volume to offset it. 4 KiB matches the small-row threshold Pentaho Kettle
+/// documents.
+const AUTO_COMPRESS_MIN_BYTES_PER_BATCH: u64 = 4 * 1024;
+
+/// Minimum projected rows-per-batch at which `auto` enables compression.
+///
+/// Pairs with [`AUTO_COMPRESS_MIN_BYTES_PER_BATCH`]: a batch must be both
+/// wide (≥ 4 KiB) and tall (≥ 1024 rows) before compression pays for itself.
+/// 1024 is the small-row row-count threshold from the same Pentaho guidance.
+const AUTO_COMPRESS_MIN_ROWS_PER_BATCH: u64 = 1024;
+
+/// Per-column byte estimate used to project a spilled batch's size from a
+/// schema's column count alone.
+///
+/// A `Value` slot is 24 bytes; `32` adds a small heap allowance for the
+/// typical mix of short strings and fixed-width scalars a spilled row holds.
+/// The projection only has to land on the correct side of the 4 KiB
+/// threshold, so a coarse per-column constant is sufficient and keeps the
+/// heuristic a pure function of the schema width and batch size.
+const ESTIMATED_BYTES_PER_COLUMN: u64 = 32;
+
+impl CompressMode {
+    /// Resolve this mode against a projected spill batch's size into a
+    /// concrete "compress this file?" decision.
+    ///
+    /// `On` and `Off` ignore the projection. `Auto` compresses only when the
+    /// batch is projected to be both ≥ 4 KiB and ≥ 1024 rows — the point at
+    /// which LZ4's per-frame fixed cost is amortized by enough compressible
+    /// volume (see [`CompressMode`]).
+    pub fn resolve(self, projected_bytes_per_batch: u64, projected_rows_per_batch: u64) -> bool {
+        match self {
+            CompressMode::On => true,
+            CompressMode::Off => false,
+            CompressMode::Auto => {
+                projected_bytes_per_batch >= AUTO_COMPRESS_MIN_BYTES_PER_BATCH
+                    && projected_rows_per_batch >= AUTO_COMPRESS_MIN_ROWS_PER_BATCH
+            }
+        }
+    }
+
+    /// Project a spilled batch's byte size from its schema width and the
+    /// configured rows-per-batch, then resolve to a compression decision.
+    ///
+    /// Convenience over [`CompressMode::resolve`] for callers that hold a
+    /// column count and batch size rather than a pre-computed byte figure:
+    /// the projection is `column_count × 32 bytes × rows_per_batch`. The
+    /// `--explain` plan and the runtime spill writer call this so the
+    /// reported mode matches the mode the run actually applies.
+    pub fn resolve_for_schema(self, column_count: usize, rows_per_batch: u64) -> bool {
+        let bytes_per_row = column_count as u64 * ESTIMATED_BYTES_PER_COLUMN;
+        let bytes_per_batch = bytes_per_row.saturating_mul(rows_per_batch);
+        self.resolve(bytes_per_batch, rows_per_batch)
+    }
+}
+
 /// `[storage.spill]` — spill-file root directory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +195,12 @@ pub struct SpillConfig {
     /// rendered as "OOM with 187 GiB available").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_cap_bytes: Option<ByteSize>,
+    /// Whether spill files are LZ4-compressed. Defaults to [`CompressMode::Auto`],
+    /// which compresses only when a spilled batch is projected large enough
+    /// to amortize LZ4's per-frame fixed cost. `off` and `on` force the
+    /// choice. See [`CompressMode`] for the rationale and threshold.
+    #[serde(default)]
+    pub compress: CompressMode,
 }
 
 impl SpillConfig {
@@ -379,5 +468,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn compress_defaults_to_auto() {
+        let doc = ClinkerToml::parse("").unwrap();
+        assert_eq!(doc.storage.spill.compress, CompressMode::Auto);
+    }
+
+    #[test]
+    fn compress_parses_each_mode() {
+        for (text, expected) in [
+            ("auto", CompressMode::Auto),
+            ("off", CompressMode::Off),
+            ("on", CompressMode::On),
+        ] {
+            let doc =
+                ClinkerToml::parse(&format!("[storage.spill]\ncompress = \"{text}\"\n")).unwrap();
+            assert_eq!(doc.storage.spill.compress, expected, "mode {text}");
+        }
+    }
+
+    #[test]
+    fn compress_rejects_unknown_mode() {
+        let err = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            compress = "gzip"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn resolve_on_off_ignore_projection() {
+        // `on` / `off` are forced regardless of the projected batch size.
+        assert!(CompressMode::On.resolve(0, 0));
+        assert!(!CompressMode::Off.resolve(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn resolve_auto_needs_both_thresholds() {
+        // Both the byte and the row threshold must be met.
+        assert!(CompressMode::Auto.resolve(4096, 1024));
+        assert!(CompressMode::Auto.resolve(64 * 1024, 4096));
+        // Wide but too few rows → no compression.
+        assert!(!CompressMode::Auto.resolve(64 * 1024, 1023));
+        // Many rows but too few bytes → no compression.
+        assert!(!CompressMode::Auto.resolve(4095, 8192));
+    }
+
+    #[test]
+    fn resolve_for_schema_projects_from_width_and_rows() {
+        // 1 column × 32 B/col × 1024 rows = 32 KiB ≥ 4 KiB and rows ≥ 1024 →
+        // compress.
+        assert!(CompressMode::Auto.resolve_for_schema(1, 1024));
+        // 8 columns × 32 B/col × 16 rows = 4 KiB of bytes but only 16 rows →
+        // below the row threshold, so no compression.
+        assert!(!CompressMode::Auto.resolve_for_schema(8, 16));
     }
 }

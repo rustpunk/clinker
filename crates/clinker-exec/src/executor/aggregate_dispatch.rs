@@ -140,6 +140,18 @@ pub(crate) fn dispatch_aggregation(
 
     let mem_limit = parse_memory_limit(ctx.config);
 
+    // Resolve the spill compression mode against this aggregate's
+    // output-schema width and the run's batch size, so spilled group state
+    // matches what `--explain` projects for the operator. The explain line
+    // for an Aggregation node resolves the same way against
+    // `stored_output_schema().column_count()`, so resolving here against the
+    // output schema keeps the reported mode and the on-disk format in
+    // lockstep. `auto` skips LZ4 on narrow/short aggregates where the
+    // per-frame fixed cost outweighs the savings.
+    let spill_compress = ctx
+        .spill_compress
+        .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
+
     let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
     let input_count = input.len() as u64;
 
@@ -207,6 +219,7 @@ pub(crate) fn dispatch_aggregation(
                 spill_schema,
                 memory_budget: mem_limit,
                 spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+                spill_compress,
                 transform_name: name.clone(),
                 consumer_handle: agg_consumer_handle,
             },
@@ -612,6 +625,13 @@ impl WindowedAggContext<'_> {
         let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
         ));
+        // Resolve the spill compression mode against this aggregate's
+        // output-schema width and the run's batch size, matching the
+        // `--explain` projection for the Aggregation node so each window's
+        // spill file's on-disk format agrees with the reported mode.
+        let spill_compress = ctx
+            .spill_compress
+            .resolve_for_schema(self.output_schema.column_count(), ctx.batch_size as u64);
         let stream = crate::aggregation::AggregateStream::for_node(
             self.strategy,
             crate::aggregation::AggregatorConfig {
@@ -621,6 +641,7 @@ impl WindowedAggContext<'_> {
                 spill_schema: Arc::clone(&self.spill_schema),
                 memory_budget: self.mem_limit,
                 spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+                spill_compress,
                 transform_name: self.name.to_string(),
                 consumer_handle: agg_consumer_handle,
             },

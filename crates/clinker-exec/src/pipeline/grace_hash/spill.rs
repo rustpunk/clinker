@@ -73,6 +73,11 @@ pub(super) struct ReloadContext<'a> {
     pub(super) build_schema: Arc<Schema>,
     pub(super) driver_schema: Arc<Schema>,
     pub(super) spill_dir: &'a Path,
+    /// Whether repartition spill files written during reload are
+    /// LZ4-compressed. Carried from the dispatcher's resolved
+    /// `[storage.spill] compress` decision so recursively-split partition
+    /// files honor the same knob the build/probe spill files did.
+    pub(super) spill_compress: bool,
     pub(super) hash_state: &'a RandomState,
 }
 
@@ -94,6 +99,7 @@ pub(super) fn process_spilled_partition(
     let build_schema = Arc::clone(&rc.build_schema);
     let driver_schema = Arc::clone(&rc.driver_schema);
     let spill_dir = rc.spill_dir;
+    let spill_compress = rc.spill_compress;
     let hash_state = rc.hash_state;
     // Reload build records (every build_files entry concatenated).
     // The reader's footer is cross-checked against the SpilledPartition
@@ -263,9 +269,13 @@ pub(super) fn process_spilled_partition(
             (parent_id * 2 + 1, child_b, child_b_probe, child_b_sketch),
         ] {
             let bcount = child_build.len() as u64;
-            let mut bw =
-                GraceSpillWriter::new(spill_dir, child_assigner.hash_bits(), child_id as u16)
-                    .map_err(|e| grace_spill_error(e, name, "repartition build writer"))?;
+            let mut bw = GraceSpillWriter::new(
+                spill_dir,
+                child_assigner.hash_bits(),
+                child_id as u16,
+                spill_compress,
+            )
+            .map_err(|e| grace_spill_error(e, name, "repartition build writer"))?;
             for r in &child_build {
                 bw.write_record(r)
                     .map_err(|e| grace_spill_error(e, name, "repartition build write"))?;
@@ -287,6 +297,7 @@ pub(super) fn process_spilled_partition(
                     spill_dir,
                     child_assigner.hash_bits(),
                     (child_id as u16) | 0x8000,
+                    spill_compress,
                 )
                 .map_err(|e| grace_spill_error(e, name, "repartition probe writer"))?;
                 for r in &child_probe {

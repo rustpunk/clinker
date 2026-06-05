@@ -122,3 +122,7 @@ harness = false
 name = "arbitration_poll"
 harness = false
 
+[[bench]]
+name = "spill_compression"
+harness = false
+

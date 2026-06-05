@@ -350,7 +350,7 @@ impl Iterator for NodeBufferDrain {
 /// every consumer drain decrements it. `try_spill` flips the handle's
 /// spill-request flag; the dispatcher reads it at the next admission
 /// boundary and routes through the existing `spill_node_buffer`
-/// (postcard + LZ4 via `SpillWriter<u64>`) path.
+/// (postcard, optionally LZ4-framed, via `SpillWriter<u64>`) path.
 ///
 /// `spill_priority = 0`: cheapest victim. Inter-stage buffers are
 /// already row-oriented and write straight through `SpillWriter<u64>`;
@@ -449,7 +449,7 @@ mod tests {
         } else {
             schema()
         };
-        let mut w: SpillWriter<u64> = SpillWriter::new(s, None).unwrap();
+        let mut w: SpillWriter<u64> = SpillWriter::new(s, None, true).unwrap();
         let count = rows.len() as u64;
         for (r, rn) in &rows {
             w.write_pair(r, rn).unwrap();
