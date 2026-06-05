@@ -18,6 +18,14 @@ pub enum SpillError {
     Json(serde_json::Error),
     Postcard(postcard::Error),
     InvalidSchema(String),
+    /// The spill root directory became unusable mid-run: it was removed,
+    /// unmounted, remounted read-only, or had its permissions revoked after
+    /// the run validated it at startup. Distinct from [`SpillError::Io`] so
+    /// the rendered diagnostic points at the directory and its likely cause
+    /// (an NFS remount, a volume unmount, an over-eager temp-file cleaner)
+    /// rather than reading as a generic byte-stream I/O failure. Carries the
+    /// offending directory path and the underlying OS message.
+    DirUnavailable { dir: String, source: String },
 }
 
 impl std::fmt::Display for SpillError {
@@ -27,6 +35,37 @@ impl std::fmt::Display for SpillError {
             SpillError::Json(e) => write!(f, "spill JSON header error: {e}"),
             SpillError::Postcard(e) => write!(f, "spill postcard error: {e}"),
             SpillError::InvalidSchema(msg) => write!(f, "spill schema error: {msg}"),
+            SpillError::DirUnavailable { dir, source } => write!(
+                f,
+                "spill directory {dir} became unavailable mid-run: {source} \
+                 (the directory may have been unmounted, remounted read-only, \
+                 deleted by an external cleaner, or had its permissions revoked)"
+            ),
+        }
+    }
+}
+
+impl SpillError {
+    /// Classify an [`std::io::Error`] raised while creating a spill file in
+    /// the spill root directory.
+    ///
+    /// A failure to create a temp file in a directory the run validated as
+    /// writable at startup means the directory itself went bad mid-run
+    /// (`NotFound` → removed/unmounted, `PermissionDenied`/`ReadOnlyFilesystem`
+    /// → permissions revoked or read-only remount). Those map to the distinct
+    /// [`SpillError::DirUnavailable`] so the operator sees a directory-level
+    /// cause rather than a generic I/O error. Any other kind (a genuine
+    /// byte-stream fault, `ENOSPC`, etc.) stays [`SpillError::Io`].
+    pub fn from_spill_dir_io(dir: &std::path::Path, e: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+                SpillError::DirUnavailable {
+                    dir: dir.display().to_string(),
+                    source: e.to_string(),
+                }
+            }
+            _ => SpillError::Io(e),
         }
     }
 }

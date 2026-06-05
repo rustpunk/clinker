@@ -12,6 +12,7 @@ pub mod route;
 pub mod scoped_var;
 pub mod sort;
 pub mod source;
+pub mod storage;
 pub mod transform;
 pub mod utils;
 
@@ -37,5 +38,8 @@ pub use route::*;
 pub use scoped_var::*;
 pub use sort::*;
 pub use source::*;
+pub use storage::{
+    ClinkerToml, SpillConfig, StagingConfig, StorageConfig, StorageConfigError,
+};
 pub use transform::*;
 pub use utils::*;

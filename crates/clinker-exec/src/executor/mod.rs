@@ -649,15 +649,26 @@ impl PipelineExecutor {
         // spills. Primary cleanup is per-file `tempfile::TempPath`
         // Drop; secondary sweep is this TempDir's recursive remove on
         // panic unwind.
+        //
+        // The root lands under `params.spill_root_dir` when the workspace
+        // `clinker.toml` set `[storage.spill] dir`, and under the OS temp dir
+        // otherwise. Operators on a `/tmp`-on-tmpfs host can thus redirect
+        // spill to a real disk so spilling does not defeat the memory budget
+        // by paging back into RAM. The directory is pre-validated by the
+        // caller, so a creation failure here is an internal fault, not a
+        // misconfiguration the user can fix.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("clinker-spill-");
         let spill_root = Arc::new(
-            tempfile::Builder::new()
-                .prefix("clinker-spill-")
-                .tempdir()
-                .map_err(|e| PipelineError::Internal {
-                    op: "executor",
-                    node: String::new(),
-                    detail: format!("failed to allocate pipeline spill root: {e}"),
-                })?,
+            match &params.spill_root_dir {
+                Some(dir) => builder.tempdir_in(dir),
+                None => builder.tempdir(),
+            }
+            .map_err(|e| PipelineError::Internal {
+                op: "executor",
+                node: String::new(),
+                detail: format!("failed to allocate pipeline spill root: {e}"),
+            })?,
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
