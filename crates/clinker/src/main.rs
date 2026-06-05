@@ -714,6 +714,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                     None => println!("Spill disk cap: unlimited (default)"),
                 }
+                // Resolved spill-compression decision per blocking operator.
+                // Under `auto` the choice varies by operator width, so an
+                // operator can confirm which spills will be LZ4-framed and
+                // which write raw postcard before committing to the run.
+                let batch_size = pipeline_config
+                    .pipeline
+                    .batch_size
+                    .unwrap_or(clinker_exec::executor::DEFAULT_BATCH_SIZE);
+                print!(
+                    "{}",
+                    dag.spill_compression_explain(storage_config.spill.compress, batch_size)
+                );
             }
             ExplainFormat::Json => {
                 let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts);
@@ -1030,6 +1042,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         shutdown_token: Some(shutdown_token),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
+        spill_compress: storage_config.spill.compress,
     };
     let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,

@@ -16,6 +16,7 @@ the per-pipeline YAML:
 [storage.spill]
 dir = "/var/clinker/spill"   # optional; default = OS temp dir
 disk_cap_bytes = "10GB"      # optional; default = unlimited
+compress = "auto"            # optional; auto | off | on   (default = auto)
 
 [storage.staging]
 enabled = false              # parsed but inactive — staging is not yet implemented
@@ -81,6 +82,17 @@ Spill disk cap: 10737418240 bytes [storage.spill.disk_cap_bytes]
 Spill disk cap: unlimited (default)
 ```
 
+Finally, `--explain` reports the resolved compression decision per blocking
+operator, so you can see which spills will be LZ4-framed (`lz4`) and which will
+be written raw (`off`) before the run starts. Under `auto` the choice varies by
+operator width:
+
+```text
+Spill compression: Auto [storage.spill.compress]
+  Aggregate 'totals' → lz4
+  Sort 'by_amount' → off
+```
+
 ## `storage.spill.disk_cap_bytes` — cap cumulative spill
 
 By default a run will spill as much as it needs, limited only by the physical
@@ -106,6 +118,42 @@ budget and the physical volume size. A run can sit well inside its
 spill files; the cap lets an operator bound that on a shared volume. It is the
 guard DataFusion shipped without ([apache/datafusion#15358]) until production
 runs filled volumes.
+
+## `storage.spill.compress` — LZ4 compression policy
+
+Spill files are postcard-encoded record streams. By default each stream is
+wrapped in an LZ4 frame, which shrinks large spilled runs. But LZ4 carries a
+**per-frame fixed cost** — clearing the compressor's internal state on every
+frame reset — and on small spills that cost can outweigh the byte savings. The
+LZ4 v1.8.2 release notes call this out directly, and Pentaho Kettle ships
+explicit guidance to turn spill compression **off** for small rows.
+
+`compress` controls the policy:
+
+```toml
+[storage.spill]
+compress = "auto"   # auto | off | on   (default = auto)
+```
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Compress only when a spilled batch is projected large enough to amortize LZ4's per-frame cost — both **≥ 4 KiB** and **≥ 1024 rows**. Below either threshold the batch is written raw. The projection comes from the operator's schema width and the run's `batch_size`, so the decision is made per blocking operator. |
+| `off` | Never compress. Postcard records are written straight to disk with no LZ4 frame. Cheapest for small spills; largest on-disk size. |
+| `on` | Always compress with an LZ4 frame. The pre-knob behavior, best for spills of large, compressible rows. |
+
+Each spill file records its compression choice in a one-byte header tag, so the
+read path always dispatches to the right decoder regardless of the mode the
+file was written with — changing the knob between runs never breaks re-reading
+an earlier run's files.
+
+The 4 KiB / 1024-row thresholds mark the empirical crossover: below them the
+LZ4 frame's fixed cost dominates the small amount of compressible payload, and
+writing raw is faster end-to-end (the `spill_compression` benchmark sweeps
+batch sizes from 256 B to 64 KiB and confirms `auto` tracks the faster of
+`on` / `off` across the range). Most pipelines should leave `compress` at
+`auto`; set `on` when spilling wide, highly compressible rows to a
+space-constrained volume, and `off` when spills are dominated by many small
+batches.
 
 ## Distinguishing the four spill-related failure conditions
 

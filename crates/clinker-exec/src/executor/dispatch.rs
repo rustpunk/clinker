@@ -870,6 +870,13 @@ pub(crate) struct ExecutorContext<'a> {
     /// for that one stage via [`Self::batch_size_for`]. Read by the fused
     /// streaming arms to size their [`crate::executor::batch_handoff::EventBatcher`].
     pub(crate) batch_size: usize,
+
+    /// Spill-file compression policy from the workspace `[storage.spill]
+    /// compress` knob. Resolved per blocking operator against the slot's
+    /// schema width and [`Self::batch_size`] at each spill site, so `auto`
+    /// can skip LZ4 on narrow/short batches where the per-frame fixed cost
+    /// outweighs the savings. See [`clinker_plan::config::CompressMode`].
+    pub(crate) spill_compress: clinker_plan::config::CompressMode,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -1024,6 +1031,8 @@ impl<'a> ExecutorContext<'a> {
             std::sync::Arc::clone(&self.spill_root_path),
             node_name.to_string(),
             spill_allowed,
+            self.spill_compress,
+            self.batch_size,
         ))
     }
 
@@ -1379,9 +1388,21 @@ pub(crate) fn admit_node_buffer(
     if !spill_allowed || !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
+    // Resolve the spill compression mode against this slot's schema width and
+    // the run's batch size, so the file's on-disk format matches what
+    // `--explain` projects. `auto` skips LZ4 on narrow/short batches where the
+    // per-frame fixed cost outweighs the savings.
+    let column_count = rows
+        .first()
+        .map(|(r, _)| r.schema().column_count())
+        .unwrap_or(0);
+    let compress = ctx
+        .spill_compress
+        .resolve_for_schema(column_count, ctx.batch_size as u64);
     match crate::executor::node_buffer_spill::spill_node_buffer(
         rows,
         Some(ctx.spill_root_path.as_ref()),
+        compress,
     )? {
         Some((file, count)) => {
             // Rows are now on disk; the in-memory portion of this slot

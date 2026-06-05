@@ -368,6 +368,11 @@ pub(crate) struct SortMergeExec<'a> {
     /// land inside it; the surrounding `Arc<TempDir>` Drop is the
     /// secondary panic-safe cleanup sweep.
     pub spill_dir: &'a Path,
+    /// Whether Phase A external-sort spill runs are LZ4-compressed. Resolved
+    /// by the dispatcher from the workspace `[storage.spill] compress` knob
+    /// against the combine's schema width and batch size, so the on-disk
+    /// format matches what `--explain` reports.
+    pub spill_compress: bool,
     /// Shared with the registered `SortMergeConsumer` wrapper.
     /// Phase A per-side `SortBuffer.bytes_used` plus Phase B
     /// matching-run accumulator size mirror into `handle.bytes`
@@ -442,6 +447,7 @@ fn execute_combine_sort_merge_with_stats(
         ctx,
         budget,
         spill_dir,
+        spill_compress,
         consumer_handle,
         strategy,
     } = args;
@@ -623,6 +629,7 @@ fn execute_combine_sort_merge_with_stats(
             name,
             &driver_field,
             budget,
+            spill_compress,
             &consumer_handle,
         )?;
         sort_build_pairs_externally(
@@ -630,6 +637,7 @@ fn execute_combine_sort_merge_with_stats(
             name,
             &build_field,
             budget,
+            spill_compress,
             &consumer_handle,
         )?;
         stats.phase_a_sort_invocations = 2;
@@ -817,6 +825,7 @@ fn sort_driver_pairs_externally(
     name: &str,
     range_field: &Option<String>,
     budget: &MemoryArbitrator,
+    spill_compress: bool,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
@@ -844,8 +853,13 @@ fn sort_driver_pairs_externally(
         order: clinker_plan::config::SortOrder::Asc,
         null_order: None,
     };
-    let mut buf: SortBuffer<RecordOrder> =
-        SortBuffer::new(vec![sort_field], spill_threshold, None, schema);
+    let mut buf: SortBuffer<RecordOrder> = SortBuffer::new(
+        vec![sort_field],
+        spill_threshold,
+        None,
+        spill_compress,
+        schema,
+    );
 
     // Track this helper's contribution to the consumer handle so the
     // Spilled-finish branch can rewind correctly. Without a local
@@ -945,6 +959,7 @@ fn sort_build_pairs_externally(
     name: &str,
     range_field: &Option<String>,
     budget: &MemoryArbitrator,
+    spill_compress: bool,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
@@ -966,7 +981,13 @@ fn sort_build_pairs_externally(
         order: clinker_plan::config::SortOrder::Asc,
         null_order: None,
     };
-    let mut buf: SortBuffer<()> = SortBuffer::new(vec![sort_field], spill_threshold, None, schema);
+    let mut buf: SortBuffer<()> = SortBuffer::new(
+        vec![sort_field],
+        spill_threshold,
+        None,
+        spill_compress,
+        schema,
+    );
 
     let mut local_charged: u64 = 0;
 
@@ -1815,6 +1836,7 @@ mod tests {
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
+            spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
         };

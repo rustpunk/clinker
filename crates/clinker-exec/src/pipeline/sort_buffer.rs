@@ -3,7 +3,8 @@
 //!
 //! Used at source-sort, output-sort, and DAG enforcer-sort intercept points.
 //! The buffer tracks its own memory usage and spills sorted chunks to
-//! NDJSON+LZ4 temp files when the budget is exceeded.
+//! postcard temp files — optionally LZ4-framed per the workspace
+//! `[storage.spill] compress` knob — when the budget is exceeded.
 //!
 //! Generic over per-record payload `P`. Source/output sort uses
 //! `SortBuffer<()>`; the DAG executor's `PlanNode::Sort` dispatch arm uses
@@ -43,6 +44,11 @@ pub struct SortBuffer<P> {
     bytes_used: usize,
     spill_threshold: usize,
     spill_dir: Option<PathBuf>,
+    /// Whether spilled sorted runs are LZ4-compressed. Resolved by the caller
+    /// from the workspace `[storage.spill] compress` knob against the sort
+    /// schema's width and the run's batch size, so the on-disk format matches
+    /// what `--explain` reports.
+    spill_compress: bool,
     spill_files: Vec<SpillFile<P>>,
     schema: Arc<Schema>,
 }
@@ -52,6 +58,7 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
         sort_by: Vec<SortField>,
         spill_threshold: usize,
         spill_dir: Option<PathBuf>,
+        spill_compress: bool,
         schema: Arc<Schema>,
     ) -> Self {
         Self {
@@ -60,6 +67,7 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
             bytes_used: 0,
             spill_threshold,
             spill_dir,
+            spill_compress,
             spill_files: Vec::new(),
             schema,
         }
@@ -92,8 +100,11 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
         self.pairs
             .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
 
-        let mut writer: SpillWriter<P> =
-            SpillWriter::new(self.schema.clone(), self.spill_dir.as_deref())?;
+        let mut writer: SpillWriter<P> = SpillWriter::new(
+            self.schema.clone(),
+            self.spill_dir.as_deref(),
+            self.spill_compress,
+        )?;
         for (record, payload) in self.pairs.drain(..) {
             writer.write_pair(&record, &payload)?;
         }
@@ -210,7 +221,7 @@ mod tests {
     fn test_sort_buffer_push_tracks_bytes() {
         let schema = test_schema();
         let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
         assert_eq!(buf.bytes_used(), 0);
         buf.push(make_record(&schema, "Alice", 1), ());
         assert!(buf.bytes_used() > 0);
@@ -224,7 +235,7 @@ mod tests {
         let schema = test_schema();
         // Very small threshold — should spill after a few records
         let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 100, None, schema.clone());
+            SortBuffer::new(sort_by_value_asc(), 100, None, true, schema.clone());
         assert!(!buf.should_spill());
         // Push records until we exceed 100 bytes
         for i in 0..10 {
@@ -240,7 +251,7 @@ mod tests {
     fn test_sort_buffer_in_memory_sort() {
         let schema = test_schema();
         let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
         buf.push(make_record(&schema, "Charlie", 30), ());
         buf.push(make_record(&schema, "Alice", 10), ());
         buf.push(make_record(&schema, "Bob", 20), ());
@@ -259,7 +270,8 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_produces_spill_files() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone()); // threshold=1 → spill immediately
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone()); // threshold=1 → spill immediately
         buf.push(make_record(&schema, "Alice", 10), ());
         assert!(buf.should_spill());
         buf.sort_and_spill().unwrap();
@@ -270,7 +282,8 @@ mod tests {
     #[test]
     fn test_sort_buffer_finish_spilled_returns_files() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
 
         // Push and spill twice
         buf.push(make_record(&schema, "B", 20), ());
@@ -291,7 +304,8 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_files_are_sorted() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
         buf.push(make_record(&schema, "C", 30), ());
         buf.push(make_record(&schema, "A", 10), ());
         buf.push(make_record(&schema, "B", 20), ());
@@ -316,7 +330,7 @@ mod tests {
         // Pattern B gate: payload travels with the record through sort permutation.
         let schema = test_schema();
         let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
         buf.push(make_record(&schema, "Charlie", 30), 100);
         buf.push(make_record(&schema, "Alice", 10), 200);
         buf.push(make_record(&schema, "Bob", 20), 300);
@@ -334,10 +348,10 @@ mod tests {
 
     #[test]
     fn test_sort_buffer_payload_survives_spill() {
-        // Pattern B gate: payload survives the NDJSON+LZ4 spill envelope.
+        // Payload survives the postcard spill envelope through the round-trip.
         let schema = test_schema();
         let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
         buf.push(make_record(&schema, "C", 30), 100);
         buf.push(make_record(&schema, "A", 10), 200);
         buf.push(make_record(&schema, "B", 20), 300);
@@ -361,7 +375,8 @@ mod tests {
     #[test]
     fn test_sort_buffer_empty_returns_empty() {
         let schema = test_schema();
-        let buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema);
+        let buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema);
         match buf.finish().unwrap() {
             SortedOutput::InMemory(pairs) => assert!(pairs.is_empty()),
             SortedOutput::Spilled(_) => panic!("expected InMemory"),

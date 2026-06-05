@@ -101,7 +101,8 @@ mod tests {
     fn test_sort_single_field_asc() {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         for i in (0..100).rev() {
             buf.push(rec2(&schema, &format!("r{i}"), i), ());
         }
@@ -120,7 +121,8 @@ mod tests {
     fn test_sort_single_field_desc() {
         let schema = schema_2();
         let sort_by = vec![sf("name", SortOrder::Desc)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         for name in &["alpha", "charlie", "bravo", "delta", "echo"] {
             buf.push(rec2(&schema, name, 0), ());
         }
@@ -143,7 +145,8 @@ mod tests {
     fn test_sort_compound_keys() {
         let schema = schema_3();
         let sort_by = vec![sf("dept", SortOrder::Asc), sf("salary", SortOrder::Desc)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         buf.push(rec3(&schema, "B", 200, 1), ());
         buf.push(rec3(&schema, "A", 100, 2), ());
         buf.push(rec3(&schema, "A", 300, 3), ());
@@ -166,7 +169,8 @@ mod tests {
     fn test_sort_nulls_first() {
         let schema = schema_2();
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::First)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         buf.push(rec2(&schema, "a", 30), ());
         buf.push(
             Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]),
@@ -187,7 +191,8 @@ mod tests {
     fn test_sort_nulls_last() {
         let schema = schema_2();
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::Last)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         buf.push(rec2(&schema, "a", 30), ());
         buf.push(
             Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]),
@@ -208,7 +213,8 @@ mod tests {
     fn test_sort_stable_equal_keys() {
         let schema = schema_3();
         let sort_by = vec![sf("dept", SortOrder::Asc)];
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 10_000_000, None, true, schema.clone());
         // All same dept — seq should preserve original order (stable sort)
         buf.push(rec3(&schema, "A", 100, 1), ());
         buf.push(rec3(&schema, "A", 200, 2), ());
@@ -229,7 +235,7 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // 1KB budget — records will exceed this quickly
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 1024, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 1024, None, true, schema.clone());
         let mut spilled = false;
         for i in 0..100 {
             buf.push(rec2(&schema, &format!("record_{i:04}"), i), ());
@@ -246,7 +252,8 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // Create 32 spill files (exceeds k_max=16 → requires cascade)
-        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by.clone(), 1, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
         for i in 0..32 {
             buf.push(rec2(&schema, &format!("r{i}"), i), ());
             buf.sort_and_spill().unwrap();
@@ -271,8 +278,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by, 1, Some(dir.path().to_path_buf()), schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by,
+            1,
+            Some(dir.path().to_path_buf()),
+            true,
+            schema.clone(),
+        );
         for i in 0..5 {
             buf.push(rec2(&schema, &format!("r{i}"), i), ());
             buf.sort_and_spill().unwrap();
@@ -311,6 +323,7 @@ mod tests {
             sort_by,
             10_000_000,
             Some(dir.path().to_path_buf()),
+            true,
             schema.clone(),
         );
         for i in (0..10).rev() {

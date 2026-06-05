@@ -596,7 +596,7 @@ fn h6b_record_round_trips_through_sort_spill() {
     ];
 
     let mut writer: SpillWriter<()> =
-        SpillWriter::new(Arc::clone(&schema), None).expect("open spill writer");
+        SpillWriter::new(Arc::clone(&schema), None, true).expect("open spill writer");
     for rec in &inputs {
         writer.write_record(rec).expect("spill write_record");
     }
