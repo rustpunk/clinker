@@ -136,6 +136,7 @@ fn push_to_buffer(
     record: Record,
     byte_limit: usize,
     spill_dir: &std::path::Path,
+    spill_compress: bool,
     spill_seq: &mut u32,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
 ) -> Result<u64, GraceSpillError> {
@@ -154,7 +155,8 @@ fn push_to_buffer(
                 let mut drained = std::mem::take(records);
                 let schema = Arc::clone(drained[0].schema());
                 drained.push(record);
-                let (segment_path, written) = write_spill_segment(spill_dir, spill_seq, &drained)?;
+                let (segment_path, written) =
+                    write_spill_segment(spill_dir, spill_compress, spill_seq, &drained)?;
                 let count = drained.len() as u64;
                 *buf = MatchingRunBuffer::Spilled {
                     segments: vec![segment_path],
@@ -185,7 +187,8 @@ fn push_to_buffer(
                 let prev_tail = *tail_bytes as u64;
                 let mut drained = std::mem::take(tail);
                 drained.push(record);
-                let (segment_path, written) = write_spill_segment(spill_dir, spill_seq, &drained)?;
+                let (segment_path, written) =
+                    write_spill_segment(spill_dir, spill_compress, spill_seq, &drained)?;
                 *spilled_count = spilled_count.saturating_add(drained.len() as u64);
                 *tail_bytes = 0;
                 segments.push(segment_path);
@@ -208,12 +211,13 @@ fn push_to_buffer(
 /// [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`].
 fn write_spill_segment(
     spill_dir: &std::path::Path,
+    spill_compress: bool,
     spill_seq: &mut u32,
     records: &[Record],
 ) -> Result<(SpillFilePath, u64), GraceSpillError> {
     let seq = *spill_seq;
     *spill_seq = spill_seq.wrapping_add(1);
-    let mut writer = GraceSpillWriter::new(spill_dir, 0, (seq & 0xFFFF) as u16)?;
+    let mut writer = GraceSpillWriter::new(spill_dir, 0, (seq & 0xFFFF) as u16, spill_compress)?;
     for r in records {
         writer.write_record(r)?;
     }
@@ -698,6 +702,7 @@ fn execute_combine_sort_merge_with_stats(
         ctx,
         byte_limit,
         spill_dir,
+        spill_compress,
         spill_seq: &mut spill_seq,
         stats: &mut stats,
         output: &mut output_records,
@@ -1087,6 +1092,11 @@ struct WalkArgs<'a, 'b, 'c> {
     ctx: &'a EvalContext<'a>,
     byte_limit: usize,
     spill_dir: &'a std::path::Path,
+    /// Whether Phase B matching-run spill segments are LZ4-compressed.
+    /// Carried from [`SortMergeExec::spill_compress`] so Phase B honors the
+    /// same `[storage.spill] compress` decision Phase A's external sort does
+    /// and `--explain` reports a single truthful mode for the operator.
+    spill_compress: bool,
     spill_seq: &'b mut u32,
     stats: &'b mut SortMergeStats,
     output: &'b mut Vec<(Record, RecordOrder)>,
@@ -1126,6 +1136,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
         ctx,
         byte_limit,
         spill_dir,
+        spill_compress,
         spill_seq,
         stats,
         output,
@@ -1159,6 +1170,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     build_record.clone(),
                     byte_limit,
                     spill_dir,
+                    spill_compress,
                     spill_seq,
                     consumer_handle,
                 )

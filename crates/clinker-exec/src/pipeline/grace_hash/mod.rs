@@ -188,6 +188,11 @@ pub(crate) struct GraceHashExec<'a> {
     /// `tempfile::TempPath` Drop; the pipeline-scoped TempDir Drop
     /// closes the panic-leak hole for files committed mid-combine.
     pub spill_dir: &'a Path,
+    /// Whether partition spill files are LZ4-compressed. Resolved by the
+    /// dispatcher from the workspace `[storage.spill] compress` knob against
+    /// this combine's output-schema width and the run's batch size, so the
+    /// build/probe/repartition spill files match what `--explain` reports.
+    pub spill_compress: bool,
     /// Shared with the registered `GraceHashConsumer` wrapper.
     /// Passed through to `GraceHashExecutor::new` so the operator's
     /// partition bytes mirror into the arbitrator's pull-mode
@@ -227,6 +232,11 @@ pub(crate) struct GraceHashExecutor {
     /// `bytes_estimated`. On-disk partitions don't count against
     /// `handle.bytes` — Velox's "reclaimable ≠ held" point.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Whether partition spill files are LZ4-compressed. Resolved by the
+    /// dispatcher from the workspace `[storage.spill] compress` knob against
+    /// this combine's output-schema width and the run's batch size, so the
+    /// on-disk format matches what `--explain` reports for the operator.
+    spill_compress: bool,
 }
 
 impl GraceHashExecutor {
@@ -239,6 +249,7 @@ impl GraceHashExecutor {
         partition_bits: u8,
         spill_dir: &Path,
         consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        spill_compress: bool,
     ) -> std::io::Result<Self> {
         let assigner = PartitionAssigner::new(partition_bits.max(1));
         let n = assigner.num_partitions();
@@ -257,6 +268,7 @@ impl GraceHashExecutor {
             hash_state: RandomState::new(),
             spilled_bytes: 0,
             consumer_handle,
+            spill_compress,
         })
     }
 
@@ -334,7 +346,12 @@ impl GraceHashExecutor {
                 }
             }
             Some(hash_bits) => {
-                let mut w = GraceSpillWriter::new(&self.spill_dir, hash_bits, p as u16)?;
+                let mut w = GraceSpillWriter::new(
+                    &self.spill_dir,
+                    hash_bits,
+                    p as u16,
+                    self.spill_compress,
+                )?;
                 w.write_record(&record)?;
                 let (new_path, written) = w.finish()?;
                 self.spilled_bytes = self.spilled_bytes.saturating_add(written);
@@ -405,7 +422,12 @@ impl GraceHashExecutor {
                 return Ok(());
             }
         };
-        let mut writer = GraceSpillWriter::new(&self.spill_dir, hash_bits, partition_id)?;
+        let mut writer = GraceSpillWriter::new(
+            &self.spill_dir,
+            hash_bits,
+            partition_id,
+            self.spill_compress,
+        )?;
         let count = records.len() as u64;
         for r in records {
             writer.write_record(&r)?;
@@ -514,6 +536,7 @@ impl GraceHashExecutor {
                         // it serves as a probe-vs-build tag at the
                         // file-name level for diagnostic clarity.
                         (p as u16) | 0x8000,
+                        self.spill_compress,
                     )?));
                 }
                 let w = probe_writer.as_mut().unwrap();
@@ -618,6 +641,7 @@ pub(crate) fn execute_combine_grace_hash(
         ctx,
         budget,
         spill_dir,
+        spill_compress,
         consumer_handle,
         strategy,
     } = args;
@@ -686,13 +710,12 @@ pub(crate) fn execute_combine_grace_hash(
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
 
     let mut executor =
-        GraceHashExecutor::new(partition_bits, spill_dir, consumer_handle).map_err(|e| {
-            PipelineError::Internal {
+        GraceHashExecutor::new(partition_bits, spill_dir, consumer_handle, spill_compress)
+            .map_err(|e| PipelineError::Internal {
                 op: "combine",
                 node: name.to_string(),
                 detail: format!("grace hash spill dir bind failed: {e}"),
-            }
-        })?;
+            })?;
 
     // ── Build phase ────────────────────────────────────────────────────
     //
@@ -843,6 +866,7 @@ pub(crate) fn execute_combine_grace_hash(
         build_schema: Arc::clone(&build_schema),
         driver_schema: Arc::clone(&driver_schema),
         spill_dir: &spill_dir_path,
+        spill_compress,
         hash_state: &hash_state,
     };
     for sp in spilled {
