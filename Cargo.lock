@@ -533,6 +533,7 @@ dependencies = [
  "indexmap",
  "lz4_flex",
  "miette",
+ "nix",
  "petgraph",
  "postcard",
  "regex",

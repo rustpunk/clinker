@@ -522,12 +522,21 @@ impl StagingPolicy {
 
         // Same-volume refusal applies only to matched sources: a source the
         // patterns do not select is read in place regardless of where it
-        // lives, so its volume is irrelevant.
+        // lives, so its volume is irrelevant. The same-device probe is the
+        // shared filesystem-detection facade — the config layer and the
+        // executor-startup checks resolve "same volume?" through one
+        // implementation rather than each carrying its own.
         for src in source_paths {
             if !self.pattern_matches(src) {
                 continue;
             }
-            if same_volume(dir, src)? {
+            let same = crate::config::fs_type::same_device(dir, src).map_err(|e| {
+                StorageConfigError::StagingDirNotWritable {
+                    path: src.clone(),
+                    source: e.to_string(),
+                }
+            })?;
+            if same {
                 return Err(StorageConfigError::StagingSameVolume {
                     staging_dir: dir.clone(),
                     source: src.clone(),
@@ -537,77 +546,6 @@ impl StagingPolicy {
 
         Ok(())
     }
-}
-
-/// Whether two existing paths reside on the same storage volume.
-///
-/// Used to refuse a staging dir on the same volume as a matched source:
-/// copying within one volume moves no I/O off the slow share. On Unix,
-/// compares the device id (`st_dev`) of each path. On Windows, compares the
-/// volume mount root (`GetVolumePathNameW`). On any other target, falls back
-/// to a path-prefix comparison.
-///
-/// # Errors
-///
-/// Returns [`StorageConfigError::StagingDirNotWritable`] when a path's
-/// volume cannot be determined (it could not be stat'd / queried), naming
-/// the offending path so the operator can correct it.
-#[cfg(unix)]
-fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    let dev = |p: &Path| -> Result<u64, StorageConfigError> {
-        std::fs::metadata(p).map(|m| m.dev()).map_err(|e| {
-            StorageConfigError::StagingDirNotWritable {
-                path: p.to_path_buf(),
-                source: e.to_string(),
-            }
-        })
-    };
-    Ok(dev(a)? == dev(b)?)
-}
-
-/// Windows volume comparison via `GetVolumePathNameW`, which maps a path to
-/// the mount root of the volume that contains it. Two paths share a volume
-/// exactly when their mount roots are equal — this distinguishes distinct
-/// mount points that share a drive letter, which a prefix compare cannot.
-#[cfg(windows)]
-fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
-    Ok(volume_root(a)? == volume_root(b)?)
-}
-
-#[cfg(windows)]
-fn volume_root(path: &Path) -> Result<std::ffi::OsString, StorageConfigError> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
-
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // MAX_PATH is the documented ceiling for a volume mount-point string.
-    let mut buf = vec![0u16; 260];
-    // SAFETY: `wide` is a NUL-terminated UTF-16 path; `buf` is a writable
-    // u16 buffer whose length is passed as the capacity, exactly as the
-    // GetVolumePathNameW contract requires.
-    let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-    if ok == 0 {
-        return Err(StorageConfigError::StagingDirNotWritable {
-            path: path.to_path_buf(),
-            source: std::io::Error::last_os_error().to_string(),
-        });
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Ok(std::ffi::OsString::from_wide(&buf[..len]))
-}
-
-/// Fallback volume comparison for targets that are neither Unix nor Windows:
-/// compares the path's root prefix component. Coarser than the device-id /
-/// mount-root checks above, but every currently-supported target hits one of
-/// those, so this arm only exists to keep the function total.
-#[cfg(not(any(unix, windows)))]
-fn same_volume(a: &Path, b: &Path) -> Result<bool, StorageConfigError> {
-    Ok(a.components().next() == b.components().next())
 }
 
 /// Failure modes when loading or validating `[storage]` configuration.

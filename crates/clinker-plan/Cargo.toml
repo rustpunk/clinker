@@ -31,11 +31,23 @@ lz4_flex = "0.11"
 # pipeline `exclude:` pattern share one grammar.
 glob = "0.3"
 
-# GetVolumePathNameW backs the Windows same-volume check that refuses a
-# staging dir on the source's own volume; the Unix path uses libstd's
-# MetadataExt and needs no extra crate.
+# statfs(2) backs the filesystem-type detection facade (fs_type.rs) on
+# Linux/macOS: `f_type` magic numbers on Linux, `f_fstypename` strings on
+# macOS. The `fs` feature gates the `nix::sys::statfs` module. same-device
+# uses libstd's MetadataExt and needs no extra crate.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+# The Windows fs_type detection facade probes the volume behind a path:
+# GetVolumePathNameW (mount root) + GetDriveTypeW (DRIVE_REMOTE/DRIVE_RAMDISK)
+# for fs-kind, and CreateFileW + GetVolumeInformationByHandleW (volume serial)
+# for same-device. The Unix path needs no extra crate.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
-    "Win32_Storage_FileSystem",
     "Win32_Foundation",
+    # CreateFileW's signature references SECURITY_ATTRIBUTES, so windows-sys
+    # gates it behind Win32_Security even though we pass a null pointer for it.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
 ] }
