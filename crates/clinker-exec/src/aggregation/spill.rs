@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use clinker_plan::SpillError;
 use clinker_record::GroupByKey;
 
 use super::error::HashAggError;
@@ -72,12 +73,21 @@ pub(super) struct AggSpillWriter {
 
 impl AggSpillWriter {
     pub(super) fn new(spill_dir: Option<&std::path::Path>) -> Result<Self, HashAggError> {
-        let temp_file = if let Some(dir) = spill_dir {
-            tempfile::NamedTempFile::new_in(dir)
-        } else {
-            tempfile::NamedTempFile::new()
-        }
-        .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        // A create failure in a spill dir the run validated at startup means
+        // the directory went bad mid-run (unmounted, removed, remounted
+        // read-only). Classify it through the shared `from_spill_dir_io`
+        // helper so the aggregate path surfaces the same `DirUnavailable`
+        // diagnostic the node-buffer and sort spill paths do, rather than
+        // folding a directory fault into a generic spill-failed string. With
+        // no configured dir (OS temp), a create failure is environment-level
+        // and stays a generic spill error.
+        let temp_file = match spill_dir {
+            Some(dir) => tempfile::NamedTempFile::new_in(dir)
+                .map_err(|e| HashAggError::SpillDir(SpillError::from_spill_dir_io(dir, e)))?,
+            None => {
+                tempfile::NamedTempFile::new().map_err(|e| HashAggError::Spill(e.to_string()))?
+            }
+        };
         let buf_writer = std::io::BufWriter::new(temp_file);
         let encoder = lz4_flex::frame::FrameEncoder::new(buf_writer);
         Ok(Self { encoder })
@@ -158,5 +168,55 @@ impl AggSpillReader {
             group_key: entry.group_key,
             state: entry.state,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_plan::error::PipelineError;
+
+    #[test]
+    fn spill_dir_removed_mid_run_yields_distinct_diagnostic() {
+        // Mirror of the node-buffer/sort spill regression: a configured
+        // aggregate spill dir that vanishes after startup validation must
+        // surface the distinct `DirUnavailable` diagnostic, not a generic
+        // `HashAggError::Spill(String)` that folds into an opaque internal
+        // error. This is the aggregate half of the documented "Aggregate,
+        // sort, and grace-hash Combine all surface the directory-level
+        // cause" guarantee.
+        let scratch = tempfile::tempdir().unwrap();
+        let spill_dir = scratch.path().join("agg-spill-root");
+        std::fs::create_dir(&spill_dir).unwrap();
+        std::fs::remove_dir(&spill_dir).unwrap();
+
+        let err = match AggSpillWriter::new(Some(&spill_dir)) {
+            Ok(_) => panic!("AggSpillWriter::new should fail when the dir is gone"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                &err,
+                HashAggError::SpillDir(SpillError::DirUnavailable { .. })
+            ),
+            "expected SpillDir(DirUnavailable), got {err:?}"
+        );
+
+        // The mapping into the top-level error must land on the spill
+        // arm so the rendered diagnostic is the directory-level message,
+        // not a generic `Internal`.
+        let pipeline_err: PipelineError = err.into();
+        assert!(
+            matches!(
+                pipeline_err,
+                PipelineError::Spill(SpillError::DirUnavailable { .. })
+            ),
+            "expected PipelineError::Spill(DirUnavailable), got {pipeline_err:?}"
+        );
+        let rendered = pipeline_err.to_string();
+        assert!(
+            rendered.contains("became unavailable mid-run"),
+            "{rendered}"
+        );
     }
 }

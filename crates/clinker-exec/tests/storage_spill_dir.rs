@@ -1,15 +1,16 @@
 //! End-to-end coverage for the workspace `[storage.spill] dir` redirect.
 //!
 //! Confirms that a configured spill root actually receives the per-run
-//! `clinker-spill-*` directory — the issue-169 acceptance criterion — and
-//! that an unconfigured run still spills to the OS temp dir.
+//! `clinker-spill-*` directory — the configurable-spill-location acceptance
+//! criterion.
 //!
 //! The per-run spill directory is created under the configured root at run
-//! start and recursively removed at run end, so a watcher thread polls the
-//! configured root for a `clinker-spill-*` entry while the run is in flight.
-//! Forcing a real disk spill needs RSS-based admission, so the spill
-//! assertion is skipped on platforms without RSS readings; the directory
-//! redirect itself does not depend on a spill firing.
+//! start (unconditionally — before any spill admission decision) and
+//! recursively removed at run end, so a watcher thread polls the configured
+//! root for a `clinker-spill-*` entry while the run is in flight. The
+//! redirect therefore holds on every platform regardless of whether a real
+//! RSS-driven spill ever fires, so this test runs and asserts the same
+//! invariant on Linux, Windows, and macOS.
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
@@ -86,13 +87,10 @@ fn has_spill_subdir(dir: &std::path::Path) -> bool {
 
 #[test]
 fn spill_dir_setting_redirects_per_run_spill_directory() {
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        // The per-run spill root is created regardless of RSS, but driving a
-        // pipeline that actually exercises the spill path is what makes this
-        // test meaningful; without RSS the admission predicate never trips.
-        return;
-    }
-
+    // No RSS gate: the per-run spill root is created unconditionally at run
+    // start, before any spill-admission decision, so the redirect is
+    // observable on every platform — including those without RSS readings,
+    // where the admission predicate never trips and no real spill fires.
     let spill_root = tempfile::tempdir().expect("create custom spill root");
     let spill_root_path = spill_root.path().to_path_buf();
 

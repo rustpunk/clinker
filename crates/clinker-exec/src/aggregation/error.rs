@@ -9,6 +9,7 @@
 use clinker_record::accumulator::AccumulatorError;
 use cxl::eval::EvalError;
 
+use clinker_plan::SpillError;
 use clinker_plan::error::PipelineError;
 
 /// Errors that can arise while evaluating a residual in aggregate
@@ -49,10 +50,21 @@ pub enum HashAggError {
         row: u64,
         message: String,
     },
-    /// Spill path raised an I/O error. Stub until 16.3.10 lands the
-    /// real spill writer integration.
+    /// A spill write, read, or decode raised a genuine byte-stream
+    /// fault (a short read, an `ENOSPC`, a postcard/LZ4 decode error).
+    /// Distinct from [`HashAggError::SpillDir`]: this is a fault on the
+    /// bytes, not on the directory hosting them.
     #[error("spill failed: {0}")]
     Spill(String),
+    /// The spill root directory became unusable mid-run while creating a
+    /// spill file (removed, unmounted, remounted read-only, permissions
+    /// revoked) after the run validated it at startup. Carries the
+    /// classified [`SpillError::DirUnavailable`] so the executor surfaces
+    /// the same directory-level diagnostic that the node-buffer and sort
+    /// spill paths emit, rather than folding a directory fault into a
+    /// generic internal error.
+    #[error("{0}")]
+    SpillDir(SpillError),
     /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). Routed
     /// to `PipelineError::Accumulator` by the 16.3.13 dispatch arm.
     #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source:?}")]
@@ -96,13 +108,17 @@ pub enum HashAggError {
 }
 
 /// Map a `HashAggError` to a `PipelineError` for the executor dispatch
-/// arm. Accumulator-finalize errors get a dedicated typed variant; the
-/// remaining cases are wrapped in `PipelineError::Eval` (data errors) or
-/// `PipelineError::Internal` (engine bugs / unsupported residuals).
+/// arm. Accumulator-finalize errors get a dedicated typed variant; a
+/// mid-run spill-directory fault maps to `PipelineError::Spill` so it
+/// renders with the same `DirUnavailable` diagnostic the node-buffer and
+/// sort paths use; the remaining cases are wrapped in `PipelineError::Eval`
+/// (data errors) or `PipelineError::Internal` (engine bugs / unsupported
+/// residuals).
 impl From<HashAggError> for PipelineError {
     fn from(e: HashAggError) -> Self {
         match e {
             HashAggError::EvalFailed(eval) => PipelineError::Eval(eval),
+            HashAggError::SpillDir(spill) => PipelineError::Spill(spill),
             HashAggError::GroupKey {
                 field,
                 row,

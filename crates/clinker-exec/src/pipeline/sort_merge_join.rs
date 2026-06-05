@@ -48,7 +48,9 @@ use indexmap::IndexMap;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor};
-use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
+use crate::pipeline::grace_spill::{
+    GraceSpillError, GraceSpillReader, GraceSpillWriter, SpillFilePath, grace_spill_error,
+};
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -136,7 +138,7 @@ fn push_to_buffer(
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
-) -> std::io::Result<u64> {
+) -> Result<u64, GraceSpillError> {
     let incoming = std::mem::size_of::<Record>() + record.estimated_heap_size();
     match buf {
         MatchingRunBuffer::InMemory { records, bytes } => {
@@ -208,7 +210,7 @@ fn write_spill_segment(
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
     records: &[Record],
-) -> std::io::Result<(SpillFilePath, u64)> {
+) -> Result<(SpillFilePath, u64), GraceSpillError> {
     let seq = *spill_seq;
     *spill_seq = spill_seq.wrapping_add(1);
     let mut writer = GraceSpillWriter::new(spill_dir, 0, (seq & 0xFFFF) as u16)?;
@@ -1139,11 +1141,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     spill_seq,
                     consumer_handle,
                 )
-                .map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("sort-merge matching-run spill failed: {e}"),
-                })?;
+                .map_err(|e| grace_spill_error(e, name, "sort-merge matching-run spill failed"))?;
                 if written > 0 && budget.record_spill_bytes(written) {
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),

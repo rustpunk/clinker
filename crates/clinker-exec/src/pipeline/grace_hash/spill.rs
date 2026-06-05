@@ -16,7 +16,9 @@ use super::build::{BuildChunkIter, Hll, PartitionAssigner};
 use super::probe::{EmitArgs, GraceEmitSink, emit_for_probe};
 use crate::executor::combine::CombineResolver;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
-use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
+use crate::pipeline::grace_spill::{
+    GraceSpillReader, GraceSpillWriter, SpillFilePath, grace_spill_error,
+};
 use crate::pipeline::memory::MemoryArbitrator;
 use clinker_plan::BudgetCategory;
 use clinker_plan::error::PipelineError;
@@ -263,23 +265,14 @@ pub(super) fn process_spilled_partition(
             let bcount = child_build.len() as u64;
             let mut bw =
                 GraceSpillWriter::new(spill_dir, child_assigner.hash_bits(), child_id as u16)
-                    .map_err(|e| PipelineError::Internal {
-                        op: "combine",
-                        node: name.to_string(),
-                        detail: format!("grace hash repartition build writer: {e}"),
-                    })?;
+                    .map_err(|e| grace_spill_error(e, name, "repartition build writer"))?;
             for r in &child_build {
-                bw.write_record(r).map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash repartition build write: {e}"),
-                })?;
+                bw.write_record(r)
+                    .map_err(|e| grace_spill_error(e, name, "repartition build write"))?;
             }
-            let (bpath, b_written) = bw.finish().map_err(|e| PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash repartition build finalize: {e}"),
-            })?;
+            let (bpath, b_written) = bw
+                .finish()
+                .map_err(|e| grace_spill_error(e, name, "repartition build finalize"))?;
             if budget.record_spill_bytes(b_written) {
                 return Err(PipelineError::MemoryBudgetExceeded {
                     node: name.to_string(),
@@ -299,23 +292,14 @@ pub(super) fn process_spilled_partition(
                     child_assigner.hash_bits(),
                     (child_id as u16) | 0x8000,
                 )
-                .map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash repartition probe writer: {e}"),
-                })?;
+                .map_err(|e| grace_spill_error(e, name, "repartition probe writer"))?;
                 for r in &child_probe {
-                    pw.write_record(r).map_err(|e| PipelineError::Internal {
-                        op: "combine",
-                        node: name.to_string(),
-                        detail: format!("grace hash repartition probe write: {e}"),
-                    })?;
+                    pw.write_record(r)
+                        .map_err(|e| grace_spill_error(e, name, "repartition probe write"))?;
                 }
-                let (p, p_written) = pw.finish().map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash repartition probe finalize: {e}"),
-                })?;
+                let (p, p_written) = pw
+                    .finish()
+                    .map_err(|e| grace_spill_error(e, name, "repartition probe finalize"))?;
                 if budget.record_spill_bytes(p_written) {
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),
