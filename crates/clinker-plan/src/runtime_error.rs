@@ -25,7 +25,10 @@ pub enum SpillError {
     /// (an NFS remount, a volume unmount, an over-eager temp-file cleaner)
     /// rather than reading as a generic byte-stream I/O failure. Carries the
     /// offending directory path and the underlying OS message.
-    DirUnavailable { dir: String, source: String },
+    DirUnavailable {
+        dir: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for SpillError {

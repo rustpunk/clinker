@@ -584,7 +584,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let storage_config = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?
         .storage;
-    let spill_root_dir = storage_config.spill.resolve().map_err(storage_config_error)?;
+    let spill_root_dir = storage_config
+        .spill
+        .resolve()
+        .map_err(storage_config_error)?;
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -675,9 +678,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 // `storage.spill.dir` when set, the OS temp dir otherwise, so
                 // an operator can confirm where blocking operators will spill
                 // before committing to the run.
-                let spill_root_display = spill_root_dir
-                    .clone()
-                    .unwrap_or_else(std::env::temp_dir);
+                let spill_root_display = spill_root_dir.clone().unwrap_or_else(std::env::temp_dir);
                 let spill_root_source = if spill_root_dir.is_some() {
                     "storage.spill.dir"
                 } else {

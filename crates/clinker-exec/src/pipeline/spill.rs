@@ -461,6 +461,9 @@ mod tests {
         // The rendered message names the directory and is distinct from the
         // generic spill I/O wording.
         let rendered = err.to_string();
-        assert!(rendered.contains("became unavailable mid-run"), "{rendered}");
+        assert!(
+            rendered.contains("became unavailable mid-run"),
+            "{rendered}"
+        );
     }
 }

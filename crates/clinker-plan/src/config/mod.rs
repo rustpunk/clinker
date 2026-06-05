@@ -38,8 +38,6 @@ pub use route::*;
 pub use scoped_var::*;
 pub use sort::*;
 pub use source::*;
-pub use storage::{
-    ClinkerToml, SpillConfig, StagingConfig, StorageConfig, StorageConfigError,
-};
+pub use storage::{ClinkerToml, SpillConfig, StagingConfig, StorageConfig, StorageConfigError};
 pub use transform::*;
 pub use utils::*;
