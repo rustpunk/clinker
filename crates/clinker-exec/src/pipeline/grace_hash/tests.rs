@@ -640,10 +640,12 @@ fn execute_grace_hash_spill_then_reload_correct() {
 }
 
 /// Disk-quota gate: a build phase that spills more than the
-/// configured `max_spill_bytes` aborts with E310 instead of
-/// continuing to fill the disk. The hard memory limit is large
-/// (so `should_abort` never fires); only the disk quota can
-/// cause this combine to fail.
+/// configured `max_spill_bytes` aborts with the dedicated
+/// `SpillCapExceeded` (E320) surface instead of continuing to fill
+/// the disk. The hard memory limit is large (so `should_abort`
+/// never fires); only the disk quota can cause this combine to
+/// fail, and the cap error must NOT masquerade as an out-of-memory
+/// E310.
 #[test]
 fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     use crate::executor::combine::CombineResolverMapping;
@@ -806,21 +808,21 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
 
     let err = result.expect_err("disk quota must abort the combine");
     match &err {
-        PipelineError::MemoryBudgetExceeded {
+        PipelineError::SpillCapExceeded {
             node,
-            source,
-            detail,
-            ..
+            cap,
+            attempted,
+            current,
         } => {
             assert_eq!(node, "grace_quota_test");
-            assert_eq!(*source, BudgetCategory::Arena);
-            let detail = detail.as_deref().unwrap_or("");
+            assert_eq!(*cap, 64, "reported cap must equal the configured quota");
+            assert!(*attempted > 0, "the overflowing flush must report its size");
             assert!(
-                detail.contains("disk-spill quota"),
-                "detail must mention disk-spill quota; got {detail:?}"
+                *current > *cap,
+                "cumulative spilled ({current}) must exceed the cap ({cap})"
             );
         }
-        other => panic!("disk-quota overflow must surface MemoryBudgetExceeded; got {other:?}"),
+        other => panic!("disk-quota overflow must surface SpillCapExceeded; got {other:?}"),
     }
     assert!(
         budget.cumulative_spill_bytes() > 64,

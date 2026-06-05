@@ -37,7 +37,6 @@ use std::sync::Arc;
 
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
-use clinker_plan::BudgetCategory;
 use clinker_plan::error::PipelineError;
 
 /// Default per-batch event count when no `pipeline.batch_size` knob and
@@ -348,7 +347,7 @@ impl StreamingChargeHandle {
     /// regardless of whether the batch round-tripped through disk. An
     /// empty run is a no-op (no spill file). Records the spilled file's
     /// on-disk size against the arbitrator's disk quota and surfaces
-    /// `MemoryBudgetExceeded` when the cumulative total exceeds the cap.
+    /// `SpillCapExceeded` (E320) when the cumulative total exceeds the cap.
     fn spill_and_forward_run(
         &self,
         run: Vec<(clinker_record::Record, u64)>,
@@ -363,13 +362,12 @@ impl StreamingChargeHandle {
         };
         let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
         if self.arbitrator.record_spill_bytes(file_bytes) {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: self.node_name.clone(),
-                used: self.arbitrator.cumulative_spill_bytes(),
-                limit: self.arbitrator.max_spill_bytes(),
-                source: BudgetCategory::NodeBuffer,
-                detail: Some("spill quota exceeded".to_string()),
-            });
+            return Err(PipelineError::spill_cap_exceeded(
+                self.node_name.clone(),
+                self.arbitrator.max_spill_bytes(),
+                file_bytes,
+                self.arbitrator.cumulative_spill_bytes(),
+            ));
         }
         for item in file.reader()? {
             let (record, rn) = item?;

@@ -24,7 +24,7 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
@@ -43,6 +43,13 @@ use clinker_plan::SpillError;
 pub struct SpillWriter<P> {
     encoder: FrameEncoder<BufWriter<NamedTempFile>>,
     schema: Arc<Schema>,
+    /// Directory the spill file lives in, retained so a mid-stream write or
+    /// finalize fault can be classified against it: an `ENOSPC` becomes
+    /// `SpillError::DiskFull` and a directory-level fault becomes
+    /// `SpillError::DirUnavailable`, rather than both collapsing into the
+    /// generic `Io` variant. Holds the OS temp dir when no explicit spill
+    /// dir was configured, so the diagnostic still names a real path.
+    spill_dir: PathBuf,
     _payload: PhantomData<P>,
 }
 
@@ -52,12 +59,16 @@ impl<P: Serialize> SpillWriter<P> {
     pub fn new(schema: Arc<Schema>, spill_dir: Option<&Path>) -> Result<Self, SpillError> {
         // A create failure in a spill dir the run validated at startup means
         // the directory went bad mid-run (unmounted, removed, remounted
-        // read-only). `from_spill_dir_io` lifts those into the distinct
-        // `DirUnavailable` diagnostic rather than a generic spill I/O error.
+        // read-only) or the volume is full. `from_spill_dir_io` lifts those
+        // into the distinct `DirUnavailable` / `DiskFull` diagnostics rather
+        // than a generic spill I/O error.
+        let resolved_dir = spill_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
         let temp_file = if let Some(dir) = spill_dir {
             NamedTempFile::new_in(dir).map_err(|e| SpillError::from_spill_dir_io(dir, e))?
         } else {
-            NamedTempFile::new()?
+            NamedTempFile::new().map_err(|e| SpillError::from_spill_dir_io(&resolved_dir, e))?
         };
 
         let buf_writer = BufWriter::new(temp_file);
@@ -67,12 +78,17 @@ impl<P: Serialize> SpillWriter<P> {
         // Kept as JSON so the header is human-inspectable without a postcard decoder.
         let columns: Vec<&str> = schema.columns().iter().map(|c| &**c).collect();
         let schema_json = serde_json::to_string(&columns)?;
-        encoder.write_all(schema_json.as_bytes())?;
-        encoder.write_all(b"\n")?;
+        encoder
+            .write_all(schema_json.as_bytes())
+            .map_err(|e| SpillError::from_spill_dir_io(&resolved_dir, e))?;
+        encoder
+            .write_all(b"\n")
+            .map_err(|e| SpillError::from_spill_dir_io(&resolved_dir, e))?;
 
         Ok(SpillWriter {
             encoder,
             schema,
+            spill_dir: resolved_dir,
             _payload: PhantomData,
         })
     }
@@ -89,8 +105,14 @@ impl<P: Serialize> SpillWriter<P> {
         };
         let bytes = postcard::to_stdvec(&(&rec_payload, payload))?;
         let len = bytes.len() as u32;
-        self.encoder.write_all(&len.to_le_bytes())?;
-        self.encoder.write_all(&bytes)?;
+        // Classify a write fault against the spill directory so an `ENOSPC`
+        // mid-stream surfaces as `DiskFull` (E321), not a generic `Io`.
+        self.encoder
+            .write_all(&len.to_le_bytes())
+            .map_err(|e| SpillError::from_spill_dir_io(&self.spill_dir, e))?;
+        self.encoder
+            .write_all(&bytes)
+            .map_err(|e| SpillError::from_spill_dir_io(&self.spill_dir, e))?;
         Ok(())
     }
 
@@ -104,10 +126,19 @@ impl<P: Serialize> SpillWriter<P> {
 
     /// Flush, finalize LZ4 frame, return handle to the completed spill file.
     pub fn finish(self) -> Result<SpillFile<P>, SpillError> {
-        let buf_writer = self.encoder.finish()?;
+        let spill_dir = self.spill_dir;
+        // The encoder's buffered tail flushes here; an `ENOSPC` on that final
+        // flush is the disk filling, classified as `DiskFull` (E321). The lz4
+        // frame error preserves the underlying `io::Error` (and its
+        // `StorageFull` kind) through its `Into<io::Error>` conversion, so the
+        // classifier still sees the real cause rather than a flattened "other".
+        let buf_writer = self
+            .encoder
+            .finish()
+            .map_err(|e| SpillError::from_spill_dir_io(&spill_dir, std::io::Error::from(e)))?;
         let temp_file = buf_writer
             .into_inner()
-            .map_err(|e| SpillError::Io(e.into_error()))?;
+            .map_err(|e| SpillError::from_spill_dir_io(&spill_dir, e.into_error()))?;
         let path = temp_file.into_temp_path();
         Ok(SpillFile {
             path,

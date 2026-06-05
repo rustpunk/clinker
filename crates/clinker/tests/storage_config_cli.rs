@@ -117,6 +117,71 @@ fn explain_surfaces_resolved_spill_root() {
 }
 
 #[test]
+fn explain_surfaces_resolved_disk_cap() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, PIPELINE_YAML).expect("write pipeline yaml");
+
+    // A configured disk cap is parsed via the shared ByteSize grammar and
+    // threaded into the run; --explain echoes the resolved byte count so an
+    // operator can confirm it before committing to a run that might spill.
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        "[storage.spill]\ndisk_cap_bytes = \"10GB\"\n",
+    )
+    .expect("write clinker.toml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .arg("--explain")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "explain with a valid disk cap must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        // 10GB in decimal ByteSize units = 10_000_000_000 bytes.
+        stdout.contains("Spill disk cap: 10000000000 bytes [storage.spill.disk_cap_bytes]"),
+        "explain must surface the resolved disk cap; got:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn explain_without_disk_cap_shows_unlimited() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, PIPELINE_YAML).expect("write pipeline yaml");
+    // No clinker.toml: the spill cap falls back to unlimited.
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .arg("--explain")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "explain with no disk cap must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Spill disk cap: unlimited (default)"),
+        "explain must label the default unlimited cap; got:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn explain_without_storage_block_shows_default_spill_root() {
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");

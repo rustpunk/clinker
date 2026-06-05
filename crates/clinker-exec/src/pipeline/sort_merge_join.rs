@@ -1143,15 +1143,12 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                 )
                 .map_err(|e| grace_spill_error(e, name, "sort-merge matching-run spill failed"))?;
                 if written > 0 && budget.record_spill_bytes(written) {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: budget.cumulative_spill_bytes(),
-                        limit: budget.disk_quota(),
-                        source: BudgetCategory::Arena,
-                        detail: Some(
-                            "sort-merge matching-run exceeded disk-spill quota".to_string(),
-                        ),
-                    });
+                    return Err(PipelineError::spill_cap_exceeded(
+                        name,
+                        budget.disk_quota(),
+                        written,
+                        budget.cumulative_spill_bytes(),
+                    ));
                 }
                 if was_inmemory && matches!(run, MatchingRunBuffer::Spilled { .. }) {
                     spilled_this_run = true;

@@ -146,32 +146,24 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
                 "the wrapper must name the user-visible composition call-site",
             );
             match *inner {
-                PipelineError::MemoryBudgetExceeded {
+                PipelineError::SpillCapExceeded {
                     node,
-                    source,
-                    used,
-                    limit,
-                    detail,
+                    cap,
+                    attempted,
+                    current,
                 } => {
                     assert_eq!(
                         node, "data",
                         "the boundary overflow must name the body's port-source node",
                     );
+                    assert_eq!(cap, 1, "reported cap must equal the one-byte quota");
+                    assert!(attempted > 0, "the overflowing flush must report its size");
                     assert!(
-                        matches!(source, clinker_plan::BudgetCategory::NodeBuffer),
-                        "port admission must surface under NodeBuffer; got {source:?}",
-                    );
-                    assert_eq!(
-                        detail.as_deref(),
-                        Some("spill quota exceeded"),
-                        "the body admission uses the same disk-spill-quota gate as every slot",
-                    );
-                    assert!(
-                        used > limit,
-                        "reported used ({used}) must exceed the spill quota ({limit})",
+                        current > cap,
+                        "reported cumulative spilled ({current}) must exceed the cap ({cap})",
                     );
                 }
-                other => panic!("expected inner MemoryBudgetExceeded; got: {other:?}"),
+                other => panic!("expected inner SpillCapExceeded; got: {other:?}"),
             }
         }
         other => panic!("expected outer CompositionBodyError; got: {other:?}"),

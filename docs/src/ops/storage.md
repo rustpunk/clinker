@@ -15,6 +15,7 @@ the per-pipeline YAML:
 ```toml
 [storage.spill]
 dir = "/var/clinker/spill"   # optional; default = OS temp dir
+disk_cap_bytes = "10GB"      # optional; default = unlimited
 
 [storage.staging]
 enabled = false              # parsed but inactive — staging is not yet implemented
@@ -68,6 +69,72 @@ Spill root: /var/clinker/spill [storage.spill.dir]
 Spill root: /tmp [OS temp dir (default)]
 ```
 
+The same `--explain` output reports the resolved disk cap on the next line:
+
+```text
+Spill disk cap: 10737418240 bytes [storage.spill.disk_cap_bytes]
+```
+
+…or, with no cap configured:
+
+```text
+Spill disk cap: unlimited (default)
+```
+
+## `storage.spill.disk_cap_bytes` — cap cumulative spill
+
+By default a run will spill as much as it needs, limited only by the physical
+space on the spill volume. `disk_cap_bytes` sets a **cumulative budget**: the
+total on-disk size of every spill file a run writes. When that running total
+would cross the cap, the run aborts with a dedicated diagnostic instead of
+continuing to fill the volume.
+
+```toml
+[storage.spill]
+dir = "/mnt/fast-ssd/clinker-spill"
+disk_cap_bytes = "50GB"
+```
+
+The value accepts the same human-readable byte-size grammar as the source
+size filters — a bare integer is bytes, and `KB`/`MB`/`GB` suffixes use
+decimal units (`1GB` = 1,000,000,000 bytes), matching `du`, `df`, and the AWS
+CLI. Omitting the key leaves spill unlimited, exactly as before.
+
+The cap is a **policy ceiling**, deliberately independent of both the memory
+budget and the physical volume size. A run can sit well inside its
+`memory.limit` and still exhaust local disk through an unbounded stream of
+spill files; the cap lets an operator bound that on a shared volume. It is the
+guard DataFusion shipped without ([apache/datafusion#15358]) until production
+runs filled volumes.
+
+## Distinguishing the four spill-related failure conditions
+
+Spill-related aborts are split into four distinct diagnostics so a single
+glance at the error tells you exactly what to fix — instead of every disk and
+memory problem rendering as one ambiguous "out of memory" message (the trap
+DuckDB hit in [duckdb/duckdb#14142], where a temp-dir cap was reported as
+"Out of Memory Error … 187.3 GiB/187.3 GiB used" and users inspected `df`
+only to find free space).
+
+| Condition | Code | What happened | What to do |
+| --- | --- | --- | --- |
+| **Out of memory** | E310 | An operator's in-RAM state crossed the hard `memory.limit` (a true RSS overrun). | Raise `memory.limit`, reduce input, or let the operator spill. |
+| **Spill cap exceeded** | E320 | Cumulative spill bytes crossed `storage.spill.disk_cap_bytes`. The volume may still have free space — you hit the configured budget. | Raise `disk_cap_bytes`, point `storage.spill.dir` at a larger volume, or reduce the spill footprint. |
+| **Spill volume full** | E321 | The OS reported the spill volume out of space (`ENOSPC`). The physical disk filled. | Free space on the volume, or move `storage.spill.dir` to a larger mount. |
+| **Spill directory unavailable** | (Spill) | The spill directory went bad mid-run — unmounted, remounted read-only, deleted by a cleaner, or permissions revoked. | Remount/restore the volume; stop the over-eager cleaner. |
+
+The key separations:
+
+- **E310 vs E320** — an OOM is an in-RAM overrun; a cap-exceeded is a
+  disk-budget stop. A run can hit E320 while comfortably inside its memory
+  envelope, so conflating the two would point you at the wrong knob.
+- **E320 vs E321** — E320 is the budget *you* set; E321 is the disk itself
+  running dry. If you removed `disk_cap_bytes`, an over-large run would no
+  longer trip E320 and would instead spill until the volume filled (E321).
+
+(A future per-operator memory-reservation surface will add a fifth,
+reservation-exhausted condition; it is not part of the engine yet.)
+
 ## Mid-run spill failures
 
 The startup check guarantees the spill directory is writable when the run
@@ -96,3 +163,5 @@ rejected as an unknown key.
 
 [`std::env::temp_dir`]: https://doc.rust-lang.org/std/env/fn.temp_dir.html
 [duckdb/duckdb#9401]: https://github.com/duckdb/duckdb/issues/9401
+[duckdb/duckdb#14142]: https://github.com/duckdb/duckdb/issues/14142
+[apache/datafusion#15358]: https://github.com/apache/datafusion/issues/15358

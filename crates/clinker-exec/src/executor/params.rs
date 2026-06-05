@@ -44,6 +44,15 @@ pub struct PipelineRunParams {
     /// path: a failure to create the spill root under it is an internal error,
     /// not a config error.
     pub spill_root_dir: Option<std::path::PathBuf>,
+    /// Cumulative disk-spill quota for the run, in bytes, resolved from the
+    /// workspace `clinker.toml` `[storage.spill] disk_cap_bytes` setting.
+    /// `None` (no setting, or no `clinker.toml`) → unlimited spill, the
+    /// historical default. `Some(cap)` is folded into the run's memory
+    /// arbitrator as `max_spill_bytes`; once the cumulative on-disk size of
+    /// the run's spill files crosses it, the spilling operator aborts with
+    /// `PipelineError::SpillCapExceeded` (E320) — a disk-cap surface kept
+    /// distinct from both the RSS budget (E310) and a full volume (E321).
+    pub spill_disk_cap_bytes: Option<u64>,
 }
 
 /// Summary returned after a pipeline execution completes (success or partial).
