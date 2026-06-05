@@ -3,6 +3,7 @@ pub mod compile_context;
 pub mod composition;
 pub mod error;
 pub mod format;
+pub mod fs_type;
 pub mod node_header;
 pub mod output;
 pub mod path_template;
@@ -27,6 +28,7 @@ pub use composition::{
 };
 pub use error::*;
 pub use format::*;
+pub use fs_type::{FsKind, classify, same_device};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use pipeline::*;
