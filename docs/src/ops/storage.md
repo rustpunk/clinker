@@ -364,6 +364,10 @@ directly under `dir`, deterministic across runs of the same source:
 - `<source-id>.manifest.json` — a sidecar recording the source's identity:
   its path, modification time, size, the BLAKE3 content hash, and the stage
   time.
+- `<source-id>.lock` — a small advisory-lock file that serializes concurrent
+  invocations staging the same source (see [the staging
+  cache](#the-staging-cache-on_existing)). It carries no data and persists
+  between runs as the per-source coordination point.
 
 `<source-id>` is derived from the source's canonical path, so the same source
 always resolves to the same staged file. That stability is what makes the
@@ -381,9 +385,10 @@ partial file a later run might trust:
    file, flushed and `fsync`'d, then **renamed** to `<source-id>.staged`. A
    rename is an atomic replace on Linux, macOS, and Windows (Windows 10 1607+),
    so a reader scanning for `.staged` files sees either nothing or the complete
-   file — never a half-written one. The `<run>` segment in the partial name lets
-   two concurrent invocations stage the same source without colliding on the
-   in-flight bytes.
+   file — never a half-written one. The `<run>` segment in the partial name
+   keeps any two in-flight copies of one source on distinct temp files, and the
+   per-source lock (see [the staging cache](#the-staging-cache-on_existing))
+   ensures only one of them ever runs at a time.
 3. **Durable rename.** On Linux/macOS the parent directory is `fsync`'d after
    the rename, because on ext4/xfs a rename is only crash-durable once the
    directory entry itself is flushed. On Windows the NTFS journal makes the
@@ -420,12 +425,16 @@ pipeline over an unchanged network share copies nothing on the second run. The
 freshness check is mtime + size, not a re-hash, so it is a cheap `stat` rather
 than a full read of the source.
 
-> Within a single run, `reuse` is correct for one invocation at a time. Running
-> several `clinker` invocations that stage the *same* shared source
-> concurrently is a separate concern addressed by a follow-up
-> concurrency-safety layer; the stable layout and manifest here are designed so
-> that layer can add an atomic-publish lock on top without changing the cache
-> shape.
+`reuse` is collision-safe across **concurrent** invocations. Under the
+partition-and-run model — several `clinker` processes over a partitioned input
+sharing one staging volume — two runs may stage the *same* shared source at the
+same time. They are serialized by a per-source advisory lock (a
+`<source-id>.lock` file under the staging root): the first run to take the lock
+copies and publishes, and every other run blocks on the lock, then acquires it,
+finds the now-fresh `.staged`, and reuses it. The result is exactly one copy of
+a given source no matter how many invocations race for it, and a reader always
+sees a complete `.staged` file (the atomic rename publish never exposes a
+half-written one).
 
 ### Cleanup (`on_success` | `always` | `never`)
 
@@ -449,17 +458,27 @@ its staged artifacts under the staging root. To stop that from accumulating
 across crashes, **every run performs an idempotent crash purge at startup**,
 before it stages anything. It reaps the artifact shapes a crash leaves behind:
 
-- a `*.partial` — an interrupted copy;
+- a `*.partial` — an interrupted copy. Reaped **only when its owning run is
+  dead** (see below), so a concurrent sibling's in-flight copy is never reaped;
 - a `*.staged` with no matching manifest — a copy that crashed before it could
   commit its manifest;
 - a `*.manifest.json` with no matching staged file.
 
 A clean pair (a `.staged` with its committed `.manifest.json`) is the reuse
 cache and is **kept** — the purge never removes a complete, trustworthy copy.
-The classification is by artifact shape alone, so it is safe to run while
-another invocation is staging (an in-flight copy is a `.partial`, which belongs
-to the writing run and is reclaimed by it, not by a concurrent purge of
-committed artifacts).
+A `.lock` file is the persistent per-source coordination point and is never
+reaped.
+
+Because several invocations can share one staging volume, the purge must not
+reap a live sibling's in-flight `.partial`. It tells a crash corpse from a live
+copy the same way the spill-directory purge does: a `.partial` is reaped only
+when the source's `.lock` is **acquirable** under a try-lock (no live process
+holds it, so the owner is gone) *and* the partial has aged past a short
+creation grace window (so a copy that has just started but not yet taken the
+lock is left alone). A partial whose lock is still held, or one too young to
+have been locked yet, is kept. This asks the operating system "is anyone still
+staging this?" rather than guessing, so a concurrent purge can never delete a
+running sibling's work.
 
 ### File permissions
 

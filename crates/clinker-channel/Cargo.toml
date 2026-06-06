@@ -26,6 +26,12 @@ uuid = { workspace = true }
 # removes the run's staged copies on drop — the same panic-safety story the
 # executor spill root uses.
 tempfile = "3"
+# Cross-platform OS advisory file lock (flock on Unix, LockFileEx on Windows)
+# behind one API. Serializes concurrent stages of the same source on a shared
+# staging volume and lets crash-purge tell a live sibling's in-flight partial
+# (lock held) from a crashed run's corpse (lock acquirable). Same primitive the
+# executor's spill crash-purge uses, so the kernel releases it on any exit.
+fs4 = { workspace = true }
 
 # posix_fadvise(POSIX_FADV_SEQUENTIAL) hints the kernel to ramp readahead for
 # the front-to-back staging copy. Linux-only; a no-op on other unixes and
