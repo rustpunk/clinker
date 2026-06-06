@@ -1522,8 +1522,9 @@ impl<'a> ExplainJson<'a> {
 /// Every field is structured rather than a stringified blob so downstream
 /// tooling (Kiln canvas, third-party consumers) can read per-stage spill
 /// estimates and the cap / staging summary without re-parsing prose. The
-/// CLI builds it via [`ExecutionPlanDag::spill_summary_json`] (the
-/// plan-derivable parts) plus the CLI-resolved spill root / cap / staging
+/// CLI assembles it from [`ExecutionPlanDag::estimated_spill_json`] and
+/// [`ExecutionPlanDag::spill_compression_json`] (the plan-derivable parts)
+/// plus the CLI-resolved spill root / cap / staging
 /// fields.
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageSummaryJson {
