@@ -84,16 +84,23 @@ Spill disk cap: 10737418240 bytes [storage.spill.disk_cap_bytes]
 Spill disk cap: unlimited (default)
 ```
 
-Finally, `--explain` reports the resolved compression decision per blocking
-operator, so you can see which spills will be LZ4-framed (`lz4`) and which will
-be written raw (`off`) before the run starts. Under `auto` the choice varies by
-operator width:
+Finally, `--explain` reports the resolved compression decision per
+spill-writing operator, so you can see which spills will be LZ4-framed (`lz4`)
+and which will be written raw (`off`) before the run starts. Under `auto` the
+choice varies by operator width:
 
 ```text
 Spill compression: Auto [storage.spill.compress]
   Aggregate 'totals' → lz4
   Sort 'by_amount' → off
 ```
+
+Only operators that actually write spill files appear here: the external sort,
+the hash Aggregate, and the grace-hash / sort-merge Combine. In-memory join
+strategies (the inline hash build/probe and the IEJoin range join) run their
+kernel entirely in RAM and never open a spill file, so spill compression does
+not apply to them and they are omitted from this list — even though they carry
+a spill priority for memory arbitration.
 
 ## `storage.spill.disk_cap_bytes` — cap cumulative spill
 
@@ -186,9 +193,11 @@ are comparing the same unit the actuals report.
 
 ### Estimated spill volume per stage
 
-The `=== Estimated Spill Volume ===` section lists one line per blocking stage
-(hash Aggregate, external sort, grace-hash / sort-merge / IEJoin / hash Combine)
-with its plan-time spill-volume estimate, followed by a total:
+The `=== Estimated Spill Volume ===` section lists one line per spill-writing
+stage (hash Aggregate, external sort, grace-hash / sort-merge Combine) with its
+plan-time spill-volume estimate, followed by a total. In-memory join strategies
+(inline hash build/probe, IEJoin) never write spill files, so they do not
+appear here and do not inflate the total:
 
 ```text
 === Estimated Spill Volume ===
@@ -265,6 +274,59 @@ Cap headroom: 5000000000 bytes free (5000000000 estimated of 10000000000 cap, 50
   [per invocation — does NOT account for sibling invocations sharing the spill
   volume under partition-and-run]
 ```
+
+### Machine-readable form — `--explain json`
+
+`clinker run --explain json` emits the whole plan as JSON for tooling (the Kiln
+canvas, dashboards, CI gates). The same storage observability the text form
+prints lives under a structured `storage_summary` object, so a consumer reads
+per-stage spill estimates and the cap / staging summary without re-parsing
+prose:
+
+```json
+{
+  "schema_version": "1",
+  "nodes": [ ... ],
+  "node_properties": { ... },
+  "storage_summary": {
+    "spill_root": { "path": "/mnt/fast-ssd/clinker-spill", "source": "storage.spill.dir" },
+    "spill_disk_cap_bytes": 1000000000,
+    "estimated_spill": {
+      "per_stage": [
+        { "node_name": "dept_totals", "display_name": "[aggregation:hash] dept_totals", "estimate_bytes": 1024 },
+        { "node_name": "by_amount", "display_name": "[sort] by_amount", "estimate_bytes": 4096 }
+      ],
+      "total_known_bytes": 5120,
+      "any_unknown": false
+    },
+    "spill_compression": {
+      "mode": "auto",
+      "per_operator": [
+        { "node_name": "dept_totals", "display_name": "[aggregation:hash] dept_totals", "compression": "lz4" },
+        { "node_name": "by_amount", "display_name": "[sort] by_amount", "compression": "off" }
+      ]
+    },
+    "cap_headroom": {
+      "headroom_bytes": 999994880,
+      "estimated_bytes": 5120,
+      "cap_bytes": 1000000000,
+      "pct_of_cap": 0.000512,
+      "over_threshold": false
+    },
+    "staging": { "enabled": false, "sources": [] }
+  }
+}
+```
+
+The fields mirror the text sections one-for-one: `estimated_spill` is the
+`=== Estimated Spill Volume ===` section (a stage whose volume is unknown at
+plan time carries `estimate_bytes: null` and sets `any_unknown: true`),
+`spill_compression` is the `Spill compression:` projection, `cap_headroom` is
+the cap-headroom line (omitted when no cap is configured or the estimate is
+zero), and `staging` is the `=== Staging Plan ===` section. The JSON and DOT
+formats emit only their machine payload — the human-readable
+`=== Resolved Outputs ===` preamble the text form prints is suppressed so the
+output parses cleanly.
 
 ### Post-run actuals — calibrating the estimate
 

@@ -962,8 +962,8 @@ impl ExecutionPlanDag {
 
     /// Render the per-blocking-stage estimated spill volume for `--explain`.
     ///
-    /// One line per spilling operator (hash Aggregate, external sort,
-    /// grace-hash / sort-merge / IEJoin / hash Combine) giving its plan-time
+    /// One line per spill-writing operator (external sort, hash Aggregate,
+    /// grace-hash / sort-merge Combine) giving its plan-time
     /// `predicted_peak_bytes` estimate, followed by a total. A stage whose
     /// volume is unknown at plan time (no on-disk file-size seed reached it —
     /// a `glob`/`regex` multi-file source, a network source, or a
@@ -1010,15 +1010,19 @@ impl ExecutionPlanDag {
     /// Render the per-blocking-operator spill-compression decision for the
     /// `--explain` text output.
     ///
-    /// Each operator that can spill (Aggregate, sort, grace-hash Combine —
-    /// the nodes that register a spillable consumer at runtime) gets one line
-    /// resolving `compress` against that operator's output-schema width and
-    /// the run's `batch_size`. Under [`CompressMode::Auto`] the decision
-    /// varies per operator because a wide operator clears the per-batch byte
+    /// Each operator that actually writes spill files (hash Aggregate,
+    /// external sort, grace-hash / sort-merge Combine — see
+    /// [`writes_spill_files`]) gets one line resolving `compress` against that
+    /// operator's output-schema width and the run's `batch_size`. In-memory
+    /// join strategies (inline hash build/probe, IEJoin) carry a
+    /// `spill_priority` for memory arbitration but never open a spill writer,
+    /// so they are excluded — spill compression has no meaning for state that
+    /// never reaches disk. Under [`CompressMode::Auto`] the decision varies
+    /// per operator because a wide operator clears the per-batch byte
     /// threshold a narrow one does not; `On` / `Off` report the same forced
     /// choice for every operator. The header line names the configured mode so
     /// an operator can confirm both the policy and its resolved effect before
-    /// a run. Returns an empty string when the plan has no spill-eligible
+    /// a run. Returns an empty string when the plan has no spill-writing
     /// operator.
     pub fn spill_compression_explain(
         &self,
@@ -1029,7 +1033,7 @@ impl ExecutionPlanDag {
             .topo_order
             .iter()
             .copied()
-            .filter(|&idx| arbitration_class(&self.graph[idx]).spill_priority.is_some())
+            .filter(|&idx| writes_spill_files(&self.graph[idx]))
             .collect();
         if blocking.is_empty() {
             return String::new();
@@ -1049,6 +1053,78 @@ impl ExecutionPlanDag {
             out.push_str(&format!("  {} → {chosen}\n", node.display_name()));
         }
         out
+    }
+
+    /// Structured per-stage spill estimate for the JSON `--explain` output.
+    ///
+    /// Mirrors [`Self::spill_estimate_explain`] field-for-field — the same
+    /// spill-writing operators, the same `unknown`-vs-bytes distinction
+    /// (rendered here as `None` vs `Some`), the same known-stage total — so
+    /// the JSON and text storage summaries cannot drift.
+    pub fn estimated_spill_json(&self) -> EstimatedSpillJson {
+        let mut per_stage = Vec::new();
+        let mut total_known_bytes: u64 = 0;
+        let mut any_unknown = false;
+        for est in self.per_stage_spill_estimates() {
+            let estimate_bytes = if est.estimate_bytes == 0 {
+                any_unknown = true;
+                None
+            } else {
+                total_known_bytes = total_known_bytes.saturating_add(est.estimate_bytes);
+                Some(est.estimate_bytes)
+            };
+            per_stage.push(StageSpillEstimateJson {
+                node_name: est.node_name,
+                display_name: est.display_name,
+                estimate_bytes,
+            });
+        }
+        EstimatedSpillJson {
+            per_stage,
+            total_known_bytes,
+            any_unknown,
+        }
+    }
+
+    /// Structured per-operator spill-compression decision for the JSON
+    /// `--explain` output.
+    ///
+    /// Mirrors [`Self::spill_compression_explain`]: the same spill-writing
+    /// operators (in-memory joins excluded), the same per-operator `lz4` /
+    /// `off` resolution against output-schema width and `batch_size`, under
+    /// the same configured mode.
+    pub fn spill_compression_json(
+        &self,
+        compress: crate::config::CompressMode,
+        batch_size: usize,
+    ) -> SpillCompressionJson {
+        let per_operator = self
+            .topo_order
+            .iter()
+            .copied()
+            .filter(|&idx| writes_spill_files(&self.graph[idx]))
+            .map(|idx| {
+                let node = &self.graph[idx];
+                let column_count = node
+                    .stored_output_schema()
+                    .map(|s| s.column_count())
+                    .unwrap_or(0);
+                let compression = if compress.resolve_for_schema(column_count, batch_size as u64) {
+                    "lz4"
+                } else {
+                    "off"
+                };
+                OperatorCompressionJson {
+                    node_name: node.name().to_string(),
+                    display_name: node.display_name(),
+                    compression: compression.to_string(),
+                }
+            })
+            .collect();
+        SpillCompressionJson {
+            mode: compress.json_label().to_string(),
+            per_operator,
+        }
     }
 
     /// Append the `CXL Expressions`, `Type Annotations`, `Memory Budget`
@@ -1404,6 +1480,14 @@ struct NodeEntry<'a> {
 pub struct ExplainJson<'a> {
     dag: &'a ExecutionPlanDag,
     artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    /// Storage observability at parity with the text `--explain` output:
+    /// per-stage spill estimates, the resolved spill root / disk cap, the
+    /// per-operator compression decision, cap headroom, and the staging
+    /// plan. `None` when the JSON view is built without storage context
+    /// (e.g. the field-provenance path), in which case the
+    /// `storage_summary` key is omitted entirely rather than emitted as
+    /// `null`.
+    storage_summary: Option<StorageSummaryJson>,
 }
 
 impl<'a> ExplainJson<'a> {
@@ -1412,13 +1496,172 @@ impl<'a> ExplainJson<'a> {
         dag: &'a ExecutionPlanDag,
         artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
     ) -> Self {
-        Self { dag, artifacts }
+        Self {
+            dag,
+            artifacts,
+            storage_summary: None,
+        }
     }
+
+    /// Attach the storage observability summary so the JSON `--explain`
+    /// output carries the same per-stage spill estimates, spill root /
+    /// disk cap, compression decision, cap headroom, and staging plan the
+    /// text output renders. The CLI assembles the summary because it holds
+    /// the resolved storage config, spill root, batch size, and staging
+    /// policy the plan layer does not.
+    pub fn with_storage_summary(mut self, summary: StorageSummaryJson) -> Self {
+        self.storage_summary = Some(summary);
+        self
+    }
+}
+
+/// Structured storage observability for the JSON `--explain` output, at
+/// parity with the text path's per-stage spill estimate, spill root,
+/// spill disk cap, spill compression, cap headroom, and staging plan.
+///
+/// Every field is structured rather than a stringified blob so downstream
+/// tooling (Kiln canvas, third-party consumers) can read per-stage spill
+/// estimates and the cap / staging summary without re-parsing prose. The
+/// CLI assembles it from [`ExecutionPlanDag::estimated_spill_json`] and
+/// [`ExecutionPlanDag::spill_compression_json`] (the plan-derivable parts)
+/// plus the CLI-resolved spill root / cap / staging
+/// fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageSummaryJson {
+    /// Resolved spill root: where the per-run spill directory is created.
+    pub spill_root: SpillRootJson,
+    /// Resolved cumulative on-disk spill cap in bytes; `None` is unlimited
+    /// (`storage.spill.disk_cap_bytes` unset).
+    pub spill_disk_cap_bytes: Option<u64>,
+    /// Per-blocking-stage estimated spill volume, plus a total over the
+    /// stages whose volume is known at plan time.
+    pub estimated_spill: EstimatedSpillJson,
+    /// Per-spill-writing-operator compression decision under the resolved
+    /// `storage.spill.compress` mode.
+    pub spill_compression: SpillCompressionJson,
+    /// Cap headroom: cap minus estimated spill volume. `None` when no cap
+    /// is configured or the estimate is unknown (`0`) — mirrors the text
+    /// path, which omits the line in those cases.
+    pub cap_headroom: Option<CapHeadroomJson>,
+    /// Per-source staging plan: whether each source (or each discovered
+    /// file) would be staged, the resolved staged path, and the
+    /// reuse-if-fresh decision.
+    pub staging: StagingPlanJson,
+}
+
+/// Resolved spill root for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpillRootJson {
+    /// The directory under which the per-run spill directory is created.
+    pub path: String,
+    /// Where the value came from: `storage.spill.dir` or the OS temp-dir
+    /// default.
+    pub source: String,
+}
+
+/// Per-stage estimated spill volume for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct EstimatedSpillJson {
+    /// One entry per spill-writing blocking stage, in topological order.
+    pub per_stage: Vec<StageSpillEstimateJson>,
+    /// Sum over stages whose estimate is known; excludes `unknown` stages.
+    pub total_known_bytes: u64,
+    /// `true` when at least one stage's volume is unknown at plan time, so
+    /// the total understates the real footprint.
+    pub any_unknown: bool,
+}
+
+/// One blocking stage's spill estimate for the JSON storage summary.
+/// `estimate_bytes` is `None` when the stage's volume is unknown at plan
+/// time (no on-disk file-size seed reached it), matching the text path's
+/// `unknown` rendering rather than a misleading `0`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageSpillEstimateJson {
+    pub node_name: String,
+    pub display_name: String,
+    pub estimate_bytes: Option<u64>,
+}
+
+/// Per-operator spill-compression decision for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpillCompressionJson {
+    /// The configured `storage.spill.compress` mode (`auto` / `on` / `off`).
+    pub mode: String,
+    /// One entry per spill-writing operator, in topological order.
+    pub per_operator: Vec<OperatorCompressionJson>,
+}
+
+/// One operator's resolved spill-compression choice (`lz4` / `off`).
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorCompressionJson {
+    pub node_name: String,
+    pub display_name: String,
+    pub compression: String,
+}
+
+/// Cap-headroom figures for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapHeadroomJson {
+    /// Cap minus estimated spill volume, in bytes.
+    pub headroom_bytes: u64,
+    /// The run's estimated spill volume, in bytes.
+    pub estimated_bytes: u64,
+    /// The configured disk cap, in bytes.
+    pub cap_bytes: u64,
+    /// Estimated volume as a percentage of the cap.
+    pub pct_of_cap: f64,
+    /// `true` when the estimate is at or above 80% of the cap, so a real
+    /// run may abort with a spill-cap error (E320).
+    pub over_threshold: bool,
+}
+
+/// Per-source staging plan for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagingPlanJson {
+    /// Whether source staging is enabled. When `false`, `sources` is empty
+    /// and every source reads in place.
+    pub enabled: bool,
+    /// One entry per source, in declaration order.
+    pub sources: Vec<StagingSourceJson>,
+}
+
+/// One source's staging plan for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagingSourceJson {
+    pub name: String,
+    /// `false` for network sources (not stagable; they read in place).
+    pub stagable: bool,
+    /// Per-file staging decision; empty for an unstagable source or one
+    /// whose matcher resolved to no files.
+    pub files: Vec<StagingFileJson>,
+    /// Present when matcher resolution failed during the explain; mirrors
+    /// the text path's inline `(discovery failed: …)` note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
+}
+
+/// One staged file's decision for the JSON storage summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagingFileJson {
+    /// The matched source file path.
+    pub source_path: String,
+    /// `true` when the file matches a staging pattern and would be copied.
+    pub staged: bool,
+    /// The resolved staged path; `None` when the file reads in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staged_path: Option<String>,
+    /// The reuse-if-fresh decision label (`hit` / `miss`); `None` when the
+    /// file is not staged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<String>,
 }
 
 impl<'a> Serialize for ExplainJson<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(3))?;
+        // schema_version + nodes + node_properties, plus storage_summary
+        // when the CLI threaded the storage context through.
+        let entry_count = 3 + usize::from(self.storage_summary.is_some());
+        let mut map = serializer.serialize_map(Some(entry_count))?;
         map.serialize_entry("schema_version", "1")?;
 
         // Combine-aware node list. Walks `topo_order` and emits a
@@ -1504,6 +1747,13 @@ impl<'a> Serialize for ExplainJson<'a> {
             }
         }
         map.serialize_entry("node_properties", &PropsMap(self.dag))?;
+
+        // Storage observability at parity with the text `--explain`
+        // output. Omitted (not `null`) when the JSON view was built
+        // without storage context.
+        if let Some(summary) = &self.storage_summary {
+            map.serialize_entry("storage_summary", summary)?;
+        }
         map.end()
     }
 }
@@ -1702,5 +1952,168 @@ fn combine_operand_qualified(expr: &cxl::ast::Expr, input: &std::sync::Arc<str>)
             .collect::<Vec<_>>()
             .join("."),
         _ => format!("{}.<expr>", input),
+    }
+}
+
+#[cfg(test)]
+mod spill_projection_tests {
+    use super::*;
+    use crate::plan::combine::{CombinePredicateSummary, CombineStrategy};
+    use crate::plan::properties::NodeProperties;
+    use petgraph::graph::DiGraph;
+    use std::sync::Arc;
+
+    fn empty_dag() -> ExecutionPlanDag {
+        ExecutionPlanDag::from_parts(
+            DiGraph::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+        )
+    }
+
+    fn combine_node(name: &str, strategy: CombineStrategy) -> PlanNode {
+        PlanNode::Combine {
+            name: name.to_string(),
+            span: Span::SYNTHETIC,
+            strategy,
+            driving_input: "a".to_string(),
+            build_inputs: vec!["b".to_string()],
+            predicate_summary: CombinePredicateSummary::default(),
+            match_mode: crate::config::pipeline_node::MatchMode::First,
+            on_miss: crate::config::pipeline_node::OnMiss::NullFields,
+            propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
+            decomposed_from: None,
+            output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn sort_node(name: &str) -> PlanNode {
+        PlanNode::Sort {
+            name: name.to_string(),
+            span: Span::SYNTHETIC,
+            sort_fields: Vec::new(),
+        }
+    }
+
+    /// Push a node onto the DAG, register it in `topo_order`, and seed a
+    /// `predicted_peak_bytes` so the per-stage estimate has a non-zero
+    /// figure to report for the spill-writing variants.
+    fn add_node(dag: &mut ExecutionPlanDag, node: PlanNode, peak_bytes: u64) {
+        let idx = dag.graph.add_node(node);
+        dag.topo_order.push(idx);
+        let mut props = NodeProperties::unordered_single();
+        props.predicted_peak_bytes = peak_bytes;
+        dag.node_properties.insert(idx, props);
+    }
+
+    /// The `--explain` spill-compression projection lists only operators
+    /// backed by a real spill writer. In-memory join strategies
+    /// (`HashBuildProbe`, `IEJoin`, `HashPartitionIEJoin`) carry a
+    /// `spill_priority` for memory arbitration but never open a spill file,
+    /// so they must not appear; the genuinely-spilling external sort and
+    /// grace-hash / sort-merge Combine must.
+    #[test]
+    fn spill_compression_lists_only_real_spill_writers() {
+        let mut dag = empty_dag();
+        add_node(
+            &mut dag,
+            combine_node("inline_join", CombineStrategy::HashBuildProbe),
+            1_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node("range_join", CombineStrategy::IEJoin),
+            1_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node(
+                "hashpart_join",
+                CombineStrategy::HashPartitionIEJoin { partition_bits: 4 },
+            ),
+            1_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node(
+                "grace_join",
+                CombineStrategy::GraceHash { partition_bits: 4 },
+            ),
+            1_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node("merge_join", CombineStrategy::SortMerge),
+            1_000,
+        );
+        add_node(&mut dag, sort_node("external_sort"), 1_000);
+
+        let out = dag.spill_compression_explain(crate::config::CompressMode::Auto, 1_024);
+
+        // In-memory joins are excluded: their state never reaches disk.
+        assert!(
+            !out.contains("inline_join"),
+            "HashBuildProbe must not appear in the spill-compression projection:\n{out}"
+        );
+        assert!(
+            !out.contains("range_join"),
+            "IEJoin must not appear in the spill-compression projection:\n{out}"
+        );
+        assert!(
+            !out.contains("hashpart_join"),
+            "HashPartitionIEJoin must not appear in the spill-compression projection:\n{out}"
+        );
+
+        // Genuine spill writers are included.
+        assert!(
+            out.contains("grace_join"),
+            "grace-hash Combine must appear in the spill-compression projection:\n{out}"
+        );
+        assert!(
+            out.contains("merge_join"),
+            "sort-merge Combine must appear in the spill-compression projection:\n{out}"
+        );
+        assert!(
+            out.contains("external_sort"),
+            "external sort must appear in the spill-compression projection:\n{out}"
+        );
+    }
+
+    /// The per-stage estimated-spill-volume projection applies the same
+    /// spill-writer predicate, so an in-memory join contributes nothing to
+    /// the disk estimate while a real spiller does.
+    #[test]
+    fn per_stage_estimate_excludes_in_memory_joins() {
+        let mut dag = empty_dag();
+        add_node(
+            &mut dag,
+            combine_node("inline_join", CombineStrategy::HashBuildProbe),
+            5_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node(
+                "grace_join",
+                CombineStrategy::GraceHash { partition_bits: 4 },
+            ),
+            7_000,
+        );
+
+        let estimates = dag.per_stage_spill_estimates();
+        let names: Vec<&str> = estimates.iter().map(|e| e.node_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["grace_join"],
+            "only the grace-hash Combine writes spill files"
+        );
+        // The disk-volume total counts the real spiller only.
+        assert_eq!(dag.estimated_spill_bytes(), 7_000);
     }
 }

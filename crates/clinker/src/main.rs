@@ -698,7 +698,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     )
     .map_err(PipelineError::Config)?;
 
-    if args.explain.is_some() || (args.dry_run && args.dry_run_n.is_none()) {
+    // The resolved-outputs preamble is human-readable text decoration. The
+    // text explain and the config-validation dry run want it; the JSON and
+    // DOT explain formats are machine-consumed, so emitting a non-JSON / non-
+    // DOT preamble to stdout would make their output unparseable (the JSON
+    // form exists precisely so downstream tooling can read the plan and the
+    // storage summary without parsing prose).
+    let preamble_wanted = match args.explain {
+        Some(ExplainFormat::Text) => true,
+        Some(ExplainFormat::Json) | Some(ExplainFormat::Dot) => false,
+        None => args.dry_run && args.dry_run_n.is_none(),
+    };
+    if preamble_wanted {
         print_resolved_outputs(&pipeline_config);
     }
 
@@ -790,7 +801,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 );
             }
             ExplainFormat::Json => {
-                let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts);
+                // Storage observability at parity with the text path: the
+                // same per-stage spill estimate, spill root / disk cap,
+                // compression decision, cap headroom, and staging plan,
+                // structured so downstream tooling reads it without
+                // re-parsing prose.
+                let storage_summary = build_storage_summary_json(
+                    dag,
+                    &pipeline_config,
+                    &storage_config,
+                    spill_root_dir.as_deref(),
+                    &args.config,
+                );
+                let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts)
+                    .with_storage_summary(storage_summary);
                 let json = serde_json::to_string_pretty(&view).map_err(|e| {
                     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                         "JSON serialization failed: {e}"
@@ -1779,6 +1803,162 @@ fn staging_plan_explain(
     }
     out.push('\n');
     out
+}
+
+/// Assemble the structured storage observability summary for
+/// `clinker run --explain --format json`.
+///
+/// Carries the same information the text path renders — per-stage spill
+/// estimate, resolved spill root, spill disk cap, per-operator spill
+/// compression, cap headroom, and the per-source staging plan — but
+/// structured so downstream tooling reads per-stage figures and the cap /
+/// staging summary without re-parsing prose. The plan-derivable parts come
+/// from the DAG ([`estimated_spill_json`](clinker_plan::plan::execution::ExecutionPlanDag::estimated_spill_json)
+/// / [`spill_compression_json`](clinker_plan::plan::execution::ExecutionPlanDag::spill_compression_json)),
+/// so they cannot drift from the text rendering; the resolved storage
+/// config the CLI loaded supplies the spill root / cap / compression /
+/// staging. `config_path` is the pipeline file's path: its parent is the
+/// discovery anchor the run uses, so the staged paths shown match the
+/// paths the real run would write.
+fn build_storage_summary_json(
+    dag: &clinker_plan::plan::execution::ExecutionPlanDag,
+    config: &clinker_plan::config::PipelineConfig,
+    storage: &clinker_plan::config::StorageConfig,
+    spill_root_dir: Option<&std::path::Path>,
+    config_path: &std::path::Path,
+) -> clinker_plan::plan::execution::StorageSummaryJson {
+    use clinker_plan::plan::execution::{
+        CapHeadroomJson, SpillRootJson, StagingFileJson, StagingPlanJson, StagingSourceJson,
+        StorageSummaryJson,
+    };
+
+    let spill_disk_cap_bytes = storage.spill.disk_cap();
+    let compress = storage.spill.compress;
+    let staging_policy = &storage.staging;
+    let batch_size = config
+        .pipeline
+        .batch_size
+        .unwrap_or(clinker_exec::executor::DEFAULT_BATCH_SIZE);
+    let discovery_anchor = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let discovery_anchor = discovery_anchor.as_path();
+
+    // Spill root: configured dir, else the OS temp dir — the same
+    // resolution the text path's "Spill root" line reports.
+    let spill_root = match spill_root_dir {
+        Some(dir) => SpillRootJson {
+            path: dir.display().to_string(),
+            source: "storage.spill.dir".to_string(),
+        },
+        None => SpillRootJson {
+            path: std::env::temp_dir().display().to_string(),
+            source: "OS temp dir (default)".to_string(),
+        },
+    };
+
+    // Cap headroom: cap minus the run's estimated spill volume. Omitted
+    // when no cap is configured or the estimate is unknown (`0`), matching
+    // the text path's `cap_headroom_explain` suppression.
+    let estimated_spill_bytes = dag.estimated_spill_bytes();
+    let cap_headroom = match spill_disk_cap_bytes {
+        Some(cap) if estimated_spill_bytes > 0 => {
+            let headroom_bytes = cap.saturating_sub(estimated_spill_bytes);
+            let pct_of_cap = if cap == 0 {
+                0.0
+            } else {
+                (estimated_spill_bytes as f64 / cap as f64) * 100.0
+            };
+            let over_threshold = estimated_spill_bytes as f64 >= cap as f64 * 0.80;
+            Some(CapHeadroomJson {
+                headroom_bytes,
+                estimated_bytes: estimated_spill_bytes,
+                cap_bytes: cap,
+                pct_of_cap,
+                over_threshold,
+            })
+        }
+        _ => None,
+    };
+
+    // Staging plan: resolve each source's matcher through the same
+    // `SourceStager::plan_entry` the text path consults, copying nothing.
+    let staging = if !staging_policy.enabled {
+        StagingPlanJson {
+            enabled: false,
+            sources: Vec::new(),
+        }
+    } else {
+        let stager = clinker_channel::SourceStager::new(staging_policy.clone());
+        let mut sources = Vec::new();
+        for body in config.source_bodies() {
+            let source = &body.source;
+            if !source.transport.is_file() {
+                sources.push(StagingSourceJson {
+                    name: source.name.clone(),
+                    stagable: false,
+                    files: Vec::new(),
+                    discovery_error: None,
+                });
+                continue;
+            }
+            match clinker_exec::source::discovery::discover(source, discovery_anchor) {
+                Ok(outcome) => {
+                    let files = outcome
+                        .files()
+                        .iter()
+                        .map(|f| {
+                            let entry = stager.plan_entry(&f.path);
+                            if entry.staged {
+                                StagingFileJson {
+                                    source_path: f.path.display().to_string(),
+                                    staged: true,
+                                    staged_path: entry
+                                        .staged_path
+                                        .as_ref()
+                                        .map(|p| p.display().to_string()),
+                                    reuse: Some(entry.reuse.label().to_string()),
+                                }
+                            } else {
+                                StagingFileJson {
+                                    source_path: f.path.display().to_string(),
+                                    staged: false,
+                                    staged_path: None,
+                                    reuse: None,
+                                }
+                            }
+                        })
+                        .collect();
+                    sources.push(StagingSourceJson {
+                        name: source.name.clone(),
+                        stagable: true,
+                        files,
+                        discovery_error: None,
+                    });
+                }
+                Err(e) => sources.push(StagingSourceJson {
+                    name: source.name.clone(),
+                    stagable: true,
+                    files: Vec::new(),
+                    discovery_error: Some(e.to_string()),
+                }),
+            }
+        }
+        StagingPlanJson {
+            enabled: true,
+            sources,
+        }
+    };
+
+    StorageSummaryJson {
+        spill_root,
+        spill_disk_cap_bytes,
+        estimated_spill: dag.estimated_spill_json(),
+        spill_compression: dag.spill_compression_json(compress, batch_size),
+        cap_headroom,
+        staging,
+    }
 }
 
 /// Best-effort hostname for the metrics payload.
