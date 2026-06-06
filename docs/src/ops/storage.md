@@ -255,6 +255,45 @@ external cleaner, or had its permissions revoked)
 This surfaces the directory-level cause directly, so the fix (remount the
 volume, stop the cleaner, restore permissions) is obvious from the message.
 
+## Crash purge of orphaned spill directories
+
+A run's spill directory (`clinker-spill-<random>/`) is normally removed when the
+run ends — a clean exit, or even a panic that unwinds, deletes it. But a
+`SIGKILL`, the Linux OOM-killer, or a power loss kills the process before that
+cleanup runs, leaking the directory and every spill file inside it under the
+spill root. Over many crashed runs that fills the spill volume.
+
+To prevent that, **a run reaps orphaned spill directories at startup — but
+only when a spill directory is explicitly configured** (`storage.spill.dir`),
+before it creates its own. Each live run holds an operating-system advisory lock
+on a `.lock` file inside its spill directory for the run's whole lifetime; the
+OS releases that lock automatically when the process exits, however it exits. At
+startup a run scans the configured spill root and, for each `clinker-spill-*`
+directory, tries to take that lock: if it succeeds the owning process is gone, so
+the directory is an orphan and is removed; if the lock is still held a concurrent
+live run owns it, so it is left alone. Asking the kernel "is anyone still
+holding this?" is robust against PID reuse and never reaps a directory a
+concurrent run is still using. The purge is best-effort: a failure to reap one
+directory is logged and the run proceeds.
+
+When `storage.spill.dir` is **not** set, the spill root defaults to the OS temp
+directory ([`std::env::temp_dir`], typically `$TMPDIR` or `/tmp`), and **no
+startup purge runs** there. In the default case a run cleans up after itself
+directly: the per-run spill directory is a `tempfile::TempDir` that is removed on
+every normal exit — a clean exit or a panic that unwinds. Only a `SIGKILL`, the
+OOM-killer, or a power loss leaks one, and a directory leaked into the OS temp
+directory is the operating system's temp-reaper's responsibility to clean up, not
+Clinker's.
+
+The purge is deliberately confined to a configured spill root because it must
+never police the shared OS temp directory. That directory is used by every
+process on the host, so a startup sweep there would race not only concurrent
+Clinker runs (the lock-based check narrows that window but cannot eliminate it
+against a peer whose just-created spill directory is not yet locked) but also
+unrelated programs that happen to use a colliding name prefix. A run owns its
+configured spill volume and can safely sweep it; it does not own `/tmp` and so
+leaves it alone.
+
 ## `storage.staging` — opt-in source staging
 
 Reading source files directly from a network share (NFS, SMB) couples every
@@ -286,8 +325,8 @@ cleanup        = "on_success" # optional; on_success | always | never (default o
 | `patterns` | `[]` | Glob patterns selecting which source paths to stage. A source is staged only when `enabled` and its path matches at least one pattern. Empty ⇒ nothing is staged. |
 | `disk_cap_bytes` | unlimited | Cumulative cap on bytes copied per run. Same byte-size grammar as the spill cap (`"50GB"`, bare integers are bytes). |
 | `verify` | `blake3` | Post-copy integrity check. `blake3` hashes source and copy and requires a match — the only check that catches a soft-mount's silent truncation. `none` skips the check. |
-| `on_existing` | `overwrite` | What to do when a copy with the target name already exists: `overwrite`, `reuse`, or `error`. Under the current per-run/per-file UUID naming a destination collision cannot occur, so this knob has no runtime effect today; it is reserved for a future stable-name layout. |
-| `cleanup` | `on_success` | When staged copies are deleted: `on_success` / `always` / `never`. The per-run subdirectory is currently removed when the run ends regardless of outcome (so the volume is reclaimed); the `keep-on-failure` and `never` modes are not yet wired. |
+| `on_existing` | `overwrite` | What to do when a staged copy of this source already exists from a prior run: `overwrite` re-copies unconditionally; `reuse` reuses the existing copy **only when it is still fresh** (the source's modification time and size match what was recorded when it was staged), otherwise re-copies; `error` fails the run rather than touch the existing copy. See [The staging cache](#the-staging-cache-on_existing) below. |
+| `cleanup` | `on_success` | When staged copies are deleted relative to the run's outcome: `on_success` removes them after a clean exit but **keeps** them after a failure so the operator can inspect the exact inputs the failed run saw; `always` removes them regardless; `never` keeps them as a persistent reuse cache for a later `reuse` run. See [Cleanup](#cleanup-on_success--always--never). |
 
 ### Pattern matching
 
@@ -318,21 +357,33 @@ patterns don't select reads in place, so its volume is irrelevant.
 
 ### How a file is staged
 
-Each matched source is copied into a **per-run subdirectory** under `dir`,
-named with a fresh UUID (`clinker-stage-<random>/`). Per-file names are UUIDs
-too, so two runs sharing one staging root never collide. The copy is built to
-survive a crash at any point without leaving a corrupt or partial file a
-later run might trust:
+Each matched source maps to a **stable, content-addressed** pair of files
+directly under `dir`, deterministic across runs of the same source:
+
+- `<source-id>.staged` — the local copy the reader opens.
+- `<source-id>.manifest.json` — a sidecar recording the source's identity:
+  its path, modification time, size, the BLAKE3 content hash, and the stage
+  time.
+
+`<source-id>` is derived from the source's canonical path, so the same source
+always resolves to the same staged file. That stability is what makes the
+`reuse` cache work (a later run can find the prior copy) and it is why the layout
+is stable rather than per-run UUIDs.
+
+The copy is built to survive a crash at any point without leaving a corrupt or
+partial file a later run might trust:
 
 1. **Single-pass copy + hash.** The source is read once in ~1 MiB chunks; each
    chunk is fed to both the BLAKE3 hasher and the destination file in the same
    pass. The copy never holds the whole file in memory, so it stays a
    memory-budget no-op regardless of file size.
-2. **Atomic publish.** Bytes are written to `<uuid>.partial`, flushed and
-   `fsync`'d, then **renamed** to `<uuid>.staged`. A rename is an atomic
-   replace on Linux, macOS, and Windows (Windows 10 1607+), so a reader scanning
-   for `.staged` files sees either nothing or the complete file — never a
-   half-written one.
+2. **Atomic publish.** Bytes are written to a `<source-id>.<run>.partial` temp
+   file, flushed and `fsync`'d, then **renamed** to `<source-id>.staged`. A
+   rename is an atomic replace on Linux, macOS, and Windows (Windows 10 1607+),
+   so a reader scanning for `.staged` files sees either nothing or the complete
+   file — never a half-written one. The `<run>` segment in the partial name lets
+   two concurrent invocations stage the same source without colliding on the
+   in-flight bytes.
 3. **Durable rename.** On Linux/macOS the parent directory is `fsync`'d after
    the rename, because on ext4/xfs a rename is only crash-durable once the
    directory entry itself is flushed. On Windows the NTFS journal makes the
@@ -342,20 +393,82 @@ later run might trust:
    catch a soft-mount that silently truncated the read; two content digests
    can. A mismatch removes the published copy and fails the run with a distinct
    "staged copy is corrupt" diagnostic — not a generic I/O error.
+5. **Commit the manifest.** The identity manifest is written with the same
+   atomic temp-file + rename discipline. **The manifest is the commit marker:**
+   a `.staged` file is only trustworthy once its manifest exists. A crash
+   between the copy and the manifest leaves a `.staged` with no manifest, which
+   the next run's [crash purge](#crash-purge-of-orphaned-artifacts) reaps as an
+   orphan rather than half-trusting.
 
 If the copy fails partway, the `.partial` is removed before the error
-propagates, and the whole per-run subdirectory is deleted when the run ends or
-the process exits — the same temporary-directory cleanup the spill root uses,
-so a crash never leaves staged copies behind.
+propagates.
+
+### The staging cache (`on_existing`)
+
+Because staged copies live at stable paths, a copy from a prior run is still on
+disk when the next run starts (unless `cleanup` removed it). `on_existing`
+decides what happens when that prior copy is found:
+
+| Mode | Behavior |
+| --- | --- |
+| `overwrite` (default) | Always re-stage. The prior copy and its manifest are removed and the source is copied fresh. The safe default: a copy from a crashed run must not be trusted. |
+| `reuse` | Reuse the prior copy **only when it is still fresh** — the source's current modification time and size both match what the manifest recorded. A fresh match **skips the copy entirely** (no bytes read off the share, nothing charged against the disk cap). A changed mtime or size means the source was rewritten, so the copy is stale and is re-staged. |
+| `error` | Fail the run with a clear diagnostic if a staged copy already exists, rather than overwrite or reuse it. For workflows that want an explicit "the cache is already populated" stop. |
+
+`reuse` is the mode that turns staging into a cache: re-running the same
+pipeline over an unchanged network share copies nothing on the second run. The
+freshness check is mtime + size, not a re-hash, so it is a cheap `stat` rather
+than a full read of the source.
+
+> Within a single run, `reuse` is correct for one invocation at a time. Running
+> several `clinker` invocations that stage the *same* shared source
+> concurrently is a separate concern addressed by a follow-up
+> concurrency-safety layer; the stable layout and manifest here are designed so
+> that layer can add an atomic-publish lock on top without changing the cache
+> shape.
+
+### Cleanup (`on_success` | `always` | `never`)
+
+`cleanup` decides when a run's staged copies are removed, keyed on the run's
+outcome:
+
+| Mode | Behavior |
+| --- | --- |
+| `on_success` (default) | Remove the copies after a **clean** exit; **keep** them after a failure (or an interrupted / DLQ-producing run) so the operator can inspect the exact inputs the run saw and re-run without re-fetching. |
+| `always` | Remove the copies when the run ends, success or failure. |
+| `never` | Keep the copies indefinitely as a persistent reuse cache. Combine with `on_existing = reuse` to make repeated runs over a stable source copy-free. The operator reclaims the staging dir manually (or lets the next run's crash purge eventually reap stale entries). |
+
+Each staged file's manifest is removed alongside it, so cleanup never leaves a
+manifest pointing at a staged file that is gone.
+
+### Crash purge of orphaned artifacts
+
+A clean (or panicking) run runs its `cleanup`. But a `SIGKILL`, the Linux
+OOM-killer, or a power loss kills the process before any cleanup runs, leaking
+its staged artifacts under the staging root. To stop that from accumulating
+across crashes, **every run performs an idempotent crash purge at startup**,
+before it stages anything. It reaps the artifact shapes a crash leaves behind:
+
+- a `*.partial` — an interrupted copy;
+- a `*.staged` with no matching manifest — a copy that crashed before it could
+  commit its manifest;
+- a `*.manifest.json` with no matching staged file.
+
+A clean pair (a `.staged` with its committed `.manifest.json`) is the reuse
+cache and is **kept** — the purge never removes a complete, trustworthy copy.
+The classification is by artifact shape alone, so it is safe to run while
+another invocation is staging (an in-flight copy is a `.partial`, which belongs
+to the writing run and is reclaimed by it, not by a concurrent purge of
+committed artifacts).
 
 ### File permissions
 
 Staged copies hold verbatim source records — potentially PII, credentials, or
 financial data — and on a shared staging volume they must not be readable by
-other users. On Unix the per-run directory is created with mode `0o700` and
-each staged file with `0o600` (owner-only). On Windows there is no portable
-mode bit; staged files inherit the staging directory's ACL, so restrict the
-directory's ACL if the volume is shared.
+other users. On Unix each staged file and its manifest are created with mode
+`0o600` (owner-only). On Windows there is no portable mode bit; staged files
+inherit the staging directory's ACL, so restrict the directory's ACL if the
+volume is shared.
 
 ### Crash durability and the parent-directory fsync
 

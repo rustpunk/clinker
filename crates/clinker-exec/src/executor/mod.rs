@@ -23,6 +23,7 @@ mod schema_check;
 pub(crate) mod sort_dispatch;
 pub(crate) mod source_dispatch;
 pub mod source_stream;
+pub mod spill_purge;
 pub mod storage_validate;
 pub(crate) mod stream_event;
 mod streaming;
@@ -196,6 +197,12 @@ struct DagExecResources {
     /// Cached path of `spill_root`, handed to each spill site without
     /// re-borrowing the `TempDir`.
     spill_root_path: Arc<std::path::Path>,
+    /// The held `<spill_root>/.lock` for this run. Kept open for the run's
+    /// lifetime so the OS advisory lock marks the spill dir as live; the next
+    /// run's startup crash-purge reaps only dirs whose lock it can acquire (the
+    /// owner is gone). Released when this `File` drops at run end or on process
+    /// exit. Never read after construction — its sole job is to hold the lock.
+    _spill_lock: Arc<std::fs::File>,
     /// Per-source / per-file event-time watermarks, carried through and
     /// returned in the [`DispatchOutcome`] for report roll-up.
     watermarks: crate::executor::watermark::PerSourceWatermarks,
@@ -679,6 +686,31 @@ impl PipelineExecutor {
         // leak query shape via `stat`/`readdir`. An owner-only root keeps every
         // spilled file unlistable to other users on a shared spill volume,
         // mirroring the 0o700 posture of the source-staging per-run dir.
+        //
+        // Idempotent crash-purge of orphaned spill directories from prior runs,
+        // run once before this run creates its own — but ONLY when a spill
+        // directory was explicitly configured (`[storage.spill] dir`). A crashed
+        // run (SIGKILL, OOM-killer, power loss) skips the TempDir Drop that
+        // removes its spill dir, leaking a `clinker-spill-*` directory under the
+        // spill root; this reaps every such orphan, identified by an OS advisory
+        // lock no live process still holds, gated by a creation grace window so a
+        // concurrent sibling's just-created, not-yet-locked dir is never reaped
+        // (concurrent runs may share one configured spill root).
+        //
+        // When no spill dir is configured the spill root is the OS temp dir,
+        // shared with every other process on the host. clinker must not police
+        // that directory: a per-run `tempfile::TempDir` already cleans itself up
+        // on every normal exit (clean or panic-unwind), and a directory leaked by
+        // a SIGKILL is the OS tmp-reaper's responsibility, not ours. Purging the
+        // shared temp dir would race not only concurrent clinker peers (the
+        // grace window narrows but cannot eliminate that race) but unrelated
+        // processes that happen to use a colliding prefix. Skipping the purge on
+        // the default root is therefore both safer and correct by construction.
+        // Best-effort and non-fatal in either case.
+        if let Some(spill_dir) = &params.spill_root_dir {
+            spill_purge::spill_crash_purge(spill_dir);
+        }
+
         let mut builder = tempfile::Builder::new();
         builder.prefix("clinker-spill-");
         #[cfg(unix)]
@@ -698,6 +730,21 @@ impl PipelineExecutor {
             })?,
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
+
+        // Take the per-run spill-dir lock and hold it for the whole run. A
+        // crashed run (SIGKILL / OOM-killer / power loss) skips the TempDir Drop
+        // that would otherwise remove this directory, but the OS releases this
+        // lock on process death regardless — so the next run's
+        // `spill_crash_purge` can tell this dir's owner is gone and reap it.
+        // The directory was pre-validated writable, so a failure to create the
+        // lock file is an internal fault, not a config error.
+        let spill_lock = Arc::new(spill_purge::lock_spill_dir(&spill_root_path).map_err(|e| {
+            PipelineError::Internal {
+                op: "executor",
+                node: String::new(),
+                detail: format!("failed to lock pipeline spill root: {e}"),
+            }
+        })?);
 
         // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
         // envelopes every node-rooted arena finalize — including the
@@ -814,6 +861,7 @@ impl PipelineExecutor {
                 compiled_routes_by_name,
                 spill_root,
                 spill_root_path,
+                _spill_lock: spill_lock,
                 watermarks,
                 memory_budget,
             },
@@ -990,6 +1038,7 @@ impl PipelineExecutor {
             compiled_routes_by_name,
             spill_root,
             spill_root_path,
+            _spill_lock,
             watermarks,
             memory_budget,
         } = resources;
@@ -1265,6 +1314,7 @@ impl PipelineExecutor {
             current_body_node_input_refs: None,
             spill_root,
             spill_root_path,
+            spill_lock: Some(_spill_lock),
             window_runtime,
             watermarks,
             memory_budget,
@@ -1472,6 +1522,14 @@ impl PipelineExecutor {
             1 => return Err(output_errors.into_iter().next().unwrap()),
             _ => return Err(PipelineError::Multiple(output_errors)),
         }
+
+        // Release the spill-dir lock before the directory is removed. On
+        // Windows an open handle blocks `remove_dir_all`, so the `.lock` file
+        // must be closed first; on Unix it is harmless but keeps the ordering
+        // uniform. A crashed run never reaches here, but the OS releases the
+        // lock on process death regardless, so the next run's crash-purge still
+        // reaps the leaked directory.
+        drop(ctx.spill_lock.take());
 
         // Release the pipeline-scoped TempDir Arc clone last; the
         // directory drops once the original `ctx.spill_root` and

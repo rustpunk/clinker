@@ -1,5 +1,6 @@
 //! Source-file staging copy: single-pass streamed copy with inline BLAKE3
-//! verification, atomic publish, and durability/permission hardening.
+//! verification, atomic publish, a stable content-addressed cache layout, and
+//! durability/permission hardening.
 //!
 //! This is the body that plugs into the staging resolution seam: when the
 //! workspace [`StagingPolicy`] selects a source path, [`SourceStager`] copies
@@ -24,36 +25,70 @@
 //! and (by default) verifies the digest, so any of these corruptions surfaces
 //! as a hard error at stage time rather than as wrong output downstream.
 //!
+//! ## Cache layout
+//!
+//! Each source maps to a **stable, content-addressed** pair of paths under the
+//! staging root, deterministic across runs of the same source:
+//!
+//! - `<source_id>.staged` — the local copy the reader opens.
+//! - `<source_id>.manifest.json` — a sidecar recording the source identity
+//!   (`StagedManifest`: path + mtime + size + content hash + stage time).
+//!
+//! `source_id` is the hex BLAKE3 of the canonicalized absolute source path, so
+//! the same source always resolves to the same staged file. That stability is
+//! what makes [`OnExisting::Reuse`] (reuse-if-fresh) functional: a later run
+//! finds the prior `<source_id>.staged` + manifest, compares the recorded
+//! mtime/size against the live source, and skips the copy when they match.
+//!
+//! The manifest is the **commit marker**: a `.staged` file is only trustworthy
+//! once its manifest exists. The write order — copy `.staged`, then publish the
+//! manifest — means a crash before the manifest lands leaves a `.staged` with
+//! no manifest, which the startup [`SourceStager::crash_purge`] treats as
+//! orphaned and reaps. A clean (staged + manifest) pair is the reuse cache and
+//! is preserved by the purge.
+//!
+//! The per-file in-flight copy lands at `<source_id>.<run_uuid>.partial`. The
+//! `run_uuid` segment keeps two concurrent invocations staging the *same*
+//! source from colliding on the partial — the foundation a follow-up
+//! concurrency-safety layer (atomic publish under a lock) builds on without
+//! reworking this layout.
+//!
 //! ## Copy invariants
 //!
 //! - **Single pass.** Each ~1 MiB chunk is read once and fed to both the
 //!   BLAKE3 hasher and the destination file. No second read of the source, so
 //!   the copy is a memory-budget no-op (one fixed buffer, no per-file
 //!   accumulation).
-//! - **Atomic publish.** Bytes land in `<file_uuid>.partial`, are `sync_all`'d,
-//!   then `rename`d to `<file_uuid>.staged`. `std::fs::rename` is an
-//!   atomic-replace on Linux/macOS/Windows (Win10 1607+), so a concurrent
+//! - **Atomic publish.** Bytes land in `<source_id>.<run_uuid>.partial`, are
+//!   `sync_all`'d, then `rename`d to `<source_id>.staged`. `std::fs::rename`
+//!   is an atomic-replace on Linux/macOS/Windows (Win10 1607+), so a concurrent
 //!   reader sees either no `.staged` file or the complete one — never a torn
-//!   write. A crash before the rename leaves only a `.partial`, which the
-//!   per-run [`tempfile::TempDir`] removes on drop.
+//!   write.
 //! - **Durable rename (POSIX).** After the rename the parent directory is
-//!   `sync_all`'d so the rename survives a crash. NTFS does not need this (see
-//!   [`SourceStager::stage_file`]).
-//! - **Restrictive permissions (Unix).** The per-run dir is `0o700` and each
-//!   staged file `0o600`, because staged copies hold verbatim source records —
-//!   potentially PII or credentials — on what may be a shared volume.
+//!   `sync_all`'d so the rename survives a crash. NTFS does not need this.
+//! - **Restrictive permissions (Unix).** The staging root entries are owner-only
+//!   (`0o600` for staged files and manifests), because staged copies hold
+//!   verbatim source records — potentially PII or credentials — on what may be
+//!   a shared volume.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use clinker_plan::config::{StagedPath, StagingPolicy, StagingVerify};
+use clinker_plan::config::{Cleanup, OnExisting, StagedPath, StagingPolicy, StagingVerify};
+use serde::{Deserialize, Serialize};
 
 /// Chunk size for the streamed copy. 1 MiB amortizes per-`read`/`write`
 /// syscall overhead against a fixed, bounded buffer — large enough to keep the
 /// pipe full on a fast local disk, small enough that the copy never scales its
 /// memory with file size.
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Filename extension for a published staged copy.
+const STAGED_EXT: &str = "staged";
+/// Filename suffix for a staged copy's identity manifest.
+const MANIFEST_SUFFIX: &str = ".manifest.json";
 
 /// Failure modes of a staging copy.
 ///
@@ -107,62 +142,115 @@ pub enum StagingError {
         /// The source path that triggered the overflow.
         source_path: PathBuf,
     },
+    /// `on_existing = error` and a staged copy of this source already exists.
+    /// The operator asked to be told rather than silently reuse or overwrite a
+    /// prior artifact, so the run fails fast naming the existing copy.
+    #[error(
+        "staging on_existing = error: a staged copy of {source_path} already \
+         exists at {staged_path}; remove it or set on_existing to overwrite or reuse"
+    )]
+    AlreadyExists {
+        /// The original source path.
+        source_path: PathBuf,
+        /// The pre-existing staged copy that blocked the run.
+        staged_path: PathBuf,
+    },
 }
 
-/// A staged copy's recorded identity, produced by the per-file copy.
+/// A staged copy's recorded identity, persisted as the `<source_id>.manifest.json`
+/// sidecar next to the staged file.
 ///
-/// Captures the integrity facts the stager logs as provenance: the local path,
-/// the source it came from, the content digest computed during the copy, and
-/// the source's size at copy time. Internal to the copy engine — the public
-/// [`SourceStager::resolve`] hands the reader a [`StagedPath`], and the rest is
-/// folded into the staged-file log line.
+/// Two roles: (1) it is the **commit marker** — a `.staged` file is only
+/// trustworthy once this manifest exists, so an interrupted copy is detectable
+/// as a `.staged` with no manifest; (2) it carries the source's mtime and size
+/// at copy time so [`OnExisting::Reuse`] can decide whether a prior copy is
+/// still fresh enough to reuse without re-copying.
+///
+/// `source_mtime` is stored as whole seconds plus a nanosecond remainder since
+/// the Unix epoch so the JSON is human-legible and the staleness comparison is
+/// exact (it never round-trips through a lossy float).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StagedManifest {
+    /// The original source path the copy was made from.
+    pub(crate) source_path: PathBuf,
+    /// Whole seconds of the source's modification time at copy time, measured
+    /// since the Unix epoch. Paired with [`Self::source_mtime_nanos`].
+    pub(crate) source_mtime_secs: i64,
+    /// Sub-second nanosecond remainder of the source's modification time.
+    pub(crate) source_mtime_nanos: u32,
+    /// Source size in bytes at copy time.
+    pub(crate) source_size: u64,
+    /// Hex BLAKE3 digest of the copied bytes.
+    pub(crate) content_hash: String,
+    /// When the staged copy was published, as an RFC 3339 timestamp. Recorded
+    /// for operator audit only; the freshness check uses mtime + size, not this.
+    pub(crate) staged_at: String,
+}
+
+impl StagedManifest {
+    /// Whether this manifest still describes the live source — its recorded
+    /// mtime and size both match the source's current `stat`.
+    ///
+    /// This is the freshness test [`OnExisting::Reuse`] runs: a match means the
+    /// source has not changed since it was staged, so the existing copy is safe
+    /// to reuse without re-copying. A changed mtime or size means the source was
+    /// rewritten and the copy is stale.
+    fn matches_source(&self, meta: &std::fs::Metadata) -> bool {
+        let Some((secs, nanos)) = mtime_parts(meta) else {
+            return false;
+        };
+        self.source_size == meta.len()
+            && self.source_mtime_secs == secs
+            && self.source_mtime_nanos == nanos
+    }
+}
+
+/// A staged copy's resolved on-disk paths and recorded identity.
+///
+/// Internal to the copy engine — the public [`SourceStager::resolve`] hands the
+/// reader a [`StagedPath`], and this is folded into the staged-file log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StagedFile {
     /// The local `.staged` copy the reader should open.
     staged_path: PathBuf,
-    /// The original source path the copy was made from.
-    source_path: PathBuf,
-    /// Hex BLAKE3 digest of the copied bytes.
-    content_hash: String,
-    /// Source size in bytes at copy time.
-    source_size: u64,
+    /// The copy's persisted identity manifest.
+    manifest: StagedManifest,
 }
 
-/// Per-run staging engine: owns the run's staging subdirectory and the running
-/// byte total, and performs the copy for each selected source.
+/// Per-run staging engine: owns the staging-policy decision, the running byte
+/// total, and the set of staged files this run produced for cleanup.
 ///
-/// One `SourceStager` is built per pipeline run. The first staged file
-/// lazily creates the per-run `<dir>/<run_uuid>/` subdirectory (mode `0o700`
-/// on Unix); subsequent files reuse it. The subdirectory is held as a
-/// [`tempfile::TempDir`], so a panic or early exit removes the whole run's
-/// staged copies on drop — the same panic-safety story the executor's spill
-/// root uses. Disk-cap accounting accumulates across every file the run
-/// stages.
+/// One `SourceStager` is built per pipeline run. Unlike a per-run temp
+/// directory, staged files land at **stable content-addressed paths** directly
+/// under the staging root so a later run can find and reuse them — cleanup is
+/// therefore explicit ([`SourceStager::cleanup`]) rather than a `TempDir` drop,
+/// and an idempotent startup [`SourceStager::crash_purge`] reaps the artifacts a
+/// crashed prior run left behind.
 ///
 /// When the policy is disabled or a path does not match a staging pattern,
 /// [`SourceStager::resolve`] returns an in-place [`StagedPath`] and never
 /// touches the filesystem.
 pub struct SourceStager {
     policy: StagingPolicy,
-    /// The per-run subdirectory, created on first use. Held as a `TempDir` so
-    /// staged copies are torn down on drop or on a panic — the same
-    /// panic-safety story the executor's spill root uses.
-    run_dir: Option<tempfile::TempDir>,
-    /// Cumulative bytes copied this run, checked against the disk cap.
+    /// Cumulative bytes copied this run, checked against the disk cap. A reused
+    /// (skipped) copy charges nothing — only bytes actually written count.
     bytes_staged: u64,
+    /// Stable paths of every staged copy this run produced or reused, used by
+    /// [`SourceStager::cleanup`] to remove them per the cleanup policy.
+    produced: Vec<PathBuf>,
 }
 
 impl SourceStager {
     /// Build a stager for one run from the workspace staging policy.
     ///
-    /// No filesystem work happens here — the per-run subdirectory is created
-    /// lazily on the first file that actually stages, so a run whose sources
-    /// never match a pattern leaves the staging dir untouched.
+    /// No filesystem work happens here. The staging root must already exist and
+    /// be writable (validated at startup); files land directly under it at
+    /// content-addressed paths on the first source that actually stages.
     pub fn new(policy: StagingPolicy) -> Self {
         Self {
             policy,
-            run_dir: None,
             bytes_staged: 0,
+            produced: Vec::new(),
         }
     }
 
@@ -170,28 +258,30 @@ impl SourceStager {
     ///
     /// Returns an in-place [`StagedPath`] (no copy, no filesystem touch) when
     /// staging is disabled or `original` matches no pattern. When the path is
-    /// selected, copies it into the per-run subdirectory with inline BLAKE3
-    /// verification and atomic publish, then returns a [`StagedPath`] whose
-    /// `staged` points at the local copy.
+    /// selected, applies the `on_existing` policy against the stable
+    /// content-addressed staged path and either reuses a fresh prior copy or
+    /// re-stages with inline BLAKE3 verification and atomic publish, then
+    /// returns a [`StagedPath`] whose `staged` points at the local copy.
     ///
     /// # Errors
     ///
-    /// Returns [`StagingError`] when the per-run dir cannot be created, the
-    /// copy fails, the digest does not match (`verify = blake3`), or the disk
-    /// cap would be exceeded.
+    /// Returns [`StagingError`] when the copy fails, the digest does not match
+    /// (`verify = blake3`), the disk cap would be exceeded, or
+    /// `on_existing = error` and a staged copy already exists.
     pub fn resolve(&mut self, original: PathBuf) -> Result<StagedPath, StagingError> {
         if !self.policy.pattern_matches(&original) {
             return Ok(StagedPath::in_place(original));
         }
-        let staged = self.stage_file(&original)?;
+        let staged = self.stage_or_reuse(&original)?;
+        self.produced.push(staged.staged_path.clone());
         // Record the copy's provenance: the operator (and any post-run audit)
         // wants the source, its size, the local copy, and the verified digest
         // so a staged run is traceable back to exact bytes.
         tracing::info!(
-            source = %staged.source_path.display(),
+            source = %staged.manifest.source_path.display(),
             staged = %staged.staged_path.display(),
-            bytes = staged.source_size,
-            blake3 = %staged.content_hash,
+            bytes = staged.manifest.source_size,
+            blake3 = %staged.manifest.content_hash,
             "staged source file to local disk"
         );
         Ok(StagedPath {
@@ -200,46 +290,73 @@ impl SourceStager {
         })
     }
 
-    /// Lazily create (once) and return the per-run staging subdirectory.
-    ///
-    /// On Unix the directory is created with mode `0o700` — staged copies hold
-    /// verbatim source records (potentially PII / credentials) and must not be
-    /// group/other-readable on a shared volume. On Windows the directory
-    /// inherits the parent's ACL, the platform's standard behavior; there is no
-    /// portable mode bit to set, so this is left to NTFS inheritance.
-    fn run_dir(&mut self) -> Result<&Path, StagingError> {
-        if self.run_dir.is_none() {
-            let parent = self
-                .policy
-                .dir
-                .as_ref()
-                .expect("staging dir is validated present at startup when enabled");
-            let mut builder = tempfile::Builder::new();
-            builder.prefix("clinker-stage-");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                // 0o700: the per-run dir holds verbatim source records and must
-                // be owner-only on a shared staging volume.
-                builder.permissions(std::fs::Permissions::from_mode(0o700));
-            }
-            let dir = builder.tempdir_in(parent).map_err(|e| StagingError::Io {
-                path: parent.clone(),
-                source: e,
-            })?;
-            self.run_dir = Some(dir);
-        }
-        Ok(self.run_dir.as_ref().unwrap().path())
+    /// The staging root the policy targets. Present and validated whenever
+    /// staging is enabled.
+    fn staging_root(&self) -> &Path {
+        self.policy
+            .dir
+            .as_deref()
+            .expect("staging dir is validated present at startup when enabled")
     }
 
-    /// Copy one selected source into the per-run dir with inline hashing and
-    /// atomic publish.
+    /// Apply `on_existing` against the stable staged path for `source`, either
+    /// reusing a fresh prior copy or (re-)staging.
+    fn stage_or_reuse(&mut self, source: &Path) -> Result<StagedFile, StagingError> {
+        let source_id = source_id(source);
+        let root = self.staging_root().to_path_buf();
+        let staged_path = root.join(format!("{source_id}.{STAGED_EXT}"));
+        let manifest_path = root.join(format!("{source_id}{MANIFEST_SUFFIX}"));
+
+        let existing = load_clean_manifest(&staged_path, &manifest_path);
+
+        match self.policy.on_existing {
+            OnExisting::Error => {
+                if existing.is_some() {
+                    return Err(StagingError::AlreadyExists {
+                        source_path: source.to_path_buf(),
+                        staged_path,
+                    });
+                }
+            }
+            OnExisting::Reuse => {
+                if let Some(manifest) = existing {
+                    let meta = stat(source)?;
+                    if manifest.matches_source(&meta) {
+                        // Fresh match: the source has not changed since it was
+                        // staged, so reuse the existing copy and copy no bytes.
+                        tracing::info!(
+                            source = %source.display(),
+                            staged = %staged_path.display(),
+                            "reusing fresh staged copy (mtime + size match)"
+                        );
+                        return Ok(StagedFile {
+                            staged_path,
+                            manifest,
+                        });
+                    }
+                    // Stale: the source was rewritten. Fall through to re-stage.
+                }
+            }
+            OnExisting::Overwrite => {}
+        }
+
+        // (Re-)stage. Remove any prior staged copy + manifest first so a stale
+        // or partial artifact never coexists with the fresh one; the manifest
+        // is unlinked before the copy so a crash mid-copy cannot leave a fresh
+        // `.staged` paired with a stale manifest.
+        let _ = std::fs::remove_file(&manifest_path);
+        let _ = std::fs::remove_file(&staged_path);
+        self.stage_file(source, &source_id, &staged_path, &manifest_path)
+    }
+
+    /// Copy one selected source to its stable staged path with inline hashing,
+    /// atomic publish, and a committed identity manifest.
     ///
     /// The full lifecycle for a file:
     ///
-    /// 1. `stat` the source for its size; charge the size against the run's
-    ///    disk cap before copying a byte.
-    /// 2. Open `<run_dir>/<file_uuid>.partial` (mode `0o600` on Unix).
+    /// 1. `stat` the source for its size + mtime; charge the size against the
+    ///    run's disk cap before copying a byte.
+    /// 2. Open `<source_id>.<run_uuid>.partial` (mode `0o600` on Unix).
     /// 3. Stream 1 MiB chunks: each chunk is read once, fed to the BLAKE3
     ///    hasher, then written to the temp file — one pass over the bytes.
     /// 4. `sync_all` the temp file. On macOS `File::sync_all` issues
@@ -247,22 +364,24 @@ impl SourceStager {
     /// 5. `rename` `.partial` → `.staged`. `std::fs::rename` is atomic-replace
     ///    on all three target OSes, so a reader never observes a torn file.
     /// 6. (POSIX) `sync_all` the parent directory so the rename itself is
-    ///    crash-durable — on ext4/xfs a rename is only durable once the
-    ///    directory entry is fsync'd. NTFS makes the rename durable through the
-    ///    journal, so this step is a Unix-only no-op on Windows.
+    ///    crash-durable.
     /// 7. When `verify = blake3`, independently re-hash the source and compare;
     ///    a mismatch is [`StagingError::Verify`].
+    /// 8. Atomically publish the manifest (`.manifest.json.partial` → rename),
+    ///    which commits the copy: only now is the `.staged` file trustworthy.
     ///
     /// On any error after the temp file is created, the `.partial` is removed
     /// before the error propagates, so a failed stage never leaves a stray temp
-    /// file behind (and the run-dir `TempDir` cleans up the rest on drop).
-    fn stage_file(&mut self, source: &Path) -> Result<StagedFile, StagingError> {
-        let source_size = std::fs::metadata(source)
-            .map_err(|e| StagingError::Io {
-                path: source.to_path_buf(),
-                source: e,
-            })?
-            .len();
+    /// file behind.
+    fn stage_file(
+        &mut self,
+        source: &Path,
+        source_id: &str,
+        staged_path: &Path,
+        manifest_path: &Path,
+    ) -> Result<StagedFile, StagingError> {
+        let meta = stat(source)?;
+        let source_size = meta.len();
 
         // Charge the disk cap before writing: a file that would push the run
         // over its configured budget is refused outright rather than copied and
@@ -279,41 +398,51 @@ impl SourceStager {
             }
         }
 
-        // Each file is named by a fresh per-file uuid inside the per-run uuid
-        // subdir, so a destination collision cannot occur — neither within a
-        // run nor across runs sharing the staging root. That is exactly what
-        // makes `on_existing` (overwrite/reuse/error) a no-op under this naming
-        // scheme: there is never a pre-existing target to overwrite, reuse, or
-        // refuse. The config knob is retained for a future content-addressed or
-        // stable-name layout; today the uuid scheme subsumes it.
-        let file_uuid = uuid::Uuid::new_v4().to_string();
-        let run_dir = self.run_dir()?.to_path_buf();
-        let partial = run_dir.join(format!("{file_uuid}.partial"));
-        let staged = run_dir.join(format!("{file_uuid}.staged"));
+        // The partial carries a fresh per-run uuid so two concurrent
+        // invocations staging the same source write distinct partials and only
+        // race on the final atomic rename, not on the in-flight bytes.
+        let run_seg = uuid::Uuid::new_v4().to_string();
+        let root = staged_path.parent().unwrap_or(Path::new("."));
+        let partial = root.join(format!("{source_id}.{run_seg}.partial"));
 
-        let copy_result = self.copy_into(source, &partial, &staged);
-        match copy_result {
+        let copy_result = self.copy_into(source, &partial, staged_path);
+        let content_hash = match copy_result {
             Ok(content_hash) => {
-                let content_hash = if self.policy.verify == StagingVerify::Blake3 {
-                    verify_staged(source, &staged, content_hash)?
+                if self.policy.verify == StagingVerify::Blake3 {
+                    verify_staged(source, staged_path, content_hash)?
                 } else {
                     content_hash
-                };
-                self.bytes_staged = self.bytes_staged.saturating_add(source_size);
-                Ok(StagedFile {
-                    staged_path: staged,
-                    source_path: source.to_path_buf(),
-                    content_hash,
-                    source_size,
-                })
+                }
             }
             Err(e) => {
-                // Best-effort cleanup of the partial; the run-dir TempDir will
-                // sweep anything left behind on drop regardless.
+                // Best-effort cleanup of the partial before propagating.
                 let _ = std::fs::remove_file(&partial);
-                Err(e)
+                return Err(e);
             }
+        };
+
+        let (secs, nanos) = mtime_parts(&meta).unwrap_or((0, 0));
+        let manifest = StagedManifest {
+            source_path: source.to_path_buf(),
+            source_mtime_secs: secs,
+            source_mtime_nanos: nanos,
+            source_size,
+            content_hash,
+            staged_at: now_rfc3339(),
+        };
+        // Publishing the manifest is the commit point. If it fails, unlink the
+        // staged copy so a `.staged` without a manifest never survives as an
+        // orphan a later run might half-trust.
+        if let Err(e) = write_manifest_atomic(manifest_path, &manifest) {
+            let _ = std::fs::remove_file(staged_path);
+            return Err(e);
         }
+
+        self.bytes_staged = self.bytes_staged.saturating_add(source_size);
+        Ok(StagedFile {
+            staged_path: staged_path.to_path_buf(),
+            manifest,
+        })
     }
 
     /// Stream `source` into `partial`, hashing as it copies, then atomically
@@ -374,16 +503,232 @@ impl SourceStager {
 
         Ok(hasher.finalize().to_hex().to_string())
     }
+
+    /// Remove the staged copies this run produced, per the cleanup policy.
+    ///
+    /// Called once after the run finishes with `success` reflecting the run's
+    /// exit status. [`Cleanup::OnSuccess`] removes the copies only on a clean
+    /// run (a failure keeps them so the operator can inspect the exact inputs);
+    /// [`Cleanup::Always`] removes them regardless; [`Cleanup::Never`] keeps
+    /// them as a persistent reuse cache. Each staged file's manifest is removed
+    /// alongside it so a half-removed (staged-gone, manifest-left) pair never
+    /// confuses a later reuse-if-fresh check.
+    ///
+    /// Best-effort: a removal failure is logged, not propagated — cleanup must
+    /// not turn a successful run into a failure, and the next run's
+    /// [`SourceStager::crash_purge`] reaps anything left behind.
+    pub fn cleanup(&self, success: bool) {
+        let remove = match self.policy.cleanup {
+            Cleanup::Always => true,
+            Cleanup::OnSuccess => success,
+            Cleanup::Never => false,
+        };
+        if !remove {
+            return;
+        }
+        for staged in &self.produced {
+            remove_staged_pair(staged);
+        }
+    }
+
+    /// Idempotently reap the staged artifacts a crashed prior run left behind,
+    /// run once at startup before any source is staged.
+    ///
+    /// A crash leaves three orphan shapes under the staging root, distinguished
+    /// by artifact shape (no process-liveness probe is needed — a clean copy is
+    /// identified by its committed manifest):
+    ///
+    /// - `*.partial` — an interrupted copy. Always reaped.
+    /// - `*.staged` with no matching `*.manifest.json` — a copy that crashed
+    ///   after the rename but before the manifest was published. Reaped.
+    /// - `*.manifest.json` with no matching `*.staged` — a manifest whose staged
+    ///   file was removed. Reaped.
+    ///
+    /// A clean pair (`.staged` + matching `.manifest.json`) is the reuse cache
+    /// and is **kept** — reuse-if-fresh depends on it surviving across runs.
+    /// This is deliberately liveness-agnostic so a concurrency-safety layer can
+    /// later add a lock/lease check on top without reworking the orphan
+    /// classification here.
+    ///
+    /// A no-op when staging is disabled, the root is unset, or the root does not
+    /// yet exist. Errors are logged, not propagated: a purge failure must not
+    /// abort an otherwise-valid run.
+    pub fn crash_purge(policy: &StagingPolicy) {
+        if !policy.enabled {
+            return;
+        }
+        let Some(root) = policy.dir.as_deref() else {
+            return;
+        };
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            // A missing root is not an error here: the startup validator owns
+            // dir validity, and the first stage creates entries under it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "staging crash-purge could not read the staging root"
+                );
+                return;
+            }
+        };
+
+        let mut reaped = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_orphan = if name.ends_with(".partial") {
+                true
+            } else if let Some(id) = name.strip_suffix(&format!(".{STAGED_EXT}")) {
+                // Orphan when the matching manifest is absent.
+                !root.join(format!("{id}{MANIFEST_SUFFIX}")).exists()
+            } else if let Some(id) = name.strip_suffix(MANIFEST_SUFFIX) {
+                // Orphan when the matching staged copy is absent.
+                !root.join(format!("{id}.{STAGED_EXT}")).exists()
+            } else {
+                false
+            };
+            if is_orphan {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => reaped += 1,
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "staging crash-purge failed to remove an orphaned artifact"
+                    ),
+                }
+            }
+        }
+        if reaped > 0 {
+            tracing::info!(
+                root = %root.display(),
+                reaped,
+                "staging crash-purge reaped orphaned artifacts from a prior run"
+            );
+        }
+    }
+}
+
+/// The stable content-addressed id for a source path: the hex BLAKE3 of its
+/// canonicalized absolute form, truncated to 32 hex chars.
+///
+/// Canonicalizing first means two spellings of one source (relative vs
+/// absolute, symlinked) map to the same staged file, so reuse-if-fresh keys on
+/// the real file rather than the string the author happened to write. When the
+/// path cannot be canonicalized (it may not exist yet at id-computation time on
+/// some flows), the raw path bytes are hashed instead — still deterministic for
+/// a given spelling, which is all the layout requires.
+fn source_id(source: &Path) -> String {
+    let canonical = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+    hash.to_hex()[..32].to_string()
+}
+
+/// Load the committed manifest for a staged path, or `None` when the pair is
+/// not a clean, reusable artifact.
+///
+/// Returns `Some` only when both the `.staged` file and a parseable
+/// `.manifest.json` are present — the manifest is the commit marker, so a
+/// `.staged` without one is an orphan, not a cache hit.
+fn load_clean_manifest(staged_path: &Path, manifest_path: &Path) -> Option<StagedManifest> {
+    if !staged_path.exists() {
+        return None;
+    }
+    let bytes = std::fs::read(manifest_path).ok()?;
+    serde_json::from_slice::<StagedManifest>(&bytes).ok()
+}
+
+/// `stat` a source path, mapping the I/O error to [`StagingError::Io`].
+fn stat(source: &Path) -> Result<std::fs::Metadata, StagingError> {
+    std::fs::metadata(source).map_err(|e| StagingError::Io {
+        path: source.to_path_buf(),
+        source: e,
+    })
+}
+
+/// Decompose a file's modification time into (whole seconds, nanosecond
+/// remainder) since the Unix epoch, or `None` when the platform cannot report
+/// an mtime. Pre-epoch mtimes (negative durations) are represented with a
+/// negative seconds component so the comparison stays exact.
+fn mtime_parts(meta: &std::fs::Metadata) -> Option<(i64, u32)> {
+    let mtime = meta.modified().ok()?;
+    match mtime.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => Some((d.as_secs() as i64, d.subsec_nanos())),
+        Err(e) => {
+            // Pre-epoch: the error carries the magnitude of the negative offset.
+            let d = e.duration();
+            Some((-(d.as_secs() as i64), d.subsec_nanos()))
+        }
+    }
+}
+
+/// Current wall-clock time as an RFC 3339 string for the manifest audit field.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Atomically write `manifest` to `path` via a sibling `.partial` + rename so a
+/// reader never sees a half-written manifest, then fsync the parent dir so the
+/// commit survives a crash.
+///
+/// This rename is what makes the manifest the durable commit marker: a crash
+/// before it leaves no manifest (the staged copy reads as an orphan), and a
+/// crash after it leaves a fully-committed pair.
+fn write_manifest_atomic(path: &Path, manifest: &StagedManifest) -> Result<(), StagingError> {
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|e| StagingError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::other(e),
+    })?;
+    let partial = path.with_extension("json.partial");
+    {
+        let mut f = open_owner_only(&partial)?;
+        f.write_all(&bytes).map_err(|e| StagingError::Io {
+            path: partial.clone(),
+            source: e,
+        })?;
+        f.sync_all().map_err(|e| StagingError::Io {
+            path: partial.clone(),
+            source: e,
+        })?;
+    }
+    std::fs::rename(&partial, path).map_err(|e| StagingError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    fsync_parent_dir(path)
+}
+
+/// Remove a staged copy and its sidecar manifest. Best-effort: a missing file
+/// or a removal error is ignored, since cleanup and crash-purge both call this
+/// where a partial prior removal is expected.
+fn remove_staged_pair(staged: &Path) {
+    let _ = std::fs::remove_file(staged);
+    if let Some(id) = staged
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(&format!(".{STAGED_EXT}")))
+        && let Some(root) = staged.parent()
+    {
+        let _ = std::fs::remove_file(root.join(format!("{id}{MANIFEST_SUFFIX}")));
+    }
 }
 
 /// Open the `.partial` temp file for writing, truncating any leftover, with
 /// mode `0o600` on Unix.
-///
-/// Staged files hold verbatim source records; on a shared staging volume they
-/// must not be group/other-readable. Unix sets the mode at create time via
-/// `OpenOptionsExt`. Windows has no portable mode bit; the file inherits the
-/// directory ACL, NTFS's standard behavior.
 fn open_partial(partial: &Path) -> Result<File, StagingError> {
+    open_owner_only(partial)
+}
+
+/// Open `path` for writing (create + truncate), owner-only (`0o600`) on Unix.
+///
+/// Staged files and manifests hold (or describe) verbatim source records; on a
+/// shared staging volume they must not be group/other-readable. Unix sets the
+/// mode at create time via `OpenOptionsExt`. Windows has no portable mode bit;
+/// the file inherits the directory ACL, NTFS's standard behavior.
+fn open_owner_only(path: &Path) -> Result<File, StagingError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -391,8 +736,8 @@ fn open_partial(partial: &Path) -> Result<File, StagingError> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    opts.open(partial).map_err(|e| StagingError::Io {
-        path: partial.to_path_buf(),
+    opts.open(path).map_err(|e| StagingError::Io {
+        path: path.to_path_buf(),
         source: e,
     })
 }
@@ -469,22 +814,22 @@ fn advise_sequential(file: &File) {
 #[cfg(not(target_os = "linux"))]
 fn advise_sequential(_file: &File) {}
 
-/// Fsync the directory containing `staged` so the rename that published it is
+/// Fsync the directory containing `published` so a rename that published it is
 /// crash-durable. POSIX-only.
 ///
 /// On ext4/xfs a `rename` is only guaranteed durable once the containing
 /// directory's metadata is also fsync'd; without it a crash immediately after
-/// the rename can leave the staged file missing even though the stage reported
-/// success. Opening the directory as a `File` and calling `sync_all` is the
-/// portable POSIX way to flush that directory entry.
+/// the rename can leave the published file missing even though the operation
+/// reported success. Opening the directory as a `File` and calling `sync_all`
+/// is the portable POSIX way to flush that directory entry.
 ///
 /// Windows is intentionally skipped: NTFS makes a `rename` durable through its
 /// metadata journal (the semantics `MOVEFILE_WRITE_THROUGH` requests), so there
 /// is no separate directory handle to flush, and Windows offers no
 /// `fsync(dir)` equivalent anyway.
 #[cfg(unix)]
-fn fsync_parent_dir(staged: &Path) -> Result<(), StagingError> {
-    let Some(parent) = staged.parent() else {
+fn fsync_parent_dir(published: &Path) -> Result<(), StagingError> {
+    let Some(parent) = published.parent() else {
         return Ok(());
     };
     let dir = File::open(parent).map_err(|e| StagingError::Io {
@@ -500,7 +845,7 @@ fn fsync_parent_dir(staged: &Path) -> Result<(), StagingError> {
 /// Windows: the rename's durability is handled by the NTFS journal, so there is
 /// no parent-directory handle to fsync. See the POSIX variant for the contrast.
 #[cfg(not(unix))]
-fn fsync_parent_dir(_staged: &Path) -> Result<(), StagingError> {
+fn fsync_parent_dir(_published: &Path) -> Result<(), StagingError> {
     Ok(())
 }
 
@@ -516,6 +861,15 @@ mod tests {
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// Count the entries under a directory matching a suffix predicate.
+    fn count_with_suffix(dir: &Path, suffix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
+            .count()
     }
 
     #[test]
@@ -536,13 +890,13 @@ mod tests {
             .resolve(PathBuf::from("/somewhere/orders.json"))
             .unwrap();
         assert_eq!(resolved.staged, None);
-        // No run subdir created for a non-staging run.
+        // No staged entry created for a non-staging run.
         let entries: Vec<_> = std::fs::read_dir(stage_dir.path()).unwrap().collect();
         assert!(entries.is_empty());
     }
 
     #[test]
-    fn matched_source_is_copied_byte_identical() {
+    fn matched_source_is_copied_byte_identical_with_manifest() {
         let src_dir = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("orders.csv");
@@ -557,41 +911,234 @@ mod tests {
         let staged = resolved.staged.expect("matched source should be staged");
         let staged_bytes = std::fs::read(&staged).unwrap();
         assert_eq!(staged_bytes, body);
-        // The published file is `.staged`, and no `.partial` survives.
         assert_eq!(staged.extension().unwrap(), "staged");
-        let leftovers: Vec<_> = std::fs::read_dir(staged.parent().unwrap())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "partial"))
-            .collect();
-        assert!(leftovers.is_empty(), "no .partial should remain");
+        // A committed manifest sits next to the staged copy, and no `.partial`
+        // survives.
+        assert_eq!(count_with_suffix(stage_dir.path(), MANIFEST_SUFFIX), 1);
+        assert_eq!(count_with_suffix(stage_dir.path(), ".partial"), 0);
+    }
+
+    #[test]
+    fn reuse_if_fresh_skips_copy_on_unchanged_source() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"id,name\n1,alice\n").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Reuse;
+
+        // First run stages the file.
+        let mut first = SourceStager::new(policy.clone());
+        let staged_first = first.resolve(src.clone()).unwrap().staged.unwrap();
+        let inode_marker = std::fs::read(&staged_first).unwrap();
+
+        // Overwrite the staged copy with a sentinel so a re-copy would clobber
+        // it; reuse must leave it untouched (proving no copy happened).
+        std::fs::write(&staged_first, b"REUSED-SENTINEL").unwrap();
+
+        // Second run, source unchanged: reuse-if-fresh must skip the copy, so
+        // the sentinel survives and bytes_staged stays zero.
+        let mut second = SourceStager::new(policy);
+        let staged_second = second.resolve(src.clone()).unwrap().staged.unwrap();
+        assert_eq!(staged_second, staged_first, "stable path across runs");
+        assert_eq!(
+            std::fs::read(&staged_second).unwrap(),
+            b"REUSED-SENTINEL",
+            "reuse must not re-copy a fresh source"
+        );
+        assert_eq!(second.bytes_staged, 0, "a reused copy charges no bytes");
+        // Sanity: the original copy did write the real bytes.
+        assert_eq!(inode_marker, b"id,name\n1,alice\n");
+    }
+
+    #[test]
+    fn reuse_if_fresh_restages_when_source_changes() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"v1").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Reuse;
+
+        let mut first = SourceStager::new(policy.clone());
+        let staged = first.resolve(src.clone()).unwrap().staged.unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"v1");
+
+        // Rewrite the source with a different *size* so the freshness check
+        // (mtime + size) sees a stale manifest. The size change alone is the
+        // robust staleness signal — it does not depend on the filesystem's
+        // mtime resolution, which can be as coarse as one second.
+        std::fs::write(&src, b"v2-longer").unwrap();
+
+        let mut second = SourceStager::new(policy);
+        let staged2 = second.resolve(src.clone()).unwrap().staged.unwrap();
+        assert_eq!(staged2, staged, "stable path");
+        assert_eq!(
+            std::fs::read(&staged2).unwrap(),
+            b"v2-longer",
+            "a changed source must be re-staged"
+        );
+        assert!(second.bytes_staged > 0, "a re-stage copies bytes");
+    }
+
+    #[test]
+    fn on_existing_error_fails_when_a_staged_copy_exists() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        // Pre-stage with the default (overwrite) policy.
+        let mut seed = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+        seed.resolve(src.clone()).unwrap();
+
+        // A second run under on_existing = error must fail fast.
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Error;
+        let mut stager = SourceStager::new(policy);
+        let err = stager.resolve(src).unwrap_err();
+        assert!(matches!(err, StagingError::AlreadyExists { .. }));
+    }
+
+    #[test]
+    fn on_existing_error_stages_when_no_copy_exists() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Error;
+        let mut stager = SourceStager::new(policy);
+        // No prior copy: error mode stages normally.
+        assert!(stager.resolve(src).unwrap().staged.is_some());
+    }
+
+    #[test]
+    fn on_existing_overwrite_restages_a_fresh_source() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"original").unwrap();
+
+        let mut seed = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+        let staged = seed.resolve(src.clone()).unwrap().staged.unwrap();
+        // Mutate the staged copy; overwrite must re-copy over it even though the
+        // source is unchanged (overwrite ignores freshness, unlike reuse).
+        std::fs::write(&staged, b"SENTINEL").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Overwrite;
+        let mut stager = SourceStager::new(policy);
+        let staged2 = stager.resolve(src).unwrap().staged.unwrap();
+        assert_eq!(
+            std::fs::read(&staged2).unwrap(),
+            b"original",
+            "overwrite must re-copy the source bytes"
+        );
+    }
+
+    #[test]
+    fn cleanup_on_success_removes_after_clean_run() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.cleanup = Cleanup::OnSuccess;
+        let mut stager = SourceStager::new(policy);
+        let staged = stager.resolve(src).unwrap().staged.unwrap();
+        assert!(staged.exists());
+
+        stager.cleanup(true);
+        assert!(!staged.exists(), "on-success cleanup removes after success");
+        assert_eq!(
+            count_with_suffix(stage_dir.path(), MANIFEST_SUFFIX),
+            0,
+            "the manifest is removed alongside the staged copy"
+        );
+    }
+
+    #[test]
+    fn cleanup_on_success_keeps_after_failure() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.cleanup = Cleanup::OnSuccess;
+        let mut stager = SourceStager::new(policy);
+        let staged = stager.resolve(src).unwrap().staged.unwrap();
+
+        // A failed run keeps the inputs for inspection.
+        stager.cleanup(false);
+        assert!(
+            staged.exists(),
+            "on-success cleanup keeps inputs after a failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_always_removes_after_failure() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.cleanup = Cleanup::Always;
+        let mut stager = SourceStager::new(policy);
+        let staged = stager.resolve(src).unwrap().staged.unwrap();
+
+        stager.cleanup(false);
+        assert!(
+            !staged.exists(),
+            "always cleanup removes even after a failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_never_keeps_a_reusable_cache() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.cleanup = Cleanup::Never;
+        let mut stager = SourceStager::new(policy);
+        let staged = stager.resolve(src).unwrap().staged.unwrap();
+
+        stager.cleanup(true);
+        assert!(staged.exists(), "never cleanup keeps the copy as a cache");
+        assert_eq!(count_with_suffix(stage_dir.path(), MANIFEST_SUFFIX), 1);
     }
 
     #[test]
     fn blake3_mismatch_is_detected_as_distinct_error() {
-        // The full verify path: stage a file (copy_into hashes the copied
-        // bytes), then mutate the source before the independent verify read so
-        // the fresh source hash diverges — modeling an NFS soft-mount that
-        // delivered different bytes during the copy than the source now holds.
-        // verify_staged is the exact branch stage_file runs, so this drives the
-        // production decision, not a hand-built error.
+        // The verify path drives the production decision: stage a file
+        // (copy_into hashes the copied bytes), then mutate the source before the
+        // independent verify read so the fresh source hash diverges — modeling
+        // an NFS soft-mount that delivered different bytes during the copy than
+        // the source now holds.
         let src_dir = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("orders.csv");
         std::fs::write(&src, b"original bytes that get copied").unwrap();
 
         let policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
-        let mut stager = SourceStager::new(policy);
+        let stager = SourceStager::new(policy);
 
-        let run_dir = stager.run_dir().unwrap().to_path_buf();
-        let partial = run_dir.join("x.partial");
-        let staged = run_dir.join("x.staged");
+        let partial = stage_dir.path().join("x.partial");
+        let staged = stage_dir.path().join("x.staged");
         let copy_hash = stager.copy_into(&src, &partial, &staged).unwrap();
         assert!(staged.exists());
 
-        // Source changes after the copy: the verify re-read no longer matches.
         std::fs::write(&src, b"different bytes entirely").unwrap();
-
         let err = verify_staged(&src, &staged, copy_hash).unwrap_err();
         match err {
             StagingError::Verify {
@@ -604,7 +1151,6 @@ mod tests {
             }
             other => panic!("expected Verify, got {other:?}"),
         }
-        // A failed verify removes the published staged copy.
         assert!(
             !staged.exists(),
             "verify failure must unlink the staged copy"
@@ -617,7 +1163,6 @@ mod tests {
         let stage_dir = tempfile::tempdir().unwrap();
         let src = src_dir.path().join("data.csv");
         std::fs::write(&src, b"a,b,c\n1,2,3\n").unwrap();
-        // Default policy verifies with BLAKE3; a clean copy must pass.
         let policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
         let mut stager = SourceStager::new(policy);
         let resolved = stager.resolve(src.clone()).unwrap();
@@ -627,13 +1172,10 @@ mod tests {
     #[test]
     fn no_torn_staged_file_when_copy_fails_midway() {
         // A read error mid-copy must leave no `.staged` file and remove the
-        // `.partial`. Simulate by staging a path that exists for the size stat
-        // but cannot be opened for read (a directory): the size stat succeeds,
-        // the open-for-read or read fails, and the partial is cleaned up.
+        // `.partial`. A directory matched as a "source" makes metadata() work
+        // but read() fail.
         let stage_dir = tempfile::tempdir().unwrap();
         let src_dir = tempfile::tempdir().unwrap();
-        // A directory matched as a "source": metadata() works, File::open then
-        // read() fails (reading a directory yields an error on Linux).
         let dir_as_src = src_dir.path().join("subdir.csv");
         std::fs::create_dir(&dir_as_src).unwrap();
 
@@ -642,9 +1184,7 @@ mod tests {
         let err = stager.resolve(dir_as_src).unwrap_err();
         assert!(matches!(err, StagingError::Io { .. }));
 
-        // No `.staged` and no `.partial` survive in the run dir.
-        let run_dir = stager.run_dir.as_ref().unwrap().path().to_path_buf();
-        let survivors: Vec<_> = std::fs::read_dir(&run_dir)
+        let survivors: Vec<_> = std::fs::read_dir(stage_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -656,45 +1196,61 @@ mod tests {
     }
 
     #[test]
-    fn crash_before_rename_leaves_no_torn_staged_file() {
-        // The atomic-publish guarantee: a crash between writing `.partial` and
-        // the rename must leave no `.staged` file. Model the crash by writing a
-        // `.partial` and stopping before the rename — exactly the on-disk state
-        // a process that died mid-stage would leave. A reader scanning for
-        // `.staged` files sees nothing, and the run-dir TempDir removes the
-        // orphaned `.partial` on drop.
+    fn crash_purge_reaps_orphans_but_keeps_clean_pairs() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
-        let mut stager = SourceStager::new(policy);
-        let run_dir = stager.run_dir().unwrap().to_path_buf();
+        let root = stage_dir.path();
 
-        // Simulate the pre-rename crash state: a partial exists, no staged yet.
-        let partial = run_dir.join("interrupted.partial");
-        std::fs::write(&partial, b"half-written bytes").unwrap();
+        // Orphan 1: an interrupted partial.
+        std::fs::write(root.join("aaaa.deadbeef.partial"), b"half").unwrap();
+        // Orphan 2: a staged copy with no manifest (crashed before commit).
+        std::fs::write(root.join("bbbb.staged"), b"orphan-staged").unwrap();
+        // Orphan 3: a manifest with no staged copy.
+        std::fs::write(root.join("cccc.manifest.json"), b"{}").unwrap();
+        // Clean pair: staged + matching manifest — the reuse cache, must survive.
+        std::fs::write(root.join("dddd.staged"), b"clean").unwrap();
+        std::fs::write(root.join("dddd.manifest.json"), b"{}").unwrap();
 
-        let staged_files: Vec<_> = std::fs::read_dir(&run_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "staged"))
-            .collect();
+        let policy = policy_with_dir(root, &["*.csv"]);
+        SourceStager::crash_purge(&policy);
+
         assert!(
-            staged_files.is_empty(),
-            "a crash before rename must leave zero .staged files"
+            !root.join("aaaa.deadbeef.partial").exists(),
+            "partial reaped"
         );
-
-        // Dropping the stager removes the whole run dir, orphaned partial and
-        // all — the panic-safety story #173 relies on.
-        let run_dir_path = run_dir.clone();
-        drop(stager);
         assert!(
-            !run_dir_path.exists(),
-            "run dir (and its orphaned .partial) must be removed on drop"
+            !root.join("bbbb.staged").exists(),
+            "manifestless staged reaped"
         );
+        assert!(
+            !root.join("cccc.manifest.json").exists(),
+            "stagedless manifest reaped"
+        );
+        assert!(root.join("dddd.staged").exists(), "clean staged kept");
+        assert!(
+            root.join("dddd.manifest.json").exists(),
+            "clean manifest kept"
+        );
+    }
+
+    #[test]
+    fn crash_purge_is_noop_when_disabled_or_root_missing() {
+        // Disabled policy: no-op even with a dir set.
+        let stage_dir = tempfile::tempdir().unwrap();
+        std::fs::write(stage_dir.path().join("x.partial"), b"x").unwrap();
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.enabled = false;
+        SourceStager::crash_purge(&policy);
+        assert!(stage_dir.path().join("x.partial").exists());
+
+        // Missing root: no panic, no error.
+        let mut missing = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        missing.dir = Some(stage_dir.path().join("does-not-exist"));
+        SourceStager::crash_purge(&missing);
     }
 
     #[cfg(unix)]
     #[test]
-    fn staged_file_is_0600_and_run_dir_is_0700() {
+    fn staged_file_and_manifest_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let src_dir = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
@@ -703,18 +1259,21 @@ mod tests {
 
         let policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
         let mut stager = SourceStager::new(policy);
-        let resolved = stager.resolve(src).unwrap();
-        let staged = resolved.staged.unwrap();
+        let staged = stager.resolve(src).unwrap().staged.unwrap();
 
         let file_mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "staged file must be owner-only");
 
-        let dir_mode = std::fs::metadata(staged.parent().unwrap())
+        let id = staged
+            .file_name()
             .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dir_mode, 0o700, "per-run dir must be owner-only");
+            .to_str()
+            .unwrap()
+            .strip_suffix(".staged")
+            .unwrap();
+        let manifest = stage_dir.path().join(format!("{id}.manifest.json"));
+        let manifest_mode = std::fs::metadata(&manifest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(manifest_mode, 0o600, "manifest must be owner-only");
     }
 
     #[test]
@@ -749,7 +1308,6 @@ mod tests {
             enabled: true,
             dir: Some(stage_dir.path().to_path_buf()),
             patterns: vec!["*.csv".into()],
-            // Room for the first file (600) but not both (1200).
             disk_cap_bytes: Some(ByteSize(1000)),
             ..Default::default()
         };
@@ -757,5 +1315,34 @@ mod tests {
         assert!(stager.resolve(a).unwrap().staged.is_some());
         let err = stager.resolve(b).unwrap_err();
         assert!(matches!(err, StagingError::DiskCapExceeded { .. }));
+    }
+
+    #[test]
+    fn manifest_round_trips_and_freshness_matches() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"abc").unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        let (secs, nanos) = mtime_parts(&meta).unwrap();
+        let manifest = StagedManifest {
+            source_path: src.clone(),
+            source_mtime_secs: secs,
+            source_mtime_nanos: nanos,
+            source_size: meta.len(),
+            content_hash: "deadbeef".into(),
+            staged_at: now_rfc3339(),
+        };
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let back: StagedManifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, manifest);
+        assert!(
+            back.matches_source(&meta),
+            "round-tripped manifest is fresh"
+        );
+
+        // A size change makes it stale.
+        std::fs::write(&src, b"abcd").unwrap();
+        let meta2 = std::fs::metadata(&src).unwrap();
+        assert!(!back.matches_source(&meta2), "a size change is stale");
     }
 }

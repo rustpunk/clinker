@@ -691,6 +691,18 @@ pub(crate) struct ExecutorContext<'a> {
     /// lifetime acrobatic that would otherwise force every operator
     /// to thread the same lifetime as the borrowed plan-time refs.
     pub(crate) spill_root_path: Arc<std::path::Path>,
+    /// The held `<spill_root>/.lock` for this run, kept open so the OS advisory
+    /// lock marks the spill directory as owned by a live process. The next
+    /// run's startup crash-purge reaps only spill dirs whose lock it can
+    /// acquire, so holding this for the run's whole lifetime is what tells a
+    /// concurrent purge "this dir is live, don't reap it".
+    ///
+    /// Wrapped in `Option` so the clean-exit teardown can drop the lock file
+    /// *before* the spill `TempDir`'s recursive remove runs: on Windows an open
+    /// handle blocks the directory deletion, so the lock must be released first.
+    /// A crash skips this teardown, but the OS releases the lock on process
+    /// death anyway, so the next run still sees the dir as reapable.
+    pub(crate) spill_lock: Option<Arc<std::fs::File>>,
 
     /// Per-window arena+index registry. Slot `i` corresponds to
     /// `plan.indices_to_build[i]`; source-rooted slots populate at
