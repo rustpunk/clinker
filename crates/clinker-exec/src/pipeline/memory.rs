@@ -615,6 +615,15 @@ pub struct MemoryArbitrator {
     /// E310 with a partition + spill-bytes diagnostic.
     max_spill_bytes: AtomicU64,
     cumulative_spill_bytes: AtomicU64,
+    /// Per-stage on-disk spill totals, keyed by the spilling node's name.
+    /// The pipeline-wide `cumulative_spill_bytes` is the sum of these, but
+    /// the calibration loop #176 exists for needs the per-stage breakdown:
+    /// an operator compares each stage's *actual* spilled volume against the
+    /// pre-run `--explain` *estimate* for that same stage. Spill is off the
+    /// per-record hot path (it fires only when a blocking operator's state
+    /// trips the memory budget), so a `Mutex<BTreeMap>` here costs nothing
+    /// observable while keeping the breakdown allocation-stable and ordered.
+    per_stage_spill_bytes: Mutex<std::collections::BTreeMap<String, u64>>,
     /// High-water mark of `sum_consumer_usage()` sampled whenever a
     /// streaming charge handle admits a batch. Lets a test prove the
     /// charged-bytes peak of a streaming stage stays bounded to one
@@ -662,6 +671,7 @@ impl MemoryArbitrator {
             peak_rss: AtomicU64::new(0),
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
+            per_stage_spill_bytes: Mutex::new(std::collections::BTreeMap::new()),
             peak_consumer_usage: AtomicU64::new(0),
             consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
@@ -814,22 +824,49 @@ impl MemoryArbitrator {
     }
 
     /// Cumulative spill bytes recorded so far across every spill
-    /// operator polling this arbitrator.
+    /// operator polling this arbitrator. Equals the sum of every entry
+    /// in [`Self::per_stage_spill_bytes`].
     pub fn cumulative_spill_bytes(&self) -> u64 {
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
     }
 
-    /// Add `n` bytes to the cumulative spill counter. Returns `true`
-    /// when the running total has exceeded `max_spill_bytes` — the
-    /// operator's signal to surface E310 instead of continuing to
-    /// write. Saturating-add via `fetch_update` keeps an overflowing
-    /// pipeline from wrapping back below the quota silently.
-    pub fn record_spill_bytes(&self, n: u64) -> bool {
+    /// Snapshot of the per-stage on-disk spill totals, keyed by the
+    /// spilling node's name. The sum of the values equals
+    /// [`Self::cumulative_spill_bytes`]. Read once at run completion to
+    /// populate [`crate::executor::ExecutionReport::per_stage_spill_bytes`]
+    /// so an operator can compare each stage's actual spilled volume
+    /// against its pre-run `--explain` estimate.
+    pub fn per_stage_spill_bytes(&self) -> std::collections::BTreeMap<String, u64> {
+        self.per_stage_spill_bytes
+            .lock()
+            .expect("per_stage_spill_bytes mutex poisoned")
+            .clone()
+    }
+
+    /// Charge `n` spilled bytes against the named stage and the
+    /// pipeline-wide cumulative total. Returns `true` when the running
+    /// cumulative total has exceeded `max_spill_bytes` — the operator's
+    /// signal to surface the spill-cap diagnostic (E320) instead of
+    /// continuing to write.
+    ///
+    /// `node` is the spilling operator's node name, so the per-stage
+    /// breakdown attributes the bytes to the exact stage that wrote them.
+    /// Saturating-add via `fetch_update` keeps an overflowing pipeline
+    /// from wrapping back below the quota silently.
+    pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
         let _ =
             self.cumulative_spill_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_add(n))
                 });
+        {
+            let mut per_stage = self
+                .per_stage_spill_bytes
+                .lock()
+                .expect("per_stage_spill_bytes mutex poisoned");
+            let entry = per_stage.entry(node.to_string()).or_insert(0);
+            *entry = entry.saturating_add(n);
+        }
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
             > self.max_spill_bytes.load(Ordering::Relaxed)
     }
@@ -1195,9 +1232,9 @@ mod tests {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.set_max_spill_bytes(1024);
-        assert!(!arbitrator.record_spill_bytes(256));
+        assert!(!arbitrator.record_spill_bytes("sort", 256));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 256);
-        assert!(!arbitrator.record_spill_bytes(512));
+        assert!(!arbitrator.record_spill_bytes("sort", 512));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 768);
     }
 
@@ -1206,8 +1243,8 @@ mod tests {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
         arbitrator.set_max_spill_bytes(1024);
-        assert!(!arbitrator.record_spill_bytes(1024));
-        assert!(arbitrator.record_spill_bytes(1));
+        assert!(!arbitrator.record_spill_bytes("sort", 1024));
+        assert!(arbitrator.record_spill_bytes("sort", 1));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 1025);
     }
 
@@ -1222,8 +1259,27 @@ mod tests {
         arbitrator
             .cumulative_spill_bytes
             .store(u64::MAX - 10, Ordering::Relaxed);
-        assert!(arbitrator.record_spill_bytes(100));
+        assert!(arbitrator.record_spill_bytes("sort", 100));
         assert_eq!(arbitrator.cumulative_spill_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn test_record_spill_bytes_attributes_per_stage() {
+        // Two stages spill; the per-stage breakdown keeps their totals
+        // distinct and the cumulative total equals their sum.
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        arbitrator.record_spill_bytes("sort_by_amount", 256);
+        arbitrator.record_spill_bytes("dept_totals", 512);
+        arbitrator.record_spill_bytes("sort_by_amount", 128);
+        let per_stage = arbitrator.per_stage_spill_bytes();
+        assert_eq!(per_stage.get("sort_by_amount"), Some(&384));
+        assert_eq!(per_stage.get("dept_totals"), Some(&512));
+        assert_eq!(
+            per_stage.values().sum::<u64>(),
+            arbitrator.cumulative_spill_bytes(),
+            "the per-stage totals must sum to the pipeline-wide cumulative total"
+        );
     }
 
     #[test]

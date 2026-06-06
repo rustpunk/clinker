@@ -15,6 +15,26 @@ use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 
 use cxl::analyzer::ParallelismHint;
 
+/// One blocking operator's plan-time spill-volume estimate, surfaced in
+/// `clinker run --explain` so an operator sees the per-stage footprint
+/// before a run fills the spill volume.
+///
+/// Produced by [`ExecutionPlanDag::per_stage_spill_estimates`]. `estimate_bytes`
+/// is `0` when the stage's volume is unknown at plan time (no on-disk file-size
+/// seed reached it) — the renderer shows "unknown" rather than a misleading `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSpillEstimate {
+    /// The spilling operator's pipeline node name (the key the runtime
+    /// per-stage actual-spill breakdown also uses, so estimate and actual
+    /// line up by name).
+    pub node_name: String,
+    /// The operator's `--explain` display name (strategy/role suffix and all).
+    pub display_name: String,
+    /// Coarse plan-time estimate, in bytes, of the live state this stage
+    /// could spill. `0` means unknown — see the type-level note.
+    pub estimate_bytes: u64,
+}
+
 impl ExecutionPlanDag {
     /// Construct from already-computed parts. The compile path supplies
     /// the populated graph + topology + per-transform plan metadata;
@@ -153,6 +173,42 @@ impl ExecutionPlanDag {
             .fold(0u64, |acc, props| {
                 acc.saturating_add(props.predicted_peak_bytes)
             })
+    }
+
+    /// Per-blocking-stage spill-volume estimate, one entry per spilling
+    /// operator (hash Aggregate, external sort, grace-hash / sort-merge /
+    /// IEJoin / hash Combine) in topological order.
+    ///
+    /// Each [`StageSpillEstimate`] carries the operator's node name, its
+    /// `--explain` display name, and its `predicted_peak_bytes` — the coarse
+    /// plan-time estimate of the live state it could spill. `estimate_bytes`
+    /// is `0` (rendered "unknown") when no on-disk file-size seed reached the
+    /// node: a multi-file source matcher (glob/regex/paths) whose discovered
+    /// sizes were not summed at plan time, a missing/unreadable input, or a
+    /// network source. Summing the entries equals [`Self::estimated_spill_bytes`].
+    /// The figures are the same `predicted_peak_bytes` the Physical Properties
+    /// arbitration line surfaces, so the per-stage estimate and the cap-headroom
+    /// preflight line up with what an operator already reads.
+    pub fn per_stage_spill_estimates(&self) -> Vec<StageSpillEstimate> {
+        self.topo_order
+            .iter()
+            .filter(|&&idx| {
+                super::arbitration_class(&self.graph[idx])
+                    .spill_priority
+                    .is_some()
+            })
+            .map(|&idx| {
+                let node = &self.graph[idx];
+                StageSpillEstimate {
+                    node_name: node.name().to_string(),
+                    display_name: node.display_name(),
+                    estimate_bytes: self
+                        .node_properties
+                        .get(&idx)
+                        .map_or(0, |p| p.predicted_peak_bytes),
+                }
+            })
+            .collect()
     }
 
     /// Get transform nodes in topological order.

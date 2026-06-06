@@ -50,6 +50,12 @@ edge aggregation.dept_totals -> output.out:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=1K, predicted_freed=1K (producer: aggregation)
 
+=== Estimated Spill Volume ===
+
+Estimated spill volume (per blocking stage):
+  [aggregation:hash] dept_totals → 1K
+  Total: 1K
+
 === CXL Expressions ===
 
 Transform 'dept_totals':

@@ -295,6 +295,48 @@ nodes:
 }
 
 #[test]
+fn explicit_paths_source_seeds_sum_of_listed_files() {
+    // An explicit `paths:` list carries no glob/exclude/size discovery filters,
+    // so the seed is the exact sum of the listed files' sizes — the multi-file
+    // case the estimate now covers (a glob/regex matcher still seeds 0).
+    let tmp = tempfile::tempdir().unwrap();
+    let a = write_file(tmp.path(), "a.csv", "department,amount\nsales,100\n");
+    let b = write_file(tmp.path(), "b.csv", "department,amount\nops,250\nops,40\n");
+    assert!(a > 0 && b > 0);
+
+    let yaml = r#"
+pipeline:
+  name: vol
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      paths: [a.csv, b.csv]
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile_anchored(yaml, tmp.path());
+    let dag = plan.dag();
+
+    let src = props_for_node(dag, "orders");
+    assert_eq!(
+        src.predicted_peak_bytes,
+        a + b,
+        "an explicit paths: list must seed the sum of the listed files' sizes"
+    );
+}
+
+#[test]
 fn propagation_source_transform_aggregate() {
     // Source -> Transform -> Aggregate: the Transform inherits the Source's
     // seeded volume (pass-through), the hash Aggregate's peak equals the

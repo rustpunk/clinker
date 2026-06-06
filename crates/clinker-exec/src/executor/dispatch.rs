@@ -1423,7 +1423,7 @@ pub(crate) fn admit_node_buffer(
             // Velox's "reclaimable ≠ held" point.
             handle.set_bytes(0);
             let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-            if ctx.memory_budget.record_spill_bytes(file_bytes) {
+            if ctx.memory_budget.record_spill_bytes(node_name, file_bytes) {
                 return Err(PipelineError::spill_cap_exceeded(
                     node_name,
                     ctx.memory_budget.max_spill_bytes(),

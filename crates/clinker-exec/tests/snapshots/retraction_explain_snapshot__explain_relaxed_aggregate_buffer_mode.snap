@@ -91,6 +91,13 @@ edge aggregation.dept_totals -> output.out:
   buffer: node_buffer (slot=2)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: aggregation)
 
+=== Estimated Spill Volume ===
+
+Estimated spill volume (per blocking stage):
+  [sort] __correlation_sort_orders → unknown
+  [aggregation:hash] dept_totals → unknown
+  Total (known stages): 0B (excludes stages whose volume is unknown at plan time — a glob/regex multi-file source, a network source, or a missing input)
+
 === Retraction ===
 
 retraction enabled — 1 relaxed aggregates, 1 buffer-mode windows, fanout policy: any.

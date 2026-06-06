@@ -44,7 +44,8 @@ pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::{CompiledRoute, CompiledRouteBranch};
 pub use storage_validate::{
-    FreeSpaceWarning, ResolvedStorage, StorageValidationError, validate_storage_config,
+    CapHeadroomWarning, FreeSpaceWarning, ResolvedStorage, StorageValidationError,
+    validate_storage_config,
 };
 pub(crate) use streaming::StreamingOutputTaskOutput;
 use streaming::{compute_streaming_output_specs, streaming_output};
@@ -136,6 +137,11 @@ pub(crate) struct DispatchOutcome {
     /// running total at dispatch close so an aborted run still
     /// reports the last committed value.
     pub(crate) cumulative_spill_bytes: u64,
+    /// Per-stage on-disk spill totals, keyed by the spilling node's name.
+    /// The sum equals `cumulative_spill_bytes`; this breakdown is what an
+    /// operator compares against the per-stage pre-run `--explain`
+    /// estimate to calibrate. Empty when no stage spilled.
+    pub(crate) per_stage_spill_bytes: BTreeMap<String, u64>,
     /// High-water mark of `MemoryArbitrator::sum_consumer_usage()` sampled
     /// at every streaming per-batch charge. A streaming stage's peak stays
     /// bounded to one in-flight batch (plus the channel's bound), proving
@@ -843,6 +849,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
         } = Self::execute_dag(
@@ -897,7 +904,19 @@ impl PipelineExecutor {
         }
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 
-        let stages = collector.into_stages();
+        let mut stages = collector.into_stages();
+        // Attribute the arbitrator's per-stage spill breakdown (keyed by node
+        // name) onto each node-scoped StageMetrics entry, so a combine's
+        // build/probe stage carries the bytes that combine actually spilled.
+        // The full map still rides on the report unchanged — this only mirrors
+        // the per-node share onto the timed stages an operator reads inline.
+        for stage in &mut stages {
+            if let Some(name) = stage.name.node_name()
+                && let Some(&bytes) = per_stage_spill_bytes.get(name)
+            {
+                stage.spill_bytes = bytes;
+            }
+        }
         let (total_cpu_user_ns, total_cpu_sys_ns, total_io_read_bytes, total_io_write_bytes) =
             sum_cpu_io_totals(&stages);
 
@@ -942,6 +961,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
         })
@@ -1559,6 +1579,7 @@ impl PipelineExecutor {
             .collect();
 
         let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
+        let per_stage_spill_bytes = ctx.memory_budget.per_stage_spill_bytes();
         let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
         let interrupted = ctx.interrupted;
         Ok(DispatchOutcome {
@@ -1570,6 +1591,7 @@ impl PipelineExecutor {
             per_source_record_counts,
             per_source_dlq_counts,
             cumulative_spill_bytes,
+            per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
         })

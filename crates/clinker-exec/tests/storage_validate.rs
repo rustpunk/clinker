@@ -157,6 +157,55 @@ fn free_space_preflight_warns_on_low_space() {
     assert!(warning.to_string().contains("W330"));
 }
 
+/// The cap-headroom preflight (W331, #176 AC#4) warns — without erroring —
+/// when the estimated spill volume reaches 80% of the configured spill cap. The
+/// message disclaims that the headroom is per-invocation (#311).
+#[test]
+fn cap_headroom_preflight_warns_above_eighty_percent() {
+    let dir = tempfile::tempdir().expect("spill dir");
+    let cfg = storage(
+        SpillConfig {
+            dir: Some(dir.path().to_path_buf()),
+            disk_cap_bytes: Some(clinker_plan::config::ByteSize(1_000)),
+            ..Default::default()
+        },
+        StagingPolicy::default(),
+    );
+    // 900-byte estimate against a 1000-byte cap = 90%, over the 80% threshold.
+    // Small enough that the real tempdir's free space does not also trip W330.
+    let resolved =
+        validate_storage_config(&cfg, &[], 900).expect("cap-headroom warns, does not error");
+    let warning = resolved
+        .cap_headroom_warning
+        .expect("cap-headroom advisory must fire above 80% of the cap");
+    assert_eq!(warning.disk_cap_bytes, 1_000);
+    assert_eq!(warning.estimated_spill_bytes, 900);
+    let msg = warning.to_string();
+    assert!(msg.contains("W331"), "message must carry W331: {msg}");
+    assert!(
+        msg.contains("per invocation"),
+        "the headroom must disclaim sibling invocations: {msg}"
+    );
+}
+
+/// No cap-headroom warning when the estimate sits comfortably below 80% of the
+/// cap, or when no cap is configured.
+#[test]
+fn cap_headroom_silent_below_threshold() {
+    let dir = tempfile::tempdir().expect("spill dir");
+    let cfg = storage(
+        SpillConfig {
+            dir: Some(dir.path().to_path_buf()),
+            disk_cap_bytes: Some(clinker_plan::config::ByteSize(1_000_000_000)),
+            ..Default::default()
+        },
+        StagingPolicy::default(),
+    );
+    // 1 KB estimate against a 1 GB cap is far under the threshold.
+    let resolved = validate_storage_config(&cfg, &[], 1_000).expect("clean validate");
+    assert!(resolved.cap_headroom_warning.is_none());
+}
+
 /// A directory-validity failure from the reused spill-dir check carries through
 /// as the same message, on every platform.
 #[test]

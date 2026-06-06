@@ -751,7 +751,7 @@ pub(crate) fn execute_combine_grace_hash(
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
     let build_spilled = executor.take_spilled_bytes();
-    if budget.record_spill_bytes(build_spilled) {
+    if budget.record_spill_bytes(name, build_spilled) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
             budget.disk_quota(),
@@ -841,7 +841,7 @@ pub(crate) fn execute_combine_grace_hash(
         .finalize_probe_spills()
         .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
     let probe_spilled = executor.take_spilled_bytes();
-    if budget.record_spill_bytes(probe_spilled) {
+    if budget.record_spill_bytes(name, probe_spilled) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
             budget.disk_quota(),

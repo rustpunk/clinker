@@ -764,6 +764,29 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     "{}",
                     dag.spill_compression_explain(storage_config.spill.compress, batch_size)
                 );
+                // Cap-headroom: the spill cap minus the run's estimated spill
+                // volume. Surfaced only when a cap is configured; the figure is
+                // per invocation and explicitly disclaims sibling invocations
+                // sharing the volume under the partition-and-run model.
+                print!(
+                    "{}",
+                    cap_headroom_explain(spill_disk_cap_bytes, dag.estimated_spill_bytes())
+                );
+                // Staging plan per source: whether each source (or each
+                // discovered file under a multi-file matcher) would be staged,
+                // the resolved staged path, and the reuse-if-fresh decision.
+                // The discovery anchor matches the run path's
+                // (`args.config.parent()`), so the staged paths shown are the
+                // exact paths the real run would write.
+                let discovery_anchor = args
+                    .config
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                print!(
+                    "{}",
+                    staging_plan_explain(&pipeline_config, &staging_policy, &discovery_anchor)
+                );
             }
             ExplainFormat::Json => {
                 let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts);
@@ -947,6 +970,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     .map_err(storage_validation_error)?;
     let spill_root_dir = resolved_storage.spill_root_dir;
     if let Some(warning) = &resolved_storage.free_space_warning {
+        tracing::warn!("{warning}");
+        eprintln!("{warning}");
+    }
+    // Cap-headroom warning: the run's estimated spill volume is within 80% of
+    // the configured `storage.spill.disk_cap_bytes`, so it is likely to abort
+    // with E320 mid-stream. Fired here on the REAL run path — before any source
+    // ingest — so the operator sees the signal at startup; advisory, not fatal.
+    if let Some(warning) = &resolved_storage.cap_headroom_warning {
         tracing::warn!("{warning}");
         eprintln!("{warning}");
     }
@@ -1353,6 +1384,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         counters.dlq_count
     );
 
+    // Per-stage actual spill volume at end-of-run, so an operator can compare
+    // each stage's real spilled bytes against the pre-run `--explain` per-stage
+    // estimate (the calibration loop #176 exists for). Printed only when a stage
+    // actually spilled; a run that stayed in memory adds no noise.
+    if !report.per_stage_spill_bytes.is_empty() {
+        println!("=== Spill Volume (actual, per stage) ===");
+        for (stage, bytes) in &report.per_stage_spill_bytes {
+            println!("  {stage} → {bytes} bytes");
+        }
+        println!(
+            "  Total: {} bytes (compare against the --explain estimate)",
+            report.cumulative_spill_bytes
+        );
+    }
+
     // Exit codes per spec §10.2. An interrupted run takes precedence:
     // the pipeline drained what it could before unwinding on the
     // shutdown signal, so report the conventional SIGINT status (130)
@@ -1621,6 +1667,117 @@ fn print_resolved_outputs(config: &clinker_plan::config::PipelineConfig) {
         );
     }
     println!();
+}
+
+/// Render the cap-headroom line for `clinker run --explain`.
+///
+/// Reports the spill cap minus the run's estimated spill volume, plus a
+/// per-invocation disclaimer. Returns an empty string when no
+/// `storage.spill.disk_cap_bytes` is configured (unlimited spill has no
+/// headroom to report) or the estimate is unknown (`0`). The figure is **per
+/// invocation**: under the partition-and-run model several `clinker`
+/// invocations can share one spill volume and one cap, so the disclaimer states
+/// the headroom does not account for sibling invocations sharing the volume.
+/// Rendered in raw bytes, matching the "Spill disk cap" line above it.
+fn cap_headroom_explain(disk_cap_bytes: Option<u64>, estimated_spill_bytes: u64) -> String {
+    let Some(cap) = disk_cap_bytes else {
+        return String::new();
+    };
+    if estimated_spill_bytes == 0 {
+        return String::new();
+    }
+    let headroom = cap.saturating_sub(estimated_spill_bytes);
+    let pct = if cap == 0 {
+        0.0
+    } else {
+        (estimated_spill_bytes as f64 / cap as f64) * 100.0
+    };
+    let over_threshold = estimated_spill_bytes as f64 >= cap as f64 * 0.80;
+    let mut out = format!(
+        "Cap headroom: {headroom} bytes free ({estimated_spill_bytes} estimated of {cap} cap, \
+         {pct:.0}%) [per invocation — does NOT account for sibling invocations sharing the \
+         spill volume under partition-and-run]\n",
+    );
+    if over_threshold {
+        out.push_str(
+            "  WARNING: the estimate exceeds 80% of the cap; a real run may abort with a \
+             spill-cap error (E320). Raise storage.spill.disk_cap_bytes or reduce the spill \
+             footprint.\n",
+        );
+    }
+    out
+}
+
+/// Render the `=== Staging Plan ===` block for `clinker run --explain`.
+///
+/// For each file-backed source, resolves its matcher to the file set the run
+/// would read and emits one line per file: whether it would be staged, the
+/// resolved `<staging_root>/<source_id>.staged` path, and (under
+/// `on_existing = reuse`) the reuse-if-fresh cache decision (hit/miss). Network
+/// sources are not stagable and render an explicit in-place note. When staging
+/// is disabled the block states that every source reads in place. Read-only:
+/// resolves through the same [`clinker_channel::SourceStager::plan_entry`] the
+/// run would consult, copying nothing.
+fn staging_plan_explain(
+    config: &clinker_plan::config::PipelineConfig,
+    staging_policy: &clinker_plan::config::StagingPolicy,
+    discovery_anchor: &std::path::Path,
+) -> String {
+    let mut out = String::from("=== Staging Plan ===\n\n");
+    if !staging_policy.enabled {
+        out.push_str("Source staging is disabled — every source reads in place.\n\n");
+        return out;
+    }
+    let stager = clinker_channel::SourceStager::new(staging_policy.clone());
+    for body in config.source_bodies() {
+        let source = &body.source;
+        if !source.transport.is_file() {
+            out.push_str(&format!(
+                "Source '{}': not stagable (network source reads in place)\n",
+                source.name
+            ));
+            continue;
+        }
+        out.push_str(&format!("Source '{}':\n", source.name));
+        // Resolve the matcher to its file set with the same anchor the run
+        // uses. A discovery failure (no match, bad glob) is reported inline
+        // rather than aborting the explain; the run's own discovery will
+        // surface the coded diagnostic.
+        match clinker_exec::source::discovery::discover(source, discovery_anchor) {
+            Ok(outcome) => {
+                let files = outcome.files();
+                if files.is_empty() {
+                    out.push_str("  (no files matched)\n");
+                }
+                for f in files {
+                    let entry = stager.plan_entry(&f.path);
+                    if entry.staged {
+                        let path = entry
+                            .staged_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "  {} → staged: yes, path: {}, reuse: {}\n",
+                            f.path.display(),
+                            path,
+                            entry.reuse.label(),
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  {} → staged: no (no pattern match, reads in place)\n",
+                            f.path.display(),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                out.push_str(&format!("  (discovery failed: {e})\n"));
+            }
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Best-effort hostname for the metrics payload.
@@ -2016,5 +2173,112 @@ mod tests {
             }
             _ => panic!("expected Run command"),
         }
+    }
+
+    #[test]
+    fn cap_headroom_explain_states_per_invocation_and_warns_over_threshold() {
+        // 9 GB estimate vs a 10 GB cap is 90%, over the 80% threshold → warning
+        // line, plus the per-invocation disclaimer (#311).
+        let out = cap_headroom_explain(Some(10_000_000_000), 9_000_000_000);
+        assert!(
+            out.contains("Cap headroom:"),
+            "must render headroom line: {out}"
+        );
+        assert!(
+            out.contains("per invocation") && out.contains("sibling invocations"),
+            "must disclaim sibling invocations sharing the volume: {out}"
+        );
+        assert!(
+            out.contains("WARNING"),
+            "90% of cap must emit a warning: {out}"
+        );
+
+        // 50% of the cap is under threshold → headroom line, no WARNING.
+        let ok = cap_headroom_explain(Some(10_000_000_000), 5_000_000_000);
+        assert!(ok.contains("Cap headroom:"));
+        assert!(!ok.contains("WARNING"), "50% of cap must not warn: {ok}");
+
+        // No cap configured → nothing rendered (unlimited spill has no headroom).
+        assert!(cap_headroom_explain(None, 5_000_000_000).is_empty());
+    }
+
+    #[test]
+    fn staging_plan_explain_reports_disabled_in_place() {
+        let config: clinker_plan::config::PipelineConfig = clinker_plan::config::parse_config(
+            r#"
+pipeline:
+  name: x
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: a, type: string }
+  - type: output
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        )
+        .expect("parse");
+        let policy = clinker_plan::config::StagingPolicy::default();
+        let out = staging_plan_explain(&config, &policy, std::path::Path::new("."));
+        assert!(out.contains("=== Staging Plan ==="));
+        assert!(
+            out.contains("Source staging is disabled"),
+            "disabled policy must say every source reads in place: {out}"
+        );
+    }
+
+    #[test]
+    fn staging_plan_explain_reports_staged_path_for_matched_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("orders.csv"), b"a\n1\n").expect("write source");
+        let stage_dir = tempfile::tempdir().expect("stage dir");
+        let config: clinker_plan::config::PipelineConfig = clinker_plan::config::parse_config(
+            r#"
+pipeline:
+  name: x
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: a, type: string }
+  - type: output
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        )
+        .expect("parse");
+        let policy = clinker_plan::config::StagingPolicy {
+            enabled: true,
+            dir: Some(stage_dir.path().to_path_buf()),
+            patterns: vec!["*.csv".into()],
+            ..Default::default()
+        };
+        let out = staging_plan_explain(&config, &policy, tmp.path());
+        assert!(out.contains("=== Staging Plan ==="));
+        assert!(
+            out.contains("Source 'orders':") && out.contains("staged: yes"),
+            "a matched source must report staged: yes with its path: {out}"
+        );
+        assert!(
+            out.contains(".staged"),
+            "the resolved staged path must appear: {out}"
+        );
     }
 }

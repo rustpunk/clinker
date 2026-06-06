@@ -3498,6 +3498,64 @@ nodes:
         }
     }
 
+    /// Run `run_combine_fixture` under a hard wall-clock bound, failing
+    /// fast instead of letting `cargo test` (which has no per-test
+    /// timeout) block the whole suite forever.
+    ///
+    /// The fixture runs on a worker thread; the caller waits for its
+    /// result over an `mpsc` channel with `recv_timeout`. A memory-abort
+    /// fixture that deadlocks (e.g. a future regression that reintroduces
+    /// a never-resumed producer pause under a permanently over-budget RSS)
+    /// trips the timeout and panics with a clear message rather than
+    /// hanging. The bound is generous relative to the few-millisecond
+    /// happy path, so it never flakes on a slow CI host.
+    ///
+    /// `yaml` and the input CSVs are copied into owned `String`s so the
+    /// worker closure is `'static` and the borrowed fixture constants
+    /// stay usable at the call site.
+    fn run_combine_fixture_bounded(
+        yaml: &str,
+        inputs: &[(&str, &str)],
+        primary_override: Option<&str>,
+        bound: std::time::Duration,
+    ) -> Result<CombineFixtureResult, CombineFixtureError> {
+        let yaml = yaml.to_string();
+        let inputs: Vec<(String, String)> = inputs
+            .iter()
+            .map(|(name, data)| ((*name).to_string(), (*data).to_string()))
+            .collect();
+        let primary_override = primary_override.map(str::to_string);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let input_refs: Vec<(&str, &str)> = inputs
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_str()))
+                .collect();
+            let result = run_combine_fixture(&yaml, &input_refs, primary_override.as_deref());
+            // A send error means the receiver already gave up (timed out);
+            // drop the result silently in that case.
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(bound) {
+            Ok(result) => {
+                handle
+                    .join()
+                    .expect("combine fixture worker thread panicked");
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "combine fixture did not complete within {bound:?}; a memory-abort \
+                 pipeline that hangs instead of surfacing a typed error indicates a \
+                 producer-pause deadlock under a permanently over-budget RSS"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("combine fixture worker thread dropped its result sender without sending")
+            }
+        }
+    }
+
     /// MemoryArbitrator abort — a 1-byte hard limit forces
     /// `MemoryArbitrator::should_abort` to return true on the first poll
     /// inside `CombineHashTable::build` (process RSS trivially exceeds
@@ -3511,6 +3569,17 @@ nodes:
     /// but exercised end-to-end through the combine executor arm so a
     /// regression in the arm's error mapping is caught here.
     ///
+    /// Determinism: `backpressure: spill` installs the bare `Priority`
+    /// policy so no producer is ever elected as a pause victim. Under the
+    /// default `pause` policy a 1-byte budget can pause the Source ingest
+    /// thread on a `Condvar` that never resumes (nothing ever frees memory
+    /// below 1 byte) while the consumer blocks on `recv`, deadlocking the
+    /// run; choosing `spill` removes that path so the synchronous arena /
+    /// NodeBuffer admission charge surfaces the abort on the first record.
+    /// The run is wrapped in `run_combine_fixture_bounded` so even a future
+    /// regression that reintroduces the deadlock fails fast instead of
+    /// hanging `cargo test`.
+    ///
     /// Skipped silently when `rss_bytes()` is unavailable on the host
     /// platform — the same gate the unit test uses, applied via
     /// `clinker_exec::pipeline::memory::rss_bytes()`.
@@ -3522,7 +3591,7 @@ nodes:
         let yaml = r#"
 pipeline:
   name: combine_exec_e310
-  memory: { limit: "1" }
+  memory: { limit: "1", backpressure: spill }
 nodes:
   - type: source
     name: orders
@@ -3565,10 +3634,11 @@ nodes:
       type: csv
       path: enriched.csv
 "#;
-        let err = run_combine_fixture(
+        let err = run_combine_fixture_bounded(
             yaml,
             &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
             Some("orders"),
+            std::time::Duration::from_secs(30),
         )
         .expect_err("1-byte mem_limit must abort combine");
         match &err {

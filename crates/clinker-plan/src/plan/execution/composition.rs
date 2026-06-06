@@ -331,27 +331,57 @@ pub(crate) fn resolve_composition_body_windows(
 
 /// On-disk byte seed for a file-backed Source's `predicted_peak_bytes`.
 ///
-/// Returns `Some(len)` only for the single-file `path:` matcher, resolving
-/// the path against `anchor` (the pipeline file's directory) so the size is
-/// independent of the process CWD. Returns `None` — the universal "unknown"
-/// seed, written as `0` by the caller — for every case this issue does not
-/// cover: multi-file matchers (`glob`/`regex`/`paths`), an absent `path:`,
-/// or an unreadable/missing file (`std::fs::metadata` error). Absolute paths
-/// resolve as-is, matching the source-discovery resolver.
+/// Resolves each literal path against `anchor` (the pipeline file's directory)
+/// so the size is independent of the process CWD, and absolute paths resolve
+/// as-is — matching the source-discovery resolver.
+///
+/// Coverage:
+/// - **`path:`** (single file) — `Some(len)`.
+/// - **`paths:`** (explicit list) — `Some(sum)` of every readable listed file.
+///   The explicit list carries no glob/exclude/min-size discovery filters, so
+///   summing the listed sizes is exact and reuses no discovery logic. An
+///   unreadable entry contributes nothing; the sum still seeds the others.
+///
+/// Returns `None` — the "unknown" seed the caller writes as `0` — for:
+/// - **`glob:` / `regex:`** matchers, which fan out through the full
+///   source-discovery resolver (exclude lists, `min_size`/`max_size`,
+///   `modified_after`/`before`, `take`, sort). Summing matched sizes here
+///   would mean re-implementing that resolver and risk diverging from the
+///   bytes the run actually reads, so these stay unknown by design — the
+///   `--explain` output and `docs/src/ops/storage.md` flag the limitation.
+/// - an absent matcher, or a `path:` whose `std::fs::metadata` fails.
 pub(crate) fn source_seed_bytes(source: &SourceConfig, anchor: &std::path::Path) -> Option<u64> {
-    // Multi-file matchers fan out to a `Vec<PathBuf>` at discovery time with
-    // no single literal size to seed; leave them unknown.
-    if source.glob.is_some() || source.regex.is_some() || source.paths.is_some() {
+    let resolve = |p: &str| -> std::path::PathBuf {
+        let p = std::path::Path::new(p);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            anchor.join(p)
+        }
+    };
+
+    // An explicit `paths:` list has no discovery filters, so the sum of the
+    // listed files' sizes is an exact seed. Sum the readable ones; an
+    // unreadable entry contributes 0 rather than poisoning the whole estimate.
+    if let Some(paths) = source.paths.as_ref() {
+        if paths.is_empty() {
+            return None;
+        }
+        let total = paths.iter().fold(0u64, |acc, p| {
+            let len = std::fs::metadata(resolve(p)).map(|m| m.len()).unwrap_or(0);
+            acc.saturating_add(len)
+        });
+        return Some(total);
+    }
+
+    // `glob` / `regex` route through the discovery resolver and its filters;
+    // estimating them here would duplicate that resolver, so leave unknown.
+    if source.glob.is_some() || source.regex.is_some() {
         return None;
     }
+
     let path = source.path.as_deref()?;
-    let p = std::path::Path::new(path);
-    let resolved = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        anchor.join(p)
-    };
-    std::fs::metadata(resolved).ok().map(|m| m.len())
+    std::fs::metadata(resolve(path)).ok().map(|m| m.len())
 }
 
 /// Idempotency predicate for enforcer-sort insertion.

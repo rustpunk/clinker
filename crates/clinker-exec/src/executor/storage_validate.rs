@@ -48,6 +48,14 @@ pub struct ResolvedStorage {
     /// and the runtime disk cap (E320) / full-volume (E321) surfaces remain the
     /// hard backstops.
     pub free_space_warning: Option<FreeSpaceWarning>,
+    /// A cap-headroom advisory, present only when a `storage.spill.disk_cap_bytes`
+    /// is configured AND the run's estimated spill volume exceeds 80% of it. The
+    /// run is likely to abort mid-stream with the spill-cap diagnostic (E320), so
+    /// surfacing the signal at startup lets the operator raise the cap or reduce
+    /// the footprint before committing. Advisory, not fatal — the estimate is a
+    /// coarse upper bound, and a run that compresses well or never trips its
+    /// memory budget may finish comfortably under the cap.
+    pub cap_headroom_warning: Option<CapHeadroomWarning>,
 }
 
 /// A startup free-space preflight finding: the spill volume looks too small
@@ -77,6 +85,53 @@ impl std::fmt::Display for FreeSpaceWarning {
             self.spill_dir.display(),
             self.available_bytes,
             self.estimated_spill_bytes,
+        )
+    }
+}
+
+/// The fraction of `storage.spill.disk_cap_bytes` above which a run's estimated
+/// spill volume trips the [`CapHeadroomWarning`]. 80% is the headroom-warning
+/// threshold #176 specifies — enough margin that the estimate's coarseness does
+/// not constantly false-alarm, while still firing before a run that would
+/// realistically blow the cap.
+pub const CAP_HEADROOM_WARN_FRACTION: f64 = 0.80;
+
+/// A startup cap-headroom finding: the run's estimated spill volume is within
+/// 80% of (or above) the configured `storage.spill.disk_cap_bytes`, so it is
+/// likely to abort with the spill-cap diagnostic (E320) mid-stream.
+///
+/// Advisory by design — see [`ResolvedStorage::cap_headroom_warning`]. The
+/// figure is **per invocation**: under the partition-and-run model several
+/// sibling `clinker` invocations can share one spill volume and one cap, so the
+/// real headroom is smaller than any single invocation sees. The rendered
+/// message states this so an operator running siblings does not read the
+/// per-invocation headroom as the whole-volume headroom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapHeadroomWarning {
+    /// The configured cumulative spill cap, in bytes
+    /// (`storage.spill.disk_cap_bytes`).
+    pub disk_cap_bytes: u64,
+    /// The run's coarse plan-time estimate of the bytes it could spill.
+    pub estimated_spill_bytes: u64,
+}
+
+impl std::fmt::Display for CapHeadroomWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pct = if self.disk_cap_bytes == 0 {
+            0.0
+        } else {
+            (self.estimated_spill_bytes as f64 / self.disk_cap_bytes as f64) * 100.0
+        };
+        write!(
+            f,
+            "W331: this run is estimated to spill up to {} bytes, which is {:.0}% of the \
+             configured spill cap storage.spill.disk_cap_bytes ({} bytes); the run may abort \
+             with a spill-cap error (E320) before it finishes — raise disk_cap_bytes or reduce \
+             the spill footprint (raise memory.limit, partition the input). This headroom is \
+             per invocation: if you partition the input and run several clinker invocations \
+             against the same spill volume and cap, they share the cap, so the real headroom \
+             is smaller than this figure",
+            self.estimated_spill_bytes, pct, self.disk_cap_bytes,
         )
     }
 }
@@ -269,10 +324,44 @@ pub fn validate_storage_config(
         None
     };
 
+    // Cap-headroom preflight (advisory). When a cumulative spill cap is
+    // configured and the run's estimate is within 80% of it, warn at startup so
+    // the operator sees the signal before the run aborts with E320 mid-stream.
+    // Skipped when the estimate is unknown (`0`) or no cap is set (unlimited
+    // spill has no headroom to overrun).
+    let cap_headroom_warning =
+        cap_headroom_preflight(storage.spill.disk_cap(), estimated_spill_bytes);
+
     Ok(ResolvedStorage {
         spill_root_dir,
         free_space_warning,
+        cap_headroom_warning,
     })
+}
+
+/// Produce a [`CapHeadroomWarning`] when a cumulative spill cap is configured
+/// and the run's estimated spill volume reaches 80% of it.
+///
+/// Pure over its two inputs (no filesystem probe), so the warn/no-warn boundary
+/// is testable without a real volume. Returns `None` when no cap is set, the
+/// estimate is unknown (`0`), or the estimate sits below the threshold.
+fn cap_headroom_preflight(
+    disk_cap_bytes: Option<u64>,
+    estimated_spill_bytes: u64,
+) -> Option<CapHeadroomWarning> {
+    let cap = disk_cap_bytes?;
+    if cap == 0 || estimated_spill_bytes == 0 {
+        return None;
+    }
+    let threshold = (cap as f64 * CAP_HEADROOM_WARN_FRACTION) as u64;
+    if estimated_spill_bytes >= threshold {
+        Some(CapHeadroomWarning {
+            disk_cap_bytes: cap,
+            estimated_spill_bytes,
+        })
+    } else {
+        None
+    }
 }
 
 /// The configured staging directory, if `enabled` set one. The `enabled`
@@ -532,6 +621,63 @@ mod tests {
             "expected E334 spill-equals-staging, got {err}"
         );
         assert!(err.to_string().contains("E334"));
+    }
+
+    #[test]
+    fn cap_headroom_warns_at_or_above_80_percent() {
+        // 8 GB estimate against a 10 GB cap is exactly 80% → warn.
+        let w = cap_headroom_preflight(Some(10_000_000_000), 8_000_000_000)
+            .expect("80% of the cap must trip the headroom warning");
+        assert_eq!(w.disk_cap_bytes, 10_000_000_000);
+        assert_eq!(w.estimated_spill_bytes, 8_000_000_000);
+        let msg = w.to_string();
+        assert!(
+            msg.contains("W331"),
+            "message must carry the W331 code: {msg}"
+        );
+        // #311: the per-invocation disclaimer must be present so an
+        // operator running siblings does not misread the headroom.
+        assert!(
+            msg.contains("per invocation"),
+            "the headroom must state it is per-invocation: {msg}"
+        );
+
+        // An estimate above the cap warns just as well.
+        assert!(cap_headroom_preflight(Some(10_000_000_000), 11_000_000_000).is_some());
+    }
+
+    #[test]
+    fn cap_headroom_silent_below_threshold_or_when_no_cap() {
+        // 7 GB against a 10 GB cap is 70% → below the 80% threshold, no warn.
+        assert!(cap_headroom_preflight(Some(10_000_000_000), 7_000_000_000).is_none());
+        // No cap configured → unlimited spill has no headroom to overrun.
+        assert!(cap_headroom_preflight(None, 8_000_000_000).is_none());
+        // Unknown estimate (0) → nothing to compare.
+        assert!(cap_headroom_preflight(Some(10_000_000_000), 0).is_none());
+    }
+
+    #[test]
+    fn validate_surfaces_cap_headroom_warning() {
+        // Drive the full validator: a tiny cap with a large estimate trips the
+        // headroom advisory without aborting the run.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_with(
+            SpillConfig {
+                dir: Some(dir.path().to_path_buf()),
+                disk_cap_bytes: Some(clinker_plan::config::ByteSize(1_000)),
+                ..Default::default()
+            },
+            StagingPolicy::default(),
+        );
+        // 2000-byte estimate vs a 1000-byte cap = 200% → warn. Use a small
+        // estimate so the free-space preflight on the real tempdir does not
+        // also fire and obscure the cap-headroom assertion.
+        let resolved = validate_storage_config(&storage, &[], 2_000).unwrap();
+        let warning = resolved
+            .cap_headroom_warning
+            .expect("an estimate above the cap must trip the cap-headroom warning");
+        assert_eq!(warning.disk_cap_bytes, 1_000);
+        assert_eq!(warning.estimated_spill_bytes, 2_000);
     }
 
     #[test]

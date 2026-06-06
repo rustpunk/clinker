@@ -36,6 +36,14 @@ pub struct StageMetrics {
     pub heap_delta_bytes: Option<i64>,
     /// Number of heap allocations during the stage. `bench-alloc` feature-gated.
     pub heap_alloc_count: Option<u64>,
+    /// On-disk bytes this stage spilled, attributed from the arbitrator's
+    /// per-stage spill breakdown after the run completes. `0` for a stage
+    /// that never spilled (and for streaming/non-blocking stages, which
+    /// hold no spillable state). This is the *actual* spilled volume an
+    /// operator compares against the pre-run `--explain` per-stage estimate
+    /// to calibrate (#176): a large estimate-vs-actual delta is the
+    /// highest-leverage debugging input when a pipeline spills unexpectedly.
+    pub spill_bytes: u64,
 }
 
 /// Named pipeline stages (not stringly-typed).
@@ -68,6 +76,25 @@ pub enum StageName {
     CombineProbe {
         name: String,
     },
+}
+
+impl StageName {
+    /// The pipeline node name this stage runs for, when the variant is
+    /// scoped to a single named node (combine build/probe, named index
+    /// builds). Returns `None` for the run-wide phases (Compile, Sort,
+    /// GroupFlush, …) that are not tied to one node by name.
+    ///
+    /// Used at run completion to attribute the arbitrator's per-stage spill
+    /// breakdown (keyed by node name) onto the matching `StageMetrics`
+    /// entry, so a combine's spilled volume lands on its build/probe stage.
+    pub fn node_name(&self) -> Option<&str> {
+        match self {
+            StageName::CombineBuild { name }
+            | StageName::CombineProbe { name }
+            | StageName::IndexBuild { name } => Some(name),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for StageName {
@@ -164,6 +191,7 @@ impl StageTimer {
             io_write_delta,
             heap_delta_bytes: heap_delta,
             heap_alloc_count: heap_count,
+            spill_bytes: 0,
         }
     }
 }
@@ -221,6 +249,7 @@ impl CumulativeTimer {
             io_write_delta: None,
             heap_delta_bytes: None,
             heap_alloc_count: None,
+            spill_bytes: 0,
         }
     }
 }
@@ -383,6 +412,7 @@ mod tests {
             io_write_delta: None,
             heap_delta_bytes: None,
             heap_alloc_count: None,
+            spill_bytes: 0,
         };
         assert!(m.cpu_user_delta_ns.is_none());
         assert!(m.cpu_sys_delta_ns.is_none());
@@ -505,6 +535,47 @@ mod tests {
         };
         let merged = a.clone().merge(ChunkTimers::default());
         assert_eq!(merged.transform_eval, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn stage_metrics_default_spill_bytes_zero() {
+        let timer = StageTimer::new(StageName::Sort);
+        let metrics = timer.finish(0, 0);
+        assert_eq!(
+            metrics.spill_bytes, 0,
+            "a freshly-timed stage spills nothing until the per-stage breakdown is folded in"
+        );
+        let cumulative = CumulativeTimer::new().finish(StageName::Projection, 0, 0);
+        assert_eq!(cumulative.spill_bytes, 0);
+    }
+
+    #[test]
+    fn stage_name_node_name_only_for_node_scoped_variants() {
+        assert_eq!(
+            StageName::CombineBuild {
+                name: "enriched".into()
+            }
+            .node_name(),
+            Some("enriched")
+        );
+        assert_eq!(
+            StageName::CombineProbe {
+                name: "enriched".into()
+            }
+            .node_name(),
+            Some("enriched")
+        );
+        assert_eq!(
+            StageName::IndexBuild {
+                name: "employees:dept".into()
+            }
+            .node_name(),
+            Some("employees:dept")
+        );
+        // Run-wide phases are not tied to one named node.
+        assert_eq!(StageName::Sort.node_name(), None);
+        assert_eq!(StageName::Compile.node_name(), None);
+        assert_eq!(StageName::GroupFlush.node_name(), None);
     }
 
     #[test]

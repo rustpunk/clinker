@@ -209,6 +209,222 @@ fn explain_without_storage_block_shows_default_spill_root() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// A pipeline with a real CSV source and a blocking hash Aggregate, so the
+/// per-stage spill estimate and the staging plan have a sized input + a
+/// spilling stage to report.
+const AGG_PIPELINE_YAML: &str = r#"pipeline:
+  name: storage_obs
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: dept_totals
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+fn write_orders_csv(dir: &std::path::Path) {
+    let mut body = String::from("department,amount\n");
+    for i in 0..200 {
+        body.push_str(&format!("dept{},{}\n", i % 7, i * 3));
+    }
+    std::fs::write(dir.join("orders.csv"), body).expect("write orders.csv");
+}
+
+#[test]
+fn explain_surfaces_per_stage_spill_estimate() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, AGG_PIPELINE_YAML).expect("write pipeline yaml");
+    write_orders_csv(&tmp);
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .arg("--explain")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "explain must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("=== Estimated Spill Volume ==="),
+        "explain must carry the per-stage spill-estimate section; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dept_totals"),
+        "the blocking Aggregate stage must appear in the estimate; got:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn explain_surfaces_staging_plan_per_source() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, AGG_PIPELINE_YAML).expect("write pipeline yaml");
+    write_orders_csv(&tmp);
+
+    // Enable staging onto a sibling directory so the *.csv source matches a
+    // pattern and the plan reports a staged path + reuse decision.
+    let staging = tmp.join("staging");
+    std::fs::create_dir(&staging).expect("create staging dir");
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        format!(
+            "[storage.staging]\nenabled = true\ndir = \"{}\"\npatterns = [\"*.csv\"]\non_existing = \"reuse\"\n",
+            staging.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write clinker.toml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .arg("--explain")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "explain with staging configured must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("=== Staging Plan ==="),
+        "explain must carry the staging-plan section; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Source 'orders':") && stdout.contains("staged: yes"),
+        "the matched source must report staged: yes; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("reuse: miss"),
+        "with no prior copy the reuse decision must be a miss; got:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn real_run_warns_when_estimate_exceeds_eighty_percent_of_cap() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, AGG_PIPELINE_YAML).expect("write pipeline yaml");
+    write_orders_csv(&tmp);
+
+    // A spill dir plus a tiny 100-byte cap. The sized input's estimate (the CSV
+    // is well over 100 bytes) dwarfs the cap, so the startup cap-headroom
+    // warning fires on the REAL run (not gated behind --explain). The run still
+    // completes — the warning is advisory, and the small input does not actually
+    // trip the memory budget to spill.
+    let spill = tmp.join("spill");
+    std::fs::create_dir(&spill).expect("create spill dir");
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        format!(
+            "[storage.spill]\ndir = \"{}\"\ndisk_cap_bytes = 100\n",
+            spill.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write clinker.toml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        // Run from the tempdir so the pipeline's relative output `out.csv`
+        // lands here, not in the crate working tree.
+        .current_dir(&tmp)
+        .output()
+        .expect("spawn clinker");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("W331"),
+        "a real run whose estimate exceeds 80% of the cap must warn at startup (W331), \
+         NOT only under --explain; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("per invocation"),
+        "the startup warning must disclaim sibling invocations sharing the volume; stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn real_run_logs_per_stage_actual_spill() {
+    // A real run that spills (1 MiB memory budget over a sized input) prints the
+    // per-stage actual-spill section at end-of-run so an operator can compare it
+    // against the --explain estimate (#176 AC#3).
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    // Inline a 1 MiB memory budget so the node-buffer admission spills.
+    let yaml = AGG_PIPELINE_YAML.replace(
+        "pipeline:\n  name: storage_obs\n",
+        "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\" }\n",
+    );
+    std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
+    // A larger input raises the chance the 1 MiB budget trips a spill.
+    let mut body = String::from("department,amount\n");
+    for i in 0..50_000 {
+        body.push_str(&format!("dept{},{}\n", i % 50, i * 3));
+    }
+    std::fs::write(tmp.join("orders.csv"), body).expect("write orders.csv");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        // Run from the tempdir so the pipeline's relative output `out.csv`
+        // lands here, not in the crate working tree.
+        .current_dir(&tmp)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "run must complete; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // RSS-based spill is platform/host dependent; only assert the per-stage
+    // actuals section when a spill actually happened (the section is omitted on
+    // a fully in-memory run by design).
+    if stdout.contains("=== Spill Volume (actual, per stage) ===") {
+        assert!(
+            stdout.contains("Total:") && stdout.contains("bytes"),
+            "the actual-spill section must report a per-stage total; got:\n{stdout}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn tempdir_path() -> std::path::PathBuf {
     let mut base = std::env::temp_dir();
     let name = format!(
