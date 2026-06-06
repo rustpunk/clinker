@@ -605,7 +605,10 @@ mod tests {
             other => panic!("expected Verify, got {other:?}"),
         }
         // A failed verify removes the published staged copy.
-        assert!(!staged.exists(), "verify failure must unlink the staged copy");
+        assert!(
+            !staged.exists(),
+            "verify failure must unlink the staged copy"
+        );
     }
 
     #[test]
@@ -755,5 +758,4 @@ mod tests {
         let err = stager.resolve(b).unwrap_err();
         assert!(matches!(err, StagingError::DiskCapExceeded { .. }));
     }
-
 }
