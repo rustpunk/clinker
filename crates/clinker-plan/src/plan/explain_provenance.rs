@@ -220,6 +220,11 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E319" => Some(include_str!("../../../../docs/explain/E319.md")),
         "E320" => Some(include_str!("../../../../docs/explain/E320.md")),
         "E321" => Some(include_str!("../../../../docs/explain/E321.md")),
+        "E330" => Some(include_str!("../../../../docs/explain/E330.md")),
+        "E331" => Some(include_str!("../../../../docs/explain/E331.md")),
+        "E332" => Some(include_str!("../../../../docs/explain/E332.md")),
+        "E333" => Some(include_str!("../../../../docs/explain/E333.md")),
+        "E334" => Some(include_str!("../../../../docs/explain/E334.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
         "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
         "E150d" => Some(include_str!("../../../../docs/explain/E150d.md")),
@@ -337,6 +342,46 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_code_e330_spill_tmpfs() {
+        let doc = explain_code("E330").unwrap();
+        assert!(doc.contains("E330"));
+        assert!(doc.contains("tmpfs"));
+        assert!(doc.contains("storage.spill.dir"));
+    }
+
+    #[test]
+    fn test_explain_code_e331_spill_network() {
+        let doc = explain_code("E331").unwrap();
+        assert!(doc.contains("E331"));
+        assert!(doc.contains("network"));
+        assert!(doc.contains("storage.spill.dir"));
+    }
+
+    #[test]
+    fn test_explain_code_e332_staging_network() {
+        let doc = explain_code("E332").unwrap();
+        assert!(doc.contains("E332"));
+        assert!(doc.contains("network"));
+        assert!(doc.contains("storage.staging.dir"));
+    }
+
+    #[test]
+    fn test_explain_code_e333_staging_same_device() {
+        let doc = explain_code("E333").unwrap();
+        assert!(doc.contains("E333"));
+        assert!(doc.contains("same"));
+        assert!(doc.contains("storage.staging.dir"));
+    }
+
+    #[test]
+    fn test_explain_code_e334_spill_equals_staging() {
+        let doc = explain_code("E334").unwrap();
+        assert!(doc.contains("E334"));
+        assert!(doc.contains("storage.spill.dir"));
+        assert!(doc.contains("storage.staging.dir"));
+    }
+
+    #[test]
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
@@ -346,8 +391,8 @@ mod tests {
         let codes = [
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E150b", "E150c",
             "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
-            "E309", "E310", "E311", "E313", "E319", "E320", "E321", "E15Y", "W101", "W302", "W305",
-            "W306",
+            "E309", "E310", "E311", "E313", "E319", "E320", "E321", "E330", "E331", "E332", "E333",
+            "E334", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

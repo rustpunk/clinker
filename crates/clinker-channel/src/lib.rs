@@ -53,7 +53,6 @@
 pub mod binding;
 pub mod error;
 pub mod overlay;
-pub mod staging;
 pub mod staging_copy;
 
 // Explicit re-exports at crate root.
@@ -62,5 +61,4 @@ pub use binding::{
 };
 pub use error::ChannelError;
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
-pub use staging::validate_staging;
 pub use staging_copy::{SourceStager, StagingError};

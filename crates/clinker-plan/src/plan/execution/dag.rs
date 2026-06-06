@@ -128,6 +128,33 @@ impl ExecutionPlanDag {
         !self.indices_to_build.is_empty()
     }
 
+    /// Coarse plan-time estimate, in bytes, of the disk volume the run could
+    /// spill — the sum of every spilling operator's predicted peak live state.
+    ///
+    /// A spilling operator (hash Aggregate, sort, grace-hash / sort-merge /
+    /// IEJoin / hash Combine) holds its whole accumulated input before it can
+    /// emit, and spills that state when the memory budget trips; a streaming
+    /// or sink stage spills nothing. Summing rather than taking the max is the
+    /// conservative choice for a free-space preflight: two blocking operators
+    /// can be live and spilled simultaneously, so their footprints add. The
+    /// figure derives from the same `predicted_peak_bytes` estimates
+    /// `--explain` surfaces, so a preflight warning lines up with the numbers
+    /// a pipeline author already sees. Returns `0` when no node spills or when
+    /// volume estimates are unknown (no on-disk file seed reached the plan).
+    pub fn estimated_spill_bytes(&self) -> u64 {
+        self.topo_order
+            .iter()
+            .filter(|&&idx| {
+                super::arbitration_class(&self.graph[idx])
+                    .spill_priority
+                    .is_some()
+            })
+            .filter_map(|idx| self.node_properties.get(idx))
+            .fold(0u64, |acc, props| {
+                acc.saturating_add(props.predicted_peak_bytes)
+            })
+    }
+
     /// Get transform nodes in topological order.
     ///
     /// Returns `(window_index, partition_lookup)` per transform in topo order.
