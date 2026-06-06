@@ -40,11 +40,14 @@ use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single
 // A 1 KiB memory budget forces the HashAggregator's dual-threshold spill: with
 // many distinct keys the group count crosses the budget-derived `max_groups`
 // well before EOF, so `add_record` calls `spill()` mid-run — the open this test
-// intercepts.
+// intercepts. `backpressure: spill` is required: the budget is below the
+// process baseline RSS, which the default `pause` policy rejects at startup
+// (E312); the spill policy never pauses a producer and so spills mid-run as
+// this test intends rather than being rejected.
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: spill_dir_unavailable_midrun
-  memory: { limit: "1024" }
+  memory: { limit: "1024", backpressure: spill }
 nodes:
   - type: source
     name: events

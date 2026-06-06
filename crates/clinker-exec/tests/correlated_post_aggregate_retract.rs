@@ -320,10 +320,15 @@ o9,ENG,300
 /// or the failure is surfaced through DLQ accounting.
 #[test]
 fn aggregator_state_degraded_falls_back_without_panic() {
+    // `backpressure: spill` keeps the bare `Priority` policy: the 1-byte
+    // budget is below the process baseline RSS, which the default `pause`
+    // policy rejects at startup (E312), but this test needs the run to
+    // reach the aggregator degrade path, which only the non-pausing spill
+    // policy does under a sub-baseline budget.
     let yaml = r#"
 pipeline:
   name: degraded_post_aggregate
-  memory: { limit: "1" }
+  memory: { limit: "1", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:

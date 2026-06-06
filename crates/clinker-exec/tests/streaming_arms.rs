@@ -189,6 +189,13 @@ nodes:
 /// `should_abort`, so a tiny test budget spills rather than aborts, the
 /// same posture the materialized `route_fanout_soft_spill` test relies on.
 ///
+/// `backpressure: spill` is required because the budget is below the
+/// process's baseline RSS: under the default `pause` policy such a budget
+/// is rejected at startup (E312, the unsatisfiable-budget guard), so a
+/// sub-baseline budget that intends to *spill* rather than *pause* must
+/// select the spill policy, which never pauses a producer and so is not
+/// rejected.
+///
 /// Asserts every record is delivered in order and
 /// `cumulative_spill_bytes > 0`. The companion `route_fanout_soft_spill`
 /// pins the blocking full-stage spill path; the unit test
@@ -208,7 +215,7 @@ fn streaming_arm_soft_spills_under_one_megabyte_budget() {
 pipeline:
   name: streaming_route_soft_spill
   batch_size: 128
-  memory: { limit: "1M" }
+  memory: { limit: "1M", backpressure: spill }
 nodes:
   - type: source
     name: orders

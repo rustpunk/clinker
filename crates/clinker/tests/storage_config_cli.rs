@@ -385,9 +385,13 @@ fn real_run_logs_per_stage_actual_spill() {
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");
     // Inline a 1 MiB memory budget so the node-buffer admission spills.
+    // `backpressure: spill` is required: 1 MiB is below the binary's
+    // baseline RSS, which the default `pause` policy rejects at startup
+    // (E312); the spill policy never pauses a producer and so spills as
+    // this test intends rather than being rejected.
     let yaml = AGG_PIPELINE_YAML.replace(
         "pipeline:\n  name: storage_obs\n",
-        "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\" }\n",
+        "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\", backpressure: spill }\n",
     );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
     // A larger input raises the chance the 1 MiB budget trips a spill.

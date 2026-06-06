@@ -169,6 +169,23 @@ pub enum PipelineError {
         source: crate::runtime_error::BudgetCategory,
         detail: Option<String>,
     },
+    /// E312 — the configured `memory.limit` is below the process's
+    /// baseline resident memory (RSS), measured at startup before any
+    /// pipeline data loads. Such a budget is unsatisfiable: no amount of
+    /// spilling or back-pressure can bring RSS under a ceiling that the
+    /// process already exceeds with an empty pipeline. Under the default
+    /// `memory.backpressure: pause` policy this would otherwise park the
+    /// Source ingest thread on a pause that never resumes (resume fires
+    /// only when RSS drops back under the threshold, which can never
+    /// happen) while a blocking consumer waits forever for input —
+    /// a deadlock. Rejecting at startup converts that hang into an
+    /// immediate, clear configuration error. `limit` is the configured
+    /// ceiling in bytes; `baseline_rss` is the measured startup RSS.
+    /// Always aborts the run before any source-ingest thread spawns.
+    UnsatisfiableMemoryBudget {
+        limit: u64,
+        baseline_rss: u64,
+    },
     /// E319 — a combine with `on_miss: error` saw a driver row that
     /// matched no build row. Semantically distinct from E310 (which
     /// is a memory-budget overflow). Always aborts the run.
@@ -336,6 +353,18 @@ impl fmt::Display for PipelineError {
                 ),
                 None => write!(f, "E310 {node}: {source} exceeded budget ({used}/{limit})"),
             },
+            Self::UnsatisfiableMemoryBudget {
+                limit,
+                baseline_rss,
+            } => write!(
+                f,
+                "E312 memory.limit of {limit} bytes is below the process's baseline \
+                 resident memory ({baseline_rss} bytes) measured before any data \
+                 loads, so no amount of spilling or back-pressure can bring the run \
+                 under it — raise memory.limit above the baseline (realistic budgets \
+                 are hundreds of MiB) or partition the input across smaller \
+                 invocations. See: clinker explain --code E312"
+            ),
             Self::CombineMissingMatch {
                 combine,
                 driver_row,

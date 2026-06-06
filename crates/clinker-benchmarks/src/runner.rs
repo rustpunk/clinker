@@ -39,6 +39,18 @@ impl BenchPipelineRunner {
     pub fn run(&self, config_path: &Path, scale: Scale) -> Result<ExecutionReport, PipelineError> {
         let mut config = load_config(config_path).expect("bench config must parse");
 
+        // Bench configs carry no `memory:` block, so they run at the 512 MiB
+        // default. The benchmark harness process (criterion + the data cache
+        // + every linked crate) carries a far larger baseline RSS than a real
+        // `clinker run`, and that baseline can exceed the 512 MiB default —
+        // which the executor's unsatisfiable-budget guard rejects at startup
+        // under the default `pause` policy. Selecting `spill` keeps the same
+        // 512 MiB spill threshold (so any spill behavior these throughput
+        // benchmarks exercise is unchanged) while opting out of the
+        // producer-pausing policy the guard targets, so the inflated bench
+        // baseline never trips a false-positive rejection.
+        config.pipeline.memory.backpressure = clinker_plan::config::BackpressureKnob::Spill;
+
         // Split outputs create files on disk via a file factory, so we need a
         // real temp directory for them instead of the placeholder `bench://` path.
         let _split_dir = rewrite_split_output_paths(&mut config);

@@ -260,24 +260,23 @@ pub(crate) fn record_with_emitted_fields(
     widen_record_to_schema(input, &widened)
 }
 
-/// Parse memory limit from config (default 512MB).
+/// Resolve the pipeline `memory.limit` into a byte count for the
+/// spill-threshold sizing the aggregate and sort arms perform.
+///
+/// Delegates to the authoritative [`clinker_plan::config::utils::parse_memory_limit_bytes`]
+/// so the spill-threshold budget honors the same `K`/`M`/`G` binary
+/// suffixes as the arbitrator ceiling. A second local parser previously
+/// lived here and silently dropped the `K` suffix, so a `limit: "256K"`
+/// sized a 256 KiB arbitrator but a 512 MiB aggregate spill budget; that
+/// divergence is gone — there is exactly one limit parser. Narrowed from
+/// the parser's `u64` to `usize` for the operator-facing budget fields;
+/// on a 32-bit host a limit above `usize::MAX` saturates rather than
+/// wrapping.
 pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
-    config
-        .pipeline
-        .memory
-        .limit
-        .as_ref()
-        .and_then(|s| {
-            let s = s.trim();
-            if let Some(num) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-                num.parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
-            } else if let Some(num) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-                num.parse::<usize>().ok().map(|n| n * 1024 * 1024)
-            } else {
-                s.parse::<usize>().ok()
-            }
-        })
-        .unwrap_or(512 * 1024 * 1024) // 512MB default
+    usize::try_from(clinker_plan::config::utils::parse_memory_limit_bytes(
+        config.pipeline.memory.limit.as_deref(),
+    ))
+    .unwrap_or(usize::MAX)
 }
 
 /// Build a `MemoryArbitrator` from the pipeline-level `memory:` block.
@@ -296,4 +295,70 @@ pub(crate) fn build_arbitrator_from_config(
         0.80,
         crate::pipeline::memory::build_policy(mem.backpressure),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_limit;
+
+    const MINIMAL_PIPELINE: &str = r#"
+pipeline:
+  name: budget_parse
+  memory: { limit: "__LIMIT__" }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: a, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    fn budget_for(limit: &str) -> usize {
+        let yaml = MINIMAL_PIPELINE.replace("__LIMIT__", limit);
+        let config = clinker_plan::config::parse_config(&yaml).expect("minimal pipeline parses");
+        parse_memory_limit(&config)
+    }
+
+    #[test]
+    fn aggregate_spill_budget_honors_binary_suffixes() {
+        // The aggregate / sort spill budget must resolve the same binary
+        // suffixes as the arbitrator ceiling. A `K` suffix that the budget
+        // parser silently dropped used to size a 256 KiB arbitrator but a
+        // 512 MiB spill budget; this pins the single-parser equivalence.
+        assert_eq!(budget_for("256K"), 256 * 1024);
+        assert_eq!(budget_for("256k"), 256 * 1024);
+        assert_eq!(budget_for("4M"), 4 * 1024 * 1024);
+        assert_eq!(budget_for("2G"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(budget_for("1024"), 1024);
+    }
+
+    #[test]
+    fn aggregate_spill_budget_matches_arbitrator_parser() {
+        // The budget the aggregate arm sizes from and the arbitrator
+        // ceiling come from one parser, so a suffixed limit yields the same
+        // byte count on both paths — no divergence between the arbitrator
+        // limit and the aggregate spill budget.
+        for limit in ["256K", "4M", "2G", "1024"] {
+            let yaml = MINIMAL_PIPELINE.replace("__LIMIT__", limit);
+            let config = clinker_plan::config::parse_config(&yaml).expect("parses");
+            let arbitrator_ceiling = clinker_plan::config::utils::parse_memory_limit_bytes(
+                config.pipeline.memory.limit.as_deref(),
+            );
+            assert_eq!(
+                parse_memory_limit(&config) as u64,
+                arbitrator_ceiling,
+                "aggregate spill budget for {limit:?} must equal the arbitrator ceiling"
+            );
+        }
+    }
 }

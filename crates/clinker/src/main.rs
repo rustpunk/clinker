@@ -317,6 +317,7 @@ fn main() -> ExitCode {
                         | PipelineError::CompositionUnknownPort { .. }
                         | PipelineError::CompositionBodyError { .. }
                         | PipelineError::MemoryBudgetExceeded { .. }
+                        | PipelineError::UnsatisfiableMemoryBudget { .. }
                         | PipelineError::CombineMissingMatch { .. } => ExitCode::from(1),
                         // Disk-cap exceedance (E320) is a resource-exhaustion
                         // halt — the run filled its configured spill budget.

@@ -35,7 +35,7 @@ use std::io::Write;
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: route_fanout_soft_spill
-  memory: { limit: "1M" }
+  memory: { limit: "1M", backpressure: spill }
 nodes:
   - type: source
     name: events
