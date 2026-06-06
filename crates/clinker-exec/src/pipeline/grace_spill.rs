@@ -267,7 +267,20 @@ impl GraceSpillWriter {
             // or `Io`; any other variant would be a classifier regression.
             other => GraceSpillError::Io(std::io::Error::other(other.to_string())),
         };
-        let mut file = File::create(&path).map_err(classify_create)?;
+        // Grace spill files hold verbatim record bytes (potentially PII /
+        // credentials) and must be owner-only on a shared spill volume — the
+        // same 0o600 posture the inter-stage and aggregate spill paths get for
+        // free from `tempfile::NamedTempFile`. This path names its files
+        // deterministically (partition + sequence) rather than using a temp
+        // name, so it opens with an explicit mode instead.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path).map_err(classify_create)?;
         // The format tag is the very first on-disk byte and sits ahead of the
         // (optionally framed) body so the reader can dispatch before opening a
         // decoder.
@@ -575,6 +588,24 @@ mod tests {
                 assert_eq!(r.get("v"), Some(&Value::String(format!("row-{i}").into())));
             }
         }
+    }
+
+    // Grace spill files hold verbatim record bytes and must be owner-only on a
+    // shared spill volume. Unlike the inter-stage and aggregate spill paths
+    // (which get 0o600 for free from `tempfile::NamedTempFile`), this path names
+    // its files deterministically and opens them itself, so the explicit mode is
+    // a separate guarantee worth pinning.
+    #[cfg(unix)]
+    #[test]
+    fn grace_spill_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let s = schema();
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 0, false).unwrap();
+        w.write_record(&record(&s, 1, "row")).unwrap();
+        let (path, _) = w.finish().unwrap();
+        let mode = std::fs::metadata(&*path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "grace spill file must be owner-only");
     }
 
     // The leading format tag must record the writer's compression choice and
