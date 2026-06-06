@@ -1732,4 +1732,5 @@ mod tests {
     mod multi_output;
     mod nested_composition_overshoot;
     mod scheduling;
+    mod spill_dir_unavailable_midrun;
 }

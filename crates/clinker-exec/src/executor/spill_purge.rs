@@ -195,6 +195,87 @@ impl Drop for SpillDir {
     }
 }
 
+/// Test-only fault injection that simulates the live per-run spill directory
+/// becoming unwritable *after* startup validation passed and the [`SpillDir`]
+/// guard already exists — the mid-run spill-failure case the classifier covers
+/// at the unit level but that no end-to-end test could reach before, because
+/// nothing in the production run flow ever invalidates a healthy live spill
+/// root.
+///
+/// The seam is compiled only under `#[cfg(test)]`, so release builds contain
+/// none of it — the spill-open helper's call drops to nothing without the cfg.
+/// It changes no public API and no production behavior: an unarmed seam is a
+/// no-op, and only a test that explicitly arms it can trip the fault.
+///
+/// ## How it fires deterministically mid-run
+///
+/// A test arms the seam with the parent spill root it configured the run to use
+/// ([`arm_spill_root_invalidation_for_test`]). The operator spill-file open
+/// sites (`SpillWriter::new` for inter-stage and sort spills, `AggSpillWriter::new`
+/// for hash-aggregate spills, and the grace-hash partition writer) each call
+/// [`maybe_invalidate_spill_root_for_test`] immediately before opening their
+/// spill file. The first such open whose directory sits under the armed root
+/// recursively removes that live per-run `clinker-spill-*` directory and
+/// disarms the seam — so the very open that triggered it then fails with
+/// `NotFound`, which the shared classifier lifts to [`SpillError::DirUnavailable`].
+/// Firing at the open site (rather than on a timer or a background thread)
+/// makes the fault land at exactly the first real spill attempt — after the
+/// guard exists, with no race and no possibility of a stall.
+///
+/// [`SpillError::DirUnavailable`]: clinker_plan::SpillError::DirUnavailable
+#[cfg(test)]
+mod fault_injection {
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    /// The parent spill root a test armed for one-shot invalidation, or `None`
+    /// when the seam is disarmed. Process-global because the operator open
+    /// sites that consult it hold only a path, not a back-channel to the test.
+    static ARMED_ROOT: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+
+    /// Arm the seam so the next operator spill-file open under `parent_root`
+    /// invalidates the live per-run spill directory before opening, making that
+    /// open fail with `NotFound`.
+    pub(crate) fn arm_spill_root_invalidation_for_test(parent_root: PathBuf) {
+        *ARMED_ROOT.lock().unwrap() = Some(parent_root);
+    }
+
+    /// Disarm the seam, restoring the unarmed (no-op) state. Tests call this in
+    /// teardown so an armed root never leaks into a sibling test sharing the
+    /// process.
+    pub(crate) fn disarm_spill_root_invalidation_for_test() {
+        *ARMED_ROOT.lock().unwrap() = None;
+    }
+
+    /// If the seam is armed and `open_dir` sits under (or equals) the armed
+    /// parent root, recursively remove `open_dir` and disarm — so the spill
+    /// open about to run against `open_dir` fails with `NotFound`. A no-op when
+    /// disarmed or when `open_dir` is unrelated to the armed root.
+    pub(crate) fn maybe_invalidate_spill_root_for_test(open_dir: &Path) {
+        let mut armed = ARMED_ROOT.lock().unwrap();
+        let Some(parent_root) = armed.as_ref() else {
+            return;
+        };
+        if !open_dir.starts_with(parent_root) {
+            return;
+        }
+        // Fire once: disarm before removing so a re-entrant open (or a retry)
+        // does not loop trying to remove an already-gone directory.
+        let target = open_dir.to_path_buf();
+        *armed = None;
+        drop(armed);
+        // Best-effort: removing an already-gone dir is fine — the goal is that
+        // the dir is absent when the imminent open runs.
+        let _ = std::fs::remove_dir_all(&target);
+    }
+}
+
+#[cfg(test)]
+pub(crate) use fault_injection::{
+    arm_spill_root_invalidation_for_test, disarm_spill_root_invalidation_for_test,
+    maybe_invalidate_spill_root_for_test,
+};
+
 /// Idempotently reap orphaned `clinker-spill-*` directories left by crashed
 /// prior runs, run once at startup before the run creates its own spill dir.
 ///
