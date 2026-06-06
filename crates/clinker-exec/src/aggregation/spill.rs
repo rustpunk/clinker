@@ -172,8 +172,17 @@ impl AggSpillWriter {
         // no configured dir (OS temp), a create failure is environment-level
         // and stays a generic spill error.
         let temp_file = match spill_dir {
-            Some(dir) => tempfile::NamedTempFile::new_in(dir)
-                .map_err(|e| HashAggError::SpillDir(SpillError::from_spill_dir_io(dir, e)))?,
+            Some(dir) => {
+                // Test-only seam: when a test has armed the mid-run spill-root
+                // fault for this root, this removes the live spill directory
+                // right before the open below, so the open fails with `NotFound`
+                // and classifies as `DirUnavailable`. Compiled out of release
+                // builds; an unarmed seam is a no-op.
+                #[cfg(test)]
+                crate::executor::spill_purge::maybe_invalidate_spill_root_for_test(dir);
+                tempfile::NamedTempFile::new_in(dir)
+                    .map_err(|e| HashAggError::SpillDir(SpillError::from_spill_dir_io(dir, e)))?
+            }
             None => {
                 tempfile::NamedTempFile::new().map_err(|e| HashAggError::Spill(e.to_string()))?
             }

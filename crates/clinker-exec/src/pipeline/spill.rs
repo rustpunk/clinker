@@ -140,6 +140,13 @@ impl<P: Serialize> SpillWriter<P> {
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
         let temp_file = if let Some(dir) = spill_dir {
+            // Test-only seam: when a test has armed the mid-run spill-root fault
+            // for this root, this removes the live spill directory right before
+            // the open below, so the open fails with `NotFound` and classifies
+            // as `DirUnavailable`. Compiled out of release builds; an unarmed
+            // seam is a no-op.
+            #[cfg(test)]
+            crate::executor::spill_purge::maybe_invalidate_spill_root_for_test(dir);
             NamedTempFile::new_in(dir).map_err(|e| SpillError::from_spill_dir_io(dir, e))?
         } else {
             NamedTempFile::new().map_err(|e| SpillError::from_spill_dir_io(&resolved_dir, e))?

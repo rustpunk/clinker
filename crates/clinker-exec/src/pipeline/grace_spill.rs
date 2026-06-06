@@ -280,6 +280,13 @@ impl GraceSpillWriter {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        // Test-only seam: when a test has armed the mid-run spill-root fault for
+        // this root, this removes the live spill directory right before the open
+        // below, so the open fails with `NotFound` and classifies as
+        // `DirUnavailable`. Compiled out of release builds; an unarmed seam is a
+        // no-op.
+        #[cfg(test)]
+        crate::executor::spill_purge::maybe_invalidate_spill_root_for_test(dir);
         let mut file = opts.open(&path).map_err(classify_create)?;
         // The format tag is the very first on-disk byte and sits ahead of the
         // (optionally framed) body so the reader can dispatch before opening a
