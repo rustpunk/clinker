@@ -635,7 +635,7 @@ mod tests {
             msg.contains("W331"),
             "message must carry the W331 code: {msg}"
         );
-        // enh-6 #311: the per-invocation disclaimer must be present so an
+        // #311: the per-invocation disclaimer must be present so an
         // operator running siblings does not misread the headroom.
         assert!(
             msg.contains("per invocation"),

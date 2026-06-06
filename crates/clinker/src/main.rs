@@ -2178,7 +2178,7 @@ mod tests {
     #[test]
     fn cap_headroom_explain_states_per_invocation_and_warns_over_threshold() {
         // 9 GB estimate vs a 10 GB cap is 90%, over the 80% threshold → warning
-        // line, plus the per-invocation disclaimer (enh-6 #311).
+        // line, plus the per-invocation disclaimer (#311).
         let out = cap_headroom_explain(Some(10_000_000_000), 9_000_000_000);
         assert!(
             out.contains("Cap headroom:"),

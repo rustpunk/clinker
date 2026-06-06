@@ -159,7 +159,7 @@ fn free_space_preflight_warns_on_low_space() {
 
 /// The cap-headroom preflight (W331, #176 AC#4) warns — without erroring —
 /// when the estimated spill volume reaches 80% of the configured spill cap. The
-/// message disclaims that the headroom is per-invocation (enh-6 #311).
+/// message disclaims that the headroom is per-invocation (#311).
 #[test]
 fn cap_headroom_preflight_warns_above_eighty_percent() {
     let dir = tempfile::tempdir().expect("spill dir");
