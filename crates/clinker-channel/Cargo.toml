@@ -17,10 +17,23 @@ indexmap = { workspace = true }
 tracing = { workspace = true }
 thiserror = "2"
 walkdir = "2"
+# Per-run staging subdirectory names. v4 (random) is sufficient — the name only
+# has to be collision-free within a staging root, not time-ordered.
+uuid = { workspace = true }
+# The per-run staging subdir is a `tempfile::TempDir`, so a panic or early exit
+# removes the run's staged copies on drop — the same panic-safety story the
+# executor spill root uses.
+tempfile = "3"
+
+# posix_fadvise(POSIX_FADV_SEQUENTIAL) hints the kernel to ramp readahead for
+# the front-to-back staging copy. Linux-only; a no-op on other unixes and
+# absent on Windows, so it never gates a build. The `fs` feature gates the
+# `fcntl::posix_fadvise` binding.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
-tempfile = "3"
 serial_test = { workspace = true }
 
 [[bench]]

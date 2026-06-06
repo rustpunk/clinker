@@ -47,6 +47,15 @@ arc-swap = "1.9"
 static_assertions = "1"
 dioxus = { version = "=0.7.4" }
 rfd = "0.15"
+# `pure` is misleadingly named: on blake3 1.x it does NOT mean scalar. It
+# compiles the SSE2/SSE4.1/AVX2 paths as Rust `std::arch` intrinsics and
+# dispatches them at runtime via `cpufeatures`, so source-staging copies hash
+# at full SIMD speed on every x86_64 host. What `pure` gives up is the
+# hand-written assembly / AVX-512 variants — and those are built by invoking a
+# C toolchain through blake3's `cc` build-dependency, which the workspace's
+# pure-Rust pillar (no C build dependencies in clinker crates) forbids. Keeping
+# `pure` therefore buys SIMD without a build-time C compiler: the correct trade
+# for this repo, not a performance compromise.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"

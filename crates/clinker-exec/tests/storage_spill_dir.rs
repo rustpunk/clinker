@@ -18,7 +18,7 @@ use clinker_plan::config::{CompileContext, PipelineConfig};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const PIPELINE_YAML: &str = r#"
 pipeline:
@@ -75,13 +75,17 @@ fn build_events_csv() -> String {
 
 /// Whether `dir` currently contains a `clinker-spill-*` entry.
 fn has_spill_subdir(dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
+    spill_subdir(dir).is_some()
+}
+
+/// The first `clinker-spill-*` entry currently under `dir`, if any.
+fn spill_subdir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries.flatten().find_map(|e| {
         e.file_name()
             .to_string_lossy()
             .starts_with("clinker-spill-")
+            .then(|| e.path())
     })
 }
 
@@ -129,13 +133,32 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
     // catching it mid-run rather than inspecting after the run returns.
     let observed = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    // The per-run spill root holds verbatim record bytes; on Unix it must be
+    // owner-only (0o700) so other users on a shared spill volume cannot list or
+    // `stat` spilled file names + sizes. The directory is created at run start
+    // and removed at run end, so the watcher captures its mode mid-run.
+    // `u32::MAX` is the "not yet observed" sentinel.
+    let observed_mode = Arc::new(AtomicU32::new(u32::MAX));
     let watcher = {
         let observed = Arc::clone(&observed);
+        let observed_mode = Arc::clone(&observed_mode);
         let done = Arc::clone(&done);
         let root = spill_root_path.clone();
         std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
-                if has_spill_subdir(&root) {
+                if let Some(spill_dir) = spill_subdir(&root) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = std::fs::metadata(&spill_dir) {
+                            observed_mode
+                                .store(meta.permissions().mode() & 0o777, Ordering::Relaxed);
+                        }
+                    }
+                    // `spill_dir` + `observed_mode` are consumed only by the
+                    // `#[cfg(unix)]` block above; reference them so non-Unix
+                    // builds don't flag them unused.
+                    let _ = (&spill_dir, &observed_mode);
                     observed.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -167,6 +190,14 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
          spill root {}",
         spill_root_path.display(),
     );
+    #[cfg(unix)]
+    {
+        let mode = observed_mode.load(Ordering::Relaxed);
+        assert_eq!(
+            mode, 0o700,
+            "per-run spill root must be owner-only (0o700), observed {mode:o}",
+        );
+    }
     // The per-run directory must be cleaned up once the run returns.
     assert!(
         !has_spill_subdir(&spill_root_path),

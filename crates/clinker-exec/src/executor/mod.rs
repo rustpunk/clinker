@@ -669,8 +669,19 @@ impl PipelineExecutor {
         // by paging back into RAM. The directory is pre-validated by the
         // caller, so a creation failure here is an internal fault, not a
         // misconfiguration the user can fix.
+        //
+        // On Unix the root is created 0o700: spill files hold verbatim record
+        // bytes (potentially PII / credentials), and even their names + sizes
+        // leak query shape via `stat`/`readdir`. An owner-only root keeps every
+        // spilled file unlistable to other users on a shared spill volume,
+        // mirroring the 0o700 posture of the source-staging per-run dir.
         let mut builder = tempfile::Builder::new();
         builder.prefix("clinker-spill-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
         let spill_root = Arc::new(
             match &params.spill_root_dir {
                 Some(dir) => builder.tempdir_in(dir),
