@@ -948,6 +948,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         eprintln!("{warning}");
     }
 
+    // Idempotent staging crash-purge, run once before this run stages. A
+    // crashed prior run (SIGKILL, OOM-killer, power loss) skips the cleanup a
+    // clean exit performs, leaking its staged artifacts under the shared
+    // staging root. Best-effort and shape-based — it reaps only a `.partial` or
+    // a `.staged` with no committed manifest, never a concurrent run's in-flight
+    // copy or a clean reuse-cache entry. (The matching spill-root crash-purge
+    // runs inside the executor at spill-root creation, so every executor entry
+    // point gets it; staging is a CLI-only concern, so its purge lives here.)
+    clinker_channel::SourceStager::crash_purge(&staging_policy);
+
     // Stage + open pass: with validation passed, copy each matched source to
     // the per-run staging subdir (single-pass BLAKE3 verify + atomic publish)
     // and open the reader on the local copy, or open the source in place when
@@ -1139,6 +1149,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     ) {
         Ok(report) => report,
         Err(e) => {
+            // A failed run keeps its staged copies so the operator can inspect
+            // the exact inputs the failure saw (cleanup = on_success); only
+            // cleanup = always reaps them on failure.
+            source_stager.cleanup(false);
             // Reservations auto-unlink via TempPath::Drop when output_temps
             // is dropped at end of scope. We just need to preserve the
             // writing tempfiles for operator inspection and log.
@@ -1339,6 +1353,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     } else {
         0
     };
+
+    // Staging cleanup, keyed on a clean exit. A zero exit code is the
+    // "exited cleanly" signal `cleanup = on_success` removes after; an
+    // interrupted run (130) or one that produced DLQ entries (2) keeps its
+    // staged inputs so the operator can re-run or inspect what the partial run
+    // saw. `cleanup = always` reaps regardless; `cleanup = never` keeps the
+    // copies as a persistent reuse cache.
+    source_stager.cleanup(exit_code == 0);
 
     // Write execution metrics to spool directory (if configured)
     if let Some(ref dir) = spool_dir {

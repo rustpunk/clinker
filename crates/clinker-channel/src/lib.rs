@@ -61,4 +61,4 @@ pub use binding::{
 };
 pub use error::ChannelError;
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
-pub use staging_copy::{SourceStager, StagingError};
+pub use staging_copy::{SourceStager, StagedManifest, StagingError};

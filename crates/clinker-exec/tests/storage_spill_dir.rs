@@ -204,3 +204,69 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
         "per-run spill directory should be removed after the run completes",
     );
 }
+
+#[test]
+fn startup_purges_an_orphaned_spill_dir_from_a_crashed_prior_run() {
+    // A crashed prior run (SIGKILL / OOM-killer) leaves its `clinker-spill-*`
+    // directory behind under the spill root: the TempDir Drop that would remove
+    // it never ran, but the OS released the directory's `.lock` on process
+    // death. The next run's startup crash-purge must reap that orphan. Drive a
+    // real pipeline run (which performs the purge before creating its own spill
+    // dir) and assert the orphan is gone afterward.
+    let spill_root = tempfile::tempdir().expect("create custom spill root");
+    let spill_root_path = spill_root.path().to_path_buf();
+
+    // Plant an orphan: a `clinker-spill-*` dir with an unlocked `.lock` (the
+    // crashed owner released it) and a leaked spill file inside.
+    let orphan = spill_root_path.join("clinker-spill-crashed0001");
+    std::fs::create_dir(&orphan).expect("create orphan spill dir");
+    std::fs::File::create(orphan.join(".lock")).expect("create orphan lock");
+    std::fs::write(orphan.join("partition-0.spill"), b"leaked-bytes").expect("write leaked spill");
+
+    let csv = build_events_csv();
+    let config: PipelineConfig =
+        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
+    readers.insert(
+        "events".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "events.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    );
+
+    let out_a = SharedBuffer::new();
+    let out_b = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
+        (
+            "out_a".to_string(),
+            Box::new(out_a.clone()) as Box<dyn Write + Send>,
+        ),
+        (
+            "out_b".to_string(),
+            Box::new(out_b.clone()) as Box<dyn Write + Send>,
+        ),
+    ]);
+
+    let params = PipelineRunParams {
+        execution_id: "spill-crash-purge".to_string(),
+        batch_id: "batch-0".to_string(),
+        spill_root_dir: Some(spill_root_path.clone()),
+        ..Default::default()
+    };
+
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("run must complete");
+    assert_eq!(report.counters.total_count as usize, ROWS);
+
+    // The orphaned spill dir from the simulated crashed run must be gone.
+    assert!(
+        !orphan.exists(),
+        "startup crash-purge should have reaped the orphaned spill directory {}",
+        orphan.display(),
+    );
+}

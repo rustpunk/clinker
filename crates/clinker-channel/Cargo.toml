@@ -12,6 +12,8 @@ clinker-record = { workspace = true }
 serde-saphyr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# RFC 3339 stage-time stamp recorded in each staged file's identity manifest.
+chrono = { workspace = true }
 blake3 = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
