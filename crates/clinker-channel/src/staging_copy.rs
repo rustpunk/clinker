@@ -49,9 +49,33 @@
 //!
 //! The per-file in-flight copy lands at `<source_id>.<run_uuid>.partial`. The
 //! `run_uuid` segment keeps two concurrent invocations staging the *same*
-//! source from colliding on the partial — the foundation a follow-up
-//! concurrency-safety layer (atomic publish under a lock) builds on without
-//! reworking this layout.
+//! source from writing the same partial — each writes its own — so they race
+//! only on the per-source lock, never on the in-flight bytes.
+//!
+//! ## Concurrency: one copy under a per-source lock
+//!
+//! Clinker's partition-and-run scaling story has several `clinker` processes
+//! over one partitioned input share a single staging volume, so two siblings
+//! routinely stage the *same* shared source at the same time. Without
+//! coordination both would see "not staged yet", both copy, and one run's
+//! startup [`SourceStager::crash_purge`] could reap the other's in-flight
+//! `.partial`. Two mechanisms make concurrent staging of one source correct:
+//!
+//! - **A per-source advisory lock** (`<source_id>.lock` under the staging root,
+//!   an `fs4` OS lock — `flock` on Unix, `LockFileEx` on Windows). A stage takes
+//!   the exclusive lock, *re-checks* reuse-if-fresh **under** the lock (so a
+//!   sibling that just published wins and the loser reuses without copying),
+//!   else copies, publishes `.staged`, writes the manifest, and only then
+//!   releases the lock. A concurrent sibling blocks on the lock and, on
+//!   acquiring it, finds the now-fresh `.staged` and reuses it — exactly one
+//!   copy of a given source across any number of overlapping invocations. The
+//!   kernel drops the lock when the process exits (clean, panicked, or killed),
+//!   so a crash never strands it.
+//! - **A liveness-aware crash-purge.** A `.partial` is reaped only when its
+//!   owning run is genuinely dead — its `<source_id>.lock` is *acquirable* under
+//!   a try-lock — and it is older than a short creation grace window. A live
+//!   sibling's in-flight `.partial` (lock held, or too young to have taken the
+//!   lock yet) is never reaped. This mirrors the executor's spill crash-purge.
 //!
 //! ## Copy invariants
 //!
@@ -74,9 +98,15 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clinker_plan::config::{Cleanup, OnExisting, StagedPath, StagingPolicy, StagingVerify};
+// `fs4::FileExt` adds `lock` (blocking exclusive) / `try_lock` (non-blocking
+// exclusive) / `unlock` to `std::fs::File` under the crate's `sync` feature (the
+// only fs4 feature this workspace enables), giving one cross-platform OS
+// advisory lock (`flock` on Unix, `LockFileEx` on Windows). Same primitive the
+// executor's spill crash-purge uses.
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Chunk size for the streamed copy. 1 MiB amortizes per-`read`/`write`
@@ -89,6 +119,30 @@ const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const STAGED_EXT: &str = "staged";
 /// Filename suffix for a staged copy's identity manifest.
 const MANIFEST_SUFFIX: &str = ".manifest.json";
+/// Filename extension for the per-source advisory lock that serializes
+/// concurrent stages of one source.
+const LOCK_EXT: &str = "lock";
+/// Filename suffix for a per-file in-flight copy, namespaced by run uuid.
+const PARTIAL_SUFFIX: &str = ".partial";
+/// Filename suffix for the in-flight manifest write (`<source_id>.manifest.json`
+/// staged as `<source_id>.manifest.json.partial` before its atomic rename).
+const MANIFEST_PARTIAL_SUFFIX: &str = ".manifest.json.partial";
+
+/// How recently a `<source_id>.<run_uuid>.partial` must have been created before
+/// the crash-purge will consider reaping it, independent of its owning run's
+/// lock state.
+///
+/// A stage creates its `.partial` and then writes into it; the per-source lock
+/// is taken before either. But a sibling that holds the lock and is still
+/// `stat`-ing the source has not yet created its `.partial`, and conversely a
+/// run that crashed the instant after `create` but before the kernel registered
+/// the lock could leave a lockless newborn partial. The grace window means a
+/// freshly created `.partial` is never reaped even if its lock probe says
+/// "acquirable", closing that narrow window. Five seconds dwarfs the
+/// sub-millisecond create→write latency yet stays far below the gap between
+/// runs, so a true crash corpse still ages past the window and is reaped on a
+/// later startup. Mirrors the executor spill crash-purge's grace window.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// Failure modes of a staging copy.
 ///
@@ -300,10 +354,39 @@ impl SourceStager {
     }
 
     /// Apply `on_existing` against the stable staged path for `source`, either
-    /// reusing a fresh prior copy or (re-)staging.
+    /// reusing a fresh prior copy or (re-)staging — serialized against concurrent
+    /// siblings staging the same source by a per-source advisory lock.
+    ///
+    /// The lock is what makes one copy across overlapping invocations: a sibling
+    /// that loses the race blocks here, then acquires the lock to find the
+    /// winner's freshly published `.staged` and reuses it. The reuse-if-fresh
+    /// check therefore runs **under** the lock (the [`stage_locked`] body), not
+    /// before it — a check before the lock would see "not staged" and copy
+    /// redundantly.
+    ///
+    /// [`stage_locked`]: Self::stage_locked
     fn stage_or_reuse(&mut self, source: &Path) -> Result<StagedFile, StagingError> {
         let source_id = source_id(source);
         let root = self.staging_root().to_path_buf();
+        let lock_path = root.join(format!("{source_id}.{LOCK_EXT}"));
+
+        // Hold the per-source lock for the whole reuse-or-stage decision so a
+        // concurrent sibling cannot interleave between the freshness check and
+        // the publish. The lock file is created if absent and kept open until
+        // the guard drops at the end of this function; the kernel releases the
+        // OS lock on drop (and on any process exit), so a crash never strands it.
+        let _guard = SourceLock::acquire(&lock_path)?;
+        self.stage_locked(source, &source_id, &root)
+    }
+
+    /// The locked critical section: re-check reuse-if-fresh, then (re-)stage if
+    /// needed. Always called with the per-source lock held.
+    fn stage_locked(
+        &mut self,
+        source: &Path,
+        source_id: &str,
+        root: &Path,
+    ) -> Result<StagedFile, StagingError> {
         let staged_path = root.join(format!("{source_id}.{STAGED_EXT}"));
         let manifest_path = root.join(format!("{source_id}{MANIFEST_SUFFIX}"));
 
@@ -322,8 +405,11 @@ impl SourceStager {
                 if let Some(manifest) = existing {
                     let meta = stat(source)?;
                     if manifest.matches_source(&meta) {
-                        // Fresh match: the source has not changed since it was
-                        // staged, so reuse the existing copy and copy no bytes.
+                        // Fresh match under the lock: either a prior run staged
+                        // it, or a concurrent sibling just published it while we
+                        // blocked on the lock. Either way reuse it and copy no
+                        // bytes — this is the cache hit that makes overlapping
+                        // invocations copy a source exactly once.
                         tracing::info!(
                             source = %source.display(),
                             staged = %staged_path.display(),
@@ -346,7 +432,7 @@ impl SourceStager {
         // `.staged` paired with a stale manifest.
         let _ = std::fs::remove_file(&manifest_path);
         let _ = std::fs::remove_file(&staged_path);
-        self.stage_file(source, &source_id, &staged_path, &manifest_path)
+        self.stage_file(source, source_id, &staged_path, &manifest_path)
     }
 
     /// Copy one selected source to its stable staged path with inline hashing,
@@ -399,11 +485,15 @@ impl SourceStager {
         }
 
         // The partial carries a fresh per-run uuid so two concurrent
-        // invocations staging the same source write distinct partials and only
-        // race on the final atomic rename, not on the in-flight bytes.
+        // invocations staging the same source write distinct partials, and the
+        // crash-purge can probe the partial's owning run for liveness via the
+        // per-source lock. (Concurrent same-source stages are serialized by that
+        // lock in `stage_or_reuse`, so in practice only one sibling reaches here
+        // per source; the uuid keeps the rare overwrite/error-mode interleavings
+        // collision-free too.)
         let run_seg = uuid::Uuid::new_v4().to_string();
         let root = staged_path.parent().unwrap_or(Path::new("."));
-        let partial = root.join(format!("{source_id}.{run_seg}.partial"));
+        let partial = root.join(format!("{source_id}.{run_seg}{PARTIAL_SUFFIX}"));
 
         let copy_result = self.copy_into(source, &partial, staged_path);
         let content_hash = match copy_result {
@@ -534,26 +624,42 @@ impl SourceStager {
     /// Idempotently reap the staged artifacts a crashed prior run left behind,
     /// run once at startup before any source is staged.
     ///
-    /// A crash leaves three orphan shapes under the staging root, distinguished
-    /// by artifact shape (no process-liveness probe is needed — a clean copy is
-    /// identified by its committed manifest):
+    /// A crash leaves three orphan shapes under the staging root:
     ///
-    /// - `*.partial` — an interrupted copy. Always reaped.
+    /// - `<source_id>.<run_uuid>.partial` — an interrupted copy. Reaped **only
+    ///   when its owning run is dead**: liveness-aware, so a concurrent sibling's
+    ///   in-flight partial is never reaped. See [`partial_is_orphaned`].
     /// - `*.staged` with no matching `*.manifest.json` — a copy that crashed
-    ///   after the rename but before the manifest was published. Reaped.
+    ///   after the rename but before the manifest was published. The manifest is
+    ///   the committed-copy marker, so a manifestless `.staged` is always an
+    ///   orphan regardless of liveness. Reaped.
     /// - `*.manifest.json` with no matching `*.staged` — a manifest whose staged
     ///   file was removed. Reaped.
     ///
     /// A clean pair (`.staged` + matching `.manifest.json`) is the reuse cache
-    /// and is **kept** — reuse-if-fresh depends on it surviving across runs.
-    /// This is deliberately liveness-agnostic so a concurrency-safety layer can
-    /// later add a lock/lease check on top without reworking the orphan
-    /// classification here.
+    /// and is **kept** — reuse-if-fresh depends on it surviving across runs. A
+    /// `.lock` file is the persistent per-source coordination point and is
+    /// **never** reaped: it carries no payload, a concurrent sibling may be about
+    /// to lock it, and leaving it costs nothing.
+    ///
+    /// The partial liveness check uses the same `fs4` try-lock + creation-grace
+    /// discipline as the executor's spill crash-purge, so concurrent
+    /// invocations sharing one staging root stay isolated by construction: a
+    /// live run's partial is protected either by its held `<source_id>.lock` or,
+    /// in the brief create→lock window, by the grace gate.
     ///
     /// A no-op when staging is disabled, the root is unset, or the root does not
     /// yet exist. Errors are logged, not propagated: a purge failure must not
     /// abort an otherwise-valid run.
     pub fn crash_purge(policy: &StagingPolicy) {
+        Self::crash_purge_with_grace(policy, REAP_GRACE);
+    }
+
+    /// [`SourceStager::crash_purge`] with the partial creation-grace window
+    /// injected, so tests can drive both sides of the window without sleeping: a
+    /// zero grace exercises the dead-owner reap path immediately, the real grace
+    /// exercises a freshly created partial's protection.
+    fn crash_purge_with_grace(policy: &StagingPolicy, grace: Duration) {
         if !policy.enabled {
             return;
         }
@@ -580,8 +686,22 @@ impl SourceStager {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_orphan = if name.ends_with(".partial") {
+            let is_orphan = if name.ends_with(MANIFEST_PARTIAL_SUFFIX) {
+                // An in-flight manifest write. It is created and atomically
+                // renamed in one tight step under the per-source lock, so a
+                // leftover is unambiguously a crash corpse — reaped outright.
+                // (Checked before the copy-partial arm, which would otherwise
+                // misparse this longer suffix.)
                 true
+            } else if let Some(stem) = name.strip_suffix(PARTIAL_SUFFIX) {
+                // Liveness-aware: only reap a copy partial whose owning run is
+                // dead (its per-source lock is acquirable) and which has aged
+                // past the creation grace window. A live sibling's in-flight
+                // partial is kept. `stem` is `<source_id>.<run_uuid>` (the uuid
+                // is hyphenated, never dotted), so the source id is the segment
+                // before the final dot.
+                let source_id = stem.rsplit_once('.').map_or(stem, |(id, _uuid)| id);
+                partial_is_orphaned(&path, root, source_id, grace)
             } else if let Some(id) = name.strip_suffix(&format!(".{STAGED_EXT}")) {
                 // Orphan when the matching manifest is absent.
                 !root.join(format!("{id}{MANIFEST_SUFFIX}")).exists()
@@ -589,6 +709,8 @@ impl SourceStager {
                 // Orphan when the matching staged copy is absent.
                 !root.join(format!("{id}.{STAGED_EXT}")).exists()
             } else {
+                // `.staged` reuse cache, `.lock` coordination files, and
+                // anything else are not orphans.
                 false
             };
             if is_orphan {
@@ -610,6 +732,100 @@ impl SourceStager {
             );
         }
     }
+}
+
+/// An RAII guard over a held per-source advisory lock. The exclusive `fs4` lock
+/// is released — and the lock file handle closed — when this drops, which also
+/// happens automatically if the process exits while holding it.
+struct SourceLock {
+    file: File,
+}
+
+impl SourceLock {
+    /// Create (if absent) and exclusively lock `<source_id>.lock`, blocking
+    /// until the lock is acquired.
+    ///
+    /// The lock file is owner-only on Unix like every other staging-root entry,
+    /// since it sits on the same potentially-shared volume. The blocking
+    /// `lock_exclusive` is what serializes concurrent stages of one source: a
+    /// sibling waits here rather than racing into a redundant copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StagingError::Io`] when the lock file cannot be created or the
+    /// OS lock call fails outright.
+    fn acquire(lock_path: &Path) -> Result<Self, StagingError> {
+        let file = open_owner_only(lock_path)?;
+        // fs4's `lock` is the blocking exclusive lock (`flock(LOCK_EX)` on Unix,
+        // `LockFileEx` with the exclusive flag on Windows).
+        FileExt::lock(&file).map_err(|e| StagingError::Io {
+            path: lock_path.to_path_buf(),
+            source: e,
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SourceLock {
+    fn drop(&mut self) {
+        // Best-effort: an unlock failure cannot be propagated from Drop, and the
+        // kernel releases the lock on the file handle's close (which Drop of
+        // `self.file` triggers next) and unconditionally on process exit.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Whether a `<source_id>.<run_uuid>.partial` is an orphan — its owning run is
+/// dead — and therefore safe to reap.
+///
+/// Two conditions must both hold, mirroring the executor's spill crash-purge:
+///
+/// 1. The partial is older than `grace` (in production [`REAP_GRACE`]). A
+///    younger partial may belong to a live sibling that created it microseconds
+///    ago, so it is never an orphan regardless of lock state.
+/// 2. The owning run's `<source_id>.lock` is *acquirable* under a try-lock. A
+///    live run staging this source holds that lock exclusively, so a successful
+///    try-lock means no live owner — the partial is a crash corpse. A
+///    `WouldBlock` means a sibling is staging the same source right now, so the
+///    partial is in-flight and kept. A missing lock file on an aged-out partial
+///    means the owner died before (or without) the lock surviving, which under
+///    the grace gate is a corpse.
+fn partial_is_orphaned(partial: &Path, root: &Path, source_id: &str, grace: Duration) -> bool {
+    // Age gate first: a freshly created partial is presumed live no matter what
+    // the lock probe says, closing the create→lock window.
+    if partial_age(partial).is_none_or(|age| age < grace) {
+        return false;
+    }
+    let lock_path = root.join(format!("{source_id}.{LOCK_EXT}"));
+    let Ok(file) = File::open(&lock_path) else {
+        // No probeable lock on a partial already past the grace window: the
+        // owning run is gone (or never registered a lock), an orphan.
+        return true;
+    };
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            // Acquired: no live owner. Release at once so the remove can proceed
+            // (on Windows an open lock handle would block it) and a concurrent
+            // purge sees a consistent state.
+            let _ = FileExt::unlock(&file);
+            drop(file);
+            true
+        }
+        // A live sibling holds the lock — its partial is in-flight, kept.
+        Err(_) => false,
+    }
+}
+
+/// Age of a `.partial`, used to decide whether its owner has had time to take
+/// the per-source lock, or `None` when no timestamp is readable (treated by the
+/// caller as "too young to reap", erring toward keeping a file it cannot date).
+///
+/// A clock skew that puts the mtime in the future yields a zero-ish age, which
+/// the grace gate treats as "too young" — the conservative direction (keep
+/// rather than reap).
+fn partial_age(partial: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(partial).and_then(|m| m.modified()).ok()?;
+    SystemTime::now().duration_since(modified).ok()
 }
 
 /// The stable content-addressed id for a source path: the hex BLAKE3 of its
@@ -853,6 +1069,10 @@ fn fsync_parent_dir(_published: &Path) -> Result<(), StagingError> {
 mod tests {
     use super::*;
     use clinker_plan::config::utils::ByteSize;
+
+    /// A zero grace window so a freshly created fixture partial is immediately
+    /// eligible by age, exercising the dead-owner lock probe without sleeping.
+    const NO_GRACE: Duration = Duration::ZERO;
 
     fn policy_with_dir(dir: &Path, patterns: &[&str]) -> StagingPolicy {
         StagingPolicy {
@@ -1184,10 +1404,14 @@ mod tests {
         let err = stager.resolve(dir_as_src).unwrap_err();
         assert!(matches!(err, StagingError::Io { .. }));
 
+        // No `.partial` or `.staged` artifact may survive a failed copy. The
+        // per-source `.lock` is the persistent coordination file and is expected
+        // to remain — it carries no payload and is reused by the next attempt.
         let survivors: Vec<_> = std::fs::read_dir(stage_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some(LOCK_EXT))
             .collect();
         assert!(
             survivors.is_empty(),
@@ -1200,7 +1424,8 @@ mod tests {
         let stage_dir = tempfile::tempdir().unwrap();
         let root = stage_dir.path();
 
-        // Orphan 1: an interrupted partial.
+        // Orphan 1: an interrupted partial with no live owner. A zero grace makes
+        // it eligible by age, and with no `.lock` present its owner reads as dead.
         std::fs::write(root.join("aaaa.deadbeef.partial"), b"half").unwrap();
         // Orphan 2: a staged copy with no manifest (crashed before commit).
         std::fs::write(root.join("bbbb.staged"), b"orphan-staged").unwrap();
@@ -1209,13 +1434,15 @@ mod tests {
         // Clean pair: staged + matching manifest — the reuse cache, must survive.
         std::fs::write(root.join("dddd.staged"), b"clean").unwrap();
         std::fs::write(root.join("dddd.manifest.json"), b"{}").unwrap();
+        // A lingering per-source lock file: never an orphan, must survive.
+        std::fs::write(root.join("dddd.lock"), b"").unwrap();
 
         let policy = policy_with_dir(root, &["*.csv"]);
-        SourceStager::crash_purge(&policy);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
 
         assert!(
             !root.join("aaaa.deadbeef.partial").exists(),
-            "partial reaped"
+            "a dead-owner partial reaped"
         );
         assert!(
             !root.join("bbbb.staged").exists(),
@@ -1230,6 +1457,100 @@ mod tests {
             root.join("dddd.manifest.json").exists(),
             "clean manifest kept"
         );
+        assert!(root.join("dddd.lock").exists(), "lock file kept");
+    }
+
+    #[test]
+    fn crash_purge_keeps_a_live_siblings_in_flight_partial() {
+        // A concurrent sibling is staging this source: it holds the per-source
+        // lock and has an in-flight partial. The purge must keep that partial
+        // even with the grace removed (zero grace), proving the keep decision is
+        // the held lock, not the file's age.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let source_id = "feedface";
+        std::fs::write(
+            root.join(format!("{source_id}.abc123.partial")),
+            b"in-flight",
+        )
+        .unwrap();
+        // Simulate the live sibling holding its per-source lock.
+        let held = SourceLock::acquire(&root.join(format!("{source_id}.{LOCK_EXT}"))).unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            root.join(format!("{source_id}.abc123.partial")).exists(),
+            "a live sibling's in-flight partial must never be reaped"
+        );
+
+        // Once the sibling releases the lock (its run ended), the same partial is
+        // a corpse and a later purge reaps it — proving the lock, not the name,
+        // gated the keep.
+        drop(held);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            !root.join(format!("{source_id}.abc123.partial")).exists(),
+            "once the owner's lock is released the partial is reapable"
+        );
+    }
+
+    #[test]
+    fn crash_purge_keeps_a_newborn_partial_within_the_grace_window() {
+        // The create→lock window: a freshly created partial whose owner has not
+        // yet been observed holding the lock. With the real grace in force it
+        // must be left alone, never reaped out from under its owner. Regression
+        // guard for reaping a live sibling's just-created partial.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        std::fs::write(root.join("cafef00d.xyz.partial"), b"newborn").unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        // The default (real) grace: a just-created partial is inside the window.
+        SourceStager::crash_purge(&policy);
+        assert!(
+            root.join("cafef00d.xyz.partial").exists(),
+            "a just-created partial must be kept during the grace window"
+        );
+    }
+
+    #[test]
+    fn crash_purge_reaps_a_leftover_manifest_partial_unconditionally() {
+        // An in-flight manifest write is created and renamed atomically under the
+        // per-source lock, so a leftover `<id>.manifest.json.partial` is always a
+        // crash corpse — reaped without a liveness probe and even within the
+        // grace window (it never belongs to a still-live writer past its rename).
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let leftover = root.join("beadfeed.manifest.json.partial");
+        std::fs::write(&leftover, b"{}").unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        // Even the real (non-zero) grace must not protect a manifest partial.
+        SourceStager::crash_purge(&policy);
+        assert!(
+            !leftover.exists(),
+            "a leftover manifest partial is an unconditional orphan"
+        );
+    }
+
+    #[test]
+    fn partial_is_orphaned_respects_the_grace_window() {
+        // Unit-level proof that age alone gates a lockless partial: identical
+        // fixture, opposite verdict purely from the grace duration.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let partial = root.join("abcd.run1.partial");
+        std::fs::write(&partial, b"x").unwrap();
+
+        assert!(
+            !partial_is_orphaned(&partial, root, "abcd", REAP_GRACE),
+            "a fresh lockless partial is protected by the grace window"
+        );
+        assert!(
+            partial_is_orphaned(&partial, root, "abcd", NO_GRACE),
+            "the same partial, aged out, is an orphan"
+        );
     }
 
     #[test]
@@ -1239,13 +1560,13 @@ mod tests {
         std::fs::write(stage_dir.path().join("x.partial"), b"x").unwrap();
         let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
         policy.enabled = false;
-        SourceStager::crash_purge(&policy);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
         assert!(stage_dir.path().join("x.partial").exists());
 
         // Missing root: no panic, no error.
         let mut missing = policy_with_dir(stage_dir.path(), &["*.csv"]);
         missing.dir = Some(stage_dir.path().join("does-not-exist"));
-        SourceStager::crash_purge(&missing);
+        SourceStager::crash_purge_with_grace(&missing, NO_GRACE);
     }
 
     #[cfg(unix)]

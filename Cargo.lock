@@ -421,6 +421,7 @@ dependencies = [
  "clinker-plan",
  "clinker-record",
  "criterion",
+ "fs4",
  "indexmap",
  "nix",
  "serde",
