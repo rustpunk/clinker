@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod compile_context;
 pub mod composition;
+pub mod discovery;
 pub mod error;
 pub mod format;
 pub mod fs_type;
@@ -26,6 +27,7 @@ pub use composition::{
     ResolvedValue, Resource, ResourceDecl, ResourceKind, ResourceName, ScopedVarsSchema, SourceMap,
     SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
 };
+pub use discovery::{DiscoveredFile, DiscoveryError, DiscoveryOutcome, discover};
 pub use error::*;
 pub use format::*;
 pub use fs_type::{FsKind, classify, same_device};

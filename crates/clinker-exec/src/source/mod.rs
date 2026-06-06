@@ -1,15 +1,13 @@
-//! Source-side discovery and multi-file ingestion.
+//! Source-side multi-file ingestion.
 //!
-//! [`discovery`] resolves a [`clinker_plan::config::SourceConfig`] matcher
-//! (`path` / `glob` / `regex` / `paths`) into a concrete file set,
-//! applying the post-discovery filters (`exclude`, `modified_after/before`,
-//! `min_size`/`max_size`, `files.sort_by`/`take_first|last`,
-//! `files.recursive`, `files.on_no_match`).
-//!
-//! Multi-file format streaming (header skipping across files, per-file
-//! `RecordProvenance` Arc swaps) lives alongside in §3.
+//! File-set discovery — resolving a [`clinker_plan::config::SourceConfig`]
+//! matcher (`path` / `glob` / `regex` / `paths`) and applying the
+//! post-discovery filters — lives in [`clinker_plan::config::discovery`], so
+//! the planner's `--explain` spill-volume estimate and the runtime ingest
+//! path resolve the same file set. This module owns the multi-file format
+//! streaming that consumes that resolved set (header skipping across files,
+//! per-file `RecordProvenance` Arc swaps).
 
-pub mod discovery;
 pub mod multi_file;
 
 use std::sync::Arc;

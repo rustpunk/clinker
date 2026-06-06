@@ -54,7 +54,7 @@ edge aggregation.dept_totals -> output.out:
 
 Estimated spill volume (per blocking stage):
   [aggregation:hash] dept_totals → unknown
-  Total (known stages): 0B (excludes stages whose volume is unknown at plan time — a glob/regex multi-file source, a network source, or a missing input)
+  Total (known stages): 0B (excludes stages whose volume is unknown at plan time — a network source, a missing or unreadable input, or a glob/regex matcher whose discovery fails)
 
 === CXL Expressions ===
 

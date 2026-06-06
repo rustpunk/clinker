@@ -225,19 +225,22 @@ are excluded:
 ```text
   [aggregation:hash] dept_totals → unknown
   Total (known stages): 0B (excludes stages whose volume is unknown at plan time
-  — a glob/regex multi-file source, a network source, or a missing input)
+  — a network source, a missing or unreadable input, or a glob/regex matcher
+  whose discovery fails)
 ```
 
-The seed is known for a single-file `path:` source and for an explicit `paths:`
-list (the listed files' sizes sum exactly, since the list carries no discovery
-filters). It is **unknown** for a `glob:` or `regex:` matcher — those fan out
-through the full discovery resolver (with `exclude`, `min_size`/`max_size`,
-`modified_after`/`before`, `take`, and sort filters), and estimating them at
-plan time would mean re-implementing that resolver and risk naming different
-bytes than the run actually reads. It is also unknown for a network source and
-for a missing or unreadable file. To get a concrete estimate for a glob/regex
-source, list the files explicitly with `paths:`, or check the post-run actuals
-below.
+The seed is known for every file-backed matcher whose files can be sized at
+plan time: a single-file `path:` source, an explicit `paths:` list, and a
+`glob:` or `regex:` matcher. A glob/regex seed runs the same discovery resolver
+the run uses — applying its `exclude`, `min_size`/`max_size`,
+`modified_after`/`before`, `take`, and sort filters — and sums the matched
+files' sizes, so the estimate names exactly the bytes the run will read with no
+second implementation to drift. A glob/regex that matches nothing seeds zero
+(rendered as `unknown`, since there is no spill volume to preview). The seed is
+genuinely **unknown** for a network source, for a missing or unreadable input
+file, and for a glob/regex matcher whose discovery itself fails (an invalid
+pattern, or no match under `on_no_match: error`) — the run surfaces the same
+error at startup. Check the post-run actuals below to calibrate any estimate.
 
 ### Staging plan per source
 
@@ -351,12 +354,15 @@ spill amplification, where an optimizer interaction turned 30 GB of input into
 
 > **Note on the `--explain` compression projection.** The per-operator
 > spill-compression decision shown under `Spill compression:` is projected from
-> each operator's *stored output schema* width at plan time. At runtime the
-> actual spilled batch may carry a different column count (engine-stamped
-> identity columns, intermediate-stage shapes), so a stage's projected `auto`
-> verdict can differ from the file it actually writes. The read path always
-> dispatches on the spill file's own one-byte header tag, so this never breaks
-> re-reading; the projection is a best-effort preview, not a guarantee.
+> the same column count the operator's runtime spill writer sees, so the
+> projected `auto` verdict matches the file the run actually writes. A hash
+> Aggregate and a grace-hash / sort-merge Combine project against their output
+> schema (engine-stamped identity columns included), exactly the width their
+> dispatch arms resolve compression against; an enforcer sort projects against
+> the width of the records flowing into it — its upstream's emitted schema —
+> which is the width its sort buffer reads at runtime. The read path also
+> dispatches on each spill file's own one-byte header tag, so re-reading is
+> robust regardless.
 
 ## Distinguishing the four spill-related failure conditions
 

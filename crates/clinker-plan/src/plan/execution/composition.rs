@@ -331,25 +331,31 @@ pub(crate) fn resolve_composition_body_windows(
 
 /// On-disk byte seed for a file-backed Source's `predicted_peak_bytes`.
 ///
-/// Resolves each literal path against `anchor` (the pipeline file's directory)
-/// so the size is independent of the process CWD, and absolute paths resolve
+/// Resolves each matcher against `anchor` (the pipeline file's directory) so
+/// the size is independent of the process CWD, and absolute paths resolve
 /// as-is — matching the source-discovery resolver.
 ///
 /// Coverage:
 /// - **`path:`** (single file) — `Some(len)`.
 /// - **`paths:`** (explicit list) — `Some(sum)` of every readable listed file.
 ///   The explicit list carries no glob/exclude/min-size discovery filters, so
-///   summing the listed sizes is exact and reuses no discovery logic. An
-///   unreadable entry contributes nothing; the sum still seeds the others.
+///   summing the listed sizes is exact. An unreadable entry contributes
+///   nothing; the sum still seeds the others.
+/// - **`glob:` / `regex:`** (multi-file matchers) — `Some(sum)` of the matched
+///   files' sizes, computed by running the same [`discover`] resolver the
+///   staging and ingest paths use. Reusing that one resolver (its `exclude`
+///   list, `min_size`/`max_size`, `modified_after`/`before`, `take`, and sort
+///   filters) means the seed names exactly the bytes the run will read, with
+///   no second implementation to drift. An empty match seeds `Some(0)`, which
+///   the caller renders as `unknown` like any other zero seed.
 ///
-/// Returns `None` — the "unknown" seed the caller writes as `0` — for:
-/// - **`glob:` / `regex:`** matchers, which fan out through the full
-///   source-discovery resolver (exclude lists, `min_size`/`max_size`,
-///   `modified_after`/`before`, `take`, sort). Summing matched sizes here
-///   would mean re-implementing that resolver and risk diverging from the
-///   bytes the run actually reads, so these stay unknown by design — the
-///   `--explain` output and `docs/src/ops/storage.md` flag the limitation.
-/// - an absent matcher, or a `path:` whose `std::fs::metadata` fails.
+/// Returns `None` — the "unknown" seed the caller writes as `0` — for an
+/// absent matcher, a `path:` whose `std::fs::metadata` fails, an empty
+/// `paths:` list, or a discovery failure on a `glob:`/`regex:` matcher
+/// (invalid pattern, a no-match under `on_no_match: error`, or a walk I/O
+/// error). A discovery failure is reported as unknown rather than `0` so a
+/// broken matcher does not masquerade as a zero-byte input; the run's own
+/// discovery surfaces the same error at startup.
 pub(crate) fn source_seed_bytes(source: &SourceConfig, anchor: &std::path::Path) -> Option<u64> {
     let resolve = |p: &str| -> std::path::PathBuf {
         let p = std::path::Path::new(p);
@@ -374,10 +380,21 @@ pub(crate) fn source_seed_bytes(source: &SourceConfig, anchor: &std::path::Path)
         return Some(total);
     }
 
-    // `glob` / `regex` route through the discovery resolver and its filters;
-    // estimating them here would duplicate that resolver, so leave unknown.
+    // `glob` / `regex` fan out through the discovery resolver and its filters.
+    // Run that one resolver and sum the matched files' already-stat'd sizes so
+    // the estimate equals the bytes the run reads — never a second, divergent
+    // re-implementation of the filter pipeline. A discovery error is unknown
+    // (`None`), not a misleading `0`.
     if source.glob.is_some() || source.regex.is_some() {
-        return None;
+        return match crate::config::discovery::discover(source, anchor) {
+            Ok(outcome) => Some(
+                outcome
+                    .files()
+                    .iter()
+                    .fold(0u64, |acc, f| acc.saturating_add(f.size)),
+            ),
+            Err(_) => None,
+        };
     }
 
     let path = source.path.as_deref()?;
