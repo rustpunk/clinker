@@ -263,17 +263,36 @@ run ends — a clean exit, or even a panic that unwinds, deletes it. But a
 cleanup runs, leaking the directory and every spill file inside it under the
 spill root. Over many crashed runs that fills the spill volume.
 
-To prevent that, **every run reaps orphaned spill directories at startup**,
+To prevent that, **a run reaps orphaned spill directories at startup — but
+only when a spill directory is explicitly configured** (`storage.spill.dir`),
 before it creates its own. Each live run holds an operating-system advisory lock
 on a `.lock` file inside its spill directory for the run's whole lifetime; the
 OS releases that lock automatically when the process exits, however it exits. At
-startup a run scans the spill root and, for each `clinker-spill-*` directory,
-tries to take that lock: if it succeeds the owning process is gone, so the
-directory is an orphan and is removed; if the lock is still held a concurrent
+startup a run scans the configured spill root and, for each `clinker-spill-*`
+directory, tries to take that lock: if it succeeds the owning process is gone, so
+the directory is an orphan and is removed; if the lock is still held a concurrent
 live run owns it, so it is left alone. Asking the kernel "is anyone still
 holding this?" is robust against PID reuse and never reaps a directory a
 concurrent run is still using. The purge is best-effort: a failure to reap one
 directory is logged and the run proceeds.
+
+When `storage.spill.dir` is **not** set, the spill root defaults to the OS temp
+directory ([`std::env::temp_dir`], typically `$TMPDIR` or `/tmp`), and **no
+startup purge runs** there. In the default case a run cleans up after itself
+directly: the per-run spill directory is a `tempfile::TempDir` that is removed on
+every normal exit — a clean exit or a panic that unwinds. Only a `SIGKILL`, the
+OOM-killer, or a power loss leaks one, and a directory leaked into the OS temp
+directory is the operating system's temp-reaper's responsibility to clean up, not
+Clinker's.
+
+The purge is deliberately confined to a configured spill root because it must
+never police the shared OS temp directory. That directory is used by every
+process on the host, so a startup sweep there would race not only concurrent
+Clinker runs (the lock-based check narrows that window but cannot eliminate it
+against a peer whose just-created spill directory is not yet locked) but also
+unrelated programs that happen to use a colliding name prefix. A run owns its
+configured spill volume and can safely sweep it; it does not own `/tmp` and so
+leaves it alone.
 
 ## `storage.staging` — opt-in source staging
 
