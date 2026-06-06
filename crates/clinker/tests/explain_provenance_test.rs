@@ -203,3 +203,42 @@ fn test_explain_error_code_e15y_streaming_help() {
         "E15Y doc must mention the streaming strategy interaction.\nstdout: {stdout}"
     );
 }
+
+#[test]
+fn test_explain_staging_codes_are_lookup_able() {
+    // Each staging-copy failure carries a stable code the operator can look up,
+    // mirroring the spill subsystem's E320/E321.
+    for code in ["E335", "E336", "E337"] {
+        let output = Command::new(clinker_bin())
+            .arg("explain")
+            .arg("--code")
+            .arg(code)
+            .output()
+            .expect("spawn clinker");
+        assert!(
+            output.status.success(),
+            "clinker explain --code {code} must succeed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(code),
+            "{code} doc must reference its own code.\nstdout: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_explain_help_lists_staging_codes() {
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("--help")
+        .output()
+        .expect("spawn clinker");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("E335-E337"),
+        "help output must advertise the staging-copy code range.\nstdout: {stdout}"
+    );
+}

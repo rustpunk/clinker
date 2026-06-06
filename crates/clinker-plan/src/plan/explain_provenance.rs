@@ -226,6 +226,9 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E332" => Some(include_str!("../../../../docs/explain/E332.md")),
         "E333" => Some(include_str!("../../../../docs/explain/E333.md")),
         "E334" => Some(include_str!("../../../../docs/explain/E334.md")),
+        "E335" => Some(include_str!("../../../../docs/explain/E335.md")),
+        "E336" => Some(include_str!("../../../../docs/explain/E336.md")),
+        "E337" => Some(include_str!("../../../../docs/explain/E337.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
         "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
         "E150d" => Some(include_str!("../../../../docs/explain/E150d.md")),
@@ -383,6 +386,31 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_code_e335_staging_verify_mismatch() {
+        let doc = explain_code("E335").unwrap();
+        assert!(doc.contains("E335"));
+        assert!(doc.contains("BLAKE3"));
+        // Must keep the content-hash mismatch distinct from a plain I/O fault.
+        assert!(doc.contains("corrupt"));
+    }
+
+    #[test]
+    fn test_explain_code_e336_staging_disk_cap() {
+        let doc = explain_code("E336").unwrap();
+        assert!(doc.contains("E336"));
+        assert!(doc.contains("storage.staging.disk_cap_bytes"));
+        // The configured cap is distinct from a physically full volume.
+        assert!(doc.contains("cap"));
+    }
+
+    #[test]
+    fn test_explain_code_e337_staging_already_exists() {
+        let doc = explain_code("E337").unwrap();
+        assert!(doc.contains("E337"));
+        assert!(doc.contains("on_existing"));
+    }
+
+    #[test]
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
@@ -393,7 +421,7 @@ mod tests {
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E150b", "E150c",
             "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
             "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E330", "E331", "E332",
-            "E333", "E334", "E15Y", "W101", "W302", "W305", "W306",
+            "E333", "E334", "E335", "E336", "E337", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",
