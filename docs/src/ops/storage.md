@@ -697,16 +697,36 @@ pipeline over an unchanged network share copies nothing on the second run. The
 freshness check is mtime + size, not a re-hash, so it is a cheap `stat` rather
 than a full read of the source.
 
-`reuse` is collision-safe across **concurrent** invocations. Under the
+Staging is collision-safe across **concurrent** invocations. Under the
 partition-and-run model — several `clinker` processes over a partitioned input
-sharing one staging volume — two runs may stage the *same* shared source at the
-same time. They are serialized by a per-source advisory lock (a
-`<source-id>.lock` file under the staging root): the first run to take the lock
-copies and publishes, and every other run blocks on the lock, then acquires it,
-finds the now-fresh `.staged`, and reuses it. The result is exactly one copy of
-a given source no matter how many invocations race for it, and a reader always
-sees a complete `.staged` file (the atomic rename publish never exposes a
-half-written one).
+sharing one staging volume — independent runs may stage, reuse, or clean up the
+*same* shared source at the same time. The per-source advisory lock (a
+`<source-id>.lock` file under the staging root) is a **reader-writer lock** that
+keeps every such overlap safe on Linux, macOS, and Windows:
+
+- **Exactly one copy.** A run that needs to copy takes the lock *exclusively*
+  for its copy-and-publish. The first run to take it copies and publishes; every
+  other run blocks, then acquires the lock, finds the now-fresh `.staged`, and
+  reuses it. So a source is copied exactly once no matter how many invocations
+  race for it.
+- **A reader is never yanked.** A run reading a staged copy holds the lock in
+  *shared* mode for as long as it has the file open, and keeps it held across the
+  moment it decides to reuse a copy and the moment it opens that copy — so the
+  file it chose cannot be deleted or replaced in between. Any number of readers
+  share the lock at once, so concurrent runs all read the same copy in parallel.
+- **Cleanup and overwrite wait for readers.** Removing or re-copying a staged
+  pair takes the lock *exclusively*, which a live reader's shared lock blocks.
+  Cleanup probes the lock without waiting: if a concurrent run is still reading
+  the copy, cleanup leaves it in place (the last run to release it, or a later
+  [crash purge](#crash-purge-of-orphaned-artifacts), reaps it). An overwrite
+  re-stage waits for in-flight readers to finish, then publishes atomically.
+
+On Windows the staged copy is additionally opened with a share mode that permits
+a concurrent delete or atomic-rename replace (`FILE_SHARE_DELETE`), so an open
+reader and a concurrent publish/cleanup interoperate there exactly as they do on
+POSIX, where an unlinked-but-open file stays readable. The net guarantee: across
+any mix of concurrent runs sharing a staged source, a reader always sees a
+complete, coherent `.staged` file and no run fails spuriously.
 
 ### Cleanup (`on_success` | `always` | `never`)
 

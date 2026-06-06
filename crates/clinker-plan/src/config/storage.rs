@@ -12,7 +12,7 @@
 //! runtime. This module owns the *decision and validation* surface: it parses
 //! the `[storage.staging]` block, validates it at startup
 //! ([`StagingPolicy::validate`]), and matches source paths against the
-//! configured patterns ([`StagingPolicy::pattern_matches`]). The copy itself —
+//! configured patterns ([`StagingPolicy::compile_matcher`]). The copy itself —
 //! single-pass streamed copy with inline BLAKE3 verification and atomic
 //! publish — lives in `clinker-channel`'s staging-copy engine, which consumes
 //! the decision this module makes.
@@ -294,7 +294,8 @@ impl SpillConfig {
 /// `smart_open` posture: decide-what-to-stage is separated from do-the-copy.
 ///
 /// This type owns the *decision* and *validation* halves:
-/// [`StagingPolicy::pattern_matches`] reports whether a path is selected, and
+/// [`StagingPolicy::compile_matcher`] builds the matcher that reports whether a
+/// path is selected, and
 /// [`StagingPolicy::validate`] runs the startup checks. The copy half — the
 /// streamed copy + BLAKE3 verify + atomic publish — lives in `clinker-channel`.
 /// Off by default: an empty or absent block leaves every source reading in
@@ -346,6 +347,49 @@ pub struct StagingPolicy {
     /// matches, so `enabled = true` with no patterns stages nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+}
+
+/// The staging patterns compiled to [`glob::Pattern`] once, for repeated
+/// source-path matching.
+///
+/// A pipeline run probes every discovered source against the staging patterns —
+/// in [`StagingPolicy::validate`], in the per-source stage decision, and in the
+/// `--explain` plan. Building this matcher once via
+/// [`StagingPolicy::compile_matcher`] and reusing it amortizes the
+/// `glob::Pattern::new` parse across all those checks, instead of recompiling
+/// every pattern on every path. It is a derived, non-config value, so it lives
+/// here rather than as a field on the serde-deserialized [`StagingPolicy`].
+#[derive(Debug, Clone)]
+pub struct StagingMatcher {
+    /// `false` when staging is disabled, so [`StagingMatcher::matches`] short-
+    /// circuits to "never matches" without consulting the compiled set.
+    enabled: bool,
+    /// The parseable patterns, compiled once. Unparseable patterns are dropped
+    /// (validity is reported by [`StagingPolicy::validate`] at startup), so a
+    /// dropped pattern simply never matches.
+    patterns: Vec<glob::Pattern>,
+}
+
+impl StagingMatcher {
+    /// Whether `path` matches at least one compiled staging pattern.
+    ///
+    /// Returns `false` when staging is disabled. Each pattern is tested against
+    /// both the full path string and the basename (gitignore-style) — `*.csv`
+    /// matches a deep path by basename while `/mnt/nfs/**` matches by full path,
+    /// mirroring the source-discovery `exclude:` matcher.
+    pub fn matches(&self, path: &Path) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let path_str = path.to_string_lossy();
+        let basename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.patterns
+            .iter()
+            .any(|pat| pat.matches(&path_str) || pat.matches(&basename))
+    }
 }
 
 /// Post-copy integrity check applied to a staged file.
@@ -431,29 +475,28 @@ impl StagedPath {
 }
 
 impl StagingPolicy {
-    /// Whether `path` matches at least one staging pattern.
+    /// Compile the staging patterns once into a reusable [`StagingMatcher`].
     ///
-    /// Returns `false` when staging is disabled or no pattern is configured.
-    /// Patterns are matched against both the full path string and the
-    /// basename (gitignore-style), mirroring the source-discovery
-    /// `exclude:` matcher, so `*.csv` matches a deep path by basename while
-    /// `/mnt/nfs/**` matches by full path. An unparseable pattern never
-    /// matches — pattern validity is reported separately by
-    /// [`StagingPolicy::validate`] so a typo fails the run at startup rather
-    /// than silently disabling staging here.
-    pub fn pattern_matches(&self, path: &Path) -> bool {
-        if !self.enabled {
-            return false;
+    /// Call this once and reuse the returned matcher for every source-path
+    /// check in a run — `validate`'s same-volume loop, the per-source stage
+    /// decision, and the `--explain` plan all probe every discovered source, so
+    /// compiling the globs once here amortizes the `glob::Pattern::new` parse
+    /// across all of them instead of recompiling per path.
+    ///
+    /// Unparseable patterns are dropped rather than erroring: pattern validity
+    /// is reported separately by [`StagingPolicy::validate`] at startup, so by
+    /// the time matching runs an invalid pattern has already failed the run —
+    /// and a dropped pattern simply never matches, the same behavior the prior
+    /// per-call `Err(_) => false` arm gave.
+    pub fn compile_matcher(&self) -> StagingMatcher {
+        StagingMatcher {
+            enabled: self.enabled,
+            patterns: self
+                .patterns
+                .iter()
+                .filter_map(|p| glob::Pattern::new(p).ok())
+                .collect(),
         }
-        let path_str = path.to_string_lossy();
-        let basename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.patterns.iter().any(|p| match glob::Pattern::new(p) {
-            Ok(pat) => pat.matches(&path_str) || pat.matches(&basename),
-            Err(_) => false,
-        })
     }
 
     /// Validate staging configuration at startup against the set of source
@@ -523,9 +566,11 @@ impl StagingPolicy {
         // lives, so its volume is irrelevant. The same-device probe is the
         // shared filesystem-detection facade — the config layer and the
         // executor-startup checks resolve "same volume?" through one
-        // implementation rather than each carrying its own.
+        // implementation rather than each carrying its own. Compile the glob
+        // matcher once for the whole loop rather than per source.
+        let matcher = self.compile_matcher();
         for src in source_paths {
-            if !self.pattern_matches(src) {
+            if !matcher.matches(src) {
                 continue;
             }
             let same = crate::config::fs_type::same_device(dir, src).map_err(|e| {
@@ -897,28 +942,38 @@ mod tests {
     }
 
     #[test]
-    fn pattern_matches_full_path_and_basename() {
+    fn compiled_matcher_matches_full_path_basename_and_disabled() {
+        // The compile-once matcher reproduces the full matching contract: a
+        // full-path glob, a basename glob, a non-match, a path matching both
+        // globs, a path with no basename, an invalid pattern that drops to
+        // never-match, and the disabled short-circuit. A trailing `[` is an
+        // invalid glob: it must compile-drop and never match, exactly as the
+        // prior per-call `Err(_) => false` arm did.
         let p = StagingPolicy {
             enabled: true,
-            patterns: vec!["/mnt/nfs/**".into(), "*.csv".into()],
+            patterns: vec!["/mnt/nfs/**".into(), "*.csv".into(), "[".into()],
             ..Default::default()
         };
-        // Full-path match.
-        assert!(p.pattern_matches(Path::new("/mnt/nfs/data/orders.json")));
-        // Basename match on a path the full-path glob does not cover.
-        assert!(p.pattern_matches(Path::new("/local/data/orders.csv")));
-        // No match.
-        assert!(!p.pattern_matches(Path::new("/local/data/orders.json")));
-    }
-
-    #[test]
-    fn pattern_matches_is_false_when_disabled() {
-        let p = StagingPolicy {
+        let cases = [
+            ("/mnt/nfs/data/orders.json", true),  // full-path glob
+            ("/local/data/orders.csv", true),     // basename glob
+            ("/local/data/orders.json", false),   // no pattern matches
+            ("/mnt/nfs/deep/nested/x.csv", true), // matches both globs
+            ("/", false),                         // no basename, no match
+        ];
+        // One matcher, built once, must give the right verdict for every path —
+        // proving the optimization changed performance, not behavior.
+        let matcher = p.compile_matcher();
+        for (path, expected) in cases {
+            assert_eq!(matcher.matches(Path::new(path)), expected, "{path}");
+        }
+        // A disabled policy never matches, regardless of patterns.
+        let disabled = StagingPolicy {
             enabled: false,
             patterns: vec!["**".into()],
             ..Default::default()
         };
-        assert!(!p.pattern_matches(Path::new("/anything")));
+        assert!(!disabled.compile_matcher().matches(Path::new("/anything")));
     }
 
     #[test]
