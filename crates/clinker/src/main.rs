@@ -951,11 +951,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Idempotent staging crash-purge, run once before this run stages. A
     // crashed prior run (SIGKILL, OOM-killer, power loss) skips the cleanup a
     // clean exit performs, leaking its staged artifacts under the shared
-    // staging root. Best-effort and shape-based — it reaps only a `.partial` or
-    // a `.staged` with no committed manifest, never a concurrent run's in-flight
-    // copy or a clean reuse-cache entry. (The matching spill-root crash-purge
-    // runs inside the executor at spill-root creation, so every executor entry
-    // point gets it; staging is a CLI-only concern, so its purge lives here.)
+    // staging root. Best-effort and shape-based — it reaps every `.partial` and
+    // any `.staged` with no committed manifest. It is NOT yet concurrency-safe:
+    // the `.partial` sweep has no liveness check, so a concurrent run's
+    // in-flight `.partial` copy would be reaped. Full concurrent-invocation
+    // safety for staging (a liveness lock mirroring the spill purge's) is a
+    // follow-up; today, concurrent runs must not share a staging root. The
+    // matching spill-root crash-purge runs inside the executor at spill-root
+    // creation (so every executor entry point gets it) and IS concurrency-safe
+    // via per-dir locking plus a creation grace window; staging is a CLI-only
+    // concern, so its purge lives here.
     clinker_channel::SourceStager::crash_purge(&staging_policy);
 
     // Stage + open pass: with validation passed, copy each matched source to

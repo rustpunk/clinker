@@ -220,8 +220,17 @@ fn startup_purges_an_orphaned_spill_dir_from_a_crashed_prior_run() {
     // crashed owner released it) and a leaked spill file inside.
     let orphan = spill_root_path.join("clinker-spill-crashed0001");
     std::fs::create_dir(&orphan).expect("create orphan spill dir");
-    std::fs::File::create(orphan.join(".lock")).expect("create orphan lock");
+    let lock = std::fs::File::create(orphan.join(".lock")).expect("create orphan lock");
     std::fs::write(orphan.join("partition-0.spill"), b"leaked-bytes").expect("write leaked spill");
+
+    // A *prior* crashed run is by definition older than the purge's creation
+    // grace window (which protects a live sibling's just-created spill dir). Age
+    // the `.lock` — the purge's "run started" marker — well past that window so
+    // this fixture is a genuine corpse, not a newborn the grace window keeps.
+    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    lock.set_modified(aged)
+        .expect("age the orphan lock past the grace window");
+    drop(lock);
 
     let csv = build_events_csv();
     let config: PipelineConfig =

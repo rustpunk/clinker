@@ -690,9 +690,12 @@ impl PipelineExecutor {
         // run once before this run creates its own. A crashed run (SIGKILL,
         // OOM-killer, power loss) skips the TempDir Drop that removes its spill
         // dir, leaking it under the shared root; this reaps every such orphan,
-        // identified by an OS advisory lock no live process still holds. Best-
-        // effort and non-fatal. Probes the resolved root the run will use: the
-        // configured dir, or the OS temp dir when none is configured.
+        // identified by an OS advisory lock no live process still holds, gated by
+        // a creation grace window so a concurrent sibling's just-created,
+        // not-yet-locked dir is never reaped (concurrent invocations may share
+        // this root). Best-effort and non-fatal. Probes the resolved root the run
+        // will use: the configured dir, or the OS temp dir when none is
+        // configured.
         let spill_purge_root = params
             .spill_root_dir
             .clone()
