@@ -149,36 +149,40 @@ impl ExecutionPlanDag {
     }
 
     /// Coarse plan-time estimate, in bytes, of the disk volume the run could
-    /// spill — the sum of every spilling operator's predicted peak live state.
+    /// spill — the sum of every spill-writing operator's predicted peak live
+    /// state.
     ///
-    /// A spilling operator (hash Aggregate, sort, grace-hash / sort-merge /
-    /// IEJoin / hash Combine) holds its whole accumulated input before it can
-    /// emit, and spills that state when the memory budget trips; a streaming
-    /// or sink stage spills nothing. Summing rather than taking the max is the
-    /// conservative choice for a free-space preflight: two blocking operators
-    /// can be live and spilled simultaneously, so their footprints add. The
-    /// figure derives from the same `predicted_peak_bytes` estimates
-    /// `--explain` surfaces, so a preflight warning lines up with the numbers
-    /// a pipeline author already sees. Returns `0` when no node spills or when
-    /// volume estimates are unknown (no on-disk file seed reached the plan).
+    /// A spill-writing operator (external sort, hash Aggregate, grace-hash /
+    /// sort-merge Combine — see [`super::writes_spill_files`]) holds its whole
+    /// accumulated input before it can emit, and writes that state to a spill
+    /// file when the memory budget trips. In-memory join strategies (inline
+    /// hash build/probe, IEJoin) carry an arbitration `spill_priority` but run
+    /// their kernel entirely in RAM, so they contribute nothing to disk
+    /// volume and are excluded — counting them would over-state the free-space
+    /// a run needs. Summing rather than taking the max is the conservative
+    /// choice for a free-space preflight: two blocking operators can be live
+    /// and spilled simultaneously, so their footprints add. The figure derives
+    /// from the same `predicted_peak_bytes` estimates `--explain` surfaces, so
+    /// a preflight warning lines up with the numbers a pipeline author already
+    /// sees. Returns `0` when no node spills or when volume estimates are
+    /// unknown (no on-disk file seed reached the plan).
     pub fn estimated_spill_bytes(&self) -> u64 {
         self.topo_order
             .iter()
-            .filter(|&&idx| {
-                super::arbitration_class(&self.graph[idx])
-                    .spill_priority
-                    .is_some()
-            })
+            .filter(|&&idx| super::writes_spill_files(&self.graph[idx]))
             .filter_map(|idx| self.node_properties.get(idx))
             .fold(0u64, |acc, props| {
                 acc.saturating_add(props.predicted_peak_bytes)
             })
     }
 
-    /// Per-blocking-stage spill-volume estimate, one entry per spilling
-    /// operator (hash Aggregate, external sort, grace-hash / sort-merge /
-    /// IEJoin / hash Combine) in topological order.
+    /// Per-blocking-stage spill-volume estimate, one entry per spill-writing
+    /// operator (external sort, hash Aggregate, grace-hash / sort-merge
+    /// Combine — see [`super::writes_spill_files`]) in topological order.
     ///
+    /// In-memory join strategies (inline hash build/probe, IEJoin) carry an
+    /// arbitration `spill_priority` but never write a spill file, so they do
+    /// not appear here — the per-stage estimate describes what reaches disk.
     /// Each [`StageSpillEstimate`] carries the operator's node name, its
     /// `--explain` display name, and its `predicted_peak_bytes` — the coarse
     /// plan-time estimate of the live state it could spill. `estimate_bytes`
@@ -192,11 +196,7 @@ impl ExecutionPlanDag {
     pub fn per_stage_spill_estimates(&self) -> Vec<StageSpillEstimate> {
         self.topo_order
             .iter()
-            .filter(|&&idx| {
-                super::arbitration_class(&self.graph[idx])
-                    .spill_priority
-                    .is_some()
-            })
+            .filter(|&&idx| super::writes_spill_files(&self.graph[idx]))
             .map(|&idx| {
                 let node = &self.graph[idx];
                 StageSpillEstimate {

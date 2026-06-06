@@ -283,6 +283,105 @@ fn explain_surfaces_per_stage_spill_estimate() {
 }
 
 #[test]
+fn explain_json_carries_storage_summary_at_text_parity() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, AGG_PIPELINE_YAML).expect("write pipeline yaml");
+    write_orders_csv(&tmp);
+
+    // Configure a spill dir and a generous disk cap so the storage summary
+    // populates the spill-root, disk-cap, and cap-headroom fields rather than
+    // their default-omitted forms.
+    let spill = tmp.join("spill");
+    std::fs::create_dir(&spill).expect("create spill dir");
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        format!(
+            "[storage.spill]\ndir = \"{}\"\ndisk_cap_bytes = 1000000000\n",
+            spill.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write clinker.toml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .arg("--explain")
+        .arg("json")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "json explain must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("explain json must parse: {e}\n{stdout}"));
+
+    let summary = json
+        .get("storage_summary")
+        .unwrap_or_else(|| panic!("json explain must carry storage_summary; got:\n{stdout}"));
+
+    // Spill root reflects the configured dir.
+    assert_eq!(
+        summary["spill_root"]["source"], "storage.spill.dir",
+        "spill_root source must name the configured dir; got:\n{summary:#}"
+    );
+
+    // Disk cap is the configured value, structured (not stringified).
+    assert_eq!(
+        summary["spill_disk_cap_bytes"], 1_000_000_000_u64,
+        "spill_disk_cap_bytes must carry the configured cap; got:\n{summary:#}"
+    );
+
+    // Per-stage estimate lists the blocking hash Aggregate as a structured
+    // entry — the same stage the text path reports.
+    let per_stage = summary["estimated_spill"]["per_stage"]
+        .as_array()
+        .expect("estimated_spill.per_stage must be an array");
+    assert!(
+        per_stage.iter().any(|s| s["node_name"] == "dept_totals"),
+        "the blocking Aggregate must appear in estimated_spill.per_stage; got:\n{summary:#}"
+    );
+
+    // Compression decision is structured, with the mode and a per-operator
+    // breakdown that includes the same Aggregate stage.
+    assert_eq!(
+        summary["spill_compression"]["mode"], "auto",
+        "spill_compression.mode must reflect the default auto mode; got:\n{summary:#}"
+    );
+    assert!(
+        summary["spill_compression"]["per_operator"]
+            .as_array()
+            .expect("spill_compression.per_operator must be an array")
+            .iter()
+            .any(|o| o["node_name"] == "dept_totals"),
+        "the Aggregate stage must appear in spill_compression.per_operator; got:\n{summary:#}"
+    );
+
+    // Cap headroom is present and structured (cap configured + non-zero
+    // estimate), carrying the cap and the over-threshold flag.
+    assert_eq!(
+        summary["cap_headroom"]["cap_bytes"], 1_000_000_000_u64,
+        "cap_headroom must carry the configured cap; got:\n{summary:#}"
+    );
+    assert!(
+        summary["cap_headroom"]["over_threshold"].is_boolean(),
+        "cap_headroom.over_threshold must be a boolean; got:\n{summary:#}"
+    );
+
+    // Staging defaults to disabled and is reported structurally.
+    assert_eq!(
+        summary["staging"]["enabled"], false,
+        "staging must report disabled by default; got:\n{summary:#}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn explain_surfaces_staging_plan_per_source() {
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");

@@ -812,6 +812,62 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
     }
 }
 
+/// `true` iff this operator backs its state with a real on-disk spill
+/// writer — i.e. it actually writes spill files when the memory budget
+/// trips, rather than merely carrying a `spill_priority` for memory
+/// arbitration.
+///
+/// This is a strict subset of "has a non-`None` [`arbitration_class`]
+/// spill priority". Some operators register a spillable `MemoryConsumer`
+/// so the arbitrator can rank them, yet run their kernel entirely
+/// in-memory and never open a spill file:
+///
+/// - inline hash Combine (`HashBuildProbe`) builds its hash table in RAM;
+///   its consumer's `try_spill` requests a rebuild, it does not write a
+///   spill file.
+/// - `IEJoin` / `HashPartitionIEJoin` register under the sort-buffer
+///   consumer for arbitration accounting but their range-join kernel
+///   partitions and walks in memory — no spill writer is wired.
+///
+/// The operators that DO write spill files (`SpillWriter` /
+/// `AggSpillWriter` / `GraceSpillWriter`):
+///
+/// - external sort (`PlanNode::Sort`),
+/// - hash Aggregate (`PlanNode::Aggregation` with the hash strategy;
+///   streaming aggregate holds one group and never spills),
+/// - grace-hash and sort-merge Combine.
+///
+/// Surfaces that describe what hits disk — the `--explain`
+/// spill-compression projection, the per-stage estimated spill volume,
+/// and the run-startup free-space / cap-headroom preflight — must filter
+/// on this predicate, not on `spill_priority.is_some()`, so an in-memory
+/// join never appears as a disk-spilling stage.
+pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
+    use crate::plan::combine::CombineStrategy;
+    match node {
+        PlanNode::Sort { .. } => true,
+        PlanNode::Aggregation {
+            strategy: AggregateStrategy::Hash,
+            ..
+        } => true,
+        PlanNode::Aggregation {
+            strategy: AggregateStrategy::Streaming,
+            ..
+        } => false,
+        PlanNode::Combine { strategy, .. } => matches!(
+            strategy,
+            CombineStrategy::GraceHash { .. } | CombineStrategy::SortMerge
+        ),
+        PlanNode::Source { .. }
+        | PlanNode::Transform { .. }
+        | PlanNode::Route { .. }
+        | PlanNode::Merge { .. }
+        | PlanNode::Output { .. }
+        | PlanNode::Composition { .. }
+        | PlanNode::CorrelationCommit { .. } => false,
+    }
+}
+
 /// DAG-based execution plan — replaces ExecutionPlan.
 ///
 /// The single source of truth for pipeline topology and execution strategy.

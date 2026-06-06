@@ -169,6 +169,19 @@ impl CompressMode {
         let bytes_per_batch = bytes_per_row.saturating_mul(rows_per_batch);
         self.resolve(bytes_per_batch, rows_per_batch)
     }
+
+    /// Lowercase mode label for JSON output, matching the YAML surface
+    /// grammar (`auto` / `off` / `on`). The text `--explain` path renders
+    /// the `Debug` form (`Auto` / `Off` / `On`); JSON consumers expect the
+    /// wire grammar they would write back, so the two surfaces differ in
+    /// case by design.
+    pub fn json_label(self) -> &'static str {
+        match self {
+            CompressMode::Auto => "auto",
+            CompressMode::Off => "off",
+            CompressMode::On => "on",
+        }
+    }
 }
 
 /// `[storage.spill]` — spill-file root directory.
