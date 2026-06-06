@@ -1296,10 +1296,20 @@ fn partial_is_orphaned(partial: &Path, root: &Path, source_id: &str, grace: Dura
 ///    exclusively. A live run reading or staging the source holds the same lock
 ///    (shared or exclusive), so the try fails and the lock is kept — the liveness
 ///    guarantee the crash-purge protects. Holding the lock across the `remove`
-///    also means a sibling that is about to acquire it either blocks behind this
-///    exclusive hold (and then finds the file gone, recreating it on its next
-///    open) or has already taken it (failing our try) — the removal can never
-///    race an in-progress acquire.
+///    covers the common acquire races: a sibling about to acquire either blocks
+///    behind this exclusive hold (then finds the file gone and recreates it on
+///    its next open) or has already taken it (failing our try). It does NOT make
+///    the unlink fully race-free, because this lock path is *shared* across runs
+///    (unlike the private per-run spill locks, which can be unlinked safely): a
+///    sibling already blocked in the `open`→`flock` window on the inode we are
+///    about to unlink can, once a third run recreates the path, end up locked to
+///    a different inode than the new holder — momentarily breaking per-source
+///    mutual exclusion. That residual window is benign: each run stages into a
+///    private per-run `.partial` and publishes the shared `<source_id>.staged` by
+///    atomic rename of content-addressed bytes, so a lost race yields at worst
+///    one redundant copy the next run reuses, never a torn or corrupt cache
+///    entry. Fully closing it would need a global reclaim lock on the acquire
+///    hot path — not worth it to reap a zero-byte orphan.
 /// 2. **Age grace.** A lock younger than `grace` may have just been created by a
 ///    sibling that has not yet taken it, so it is kept regardless of the try
 ///    result — closing the create→lock window exactly as the partial reap does.

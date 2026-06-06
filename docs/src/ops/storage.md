@@ -752,13 +752,16 @@ A clean (or panicking) run runs its `cleanup`. But a `SIGKILL`, the Linux
 OOM-killer, or a power loss kills the process before any cleanup runs, leaking
 its staged artifacts under the staging root. To stop that from accumulating
 across crashes, **every run performs an idempotent crash purge at startup**,
-before it stages anything. It reaps the artifact shapes a crash leaves behind:
+before it stages anything. It reaps four orphan shapes left under the staging root:
 
 - a `*.partial` — an interrupted copy. Reaped **only when its owning run is
   dead** (see below), so a concurrent sibling's in-flight copy is never reaped;
 - a `*.staged` with no matching manifest — a copy that crashed before it could
   commit its manifest;
-- a `*.manifest.json` with no matching staged file.
+- a `*.manifest.json` with no matching staged file;
+- a `*.lock` whose source has no surviving cache entry — a coordination lock left
+  by a source that is no longer staged (not necessarily from a crash), reclaimed
+  under the liveness and age gates described below.
 
 A clean pair (a `.staged` with its committed `.manifest.json`) is the reuse
 cache and is **kept** — the purge never removes a complete, trustworthy copy —
