@@ -3556,41 +3556,131 @@ nodes:
         }
     }
 
-    /// MemoryArbitrator abort — a 1-byte hard limit forces
-    /// `MemoryArbitrator::should_abort` to return true on the first poll
-    /// inside `CombineHashTable::build` (process RSS trivially exceeds
-    /// 1 byte). The build's safety-net final check fires for the small
-    /// build set, the executor wraps `CombineError::MemoryLimitExceeded`
-    /// as a typed `MemoryBudgetExceeded` carrying the combine node's
-    /// name and the budget source, and that surfaces in the run error.
+    /// Unsatisfiable memory budget — a 1-byte hard limit is below the test
+    /// process's baseline RSS, so under the default `pause` backpressure
+    /// policy the run is rejected at startup with E312
+    /// (`UnsatisfiableMemoryBudget`) before any source-ingest thread spawns
+    /// or any combine build begins.
     ///
-    /// Mirrors the build-side regression test in
-    /// `pipeline/combine.rs::test_combine_hash_table_oom_aborts_during_build`,
-    /// but exercised end-to-end through the combine executor arm so a
-    /// regression in the arm's error mapping is caught here.
+    /// This pins the fail-fast path for the deadlock a sub-baseline budget
+    /// would otherwise cause: under `pause`, the arbitration round parks
+    /// the Source on a pause that never resumes (nothing frees memory below
+    /// 1 byte) while the combine build waits for input that never arrives.
+    /// Detecting the unsatisfiable budget at startup converts that hang
+    /// into an immediate, clear configuration error.
     ///
-    /// Determinism: `backpressure: spill` installs the bare `Priority`
-    /// policy so no producer is ever elected as a pause victim. Under the
-    /// default `pause` policy a 1-byte budget can pause the Source ingest
-    /// thread on a `Condvar` that never resumes (nothing ever frees memory
-    /// below 1 byte) while the consumer blocks on `recv`, deadlocking the
-    /// run; choosing `spill` removes that path so the synchronous arena /
-    /// NodeBuffer admission charge surfaces the abort on the first record.
     /// The run is wrapped in `run_combine_fixture_bounded` so even a future
-    /// regression that reintroduces the deadlock fails fast instead of
-    /// hanging `cargo test`.
+    /// regression that reintroduces the deadlock — rather than rejecting at
+    /// startup — fails fast on the wall-clock bound instead of hanging
+    /// `cargo test`. The companion `test_combine_exec_spill_budget_aborts_fast`
+    /// pins the `spill`-policy half: a sub-baseline budget there is NOT
+    /// rejected at startup but instead aborts fast via the per-record
+    /// admission charge.
     ///
     /// Skipped silently when `rss_bytes()` is unavailable on the host
-    /// platform — the same gate the unit test uses, applied via
-    /// `clinker_exec::pipeline::memory::rss_bytes()`.
+    /// platform — the unsatisfiable check needs a baseline to compare
+    /// against, applied via `clinker_exec::pipeline::memory::rss_bytes()`.
     #[test]
-    fn test_combine_exec_e310_memory_abort() {
+    fn test_combine_exec_e312_unsatisfiable_budget_rejected_at_startup() {
         if clinker_exec::pipeline::memory::rss_bytes().is_none() {
             return;
         }
         let yaml = r#"
 pipeline:
-  name: combine_exec_e310
+  name: combine_exec_e312
+  memory: { limit: "1" }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+      propagate_ck: driver
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: enriched.csv
+"#;
+        let err = run_combine_fixture_bounded(
+            yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+            std::time::Duration::from_secs(30),
+        )
+        .expect_err("1-byte mem_limit must be rejected at startup under the default pause policy");
+        match &err {
+            CombineFixtureError::Run(
+                clinker_plan::error::PipelineError::UnsatisfiableMemoryBudget {
+                    limit,
+                    baseline_rss,
+                },
+            ) => {
+                assert_eq!(*limit, 1, "the rejection must carry the configured limit");
+                assert!(
+                    *baseline_rss > *limit,
+                    "the rejection must report a baseline RSS above the unsatisfiable limit; \
+                     got baseline_rss={baseline_rss} limit={limit}"
+                );
+            }
+            other => {
+                panic!(
+                    "unsatisfiable budget must surface UnsatisfiableMemoryBudget; got: {other:?}"
+                )
+            }
+        }
+    }
+
+    /// The `spill`-policy half of the unsatisfiable-budget contract: a
+    /// sub-baseline 1-byte budget under `backpressure: spill` is NOT
+    /// rejected at startup (the bare `Priority` policy never pauses a
+    /// producer, so it cannot deadlock), and instead aborts fast via the
+    /// synchronous per-record arena / NodeBuffer admission charge — the
+    /// run surfaces a typed `MemoryBudgetExceeded` rather than hanging.
+    ///
+    /// Pins both backpressure policies the way #352 requires: `pause`
+    /// rejects at startup (see
+    /// `test_combine_exec_e312_unsatisfiable_budget_rejected_at_startup`),
+    /// `spill` runs and aborts on the first admission. Wrapped in
+    /// `run_combine_fixture_bounded` so a regression that hangs fails fast
+    /// on the wall-clock bound.
+    #[test]
+    fn test_combine_exec_spill_budget_aborts_fast() {
+        if clinker_exec::pipeline::memory::rss_bytes().is_none() {
+            return;
+        }
+        let yaml = r#"
+pipeline:
+  name: combine_exec_spill_abort
   memory: { limit: "1", backpressure: spill }
 nodes:
   - type: source
@@ -3640,7 +3730,7 @@ nodes:
             Some("orders"),
             std::time::Duration::from_secs(30),
         )
-        .expect_err("1-byte mem_limit must abort combine");
+        .expect_err("1-byte mem_limit under spill must abort fast on the first admission");
         match &err {
             CombineFixtureError::Run(
                 clinker_plan::error::PipelineError::MemoryBudgetExceeded { node, source, .. },
@@ -3650,8 +3740,7 @@ nodes:
                 // build/probe path or the per-Vec NodeBuffer admission
                 // charge at any upstream insert can be the first surface
                 // to trip the 1-byte ceiling. Both report the producing
-                // operator's name and the BudgetCategory tag — the
-                // architectural guarantee this regression test pins.
+                // operator's name and the BudgetCategory tag.
                 assert!(
                     matches!(*source, BudgetCategory::Arena | BudgetCategory::NodeBuffer),
                     "memory abort must carry a BudgetCategory; got {source:?}"
@@ -3661,7 +3750,7 @@ nodes:
                     "memory abort must name the producing operator; got empty string"
                 );
             }
-            other => panic!("memory abort must surface MemoryBudgetExceeded; got: {other:?}"),
+            other => panic!("spill-policy abort must surface MemoryBudgetExceeded; got: {other:?}"),
         }
     }
 

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: storage_spill_dir
-  memory: { limit: "1M" }
+  memory: { limit: "1M", backpressure: spill }
 nodes:
   - type: source
     name: events

@@ -384,6 +384,22 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
+        // Reject an unsatisfiable memory budget before building the run.
+        // A `memory.limit` below the process's live baseline RSS can never
+        // be met (the empty pipeline already exceeds it), and under the
+        // default producer-pausing policy it deadlocks rather than failing
+        // fast — so surface a clear E312 startup error here, alongside the
+        // storage-config validation the CLI run path performs, instead of
+        // letting the run park. Scoped to the pausing policies; `spill`
+        // makes forward progress under a tiny budget and is left alone.
+        let configured_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
+            config.pipeline.memory.limit.as_deref(),
+        );
+        crate::pipeline::memory::reject_unsatisfiable_budget(
+            configured_limit,
+            config.pipeline.memory.backpressure,
+        )?;
+
         let arbitrator = build_arbitrator_from_config(config);
         // Fold the workspace `storage.spill.disk_cap_bytes` quota into the
         // arbitrator's disk-spill ceiling. Absent config leaves the cap at

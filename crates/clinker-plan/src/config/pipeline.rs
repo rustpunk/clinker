@@ -151,6 +151,24 @@ impl BackpressureKnob {
         matches!(self, Self::Pause)
     }
 
+    /// Whether this policy can park a producer on a pause that only a
+    /// later `resume()` releases.
+    ///
+    /// `Pause` and `Both` both install a `BackPressurePreferred` front
+    /// that prefers pausing a back-pressureable producer over forcing a
+    /// spill; `Spill` (bare `Priority`) never pauses. The distinction is
+    /// load-bearing for the unsatisfiable-budget startup check: a budget
+    /// below the process baseline RSS deadlocks only under a pausing
+    /// policy (the paused Source never resumes because RSS can never drop
+    /// under the ceiling), whereas under `Spill` the same budget spills
+    /// or aborts immediately and makes forward progress.
+    pub fn pauses_producers(&self) -> bool {
+        match self {
+            Self::Spill => false,
+            Self::Pause | Self::Both => true,
+        }
+    }
+
     /// Display name of the arbitration policy this knob selects.
     ///
     /// Matches the `policy_name()` the corresponding boxed policy reports

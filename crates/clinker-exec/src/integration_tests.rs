@@ -70,6 +70,7 @@ mod tests {
                 | PipelineError::CompositionUnknownPort { .. }
                 | PipelineError::CompositionBodyError { .. }
                 | PipelineError::MemoryBudgetExceeded { .. }
+                | PipelineError::UnsatisfiableMemoryBudget { .. }
                 | PipelineError::CombineMissingMatch { .. },
             ) => 1,
             Err(

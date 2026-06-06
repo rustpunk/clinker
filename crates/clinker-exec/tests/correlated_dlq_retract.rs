@@ -1210,10 +1210,15 @@ O5,ENG,200
 /// finding so the bug can be addressed in a dedicated commit.
 #[test]
 fn degrade_fallback_runtime_protection_or_documented_panic() {
+    // `backpressure: spill` keeps the bare `Priority` policy: the 1-byte
+    // budget is below the process baseline RSS, which the default `pause`
+    // policy rejects at startup (E312), but this test needs the run to
+    // reach the per-row admission guard, which only the non-pausing spill
+    // policy does under a sub-baseline budget.
     let yaml = r#"
 pipeline:
   name: degrade_fallback
-  memory: { limit: "1" }
+  memory: { limit: "1", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:

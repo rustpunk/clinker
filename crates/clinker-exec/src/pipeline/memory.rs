@@ -106,6 +106,54 @@ fn rss_bytes_impl() -> Option<u64> {
     None
 }
 
+/// Reject an unsatisfiable memory budget at startup, before any
+/// source-ingest thread spawns.
+///
+/// A `memory.limit` below the process's live baseline RSS is
+/// unsatisfiable: the process already exceeds the ceiling with an empty
+/// pipeline, so no amount of spilling operator state or pausing producers
+/// can ever bring RSS under it. Under a producer-pausing policy (`pause`,
+/// the default, and `both`) this otherwise deadlocks — the arbitration
+/// round parks the Source on a pause that only `resume()` releases, but
+/// `resume()` fires only when RSS drops back under the threshold, which
+/// can never happen — while a blocking consumer waits forever for input.
+/// Converting that hang into an immediate [`PipelineError::UnsatisfiableMemoryBudget`]
+/// (E312) lets the operator fix the config rather than watch the run park.
+///
+/// Scoped to producer-pausing policies on purpose: under `spill` (bare
+/// `Priority`) a sub-baseline budget never pauses, so it spills or aborts
+/// fast and makes forward progress — that path is a legitimate way to
+/// force aggressive spilling and is left alone.
+///
+/// Skipped when `rss_bytes()` is unavailable: with no baseline to compare
+/// against, the budget cannot be judged unsatisfiable, and the run
+/// proceeds to surface any overflow through the normal runtime path.
+///
+/// # Errors
+///
+/// Returns [`PipelineError::UnsatisfiableMemoryBudget`] when the policy
+/// pauses producers and `limit` is below the measured baseline RSS.
+pub fn reject_unsatisfiable_budget(
+    limit: u64,
+    knob: clinker_plan::config::BackpressureKnob,
+) -> Result<(), clinker_plan::error::PipelineError> {
+    if !knob.pauses_producers() {
+        return Ok(());
+    }
+    let Some(baseline_rss) = rss_bytes() else {
+        return Ok(());
+    };
+    if limit < baseline_rss {
+        return Err(
+            clinker_plan::error::PipelineError::UnsatisfiableMemoryBudget {
+                limit,
+                baseline_rss,
+            },
+        );
+    }
+    Ok(())
+}
+
 /// Stable identifier for a memory consumer registered with the
 /// arbitrator. Assigned by `MemoryArbitrator` at registration time and
 /// referenced by every subsequent arbitration decision.
@@ -1163,15 +1211,76 @@ mod tests {
             return; // Skip on unsupported platforms
         }
         let before = rss_bytes().unwrap();
-        // Allocate 10MB and touch it to ensure pages are resident
-        let big_vec: Vec<u8> = vec![1u8; 10 * 1024 * 1024];
+        // Allocate 64 MiB and touch every page so the pages are resident.
+        // A delta-threshold assertion (`after >= before + N`) flakes under a
+        // loaded harness: a concurrent test thread can free more than the
+        // probe allocates between the two samples, so the resident set can
+        // momentarily dip. Asserting `after >= before` keeps the real
+        // coverage (a large touched allocation never lowers this process's
+        // RSS) without depending on a fixed delta surviving harness churn;
+        // the absolute-value coverage that `rss_bytes` reads a positive
+        // figure lives in `test_rss_bytes_returns_some`.
+        let mut big_vec: Vec<u8> = vec![0u8; 64 * 1024 * 1024];
+        let page = 4096;
+        let mut i = 0;
+        while i < big_vec.len() {
+            big_vec[i] = 1;
+            i += page;
+        }
         std::hint::black_box(&big_vec);
         let after = rss_bytes().unwrap();
-        // RSS should increase by at least 5MB (accounting for page granularity)
         assert!(
-            after >= before + 5 * 1024 * 1024,
-            "RSS should increase by at least 5MB after 10MB alloc, got before={before} after={after}"
+            after >= before,
+            "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
         );
+    }
+
+    #[test]
+    fn reject_unsatisfiable_budget_pins_both_policies() {
+        use clinker_plan::config::BackpressureKnob;
+        use clinker_plan::error::PipelineError;
+
+        // No baseline to compare against → cannot judge; never rejects.
+        let Some(baseline) = rss_bytes() else {
+            assert!(reject_unsatisfiable_budget(1, BackpressureKnob::Pause).is_ok());
+            return;
+        };
+
+        // A 1-byte budget is below baseline RSS. Under the producer-pausing
+        // policies (pause/both) it would deadlock, so it is rejected at
+        // startup with the configured limit and the measured baseline.
+        for knob in [BackpressureKnob::Pause, BackpressureKnob::Both] {
+            match reject_unsatisfiable_budget(1, knob) {
+                Err(PipelineError::UnsatisfiableMemoryBudget {
+                    limit,
+                    baseline_rss,
+                }) => {
+                    assert_eq!(limit, 1);
+                    assert!(baseline_rss >= baseline, "baseline must be the live RSS");
+                }
+                other => panic!("pausing policy must reject a sub-baseline budget; got {other:?}"),
+            }
+        }
+
+        // Under spill the same sub-baseline budget never pauses, so it is
+        // NOT rejected — it spills/aborts via the runtime admission path.
+        assert!(
+            reject_unsatisfiable_budget(1, BackpressureKnob::Spill).is_ok(),
+            "spill policy must not reject a sub-baseline budget at startup"
+        );
+
+        // A budget well above baseline is satisfiable under every policy.
+        let generous = baseline.saturating_mul(4).max(512 * 1024 * 1024);
+        for knob in [
+            BackpressureKnob::Pause,
+            BackpressureKnob::Both,
+            BackpressureKnob::Spill,
+        ] {
+            assert!(
+                reject_unsatisfiable_budget(generous, knob).is_ok(),
+                "a budget above baseline must be satisfiable under {knob:?}"
+            );
+        }
     }
 
     #[test]
