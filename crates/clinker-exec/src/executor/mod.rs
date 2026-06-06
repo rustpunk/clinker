@@ -23,6 +23,7 @@ mod schema_check;
 pub(crate) mod sort_dispatch;
 pub(crate) mod source_dispatch;
 pub mod source_stream;
+pub mod storage_validate;
 pub(crate) mod stream_event;
 mod streaming;
 pub(crate) mod time_window;
@@ -41,6 +42,9 @@ pub use params::{ExecutionReport, PipelineRunParams};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::{CompiledRoute, CompiledRouteBranch};
+pub use storage_validate::{
+    FreeSpaceWarning, ResolvedStorage, StorageValidationError, validate_storage_config,
+};
 pub(crate) use streaming::StreamingOutputTaskOutput;
 use streaming::{compute_streaming_output_specs, streaming_output};
 pub(crate) use transform::CompiledTransform;

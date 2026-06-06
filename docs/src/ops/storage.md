@@ -185,6 +185,58 @@ The key separations:
 (A future per-operator memory-reservation surface will add a fifth,
 reservation-exhausted condition; it is not part of the engine yet.)
 
+## Startup storage validation
+
+Before a run spawns its first source-ingest thread — after the plan compiles
+but before any input is read or any byte is spilled or staged — Clinker runs a
+single comprehensive validation pass over the resolved `[storage]`
+configuration. It rejects configurations that are physically wrong for the job,
+each with a stable diagnostic code, the offending `clinker.toml` field, and a
+`clinker explain --code <CODE>` pointer. Validating up front fails a
+misconfigured volume while the run is still cheap to abandon, rather than after
+minutes of work when the first spill or staged copy hits the bad volume.
+
+| Code | Rejected configuration | Why |
+| --- | --- | --- |
+| **E330** | `storage.spill.dir` on an in-memory filesystem (Linux tmpfs / ramfs, Windows RAM disk). | Spilling there keeps the bytes in RAM, so it frees no physical memory and defeats the memory budget. |
+| **E331** | `storage.spill.dir` on a network filesystem (NFS / SMB / CIFS / FUSE). | A spill target on a soft-mounted share risks silent truncation and mmap data loss — the failure modes spill exists to avoid. |
+| **E332** | `storage.staging.dir` on a network filesystem. | Staging copies inputs *off* a flaky share; a staging dir that is itself on a share reintroduces the fragility staging exists to escape. |
+| **E333** | `storage.staging.dir` on the same physical device as a matched (staged) source. | The copy moves no I/O off the source volume, so it buys nothing while still spending time and space. Applies only to **matched** sources. |
+| **E334** | `storage.spill.dir` equal to `storage.staging.dir`. | Spill files and staged source copies are sized and cleaned up differently; sharing one directory makes accounting and cleanup ambiguous. |
+
+The filesystem-class checks (E330–E332) read the volume type through one
+cross-platform detection layer, so they behave identically on Linux, macOS,
+and Windows: Linux matches the `statfs` `f_type` magic, macOS matches the
+`f_fstypename` string, and Windows maps `GetDriveTypeW`. (macOS has no native
+tmpfs, so E330 only ever fires on Linux and Windows.) The same-device check
+(E333) compares the device id on Linux/macOS and the volume serial number on
+Windows — the very same probe the staging same-volume rule uses, so there is
+one consistent notion of "same device" across the whole run.
+
+### Free-space preflight
+
+Separately from the runtime disk cap (E320) and the full-volume surface
+(E321), the startup pass runs a **free-space preflight**: it queries the bytes
+available on the spill volume and compares them to the run's estimated spill
+footprint (the sum of every blocking operator's predicted peak state, the same
+estimate `--explain` surfaces). When the spill volume looks too small, the run
+prints a **warning** and continues:
+
+```
+W330: spill volume /var/clinker/spill has 2000000000 bytes free but the run is
+estimated to spill up to 8000000000 bytes; the run may abort with a full-volume
+error (E321) at the final spill — point storage.spill.dir at a larger volume or
+reduce the spill footprint (raise memory.limit, partition the input)
+```
+
+This is **advisory, not fatal**: the estimate is a coarse upper bound (it
+ignores spill compression and the streaming drain), so the run may well finish
+within the available space. The warning exists so a long pipeline that *would*
+die at its final spill surfaces that risk before it runs for an hour, rather
+than after. The free-space query uses a cross-platform probe (statvfs on
+Unix, `GetDiskFreeSpaceExW` on Windows) that returns a 64-bit byte count, so
+the historical 32-bit `f_bavail` truncation never affects the comparison.
+
 ## Mid-run spill failures
 
 The startup check guarantees the spill directory is writable when the run

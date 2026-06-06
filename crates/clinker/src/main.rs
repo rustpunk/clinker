@@ -526,6 +526,20 @@ fn storage_config_error(e: clinker_plan::config::StorageConfigError) -> Pipeline
     PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
 }
 
+/// Map a comprehensive run-startup storage-validation failure onto the
+/// top-level `PipelineError::Config`, the same path the config-time storage
+/// errors take, so it renders through the shared miette diagnostic surface and
+/// exits with the config status code.
+///
+/// The `StorageValidationError` Display already carries the stable diagnostic
+/// code (E330–E334), the offending `clinker.toml` field, and the
+/// `clinker explain --code <CODE>` pointer, so no span is attached — the
+/// failing setting lives in `clinker.toml`, not the pipeline YAML the renderer
+/// carries as its `NamedSource`.
+fn storage_validation_error(e: clinker_exec::executor::StorageValidationError) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+}
+
 /// Map a source-staging copy failure into the run's error type.
 ///
 /// Staging is a run-setup concern (it happens before any record flows), so a
@@ -592,13 +606,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         resolve_compile_anchor(&args.config, args.base_dir.as_deref());
 
     // Workspace `[storage]` config (clinker.toml at the workspace root).
-    // Loaded and validated here, before compile and before any reader or
-    // writer is opened, so a misconfigured spill volume fails the run at
-    // startup with a clear message rather than at the first spill — the trap
-    // DuckDB fell into when its temp-directory setting was honored only
-    // lazily (duckdb/duckdb#9401). The validated directory threads into the
-    // run via `PipelineRunParams.spill_root_dir`; absent config keeps the
-    // historical OS-temp-dir default.
+    // The comprehensive run-startup validation (spill/staging filesystem-type
+    // rejections, staging same-device, spill == staging, free-space preflight)
+    // runs once on the run path below via `validate_storage_config`, after the
+    // plan compiles and the source file set is discovered, and before any
+    // source-ingest thread spawns. The lighter `spill.resolve()` here checks
+    // only that a configured spill dir exists and is writable; it serves the
+    // plan-only `--explain` display path (which never ingests, so the
+    // filesystem-class rejections do not apply) and seeds the run path with the
+    // same resolved root the validator re-derives.
     let storage_config = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?
         .storage;
@@ -615,10 +631,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Workspace `[storage.staging]` policy. Off by default; when enabled it
     // copies matched source files to a local volume before the run reads them.
-    // Validated below against the discovered file set, then driven per file by
-    // the staging-copy engine at reader-open: a matched file is copied to a
-    // per-run local subdir (single-pass BLAKE3 verify + atomic publish) and the
-    // reader opens the local copy.
+    // Validated below against the discovered file set by
+    // `validate_storage_config`, then driven per file by the staging-copy
+    // engine at reader-open: a matched file is copied to a per-run local subdir
+    // (single-pass BLAKE3 verify + atomic publish) and the reader opens the
+    // local copy.
     let staging_policy = storage_config.staging.clone();
 
     let mut compile_ctx =
@@ -835,11 +852,30 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // each record so fan-out writers key correctly.
     let mut source_files_by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
         std::collections::HashMap::new();
-    // One staging engine for the whole run: it lazily creates a single per-run
-    // subdir on the first staged file and accumulates the disk-cap byte total
-    // across every source. When staging is disabled or a path matches no
-    // pattern, `resolve` returns an in-place path and touches no disk.
-    let mut source_stager = clinker_channel::SourceStager::new(staging_policy.clone());
+    // Compile the plan before opening any reader so the run-startup storage
+    // validation can read the plan's estimated spill volume for its free-space
+    // preflight, and so output-side fan-out detection (§5) can read
+    // `fan_out_per_source_file` flags before the writer setup decides whether
+    // to open one writer or N.
+    let mut compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    if let Some(binding) = &channel_binding {
+        let overlay =
+            clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, &pipeline_config);
+        abort_on_overlay_errors(&overlay)?;
+        channel_static_vars = overlay.static_vars;
+        channel_pipeline_vars = overlay.pipeline_vars;
+        channel_source_vars = overlay.source_vars;
+        channel_record_vars = overlay.record_vars;
+    }
+
+    // Discovery pre-pass: resolve every File source's matcher to its file set
+    // and build a Rest reader for every network source, before any storage
+    // validation or staging copy. Collecting the full discovered file set up
+    // front lets the run-startup validation below run once against all sources
+    // (the staging same-device rule needs the complete matched set), rather
+    // than per source.
+    let mut discovered_files: Vec<(String, Vec<std::path::PathBuf>)> = Vec::new();
+    let mut all_source_paths: Vec<std::path::PathBuf> = Vec::new();
     for body in pipeline_config.source_bodies() {
         let source = &body.source;
         match &source.transport {
@@ -863,52 +899,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                             )),
                         )
                     })?;
-                // Staging is validated against the actually-discovered file
-                // set, before any reader for this source is opened, so a
-                // staging dir on the matched source's own volume (or a typo'd
-                // pattern) fails the run at startup rather than at the first
-                // copy.
-                let discovered_paths: Vec<std::path::PathBuf> =
+                let paths: Vec<std::path::PathBuf> =
                     outcome.files().iter().map(|f| f.path.clone()).collect();
-                clinker_channel::validate_staging(&staging_policy, &discovered_paths)
-                    .map_err(storage_config_error)?;
-
-                let mut slots: Vec<clinker_exec::source::multi_file::FileSlot> = Vec::new();
-                let mut paths: Vec<std::path::PathBuf> = Vec::new();
-                for f in outcome.files() {
-                    // Resolve each discovered file against the staging policy.
-                    // A matched file is copied to the per-run local subdir
-                    // (single-pass BLAKE3 verify + atomic publish) and
-                    // `read_path()` points at the local copy; an unmatched file
-                    // or a disabled policy reads in place. Either way the reader
-                    // opens `read_path()` and stays agnostic to staging.
-                    let staged = source_stager
-                        .resolve(f.path.clone())
-                        .map_err(staging_error)?;
-                    let read_path = staged.read_path().to_path_buf();
-                    let file = std::fs::File::open(&read_path)?;
-                    slots.push(clinker_exec::source::multi_file::FileSlot::new(
-                        f.path.clone(),
-                        Box::new(file),
-                    ));
-                    paths.push(f.path.clone());
-                }
-                source_files_by_name.insert(source.name.clone(), paths);
-                // EmptyWarn / EmptySkip outcomes leave `slots` empty; the
-                // executor short-circuits via the empty-list guard upstream.
-                if slots.is_empty() {
-                    // Stash a single empty reader so the executor's "missing
-                    // reader" check passes. Records flow through as zero-row
-                    // sources.
-                    slots.push(clinker_exec::source::multi_file::FileSlot::new(
-                        "<empty>",
-                        Box::new(std::io::empty()),
-                    ));
-                }
-                readers.insert(
-                    source.name.clone(),
-                    clinker_exec::executor::SourceInput::Files(slots),
-                );
+                all_source_paths.extend(paths.iter().cloned());
+                discovered_files.push((source.name.clone(), paths));
             }
             clinker_plan::config::SourceTransport::Rest(rest_cfg) => {
                 // The rest transport bypasses fs discovery entirely. The
@@ -929,6 +923,68 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 );
             }
         }
+    }
+
+    // Run-startup storage-config validation — the single, comprehensive pass.
+    // Runs after the plan compiles and the source file set is discovered, and
+    // before any source-ingest thread spawns or any staged copy is written, so
+    // a spill dir on tmpfs/network (E330/E331), a staging dir on a network FS
+    // (E332), a staging dir sharing a device with a staged source (E333), or a
+    // spill dir equal to the staging dir (E334) fails the run at startup rather
+    // than at the first spill or copy. The free-space preflight reads the
+    // plan's estimated spill volume and warns (W330) — without aborting — when
+    // the spill volume looks too small, a backstop separate from the runtime
+    // disk cap (E320) and full-volume (E321) surfaces.
+    let estimated_spill_bytes = compiled_plan.dag().estimated_spill_bytes();
+    let resolved_storage = clinker_exec::executor::validate_storage_config(
+        &storage_config,
+        &all_source_paths,
+        estimated_spill_bytes,
+    )
+    .map_err(storage_validation_error)?;
+    let spill_root_dir = resolved_storage.spill_root_dir;
+    if let Some(warning) = &resolved_storage.free_space_warning {
+        tracing::warn!("{warning}");
+        eprintln!("{warning}");
+    }
+
+    // Stage + open pass: with validation passed, copy each matched source to
+    // the per-run staging subdir (single-pass BLAKE3 verify + atomic publish)
+    // and open the reader on the local copy, or open the source in place when
+    // staging is disabled or no pattern matched. One staging engine for the
+    // whole run lazily creates a single per-run subdir on the first staged
+    // file and accumulates the disk-cap byte total across every source.
+    let mut source_stager = clinker_channel::SourceStager::new(staging_policy.clone());
+    for (source_name, paths) in discovered_files {
+        let mut slots: Vec<clinker_exec::source::multi_file::FileSlot> = Vec::new();
+        for path in &paths {
+            // A matched file is copied to the per-run local subdir and
+            // `read_path()` points at the local copy; an unmatched file or a
+            // disabled policy reads in place. Either way the reader opens
+            // `read_path()` and stays agnostic to staging.
+            let staged = source_stager.resolve(path.clone()).map_err(staging_error)?;
+            let read_path = staged.read_path().to_path_buf();
+            let file = std::fs::File::open(&read_path)?;
+            slots.push(clinker_exec::source::multi_file::FileSlot::new(
+                path.clone(),
+                Box::new(file),
+            ));
+        }
+        source_files_by_name.insert(source_name.clone(), paths);
+        // EmptyWarn / EmptySkip outcomes leave `slots` empty; the executor
+        // short-circuits via the empty-list guard upstream.
+        if slots.is_empty() {
+            // Stash a single empty reader so the executor's "missing reader"
+            // check passes. Records flow through as zero-row sources.
+            slots.push(clinker_exec::source::multi_file::FileSlot::new(
+                "<empty>",
+                Box::new(std::io::empty()),
+            ));
+        }
+        readers.insert(
+            source_name,
+            clinker_exec::executor::SourceInput::Files(slots),
+        );
     }
 
     // Outputs are written atomically: each output writes to a sibling
@@ -954,19 +1010,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // path on OutputConfig).
     let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
-    // Compile the plan up front so output-side fan-out detection
-    // (§5) can read `fan_out_per_source_file` flags before the writer
-    // setup decides whether to open one writer or N.
-    let mut compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
-    if let Some(binding) = &channel_binding {
-        let overlay =
-            clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, &pipeline_config);
-        abort_on_overlay_errors(&overlay)?;
-        channel_static_vars = overlay.static_vars;
-        channel_pipeline_vars = overlay.pipeline_vars;
-        channel_source_vars = overlay.source_vars;
-        channel_record_vars = overlay.record_vars;
-    }
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
