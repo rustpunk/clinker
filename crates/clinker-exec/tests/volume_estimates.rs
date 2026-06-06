@@ -1,9 +1,12 @@
 //! Gate tests for per-node input-volume byte estimates.
 //!
 //! `derive_volume_estimates` seeds `predicted_peak_bytes` at file-backed
-//! Sources from the on-disk `path:` file size (resolved against the pipeline
-//! file's directory, never the process CWD) and propagates it forward in
-//! topological order. A blocking node (hash Aggregate) carries a non-zero
+//! Sources from the matched files' on-disk sizes (resolved against the
+//! pipeline file's directory, never the process CWD): a `path:` single file,
+//! the sum of a `paths:` list, or the sum of every file a `glob:`/`regex:`
+//! matcher expands to through the shared discovery resolver. It propagates
+//! that seed forward in topological order. A blocking node (hash Aggregate)
+//! carries a non-zero
 //! `predicted_freed_bytes_on_complete` equal to the volume it accumulates;
 //! streaming/fused nodes free nothing. A second, reverse-topological pass
 //! then propagates `predicted_subtree_reclaim_bytes` UP each chain — the
@@ -255,13 +258,15 @@ fn missing_file_source_seeds_zero() {
 }
 
 #[test]
-fn glob_multi_file_source_seeds_zero() {
-    // A glob matcher fans out to multiple files at discovery time and has no
-    // single literal size to seed, so it stays at the `0` unknown sentinel
-    // even when matching files exist on disk.
+fn glob_multi_file_source_seeds_sum_of_matched_files() {
+    // A glob matcher fans out to multiple files at discovery time. The seed
+    // expands the glob through the same discovery resolver the run uses and
+    // sums the matched files' sizes, so the estimate names exactly the bytes
+    // the run reads — no longer the `0` unknown sentinel.
     let tmp = tempfile::tempdir().unwrap();
-    write_file(tmp.path(), "a.csv", "department,amount\nsales,100\n");
-    write_file(tmp.path(), "b.csv", "department,amount\nops,250\n");
+    let a = write_file(tmp.path(), "a.csv", "department,amount\nsales,100\n");
+    let b = write_file(tmp.path(), "b.csv", "department,amount\nops,250\n");
+    assert!(a > 0 && b > 0);
 
     let yaml = r#"
 pipeline:
@@ -289,8 +294,48 @@ nodes:
 
     let src = props_for_node(dag, "orders");
     assert_eq!(
+        src.predicted_peak_bytes,
+        a + b,
+        "a glob Source must seed the summed size of every matched file"
+    );
+}
+
+#[test]
+fn glob_no_match_source_seeds_zero() {
+    // A glob that matches nothing has zero matched bytes. With the default
+    // `on_no_match: error` policy the discovery resolver reports an error, so
+    // the seed is the `0` unknown sentinel rather than a misleading concrete
+    // size — the run's own discovery surfaces the same error at startup.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let yaml = r#"
+pipeline:
+  name: vol
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: "nonexistent_*.csv"
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile_anchored(yaml, tmp.path());
+    let dag = plan.dag();
+
+    let src = props_for_node(dag, "orders");
+    assert_eq!(
         src.predicted_peak_bytes, 0,
-        "a multi-file (glob) Source must seed 0 (unknown)"
+        "a glob that matches no files must seed 0 (unknown)"
     );
 }
 

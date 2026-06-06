@@ -1,4 +1,4 @@
-//! File discovery for [`clinker_plan::config::SourceConfig`].
+//! File discovery for [`crate::config::SourceConfig`].
 //!
 //! Resolves the matcher (`path` / `glob` / `regex` / `paths`) and applies
 //! the post-discovery filters (`exclude`, `modified_after`/`modified_before`,
@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use clinker_plan::config::{FileSortKey, NoMatchPolicy, SortDir, SourceConfig, TimeBound};
+use crate::config::{FileSortKey, NoMatchPolicy, SortDir, SourceConfig, TimeBound};
 
 /// One discovered file with its metadata stamps. Returned in the order
 /// the discovery pipeline produced (post-sort, post-take).
@@ -426,7 +426,7 @@ fn sort_files(files: &mut [DiscoveredFile], key: FileSortKey, dir: SortDir) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_plan::config::{
+    use crate::config::{
         ByteSize, FileListingControls, FileSortKey, InputFormat, NoMatchPolicy, SortDir,
         SourceConfig, TimeBound,
     };
@@ -455,7 +455,7 @@ mod tests {
             schema_overrides: None,
             array_paths: None,
             sort_order: None,
-            transport: clinker_plan::config::SourceTransport::File,
+            transport: crate::config::SourceTransport::File,
             format: InputFormat::Csv(None),
             notes: None,
         }

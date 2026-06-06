@@ -998,7 +998,8 @@ impl ExecutionPlanDag {
         if any_unknown {
             out.push_str(&format!(
                 "  Total (known stages): {} (excludes stages whose volume is unknown at plan time — \
-                 a glob/regex multi-file source, a network source, or a missing input)\n",
+                 a network source, a missing or unreadable input, or a glob/regex matcher whose \
+                 discovery fails)\n",
                 format_bytes(total),
             ));
         } else {
@@ -1007,13 +1008,33 @@ impl ExecutionPlanDag {
         out
     }
 
+    /// Column count the spill-compression decision resolves against for the
+    /// node at `idx` — the same width the runtime spill writer sees.
+    ///
+    /// Returns the node's *effective* output-schema column count via
+    /// [`PlanNode::output_schema_in`], which for a row-preserving operator
+    /// (an enforcer [`PlanNode::Sort`], whose own `stored_output_schema` is
+    /// `None`) walks to its sole upstream and reports that schema's width.
+    /// This is exactly the width the runtime sort buffer reads off its first
+    /// input record (`sort_dispatch`), so the `--explain` projection and the
+    /// on-disk spill file agree on the column count the `auto` heuristic
+    /// weighs. Hash Aggregate and grace-hash / sort-merge Combine carry a
+    /// stored output schema, so `output_schema_in` returns it directly — the
+    /// same `Arc<Schema>` their runtime dispatch arms resolve compression
+    /// against.
+    fn spill_decision_column_count(&self, idx: NodeIndex) -> usize {
+        self.graph[idx].output_schema_in(self).column_count()
+    }
+
     /// Render the per-blocking-operator spill-compression decision for the
     /// `--explain` text output.
     ///
     /// Each operator that actually writes spill files (hash Aggregate,
     /// external sort, grace-hash / sort-merge Combine — see
-    /// [`writes_spill_files`]) gets one line resolving `compress` against that
-    /// operator's output-schema width and the run's `batch_size`. In-memory
+    /// [`writes_spill_files`]) gets one line resolving `compress` against the
+    /// column count its runtime spill writer sees
+    /// ([`Self::spill_decision_column_count`]) and the run's `batch_size`, so
+    /// the projected mode equals the on-disk format the run produces. In-memory
     /// join strategies (inline hash build/probe, IEJoin) carry a
     /// `spill_priority` for memory arbitration but never open a spill writer,
     /// so they are excluded — spill compression has no meaning for state that
@@ -1041,10 +1062,7 @@ impl ExecutionPlanDag {
         let mut out = format!("Spill compression: {compress:?} [storage.spill.compress]\n");
         for idx in blocking {
             let node = &self.graph[idx];
-            let column_count = node
-                .stored_output_schema()
-                .map(|s| s.column_count())
-                .unwrap_or(0);
+            let column_count = self.spill_decision_column_count(idx);
             let chosen = if compress.resolve_for_schema(column_count, batch_size as u64) {
                 "lz4"
             } else {
@@ -1091,8 +1109,9 @@ impl ExecutionPlanDag {
     ///
     /// Mirrors [`Self::spill_compression_explain`]: the same spill-writing
     /// operators (in-memory joins excluded), the same per-operator `lz4` /
-    /// `off` resolution against output-schema width and `batch_size`, under
-    /// the same configured mode.
+    /// `off` resolution against the runtime spill writer's column count
+    /// ([`Self::spill_decision_column_count`]) and `batch_size`, under the
+    /// same configured mode.
     pub fn spill_compression_json(
         &self,
         compress: crate::config::CompressMode,
@@ -1105,10 +1124,7 @@ impl ExecutionPlanDag {
             .filter(|&idx| writes_spill_files(&self.graph[idx]))
             .map(|idx| {
                 let node = &self.graph[idx];
-                let column_count = node
-                    .stored_output_schema()
-                    .map(|s| s.column_count())
-                    .unwrap_or(0);
+                let column_count = self.spill_decision_column_count(idx);
                 let compression = if compress.resolve_for_schema(column_count, batch_size as u64) {
                     "lz4"
                 } else {
@@ -2002,6 +2018,21 @@ mod spill_projection_tests {
         }
     }
 
+    /// A Source carrying an explicit output schema of `column_names`. The
+    /// schema is the exact `Arc` every record this Source emits carries, so a
+    /// downstream node's runtime input-record width equals this column count.
+    fn source_node(name: &str, column_names: &[&str]) -> PlanNode {
+        let schema = clinker_record::Schema::new(
+            column_names.iter().map(|c| Box::<str>::from(*c)).collect(),
+        );
+        PlanNode::Source {
+            name: name.to_string(),
+            span: Span::SYNTHETIC,
+            resolved: None,
+            output_schema: Arc::new(schema),
+        }
+    }
+
     /// Push a node onto the DAG, register it in `topo_order`, and seed a
     /// `predicted_peak_bytes` so the per-stage estimate has a non-zero
     /// figure to report for the spill-writing variants.
@@ -2115,5 +2146,58 @@ mod spill_projection_tests {
         );
         // The disk-volume total counts the real spiller only.
         assert_eq!(dag.estimated_spill_bytes(), 7_000);
+    }
+
+    /// The spill-compression projection resolves an enforcer `Sort`'s column
+    /// count against the records that actually flow into it — its upstream's
+    /// output-schema width — not the Sort's own `stored_output_schema`, which
+    /// is `None` for a row-preserving operator.
+    ///
+    /// At runtime `sort_dispatch` reads the column count off its first input
+    /// record's schema (the upstream's emitted schema), so the basis the
+    /// `--explain` projection prints must equal that width or the reported
+    /// compression mode can disagree with the on-disk spill file. A Source
+    /// emits records widened with engine-stamped tail columns, so a five-wide
+    /// upstream makes the Sort's runtime spilled-batch five columns wide —
+    /// `spill_decision_column_count` must report exactly that, never `0`.
+    #[test]
+    fn sort_spill_column_count_matches_runtime_input_width() {
+        let mut dag = empty_dag();
+        // Five-wide upstream: three declared columns plus two engine-stamped
+        // tail columns, the shape ingest hands every record at runtime.
+        let upstream_columns = ["sku", "price", "qty", "$source.file", "$source.name"];
+        let src_idx = dag.graph.add_node(source_node("orders", &upstream_columns));
+        let sort_idx = dag.graph.add_node(sort_node("__sort__orders"));
+        dag.graph.add_edge(
+            src_idx,
+            sort_idx,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+                port: None,
+            },
+        );
+        dag.topo_order = vec![src_idx, sort_idx];
+        dag.node_properties
+            .insert(src_idx, NodeProperties::unordered_single());
+        dag.node_properties
+            .insert(sort_idx, NodeProperties::unordered_single());
+
+        // The width the runtime sort buffer reads off its first input record
+        // is exactly the upstream Source's emitted-schema width.
+        let runtime_input_width = dag.graph[src_idx]
+            .stored_output_schema()
+            .expect("a Source carries an output schema")
+            .column_count();
+        assert_eq!(runtime_input_width, upstream_columns.len());
+
+        // `--explain` must resolve the Sort's compression decision against the
+        // same width — not the Sort's own `stored_output_schema` (which is
+        // `None`, and would otherwise collapse the projected width to `0`).
+        assert!(dag.graph[sort_idx].stored_output_schema().is_none());
+        assert_eq!(
+            dag.spill_decision_column_count(sort_idx),
+            runtime_input_width,
+            "the --explain Sort column count must equal the runtime spilled-batch width"
+        );
     }
 }

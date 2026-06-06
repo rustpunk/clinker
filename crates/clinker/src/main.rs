@@ -931,9 +931,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let source = &body.source;
         match &source.transport {
             clinker_plan::config::SourceTransport::File => {
-                let outcome = clinker_exec::source::discovery::discover(source, &workspace_root)
+                let outcome = clinker_plan::config::discovery::discover(source, &workspace_root)
                     .map_err(|e| {
-                        use clinker_exec::source::discovery::DiscoveryError;
+                        use clinker_plan::config::discovery::DiscoveryError;
                         let code = match &e {
                             DiscoveryError::MultipleMatchers { .. } => "E210",
                             DiscoveryError::NoMatcher => "E211",
@@ -1768,7 +1768,7 @@ fn staging_plan_explain(
         // uses. A discovery failure (no match, bad glob) is reported inline
         // rather than aborting the explain; the run's own discovery will
         // surface the coded diagnostic.
-        match clinker_exec::source::discovery::discover(source, discovery_anchor) {
+        match clinker_plan::config::discovery::discover(source, discovery_anchor) {
             Ok(outcome) => {
                 let files = outcome.files();
                 if files.is_empty() {
@@ -1903,7 +1903,7 @@ fn build_storage_summary_json(
                 });
                 continue;
             }
-            match clinker_exec::source::discovery::discover(source, discovery_anchor) {
+            match clinker_plan::config::discovery::discover(source, discovery_anchor) {
                 Ok(outcome) => {
                     let files = outcome
                         .files()
