@@ -151,6 +151,14 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 /// is deliberately distinct from [`StagingError::Io`]: a digest mismatch is the
 /// silent-corruption signal staging exists to catch, and the operator needs to
 /// see "the copy did not match the source" — not a generic I/O error.
+///
+/// The three policy/budget failures carry stable diagnostic codes the operator
+/// can look up with `clinker explain --code <CODE>`, mirroring the spill
+/// subsystem's E320/E321: [`StagingError::Verify`] is **E335**,
+/// [`StagingError::DiskCapExceeded`] is **E336**, and
+/// [`StagingError::AlreadyExists`] is **E337**. [`StagingError::Io`] is a
+/// generic OS fault with no stable code — its remediation depends on the
+/// underlying `errno`, not a clinker policy.
 #[derive(Debug, thiserror::Error)]
 pub enum StagingError {
     /// An OS-level I/O error while reading the source, writing the temp file,
@@ -162,13 +170,14 @@ pub enum StagingError {
         /// The underlying OS error.
         source: io::Error,
     },
-    /// The staged copy's BLAKE3 digest did not match the source's. The bytes on
-    /// the network share and the bytes that landed locally differ — exactly the
-    /// soft-mount silent-truncation mode staging guards against.
+    /// E335 — the staged copy's BLAKE3 digest did not match the source's. The
+    /// bytes on the network share and the bytes that landed locally differ —
+    /// exactly the soft-mount silent-truncation mode staging guards against.
     #[error(
-        "staged copy of {source_path} is corrupt: BLAKE3 of the local copy \
+        "E335 staged copy of {source_path} is corrupt: BLAKE3 of the local copy \
          ({copy_hash}) does not match the source ({source_hash}); \
-         the transport delivered different bytes than the source holds"
+         the transport delivered different bytes than the source holds. \
+         See: clinker explain --code E335"
     )]
     Verify {
         /// The original source path.
@@ -178,13 +187,14 @@ pub enum StagingError {
         /// Hex BLAKE3 digest of a fresh independent read of the source.
         source_hash: String,
     },
-    /// The cumulative bytes copied this run would exceed
+    /// E336 — the cumulative bytes copied this run would exceed
     /// `storage.staging.disk_cap_bytes`. Distinct from a full-disk
     /// [`StagingError::Io`]: the operator hit a configured budget, not the
     /// volume's physical limit.
     #[error(
-        "staging would exceed the configured cap of {cap} bytes \
-         (already staged {staged}, {source_path} adds {incoming})"
+        "E336 staging would exceed the configured cap of {cap} bytes \
+         (already staged {staged}, {source_path} adds {incoming}). \
+         See: clinker explain --code E336"
     )]
     DiskCapExceeded {
         /// The configured `storage.staging.disk_cap_bytes`.
@@ -196,12 +206,13 @@ pub enum StagingError {
         /// The source path that triggered the overflow.
         source_path: PathBuf,
     },
-    /// `on_existing = error` and a staged copy of this source already exists.
-    /// The operator asked to be told rather than silently reuse or overwrite a
-    /// prior artifact, so the run fails fast naming the existing copy.
+    /// E337 — `on_existing = error` and a staged copy of this source already
+    /// exists. The operator asked to be told rather than silently reuse or
+    /// overwrite a prior artifact, so the run fails fast naming the existing copy.
     #[error(
-        "staging on_existing = error: a staged copy of {source_path} already \
-         exists at {staged_path}; remove it or set on_existing to overwrite or reuse"
+        "E337 staging on_existing = error: a staged copy of {source_path} already \
+         exists at {staged_path}; remove it or set on_existing to overwrite or reuse. \
+         See: clinker explain --code E337"
     )]
     AlreadyExists {
         /// The original source path.
@@ -277,7 +288,7 @@ struct StagedFile {
 /// `--explain` does no copy, but it can `stat` the source and read a committed
 /// manifest read-only to predict whether the real run would reuse a fresh prior
 /// copy (a cache *hit*) or re-stage (a *miss*). The decision is exactly the one
-/// [`SourceStager::stage_locked`] makes at run time, computed without touching
+/// `SourceStager::stage_locked` makes at run time, computed without touching
 /// the copy path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReuseDecision {
@@ -406,7 +417,7 @@ impl SourceStager {
     /// staging pattern, the stable content-addressed staged path it would land
     /// at, and — under `on_existing = reuse` — whether a fresh prior copy would
     /// be reused. The reuse check `stat`s the source and reads the committed
-    /// manifest exactly as the real run's [`Self::stage_locked`] does, so the
+    /// manifest exactly as the real run's `Self::stage_locked` does, so the
     /// `--explain` prediction matches the run's decision without doing I/O on the
     /// copy path. An in-place source (staging disabled or no pattern match)
     /// returns `staged = false` and a [`ReuseDecision::NotApplicable`].
@@ -735,7 +746,7 @@ impl SourceStager {
     ///
     /// - `<source_id>.<run_uuid>.partial` — an interrupted copy. Reaped **only
     ///   when its owning run is dead**: liveness-aware, so a concurrent sibling's
-    ///   in-flight partial is never reaped. See [`partial_is_orphaned`].
+    ///   in-flight partial is never reaped. See `partial_is_orphaned`.
     /// - `*.staged` with no matching `*.manifest.json` — a copy that crashed
     ///   after the rename but before the manifest was published. The manifest is
     ///   the committed-copy marker, so a manifestless `.staged` is always an
@@ -1858,5 +1869,77 @@ mod tests {
         let entry = stager.plan_entry(&src);
         assert!(entry.staged);
         assert_eq!(entry.reuse, ReuseDecision::NotApplicable);
+    }
+
+    #[test]
+    fn verify_mismatch_renders_stable_code_e335() {
+        // A content-hash mismatch must carry E335 and the explain pointer so the
+        // operator can look the failure up — the staging counterpart to the
+        // spill subsystem's E320/E321.
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"original bytes that get copied").unwrap();
+
+        let policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        let stager = SourceStager::new(policy);
+        let partial = stage_dir.path().join("x.partial");
+        let staged = stage_dir.path().join("x.staged");
+        let copy_hash = stager.copy_into(&src, &partial, &staged).unwrap();
+
+        std::fs::write(&src, b"different bytes entirely").unwrap();
+        let err = verify_staged(&src, &staged, copy_hash).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("E335"), "{rendered}");
+        assert!(
+            rendered.contains("clinker explain --code E335"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn disk_cap_overflow_renders_stable_code_e336() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("big.csv");
+        std::fs::write(&src, vec![b'x'; 4096]).unwrap();
+
+        let policy = StagingPolicy {
+            enabled: true,
+            dir: Some(stage_dir.path().to_path_buf()),
+            patterns: vec!["*.csv".into()],
+            disk_cap_bytes: Some(ByteSize(1024)),
+            ..Default::default()
+        };
+        let mut stager = SourceStager::new(policy);
+        let err = stager.resolve(src).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("E336"), "{rendered}");
+        assert!(
+            rendered.contains("clinker explain --code E336"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn already_exists_renders_stable_code_e337() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"data").unwrap();
+
+        let mut seed = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+        seed.resolve(src.clone()).unwrap();
+
+        let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
+        policy.on_existing = OnExisting::Error;
+        let mut stager = SourceStager::new(policy);
+        let err = stager.resolve(src).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("E337"), "{rendered}");
+        assert!(
+            rendered.contains("clinker explain --code E337"),
+            "{rendered}"
+        );
     }
 }

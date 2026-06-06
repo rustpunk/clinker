@@ -364,14 +364,18 @@ spill amplification, where an optimizer interaction turned 30 GB of input into
 > dispatches on each spill file's own one-byte header tag, so re-reading is
 > robust regardless.
 
-## Distinguishing the four spill-related failure conditions
+## Distinguishing the runtime storage-abort conditions
 
-Spill-related aborts are split into four distinct diagnostics so a single
-glance at the error tells you exactly what to fix — instead of every disk and
-memory problem rendering as one ambiguous "out of memory" message (the trap
-DuckDB hit in [duckdb/duckdb#14142], where a temp-dir cap was reported as
-"Out of Memory Error … 187.3 GiB/187.3 GiB used" and users inspected `df`
-only to find free space).
+A run that fails while spilling or staging emits one of several distinct
+diagnostics so a single glance at the error tells you exactly what to fix —
+instead of every disk and memory problem rendering as one ambiguous "out of
+memory" message (the trap DuckDB hit in [duckdb/duckdb#14142], where a temp-dir
+cap was reported as "Out of Memory Error … 187.3 GiB/187.3 GiB used" and users
+inspected `df` only to find free space). The aborts split along two axes: the
+**spill** side (in-memory operator state landing on disk) and the **staging**
+side (matched source files copied to local disk before they are read).
+
+### Spill aborts
 
 | Condition | Code | What happened | What to do |
 | --- | --- | --- | --- |
@@ -391,6 +395,27 @@ The key separations:
 
 (A future per-operator memory-reservation surface will add a fifth,
 reservation-exhausted condition; it is not part of the engine yet.)
+
+### Staging-copy aborts
+
+When `storage.staging` is enabled, copying a matched source to local disk can
+fail in three distinct ways. Like the spill split, each has its own code so a
+content-corruption problem never renders as a budget problem and vice versa.
+Staging runs before any record flows, so these surface as startup-style
+validation failures.
+
+| Condition | Code | What happened | What to do |
+| --- | --- | --- | --- |
+| **Staged copy corrupt** | E335 | The local copy's BLAKE3 digest did not match the source — the transport (e.g. a soft-mount NFS share) delivered different bytes than the source holds. | Re-run over a healthy transport, harden the mount, or stage from a stable snapshot. Do not set `verify = "none"` to silence it — that hides corruption, not fixes it. |
+| **Staging cap exceeded** | E336 | The cumulative bytes staged this run would cross `storage.staging.disk_cap_bytes`. The volume may still have free space — you hit the configured budget, **not** a full disk. | Raise `disk_cap_bytes`, point `storage.staging.dir` at a larger volume, narrow `storage.staging.patterns`, or remove the cap. |
+| **Staged copy already exists** | E337 | A staged copy of this source already exists and `on_existing = error` refuses to touch it. | Remove the existing copy, or switch `on_existing` to `overwrite` (re-stage) or `reuse` (reuse a fresh copy). |
+
+The same cap-vs-full-disk separation applies here as on the spill side: **E336**
+is the budget you set (mirroring E320), so it must not render as an
+out-of-space message — a physically full staging volume instead surfaces as a
+staging I/O error (mirroring E321). **E335** is distinct from a generic staging
+I/O error: an I/O error means the OS reported a fault, whereas E335 means the
+copy completed cleanly yet still does not match the source.
 
 ## Startup storage validation
 
@@ -643,7 +668,8 @@ partial file a later run might trust:
    re-read and hashed, and the two digests must match. A size check cannot
    catch a soft-mount that silently truncated the read; two content digests
    can. A mismatch removes the published copy and fails the run with a distinct
-   "staged copy is corrupt" diagnostic — not a generic I/O error.
+   "staged copy is corrupt" diagnostic ([E335](#staging-copy-aborts)) — not a
+   generic I/O error.
 5. **Commit the manifest.** The identity manifest is written with the same
    atomic temp-file + rename discipline. **The manifest is the commit marker:**
    a `.staged` file is only trustworthy once its manifest exists. A crash

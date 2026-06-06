@@ -2,7 +2,8 @@
 //!
 //! Applies a [`ChannelBinding`] to a [`CompiledPlan`], overlaying config
 //! values as `ChannelDefault` or `ChannelFixed` provenance layers on the
-//! plan's [`ProvenanceDb`], and resolving channel-supplied var
+//! plan's [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb),
+//! and resolving channel-supplied var
 //! overrides/adds for the four scoped registries (`$vars.*`,
 //! `$pipeline.*`, `$source.*`, `$record.*`) against the pipeline's
 //! declarations. Stamps a [`ChannelIdentity`] for cache-keying.
@@ -44,7 +45,8 @@ pub struct ChannelOverlayResult {
 /// Performs three things:
 ///
 /// 1. Overlays `config.default` / `config.fixed` onto the plan's
-///    [`ProvenanceDb`] as `ChannelDefault` / `ChannelFixed` layers
+///    [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb) as
+///    `ChannelDefault` / `ChannelFixed` layers
 ///    (W103 for keys not matched in the plan).
 /// 2. Resolves the channel's `vars:` block against the pipeline's
 ///    declared registries — typecheck on override (E107), reserved
