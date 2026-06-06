@@ -633,9 +633,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // copies matched source files to a local volume before the run reads them.
     // Validated below against the discovered file set by
     // `validate_storage_config`, then driven per file by the staging-copy
-    // engine at reader-open: a matched file is copied to a per-run local subdir
-    // (single-pass BLAKE3 verify + atomic publish) and the reader opens the
-    // local copy.
+    // engine at reader-open: a matched file is copied to a stable
+    // content-addressed path under the staging root (`<source_id>.staged` plus a
+    // `<source_id>.manifest.json` sidecar), single-pass BLAKE3 verify + atomic
+    // publish, and the reader opens the local copy. The flat content-addressed
+    // layout lets a later run reuse a still-fresh prior copy instead of
+    // re-copying it per run.
     let staging_policy = storage_config.staging.clone();
 
     let mut compile_ctx =
@@ -950,30 +953,31 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Idempotent staging crash-purge, run once before this run stages. A
     // crashed prior run (SIGKILL, OOM-killer, power loss) skips the cleanup a
-    // clean exit performs, leaking its staged artifacts under the shared
-    // staging root. Best-effort and shape-based — it reaps every `.partial` and
-    // any `.staged` with no committed manifest. It is NOT yet concurrency-safe:
-    // the `.partial` sweep has no liveness check, so a concurrent run's
-    // in-flight `.partial` copy would be reaped. Full concurrent-invocation
-    // safety for staging (a liveness lock mirroring the spill purge's) is a
-    // follow-up; today, concurrent runs must not share a staging root. The
-    // matching spill-root crash-purge runs inside the executor at spill-root
-    // creation (so every executor entry point gets it) and IS concurrency-safe
-    // via per-dir locking plus a creation grace window; staging is a CLI-only
-    // concern, so its purge lives here.
+    // clean exit performs, leaking its staged artifacts under the staging root.
+    // Best-effort and shape-based — it reaps every `.partial` and any `.staged`
+    // with no committed manifest. It is NOT yet concurrency-safe: the `.partial`
+    // sweep has no liveness check, so a concurrent run's in-flight `.partial`
+    // copy would be reaped. Full concurrent-invocation safety for staging (a
+    // liveness lock mirroring the spill purge's) is a follow-up; today,
+    // concurrent runs must not share a staging root. The staging root is always
+    // an explicitly configured local volume, so unlike the spill purge (which
+    // skips the unconfigured OS-temp default) this always runs when staging is
+    // enabled; it lives here because staging is a CLI-only concern.
     clinker_channel::SourceStager::crash_purge(&staging_policy);
 
     // Stage + open pass: with validation passed, copy each matched source to
-    // the per-run staging subdir (single-pass BLAKE3 verify + atomic publish)
-    // and open the reader on the local copy, or open the source in place when
-    // staging is disabled or no pattern matched. One staging engine for the
-    // whole run lazily creates a single per-run subdir on the first staged
-    // file and accumulates the disk-cap byte total across every source.
+    // its stable content-addressed path under the staging root
+    // (`<source_id>.staged` + `<source_id>.manifest.json`, single-pass BLAKE3
+    // verify + atomic publish) and open the reader on the local copy, or open
+    // the source in place when staging is disabled or no pattern matched. One
+    // staging engine for the whole run reuses a still-fresh prior copy when the
+    // manifest matches and accumulates the disk-cap byte total across every
+    // source it actually copies.
     let mut source_stager = clinker_channel::SourceStager::new(staging_policy.clone());
     for (source_name, paths) in discovered_files {
         let mut slots: Vec<clinker_exec::source::multi_file::FileSlot> = Vec::new();
         for path in &paths {
-            // A matched file is copied to the per-run local subdir and
+            // A matched file is copied to its content-addressed local path and
             // `read_path()` points at the local copy; an unmatched file or a
             // disabled policy reads in place. Either way the reader opens
             // `read_path()` and stays agnostic to staging.

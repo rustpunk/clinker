@@ -686,21 +686,30 @@ impl PipelineExecutor {
         // leak query shape via `stat`/`readdir`. An owner-only root keeps every
         // spilled file unlistable to other users on a shared spill volume,
         // mirroring the 0o700 posture of the source-staging per-run dir.
+        //
         // Idempotent crash-purge of orphaned spill directories from prior runs,
-        // run once before this run creates its own. A crashed run (SIGKILL,
-        // OOM-killer, power loss) skips the TempDir Drop that removes its spill
-        // dir, leaking it under the shared root; this reaps every such orphan,
-        // identified by an OS advisory lock no live process still holds, gated by
-        // a creation grace window so a concurrent sibling's just-created,
-        // not-yet-locked dir is never reaped (concurrent invocations may share
-        // this root). Best-effort and non-fatal. Probes the resolved root the run
-        // will use: the configured dir, or the OS temp dir when none is
-        // configured.
-        let spill_purge_root = params
-            .spill_root_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
-        spill_purge::spill_crash_purge(&spill_purge_root);
+        // run once before this run creates its own — but ONLY when a spill
+        // directory was explicitly configured (`[storage.spill] dir`). A crashed
+        // run (SIGKILL, OOM-killer, power loss) skips the TempDir Drop that
+        // removes its spill dir, leaking a `clinker-spill-*` directory under the
+        // spill root; this reaps every such orphan, identified by an OS advisory
+        // lock no live process still holds, gated by a creation grace window so a
+        // concurrent sibling's just-created, not-yet-locked dir is never reaped
+        // (concurrent runs may share one configured spill root).
+        //
+        // When no spill dir is configured the spill root is the OS temp dir,
+        // shared with every other process on the host. clinker must not police
+        // that directory: a per-run `tempfile::TempDir` already cleans itself up
+        // on every normal exit (clean or panic-unwind), and a directory leaked by
+        // a SIGKILL is the OS tmp-reaper's responsibility, not ours. Purging the
+        // shared temp dir would race not only concurrent clinker peers (the
+        // grace window narrows but cannot eliminate that race) but unrelated
+        // processes that happen to use a colliding prefix. Skipping the purge on
+        // the default root is therefore both safer and correct by construction.
+        // Best-effort and non-fatal in either case.
+        if let Some(spill_dir) = &params.spill_root_dir {
+            spill_purge::spill_crash_purge(spill_dir);
+        }
 
         let mut builder = tempfile::Builder::new();
         builder.prefix("clinker-spill-");

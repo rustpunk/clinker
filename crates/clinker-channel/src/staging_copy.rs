@@ -32,7 +32,7 @@
 //!
 //! - `<source_id>.staged` — the local copy the reader opens.
 //! - `<source_id>.manifest.json` — a sidecar recording the source identity
-//!   ([`StagedManifest`]: path + mtime + size + content hash + stage time).
+//!   (`StagedManifest`: path + mtime + size + content hash + stage time).
 //!
 //! `source_id` is the hex BLAKE3 of the canonicalized absolute source path, so
 //! the same source always resolves to the same staged file. That stability is
@@ -170,21 +170,21 @@ pub enum StagingError {
 /// the Unix epoch so the JSON is human-legible and the staleness comparison is
 /// exact (it never round-trips through a lossy float).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StagedManifest {
+pub(crate) struct StagedManifest {
     /// The original source path the copy was made from.
-    pub source_path: PathBuf,
+    pub(crate) source_path: PathBuf,
     /// Whole seconds of the source's modification time at copy time, measured
     /// since the Unix epoch. Paired with [`Self::source_mtime_nanos`].
-    pub source_mtime_secs: i64,
+    pub(crate) source_mtime_secs: i64,
     /// Sub-second nanosecond remainder of the source's modification time.
-    pub source_mtime_nanos: u32,
+    pub(crate) source_mtime_nanos: u32,
     /// Source size in bytes at copy time.
-    pub source_size: u64,
+    pub(crate) source_size: u64,
     /// Hex BLAKE3 digest of the copied bytes.
-    pub content_hash: String,
+    pub(crate) content_hash: String,
     /// When the staged copy was published, as an RFC 3339 timestamp. Recorded
     /// for operator audit only; the freshness check uses mtime + size, not this.
-    pub staged_at: String,
+    pub(crate) staged_at: String,
 }
 
 impl StagedManifest {

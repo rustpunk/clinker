@@ -11,6 +11,21 @@
 //! leaks under the spill root indefinitely. Over many crashed runs that fills
 //! the spill volume, the exact class of report this purge prevents.
 //!
+//! ## Scope: only an explicitly configured spill root is purged
+//!
+//! This purge runs **only when the workspace configured a dedicated spill
+//! directory** (`[storage.spill] dir`). When no spill dir is configured the
+//! spill root is the OS temp dir, which clinker shares with every other process
+//! on the host — including unrelated programs and the OS tmp-reaper. clinker
+//! must not police that shared directory: a non-configured run's spill dir is a
+//! per-run [`tempfile::TempDir`] that cleans itself up on every normal exit, and
+//! a SIGKILL-leaked temp dir is the OS tmp-reaper's job. Reaping under the shared
+//! temp dir would race concurrent peers and unrelated processes for no benefit,
+//! so the executor gates the purge on a configured root. The liveness machinery
+//! below is therefore for the configured-but-shared case: several runs pointed at
+//! one dedicated spill volume, where one run's startup purge must not reap
+//! another's in-flight directory.
+//!
 //! ## How a live dir is told apart from a corpse
 //!
 //! Each run, at spill-root creation, opens `<spill_dir>/.lock` and takes an
@@ -33,13 +48,14 @@
 //! A run cannot create its spill directory and take the lock in one atomic
 //! syscall: [`tempfile::Builder`] makes the directory, then [`lock_spill_dir`]
 //! creates and locks `.lock` inside it. For a few milliseconds the directory
-//! exists with no lock — and, sharing the OS temp dir as the default spill root,
+//! exists with no lock — and when several runs share one configured spill root,
 //! a concurrent `clinker run` doing its own startup [`spill_crash_purge`] could
 //! observe that lockless dir. A naïve "no `.lock` file ⇒ orphan" rule would then
 //! delete a live sibling's in-flight spill dir out from under it, killing the
 //! victim with an ENOENT the moment it tried to write its own lock or a spill
-//! file. (Concurrent invocations sharing a spill root are a supported scaling
-//! story, so this is a real correctness bug, not a theoretical one.)
+//! file. (Concurrent invocations sharing one configured spill root are a
+//! supported scaling story, so this is a real correctness bug, not a theoretical
+//! one.)
 //!
 //! The purge closes that window with a **creation grace period**
 //! ([`REAP_GRACE`]): a `clinker-spill-*` directory younger than the grace period
@@ -49,7 +65,9 @@
 //! owner has had time to take the lock. The grace period is generous relative to
 //! the sub-millisecond create→lock latency yet far shorter than the interval
 //! between runs, so a genuine pre-lock crash corpse is still reaped on the next
-//! startup once it has aged past the window.
+//! startup once it has aged past the window. This is the second line of defense
+//! for the configured-but-shared spill root; the first is the executor never
+//! purging the unconfigured default (the OS temp dir) at all.
 
 use std::fs::File;
 use std::io;
@@ -114,22 +132,22 @@ pub fn lock_spill_dir(spill_dir: &Path) -> io::Result<File> {
 /// Idempotently reap orphaned `clinker-spill-*` directories left by crashed
 /// prior runs, run once at startup before the run creates its own spill dir.
 ///
-/// `spill_root` is the resolved spill root — the configured
-/// `storage.spill.dir`, or the OS temp dir when none is configured. For each
-/// `clinker-spill-*` child directory, the purge first checks the directory's
-/// age: a directory younger than [`REAP_GRACE`] is left alone unconditionally,
-/// since a live sibling may have just created it and not yet taken its lock.
-/// For an older directory the purge tries to take the directory's `.lock`; a
-/// successful acquire means the owning process is gone, so the whole directory
-/// is removed. A directory whose lock is still held (a concurrent live run) is
-/// skipped. An aged-out directory with no `.lock` file at all is an orphan from
-/// a run that crashed before it could create the lock.
+/// `spill_root` is an **explicitly configured** spill root (`[storage.spill]
+/// dir`); the executor never calls this on the unconfigured default (the OS temp
+/// dir), which it must not police. For each `clinker-spill-*` child directory,
+/// the purge first checks the directory's age: a directory younger than
+/// [`REAP_GRACE`] is left alone unconditionally, since a live sibling may have
+/// just created it and not yet taken its lock. For an older directory the purge
+/// tries to take the directory's `.lock`; a successful acquire means the owning
+/// process is gone, so the whole directory is removed. A directory whose lock is
+/// still held (a concurrent live run) is skipped. An aged-out directory with no
+/// `.lock` file at all is an orphan from a run that crashed before it could
+/// create the lock.
 ///
 /// This is concurrency-safe by construction: it can never reap a live sibling's
 /// spill directory. A held lock is never reaped, and a not-yet-locked newborn is
 /// protected by the grace window until its owner takes the lock — so concurrent
-/// `clinker run` invocations sharing one spill root (the default OS temp dir)
-/// stay isolated.
+/// `clinker run` invocations sharing one configured spill root stay isolated.
 ///
 /// Best-effort and non-fatal: every error is logged, never propagated — a purge
 /// failure must not abort an otherwise-valid run, and the next startup retries.
