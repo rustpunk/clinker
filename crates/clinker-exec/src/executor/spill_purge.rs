@@ -129,6 +129,72 @@ pub fn lock_spill_dir(spill_dir: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Owns a run's spill `TempDir` together with the OS advisory lock held on its
+/// `.lock` file, and guarantees on `Drop` that the lock is released **before**
+/// the directory is removed.
+///
+/// ## Why the bundle, and why the explicit drop order
+///
+/// The lock file lives *inside* the spill directory, so the directory's
+/// recursive removal also deletes the lock file. On Windows an open handle to a
+/// file blocks deletion of that file (and thus its parent directory), so the
+/// lock handle must be closed before [`tempfile::TempDir`]'s removal runs or the
+/// directory silently survives. On Unix an open handle never blocks removal, but
+/// closing the lock first there is harmless and keeps one ordering for all
+/// platforms.
+///
+/// Keeping the two as separate struct fields elsewhere made this ordering depend
+/// on field-declaration order, which a future reorder or an early-return that
+/// unwound the owning struct could regress silently. Bundling them here with an
+/// explicit `Drop` makes "lock released before directory removed" hold on *every*
+/// drop path — clean exit, early-error return, and panic unwind — by
+/// construction, so no caller has to remember to release the lock manually before
+/// returning.
+pub(crate) struct SpillDir {
+    // `Option` so `Drop` can take and release the lock file first; `None` once
+    // released. A failed `lock_spill_dir` still yields `Some(file)` (the lock is
+    // best-effort) so the handle is closed before removal regardless.
+    lock: Option<File>,
+    // Declared after `lock` so even the implicit field-drop order (which runs
+    // after the explicit `Drop` body) would release the lock first; the explicit
+    // body below makes the guarantee independent of this ordering.
+    dir: tempfile::TempDir,
+}
+
+impl SpillDir {
+    /// Take ownership of `dir` and acquire its per-run `.lock`, returning the
+    /// guard that releases the lock before removing the directory on drop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`lock_spill_dir`]'s error — the lock file could not be created
+    /// in a pre-validated-writable directory, an internal fault.
+    pub(crate) fn new(dir: tempfile::TempDir) -> io::Result<Self> {
+        let lock = lock_spill_dir(dir.path())?;
+        Ok(Self {
+            lock: Some(lock),
+            dir,
+        })
+    }
+
+    /// Path of the owned spill directory, handed to operators as the root for
+    /// their per-file spill artifacts.
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        // Release the lock file FIRST: closing the handle frees the OS advisory
+        // lock and, critically on Windows, removes the open-handle that would
+        // otherwise block the directory's recursive removal. `dir` (the
+        // `TempDir`) then drops after this body returns and removes the
+        // directory — by which point the `.lock` handle is already closed.
+        self.lock.take();
+    }
+}
+
 /// Idempotently reap orphaned `clinker-spill-*` directories left by crashed
 /// prior runs, run once at startup before the run creates its own spill dir.
 ///
@@ -407,5 +473,91 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _held = lock_spill_dir(dir.path()).unwrap();
         assert!(dir.path().join(SPILL_LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn spill_dir_holds_the_lock_while_alive() {
+        // While the guard lives it must hold the OS advisory lock, so a
+        // concurrent probe (the next run's crash-purge) sees the dir as live and
+        // never reaps it. A second handle's `try_lock` failing is the same signal
+        // `dir_is_orphaned` reads, so this is the load-bearing liveness property —
+        // and it is real `flock`/`LockFileEx` behavior on every platform.
+        let tempdir = tempfile::Builder::new()
+            .prefix(SPILL_DIR_PREFIX)
+            .tempdir()
+            .unwrap();
+        let lock_path = tempdir.path().join(SPILL_LOCK_NAME);
+        let guard = SpillDir::new(tempdir).unwrap();
+
+        let probe = File::open(&lock_path).unwrap();
+        assert!(
+            FileExt::try_lock(&probe).is_err(),
+            "a live SpillDir must hold the .lock so a concurrent purge keeps the dir"
+        );
+        // Keep the guard alive across the probe so the lock contention is real.
+        drop(guard);
+    }
+
+    #[test]
+    fn spill_dir_drop_releases_the_lock_and_removes_the_directory() {
+        // The fix for the Windows error-path leak: the guard's Drop must release
+        // the `.lock` BEFORE removing the directory, on every drop path. On
+        // Windows the reversed order leaves the directory behind (an open handle
+        // blocks the removal); on Unix the removal always succeeds, so a bare
+        // "dir is gone" check cannot tell the orders apart. This test asserts the
+        // two observable halves of the invariant separately, both meaningful on
+        // Unix:
+        //
+        //   * release: a second handle opened on the SAME `.lock` inode before
+        //     drop cannot take the advisory lock while the guard holds it, but
+        //     CAN once the guard drops — proving Drop genuinely releases the lock
+        //     rather than leaking the handle open. (The handle keeps the unlinked
+        //     inode alive past removal, so the post-drop acquire is observable.)
+        //   * removal: the directory itself is gone after drop.
+        //
+        // Together these encode "lock released, directory removed" — exactly the
+        // property whose ordering makes the removal succeed on Windows.
+        let parent = tempfile::tempdir().unwrap();
+        let tempdir = tempfile::Builder::new()
+            .prefix(SPILL_DIR_PREFIX)
+            .tempdir_in(parent.path())
+            .unwrap();
+        let dir_path = tempdir.path().to_path_buf();
+        let lock_path = dir_path.join(SPILL_LOCK_NAME);
+
+        let guard = SpillDir::new(tempdir).unwrap();
+        assert!(
+            dir_path.exists(),
+            "the spill dir exists while the guard lives"
+        );
+        assert!(lock_path.exists(), "the .lock exists while the guard lives");
+
+        // A second handle on the same `.lock` inode. Held across the drop so its
+        // post-drop acquire observes the guard's release on the very same inode —
+        // the removal unlinks the path but this open handle keeps the inode (and
+        // its advisory lock state) alive to probe.
+        let probe = File::open(&lock_path).unwrap();
+        assert!(
+            FileExt::try_lock(&probe).is_err(),
+            "the lock must be held while the guard is alive"
+        );
+
+        drop(guard);
+
+        // Release half: the same-inode probe can now take the lock, so Drop freed
+        // it. A leaked-open guard handle (the bug) would keep this contended.
+        assert!(
+            FileExt::try_lock(&probe).is_ok(),
+            "the guard's Drop must release the .lock so the same inode can be re-locked"
+        );
+        let _ = FileExt::unlock(&probe);
+        drop(probe);
+
+        // Removal half: the directory (and its `.lock`) is gone. On Windows this
+        // is exactly the assertion that fails if the lock outlives the directory.
+        assert!(
+            !dir_path.exists(),
+            "the guard's Drop must remove the spill directory on every path"
+        );
     }
 }

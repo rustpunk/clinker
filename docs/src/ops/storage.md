@@ -432,10 +432,14 @@ volume, stop the cleaner, restore permissions) is obvious from the message.
 ## Crash purge of orphaned spill directories
 
 A run's spill directory (`clinker-spill-<random>/`) is normally removed when the
-run ends — a clean exit, or even a panic that unwinds, deletes it. But a
-`SIGKILL`, the Linux OOM-killer, or a power loss kills the process before that
-cleanup runs, leaking the directory and every spill file inside it under the
-spill root. Over many crashed runs that fills the spill volume.
+run ends — a clean exit, a run that aborts with a fatal error, or even a panic
+that unwinds all delete it, on every platform. (The run holds an advisory lock on
+a `.lock` file inside that directory; the lock is always released before the
+directory is removed, so the removal never trips over its own open handle — which
+matters on Windows, where an open file handle blocks deletion.) But a `SIGKILL`,
+the Linux OOM-killer, or a power loss kills the process before that cleanup runs,
+leaking the directory and every spill file inside it under the spill root. Over
+many crashed runs that fills the spill volume.
 
 To prevent that, **a run reaps orphaned spill directories at startup — but
 only when a spill directory is explicitly configured** (`storage.spill.dir`),
@@ -453,11 +457,11 @@ directory is logged and the run proceeds.
 When `storage.spill.dir` is **not** set, the spill root defaults to the OS temp
 directory ([`std::env::temp_dir`], typically `$TMPDIR` or `/tmp`), and **no
 startup purge runs** there. In the default case a run cleans up after itself
-directly: the per-run spill directory is a `tempfile::TempDir` that is removed on
-every normal exit — a clean exit or a panic that unwinds. Only a `SIGKILL`, the
-OOM-killer, or a power loss leaks one, and a directory leaked into the OS temp
-directory is the operating system's temp-reaper's responsibility to clean up, not
-Clinker's.
+directly: the per-run spill directory is removed on every exit short of a hard
+kill — a clean exit, an error-return abort, or a panic that unwinds. Only a
+`SIGKILL`, the OOM-killer, or a power loss leaks one, and a directory leaked into
+the OS temp directory is the operating system's temp-reaper's responsibility to
+clean up, not Clinker's.
 
 The purge is deliberately confined to a configured spill root because it must
 never police the shared OS temp directory. That directory is used by every
