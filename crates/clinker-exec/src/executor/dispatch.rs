@@ -671,38 +671,38 @@ pub(crate) struct ExecutorContext<'a> {
     /// overflow.
     pub(crate) recursion_depth: u32,
 
-    /// Pipeline-scoped temporary directory. Allocated once at
-    /// `execute_dag_branching` start; every spilling operator (grace
-    /// hash, sort-merge join, sort buffer, hash aggregation) writes
-    /// spill files inside it. Shared across composition body
+    /// Pipeline-scoped spill directory bundled with the OS advisory lock held on
+    /// its `.lock` file. Allocated once at `execute_dag_branching` start; every
+    /// spilling operator (grace hash, sort-merge join, sort buffer, hash
+    /// aggregation) writes spill files inside it. Shared across composition body
     /// recursion — body executors do not allocate a fresh subdir.
-    /// Primary cleanup is per-file `tempfile::TempPath` Drop;
-    /// secondary sweep is the pipeline-scoped TempDir Drop on panic
-    /// unwinding, which closes the operator-level panic-leak hole
-    /// observed in Spark (SPARK-3563, SPARK-24340) and DuckDB
-    /// (issues 6420, 5878). The `Arc` keeps the directory alive
-    /// while any outstanding spill file path borrows it; this
-    /// matters in error paths where the executor returns before
-    /// every reader has been drained.
-    pub(crate) spill_root: Arc<tempfile::TempDir>,
+    ///
+    /// Primary cleanup is per-file `tempfile::TempPath` Drop; secondary sweep is
+    /// this guard's Drop on panic unwinding or error-return, which closes the
+    /// operator-level panic-leak hole observed in Spark (SPARK-3563, SPARK-24340)
+    /// and DuckDB (issues 6420, 5878). The held lock marks the directory as owned
+    /// by a live process so the next run's startup crash-purge reaps only spill
+    /// dirs whose lock it can acquire.
+    ///
+    /// The `Arc` keeps the directory alive while any outstanding spill file path
+    /// borrows it; this matters in error paths where the executor returns before
+    /// every reader has been drained. [`SpillDir`]'s `Drop` releases the lock
+    /// *before* the directory is removed — on Windows an open handle blocks the
+    /// directory deletion, so the lock must close first. The clean-exit path drops
+    /// this guard explicitly for deterministic teardown timing; the early-error
+    /// returns and panic unwinds drop it implicitly with the rest of `ctx`. Both
+    /// run the same lock-before-removal `Drop`, so the ordering holds on every
+    /// path by construction rather than by a manual `drop` no error-return could
+    /// be trusted to reach.
+    ///
+    /// [`SpillDir`]: crate::executor::spill_purge::SpillDir
+    pub(crate) spill_root: Arc<crate::executor::spill_purge::SpillDir>,
     /// Cached path into [`Self::spill_root`]. Sharing an
     /// `Arc<Path>` keeps every operator-side `to_path_buf()` call
-    /// off the `TempDir::path()` chain in hot paths and bypasses a
+    /// off the `SpillDir::path()` chain in hot paths and bypasses a
     /// lifetime acrobatic that would otherwise force every operator
     /// to thread the same lifetime as the borrowed plan-time refs.
     pub(crate) spill_root_path: Arc<std::path::Path>,
-    /// The held `<spill_root>/.lock` for this run, kept open so the OS advisory
-    /// lock marks the spill directory as owned by a live process. The next
-    /// run's startup crash-purge reaps only spill dirs whose lock it can
-    /// acquire, so holding this for the run's whole lifetime is what tells a
-    /// concurrent purge "this dir is live, don't reap it".
-    ///
-    /// Wrapped in `Option` so the clean-exit teardown can drop the lock file
-    /// *before* the spill `TempDir`'s recursive remove runs: on Windows an open
-    /// handle blocks the directory deletion, so the lock must be released first.
-    /// A crash skips this teardown, but the OS releases the lock on process
-    /// death anyway, so the next run still sees the dir as reapable.
-    pub(crate) spill_lock: Option<Arc<std::fs::File>>,
 
     /// Per-window arena+index registry. Slot `i` corresponds to
     /// `plan.indices_to_build[i]`; source-rooted slots populate at
@@ -942,18 +942,6 @@ pub(crate) struct RetainedAggregatorState {
 }
 
 impl<'a> ExecutorContext<'a> {
-    /// Borrow the pipeline-scoped TempDir handle. Held alongside
-    /// the cached `spill_root_path` so every operator that prefers
-    /// the owned form (e.g. `SortBuffer::new` taking
-    /// `Option<PathBuf>`) can clone the path without re-traversing
-    /// `TempDir::path()`. The TempDir itself is needed to keep the
-    /// directory alive across the whole walk including any
-    /// concurrent reads on spill paths the executor has not yet
-    /// drained.
-    pub(crate) fn spill_root(&self) -> &Arc<tempfile::TempDir> {
-        &self.spill_root
-    }
-
     /// Poll the run's shutdown flag at an operator chunk boundary. When
     /// the token has tripped (SIGINT/SIGTERM, or a programmatic
     /// request), record the interruption and return

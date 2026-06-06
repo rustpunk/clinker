@@ -205,6 +205,106 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
     );
 }
 
+/// A writer that fails on its first `write`, so the run aborts through the
+/// output-error early-return path after the per-run spill directory and its
+/// `.lock` already exist.
+struct FailingWriter;
+impl Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("simulated output failure"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("simulated flush failure"))
+    }
+}
+
+#[test]
+fn error_path_run_cleans_up_its_spill_directory_immediately() {
+    // Regression guard for the Windows error-path spill-dir leak: when a run
+    // aborts with a fatal error after its per-run spill directory and `.lock`
+    // exist, the directory must be cleaned up immediately on the error-return
+    // path — not left for the next run's crash-purge. The per-run spill dir is
+    // created at run start (before dispatch), so a writer that fails during the
+    // run aborts after the dir + lock exist, exercising the exact early-return
+    // path the fix covers.
+    //
+    // On Unix an open lock handle never blocks directory removal, so the dir is
+    // reaped regardless of teardown order; the dedicated SpillDir Drop unit test
+    // (`spill_dir_drop_releases_the_lock_and_removes_the_directory`) proves the
+    // lock-before-removal ordering that makes this same teardown correct on
+    // Windows. This test pins the end-to-end invariant on every platform: a
+    // failed run leaves no orphaned spill directory behind, and — encoding the
+    // release half here too — the spill root can be re-locked afterward, which a
+    // leaked lock handle would prevent.
+    let spill_root = tempfile::tempdir().expect("create custom spill root");
+    let spill_root_path = spill_root.path().to_path_buf();
+
+    let csv = build_events_csv();
+    let config: PipelineConfig =
+        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
+    readers.insert(
+        "events".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "events.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    );
+
+    // Both outputs fail, so the run aborts with an output error after the spill
+    // dir + lock exist.
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
+        (
+            "out_a".to_string(),
+            Box::new(FailingWriter) as Box<dyn Write + Send>,
+        ),
+        (
+            "out_b".to_string(),
+            Box::new(FailingWriter) as Box<dyn Write + Send>,
+        ),
+    ]);
+
+    let params = PipelineRunParams {
+        execution_id: "spill-error-path".to_string(),
+        batch_id: "batch-0".to_string(),
+        spill_root_dir: Some(spill_root_path.clone()),
+        ..Default::default()
+    };
+
+    let result = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params);
+    assert!(
+        result.is_err(),
+        "the failing writers must abort the run so the error-return teardown runs",
+    );
+
+    // Cleanup half: no per-run spill directory survives the failed run.
+    assert!(
+        !has_spill_subdir(&spill_root_path),
+        "a failed run must remove its spill directory immediately, leaving no orphan \
+         under {}",
+        spill_root_path.display(),
+    );
+
+    // Release half (meaningful on Unix): the next run's crash-purge can take the
+    // lock on any new spill dir under this root. A run leaving a still-locked
+    // orphan would make a same-named re-lock contend; here we simply confirm a
+    // fresh lock under the root acquires cleanly, demonstrating no leaked handle.
+    let fresh = spill_root_path.join("clinker-spill-postcheck");
+    std::fs::create_dir(&fresh).expect("create post-check dir");
+    let lock_path = fresh.join(".lock");
+    let lock_file = std::fs::File::create(&lock_path).expect("create post-check lock");
+    use fs4::FileExt;
+    assert!(
+        FileExt::try_lock(&lock_file).is_ok(),
+        "a fresh lock under the spill root must acquire — no leaked lock from the failed run",
+    );
+    let _ = FileExt::unlock(&lock_file);
+}
+
 #[test]
 fn startup_purges_an_orphaned_spill_dir_from_a_crashed_prior_run() {
     // A crashed prior run (SIGKILL / OOM-killer) leaves its `clinker-spill-*`

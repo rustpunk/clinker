@@ -197,18 +197,14 @@ struct DagExecResources {
     /// Compiled routes keyed by node name, for nested / composition-body
     /// Route nodes resolved during the walk.
     compiled_routes_by_name: HashMap<String, CompiledRoute>,
-    /// Pipeline-scoped spill `TempDir`, held until the walk drains so
-    /// operator-side spill files survive the topo loop.
-    spill_root: Arc<tempfile::TempDir>,
-    /// Cached path of `spill_root`, handed to each spill site without
-    /// re-borrowing the `TempDir`.
-    spill_root_path: Arc<std::path::Path>,
-    /// The held `<spill_root>/.lock` for this run. Kept open for the run's
-    /// lifetime so the OS advisory lock marks the spill dir as live; the next
-    /// run's startup crash-purge reaps only dirs whose lock it can acquire (the
-    /// owner is gone). Released when this `File` drops at run end or on process
-    /// exit. Never read after construction — its sole job is to hold the lock.
-    _spill_lock: Arc<std::fs::File>,
+    /// Pipeline-scoped spill directory bundled with its held `.lock`, kept until
+    /// the walk drains so operator-side spill files survive the topo loop. The
+    /// held lock marks the spill dir as live; the next run's startup crash-purge
+    /// reaps only dirs whose lock it can acquire. The guard's `Drop` releases the
+    /// lock before removing the directory on every teardown path. The cached
+    /// `Arc<Path>` operators spill into is derived from this guard's `path()`
+    /// inside the walk, so the path handle and the liveness guard never diverge.
+    spill_root: Arc<crate::executor::spill_purge::SpillDir>,
     /// Per-source / per-file event-time watermarks, carried through and
     /// returned in the [`DispatchOutcome`] for report roll-up.
     watermarks: crate::executor::watermark::PerSourceWatermarks,
@@ -724,27 +720,26 @@ impl PipelineExecutor {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        let spill_root = Arc::new(
-            match &params.spill_root_dir {
-                Some(dir) => builder.tempdir_in(dir),
-                None => builder.tempdir(),
-            }
-            .map_err(|e| PipelineError::Internal {
-                op: "executor",
-                node: String::new(),
-                detail: format!("failed to allocate pipeline spill root: {e}"),
-            })?,
-        );
-        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
+        let spill_tempdir = match &params.spill_root_dir {
+            Some(dir) => builder.tempdir_in(dir),
+            None => builder.tempdir(),
+        }
+        .map_err(|e| PipelineError::Internal {
+            op: "executor",
+            node: String::new(),
+            detail: format!("failed to allocate pipeline spill root: {e}"),
+        })?;
 
-        // Take the per-run spill-dir lock and hold it for the whole run. A
-        // crashed run (SIGKILL / OOM-killer / power loss) skips the TempDir Drop
-        // that would otherwise remove this directory, but the OS releases this
-        // lock on process death regardless — so the next run's
-        // `spill_crash_purge` can tell this dir's owner is gone and reap it.
-        // The directory was pre-validated writable, so a failure to create the
-        // lock file is an internal fault, not a config error.
-        let spill_lock = Arc::new(spill_purge::lock_spill_dir(&spill_root_path).map_err(|e| {
+        // Wrap the directory in a `SpillDir` guard: it takes the per-run
+        // `.lock` and holds it for the whole run, and its `Drop` releases that
+        // lock before removing the directory on every teardown path (clean exit,
+        // error-return, panic unwind). A crashed run (SIGKILL / OOM-killer /
+        // power loss) skips the guard's Drop, but the OS releases the lock on
+        // process death regardless — so the next run's `spill_crash_purge` can
+        // tell this dir's owner is gone and reap it. The directory was
+        // pre-validated writable, so a failure to create the lock file is an
+        // internal fault, not a config error.
+        let spill_root = Arc::new(spill_purge::SpillDir::new(spill_tempdir).map_err(|e| {
             PipelineError::Internal {
                 op: "executor",
                 node: String::new(),
@@ -867,8 +862,6 @@ impl PipelineExecutor {
                 compiled_route,
                 compiled_routes_by_name,
                 spill_root,
-                spill_root_path,
-                _spill_lock: spill_lock,
                 watermarks,
                 memory_budget,
             },
@@ -1057,11 +1050,16 @@ impl PipelineExecutor {
             compiled_route,
             compiled_routes_by_name,
             spill_root,
-            spill_root_path,
-            _spill_lock,
             watermarks,
             memory_budget,
         } = resources;
+
+        // Cache the spill-dir path as an `Arc<Path>` derived from the guard, so
+        // each operator-side spill site clones the path without re-traversing
+        // `SpillDir::path()` on hot paths. Reading `spill_root.path()` here also
+        // ties this handle to the same guard that keeps the directory alive and
+        // removes it on drop — the path and the liveness guard cannot diverge.
+        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
@@ -1334,7 +1332,6 @@ impl PipelineExecutor {
             current_body_node_input_refs: None,
             spill_root,
             spill_root_path,
-            spill_lock: Some(_spill_lock),
             window_runtime,
             watermarks,
             memory_budget,
@@ -1488,12 +1485,15 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(retained.consumer_id);
         }
 
-        // Take the pipeline-scoped TempDir out of the context. Held
-        // until the very end of the walk so any operator-side spill
-        // files survive the topo loop; dropped explicitly below
-        // after the metrics flush so the directory's recursive
-        // remove runs after every reader has gone away.
-        let pipeline_spill_root = ctx.spill_root().clone();
+        // The pipeline-scoped spill directory is held on `ctx.spill_root` until
+        // `ctx` drops at this function's scope end — after every operator-side
+        // spill path has been drained and the metrics flushed below. The
+        // `SpillDir` guard's `Drop` releases the held `.lock` *before* the
+        // directory's recursive remove runs, so cleanup is correct on Windows
+        // and ordered uniformly across platforms on EVERY return path —
+        // including the early-error returns and the `?` propagations above —
+        // without any manual `drop` call at the return site that a future
+        // early-return could silently bypass.
 
         // Drain mutable per-walk state out of the context for the
         // post-walk reporting + caller-facing return tuple. Sources are
@@ -1536,28 +1536,24 @@ impl PipelineExecutor {
         // Aggregate Output errors collected during the topo walk.
         // Single error → bare error; ≥2 errors →
         // `PipelineError::Multiple` (the DataFusion collection-pattern
-        // shape). Zero errors → fall through to Ok.
+        // shape). Zero errors → fall through to Ok. An early return here drops
+        // `ctx` (and with it the sole `SpillDir` guard), whose `Drop` releases
+        // the lock before removing the directory — the error path is cleaned up
+        // identically to the clean path.
         match output_errors.len() {
             0 => {}
             1 => return Err(output_errors.into_iter().next().unwrap()),
             _ => return Err(PipelineError::Multiple(output_errors)),
         }
 
-        // Release the spill-dir lock before the directory is removed. On
-        // Windows an open handle blocks `remove_dir_all`, so the `.lock` file
-        // must be closed first; on Unix it is harmless but keeps the ordering
-        // uniform. A crashed run never reaches here, but the OS releases the
-        // lock on process death regardless, so the next run's crash-purge still
-        // reaps the leaked directory.
-        drop(ctx.spill_lock.take());
-
-        // Release the pipeline-scoped TempDir Arc clone last; the
-        // directory drops once the original `ctx.spill_root` and
-        // this clone are both gone. Spill operators have already
-        // released their per-file `TempPath` handles by this point;
-        // any path the dispatcher couldn't drain still lives inside
-        // this directory, and its Drop now sweeps the filesystem.
-        drop(pipeline_spill_root);
+        // Clean-exit teardown of the spill directory. Dropping the guard here —
+        // after every operator-side spill path has been drained and the metrics
+        // flushed — releases the held `.lock` and then removes the directory, in
+        // that order, before this function returns `Ok`. The early-error returns
+        // above (and any `?` propagation) instead drop the guard implicitly as
+        // part of dropping `ctx`, which runs the same lock-before-removal `Drop`,
+        // so the directory is cleaned up on EVERY path, not just this one.
+        drop(ctx.spill_root);
 
         let rollback_cursors: BTreeMap<String, u64> = ctx
             .rollback_cursors
