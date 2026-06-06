@@ -166,6 +166,24 @@ cap, and compression decision documented above, `--explain` surfaces three
 storage-observability sections, and a real `clinker run` reports the matching
 *actuals* at end-of-run so you can calibrate the estimate.
 
+**A note on byte units.** Three different unit conventions appear across the
+storage surface, and it helps to know which is which before comparing figures:
+
+- **Config values you write** (`disk_cap_bytes = "10GB"`) use **decimal** units
+  — `1GB` = 1,000,000,000 bytes — matching `du`, `df`, and the AWS CLI (see
+  [the disk-cap grammar](#storagespilldisk_cap_bytes--cap-cumulative-spill)).
+- **The `=== Estimated Spill Volume ===` section** humanizes with **binary**
+  suffixes — `K`/`M`/`G` = KiB/MiB/GiB — so it lines up with the
+  `predicted_peak` figure on each stage's Physical Properties line, which uses
+  the same humanizer.
+- **The cap-headroom line and the post-run actuals** print **raw bytes** with no
+  suffix, so the cap-minus-estimate subtraction and the estimate-vs-actual
+  comparison are exact rather than rounded.
+
+When you calibrate the estimate against the post-run actual, convert the binary
+estimate suffix to bytes first (`1K` = 1024 bytes, `1M` = 1,048,576 bytes) so you
+are comparing the same unit the actuals report.
+
 ### Estimated spill volume per stage
 
 The `=== Estimated Spill Volume ===` section lists one line per blocking stage
@@ -230,9 +248,10 @@ Source 'orders':
 
 The reuse prediction runs the exact freshness check (mtime + size against the
 committed manifest) the real run makes, read-only — `--explain` copies nothing.
-A source that matches no staging pattern reports `staged: no (reads in place)`;
-a network source reports `not stagable`. When staging is disabled the section
-states that every source reads in place.
+A source that matches no staging pattern reports
+`staged: no (no pattern match, reads in place)`; a network source reports
+`not stagable (network source reads in place)`. When staging is disabled the
+section states that every source reads in place.
 
 ### Cap headroom
 
