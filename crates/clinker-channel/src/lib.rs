@@ -61,4 +61,6 @@ pub use binding::{
 };
 pub use error::ChannelError;
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
-pub use staging_copy::{ReuseDecision, SourceStager, StagingError, StagingPlanEntry};
+pub use staging_copy::{
+    ReuseDecision, SourceStager, StagingError, StagingPlanEntry, open_source_file,
+};

@@ -1043,7 +1043,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // `read_path()` and stays agnostic to staging.
             let staged = source_stager.resolve(path.clone()).map_err(staging_error)?;
             let read_path = staged.read_path().to_path_buf();
-            let file = std::fs::File::open(&read_path)?;
+            // `resolve` returned holding this source's shared advisory read lock
+            // (retained inside `source_stager` for the run), so between that
+            // return and this open a concurrent run's cleanup/overwrite — which
+            // need the exclusive lock — cannot remove or replace the staged file.
+            // `open_source_file` adds the Windows FILE_SHARE_DELETE share mode so
+            // a concurrent atomic-rename publish or delete still interoperates
+            // with this open handle on Windows.
+            let file = clinker_channel::open_source_file(&read_path)?;
             slots.push(clinker_exec::source::multi_file::FileSlot::new(
                 path.clone(),
                 Box::new(file),

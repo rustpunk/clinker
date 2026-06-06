@@ -52,30 +52,47 @@
 //! source from writing the same partial — each writes its own — so they race
 //! only on the per-source lock, never on the in-flight bytes.
 //!
-//! ## Concurrency: one copy under a per-source lock
+//! ## Concurrency: a per-source reader-writer lock
 //!
 //! Clinker's partition-and-run scaling story has several `clinker` processes
-//! over one partitioned input share a single staging volume, so two siblings
-//! routinely stage the *same* shared source at the same time. Without
-//! coordination both would see "not staged yet", both copy, and one run's
-//! startup [`SourceStager::crash_purge`] could reap the other's in-flight
-//! `.partial`. Two mechanisms make concurrent staging of one source correct:
+//! over one partitioned input share a single staging volume, so independent
+//! runs routinely stage, reuse, *and* clean up the *same* shared source at the
+//! same time. Without coordination two runs would both copy, a cleanup could
+//! delete a file another run is reading, and a startup
+//! [`SourceStager::crash_purge`] could reap a sibling's in-flight `.partial`.
 //!
-//! - **A per-source advisory lock** (`<source_id>.lock` under the staging root,
-//!   an `fs4` OS lock — `flock` on Unix, `LockFileEx` on Windows). A stage takes
-//!   the exclusive lock, *re-checks* reuse-if-fresh **under** the lock (so a
-//!   sibling that just published wins and the loser reuses without copying),
-//!   else copies, publishes `.staged`, writes the manifest, and only then
-//!   releases the lock. A concurrent sibling blocks on the lock and, on
-//!   acquiring it, finds the now-fresh `.staged` and reuses it — exactly one
-//!   copy of a given source across any number of overlapping invocations. The
-//!   kernel drops the lock when the process exits (clean, panicked, or killed),
-//!   so a crash never strands it.
+//! The per-source `<source_id>.lock` is a **reader-writer advisory lock** (an
+//! `fs4` OS lock — `flock` on Unix, `LockFileEx` on Windows) that makes every
+//! overlap safe cross-platform. The kernel drops the lock when the process exits
+//! (clean, panicked, or killed), so a crash never strands it.
+//!
+//! - **Writers take it exclusively.** A stage (copy + publish) holds the
+//!   *exclusive* lock for its critical section: it re-checks reuse-if-fresh under
+//!   the lock (so a sibling that just published wins and the loser reuses without
+//!   copying), else copies, publishes `.staged`, and writes the manifest — so a
+//!   source is copied exactly once across any number of overlapping invocations.
+//!   Cleanup and crash-purge also take the exclusive lock to remove a pair.
+//! - **Readers take it shared.** [`SourceStager::resolve`] holds the *shared*
+//!   lock from the reuse decision through the caller's `File::open` and for the
+//!   whole read (see [`SourceStager::cleanup`], which releases it). Any number of
+//!   readers share the lock at once, while the exclusive lock a concurrent
+//!   cleanup or overwrite needs blocks until every reader finishes — so a live
+//!   reader's `.staged` file is never deleted or replaced underneath it. Cleanup
+//!   probes the exclusive lock with a *try-lock*: a held shared lock means a live
+//!   reader, so the pair is kept rather than yanked.
 //! - **A liveness-aware crash-purge.** A `.partial` is reaped only when its
 //!   owning run is genuinely dead — its `<source_id>.lock` is *acquirable* under
 //!   a try-lock — and it is older than a short creation grace window. A live
 //!   sibling's in-flight `.partial` (lock held, or too young to have taken the
-//!   lock yet) is never reaped. This mirrors the executor's spill crash-purge.
+//!   lock yet) is never reaped. A manifestless `.staged` (or stagedless manifest)
+//!   is likewise removed only under a successful try-exclusive, so the purge
+//!   never reaps a copy a sibling is mid-publish on. This mirrors the executor's
+//!   spill crash-purge.
+//!
+//! On Windows the staged copy is opened (via [`open_source_file`]) with a share
+//! mode including `FILE_SHARE_DELETE`, so a concurrent atomic-rename publish or
+//! delete interoperates with an open reader exactly as it does on POSIX, where an
+//! unlinked-but-open file stays readable.
 //!
 //! ## Copy invariants
 //!
@@ -100,7 +117,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use clinker_plan::config::{Cleanup, OnExisting, StagedPath, StagingPolicy, StagingVerify};
+use clinker_plan::config::{
+    Cleanup, OnExisting, StagedPath, StagingMatcher, StagingPolicy, StagingVerify,
+};
 // `fs4::FileExt` adds `lock` (blocking exclusive) / `try_lock` (non-blocking
 // exclusive) / `unlock` to `std::fs::File` under the crate's `sync` feature (the
 // only fs4 feature this workspace enables), giving one cross-platform OS
@@ -352,12 +371,22 @@ pub struct StagingPlanEntry {
 /// touches the filesystem.
 pub struct SourceStager {
     policy: StagingPolicy,
+    /// The staging glob patterns compiled once at construction, reused for every
+    /// per-source match check this stager makes — `resolve` and `plan_entry`
+    /// both probe each source against it without recompiling the globs per path.
+    matcher: StagingMatcher,
     /// Cumulative bytes copied this run, checked against the disk cap. A reused
     /// (skipped) copy charges nothing — only bytes actually written count.
     bytes_staged: u64,
     /// Stable paths of every staged copy this run produced or reused, used by
     /// [`SourceStager::cleanup`] to remove them per the cleanup policy.
     produced: Vec<PathBuf>,
+    /// One held **shared** read lock per staged source this run resolved, kept
+    /// alive for the whole run so no concurrent sibling's cleanup/overwrite can
+    /// delete or replace a `.staged` file this run is reading. Released in
+    /// [`SourceStager::cleanup`] just before this run removes its own copies, so
+    /// our own exclusive-locked removal never blocks on our own read locks.
+    read_guards: Vec<SourceReadGuard>,
 }
 
 impl SourceStager {
@@ -367,10 +396,13 @@ impl SourceStager {
     /// be writable (validated at startup); files land directly under it at
     /// content-addressed paths on the first source that actually stages.
     pub fn new(policy: StagingPolicy) -> Self {
+        let matcher = policy.compile_matcher();
         Self {
             policy,
+            matcher,
             bytes_staged: 0,
             produced: Vec::new(),
+            read_guards: Vec::new(),
         }
     }
 
@@ -389,11 +421,19 @@ impl SourceStager {
     /// (`verify = blake3`), the disk cap would be exceeded, or
     /// `on_existing = error` and a staged copy already exists.
     pub fn resolve(&mut self, original: PathBuf) -> Result<StagedPath, StagingError> {
-        if !self.policy.pattern_matches(&original) {
+        if !self.matcher.matches(&original) {
             return Ok(StagedPath::in_place(original));
         }
-        let staged = self.stage_or_reuse(&original)?;
+        let (staged, guard) = self.stage_or_reuse(&original)?;
         self.produced.push(staged.staged_path.clone());
+        // Retain the held shared read lock for the rest of the run. It closes
+        // the publish→open window: between this `resolve` returning and the
+        // caller's `File::open`, a concurrent sibling's cleanup or overwrite
+        // would need the per-source *exclusive* lock, which this still-held
+        // shared lock blocks — so the `.staged` file the caller is about to open
+        // cannot vanish or be replaced underneath it. The guard lives until
+        // [`SourceStager::cleanup`] releases it at end of run.
+        self.read_guards.push(guard);
         // Record the copy's provenance: the operator (and any post-run audit)
         // wants the source, its size, the local copy, and the verified digest
         // so a staged run is traceable back to exact bytes.
@@ -422,7 +462,7 @@ impl SourceStager {
     /// copy path. An in-place source (staging disabled or no pattern match)
     /// returns `staged = false` and a [`ReuseDecision::NotApplicable`].
     pub fn plan_entry(&self, source: &Path) -> StagingPlanEntry {
-        if !self.policy.pattern_matches(source) {
+        if !self.matcher.matches(source) {
             return StagingPlanEntry {
                 source: source.to_path_buf(),
                 staged: false,
@@ -472,85 +512,176 @@ impl SourceStager {
     }
 
     /// Apply `on_existing` against the stable staged path for `source`, either
-    /// reusing a fresh prior copy or (re-)staging — serialized against concurrent
-    /// siblings staging the same source by a per-source advisory lock.
+    /// reusing a fresh prior copy or (re-)staging, and return both the resolved
+    /// [`StagedFile`] and a **held shared read lock** the caller keeps alive
+    /// across `File::open` and the whole read.
     ///
-    /// The lock is what makes one copy across overlapping invocations: a sibling
-    /// that loses the race blocks here, then acquires the lock to find the
-    /// winner's freshly published `.staged` and reuses it. The reuse-if-fresh
-    /// check therefore runs **under** the lock (the [`stage_locked`] body), not
-    /// before it — a check before the lock would see "not staged" and copy
-    /// redundantly.
+    /// The per-source `<source_id>.lock` is used as a reader-writer lock to
+    /// serialize against concurrent siblings sharing the same staged source:
     ///
-    /// [`stage_locked`]: Self::stage_locked
-    fn stage_or_reuse(&mut self, source: &Path) -> Result<StagedFile, StagingError> {
-        let source_id = source_id(source);
-        let root = self.staging_root().to_path_buf();
-        let lock_path = root.join(format!("{source_id}.{LOCK_EXT}"));
-
-        // Hold the per-source lock for the whole reuse-or-stage decision so a
-        // concurrent sibling cannot interleave between the freshness check and
-        // the publish. The lock file is created if absent and kept open until
-        // the guard drops at the end of this function; the kernel releases the
-        // OS lock on drop (and on any process exit), so a crash never strands it.
-        let _guard = SourceLock::acquire(&lock_path)?;
-        self.stage_locked(source, &source_id, &root)
-    }
-
-    /// The locked critical section: re-check reuse-if-fresh, then (re-)stage if
-    /// needed. Always called with the per-source lock held.
-    fn stage_locked(
+    /// - A **stage** (copy + publish) takes the *exclusive* lock for its
+    ///   critical section, so exactly one sibling copies across overlapping
+    ///   invocations; the rest block, then reuse the freshly published copy.
+    /// - A **reader** holds a *shared* lock for as long as the `.staged` file is
+    ///   open, so any number of concurrent readers coexist while
+    ///   cleanup/overwrite (which take the exclusive lock) wait for every reader
+    ///   to finish.
+    ///
+    /// The returned guard is the reader's shared lock. It is acquired and
+    /// re-validated so that on return a committed, fresh `.staged` exists **and**
+    /// this run holds a shared lock on it — closing the window in which a
+    /// concurrent stage or cleanup could replace or delete the file between the
+    /// reuse decision and the caller's open.
+    fn stage_or_reuse(
         &mut self,
         source: &Path,
-        source_id: &str,
-        root: &Path,
-    ) -> Result<StagedFile, StagingError> {
+    ) -> Result<(StagedFile, SourceReadGuard), StagingError> {
+        let source_id = source_id(source);
+        let root = self.staging_root().to_path_buf();
         let staged_path = root.join(format!("{source_id}.{STAGED_EXT}"));
         let manifest_path = root.join(format!("{source_id}{MANIFEST_SUFFIX}"));
+        let lock_path = root.join(format!("{source_id}.{LOCK_EXT}"));
 
-        let existing = load_clean_manifest(&staged_path, &manifest_path);
+        // A bounded retry: under normal operation the first iteration returns.
+        // A second pass only happens in the rare event that a concurrent
+        // sibling's cleanup deleted the just-published copy in the instant
+        // between releasing the exclusive stage lock and re-taking the shared
+        // read lock below — in which case this run re-stages. The bound keeps a
+        // pathological cleanup/stage ping-pong from looping forever; in practice
+        // it converges on the first or second pass.
+        const MAX_RESTAGE_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_RESTAGE_ATTEMPTS {
+            // Take the shared read lock FIRST. Holding it means no sibling can
+            // take the exclusive lock to delete or overwrite the staged pair
+            // while we inspect it and (on a hit) hand it to the caller.
+            let guard = SourceReadGuard::acquire(&lock_path)?;
 
+            // Decide under the shared lock whether a committed fresh copy can be
+            // reused without copying a byte.
+            if let Some(reuse) =
+                self.try_reuse_under_read_lock(source, &staged_path, &manifest_path)?
+            {
+                return Ok((reuse, guard));
+            }
+
+            // No reusable copy (absent, stale, or `on_existing` forces a copy).
+            // Drop the shared lock and take the exclusive lock to (re-)stage:
+            // the exclusive lock blocks until every other reader/writer of this
+            // source has finished, so the copy never races a live reader.
+            drop(guard);
+            let staged = self.stage_under_exclusive_lock(
+                source,
+                &source_id,
+                &staged_path,
+                &manifest_path,
+                &lock_path,
+            )?;
+
+            // Re-take the shared read lock and confirm the copy we just
+            // published is still the committed copy on disk. If a concurrent
+            // cleanup removed it in the gap, loop and re-stage.
+            let guard = SourceReadGuard::acquire(&lock_path)?;
+            if load_clean_manifest(&staged_path, &manifest_path).is_some() {
+                return Ok((staged, guard));
+            }
+            drop(guard);
+        }
+
+        // Exhausting the retry bound means a sibling kept deleting the copy as
+        // fast as this run published it — a misconfiguration (e.g. two runs with
+        // contradictory cleanup policies racing the same source), surfaced as an
+        // I/O error rather than an infinite loop.
+        Err(StagingError::Io {
+            path: staged_path,
+            source: io::Error::other(
+                "staged copy was repeatedly removed by a concurrent run before it could be opened",
+            ),
+        })
+    }
+
+    /// Under a held shared read lock, decide whether a committed fresh staged
+    /// copy can be reused. Returns `Some(StagedFile)` on a reuse hit, `None`
+    /// when a (re-)stage is required.
+    ///
+    /// `on_existing = error` with an existing copy is the one case that fails
+    /// rather than returning a decision.
+    fn try_reuse_under_read_lock(
+        &self,
+        source: &Path,
+        staged_path: &Path,
+        manifest_path: &Path,
+    ) -> Result<Option<StagedFile>, StagingError> {
+        let existing = load_clean_manifest(staged_path, manifest_path);
         match self.policy.on_existing {
             OnExisting::Error => {
                 if existing.is_some() {
                     return Err(StagingError::AlreadyExists {
                         source_path: source.to_path_buf(),
-                        staged_path,
+                        staged_path: staged_path.to_path_buf(),
                     });
                 }
+                Ok(None)
             }
             OnExisting::Reuse => {
                 if let Some(manifest) = existing {
                     let meta = stat(source)?;
                     if manifest.matches_source(&meta) {
-                        // Fresh match under the lock: either a prior run staged
-                        // it, or a concurrent sibling just published it while we
-                        // blocked on the lock. Either way reuse it and copy no
-                        // bytes — this is the cache hit that makes overlapping
+                        // Fresh match under the read lock: a prior run or a
+                        // concurrent sibling published it. Reuse it, copy no
+                        // bytes — the cache hit that makes overlapping
                         // invocations copy a source exactly once.
                         tracing::info!(
                             source = %source.display(),
                             staged = %staged_path.display(),
                             "reusing fresh staged copy (mtime + size match)"
                         );
-                        return Ok(StagedFile {
-                            staged_path,
+                        return Ok(Some(StagedFile {
+                            staged_path: staged_path.to_path_buf(),
                             manifest,
-                        });
+                        }));
                     }
-                    // Stale: the source was rewritten. Fall through to re-stage.
                 }
+                // Absent or stale: re-stage.
+                Ok(None)
             }
-            OnExisting::Overwrite => {}
+            // `overwrite` always re-copies.
+            OnExisting::Overwrite => Ok(None),
+        }
+    }
+
+    /// Take the per-source *exclusive* lock and (re-)stage the source under it.
+    ///
+    /// Re-checks reuse-if-fresh under the exclusive lock first (a sibling may
+    /// have published while this run dropped the shared lock to escalate), so a
+    /// late winner is reused rather than redundantly recopied; otherwise removes
+    /// any prior pair and copies fresh. `on_existing = error` with an existing
+    /// copy is already rejected by the shared-lock reuse check before this runs,
+    /// so this only ever reuses or copies.
+    fn stage_under_exclusive_lock(
+        &mut self,
+        source: &Path,
+        source_id: &str,
+        staged_path: &Path,
+        manifest_path: &Path,
+        lock_path: &Path,
+    ) -> Result<StagedFile, StagingError> {
+        let _guard = SourceLock::acquire(lock_path)?;
+
+        // Re-check reuse under the exclusive lock: a sibling that won the race
+        // while we held no lock may have published a fresh copy, in which case
+        // this run reuses it without copying.
+        if let Some(reuse) = self.try_reuse_under_read_lock(source, staged_path, manifest_path)? {
+            return Ok(reuse);
         }
 
         // (Re-)stage. Remove any prior staged copy + manifest first so a stale
         // or partial artifact never coexists with the fresh one; the manifest
         // is unlinked before the copy so a crash mid-copy cannot leave a fresh
-        // `.staged` paired with a stale manifest.
-        let _ = std::fs::remove_file(&manifest_path);
-        let _ = std::fs::remove_file(&staged_path);
-        self.stage_file(source, source_id, &staged_path, &manifest_path)
+        // `.staged` paired with a stale manifest. Both removals happen under the
+        // exclusive lock, so no concurrent reader can be yanked.
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(staged_path);
+        self.stage_file(source, source_id, staged_path, manifest_path)
     }
 
     /// Copy one selected source to its stable staged path with inline hashing,
@@ -725,34 +856,54 @@ impl SourceStager {
     /// Best-effort: a removal failure is logged, not propagated — cleanup must
     /// not turn a successful run into a failure, and the next run's
     /// [`SourceStager::crash_purge`] reaps anything left behind.
-    pub fn cleanup(&self, success: bool) {
+    ///
+    /// **Lock-gated and liveness-aware.** This run's own shared read locks are
+    /// released first (so its own removal does not block on them), then each
+    /// staged pair is removed only while holding that source's *exclusive* lock,
+    /// taken with a non-blocking try-lock. A concurrent sibling still reading the
+    /// same staged source holds a shared lock, which fails the try-exclusive — so
+    /// cleanup skips that pair rather than yanking a file out from under a live
+    /// reader. The skipped copy is reaped by whichever run last releases it, or
+    /// by a later [`SourceStager::crash_purge`].
+    pub fn cleanup(&mut self, success: bool) {
         let remove = match self.policy.cleanup {
             Cleanup::Always => true,
             Cleanup::OnSuccess => success,
             Cleanup::Never => false,
         };
+        // Release this run's read locks unconditionally: the run is over, so the
+        // files it was reading no longer need protection from *this* run, and a
+        // retained guard would otherwise block our own exclusive-locked removal.
+        self.read_guards.clear();
         if !remove {
             return;
         }
         for staged in &self.produced {
-            remove_staged_pair(staged);
+            remove_staged_pair_locked(staged);
         }
     }
 
     /// Idempotently reap the staged artifacts a crashed prior run left behind,
     /// run once at startup before any source is staged.
     ///
-    /// A crash leaves three orphan shapes under the staging root:
+    /// A crash leaves three orphan shapes under the staging root, each reaped
+    /// only when no live run owns the source (a held `<source_id>.lock` keeps
+    /// the artifact):
     ///
     /// - `<source_id>.<run_uuid>.partial` — an interrupted copy. Reaped **only
-    ///   when its owning run is dead**: liveness-aware, so a concurrent sibling's
-    ///   in-flight partial is never reaped. See `partial_is_orphaned`.
-    /// - `*.staged` with no matching `*.manifest.json` — a copy that crashed
-    ///   after the rename but before the manifest was published. The manifest is
-    ///   the committed-copy marker, so a manifestless `.staged` is always an
-    ///   orphan regardless of liveness. Reaped.
+    ///   when its owning run is dead**: liveness-aware via a try-lock plus a
+    ///   creation-grace window, so a concurrent sibling's in-flight partial is
+    ///   never reaped. See `partial_is_orphaned`.
+    /// - `*.staged` with no matching `*.manifest.json` — usually a copy that
+    ///   crashed after the rename but before the manifest was published. But a
+    ///   live sibling mid-stage holds the exclusive lock across its own
+    ///   publish→commit window, so reaping is gated on a *successful try-exclusive
+    ///   lock*: a held lock (a live writer, or a live reader's shared lock) keeps
+    ///   the file; only a lockless one is reaped.
     /// - `*.manifest.json` with no matching `*.staged` — a manifest whose staged
-    ///   file was removed. Reaped.
+    ///   file was removed. Reaped under the same try-exclusive-lock gate, so a
+    ///   sibling re-staging (which removes then re-copies under the lock) is not
+    ///   raced.
     ///
     /// A clean pair (`.staged` + matching `.manifest.json`) is the reuse cache
     /// and is **kept** — reuse-if-fresh depends on it surviving across runs. A
@@ -804,13 +955,16 @@ impl SourceStager {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_orphan = if name.ends_with(MANIFEST_PARTIAL_SUFFIX) {
+            // Decide whether this entry is an orphan and, when it is, whether
+            // removing it must be gated on the source's exclusive lock so a live
+            // sibling's in-flight artifact is never yanked.
+            let reap = if name.ends_with(MANIFEST_PARTIAL_SUFFIX) {
                 // An in-flight manifest write. It is created and atomically
                 // renamed in one tight step under the per-source lock, so a
                 // leftover is unambiguously a crash corpse — reaped outright.
                 // (Checked before the copy-partial arm, which would otherwise
                 // misparse this longer suffix.)
-                true
+                Reap::Unconditional
             } else if let Some(stem) = name.strip_suffix(PARTIAL_SUFFIX) {
                 // Liveness-aware: only reap a copy partial whose owning run is
                 // dead (its per-source lock is acquirable) and which has aged
@@ -819,27 +973,67 @@ impl SourceStager {
                 // is hyphenated, never dotted), so the source id is the segment
                 // before the final dot.
                 let source_id = stem.rsplit_once('.').map_or(stem, |(id, _uuid)| id);
-                partial_is_orphaned(&path, root, source_id, grace)
+                if partial_is_orphaned(&path, root, source_id, grace) {
+                    Reap::Unconditional
+                } else {
+                    Reap::Keep
+                }
             } else if let Some(id) = name.strip_suffix(&format!(".{STAGED_EXT}")) {
-                // Orphan when the matching manifest is absent.
-                !root.join(format!("{id}{MANIFEST_SUFFIX}")).exists()
+                // A `.staged` with no manifest. Usually a crash-before-commit
+                // corpse, but it can also be a live sibling's freshly renamed
+                // copy in the publish→commit window (the sibling holds the
+                // exclusive lock until the manifest lands). So reaping is gated
+                // on the source's exclusive lock: a held lock means a live
+                // writer, and the copy is kept.
+                if root.join(format!("{id}{MANIFEST_SUFFIX}")).exists() {
+                    Reap::Keep // committed pair: the reuse cache
+                } else {
+                    Reap::LockGated {
+                        lock_path: root.join(format!("{id}.{LOCK_EXT}")),
+                    }
+                }
             } else if let Some(id) = name.strip_suffix(MANIFEST_SUFFIX) {
-                // Orphan when the matching staged copy is absent.
-                !root.join(format!("{id}.{STAGED_EXT}")).exists()
+                // A manifest with no `.staged`. A crash corpse, but a live
+                // sibling re-staging holds the exclusive lock across the
+                // remove-then-copy step, so gate the reap on that lock too.
+                if root.join(format!("{id}.{STAGED_EXT}")).exists() {
+                    Reap::Keep // committed pair
+                } else {
+                    Reap::LockGated {
+                        lock_path: root.join(format!("{id}.{LOCK_EXT}")),
+                    }
+                }
             } else {
                 // `.staged` reuse cache, `.lock` coordination files, and
                 // anything else are not orphans.
-                false
+                Reap::Keep
             };
-            if is_orphan {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => reaped += 1,
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "staging crash-purge failed to remove an orphaned artifact"
-                    ),
+
+            let removed = match reap {
+                Reap::Keep => false,
+                Reap::Unconditional => reap_file(&path),
+                Reap::LockGated { lock_path } => {
+                    // Gate on the exclusive lock: a live reader (shared) or a
+                    // live writer (exclusive) of this source fails the try-lock,
+                    // so its artifact is kept. A successful try means no live
+                    // owner — the artifact is a corpse and is removed under the
+                    // held lock.
+                    match SourceLock::try_acquire(&lock_path) {
+                        Ok(Some(guard)) => {
+                            let removed = reap_file(&path);
+                            drop(guard);
+                            removed
+                        }
+                        // A live sibling holds the lock — keep the artifact.
+                        Ok(None) => false,
+                        // Lock file unopenable (broken root): reap unconditionally
+                        // rather than leak an orphan forever.
+                        Err(_) => reap_file(&path),
+                    }
                 }
+            };
+            if removed {
+                reaped += 1;
             }
         }
         if reaped > 0 {
@@ -852,9 +1046,65 @@ impl SourceStager {
     }
 }
 
-/// An RAII guard over a held per-source advisory lock. The exclusive `fs4` lock
-/// is released — and the lock file handle closed — when this drops, which also
-/// happens automatically if the process exits while holding it.
+/// How the crash-purge should treat one staging-root entry.
+enum Reap {
+    /// Not an orphan — leave it alone.
+    Keep,
+    /// An unambiguous crash corpse — remove it without a liveness probe.
+    Unconditional,
+    /// A possible orphan whose removal must be gated on the source's exclusive
+    /// lock, so a live sibling's in-flight artifact is never yanked.
+    LockGated { lock_path: PathBuf },
+}
+
+/// Remove one crash-purge artifact, logging a non-`NotFound` failure. Returns
+/// whether a file was actually removed.
+fn reap_file(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "staging crash-purge failed to remove an orphaned artifact"
+            );
+            false
+        }
+    }
+}
+
+/// Open the per-source `<source_id>.lock` file for locking, creating it if
+/// absent.
+///
+/// The lock file is owner-only on Unix like every other staging-root entry,
+/// since it sits on the same potentially-shared volume. Opened read-write so the
+/// same handle can take either a shared or an exclusive `fs4` lock (some
+/// platforms require write access for an exclusive lock).
+fn open_lock_file(lock_path: &Path) -> Result<File, StagingError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(lock_path).map_err(|e| StagingError::Io {
+        path: lock_path.to_path_buf(),
+        source: e,
+    })
+}
+
+/// An RAII guard over a held per-source **exclusive** advisory lock, taken by a
+/// stager during the copy/publish critical section and by cleanup/crash-purge
+/// during removal. The `fs4` exclusive lock is released — and the lock file
+/// handle closed — when this drops, which also happens automatically if the
+/// process exits while holding it.
+///
+/// Exclusive blocks both other exclusive holders (so exactly one sibling copies)
+/// and shared readers (so a removal/overwrite waits for every live reader of the
+/// source to finish), making cleanup and overwrite liveness-aware by
+/// construction.
 struct SourceLock {
     file: File,
 }
@@ -863,9 +1113,7 @@ impl SourceLock {
     /// Create (if absent) and exclusively lock `<source_id>.lock`, blocking
     /// until the lock is acquired.
     ///
-    /// The lock file is owner-only on Unix like every other staging-root entry,
-    /// since it sits on the same potentially-shared volume. The blocking
-    /// `lock_exclusive` is what serializes concurrent stages of one source: a
+    /// The blocking `lock` is what serializes concurrent stages of one source: a
     /// sibling waits here rather than racing into a redundant copy.
     ///
     /// # Errors
@@ -873,7 +1121,7 @@ impl SourceLock {
     /// Returns [`StagingError::Io`] when the lock file cannot be created or the
     /// OS lock call fails outright.
     fn acquire(lock_path: &Path) -> Result<Self, StagingError> {
-        let file = open_owner_only(lock_path)?;
+        let file = open_lock_file(lock_path)?;
         // fs4's `lock` is the blocking exclusive lock (`flock(LOCK_EX)` on Unix,
         // `LockFileEx` with the exclusive flag on Windows).
         FileExt::lock(&file).map_err(|e| StagingError::Io {
@@ -882,6 +1130,26 @@ impl SourceLock {
         })?;
         Ok(Self { file })
     }
+
+    /// Try to take the exclusive lock without blocking, for a liveness probe.
+    ///
+    /// Returns `Some(guard)` when the lock was acquired (no live reader or
+    /// writer holds the source's lock), `None` when it is currently held (a live
+    /// sibling is reading or staging). An I/O error opening the lock file (not a
+    /// contention `WouldBlock`) propagates so a genuinely unreadable lock file is
+    /// not silently treated as "no live owner".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StagingError::Io`] when the lock file cannot be opened.
+    fn try_acquire(lock_path: &Path) -> Result<Option<Self>, StagingError> {
+        let file = open_lock_file(lock_path)?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => Ok(Some(Self { file })),
+            // `WouldBlock` (or any contention error): a live sibling holds it.
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 impl Drop for SourceLock {
@@ -889,6 +1157,47 @@ impl Drop for SourceLock {
         // Best-effort: an unlock failure cannot be propagated from Drop, and the
         // kernel releases the lock on the file handle's close (which Drop of
         // `self.file` triggers next) and unconditionally on process exit.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// An RAII guard over a held per-source **shared** advisory lock, taken by a
+/// reader for as long as it has a `.staged` file open.
+///
+/// Any number of shared readers coexist, so concurrent independent runs sharing
+/// one staged source all read it at once. A shared lock blocks the exclusive
+/// lock cleanup/overwrite/crash-purge take, so a held read guard guarantees the
+/// `.staged` file the reader opened cannot be deleted or replaced underneath it
+/// until the guard drops. Released — and the handle closed — on drop or process
+/// exit.
+struct SourceReadGuard {
+    file: File,
+}
+
+impl SourceReadGuard {
+    /// Create (if absent) and take a shared lock on `<source_id>.lock`, blocking
+    /// only while a writer (stage/cleanup) holds the exclusive lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StagingError::Io`] when the lock file cannot be created or the
+    /// OS lock call fails outright.
+    fn acquire(lock_path: &Path) -> Result<Self, StagingError> {
+        let file = open_lock_file(lock_path)?;
+        // fs4's `lock_shared` is the blocking shared lock (`flock(LOCK_SH)` on
+        // Unix, `LockFileEx` without the exclusive flag on Windows).
+        FileExt::lock_shared(&file).map_err(|e| StagingError::Io {
+            path: lock_path.to_path_buf(),
+            source: e,
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SourceReadGuard {
+    fn drop(&mut self) {
+        // Best-effort, same rationale as `SourceLock::drop`: the kernel releases
+        // the shared lock when the handle closes and on process exit.
         let _ = FileExt::unlock(&self.file);
     }
 }
@@ -1035,17 +1344,69 @@ fn write_manifest_atomic(path: &Path, manifest: &StagedManifest) -> Result<(), S
     fsync_parent_dir(path)
 }
 
-/// Remove a staged copy and its sidecar manifest. Best-effort: a missing file
-/// or a removal error is ignored, since cleanup and crash-purge both call this
-/// where a partial prior removal is expected.
-fn remove_staged_pair(staged: &Path) {
-    let _ = std::fs::remove_file(staged);
-    if let Some(id) = staged
+/// The `<id>` and staging root of a `<id>.staged` path, or `None` when the path
+/// is not a well-formed staged-copy name.
+fn staged_id_and_root(staged: &Path) -> Option<(&str, &Path)> {
+    let id = staged
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_suffix(&format!(".{STAGED_EXT}")))
-        && let Some(root) = staged.parent()
-    {
+        .and_then(|n| n.strip_suffix(&format!(".{STAGED_EXT}")))?;
+    let root = staged.parent()?;
+    Some((id, root))
+}
+
+/// Remove a staged copy and its sidecar manifest under the source's **exclusive
+/// lock**, taken with a non-blocking try-lock so a live reader's shared lock
+/// keeps its file.
+///
+/// The exclusive lock is the liveness gate: a concurrent run reading the same
+/// staged source holds the per-source *shared* lock, which makes the
+/// try-exclusive fail, so the pair is kept rather than deleted out from under
+/// the reader. When the try-lock succeeds no live reader exists, so the pair is
+/// removed under the held lock. The lock is released (handle dropped) before the
+/// removal on Windows, where an open lock-file handle does not block removal of
+/// the *sibling* `.staged`/manifest files — only the lock file itself, which is
+/// never removed here.
+///
+/// Best-effort: a missing file or a removal error is ignored, since cleanup and
+/// crash-purge both call this where a partial prior removal is expected. A
+/// kept-because-locked pair is left for whichever run last releases it, or a
+/// later [`SourceStager::crash_purge`].
+fn remove_staged_pair_locked(staged: &Path) {
+    let Some((id, root)) = staged_id_and_root(staged) else {
+        return;
+    };
+    let lock_path = root.join(format!("{id}.{LOCK_EXT}"));
+    // Try to take the exclusive lock. A live reader of this source holds a
+    // shared lock, so the try fails and we keep the pair — never yanking a file
+    // a sibling run is actively reading.
+    let guard = match SourceLock::try_acquire(&lock_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            // A live sibling holds the lock (reading or staging): keep the pair.
+            tracing::debug!(
+                staged = %staged.display(),
+                "staging cleanup kept a staged copy a concurrent run still holds"
+            );
+            return;
+        }
+        // Lock file unopenable: fall back to an unlocked remove rather than
+        // leak the pair. This only happens on a genuinely broken staging root.
+        Err(_) => {
+            remove_staged_pair_unlocked(staged);
+            return;
+        }
+    };
+    remove_staged_pair_unlocked(staged);
+    drop(guard);
+}
+
+/// Remove a staged copy and its sidecar manifest without locking. Callers must
+/// hold the source's exclusive lock (or be the crash-purge, which gates removal
+/// on its own liveness probe). Best-effort: missing files are ignored.
+fn remove_staged_pair_unlocked(staged: &Path) {
+    let _ = std::fs::remove_file(staged);
+    if let Some((id, root)) = staged_id_and_root(staged) {
         let _ = std::fs::remove_file(root.join(format!("{id}{MANIFEST_SUFFIX}")));
     }
 }
@@ -1074,6 +1435,47 @@ fn open_owner_only(path: &Path) -> Result<File, StagingError> {
         path: path.to_path_buf(),
         source: e,
     })
+}
+
+/// Open a resolved source path for reading, with a Windows share mode that lets
+/// it interoperate with a concurrent run's atomic-rename publish or
+/// liveness-gated delete of the same staged file.
+///
+/// The reader of a staged source holds the per-source *shared* advisory lock for
+/// the whole read (see [`SourceStager::resolve`]), so a concurrent overwrite or
+/// cleanup — which need the *exclusive* lock — cannot replace or delete the file
+/// while it is open. On Windows that lock interplay is not enough on its own: a
+/// plain `File::open` opens with no `FILE_SHARE_DELETE`, so the OS would refuse a
+/// concurrent `rename`-replace or delete of the open file even when the advisory
+/// lock permits it. Opening with `FILE_SHARE_READ | FILE_SHARE_WRITE |
+/// FILE_SHARE_DELETE` lets a concurrent atomic-rename publish or delete proceed
+/// while this handle stays valid and keeps reading the bytes it opened — the
+/// POSIX semantics where an unlinked-but-open file remains readable. The share
+/// flags come from `std::os::windows::fs::OpenOptionsExt`, std on Windows, so no
+/// dependency is added.
+///
+/// On Unix this is a plain `File::open`: an open fd already survives a concurrent
+/// `rename`/`unlink` of the path, so no extra flag is needed.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the path cannot be opened.
+pub fn open_source_file(path: &Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // winnt.h: FILE_SHARE_READ = 0x1, FILE_SHARE_WRITE = 0x2,
+        // FILE_SHARE_DELETE = 0x4. DELETE is the load-bearing one — it lets a
+        // concurrent run's atomic-rename publish or delete of this staged file
+        // succeed while this handle keeps reading.
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    opts.open(path)
 }
 
 /// Confirm the staged copy matches the source by re-hashing the source and
@@ -1300,9 +1702,15 @@ mod tests {
         let mut policy = policy_with_dir(stage_dir.path(), &["*.csv"]);
         policy.on_existing = OnExisting::Reuse;
 
-        let mut first = SourceStager::new(policy.clone());
-        let staged = first.resolve(src.clone()).unwrap().staged.unwrap();
-        assert_eq!(std::fs::read(&staged).unwrap(), b"v1");
+        // The first run stages, then ends — dropping its stager releases the
+        // shared read lock it held, so the second run's re-stage (which takes the
+        // exclusive lock) does not block on a still-live reader.
+        let staged = {
+            let mut first = SourceStager::new(policy.clone());
+            let staged = first.resolve(src.clone()).unwrap().staged.unwrap();
+            assert_eq!(std::fs::read(&staged).unwrap(), b"v1");
+            staged
+        };
 
         // Rewrite the source with a different *size* so the freshness check
         // (mtime + size) sees a stale manifest. The size change alone is the
@@ -1361,8 +1769,13 @@ mod tests {
         let src = src_dir.path().join("orders.csv");
         std::fs::write(&src, b"original").unwrap();
 
-        let mut seed = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
-        let staged = seed.resolve(src.clone()).unwrap().staged.unwrap();
+        // The seed run stages, then ends — dropping its stager releases the
+        // shared read lock so the overwrite run's exclusive re-stage does not
+        // block on a still-live reader.
+        let staged = {
+            let mut seed = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+            seed.resolve(src.clone()).unwrap().staged.unwrap()
+        };
         // Mutate the staged copy; overwrite must re-copy over it even though the
         // source is unchanged (overwrite ignores freshness, unlike reuse).
         std::fs::write(&staged, b"SENTINEL").unwrap();
