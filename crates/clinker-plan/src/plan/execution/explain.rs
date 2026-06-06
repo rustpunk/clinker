@@ -465,6 +465,17 @@ impl ExecutionPlanDag {
             }
         }
 
+        // Estimated spill volume per blocking stage. Plan-only (reads
+        // `predicted_peak_bytes` already computed by the volume-estimate pass),
+        // so it renders on every `--explain` path. A streaming-only pipeline
+        // has no spilling operator and adds nothing here.
+        let spill_estimate = self.spill_estimate_explain();
+        if !spill_estimate.is_empty() {
+            out.push_str("=== Estimated Spill Volume ===\n\n");
+            out.push_str(&spill_estimate);
+            out.push('\n');
+        }
+
         // Show route info from graph nodes
         for node in self.graph.node_weights() {
             if let PlanNode::Route {
@@ -946,6 +957,53 @@ impl ExecutionPlanDag {
     ) -> String {
         let mut out = self.explain_full_with_artifacts(config, artifacts);
         self.append_topology_section(&mut out);
+        out
+    }
+
+    /// Render the per-blocking-stage estimated spill volume for `--explain`.
+    ///
+    /// One line per spilling operator (hash Aggregate, external sort,
+    /// grace-hash / sort-merge / IEJoin / hash Combine) giving its plan-time
+    /// `predicted_peak_bytes` estimate, followed by a total. A stage whose
+    /// volume is unknown at plan time (no on-disk file-size seed reached it —
+    /// a `glob`/`regex` multi-file source, a network source, or a
+    /// missing/unreadable input) renders `unknown` instead of a misleading
+    /// `0B`, and the total notes that unknown stages are excluded. Returns an
+    /// empty string when the plan has no spill-eligible operator, so a
+    /// streaming-only pipeline adds no section.
+    ///
+    /// Bytes render in binary units (`G`/`M`/`K` = GiB/MiB/KiB), matching the
+    /// Physical Properties `predicted_peak` line these figures derive from.
+    pub fn spill_estimate_explain(&self) -> String {
+        let estimates = self.per_stage_spill_estimates();
+        if estimates.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("Estimated spill volume (per blocking stage):\n");
+        let mut total: u64 = 0;
+        let mut any_unknown = false;
+        for est in &estimates {
+            if est.estimate_bytes == 0 {
+                any_unknown = true;
+                out.push_str(&format!("  {} → unknown\n", est.display_name));
+            } else {
+                total = total.saturating_add(est.estimate_bytes);
+                out.push_str(&format!(
+                    "  {} → {}\n",
+                    est.display_name,
+                    format_bytes(est.estimate_bytes)
+                ));
+            }
+        }
+        if any_unknown {
+            out.push_str(&format!(
+                "  Total (known stages): {} (excludes stages whose volume is unknown at plan time — \
+                 a glob/regex multi-file source, a network source, or a missing input)\n",
+                format_bytes(total),
+            ));
+        } else {
+            out.push_str(&format!("  Total: {}\n", format_bytes(total)));
+        }
         out
     }
 

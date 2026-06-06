@@ -1175,7 +1175,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     consumer_handle,
                 )
                 .map_err(|e| grace_spill_error(e, name, "sort-merge matching-run spill failed"))?;
-                if written > 0 && budget.record_spill_bytes(written) {
+                if written > 0 && budget.record_spill_bytes(name, written) {
                     return Err(PipelineError::spill_cap_exceeded(
                         name,
                         budget.disk_quota(),

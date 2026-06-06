@@ -271,6 +271,61 @@ struct StagedFile {
     manifest: StagedManifest,
 }
 
+/// The reuse decision `clinker run --explain` reports for a staged source under
+/// `on_existing = reuse`.
+///
+/// `--explain` does no copy, but it can `stat` the source and read a committed
+/// manifest read-only to predict whether the real run would reuse a fresh prior
+/// copy (a cache *hit*) or re-stage (a *miss*). The decision is exactly the one
+/// [`SourceStager::stage_locked`] makes at run time, computed without touching
+/// the copy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseDecision {
+    /// `on_existing = reuse` and a committed staged copy matches the live source
+    /// (mtime + size) — the real run would reuse it and copy no bytes.
+    Hit,
+    /// `on_existing = reuse` but no fresh committed copy exists (absent, stale,
+    /// or orphaned) — the real run would re-stage.
+    Miss,
+    /// `on_existing` is not `reuse` (`overwrite` re-copies every run; `error`
+    /// fails on an existing copy), so the reuse-if-fresh cache does not apply.
+    NotApplicable,
+}
+
+impl ReuseDecision {
+    /// Lowercase label for the `--explain` staging-plan line.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReuseDecision::Hit => "hit",
+            ReuseDecision::Miss => "miss",
+            ReuseDecision::NotApplicable => "n/a",
+        }
+    }
+}
+
+/// A read-only prediction of what staging would do to one source, for
+/// `clinker run --explain`.
+///
+/// Computed by [`SourceStager::plan_entry`] without copying a byte: it reports
+/// whether the source matches a staging pattern (`staged`), the stable
+/// content-addressed path the copy would land at (`staged_path`, present only
+/// when staged), and — under `on_existing = reuse` — whether a fresh prior copy
+/// would be reused (`reuse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingPlanEntry {
+    /// The source path the pipeline author declared.
+    pub source: PathBuf,
+    /// Whether staging is enabled and this source matches a staging pattern.
+    /// `false` means the run reads the source in place.
+    pub staged: bool,
+    /// The stable `<staging_root>/<source_id>.staged` path the copy would land
+    /// at. `Some` only when `staged`; `None` for an in-place source.
+    pub staged_path: Option<PathBuf>,
+    /// The reuse-if-fresh cache decision the real run would make. Always
+    /// [`ReuseDecision::NotApplicable`] for an in-place source.
+    pub reuse: ReuseDecision,
+}
+
 /// Per-run staging engine: owns the staging-policy decision, the running byte
 /// total, and the set of staged files this run produced for cleanup.
 ///
@@ -342,6 +397,58 @@ impl SourceStager {
             original,
             staged: Some(staged.staged_path),
         })
+    }
+
+    /// Predict, read-only, what staging would do to `source` — for
+    /// `clinker run --explain`.
+    ///
+    /// Copies nothing and acquires no lock. Reports whether the source matches a
+    /// staging pattern, the stable content-addressed staged path it would land
+    /// at, and — under `on_existing = reuse` — whether a fresh prior copy would
+    /// be reused. The reuse check `stat`s the source and reads the committed
+    /// manifest exactly as the real run's [`Self::stage_locked`] does, so the
+    /// `--explain` prediction matches the run's decision without doing I/O on the
+    /// copy path. An in-place source (staging disabled or no pattern match)
+    /// returns `staged = false` and a [`ReuseDecision::NotApplicable`].
+    pub fn plan_entry(&self, source: &Path) -> StagingPlanEntry {
+        if !self.policy.pattern_matches(source) {
+            return StagingPlanEntry {
+                source: source.to_path_buf(),
+                staged: false,
+                staged_path: None,
+                reuse: ReuseDecision::NotApplicable,
+            };
+        }
+        let root = self.staging_root();
+        let source_id = source_id(source);
+        let staged_path = root.join(format!("{source_id}.{STAGED_EXT}"));
+        let manifest_path = root.join(format!("{source_id}{MANIFEST_SUFFIX}"));
+
+        let reuse = match self.policy.on_existing {
+            OnExisting::Reuse => {
+                // Mirror the run-time freshness check: a committed copy whose
+                // recorded mtime + size still match the live source is a hit.
+                match (
+                    load_clean_manifest(&staged_path, &manifest_path),
+                    std::fs::metadata(source),
+                ) {
+                    (Some(manifest), Ok(meta)) if manifest.matches_source(&meta) => {
+                        ReuseDecision::Hit
+                    }
+                    _ => ReuseDecision::Miss,
+                }
+            }
+            // `overwrite` re-copies every run; `error` aborts on an existing
+            // copy. Neither consults the reuse-if-fresh cache.
+            OnExisting::Overwrite | OnExisting::Error => ReuseDecision::NotApplicable,
+        };
+
+        StagingPlanEntry {
+            source: source.to_path_buf(),
+            staged: true,
+            staged_path: Some(staged_path),
+            reuse,
+        }
     }
 
     /// The staging root the policy targets. Present and validated whenever
@@ -1665,5 +1772,91 @@ mod tests {
         std::fs::write(&src, b"abcd").unwrap();
         let meta2 = std::fs::metadata(&src).unwrap();
         assert!(!back.matches_source(&meta2), "a size change is stale");
+    }
+
+    #[test]
+    fn plan_entry_in_place_when_disabled_or_unmatched() {
+        // Staging disabled → in place.
+        let stager = SourceStager::new(StagingPolicy::default());
+        let entry = stager.plan_entry(Path::new("/data/orders.csv"));
+        assert!(!entry.staged);
+        assert_eq!(entry.staged_path, None);
+        assert_eq!(entry.reuse, ReuseDecision::NotApplicable);
+
+        // Enabled but the pattern does not match → in place.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let stager = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+        let entry = stager.plan_entry(Path::new("/data/orders.json"));
+        assert!(!entry.staged);
+        assert_eq!(entry.staged_path, None);
+    }
+
+    #[test]
+    fn plan_entry_reports_staged_path_and_reuse_miss_when_absent() {
+        // A matched source under reuse with no prior copy → staged, reuse miss,
+        // and the staged path is the stable content-addressed path under root.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"a,b\n1,2\n").unwrap();
+        let policy = StagingPolicy {
+            on_existing: OnExisting::Reuse,
+            ..policy_with_dir(stage_dir.path(), &["*.csv"])
+        };
+        let stager = SourceStager::new(policy);
+        let entry = stager.plan_entry(&src);
+        assert!(entry.staged);
+        let expected = stage_dir
+            .path()
+            .join(format!("{}.{STAGED_EXT}", source_id(&src)));
+        assert_eq!(entry.staged_path.as_deref(), Some(expected.as_path()));
+        assert_eq!(
+            entry.reuse,
+            ReuseDecision::Miss,
+            "no prior copy exists, so the real run would re-stage"
+        );
+    }
+
+    #[test]
+    fn plan_entry_reports_reuse_hit_after_a_fresh_copy() {
+        // Stage once, then a read-only plan_entry under reuse predicts a hit —
+        // matching the run-time freshness check without copying again.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"a,b\n1,2\n").unwrap();
+        let policy = StagingPolicy {
+            on_existing: OnExisting::Reuse,
+            ..policy_with_dir(stage_dir.path(), &["*.csv"])
+        };
+        let mut stager = SourceStager::new(policy.clone());
+        stager.resolve(src.clone()).expect("first stage copies");
+
+        let planner = SourceStager::new(policy);
+        let entry = planner.plan_entry(&src);
+        assert!(entry.staged);
+        assert_eq!(
+            entry.reuse,
+            ReuseDecision::Hit,
+            "a committed fresh copy must predict a reuse hit"
+        );
+
+        // Rewriting the source makes the copy stale → the prediction flips to miss.
+        std::fs::write(&src, b"a,b\n1,2\n3,4\n").unwrap();
+        assert_eq!(planner.plan_entry(&src).reuse, ReuseDecision::Miss);
+    }
+
+    #[test]
+    fn plan_entry_reuse_not_applicable_under_overwrite() {
+        // Under the default overwrite policy the reuse cache does not apply even
+        // when a matching copy exists.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orders.csv");
+        std::fs::write(&src, b"a,b\n1,2\n").unwrap();
+        let stager = SourceStager::new(policy_with_dir(stage_dir.path(), &["*.csv"]));
+        let entry = stager.plan_entry(&src);
+        assert!(entry.staged);
+        assert_eq!(entry.reuse, ReuseDecision::NotApplicable);
     }
 }

@@ -384,7 +384,10 @@ impl StreamingChargeHandle {
             return Ok(());
         };
         let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-        if self.arbitrator.record_spill_bytes(file_bytes) {
+        if self
+            .arbitrator
+            .record_spill_bytes(&self.node_name, file_bytes)
+        {
             return Err(PipelineError::spill_cap_exceeded(
                 self.node_name.clone(),
                 self.arbitrator.max_spill_bytes(),

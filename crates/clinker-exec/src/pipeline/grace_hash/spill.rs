@@ -283,7 +283,7 @@ pub(super) fn process_spilled_partition(
             let (bpath, b_written) = bw
                 .finish()
                 .map_err(|e| grace_spill_error(e, name, "repartition build finalize"))?;
-            if budget.record_spill_bytes(b_written) {
+            if budget.record_spill_bytes(name, b_written) {
                 return Err(PipelineError::spill_cap_exceeded(
                     name,
                     budget.disk_quota(),
@@ -307,7 +307,7 @@ pub(super) fn process_spilled_partition(
                 let (p, p_written) = pw
                     .finish()
                     .map_err(|e| grace_spill_error(e, name, "repartition probe finalize"))?;
-                if budget.record_spill_bytes(p_written) {
+                if budget.record_spill_bytes(name, p_written) {
                     return Err(PipelineError::spill_cap_exceeded(
                         name,
                         budget.disk_quota(),

@@ -225,3 +225,74 @@ fn explain_nonzero_predictions_are_surfaced() {
         "the Source→Aggregate node_buffer edge must carry the producer's non-zero volume, got:\n{text}"
     );
 }
+
+/// The `=== Estimated Spill Volume ===` section lists one estimate per
+/// blocking stage and a total. With a sized 1 KiB input feeding a hash
+/// Aggregate, the section names the Aggregate at its `1K` predicted peak and
+/// reports a `1K` total — the per-stage estimate AC#1 surfaces.
+#[test]
+fn explain_renders_per_stage_spill_estimate() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_sized(tmp.path(), "orders.csv", &orders_csv_1kib(), 1024);
+
+    let text = render_explain_anchored(source_aggregate_output_yaml(), tmp.path());
+
+    assert!(
+        text.contains("=== Estimated Spill Volume ==="),
+        "explain text must carry the per-stage spill-estimate section, got:\n{text}"
+    );
+    let section_start = text
+        .find("=== Estimated Spill Volume ===")
+        .expect("estimate section present");
+    let section = &text[section_start..];
+    assert!(
+        section.contains("dept_totals") && section.contains("→ 1K"),
+        "the hash Aggregate stage must show its 1K estimate, got:\n{section}"
+    );
+    assert!(
+        section.contains("Total: 1K"),
+        "the section must report a 1K total for the single spilling stage, got:\n{section}"
+    );
+}
+
+/// A streaming-only pipeline (Source → Transform → Output, no blocking
+/// operator) has nothing that spills, so the estimate section is omitted
+/// entirely rather than rendering an empty or zero block.
+#[test]
+fn explain_omits_spill_estimate_for_streaming_only() {
+    let yaml = r#"
+pipeline:
+  name: streaming_only
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: transform
+    name: tag
+    input: orders
+    config:
+      cxl: |
+        emit department = department
+        emit amount = amount
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let text = render_explain(yaml);
+    assert!(
+        !text.contains("=== Estimated Spill Volume ==="),
+        "a streaming-only pipeline has no spilling stage, so the estimate section must be omitted, \
+         got:\n{text}"
+    );
+}

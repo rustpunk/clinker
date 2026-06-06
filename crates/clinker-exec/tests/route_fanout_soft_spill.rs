@@ -170,6 +170,22 @@ fn route_fanout_emits_spill_under_one_megabyte_budget() {
         report.cumulative_spill_bytes,
     );
 
+    // The per-stage spill breakdown (#176, AC#3) must be populated on a real
+    // run that spilled, attribute the bytes to a named node, and sum exactly to
+    // the pipeline-wide cumulative total — the per-stage actual an operator
+    // compares against the pre-run `--explain` per-stage estimate.
+    assert!(
+        !report.per_stage_spill_bytes.is_empty(),
+        "a run that spilled must populate the per-stage breakdown, got an empty map",
+    );
+    let per_stage_sum: u64 = report.per_stage_spill_bytes.values().sum();
+    assert_eq!(
+        per_stage_sum, report.cumulative_spill_bytes,
+        "the per-stage spill totals must sum to the pipeline-wide cumulative total \
+         (per_stage_sum={per_stage_sum}, cumulative={})",
+        report.cumulative_spill_bytes,
+    );
+
     assert_eq!(
         count_data_rows(&out_a.as_string()),
         ROWS_A,

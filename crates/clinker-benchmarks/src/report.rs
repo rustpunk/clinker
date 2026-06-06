@@ -423,6 +423,7 @@ mod tests {
                     io_write_delta: None,
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
+                    spill_bytes: 0,
                 },
                 StageMetrics {
                     name: StageName::TransformEval,
@@ -437,6 +438,7 @@ mod tests {
                     io_write_delta: Some(300_000),
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
+                    spill_bytes: 0,
                 },
                 StageMetrics {
                     name: StageName::Write,
@@ -451,6 +453,7 @@ mod tests {
                     io_write_delta: Some(50_000),
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
+                    spill_bytes: 0,
                 },
             ],
             per_source_file_watermarks: Default::default(),
@@ -460,6 +463,7 @@ mod tests {
             per_source_record_counts: Default::default(),
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
+            per_stage_spill_bytes: Default::default(),
             peak_consumer_usage_bytes: 0,
             interrupted: false,
         };
@@ -518,6 +522,7 @@ mod tests {
                     io_write_delta: None,
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
+                    spill_bytes: 0,
                 },
                 StageMetrics {
                     name: StageName::Write,
@@ -532,6 +537,7 @@ mod tests {
                     io_write_delta: None,
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
+                    spill_bytes: 0,
                 },
             ],
             per_source_file_watermarks: Default::default(),
@@ -541,6 +547,7 @@ mod tests {
             per_source_record_counts: Default::default(),
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
+            per_stage_spill_bytes: Default::default(),
             peak_consumer_usage_bytes: 0,
             interrupted: false,
         };

@@ -157,6 +157,126 @@ batch sizes from 256 B to 64 KiB and confirms `auto` tracks the faster of
 space-constrained volume, and `off` when spills are dominated by many small
 batches.
 
+## Observability — what the planner will do before you run
+
+`clinker run --explain` is plan-only (it reads no input and spills nothing), so
+it is the safe place to see what a run *would* do to the spill volume and to the
+staging dir before committing to it. On top of the resolved spill root, disk
+cap, and compression decision documented above, `--explain` surfaces three
+storage-observability sections, and a real `clinker run` reports the matching
+*actuals* at end-of-run so you can calibrate the estimate.
+
+### Estimated spill volume per stage
+
+The `=== Estimated Spill Volume ===` section lists one line per blocking stage
+(hash Aggregate, external sort, grace-hash / sort-merge / IEJoin / hash Combine)
+with its plan-time spill-volume estimate, followed by a total:
+
+```text
+=== Estimated Spill Volume ===
+
+Estimated spill volume (per blocking stage):
+  [aggregation:hash] dept_totals → 1K
+  [sort] by_amount → 4K
+  Total: 5K
+```
+
+Each figure is the operator's coarse predicted peak live state — the same
+`predicted_peak` the Physical Properties arbitration line shows — and bytes
+render in binary units (`K`/`M`/`G` = KiB/MiB/GiB). Summing rather than maxing is
+the conservative choice for a preflight: two blocking operators can be live and
+spilled at the same time, so their footprints add.
+
+A streaming-only pipeline (no blocking operator) has nothing that spills, so the
+section is omitted entirely.
+
+**Unknown stages.** The estimate is seeded from input file sizes resolved at
+plan time. A stage whose volume cannot be known before the run renders
+`unknown` instead of a misleading `0B`, and the total notes that unknown stages
+are excluded:
+
+```text
+  [aggregation:hash] dept_totals → unknown
+  Total (known stages): 0B (excludes stages whose volume is unknown at plan time
+  — a glob/regex multi-file source, a network source, or a missing input)
+```
+
+The seed is known for a single-file `path:` source and for an explicit `paths:`
+list (the listed files' sizes sum exactly, since the list carries no discovery
+filters). It is **unknown** for a `glob:` or `regex:` matcher — those fan out
+through the full discovery resolver (with `exclude`, `min_size`/`max_size`,
+`modified_after`/`before`, `take`, and sort filters), and estimating them at
+plan time would mean re-implementing that resolver and risk naming different
+bytes than the run actually reads. It is also unknown for a network source and
+for a missing or unreadable file. To get a concrete estimate for a glob/regex
+source, list the files explicitly with `paths:`, or check the post-run actuals
+below.
+
+### Staging plan per source
+
+When `storage.staging` is enabled, the `=== Staging Plan ===` section reports,
+for each source (and each discovered file under a multi-file matcher): whether
+it would be staged, the resolved content-addressed staged path, and — under
+`on_existing = reuse` — the reuse-if-fresh cache decision (`hit` if a committed
+prior copy still matches the live source, `miss` if it would be re-staged):
+
+```text
+=== Staging Plan ===
+
+Source 'orders':
+  /data/in/orders-2024.csv → staged: yes, path: /mnt/local/staging/3f2a…b1.staged, reuse: hit
+  /data/in/orders-2025.csv → staged: yes, path: /mnt/local/staging/9c4e…07.staged, reuse: miss
+```
+
+The reuse prediction runs the exact freshness check (mtime + size against the
+committed manifest) the real run makes, read-only — `--explain` copies nothing.
+A source that matches no staging pattern reports `staged: no (reads in place)`;
+a network source reports `not stagable`. When staging is disabled the section
+states that every source reads in place.
+
+### Cap headroom
+
+When a spill cap is configured, `--explain` reports the headroom (cap minus
+estimate) with the same per-invocation disclaimer the startup
+[cap-headroom preflight](#cap-headroom-preflight) carries, and the same 80%
+warning:
+
+```text
+Cap headroom: 5000000000 bytes free (5000000000 estimated of 10000000000 cap, 50%)
+  [per invocation — does NOT account for sibling invocations sharing the spill
+  volume under partition-and-run]
+```
+
+### Post-run actuals — calibrating the estimate
+
+A real `clinker run` that spills prints a per-stage **actual** spill-volume
+section at end-of-run, so you can compare it against the `--explain` estimate
+for the same stage — the calibration loop that turns a coarse pre-run estimate
+into a trustworthy one over repeated runs:
+
+```text
+=== Spill Volume (actual, per stage) ===
+  dept_totals → 1048576 bytes
+  by_amount → 4194304 bytes
+  Total: 5242880 bytes (compare against the --explain estimate)
+```
+
+The per-stage breakdown sums to the pipeline-wide cumulative spill total. A run
+that stayed within memory spilled nothing and prints no section. A large
+estimate-vs-actual delta is the single highest-leverage signal when a pipeline
+starts spilling unexpectedly (the failure mode behind Polars' documented 13.5×
+spill amplification, where an optimizer interaction turned 30 GB of input into
+400 GB of spill with no per-stage visibility).
+
+> **Note on the `--explain` compression projection.** The per-operator
+> spill-compression decision shown under `Spill compression:` is projected from
+> each operator's *stored output schema* width at plan time. At runtime the
+> actual spilled batch may carry a different column count (engine-stamped
+> identity columns, intermediate-stage shapes), so a stage's projected `auto`
+> verdict can differ from the file it actually writes. The read path always
+> dispatches on the spill file's own one-byte header tag, so this never breaks
+> re-reading; the projection is a best-effort preview, not a guarantee.
+
 ## Distinguishing the four spill-related failure conditions
 
 Spill-related aborts are split into four distinct diagnostics so a single
@@ -236,6 +356,41 @@ die at its final spill surfaces that risk before it runs for an hour, rather
 than after. The free-space query uses a cross-platform probe (statvfs on
 Unix, `GetDiskFreeSpaceExW` on Windows) that returns a 64-bit byte count, so
 the historical 32-bit `f_bavail` truncation never affects the comparison.
+
+### Cap-headroom preflight
+
+When `storage.spill.disk_cap_bytes` is configured, the same startup pass also
+runs a **cap-headroom preflight**: it compares the run's estimated spill volume
+to the configured cap and warns when the estimate reaches **80% of the cap**.
+Unlike the free-space preflight (which probes the physical volume), this checks
+the run against the *policy* ceiling you set, so it fires even on a volume with
+plenty of free space:
+
+```
+W331: this run is estimated to spill up to 9000000000 bytes, which is 90% of the
+configured spill cap storage.spill.disk_cap_bytes (10000000000 bytes); the run
+may abort with a spill-cap error (E320) before it finishes — raise disk_cap_bytes
+or reduce the spill footprint (raise memory.limit, partition the input). This
+headroom is per invocation: if you partition the input and run several clinker
+invocations against the same spill volume and cap, they share the cap, so the
+real headroom is smaller than this figure
+```
+
+Like W330, this is **advisory, not fatal** — the estimate is a coarse upper
+bound, so a run that compresses well or never trips its memory budget may finish
+comfortably under the cap. It fires on a normal `clinker run` (before ingestion,
+at startup), not only under `--explain`, so an operator sees the signal on the
+real run even when they did not explicitly inspect the plan first.
+
+**Per-invocation accounting.** The cap and the headroom figure are scoped to a
+single `clinker` invocation. Under the [partition-and-run](#) model — where you
+split a large input by file or key and launch several `clinker` processes that
+share one spill volume and one `disk_cap_bytes` — the physical spill volume is
+shared by every sibling, so the real headroom is smaller than any one
+invocation's figure. The warning text states this explicitly rather than
+silently presenting a per-invocation number as a whole-volume guarantee. Clinker
+is single-process by design (one invocation = one OS process), so the engine
+cannot see its siblings; the disclaimer is the honest stance.
 
 ## Mid-run spill failures
 
