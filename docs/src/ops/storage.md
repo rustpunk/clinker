@@ -638,7 +638,11 @@ directly under `dir`, deterministic across runs of the same source:
 - `<source-id>.lock` — a small advisory-lock file that serializes concurrent
   invocations staging the same source (see [the staging
   cache](#the-staging-cache-on_existing)). It carries no data and persists
-  between runs as the per-source coordination point.
+  between runs as the per-source coordination point, alongside the cached copy
+  it guards. Once that source's cache entry is gone and no run holds the lock, a
+  later startup [crash purge](#crash-purge-of-orphaned-artifacts) reclaims the
+  lock too, so a persistent staging root does not accumulate one orphan lock per
+  source that has ever passed through it.
 
 `<source-id>` is derived from the source's canonical path, so the same source
 always resolves to the same staged file. That stability is what makes the
@@ -748,18 +752,32 @@ A clean (or panicking) run runs its `cleanup`. But a `SIGKILL`, the Linux
 OOM-killer, or a power loss kills the process before any cleanup runs, leaking
 its staged artifacts under the staging root. To stop that from accumulating
 across crashes, **every run performs an idempotent crash purge at startup**,
-before it stages anything. It reaps the artifact shapes a crash leaves behind:
+before it stages anything. It reaps four orphan shapes left under the staging root:
 
 - a `*.partial` — an interrupted copy. Reaped **only when its owning run is
   dead** (see below), so a concurrent sibling's in-flight copy is never reaped;
 - a `*.staged` with no matching manifest — a copy that crashed before it could
   commit its manifest;
-- a `*.manifest.json` with no matching staged file.
+- a `*.manifest.json` with no matching staged file;
+- a `*.lock` whose source has no surviving cache entry — a coordination lock left
+  by a source that is no longer staged (not necessarily from a crash), reclaimed
+  under the liveness and age gates described below.
 
 A clean pair (a `.staged` with its committed `.manifest.json`) is the reuse
-cache and is **kept** — the purge never removes a complete, trustworthy copy.
-A `.lock` file is the persistent per-source coordination point and is never
-reaped.
+cache and is **kept** — the purge never removes a complete, trustworthy copy —
+and the source's `.lock` is kept alongside it so a later reuse run has a lock to
+take.
+
+A `.lock` whose source has **no surviving cache entry** (no `.staged` and no
+`.manifest.json`) is itself reclaimed by the purge, under the same liveness gate
+as a partial: it is removed only when it is acquirable under a try-lock (no live
+run holds it) *and* has aged past the creation grace window (so a sibling
+mid-acquire is not raced), and the removal is performed while the purge holds the
+lock exclusively. A held lock, a lock still guarding a cached copy, and a
+freshly created lock are all kept. This bounds what would otherwise be unbounded
+growth of one zero-byte lock file per distinct source ever staged — relevant for
+a long-lived persistent cache (`on_existing = reuse`, `cleanup = never`) — while
+never removing a coordination point a live or cached source still needs.
 
 Because several invocations can share one staging volume, the purge must not
 reap a live sibling's in-flight `.partial`. It tells a crash corpse from a live

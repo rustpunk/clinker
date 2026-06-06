@@ -86,8 +86,12 @@
 //!   sibling's in-flight `.partial` (lock held, or too young to have taken the
 //!   lock yet) is never reaped. A manifestless `.staged` (or stagedless manifest)
 //!   is likewise removed only under a successful try-exclusive, so the purge
-//!   never reaps a copy a sibling is mid-publish on. This mirrors the executor's
-//!   spill crash-purge.
+//!   never reaps a copy a sibling is mid-publish on. An orphaned
+//!   `<source_id>.lock` — one whose source has no surviving `.staged`/manifest
+//!   pair — is reclaimed under the same try-exclusive + grace gate, removed while
+//!   the purge holds it exclusively so the removal cannot race a sibling about to
+//!   acquire it; a held lock, or one still guarding a cached copy, is kept. This
+//!   mirrors the executor's spill crash-purge.
 //!
 //! On Windows the staged copy is opened (via [`open_source_file`]) with a share
 //! mode including `FILE_SHARE_DELETE`, so a concurrent atomic-rename publish or
@@ -886,7 +890,7 @@ impl SourceStager {
     /// Idempotently reap the staged artifacts a crashed prior run left behind,
     /// run once at startup before any source is staged.
     ///
-    /// A crash leaves three orphan shapes under the staging root, each reaped
+    /// A crash leaves four orphan shapes under the staging root, each reaped
     /// only when no live run owns the source (a held `<source_id>.lock` keeps
     /// the artifact):
     ///
@@ -904,12 +908,20 @@ impl SourceStager {
     ///   file was removed. Reaped under the same try-exclusive-lock gate, so a
     ///   sibling re-staging (which removes then re-copies under the lock) is not
     ///   raced.
+    /// - `<source_id>.lock` with no surviving `.staged`/manifest pair — a
+    ///   coordination lock left behind after its source's cache entry is gone.
+    ///   Reclaimed under the *same* try-exclusive + grace gate, and removed while
+    ///   the purge holds the lock exclusively so the removal cannot race a sibling
+    ///   about to acquire it. See `reclaim_orphan_lock`. A lock that is held, that
+    ///   still guards a cached pair, or that is too young to have been acquired is
+    ///   kept.
     ///
     /// A clean pair (`.staged` + matching `.manifest.json`) is the reuse cache
-    /// and is **kept** — reuse-if-fresh depends on it surviving across runs. A
-    /// `.lock` file is the persistent per-source coordination point and is
-    /// **never** reaped: it carries no payload, a concurrent sibling may be about
-    /// to lock it, and leaving it costs nothing.
+    /// and is **kept** — reuse-if-fresh depends on it surviving across runs, and
+    /// its `<source_id>.lock` is kept alongside it so a later reuse run has a lock
+    /// to take. Reclaiming the lock only once the cache entry is gone bounds the
+    /// otherwise-unbounded growth of one zero-byte lock per distinct source ever
+    /// staged, without ever stripping a live coordination point.
     ///
     /// The partial liveness check uses the same `fs4` try-lock + creation-grace
     /// discipline as the executor's spill crash-purge, so concurrent
@@ -1003,15 +1015,38 @@ impl SourceStager {
                         lock_path: root.join(format!("{id}.{LOCK_EXT}")),
                     }
                 }
+            } else if let Some(id) = name.strip_suffix(&format!(".{LOCK_EXT}")) {
+                // A per-source coordination lock. Kept whenever it might still be
+                // needed — a live holder, a fresh lock racing its own first use,
+                // or a lock still guarding a cached `.staged`/manifest pair — and
+                // reclaimed only when all three of those are false. Without this
+                // arm a lock file is created for every distinct source ever
+                // staged and never removed, so a long-lived persistent staging
+                // root accumulates one zero-byte orphan lock per retired source.
+                if root.join(format!("{id}.{STAGED_EXT}")).exists()
+                    || root.join(format!("{id}{MANIFEST_SUFFIX}")).exists()
+                {
+                    // The lock still guards a cached copy (or a half-published
+                    // pair another arm handles): keep it so a reuse run that
+                    // takes it has a lock to take.
+                    Reap::Keep
+                } else {
+                    // Orphaned (no cache entry). Whether it is actually reclaimed
+                    // is decided under the lock itself: the reclaim path takes the
+                    // exclusive lock (proving no live holder) and re-checks the age
+                    // grace, then removes the lock file while still holding it so
+                    // the removal cannot race a sibling about to acquire it.
+                    Reap::LockReclaim
+                }
             } else {
-                // `.staged` reuse cache, `.lock` coordination files, and
-                // anything else are not orphans.
+                // `.staged` reuse cache and anything else are not orphans.
                 Reap::Keep
             };
 
             let removed = match reap {
                 Reap::Keep => false,
                 Reap::Unconditional => reap_file(&path),
+                Reap::LockReclaim => reclaim_orphan_lock(&path, grace),
                 Reap::LockGated { lock_path } => {
                     // Gate on the exclusive lock: a live reader (shared) or a
                     // live writer (exclusive) of this source fails the try-lock,
@@ -1055,6 +1090,12 @@ enum Reap {
     /// A possible orphan whose removal must be gated on the source's exclusive
     /// lock, so a live sibling's in-flight artifact is never yanked.
     LockGated { lock_path: PathBuf },
+    /// An orphaned per-source `.lock` whose source has no remaining cache entry.
+    /// Reclaimed only while holding the lock's own exclusive lock (proving no
+    /// live holder) and only once it has aged past the creation grace window —
+    /// the same try-exclusive + age discipline a copy partial's reclaim uses,
+    /// applied to the lock file itself so its removal cannot race an acquire.
+    LockReclaim,
 }
 
 /// Remove one crash-purge artifact, logging a non-`NotFound` failure. Returns
@@ -1220,7 +1261,7 @@ impl Drop for SourceReadGuard {
 fn partial_is_orphaned(partial: &Path, root: &Path, source_id: &str, grace: Duration) -> bool {
     // Age gate first: a freshly created partial is presumed live no matter what
     // the lock probe says, closing the create→lock window.
-    if partial_age(partial).is_none_or(|age| age < grace) {
+    if entry_age(partial).is_none_or(|age| age < grace) {
         return false;
     }
     let lock_path = root.join(format!("{source_id}.{LOCK_EXT}"));
@@ -1243,15 +1284,70 @@ fn partial_is_orphaned(partial: &Path, root: &Path, source_id: &str, grace: Dura
     }
 }
 
-/// Age of a `.partial`, used to decide whether its owner has had time to take
-/// the per-source lock, or `None` when no timestamp is readable (treated by the
-/// caller as "too young to reap", erring toward keeping a file it cannot date).
+/// Reclaim an orphaned per-source `<source_id>.lock` whose source has no
+/// remaining cache entry, returning whether the lock file was removed.
 ///
-/// A clock skew that puts the mtime in the future yields a zero-ish age, which
-/// the grace gate treats as "too young" — the conservative direction (keep
-/// rather than reap).
-fn partial_age(partial: &Path) -> Option<Duration> {
-    let modified = std::fs::metadata(partial).and_then(|m| m.modified()).ok()?;
+/// The caller has already established the orphan condition — no `.staged` and no
+/// `.manifest.json` for this source survive — so a kept cache entry can never be
+/// stripped of its lock. This finishes the reclaim under two further gates,
+/// mirroring `partial_is_orphaned` but with the *lock file itself* as the target:
+///
+/// 1. **Try-exclusive lock.** The lock is removed only while this purge holds it
+///    exclusively. A live run reading or staging the source holds the same lock
+///    (shared or exclusive), so the try fails and the lock is kept — the liveness
+///    guarantee the crash-purge protects. Holding the lock across the `remove`
+///    covers the common acquire races: a sibling about to acquire either blocks
+///    behind this exclusive hold (then finds the file gone and recreates it on
+///    its next open) or has already taken it (failing our try). It does NOT make
+///    the unlink fully race-free, because this lock path is *shared* across runs
+///    (unlike the private per-run spill locks, which can be unlinked safely): a
+///    sibling already blocked in the `open`→`flock` window on the inode we are
+///    about to unlink can, once a third run recreates the path, end up locked to
+///    a different inode than the new holder — momentarily breaking per-source
+///    mutual exclusion. That residual window is benign: each run stages into a
+///    private per-run `.partial` and publishes the shared `<source_id>.staged` by
+///    atomic rename of content-addressed bytes, so a lost race yields at worst
+///    one redundant copy the next run reuses, never a torn or corrupt cache
+///    entry. Fully closing it would need a global reclaim lock on the acquire
+///    hot path — not worth it to reap a zero-byte orphan.
+/// 2. **Age grace.** A lock younger than `grace` may have just been created by a
+///    sibling that has not yet taken it, so it is kept regardless of the try
+///    result — closing the create→lock window exactly as the partial reap does.
+///
+/// Best-effort: an unopenable lock file (broken root) or a removal error is
+/// logged by `reap_file`, not propagated.
+fn reclaim_orphan_lock(lock_path: &Path, grace: Duration) -> bool {
+    // Age gate first: a freshly created lock may belong to a sibling that has not
+    // yet acquired it, so it is never reclaimed inside the grace window.
+    if entry_age(lock_path).is_none_or(|age| age < grace) {
+        return false;
+    }
+    match SourceLock::try_acquire(lock_path) {
+        // No live holder: remove the lock file while still holding the exclusive
+        // lock so the removal cannot race a concurrent acquire, then release.
+        Ok(Some(guard)) => {
+            let removed = reap_file(lock_path);
+            drop(guard);
+            removed
+        }
+        // A live run holds it (reading or staging): keep the lock.
+        Ok(None) => false,
+        // Lock file unopenable (broken root): leave it rather than guess.
+        Err(_) => false,
+    }
+}
+
+/// Age of a staging-root entry from its mtime, or `None` when no timestamp is
+/// readable (treated by both grace-gated reap paths as "too young to reap",
+/// erring toward keeping a file it cannot date).
+///
+/// Used by the partial reap to keep a `.partial` whose owner has not yet had
+/// time to take the per-source lock, and by the orphan-lock reclaim to keep a
+/// `.lock` a sibling just created but has not yet acquired. A clock skew that
+/// puts the mtime in the future yields a zero-ish age, which the grace gate
+/// treats as "too young" — the conservative direction (keep rather than reap).
+fn entry_age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     SystemTime::now().duration_since(modified).ok()
 }
 
@@ -1965,7 +2061,8 @@ mod tests {
         // Clean pair: staged + matching manifest — the reuse cache, must survive.
         std::fs::write(root.join("dddd.staged"), b"clean").unwrap();
         std::fs::write(root.join("dddd.manifest.json"), b"{}").unwrap();
-        // A lingering per-source lock file: never an orphan, must survive.
+        // A per-source lock still guarding that cached pair: must survive so a
+        // later reuse run has a lock to take, even at zero grace.
         std::fs::write(root.join("dddd.lock"), b"").unwrap();
 
         let policy = policy_with_dir(root, &["*.csv"]);
@@ -1988,7 +2085,10 @@ mod tests {
             root.join("dddd.manifest.json").exists(),
             "clean manifest kept"
         );
-        assert!(root.join("dddd.lock").exists(), "lock file kept");
+        assert!(
+            root.join("dddd.lock").exists(),
+            "a lock guarding a cached pair is kept"
+        );
     }
 
     #[test]
@@ -2062,6 +2162,110 @@ mod tests {
         assert!(
             !leftover.exists(),
             "a leftover manifest partial is an unconditional orphan"
+        );
+    }
+
+    #[test]
+    fn crash_purge_reclaims_a_stale_unheld_orphan_lock() {
+        // The reclaim path: a per-source `.lock` whose source has no `.staged`
+        // and no `.manifest.json` left (its cache was cleaned up or never
+        // committed), is unheld, and has aged past the grace window. Such a lock
+        // is pure accumulated debt — nothing needs it — so the startup purge
+        // reclaims it under its own exclusive lock. Without this, a long-lived
+        // staging root grows one zero-byte orphan lock per retired source forever.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let orphan_lock = root.join(format!("ab12cd34.{LOCK_EXT}"));
+        std::fs::write(&orphan_lock, b"").unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        // Zero grace ages the just-created lock past the window immediately, so
+        // the reclaim hinges on the orphan + try-exclusive gates, not on sleeping.
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            !orphan_lock.exists(),
+            "a stale, unheld, orphaned lock must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn crash_purge_keeps_a_lock_whose_staged_pair_still_exists() {
+        // A lock that still guards a committed cache pair must never be
+        // reclaimed, even aged out and unheld: a later reuse run takes it to read
+        // the cached `.staged`, so removing it would strip a live cache entry of
+        // its coordination point. The committed pair survives, so the lock keeps
+        // seeing a cache entry on every purge and is held indefinitely.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+
+        let paired_lock = root.join(format!("cafe1234.{LOCK_EXT}"));
+        std::fs::write(&paired_lock, b"").unwrap();
+        std::fs::write(root.join("cafe1234.staged"), b"cached").unwrap();
+        std::fs::write(root.join("cafe1234.manifest.json"), b"{}").unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            paired_lock.exists(),
+            "a lock guarding a committed cache pair is kept"
+        );
+        assert!(
+            root.join("cafe1234.staged").exists(),
+            "the cached staged copy it guards survives"
+        );
+        assert!(
+            root.join("cafe1234.manifest.json").exists(),
+            "the cached manifest it guards survives"
+        );
+    }
+
+    #[test]
+    fn crash_purge_keeps_a_held_orphan_lock() {
+        // The liveness guarantee: a lock a concurrent run currently holds is
+        // never reclaimed, even with no cache entry and zero grace — a live run
+        // is mid-stage or mid-read and is about to (or already did) publish under
+        // this lock. Only once the holder releases it does a later purge reclaim
+        // it, proving the held exclusive lock, not the file's age, gates the keep.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let lock_path = root.join(format!("d00df00d.{LOCK_EXT}"));
+        // Simulate a live sibling holding its per-source lock with no cache entry
+        // committed yet (e.g. mid-first-copy).
+        let held = SourceLock::acquire(&lock_path).unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            lock_path.exists(),
+            "a lock a live run holds must never be reclaimed"
+        );
+
+        // Once the holder's run ends, the same orphan lock becomes reclaimable.
+        drop(held);
+        SourceStager::crash_purge_with_grace(&policy, NO_GRACE);
+        assert!(
+            !lock_path.exists(),
+            "once released, a stale orphan lock is reclaimed"
+        );
+    }
+
+    #[test]
+    fn crash_purge_keeps_a_newborn_orphan_lock_within_the_grace_window() {
+        // The create→acquire window: a lock a sibling just created but has not
+        // yet acquired must be kept by the age grace, mirroring the newborn
+        // partial protection — otherwise the purge could reclaim a lock a run is
+        // microseconds from taking.
+        let stage_dir = tempfile::tempdir().unwrap();
+        let root = stage_dir.path();
+        let newborn = root.join(format!("0badf00d.{LOCK_EXT}"));
+        std::fs::write(&newborn, b"").unwrap();
+
+        let policy = policy_with_dir(root, &["*.csv"]);
+        // The default (real) grace: a just-created lock is inside the window.
+        SourceStager::crash_purge(&policy);
+        assert!(
+            newborn.exists(),
+            "a just-created orphan lock must be kept during the grace window"
         );
     }
 
