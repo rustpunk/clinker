@@ -8,12 +8,14 @@
 //! threaded into the run as runtime parameters rather than as part of the
 //! compiled plan.
 //!
-//! Today only the spill root directory is honored at runtime. The staging
-//! block parses and is validated at startup, and the resolution layer
-//! decides per source whether a path would be staged — but no copy runs
-//! yet: a matched source still reads in place (`StagedPath::staged == None`),
-//! so the file-copy step can be plugged in without re-touching the decision
-//! or validation surface.
+//! The spill root directory and the staging block are both honored at
+//! runtime. This module owns the *decision and validation* surface: it parses
+//! the `[storage.staging]` block, validates it at startup
+//! ([`StagingPolicy::validate`]), and matches source paths against the
+//! configured patterns ([`StagingPolicy::pattern_matches`]). The copy itself —
+//! single-pass streamed copy with inline BLAKE3 verification and atomic
+//! publish — lives in `clinker-channel`'s staging-copy engine, which consumes
+//! the decision this module makes.
 
 use crate::config::utils::ByteSize;
 use serde::{Deserialize, Serialize};
@@ -80,7 +82,8 @@ pub struct StorageConfig {
     pub spill: SpillConfig,
     /// `[storage.staging]` — opt-in copy of source files to local disk
     /// before execution. Off by default; activated per-pipeline by pattern
-    /// match. Validated at startup; the copy itself is not wired yet.
+    /// match. Validated at startup, then driven by `clinker-channel`'s
+    /// staging-copy engine per matched source.
     #[serde(default)]
     pub staging: StagingPolicy,
 }
@@ -277,11 +280,12 @@ impl SpillConfig {
 /// local copy instead. This mirrors the NiFi `FetchFile` / Airbyte
 /// `smart_open` posture: decide-what-to-stage is separated from do-the-copy.
 ///
-/// The current engine performs the *decision* and *validation* but not the
-/// copy. [`StagingPolicy::resolve_one`] reports whether a path would be
-/// staged; until the copy lands it always returns `staged == None` (read in
-/// place). Off by default — an empty or absent block leaves every source
-/// reading in place exactly as before.
+/// This type owns the *decision* and *validation* halves:
+/// [`StagingPolicy::pattern_matches`] reports whether a path is selected, and
+/// [`StagingPolicy::validate`] runs the startup checks. The copy half — the
+/// streamed copy + BLAKE3 verify + atomic publish — lives in `clinker-channel`.
+/// Off by default: an empty or absent block leaves every source reading in
+/// place exactly as before.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StagingPolicy {
@@ -299,25 +303,26 @@ pub struct StagingPolicy {
     /// Cumulative cap on bytes copied into the staging dir for one run, in
     /// bytes. `None` (omitted) → unlimited. Accepts a bare integer or a
     /// human-readable size (`"50GB"`) through the same [`ByteSize`] grammar
-    /// the spill cap uses. Honored by the copy step (not yet wired); parsed
-    /// and surfaced now so a `clinker.toml` author declares it once.
+    /// the spill cap uses. Charged by the copy engine before each file is
+    /// copied, so a file that would push the run over the cap is refused
+    /// rather than copied and rolled back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_cap_bytes: Option<ByteSize>,
     /// Whether a staged copy is integrity-checked against its source after
     /// the copy. Defaults to [`StagingVerify::Blake3`] — a BLAKE3 digest of
     /// source and copy must match, catching the silent truncation an NFS
-    /// soft-mount can produce. Consumed by the copy step (not yet wired).
+    /// soft-mount can produce. Consumed by the copy engine.
     #[serde(default)]
     pub verify: StagingVerify,
     /// What to do when a staging-dir copy with the target name already
     /// exists (e.g. a prior crashed run). Defaults to
-    /// [`OnExisting::Overwrite`]. Consumed by the copy step (not yet wired).
+    /// [`OnExisting::Overwrite`]. Consumed by the copy engine.
     #[serde(default)]
     pub on_existing: OnExisting,
     /// Whether staged copies are removed when the run finishes. Defaults to
     /// [`Cleanup::OnSuccess`] — keep copies after a failure so a re-run can
     /// inspect them, delete them after a clean run. Consumed by the copy
-    /// step (not yet wired).
+    /// engine.
     #[serde(default)]
     pub cleanup: Cleanup,
     /// Glob patterns selecting which source paths are staged. A source is
@@ -382,9 +387,8 @@ pub enum Cleanup {
 ///
 /// `original` is the path the pipeline author wrote; `staged` is the local
 /// copy the reader should open instead, or `None` when the source reads in
-/// place (staging disabled, no pattern match, or — for now — always, since
-/// the copy step is not yet wired). Threading this through the reader keeps
-/// the read side agnostic to whether staging happened: it opens
+/// place (staging disabled or no pattern match). Threading this through the
+/// reader keeps the read side agnostic to whether staging happened: it opens
 /// [`StagedPath::read_path`] regardless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedPath {
@@ -437,25 +441,6 @@ impl StagingPolicy {
             Ok(pat) => pat.matches(&path_str) || pat.matches(&basename),
             Err(_) => false,
         })
-    }
-
-    /// Decide how a single source path resolves under this policy.
-    ///
-    /// When staging is enabled and `original` matches a pattern, the source
-    /// is *selected* for staging — but the copy step is not yet wired, so
-    /// the returned [`StagedPath`] still carries `staged == None` (read in
-    /// place). Plugging the copy in means producing `Some(local_copy)` here
-    /// for the matched arm; nothing else on the read side changes.
-    pub fn resolve_one(&self, original: PathBuf) -> StagedPath {
-        // The copy is intentionally absent: this scaffold lands the
-        // decision + validation surface so the file-copy step can be added
-        // without re-touching either. A matched source reads in place until
-        // the copy is wired, leaving `enabled = true` behavior identical to
-        // today's in-place read for every existing pipeline.
-        if self.pattern_matches(&original) {
-            return StagedPath::in_place(original);
-        }
-        StagedPath::in_place(original)
     }
 
     /// Validate staging configuration at startup against the set of source
@@ -921,21 +906,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!p.pattern_matches(Path::new("/anything")));
-    }
-
-    #[test]
-    fn resolve_one_reads_in_place_until_copy_lands() {
-        let p = StagingPolicy {
-            enabled: true,
-            dir: Some(PathBuf::from("/tmp")),
-            patterns: vec!["/mnt/nfs/**".into()],
-            ..Default::default()
-        };
-        let matched = p.resolve_one(PathBuf::from("/mnt/nfs/data/x.csv"));
-        assert_eq!(matched.staged, None);
-        assert_eq!(matched.read_path(), Path::new("/mnt/nfs/data/x.csv"));
-        let unmatched = p.resolve_one(PathBuf::from("/local/x.csv"));
-        assert_eq!(unmatched.staged, None);
     }
 
     #[test]

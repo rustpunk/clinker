@@ -1,34 +1,19 @@
-//! Source-staging resolution hook.
+//! Source-staging startup validation.
 //!
 //! The channel layer is where a source's declared path meets the workspace
-//! [`StagingPolicy`]: [`resolve_source`] decides, per source, whether the
-//! reader should open a local staged copy instead of the original path, and
-//! [`validate_staging`] runs the one-time startup checks that fail a
-//! misconfigured staging dir before any input is opened.
+//! [`StagingPolicy`]. The work splits in two, mirroring NiFi's `ListFile` +
+//! `FetchFile`: deciding *what* to stage and validating the configuration
+//! ([`validate_staging`], here) is kept separate from doing the copy
+//! ([`crate::staging_copy::SourceStager`]), so each layer is testable in
+//! isolation.
 //!
-//! The split mirrors NiFi's `ListFile` + `FetchFile`: deciding *what* to
-//! stage is kept separate from doing the copy, so each layer is testable in
-//! isolation. The copy itself is not wired yet — [`resolve_source`] reports a
-//! [`StagedPath`] whose `staged` is always `None` (read in place), so a run
-//! with staging enabled behaves identically to today until the copy lands.
+//! [`validate_staging`] runs the one-time startup checks that fail a
+//! misconfigured staging dir before any input is opened; the per-file copy and
+//! its decision live in [`crate::staging_copy`].
 
 use std::path::PathBuf;
 
-use clinker_plan::config::{StagedPath, StagingPolicy, StorageConfigError};
-
-/// Resolve one source path against the workspace staging policy.
-///
-/// Returns the [`StagedPath`] the reader should honor: it opens
-/// [`StagedPath::read_path`] regardless of whether staging fired, so the read
-/// side stays agnostic to staging. When the policy is enabled and `original`
-/// matches a staging pattern the source is *selected* for staging, but —
-/// because the copy step is not yet wired — the returned path still reads in
-/// place (`staged == None`). Wiring the copy means returning the local copy
-/// from the matched arm of [`StagingPolicy::resolve_one`]; nothing here
-/// changes.
-pub fn resolve_source(policy: &StagingPolicy, original: PathBuf) -> StagedPath {
-    policy.resolve_one(original)
-}
+use clinker_plan::config::{StagingPolicy, StorageConfigError};
 
 /// Validate the workspace staging policy against the paths a run will read.
 ///
@@ -63,26 +48,6 @@ mod tests {
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn disabled_policy_reads_in_place() {
-        let policy = StagingPolicy::default();
-        let resolved = resolve_source(&policy, PathBuf::from("/mnt/nfs/data/orders.csv"));
-        assert_eq!(resolved.staged, None);
-        assert_eq!(
-            resolved.read_path(),
-            std::path::Path::new("/mnt/nfs/data/orders.csv")
-        );
-    }
-
-    #[test]
-    fn matched_source_still_reads_in_place_until_copy_lands() {
-        // Staging is enabled and the path matches, but the copy step is not
-        // wired, so the resolved path still reads in place.
-        let policy = policy_with(&["/mnt/nfs/**"], Some(PathBuf::from("/tmp")));
-        let resolved = resolve_source(&policy, PathBuf::from("/mnt/nfs/data/orders.csv"));
-        assert_eq!(resolved.staged, None);
     }
 
     #[test]

@@ -421,6 +421,7 @@ dependencies = [
  "clinker-record",
  "criterion",
  "indexmap",
+ "nix",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -428,6 +429,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 

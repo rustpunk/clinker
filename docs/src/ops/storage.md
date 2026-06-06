@@ -234,8 +234,8 @@ cleanup        = "on_success" # optional; on_success | always | never (default o
 | `patterns` | `[]` | Glob patterns selecting which source paths to stage. A source is staged only when `enabled` and its path matches at least one pattern. Empty ⇒ nothing is staged. |
 | `disk_cap_bytes` | unlimited | Cumulative cap on bytes copied per run. Same byte-size grammar as the spill cap (`"50GB"`, bare integers are bytes). |
 | `verify` | `blake3` | Post-copy integrity check. `blake3` hashes source and copy and requires a match — the only check that catches a soft-mount's silent truncation. `none` skips the check. |
-| `on_existing` | `overwrite` | What to do when a copy with the target name already exists (e.g. from a crashed run): `overwrite` (replace — a partial copy can't be trusted), `reuse` (keep it — only safe with `verify`), or `error`. |
-| `cleanup` | `on_success` | When staged copies are deleted: `on_success` (delete after a clean run, keep after a failure so the inputs can be inspected), `always`, or `never`. |
+| `on_existing` | `overwrite` | What to do when a copy with the target name already exists: `overwrite`, `reuse`, or `error`. Under the current per-run/per-file UUID naming a destination collision cannot occur, so this knob has no runtime effect today; it is reserved for a future stable-name layout. |
+| `cleanup` | `on_success` | When staged copies are deleted: `on_success` / `always` / `never`. The per-run subdirectory is currently removed when the run ends regardless of outcome (so the volume is reclaimed); the `keep-on-failure` and `never` modes are not yet wired. |
 
 ### Pattern matching
 
@@ -264,16 +264,55 @@ first copy. The run is refused when:
 The same-volume rule applies only to **matched** sources: a source the
 patterns don't select reads in place, so its volume is irrelevant.
 
-### Current status: decision wired, copy pending
+### How a file is staged
 
-This release lands the staging **decision and validation** surface but not the
-file copy itself: a matched source is recognized and validated, but still
-reads in place (`enabled = true` behaves identically to an in-place read).
-This deliberately mirrors NiFi's `ListFile` + `FetchFile` split — deciding
-*what* to stage is separated from doing the copy — so the copy step can be
-added without re-touching the decision or validation surface. Until it lands,
-`enabled = true` is safe to set: it validates the configuration and selects
-the right sources without changing where bytes are read from.
+Each matched source is copied into a **per-run subdirectory** under `dir`,
+named with a fresh UUID (`clinker-stage-<random>/`). Per-file names are UUIDs
+too, so two runs sharing one staging root never collide. The copy is built to
+survive a crash at any point without leaving a corrupt or partial file a
+later run might trust:
+
+1. **Single-pass copy + hash.** The source is read once in ~1 MiB chunks; each
+   chunk is fed to both the BLAKE3 hasher and the destination file in the same
+   pass. The copy never holds the whole file in memory, so it stays a
+   memory-budget no-op regardless of file size.
+2. **Atomic publish.** Bytes are written to `<uuid>.partial`, flushed and
+   `fsync`'d, then **renamed** to `<uuid>.staged`. A rename is an atomic
+   replace on Linux, macOS, and Windows (Windows 10 1607+), so a reader scanning
+   for `.staged` files sees either nothing or the complete file — never a
+   half-written one.
+3. **Durable rename.** On Linux/macOS the parent directory is `fsync`'d after
+   the rename, because on ext4/xfs a rename is only crash-durable once the
+   directory entry itself is flushed. On Windows the NTFS journal makes the
+   rename durable, so there is no separate directory flush to do.
+4. **Verify.** With `verify = blake3` (the default) the source is independently
+   re-read and hashed, and the two digests must match. A size check cannot
+   catch a soft-mount that silently truncated the read; two content digests
+   can. A mismatch removes the published copy and fails the run with a distinct
+   "staged copy is corrupt" diagnostic — not a generic I/O error.
+
+If the copy fails partway, the `.partial` is removed before the error
+propagates, and the whole per-run subdirectory is deleted when the run ends or
+the process exits — the same temporary-directory cleanup the spill root uses,
+so a crash never leaves staged copies behind.
+
+### File permissions
+
+Staged copies hold verbatim source records — potentially PII, credentials, or
+financial data — and on a shared staging volume they must not be readable by
+other users. On Unix the per-run directory is created with mode `0o700` and
+each staged file with `0o600` (owner-only). On Windows there is no portable
+mode bit; staged files inherit the staging directory's ACL, so restrict the
+directory's ACL if the volume is shared.
+
+### Crash durability and the parent-directory fsync
+
+The atomic-rename guarantee only holds across a crash if the rename is durable.
+On POSIX filesystems (ext4, xfs) a rename's directory entry can still be in the
+page cache after `rename` returns, so Clinker `fsync`s the parent directory
+after the rename. Windows is intentionally exempt: the NTFS metadata journal
+already makes the rename crash-durable (the semantics `MOVEFILE_WRITE_THROUGH`
+requests), and Windows offers no directory-fsync equivalent.
 
 [`std::env::temp_dir`]: https://doc.rust-lang.org/std/env/fn.temp_dir.html
 [duckdb/duckdb#9401]: https://github.com/duckdb/duckdb/issues/9401

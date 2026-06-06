@@ -526,6 +526,16 @@ fn storage_config_error(e: clinker_plan::config::StorageConfigError) -> Pipeline
     PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
 }
 
+/// Map a source-staging copy failure into the run's error type.
+///
+/// Staging is a run-setup concern (it happens before any record flows), so a
+/// failure surfaces as a config-style validation error carrying the
+/// staging-copy engine's full message — which already distinguishes a BLAKE3
+/// verify mismatch, a disk-cap overflow, and a plain I/O failure.
+fn staging_error(e: clinker_channel::StagingError) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -604,10 +614,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let spill_disk_cap_bytes = storage_config.spill.disk_cap();
 
     // Workspace `[storage.staging]` policy. Off by default; when enabled it
-    // copies matched source files to a local volume before the run reads
-    // them. Validated below against the discovered file set, then consulted
-    // per file at reader-open. The copy itself is not wired yet, so a matched
-    // source still reads in place.
+    // copies matched source files to a local volume before the run reads them.
+    // Validated below against the discovered file set, then driven per file by
+    // the staging-copy engine at reader-open: a matched file is copied to a
+    // per-run local subdir (single-pass BLAKE3 verify + atomic publish) and the
+    // reader opens the local copy.
     let staging_policy = storage_config.staging.clone();
 
     let mut compile_ctx =
@@ -824,6 +835,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // each record so fan-out writers key correctly.
     let mut source_files_by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
         std::collections::HashMap::new();
+    // One staging engine for the whole run: it lazily creates a single per-run
+    // subdir on the first staged file and accumulates the disk-cap byte total
+    // across every source. When staging is disabled or a path matches no
+    // pattern, `resolve` returns an in-place path and touches no disk.
+    let mut source_stager = clinker_channel::SourceStager::new(staging_policy.clone());
     for body in pipeline_config.source_bodies() {
         let source = &body.source;
         match &source.transport {
@@ -861,11 +877,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 let mut paths: Vec<std::path::PathBuf> = Vec::new();
                 for f in outcome.files() {
                     // Resolve each discovered file against the staging policy.
-                    // The reader opens `read_path()`, which is the original
-                    // path until the copy step is wired — so an enabled policy
-                    // leaves the read identical to an in-place read today while
-                    // making the resolution hook a live part of the open path.
-                    let staged = clinker_channel::resolve_source(&staging_policy, f.path.clone());
+                    // A matched file is copied to the per-run local subdir
+                    // (single-pass BLAKE3 verify + atomic publish) and
+                    // `read_path()` points at the local copy; an unmatched file
+                    // or a disabled policy reads in place. Either way the reader
+                    // opens `read_path()` and stays agnostic to staging.
+                    let staged = source_stager
+                        .resolve(f.path.clone())
+                        .map_err(staging_error)?;
                     let read_path = staged.read_path().to_path_buf();
                     let file = std::fs::File::open(&read_path)?;
                     slots.push(clinker_exec::source::multi_file::FileSlot::new(
