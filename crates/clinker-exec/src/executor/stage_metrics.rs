@@ -454,14 +454,25 @@ mod tests {
     #[test]
     fn test_cumulative_timer_stop_then_drop_no_double_count() {
         let mut timer = CumulativeTimer::new();
+        let wall = std::time::Instant::now();
         {
             let mut guard = timer.guard();
             std::thread::sleep(std::time::Duration::from_millis(5));
             guard.stop(); // explicit stop
         } // drop after stop — should not double-count
+        let single_span = wall.elapsed();
         let metrics = timer.finish(StageName::Write, 1, 1);
-        // Should be ~5ms, not ~10ms
-        assert!(metrics.elapsed < Duration::from_millis(20));
+        // The guarded span ran exactly once; a double-count (recording it on
+        // both stop() and drop) would report ~2x. Compare against the span's
+        // real wall time rather than an absolute millisecond ceiling — under
+        // CI scheduler load a 5ms sleep can stretch well past any fixed bound,
+        // which would false-fail an absolute assertion without any regression.
+        assert!(
+            metrics.elapsed <= single_span + single_span / 2,
+            "timer double-counted: recorded {:?} vs single wall span {:?}",
+            metrics.elapsed,
+            single_span
+        );
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Snapshot fixtures are parsed with line-ending-sensitive `---` separators.
+# Pin them to LF so a Windows checkout (git autocrlf) does not rewrite them
+# to CRLF and break the parsers that read them back.
+*.snap text eol=lf

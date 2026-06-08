@@ -2332,8 +2332,12 @@ nodes:
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/snapshots")
             .join(format!("combine_test__tests__{name}.snap"));
+        // Normalize line endings: a Windows checkout (git autocrlf) rewrites
+        // these committed fixtures to CRLF, and the `---\n` separator scan
+        // below is line-ending sensitive.
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
         // An insta snapshot file is:
         //   ---
         //   <yaml metadata>
@@ -2933,8 +2937,11 @@ nodes:
                 "missing baseline snapshot: {}",
                 path.display()
             );
+            // Normalize line endings (Windows autocrlf checkout) before the
+            // line-ending-sensitive `---\n` separator scan.
             let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+                .replace("\r\n", "\n");
             // An insta snapshot body starts after the second `---`.
             let body_start = content.find("---\n").and_then(|i| {
                 let after = &content[i + 4..];

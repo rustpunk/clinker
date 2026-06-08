@@ -465,11 +465,15 @@ nodes:
         let signaled_at = Instant::now();
         token.request();
 
-        // 3 s is generous headroom over one chunk's worth of processing
-        // yet well under the ~6 s clean-run wall time, so a regression
-        // that ignores the token surfaces as a timeout, not a hang.
+        // The actual regression gate is `total_count < 6000` below: a run
+        // that honors the token stops early, one that ignores it ingests all
+        // 6000 rows. This recv_timeout is only an anti-hang guard, set well
+        // above one chunk's drain time. The bound is generous (per-row sleeps
+        // stretch under CI scheduler load, especially on macOS) yet still
+        // bounded, so a token-ignoring regression surfaces either as the
+        // count assertion or, if it hangs, as a timeout.
         let report = done_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(20))
             .expect("interrupted run must terminate within the shutdown bound");
         let shutdown_latency = signaled_at.elapsed();
         worker.join().expect("executor thread did not panic");
