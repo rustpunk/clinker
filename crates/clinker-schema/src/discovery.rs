@@ -162,10 +162,13 @@ fn glob_paths(pattern: &str) -> Result<Vec<PathBuf>, ()> {
         return Ok(entries
             .filter_map(|e| e.ok())
             .filter(|e| {
+                // Case-insensitive: a case-preserving filesystem (macOS APFS,
+                // Windows NTFS) returns the on-disk casing, so `*.yaml` must
+                // still match a file stored as `flow.YAML`.
                 e.path()
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext == ext_match)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(ext_match))
             })
             .map(|e| e.path())
             .collect());
@@ -563,6 +566,28 @@ fields:
             !names
                 .iter()
                 .any(|n| n.to_ascii_lowercase().contains(".schema."))
+        );
+    }
+
+    #[test]
+    fn test_glob_discovery_mixed_case_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("schemas")).unwrap();
+
+        // The glob-driven path (manifest `include` globs) must match a
+        // case-preserving filesystem's on-disk casing: `*.yaml` finds
+        // `flow.YAML`.
+        write_file(root, "flow.YAML", "pipeline: {name: test}");
+
+        let pipelines = discover_pipelines(root, "schemas", &["*.yaml".to_string()], &[]);
+        let names: Vec<_> = pipelines
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"flow.YAML"),
+            "glob discovery missed mixed-case extension: {names:?}"
         );
     }
 
