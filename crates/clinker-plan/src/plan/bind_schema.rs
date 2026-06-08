@@ -970,10 +970,23 @@ pub(crate) fn validate_dlq_per_source(
         .collect();
 
     // Track path collisions across the pipeline-wide + every per-source
-    // entry. First insertion wins; subsequent insertions emit E318.
-    let mut paths: HashMap<&str, String> = HashMap::new();
+    // entry. Two paths collide when they name the *same physical file*, which
+    // on a case-insensitive output filesystem (macOS APFS / Windows NTFS
+    // default) includes paths differing only in case — `errors.csv` and
+    // `Errors.csv` resolve to one file there, so the per-source and
+    // pipeline-wide writers would silently overwrite each other. The
+    // collision key is therefore folded *conditionally*: only when the actual
+    // target filesystem folds case (probed via `case_sensitive_dir`), never
+    // unconditionally, so two legitimately-distinct files on case-sensitive
+    // Linux are not falsely flagged. First insertion wins; subsequent
+    // insertions onto the same key emit E318. The stored value keeps the raw
+    // path for the diagnostic message; the value's `.1` is the config label.
+    let mut paths: HashMap<String, (String, String)> = HashMap::new();
     if let Some(p) = dlq.path.as_deref() {
-        paths.insert(p, "error_handling.dlq.path".to_string());
+        paths.insert(
+            crate::config::collision_key(p),
+            (p.to_string(), "error_handling.dlq.path".to_string()),
+        );
     }
 
     for (src_name, per) in &dlq.per_source {
@@ -1000,15 +1013,27 @@ pub(crate) fn validate_dlq_per_source(
             ));
         }
         if let Some(p) = per.path.as_deref()
-            && let Some(prev) =
-                paths.insert(p, format!("error_handling.dlq.per_source.{src_name}.path"))
+            && let Some((prev_path, prev_label)) = paths.insert(
+                crate::config::collision_key(p),
+                (
+                    p.to_string(),
+                    format!("error_handling.dlq.per_source.{src_name}.path"),
+                ),
+            )
         {
+            // Surface the prior path explicitly so a case-only collision reads
+            // clearly (`Errors.csv` collides with `errors.csv` …).
+            let collide_note = if prev_path == p {
+                format!("collides with {prev_label}")
+            } else {
+                format!(
+                    "collides with {prev_label} ({prev_path:?}) — these paths name \
+                     the same file on a case-insensitive output filesystem"
+                )
+            };
             diags.push(Diagnostic::error(
                 "E318",
-                format!(
-                    "error_handling.dlq.per_source.{src_name}.path {p:?} collides \
-                     with {prev}"
-                ),
+                format!("error_handling.dlq.per_source.{src_name}.path {p:?} {collide_note}"),
                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
             ));
         }

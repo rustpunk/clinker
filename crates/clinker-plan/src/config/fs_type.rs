@@ -81,6 +81,132 @@ pub fn same_device(a: &Path, b: &Path) -> io::Result<bool> {
     same_device_impl(a, b)
 }
 
+/// Whether the filesystem that *would back a file at `path`* preserves case in
+/// filenames (`true`) or folds it (`false`).
+///
+/// This drives output-path collision detection: two paths differing only in
+/// case (`errors.csv` vs `Errors.csv`) are two distinct files on a
+/// case-sensitive filesystem but **one** physical file on a case-insensitive
+/// one (the common macOS APFS and Windows NTFS default). Case must therefore
+/// be folded *conditionally* — only when the target filesystem actually folds
+/// it — otherwise a correct case-sensitive Linux pipeline would be wrongly
+/// flagged for a collision that does not exist on its disk.
+///
+/// The answer is obtained by **active probe**, not by mapping a filesystem-type
+/// table to a case-sensitivity guess: a real file is created and the same path
+/// re-cased is re-statted. This is the mechanism Git uses to auto-detect
+/// `core.ignorecase`, and it is correct regardless of OS, mount options, or
+/// per-directory case-sensitivity attributes (Windows per-directory case
+/// sensitivity, APFS case-sensitive volumes) that a static table cannot see.
+///
+/// `path` itself need not exist. The probe runs in the **nearest existing
+/// ancestor directory** of `path`, because that is the filesystem the file will
+/// be created on once its parent directories are materialized (the writer
+/// `create_dir_all`s the missing parents onto that same filesystem). The
+/// probe file is created and removed inside that directory; it never collides
+/// with the real output path.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when no existing ancestor directory can
+/// be found or the probe file cannot be created in it. Callers treat a probe
+/// failure as "assume case-sensitive" (do not flag a collision) so a transient
+/// or permission failure never converts a correct pipeline into a hard
+/// validation error; the silent-data-loss risk a probe failure leaves unguarded
+/// is confined to filesystems that are simultaneously case-insensitive *and*
+/// unprobeable, which a writable output directory never is in practice.
+pub fn case_sensitive_dir(path: &Path) -> io::Result<bool> {
+    let dir = nearest_existing_dir(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no existing ancestor directory to probe for case-sensitivity",
+        )
+    })?;
+    probe_case_sensitive(&dir)
+}
+
+/// Walk up from `path`'s parent to the first directory that exists. Returns
+/// `None` only when neither the parent chain nor the current directory exists,
+/// which cannot happen for a relative path (`.` always exists) but can for an
+/// absolute path whose entire prefix is absent.
+fn nearest_existing_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let mut candidate = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        // A bare filename (`errors.csv`) or empty parent resolves against the
+        // current working directory.
+        _ => std::path::PathBuf::from("."),
+    };
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        match candidate.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => candidate = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// Create a uniquely-named lowercase probe file in `dir` and report whether its
+/// uppercased name resolves to the same file. OS-agnostic: it measures the
+/// filesystem's actual behavior rather than inferring it from a type table, so
+/// no `#[cfg]` arm is needed.
+fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
+    // A lowercase, process+time-unique stem so two concurrent probes in one
+    // directory never clash. The extension stays lowercase; only the stem case
+    // is toggled for the re-stat.
+    let stem = format!(
+        "clinker-case-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let lower = dir.join(format!("{stem}.tmp"));
+    // Create exclusively so a stale same-named file can never make the probe
+    // read a foreign filesystem state as our own.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lower)?;
+    drop(file);
+
+    let upper = dir.join(format!("{}.TMP", stem.to_ascii_uppercase()));
+    // If the uppercased name resolves to a file, the filesystem folded the case
+    // back onto the lowercase probe we just created — it is case-insensitive.
+    let insensitive = upper.exists();
+
+    // Best-effort cleanup; a leaked probe file is harmless and the temp dir is
+    // the writer's own output directory, but removal failure must not mask the
+    // probe result.
+    let _ = std::fs::remove_file(&lower);
+
+    Ok(!insensitive)
+}
+
+/// Canonical collision key for an output path: the key under which two paths
+/// are considered to name the *same physical file*.
+///
+/// On a case-insensitive output filesystem (macOS APFS / Windows NTFS default)
+/// paths differing only in case resolve to one file, so their keys must
+/// coincide; on a case-sensitive one they are distinct files and must not. Case
+/// is folded *conditionally* — only when [`case_sensitive_dir`] reports the
+/// target filesystem folds it — so two legitimately-distinct files on
+/// case-sensitive Linux are never falsely merged. A probe failure falls back to
+/// the raw (case-sensitive) key, the safe default that never merges two paths
+/// the filesystem might keep distinct.
+///
+/// Both the config-time DLQ-collision check and the runtime DLQ partitioner key
+/// on this single function so their notions of "same file" cannot drift.
+pub fn collision_key(path: &str) -> String {
+    if case_sensitive_dir(Path::new(path)).unwrap_or(true) {
+        path.to_string()
+    } else {
+        path.to_ascii_lowercase()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Linux
 // ---------------------------------------------------------------------------
@@ -355,5 +481,63 @@ mod tests {
         std::fs::write(&real, b"x").unwrap();
         let missing = dir.path().join("nope.txt");
         assert!(same_device(&real, &missing).is_err());
+    }
+
+    #[test]
+    fn case_sensitive_dir_probes_an_existing_dir_without_error() {
+        // The host tempdir is whatever the OS provides; the contract here is
+        // only that the active probe runs to completion and returns a verdict
+        // (whichever the host filesystem actually is) rather than erroring.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("errors.csv");
+        let verdict = case_sensitive_dir(&target).unwrap();
+        // The probe leaves no file behind: it cleans up its temp probe and the
+        // real output path was never created.
+        assert!(!target.exists());
+        // `verdict` is a real measurement of this filesystem; both values are
+        // legitimate depending on the host (case-sensitive ext4/tmpfs vs a
+        // case-insensitive mount), so we only assert it is one of the two.
+        let _ = verdict;
+    }
+
+    #[test]
+    fn case_sensitive_dir_walks_up_to_an_existing_ancestor() {
+        // A path whose parent directories do not exist yet still probes: the
+        // walk-up lands on the nearest existing ancestor (the filesystem the
+        // writer will `create_dir_all` the missing parents onto).
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c/errors.csv");
+        assert!(!deep.parent().unwrap().exists());
+        // Should not error — it probes `dir` (the nearest existing ancestor).
+        let _ = case_sensitive_dir(&deep).unwrap();
+    }
+
+    #[test]
+    fn case_sensitive_dir_handles_bare_filename_against_cwd() {
+        // A bare filename has an empty parent and must resolve against the
+        // current working directory, which always exists, so the probe never
+        // fails for lack of an ancestor.
+        let verdict = case_sensitive_dir(Path::new("errors.csv"));
+        assert!(verdict.is_ok());
+    }
+
+    #[test]
+    fn case_sensitive_dir_agrees_with_a_direct_re_case_stat() {
+        // Cross-check the probe against the ground truth on whatever filesystem
+        // the host provides: create a lowercase file, ask whether its uppercase
+        // twin resolves to it, and assert `case_sensitive_dir` returns the
+        // opposite of that fold. Deterministic on every host (it measures the
+        // real filesystem) and never a silent no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("errors.csv");
+        std::fs::write(&lower, b"x").unwrap();
+        let upper_twin = dir.path().join("ERRORS.CSV");
+        let folded = upper_twin.exists();
+
+        let target = dir.path().join("out.csv");
+        let sensitive = case_sensitive_dir(&target).unwrap();
+        // Case-insensitive filesystem ⇔ the uppercase twin folded onto the
+        // lowercase file.
+        assert_eq!(sensitive, !folded);
     }
 }

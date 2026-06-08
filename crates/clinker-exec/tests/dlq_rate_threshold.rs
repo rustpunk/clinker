@@ -537,3 +537,84 @@ nodes:
         "expected E318 path collision, got:\n{combined}"
     );
 }
+
+/// E318: two DLQ paths differing only in case (`errors.csv` vs `Errors.csv`)
+/// resolve to one physical file on a case-insensitive filesystem and must
+/// collide there — while remaining two distinct files (no collision) on a
+/// case-sensitive one. The expectation is therefore conditioned on the *actual*
+/// case-sensitivity of the test's working directory, probed the same way the
+/// validator does, so the assertion is deterministic on every CI runner: it
+/// requires the collision on case-insensitive macOS/Windows runners and forbids
+/// the false positive on case-sensitive Linux runners.
+#[test]
+fn case_variant_dlq_paths_emit_e318_only_when_filesystem_folds_case() {
+    let yaml = r#"
+pipeline:
+  name: e318_case_collision
+error_handling:
+  strategy: continue
+  dlq:
+    path: errors.csv
+    per_source:
+      src_a:
+        path: Errors.csv
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out
+    input: src_a
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    // Probe the working directory the validator will probe (paths resolve
+    // against cwd). `false` ⇒ case-insensitive ⇒ the two paths name one file.
+    let case_sensitive =
+        clinker_plan::config::case_sensitive_dir(std::path::Path::new("errors.csv"))
+            .unwrap_or(true);
+
+    let config = parse_config(yaml).expect("parse");
+    let result = config.compile(&CompileContext::default());
+
+    if case_sensitive {
+        // Case-sensitive filesystem: `errors.csv` and `Errors.csv` are two
+        // distinct files, so no path collision is raised. (The pipeline still
+        // compiles; absence of an E318 *collision* diagnostic is the point.)
+        if let Err(diags) = result {
+            let collision = diags
+                .iter()
+                .any(|d| d.code == "E318" && d.message.contains("collides"));
+            assert!(
+                !collision,
+                "case-sensitive filesystem must not flag a case-only DLQ collision, got: {:?}",
+                diags
+                    .iter()
+                    .map(|d| (&d.code, &d.message))
+                    .collect::<Vec<_>>()
+            );
+        }
+    } else {
+        // Case-insensitive filesystem: the two paths name one file, so the
+        // per-source writer would silently overwrite the pipeline-wide one —
+        // E318 must fire.
+        let diags =
+            result.expect_err("case-insensitive filesystem must flag the case-only DLQ collision");
+        let combined = diags
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("E318") && combined.contains("collides"),
+            "expected E318 case-variant collision, got:\n{combined}"
+        );
+    }
+}
