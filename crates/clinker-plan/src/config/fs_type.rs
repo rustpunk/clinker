@@ -66,6 +66,19 @@ pub enum FsKind {
 /// path does not exist, cannot be stat'd / queried, or the OS call returns an
 /// error.
 pub fn classify(path: &Path) -> io::Result<FsKind> {
+    // Enforce the documented "path must exist" contract uniformly. Unix
+    // statfs(2) already errors on a missing path, but the Windows volume query
+    // resolves the path's drive root and would succeed for a non-existent
+    // file — so check existence here rather than leave the behavior per-OS.
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cannot classify filesystem: path does not exist: {}",
+                path.display()
+            ),
+        ));
+    }
     classify_impl(path)
 }
 
