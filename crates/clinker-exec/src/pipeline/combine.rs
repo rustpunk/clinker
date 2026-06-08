@@ -847,6 +847,21 @@ fn partial_memory_bytes(
             .sum::<usize>()
 }
 
+/// Estimated owned-memory footprint of an accumulated combine output buffer
+/// (`(Record, RecordOrder)` pairs). The IEJoin and sort-merge probe kernels
+/// gate this buffer's growth on its own byte count via `should_abort_local`,
+/// so the memory budget still fires on a platform where process RSS is
+/// unavailable — without it those two kernels would grow unbounded toward an
+/// OOM on the wasm build, unsupported targets, or a transient platform-API
+/// failure. Mirrors the equi-join build-side `partial_memory_bytes` gate.
+pub(crate) fn combine_output_buffer_bytes(records: &[(Record, u64)]) -> usize {
+    std::mem::size_of_val(records)
+        + records
+            .iter()
+            .map(|(r, _)| r.estimated_heap_size())
+            .sum::<usize>()
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // MemoryConsumer wrapper for the inline-combine `CombineHashTable`
 // ──────────────────────────────────────────────────────────────────────────
@@ -1386,6 +1401,34 @@ mod tests {
 
     fn mk_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
         Record::new(Arc::clone(schema), values)
+    }
+
+    #[test]
+    fn combine_output_buffer_bytes_is_nonzero_and_grows() {
+        // The IEJoin and sort-merge probe kernels gate their output buffer's
+        // growth on this figure when process RSS is unavailable, so it must be
+        // non-zero for a populated buffer and increase as records accrue.
+        let schema = test_schema(&["id", "name"]);
+        let rec = |id: i64, name: &str| {
+            (
+                mk_record(
+                    &schema,
+                    vec![Value::Integer(id), Value::String(name.into())],
+                ),
+                0u64,
+            )
+        };
+        let empty: Vec<(Record, u64)> = Vec::new();
+        assert_eq!(combine_output_buffer_bytes(&empty), 0);
+
+        let one = vec![rec(1, "alice")];
+        let three = vec![rec(1, "alice"), rec(2, "bob"), rec(3, "carol")];
+        let one_bytes = combine_output_buffer_bytes(&one);
+        assert!(one_bytes > 0, "populated buffer must report non-zero bytes");
+        assert!(
+            combine_output_buffer_bytes(&three) > one_bytes,
+            "byte estimate must grow with the buffer"
+        );
     }
 
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {

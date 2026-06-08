@@ -856,14 +856,19 @@ pub(crate) fn execute_combine_iejoin(
                                     matched_driver[driver_idx] = true;
                                     emitted_since_check += 1;
                                     if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                        if budget.should_abort() {
+                                        let used =
+                                            crate::pipeline::combine::combine_output_buffer_bytes(
+                                                &output_records,
+                                            ) as u64;
+                                        if budget.should_abort_local(used) {
                                             return Err(PipelineError::MemoryBudgetExceeded {
                                                 node: name.to_string(),
-                                                used: budget.peak_rss().unwrap_or(0),
+                                                used,
                                                 limit: budget.hard_limit(),
                                                 source: BudgetCategory::Arena,
                                                 detail: Some(
-                                                    "iejoin combine probe RSS abort".to_string(),
+                                                    "iejoin output buffer exceeded budget"
+                                                        .to_string(),
                                                 ),
                                             });
                                         }
@@ -932,13 +937,18 @@ pub(crate) fn execute_combine_iejoin(
                             matched_driver[driver_idx] = true;
                             emitted_since_check += 1;
                             if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                if budget.should_abort() {
+                                let used = crate::pipeline::combine::combine_output_buffer_bytes(
+                                    &output_records,
+                                ) as u64;
+                                if budget.should_abort_local(used) {
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
-                                        used: budget.peak_rss().unwrap_or(0),
+                                        used,
                                         limit: budget.hard_limit(),
                                         source: BudgetCategory::Arena,
-                                        detail: Some("iejoin combine probe RSS abort".to_string()),
+                                        detail: Some(
+                                            "iejoin output buffer exceeded budget".to_string(),
+                                        ),
                                     });
                                 }
                                 emitted_since_check = 0;
@@ -1029,13 +1039,18 @@ pub(crate) fn execute_combine_iejoin(
                         output_records.push((rec, driver_order));
                         emitted_since_check += 1;
                         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                            if budget.should_abort() {
+                            let used = crate::pipeline::combine::combine_output_buffer_bytes(
+                                &output_records,
+                            ) as u64;
+                            if budget.should_abort_local(used) {
                                 return Err(PipelineError::MemoryBudgetExceeded {
                                     node: name.to_string(),
-                                    used: budget.peak_rss().unwrap_or(0),
+                                    used,
                                     limit: budget.hard_limit(),
                                     source: BudgetCategory::Arena,
-                                    detail: Some("iejoin combine probe RSS abort".to_string()),
+                                    detail: Some(
+                                        "iejoin output buffer exceeded budget".to_string(),
+                                    ),
                                 });
                             }
                             emitted_since_check = 0;
