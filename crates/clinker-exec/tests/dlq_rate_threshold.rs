@@ -538,6 +538,53 @@ nodes:
     );
 }
 
+/// E322: two Output nodes writing the same path resolve to one physical file
+/// and would silently overwrite each other. The exact-path case collides on
+/// every platform (no case-folding needed), so this is deterministic.
+#[test]
+fn two_outputs_same_path_emit_e322() {
+    let yaml = r#"
+pipeline:
+  name: e322_output_collision
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out1
+    input: src_a
+    config:
+      name: out1
+      type: csv
+      path: shared.csv
+  - type: output
+    name: out2
+    input: src_a
+    config:
+      name: out2
+      type: csv
+      path: shared.csv
+"#;
+    let config = parse_config(yaml).expect("parse");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("two outputs writing one path must produce E322");
+    let combined = diags
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("E322") && combined.contains("collides"),
+        "expected E322 output-path collision, got:\n{combined}"
+    );
+}
+
 /// E318: two DLQ paths differing only in case (`errors.csv` vs `Errors.csv`)
 /// resolve to one physical file on a case-insensitive filesystem and must
 /// collide there — while remaining two distinct files (no collision) on a

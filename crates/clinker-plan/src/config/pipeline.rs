@@ -666,6 +666,11 @@ impl PipelineConfig {
             &self.nodes,
             &mut diags,
         );
+        crate::plan::bind_schema::validate_output_path_collisions(
+            &self.nodes,
+            self.error_handling.dlq.as_ref(),
+            &mut diags,
+        );
 
         // Only abort on non-composition CXL errors (E200/E201) and
         // source-CK validation errors (E153). Composition binding

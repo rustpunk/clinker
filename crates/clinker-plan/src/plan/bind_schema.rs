@@ -1040,6 +1040,82 @@ pub(crate) fn validate_dlq_per_source(
     }
 }
 
+/// Flags E322 when two output destinations resolve to the same physical
+/// file: two `Output` nodes' paths, or an `Output` node's path and a
+/// configured DLQ path. The engine otherwise only checks whether a single
+/// output path already exists on disk (`validate_path`), so two writers onto
+/// one file are silent — and on a case-insensitive output filesystem (macOS
+/// APFS / Windows NTFS) paths differing only in case (`out.csv` / `Out.csv`)
+/// name one file.
+///
+/// Case is folded conditionally via [`crate::config::collision_key`] — the
+/// same primitive the DLQ collision check uses — so two legitimately-distinct
+/// files on case-sensitive Linux are not flagged. Paths are compared
+/// as-authored; collisions that only emerge after path-template token
+/// resolution are left to runtime. DLQ-vs-DLQ collisions stay owned by
+/// [`validate_dlq_per_source`] (E318): this pass seeds the map with DLQ paths
+/// only to catch Output-vs-DLQ overlap, and never re-reports a DLQ-only
+/// collision.
+pub(crate) fn validate_output_path_collisions(
+    nodes: &[Spanned<PipelineNode>],
+    dlq: Option<&crate::config::DlqConfig>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // (raw path, config label) keyed by the case-folded collision key.
+    let mut paths: HashMap<String, (String, String)> = HashMap::new();
+
+    // Seed DLQ paths silently so an Output colliding with one surfaces, while
+    // DLQ-vs-DLQ collisions remain E318's responsibility.
+    if let Some(dlq) = dlq {
+        if let Some(p) = dlq.path.as_deref() {
+            paths.insert(
+                crate::config::collision_key(p),
+                (p.to_string(), "error_handling.dlq.path".to_string()),
+            );
+        }
+        for (src_name, per) in &dlq.per_source {
+            if let Some(p) = per.path.as_deref() {
+                paths.insert(
+                    crate::config::collision_key(p),
+                    (
+                        p.to_string(),
+                        format!("error_handling.dlq.per_source.{src_name}.path"),
+                    ),
+                );
+            }
+        }
+    }
+
+    for n in nodes {
+        let PipelineNode::Output { config, .. } = &n.value else {
+            continue;
+        };
+        let p = config.output.path.as_str();
+        if p.is_empty() {
+            continue;
+        }
+        let name = config.output.name.as_str();
+        if let Some((prev_path, prev_label)) = paths.insert(
+            crate::config::collision_key(p),
+            (p.to_string(), format!("output {name:?}")),
+        ) {
+            let collide_note = if prev_path == p {
+                format!("collides with {prev_label}")
+            } else {
+                format!(
+                    "collides with {prev_label} ({prev_path:?}) — these paths name the \
+                     same file on a case-insensitive output filesystem"
+                )
+            };
+            diags.push(Diagnostic::error(
+                "E322",
+                format!("output {name:?} path {p:?} {collide_note}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+        }
+    }
+}
+
 fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     TypedProgram {
         program: cxl::ast::Program {
