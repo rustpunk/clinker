@@ -258,6 +258,11 @@ mod tests {
         assert!(err.message.contains("directory traversal"));
     }
 
+    // POSIX symlinks need no special privilege to create, so this test is
+    // Unix-only. The Windows junction equivalent lives in the `#[cfg(windows)]`
+    // tests below; gating the whole fn (rather than early-returning mid-body)
+    // keeps non-Unix builds free of unreachable-tail warnings.
+    #[cfg(unix)]
     #[test]
     fn test_validate_path_rejects_symlink_escape() {
         let outside = tempfile::tempdir().unwrap();
@@ -265,13 +270,7 @@ mod tests {
 
         let base = tempfile::tempdir().unwrap();
         let link = base.path().join("leak");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // On non-unix targets we can't create a symlink without admin rights.
-            return;
-        }
 
         let err = validate_path(Path::new("leak"), base.path(), false).unwrap_err();
         assert!(
