@@ -102,6 +102,11 @@ impl XmlReader {
     pub fn new<R: Read>(mut reader: R, config: XmlReaderConfig) -> io::Result<Self> {
         let mut bytes_vec = Vec::new();
         reader.read_to_end(&mut bytes_vec)?;
+        // Strip a leading UTF-8 BOM (Windows utf8 export) before the bytes
+        // reach the parser, so it does not precede the prolog/root element.
+        if bytes_vec.starts_with(&crate::bom::UTF8_BOM) {
+            bytes_vec.drain(..crate::bom::UTF8_BOM.len());
+        }
         let bytes: Arc<[u8]> = Arc::from(bytes_vec);
         Ok(Self::from_bytes(bytes, config))
     }
@@ -879,6 +884,25 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("id"), Some(&Value::Integer(2)));
 
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_xml_strips_leading_bom() {
+        // A leading UTF-8 BOM (Windows utf8 export) must be stripped, or it
+        // precedes the root element and breaks element-path matching.
+        let xml = r#"<Root><Orders><Order><id>1</id><name>Alice</name></Order></Orders></Root>"#;
+        let mut bytes = crate::bom::UTF8_BOM.to_vec();
+        bytes.extend_from_slice(xml.as_bytes());
+        let mut r = XmlReader::new(
+            Cursor::new(bytes),
+            default_config_with_path("Root/Orders/Order"),
+        )
+        .expect("XML buffer read");
+
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
         assert!(r.next_record().unwrap().is_none());
     }
 
