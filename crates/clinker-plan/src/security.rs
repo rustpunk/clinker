@@ -105,16 +105,26 @@ pub fn validate_path(
         }
     }
 
-    if raw.is_absolute() && !allow_absolute {
+    // A leading drive prefix or root means the path is not provably relative to
+    // `base_dir`. `Path::is_absolute()` is insufficient here: on Windows it
+    // returns `false` for drive-relative paths like `C:evil.csv` (a prefix with
+    // no root) and root-relative paths like `\x` (a root with no prefix), yet
+    // both discard `base_dir` when joined and resolve against a current
+    // directory the validator never sanctioned. Inspecting the leading
+    // component directly rejects every drive- or root-anchored form on every
+    // platform, closing the Windows escape that `is_absolute()` lets through.
+    if is_drive_or_root_anchored(raw) && !allow_absolute {
         return Err(sec_diag(format!(
             "absolute path not allowed: {raw:?} — use --allow-absolute-paths to override"
         )));
     }
 
-    let resolved = if raw.is_relative() {
-        base_dir.join(raw)
-    } else {
+    let resolved = if is_drive_or_root_anchored(raw) {
+        // Reached only when `allow_absolute` is set; honor the anchored path
+        // verbatim rather than joining it onto `base_dir`.
         raw.to_path_buf()
+    } else {
+        base_dir.join(raw)
     };
 
     // Symlink-escape check: if both the candidate and the base exist, compare
@@ -133,6 +143,21 @@ pub fn validate_path(
     }
 
     Ok(ValidatedPath(resolved))
+}
+
+/// Report whether `path` begins with a drive prefix or a root component.
+///
+/// Returns `true` for Unix absolute paths (`/x`), Windows drive-rooted paths
+/// (`C:\x`), Windows drive-relative paths (`C:x`), Windows root-relative paths
+/// (`\x`), and UNC/verbatim prefixes. These are exactly the forms that ignore a
+/// `base_dir` when joined, so the validator treats them all as non-relative.
+/// Strictly broader than [`Path::is_absolute`], which misses the drive-relative
+/// and root-relative Windows cases.
+fn is_drive_or_root_anchored(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
+    )
 }
 
 fn sec_diag(message: String) -> Diagnostic {
@@ -283,6 +308,44 @@ mod tests {
     #[test]
     fn test_path_reject_absolute() {
         let err = validate_path(Path::new("/tmp/out.csv"), &base(), false).unwrap_err();
+        assert!(err.message.contains("absolute path not allowed"));
+    }
+
+    // Windows drive-relative (`C:x`) and drive-rooted (`C:\x`) paths must be
+    // rejected when absolutes are disallowed. The former is the dangerous case:
+    // `Path::is_absolute()` reports `false` for it, so before the explicit
+    // prefix inspection it slipped the gate and discarded `base_dir` on join.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_drive_relative() {
+        let err = validate_path(Path::new("C:evil.csv"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
+        assert!(
+            err.message.contains("absolute path not allowed"),
+            "expected absolute-path rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_drive_rooted() {
+        let err = validate_path(Path::new("C:\\x"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
+        assert!(
+            err.message.contains("absolute path not allowed"),
+            "expected absolute-path rejection, got: {}",
+            err.message
+        );
+    }
+
+    // `\x` (root-relative to the current drive) is likewise non-relative and
+    // must not be joined onto `base_dir`.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_root_relative() {
+        let err = validate_path(Path::new("\\x"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
         assert!(err.message.contains("absolute path not allowed"));
     }
 
