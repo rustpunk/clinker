@@ -1,4 +1,7 @@
-# Snapshot fixtures are parsed with line-ending-sensitive `---` separators.
-# Pin them to LF so a Windows checkout (git autocrlf) does not rewrite them
-# to CRLF and break the parsers that read them back.
-*.snap text eol=lf
+# This repository is authored with LF line endings, and the engine emits LF
+# in its output. Force LF on checkout on every platform — without this, a
+# Windows checkout (core.autocrlf) rewrites committed text fixtures to CRLF,
+# breaking byte-comparison baseline tests (engine LF output vs CRLF fixture)
+# and line-ending-sensitive snapshot parsers. `text=auto` still lets git
+# detect and leave binary files untouched.
+* text=auto eol=lf
