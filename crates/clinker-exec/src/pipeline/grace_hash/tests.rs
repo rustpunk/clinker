@@ -212,6 +212,61 @@ fn spill_activates_under_tiny_budget() {
     );
 }
 
+/// RSS-independent backstop: grace-hash spills on the pull-mode
+/// charged-byte sum even when the RSS arm of `should_spill` is inert.
+/// The executor's `consumer_handle` is registered with the arbitrator
+/// (mirroring production), then pre-charged above the soft limit while a
+/// 1 GiB hard limit keeps the soft threshold (800 MiB) above any real
+/// test-process RSS — the faithful Linux proxy for a platform where
+/// `rss_bytes()` returns `None`. Adding a single build record drives
+/// `add_build_record`'s `should_spill` poll, which must trip on the
+/// charged bytes alone and evict a partition to disk. Without the
+/// charged-byte arm the build would grow unbounded under no RSS reading.
+#[test]
+fn spill_activates_on_charged_bytes_without_rss() {
+    let schema = schema_with(&["k", "v"]);
+    let dir = tempfile::Builder::new()
+        .prefix("gh-test-")
+        .tempdir()
+        .unwrap();
+    let consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+    let mut exec = GraceHashExecutor::new(4, dir.path(), consumer_handle.clone(), true).unwrap();
+
+    // 1 GiB hard limit → 800 MiB soft limit, above any host's test RSS,
+    // so the RSS arm of `should_spill` cannot trip. Register the handle so
+    // its charged bytes flow into `sum_consumer_usage`.
+    let budget = MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    budget.register_consumer(Arc::new(GraceHashConsumer::new(consumer_handle.clone())));
+    let soft = budget.soft_limit();
+    assert!(
+        budget.peak_rss().is_none_or(|rss| rss < soft),
+        "test invariant: real RSS must stay under the 800 MiB soft limit so only \
+         the charged-byte arm can trip the spill"
+    );
+
+    // Pre-charge the handle above the soft limit but below the 1 GiB hard
+    // limit (so `should_spill` trips while `should_abort` does not). One
+    // real build record then carries enough Building bytes for
+    // `spill_largest_building` to have a victim.
+    consumer_handle.set_bytes(soft + 1);
+    let rec = record_for(
+        &schema,
+        vec![Value::Integer(0), Value::String("row-0".into())],
+    );
+    exec.add_build_record(rec, 0, &budget).unwrap();
+
+    let on_disk = exec
+        .partitions
+        .iter()
+        .filter(|p| matches!(p, PartitionState::OnDisk { .. }))
+        .count();
+    assert!(
+        on_disk >= 1,
+        "charged bytes over the soft limit must spill a partition with the RSS arm inert; \
+         got {on_disk} on-disk partitions"
+    );
+}
+
 /// Lazy probe spill: a partition pre-spilled during build receives a
 /// probe record and writes it to its probe-side spill file rather
 /// than dropping it.

@@ -757,13 +757,26 @@ impl MemoryArbitrator {
         }
     }
 
-    /// True when current RSS exceeds the soft spill threshold. Also
-    /// updates `peak_rss` as a side-effect and runs one arbitration
-    /// round; the round is a no-op when no consumers are registered.
-    /// False when RSS cannot be measured (sentinel `0`).
+    /// True when EITHER current RSS or the pull-mode charged-byte sum
+    /// exceeds the soft spill threshold. Also updates `peak_rss` as a
+    /// side-effect and runs one arbitration round; the round is a no-op
+    /// when no consumers are registered.
+    ///
+    /// The charged-byte arm is the RSS-independent backstop: when
+    /// `rss_bytes()` returns `None` (unsupported target, the wasm build,
+    /// or a transient platform-API failure) `peak_rss` stays at the
+    /// sentinel `0`, so an RSS-only gate would be permanently false and
+    /// the budget would silently become a no-op that OOMs instead of
+    /// spilling. Summing the registered consumers' live bytes keeps the
+    /// budget degrading to a heuristic ceiling rather than to nothing —
+    /// grace-hash partitions and inter-stage `node_buffers` slots mirror
+    /// their footprint into a registered handle, so their growth trips
+    /// this arm even with no RSS reading.
     pub fn should_spill(&self) -> bool {
         self.observe();
-        let tripped = self.peak_rss.load(Ordering::Relaxed) > self.soft_limit();
+        let soft = self.soft_limit();
+        let tripped =
+            self.peak_rss.load(Ordering::Relaxed) > soft || self.sum_consumer_usage() > soft;
         if tripped {
             // Drive the round-trip: the elected victim is paused
             // (back-pressureable) or asked to spill (everything else).
@@ -790,9 +803,15 @@ impl MemoryArbitrator {
     /// refilling, the dispatch loop blocks on `recv`, and the pipeline
     /// deadlocks. The streaming path's back-pressure is the bounded
     /// inter-stage channel, not a pause signal.
+    ///
+    /// Trips on EITHER RSS or the pull-mode charged-byte sum crossing the
+    /// soft limit, so a streaming stage still spills its in-flight batch
+    /// when `rss_bytes()` is unavailable (see [`Self::should_spill`] for
+    /// why the charged-byte arm is the RSS-independent backstop).
     pub fn should_spill_self(&self) -> bool {
         self.observe();
-        self.peak_rss.load(Ordering::Relaxed) > self.soft_limit()
+        let soft = self.soft_limit();
+        self.peak_rss.load(Ordering::Relaxed) > soft || self.sum_consumer_usage() > soft
     }
 
     /// Soft spill threshold in absolute bytes.
@@ -834,12 +853,38 @@ impl MemoryArbitrator {
         self.hard_limit() - self.soft_limit()
     }
 
-    /// True when RSS exceeds the hard limit. Check periodically in
-    /// probe loops (every 10K output records) to prevent unbounded
-    /// fan-out from blowing the ceiling between spill polls.
+    /// True when EITHER RSS or the pull-mode charged-byte sum exceeds the
+    /// hard limit. Check periodically in probe loops (every 10K output
+    /// records) to prevent unbounded fan-out from blowing the ceiling
+    /// between spill polls.
+    ///
+    /// The charged-byte arm is the RSS-independent backstop: see
+    /// [`Self::should_spill`]. Without it the hard-abort gate is
+    /// permanently false whenever `rss_bytes()` returns `None`, so a join
+    /// or aggregate grows unbounded until the OS kills the process instead
+    /// of aborting cleanly under the configured budget.
     pub fn should_abort(&self) -> bool {
         self.observe();
-        self.peak_rss.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
+        let hard = self.limit.load(Ordering::Relaxed);
+        self.peak_rss.load(Ordering::Relaxed) > hard || self.sum_consumer_usage() > hard
+    }
+
+    /// True when the hard limit is breached by RSS, by the pull-mode
+    /// charged-byte sum, or by an operator-supplied `local_bytes`
+    /// estimate of in-progress state that is not yet reflected in a
+    /// registered consumer handle.
+    ///
+    /// The combine equi-join build loop registers its `MemoryConsumer`
+    /// wrapper with a zero-seeded handle and only mirrors the table's
+    /// footprint into it *after* the build completes, so the build loop's
+    /// growing bytes are invisible to [`Self::sum_consumer_usage`] while
+    /// the build runs. Passing the running `partial_memory_bytes` here is
+    /// the RSS-independent gate for that window — it aborts the build when
+    /// the in-memory table alone exceeds the budget, even on a target
+    /// where `rss_bytes()` returns `None`. Mirrors the arena's own
+    /// `local_bytes_used > hard_limit` self-trigger.
+    pub fn should_abort_local(&self, local_bytes: u64) -> bool {
+        local_bytes > self.limit.load(Ordering::Relaxed) || self.should_abort()
     }
 
     /// Peak RSS observed so far, or `None` on platforms where
@@ -1358,6 +1403,93 @@ mod tests {
                 "a budget above baseline must be satisfiable under {knob:?}"
             );
         }
+    }
+
+    #[test]
+    fn should_spill_trips_on_charged_bytes_without_rss() {
+        // RSS-independent backstop. A 100 GiB hard limit puts the soft
+        // threshold (80 GiB) far above any real test-process RSS, so the
+        // RSS arm of `should_spill` can never trip — whatever `observe()`
+        // samples stays below the soft limit. That isolates the
+        // charged-byte arm: it is the faithful Linux proxy for a platform
+        // where `rss_bytes()` returns `None` (there the RSS arm is also
+        // permanently below-threshold, just for a different reason). A
+        // registered consumer holding more than the soft limit must trip
+        // the gate through that arm alone.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let soft = arbitrator.soft_limit();
+        assert!(!arbitrator.should_spill(), "empty registry must not trip");
+        // Whatever RSS `observe()` just sampled is below the soft limit, so
+        // only the charged-byte arm can be responsible for any trip below.
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < soft),
+            "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        assert!(
+            arbitrator.should_spill(),
+            "charged bytes over the soft limit must trip should_spill via the RSS-independent arm"
+        );
+    }
+
+    #[test]
+    fn should_abort_trips_on_charged_bytes_without_rss() {
+        // Same RSS-independent backstop for the hard-abort gate; the 100
+        // GiB hard limit keeps the RSS arm inert (see the sibling
+        // should_spill test for why this isolates the charged-byte arm).
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let hard = arbitrator.hard_limit();
+        assert!(!arbitrator.should_abort(), "empty registry must not abort");
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < hard),
+            "test invariant: real RSS must stay under the hard limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(hard + 1, 0, 0)));
+        assert!(
+            arbitrator.should_abort(),
+            "charged bytes over the hard limit must trip should_abort via the RSS-independent arm"
+        );
+    }
+
+    #[test]
+    fn should_abort_local_trips_on_operator_bytes_without_rss() {
+        // The combine build loop's gate: in-progress bytes that are not yet
+        // in any registered consumer handle must still abort the build when
+        // they exceed the hard limit, independent of RSS. The registry is
+        // empty here (the build's handle is zero-seeded until build
+        // completes) and the 100 GiB limit keeps the RSS arm inert, so only
+        // the `local_bytes` arm can fire.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let hard = arbitrator.hard_limit();
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+        assert!(
+            !arbitrator.should_abort_local(hard),
+            "local bytes at exactly the limit must not abort"
+        );
+        assert!(
+            arbitrator.should_abort_local(hard + 1),
+            "local bytes over the hard limit must abort with the RSS arm inert and no registered consumer"
+        );
+    }
+
+    #[test]
+    fn should_spill_self_trips_on_charged_bytes_without_rss() {
+        // The streaming-stage variant carries the same backstop so a
+        // streaming batch still spills itself when RSS is unavailable. The
+        // 100 GiB limit keeps the RSS arm inert.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let soft = arbitrator.soft_limit();
+        assert!(!arbitrator.should_spill_self());
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < soft),
+            "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        assert!(arbitrator.should_spill_self());
     }
 
     #[test]
