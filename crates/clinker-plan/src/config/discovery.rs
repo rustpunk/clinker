@@ -376,8 +376,13 @@ fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, DiscoveryErr
 /// Match a path against any of the compiled exclude patterns. Tested
 /// against both the basename (gitignore-style) and the full path string
 /// — Logstash's `exclude` works similarly.
+///
+/// The full path is normalized to forward slashes before matching, mirroring
+/// the regex matcher: the `glob` crate treats only `/` as a path separator on
+/// every platform, so a separator-bearing exclude (e.g. `**/old/*`) would never
+/// match the backslash-separated path string Windows yields without this.
 fn matches_any(path: &Path, patterns: &[glob::Pattern]) -> bool {
-    let path_str = path.to_string_lossy();
+    let path_str = path.to_string_lossy().replace('\\', "/");
     let basename = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -761,5 +766,50 @@ mod tests {
         s.glob = Some("**/*.csv".into());
         let out = discover(&s, tmp.path()).unwrap();
         assert_eq!(out.files().len(), 2);
+    }
+
+    /// A separator-bearing exclude pattern matches a backslash-separated path
+    /// string. The `glob` crate only treats `/` as a separator, so without the
+    /// normalization in `matches_any` this pattern would never match the path
+    /// shape Windows yields. The backslash path is built directly so the
+    /// assertion runs and verifies the normalization on any host.
+    #[test]
+    fn exclude_matches_windows_backslash_path() {
+        let compiled = compile_globs(&["**/old/*".into()]).unwrap();
+        // A path string with backslash separators, as Windows produces. On
+        // Linux the bytes are identical; backslashes are ordinary characters
+        // there, so this exercises the same normalization path.
+        let windows_path = Path::new(r"C:\data\old\x.csv");
+        assert!(
+            matches_any(windows_path, &compiled),
+            "separator-bearing exclude must match a backslash path after normalization"
+        );
+        // A file outside the excluded directory must survive.
+        let kept = Path::new(r"C:\data\fresh\y.csv");
+        assert!(!matches_any(kept, &compiled));
+    }
+
+    /// `exclude: ["**/old/*"]` drops nested files under `old/` during real
+    /// discovery, the cross-OS behavioral guarantee. The host separator is
+    /// native, so this pins the Linux/macOS side; the unit test above pins the
+    /// Windows backslash shape.
+    #[test]
+    fn exclude_drops_nested_subdir_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("old")).unwrap();
+        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
+        write(&tmp.path().join("old"), "stale.csv", "");
+        write(&tmp.path().join("fresh"), "current.csv", "");
+        let mut s = cfg();
+        s.glob = Some("**/*.csv".into());
+        s.exclude = Some(vec!["**/old/*".into()]);
+        let out = discover(&s, tmp.path()).unwrap();
+        let names: Vec<_> = out
+            .files()
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"current.csv".to_string()));
+        assert!(!names.contains(&"stale.csv".to_string()));
     }
 }
