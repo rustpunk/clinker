@@ -602,7 +602,6 @@ fn distinct_seeds_diverge() {
 #[test]
 fn interleave_shutdown_unwinds_mid_stream() {
     use clinker_exec::pipeline::shutdown::ShutdownToken;
-    use std::time::Instant;
 
     let yaml = pipeline_yaml("mode: interleave");
     let config = parse_config(&yaml).unwrap();
