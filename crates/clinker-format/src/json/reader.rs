@@ -25,6 +25,7 @@ use clinker_record::{
 };
 use indexmap::IndexMap;
 
+use crate::bom::UTF8_BOM;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -96,6 +97,13 @@ impl JsonReader {
     ) -> Result<Self, FormatError> {
         let mut bytes_vec = Vec::new();
         reader.read_to_end(&mut bytes_vec)?;
+        // Strip a single leading UTF-8 BOM once at the source. `raw_bytes`
+        // feeds every JSON path — array/object auto-detect, the NDJSON
+        // line scan, and the envelope pre-scan's `serde_json::from_slice`
+        // — so one strip here clears the marker from all of them.
+        if bytes_vec.starts_with(&UTF8_BOM) {
+            bytes_vec.drain(..UTF8_BOM.len());
+        }
         let raw_bytes: Arc<[u8]> = Arc::from(bytes_vec);
         let body_cursor: Box<dyn Read + Send> = Box::new(Cursor::new(Arc::clone(&raw_bytes)));
         let mut buf = BufReader::new(body_cursor);
@@ -639,6 +647,14 @@ mod tests {
         JsonReader::from_reader(std::io::Cursor::new(input.as_bytes().to_vec()), config).unwrap()
     }
 
+    /// Builds a reader over `input` prefixed with a UTF-8 BOM, mimicking
+    /// a Windows-authored JSON file (Excel / PowerShell utf8 export).
+    fn reader_from_str_with_bom(input: &str, config: JsonReaderConfig) -> JsonReader {
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(input.as_bytes());
+        JsonReader::from_reader(std::io::Cursor::new(bytes), config).unwrap()
+    }
+
     fn default_config() -> JsonReaderConfig {
         JsonReaderConfig::default()
     }
@@ -840,6 +856,99 @@ mod tests {
             Some(&Value::Integer(2))
         );
         assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_json_array_strips_leading_bom() {
+        // Auto-detect must see `[`, not the leading `0xEF` of the BOM,
+        // and the parse must be identical to BOM-less input.
+        let mut r = reader_from_str_with_bom(r#"[{"a":1},{"a":2}]"#, default_config());
+        let s = r.schema().unwrap();
+        assert_eq!(s.columns().len(), 1);
+        assert_eq!(&*s.columns()[0], "a");
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(2))
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_json_ndjson_strips_leading_bom() {
+        // `str::trim` does not remove `U+FEFF`, so without the source
+        // strip the first NDJSON line would fail `serde_json::from_str`.
+        let mut r = reader_from_str_with_bom("{\"a\":1}\n{\"a\":2}\n", default_config());
+        let s = r.schema().unwrap();
+        assert_eq!(s.columns().len(), 1);
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(2))
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_json_bom_matches_bomless() {
+        // Full parse equivalence across a multi-field array: a
+        // BOM-prefixed document and its BOM-less twin emit identical
+        // records.
+        let input = r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]"#;
+        let collect = |mut r: JsonReader| {
+            let _ = r.schema().unwrap();
+            let mut rows = Vec::new();
+            while let Some(rec) = r.next_record().unwrap() {
+                rows.push((rec.get("id").cloned(), rec.get("name").cloned()));
+            }
+            rows
+        };
+        let plain = collect(reader_from_str(input, default_config()));
+        let bom = collect(reader_from_str_with_bom(input, default_config()));
+        assert_eq!(plain, bom);
+        assert_eq!(plain.len(), 2);
+    }
+
+    #[test]
+    fn test_json_envelope_prescan_strips_leading_bom() {
+        // The envelope pre-scan re-parses `raw_bytes` via
+        // `serde_json::from_slice`; the source-level strip must clear
+        // the BOM for that path too, not just body iteration.
+        let json = r#"{
+            "BatchInfo": {"batch_id": "RUN-001", "count": 42},
+            "records": [{"x": 1}, {"x": 2}]
+        }"#;
+        let cfg = envelope_config(&[(
+            "BatchInfo",
+            "/BatchInfo",
+            &[
+                ("batch_id", EnvelopeFieldType::String),
+                ("count", EnvelopeFieldType::Int),
+            ],
+        )]);
+        let mut reader = reader_from_str_with_bom(
+            json,
+            JsonReaderConfig {
+                record_path: Some("records".into()),
+                ..Default::default()
+            },
+        );
+        let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
+        let head = unwrap_section_map(sections.get("BatchInfo").unwrap());
+        assert_eq!(head.get("batch_id"), Some(&Value::String("RUN-001".into())));
+        assert_eq!(head.get("count"), Some(&Value::Integer(42)));
+
+        let r1 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("x"), Some(&Value::Integer(1)));
+        let r2 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("x"), Some(&Value::Integer(2)));
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]

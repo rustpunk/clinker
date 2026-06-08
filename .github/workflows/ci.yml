@@ -40,6 +40,39 @@ jobs:
       - run: cargo check --features bench-alloc -p clinker-benchmarks
       - run: cargo test --benches -p clinker-benchmarks
 
+  # Execute the full suite on the other two first-class targets. These
+  # runners have a native C toolchain, so the `ring` (TLS) build script in
+  # clinker-net/clinker links cleanly here — which the ubuntu cross-check
+  # job below cannot do without an MSVC/Apple cross-linker. This is where
+  # the platform `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` test
+  # modules — including the de-gated RSS-validity assertions — actually run.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # Type-check the non-Linux targets from the ubuntu host. `--all-targets`
+  # so test and bench targets compile too — a #[cfg(windows)] /
+  # #[cfg(target_os = "macos")] branch that fails to build now fails CI
+  # here, not only when a native runner reaches it. Scoped to the crates
+  # that cross-compile without a C toolchain; clinker-net and clinker pull
+  # in `ring`, whose build script needs a cross-linker the ubuntu host
+  # lacks, so their non-Linux coverage comes from the native runners above.
   cross-platform:
     runs-on: ubuntu-latest
     steps:
@@ -52,8 +85,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo check --target x86_64-pc-windows-msvc -p clinker-exec -p clinker-plan
-      - run: cargo check --target aarch64-apple-darwin -p clinker-exec -p clinker-plan
+      - run: >-
+          cargo check --all-targets --target x86_64-pc-windows-msvc
+          -p clinker-exec -p clinker-plan -p clinker-schema
+          -p clinker-channel -p cxl-cli
+      - run: >-
+          cargo check --all-targets --target aarch64-apple-darwin
+          -p clinker-exec -p clinker-plan -p clinker-schema
+          -p clinker-channel -p cxl-cli
 
   deny:
     runs-on: ubuntu-latest

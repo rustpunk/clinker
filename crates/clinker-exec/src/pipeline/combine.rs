@@ -666,18 +666,27 @@ impl CombineHashTable {
             keys_cache.push(keys);
             arena.push(rec);
 
-            // Periodic budget poll. `should_abort` observes RSS and returns
-            // true when the process has crossed the hard limit.
-            if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) && budget.should_abort() {
-                // Partial memory footprint (arena + chain + keys_cache +
-                // index-so-far). Finalized memory might be slightly higher
-                // once the HashTable rehashes; we report what we've
-                // allocated up to this point so the diagnostic is honest.
+            // Periodic budget poll. The build-side table's bytes are not
+            // yet mirrored into the registered consumer handle (the
+            // executor seeds it only after build completes), so RSS is the
+            // only whole-process signal — and RSS is unavailable on
+            // unsupported targets and the wasm build, where an RSS-only
+            // gate never fires and the build grows until the OS OOMs.
+            // `should_abort_local` adds the partial table footprint as an
+            // RSS-independent gate: the build aborts when the in-memory
+            // table alone exceeds the budget regardless of RSS
+            // availability. Partial footprint (arena + chain + keys_cache +
+            // index-so-far) under-reports the finalized table slightly once
+            // the HashTable rehashes, which is the honest figure to gate
+            // and report mid-build.
+            if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) {
                 let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
-                return Err(CombineError::MemoryLimitExceeded {
-                    used: used as u64,
-                    limit: budget.limit(),
-                });
+                if budget.should_abort_local(used as u64) {
+                    return Err(CombineError::MemoryLimitExceeded {
+                        used: used as u64,
+                        limit: budget.limit(),
+                    });
+                }
             }
         }
 
@@ -690,8 +699,10 @@ impl CombineHashTable {
         };
 
         // Safety-net final check — catches builds shorter than
-        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll.
-        if budget.should_abort() {
+        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll. Gates
+        // on the finalized table's own bytes too, so a sub-interval build
+        // over a tiny budget aborts even when RSS cannot be measured.
+        if budget.should_abort_local(table.memory_bytes() as u64) {
             return Err(CombineError::MemoryLimitExceeded {
                 used: table.memory_bytes() as u64,
                 limit: budget.limit(),
@@ -833,6 +844,21 @@ fn partial_memory_bytes(
                 k.capacity() * std::mem::size_of::<Value>()
                     + k.iter().map(Value::heap_size).sum::<usize>()
             })
+            .sum::<usize>()
+}
+
+/// Estimated owned-memory footprint of an accumulated combine output buffer
+/// (`(Record, RecordOrder)` pairs). The IEJoin and sort-merge probe kernels
+/// gate this buffer's growth on its own byte count via `should_abort_local`,
+/// so the memory budget still fires on a platform where process RSS is
+/// unavailable — without it those two kernels would grow unbounded toward an
+/// OOM on the wasm build, unsupported targets, or a transient platform-API
+/// failure. Mirrors the equi-join build-side `partial_memory_bytes` gate.
+pub(crate) fn combine_output_buffer_bytes(records: &[(Record, u64)]) -> usize {
+    std::mem::size_of_val(records)
+        + records
+            .iter()
+            .map(|(r, _)| r.estimated_heap_size())
             .sum::<usize>()
 }
 
@@ -1377,6 +1403,34 @@ mod tests {
         Record::new(Arc::clone(schema), values)
     }
 
+    #[test]
+    fn combine_output_buffer_bytes_is_nonzero_and_grows() {
+        // The IEJoin and sort-merge probe kernels gate their output buffer's
+        // growth on this figure when process RSS is unavailable, so it must be
+        // non-zero for a populated buffer and increase as records accrue.
+        let schema = test_schema(&["id", "name"]);
+        let rec = |id: i64, name: &str| {
+            (
+                mk_record(
+                    &schema,
+                    vec![Value::Integer(id), Value::String(name.into())],
+                ),
+                0u64,
+            )
+        };
+        let empty: Vec<(Record, u64)> = Vec::new();
+        assert_eq!(combine_output_buffer_bytes(&empty), 0);
+
+        let one = vec![rec(1, "alice")];
+        let three = vec![rec(1, "alice"), rec(2, "bob"), rec(3, "carol")];
+        let one_bytes = combine_output_buffer_bytes(&one);
+        assert!(one_bytes > 0, "populated buffer must report non-zero bytes");
+        assert!(
+            combine_output_buffer_bytes(&three) > one_bytes,
+            "byte estimate must grow with the buffer"
+        );
+    }
+
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {
         MemoryArbitrator::with_policy(limit_bytes, 0.80, Box::new(NoOpPolicy))
     }
@@ -1821,10 +1875,11 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_oom_aborts_during_build() {
-        // With a 1-byte budget, the process RSS trivially exceeds the
-        // hard limit — `should_abort()` returns true on the first poll.
-        // The final-check safety net fires even though we have fewer
-        // than MEMORY_CHECK_INTERVAL records.
+        // With a 1-byte budget the 10-record table's own footprint trivially
+        // exceeds the hard limit, so the final-check safety net's
+        // `should_abort_local(table.memory_bytes())` fires regardless of
+        // whether RSS is measurable — the build-side cap is no longer an
+        // RSS-only gate that goes silent when `rss_bytes()` returns `None`.
         let schema = test_schema(&["k"]);
         let records: Vec<Record> = (0..10)
             .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
@@ -1838,24 +1893,48 @@ mod tests {
         match CombineHashTable::build(records, &extractor, &ctx, &budget, None) {
             Err(CombineError::MemoryLimitExceeded { used, limit }) => {
                 assert_eq!(limit, 1);
-                // `used` is either non-zero if the final check fires and
-                // reports table.memory_bytes(), or zero if the periodic
-                // poll fired mid-build — the variant is the gate.
-                let _ = used;
-            }
-            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
-            Ok(_) => {
-                // RSS measurement unavailable on this platform
-                // (`rss_bytes()` returns None) — `should_abort()` can't
-                // fire. Accepting Ok here would hide a real abort-path
-                // regression on Linux CI; fail explicitly so the
-                // maintainer has to decide to wire a platform gate.
-                panic!(
-                    "build() succeeded under 1-byte budget — either RSS polling \
-                     returned None on this platform (add a cfg gate), or the \
-                     should_abort wiring regressed"
+                // The 10-record table holds far more than 1 byte, so the
+                // local-bytes gate reports a non-zero footprint.
+                assert!(
+                    used > 1,
+                    "expected a non-trivial table footprint, got {used}"
                 );
             }
+            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+            Ok(_) => panic!(
+                "build() succeeded under a 1-byte budget — the byte-counted \
+                 build-side cap regressed; it must abort even when RSS is \
+                 unavailable"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_combine_build_aborts_under_tiny_budget_without_seeding_rss() {
+        // RSS-independent backstop: a build over input larger than the
+        // budget must abort even with NO seeded peak_rss. `test_budget`
+        // never seeds `peak_rss`, so on a target where `rss_bytes()`
+        // returns `None` the only signal is the byte-counted local-bytes
+        // gate. A 64-byte budget cannot hold a 5000-record integer-key
+        // table, so the build must fail with MemoryLimitExceeded rather
+        // than succeed and risk an OOM.
+        let schema = test_schema(&["k"]);
+        let records: Vec<Record> = (0..5000)
+            .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
+            .collect();
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let budget = test_budget(64);
+
+        match CombineHashTable::build(records, &extractor, &ctx, &budget, Some(5000)) {
+            Err(CombineError::MemoryLimitExceeded { limit, .. }) => assert_eq!(limit, 64),
+            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+            Ok(_) => panic!(
+                "build() succeeded under a 64-byte budget without a seeded RSS — \
+                 the byte-counted backstop did not fire, so the budget is a no-op \
+                 that would OOM on a platform with no RSS reading"
+            ),
         }
     }
 

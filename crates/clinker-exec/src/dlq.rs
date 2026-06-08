@@ -6,7 +6,7 @@
 //! pipeline's config and executor types.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, Schema, Value};
@@ -129,20 +129,28 @@ pub fn partition_dlq_entries<'a>(
         }
     }
 
-    // Deterministic output order: pipeline-wide path first (if set),
-    // then per-source paths in BTreeMap order.
+    // Bucket identity is the path's *collision key*, not its raw bytes. On a
+    // case-insensitive output filesystem (macOS APFS / Windows NTFS default)
+    // `errors.csv` and `Errors.csv` name one physical file; keying buckets on
+    // the raw `PathBuf` would open two writers onto it and let the per-source
+    // and pipeline-wide records overwrite each other. Folding is conditional on
+    // the actual target filesystem (the same `collision_key` the config-time
+    // check uses), so case-sensitive Linux still keeps distinct files distinct.
+    // The bucket's display `PathBuf` is the first path that claimed the key —
+    // pipeline-wide wins, matching the static check's first-insertion-wins.
     let mut buckets: Vec<(PathBuf, Vec<&'a DlqEntry>)> = Vec::new();
-    let mut index_of: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let key_of = |p: &Path| clinker_plan::config::collision_key(&p.to_string_lossy());
     if let Some(p) = dlq_config.path.as_deref() {
         let pb = PathBuf::from(p);
-        index_of.insert(pb.clone(), 0);
+        index_of.insert(key_of(&pb), 0);
         buckets.push((pb, Vec::new()));
     }
     for path in per_source_paths.values() {
-        if !index_of.contains_key(path) {
-            index_of.insert(path.clone(), buckets.len());
+        index_of.entry(key_of(path)).or_insert_with(|| {
             buckets.push((path.clone(), Vec::new()));
-        }
+            buckets.len() - 1
+        });
     }
 
     for entry in entries {
@@ -151,7 +159,7 @@ pub fn partition_dlq_entries<'a>(
             .cloned()
             .or_else(|| dlq_config.path.as_deref().map(PathBuf::from));
         if let Some(target) = target
-            && let Some(&i) = index_of.get(&target)
+            && let Some(&i) = index_of.get(&key_of(&target))
         {
             buckets[i].1.push(entry);
         }
@@ -694,5 +702,77 @@ mod tests {
         assert_eq!(buckets[1].0, PathBuf::from("dlq_b.csv"));
         assert_eq!(buckets[1].1.len(), 1);
         assert_eq!(buckets[1].1[0].source_name.as_ref(), "src_b");
+    }
+
+    /// A per-source DLQ path that differs from the pipeline-wide path only in
+    /// case must share *one* writer bucket on a case-insensitive filesystem
+    /// (they name one physical file), while remaining two distinct buckets on a
+    /// case-sensitive one. The expectation is conditioned on the working
+    /// directory's actual case-sensitivity — probed the same way the
+    /// partitioner does — so the assertion is deterministic on every CI runner.
+    #[test]
+    fn test_partition_collapses_case_variant_paths_only_when_filesystem_folds() {
+        let schema = make_schema();
+        let mk = |src: &str| {
+            let rec = Record::new(
+                Arc::clone(&schema),
+                vec![Value::String("n".into()), Value::String("v".into())],
+            );
+            DlqEntry {
+                source_row: 0,
+                category: DlqErrorCategory::TypeCoercionFailure,
+                error_message: String::new(),
+                original_record: rec,
+                stage: None,
+                route: None,
+                trigger: true,
+                source_name: Arc::from(src),
+                triggering_field: None,
+                triggering_value: None,
+            }
+        };
+        // `src_b` routes to a case-variant of the pipeline-wide path.
+        let entries = vec![mk("src_a"), mk("src_b")];
+
+        let mut per_source = std::collections::BTreeMap::new();
+        per_source.insert(
+            "src_b".to_string(),
+            clinker_plan::config::DlqPerSourceConfig {
+                path: Some("Errors.csv".to_string()),
+                max_rate: None,
+                min_records: None,
+            },
+        );
+        let cfg = clinker_plan::config::DlqConfig {
+            path: Some("errors.csv".to_string()),
+            include_reason: None,
+            include_source_row: None,
+            max_rate: None,
+            min_records: None,
+            per_source,
+        };
+
+        let case_sensitive =
+            clinker_plan::config::case_sensitive_dir(Path::new("errors.csv")).unwrap_or(true);
+        let buckets = partition_dlq_entries(&entries, &cfg);
+
+        if case_sensitive {
+            // Two distinct files: separate buckets, one entry each.
+            assert_eq!(buckets.len(), 2);
+            assert_eq!(buckets[0].0, PathBuf::from("errors.csv"));
+            assert_eq!(buckets[1].0, PathBuf::from("Errors.csv"));
+            assert_eq!(buckets[0].1.len(), 1);
+            assert_eq!(buckets[1].1.len(), 1);
+        } else {
+            // One physical file: both entries collapse into the single
+            // pipeline-wide bucket (first claimant of the key).
+            assert_eq!(buckets.len(), 1);
+            assert_eq!(buckets[0].0, PathBuf::from("errors.csv"));
+            assert_eq!(
+                buckets[0].1.len(),
+                2,
+                "case-variant per-source path must reuse the pipeline-wide writer"
+            );
+        }
     }
 }

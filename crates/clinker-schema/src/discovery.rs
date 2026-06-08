@@ -14,11 +14,37 @@ use crate::parse::{SchemaParseError, parse_schema};
 /// Default schema directory name relative to workspace root.
 pub const DEFAULT_SCHEMA_DIR: &str = "schemas";
 
+/// Returns whether the path's extension is a YAML extension, ignoring case.
+///
+/// Case-folds the extension so that case-preserving filesystems (macOS APFS,
+/// Windows NTFS) surface files stored as `*.YAML`/`*.YML` identically to the
+/// lowercase forms a case-sensitive Linux filesystem would carry.
+fn has_yaml_extension(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+}
+
+/// Returns whether the path's file stem ends in the `.schema` marker, ignoring case.
+///
+/// The stem of `customers.schema.YAML` is `customers.schema`; case-folding the
+/// `.schema` suffix lets a schema authored as `customers.SCHEMA.yaml` on a
+/// case-preserving filesystem still be recognized as a schema file.
+fn has_schema_stem(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| {
+            stem.len() >= ".schema".len()
+                && stem[stem.len() - ".schema".len()..].eq_ignore_ascii_case(".schema")
+        })
+}
+
 /// Discover all `.schema.yaml` files in the given directory (non-recursive).
 ///
-/// Returns parsed schemas with their `path` fields set. The caller is
-/// responsible for populating `referencing_pipelines` via
-/// [`resolve_schema_references`].
+/// Extension and `.schema` stem matching is case-insensitive, so a schema
+/// stored as `customers.schema.YAML` on a case-preserving filesystem is found
+/// alongside the lowercase form. Returns parsed schemas with their `path`
+/// fields set. The caller is responsible for populating
+/// `referencing_pipelines` via [`resolve_schema_references`].
 pub fn discover_schemas(
     schema_dir: &Path,
 ) -> Vec<Result<SourceSchema, (PathBuf, SchemaParseError)>> {
@@ -29,15 +55,8 @@ pub fn discover_schemas(
     entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-                && entry
-                    .path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|name| name.ends_with(".schema"))
+            let path = entry.path();
+            has_yaml_extension(&path) && has_schema_stem(&path)
         })
         .map(|entry| {
             let path = entry.path();
@@ -52,7 +71,10 @@ pub fn discover_schemas(
 ///
 /// Scans the workspace root for `.yaml`/`.yml` files (non-recursive by default),
 /// and optionally uses include/exclude glob patterns from the manifest.
-/// Excludes the schema directory and common non-pipeline directories.
+/// Extension matching and the `.schema` exclusion are case-insensitive, so a
+/// pipeline saved as `flow.YAML` is discovered and a `*.schema.YAML` file is
+/// still excluded on case-preserving filesystems. Excludes the schema directory
+/// and common non-pipeline directories.
 pub fn discover_pipelines(
     workspace_root: &Path,
     schema_dir: &str,
@@ -81,18 +103,11 @@ pub fn discover_pipelines(
                 return false;
             }
             // Must be YAML
-            let is_yaml = path
-                .extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml");
-            if !is_yaml {
+            if !has_yaml_extension(&path) {
                 return false;
             }
             // Exclude schema files
-            let is_schema = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|name| name.ends_with(".schema"));
-            if is_schema {
+            if has_schema_stem(&path) {
                 return false;
             }
             // Exclude kiln.toml companion files
@@ -147,10 +162,13 @@ fn glob_paths(pattern: &str) -> Result<Vec<PathBuf>, ()> {
         return Ok(entries
             .filter_map(|e| e.ok())
             .filter(|e| {
+                // Case-insensitive: a case-preserving filesystem (macOS APFS,
+                // Windows NTFS) returns the on-disk casing, so `*.yaml` must
+                // still match a file stored as `flow.YAML`.
                 e.path()
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext == ext_match)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(ext_match))
             })
             .map(|e| e.path())
             .collect());
@@ -455,5 +473,184 @@ outputs:
         assert!(names.contains(&"pipeline.yaml"));
         assert!(names.contains(&"another.yml"));
         assert!(!names.iter().any(|n| n.contains("schema")));
+    }
+
+    #[test]
+    fn test_discover_schemas_mixed_case_extension_and_stem() {
+        let tmp = TempDir::new().unwrap();
+        let schemas_dir = tmp.path().join("schemas");
+        fs::create_dir(&schemas_dir).unwrap();
+
+        // Uppercase extension — the case a macOS APFS / Windows NTFS file
+        // preserves verbatim and a case-sensitive Linux scan would miss.
+        write_file(
+            &schemas_dir,
+            "customers.schema.YAML",
+            r#"
+_schema:
+  name: customers
+  format: csv
+fields:
+  - name: id
+    type: int
+    nullable: false
+"#,
+        );
+
+        // Uppercase short extension.
+        write_file(
+            &schemas_dir,
+            "orders.schema.YML",
+            r#"
+_schema:
+  name: orders
+  format: csv
+fields:
+  - name: order_id
+    type: string
+    nullable: false
+"#,
+        );
+
+        // Uppercase `.SCHEMA` stem marker.
+        write_file(
+            &schemas_dir,
+            "events.SCHEMA.yaml",
+            r#"
+_schema:
+  name: events
+  format: jsonl
+fields:
+  - name: event_id
+    type: string
+    nullable: false
+"#,
+        );
+
+        let results = discover_schemas(&schemas_dir);
+        let schemas: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+
+        assert_eq!(schemas.len(), 3);
+        let names: Vec<_> = schemas.iter().map(|s| s.metadata.name.as_str()).collect();
+        assert!(names.contains(&"customers"));
+        assert!(names.contains(&"orders"));
+        assert!(names.contains(&"events"));
+    }
+
+    #[test]
+    fn test_discover_pipelines_mixed_case_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir(root.join("schemas")).unwrap();
+
+        // Mixed-case pipeline extensions must be discovered.
+        write_file(root, "flow.YAML", "pipeline: {name: test}");
+        write_file(root, "other.YML", "pipeline: {name: test2}");
+        // A mixed-case schema file at the root must still be excluded.
+        write_file(
+            root,
+            "inline.schema.YAML",
+            "_schema: {name: x, format: csv}",
+        );
+
+        let pipelines = discover_pipelines(root, "schemas", &[], &[]);
+
+        let names: Vec<_> = pipelines
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(names.contains(&"flow.YAML"));
+        assert!(names.contains(&"other.YML"));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.to_ascii_lowercase().contains(".schema."))
+        );
+    }
+
+    #[test]
+    fn test_glob_discovery_mixed_case_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("schemas")).unwrap();
+
+        // The glob-driven path (manifest `include` globs) must match a
+        // case-preserving filesystem's on-disk casing: `*.yaml` finds
+        // `flow.YAML`.
+        write_file(root, "flow.YAML", "pipeline: {name: test}");
+
+        let pipelines = discover_pipelines(root, "schemas", &["*.yaml".to_string()], &[]);
+        let names: Vec<_> = pipelines
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"flow.YAML"),
+            "glob discovery missed mixed-case extension: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_full_workspace_discovery_mixed_case_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let schemas_dir = root.join("schemas");
+        fs::create_dir(&schemas_dir).unwrap();
+
+        // Schema stored with an uppercase extension, as a case-preserving
+        // filesystem would surface it.
+        write_file(
+            &schemas_dir,
+            "customers.schema.YAML",
+            r#"
+_schema:
+  name: customers
+  format: csv
+fields:
+  - name: id
+    type: int
+    nullable: false
+  - name: email
+    type: string
+"#,
+        );
+
+        write_file(
+            root,
+            "pipeline.yaml",
+            r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: source
+    type: csv
+    path: ./data/customers.csv
+    schema: schemas/customers.schema.YAML
+
+transformations:
+  - name: t1
+    cxl: "emit x = id"
+
+outputs:
+  - name: dest
+    type: csv
+    path: ./output.csv
+"#,
+        );
+
+        let (index, errors) = build_workspace_schema_index(root, "schemas", &[], &[]);
+
+        assert!(errors.is_empty());
+        assert_eq!(index.len(), 1);
+
+        // The mixed-case schema file is discovered, parsed, and bound to its
+        // referencing pipeline.
+        let schema_path = schemas_dir.join("customers.schema.YAML");
+        let schema = index.get(&schema_path).unwrap();
+        assert_eq!(schema.metadata.name, "customers");
+        assert_eq!(schema.referencing_pipelines.len(), 1);
     }
 }

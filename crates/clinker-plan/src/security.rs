@@ -105,27 +105,43 @@ pub fn validate_path(
         }
     }
 
-    if raw.is_absolute() && !allow_absolute {
+    // A leading drive prefix or root means the path is not provably relative to
+    // `base_dir`. `Path::is_absolute()` is insufficient here: on Windows it
+    // returns `false` for drive-relative paths like `C:evil.csv` (a prefix with
+    // no root) and root-relative paths like `\x` (a root with no prefix), yet
+    // both discard `base_dir` when joined and resolve against a current
+    // directory the validator never sanctioned. Inspecting the leading
+    // component directly rejects every drive- or root-anchored form on every
+    // platform, closing the Windows escape that `is_absolute()` lets through.
+    if is_drive_or_root_anchored(raw) && !allow_absolute {
         return Err(sec_diag(format!(
             "absolute path not allowed: {raw:?} — use --allow-absolute-paths to override"
         )));
     }
 
-    let resolved = if raw.is_relative() {
-        base_dir.join(raw)
-    } else {
+    let resolved = if is_drive_or_root_anchored(raw) {
+        // Reached only when `allow_absolute` is set; honor the anchored path
+        // verbatim rather than joining it onto `base_dir`.
         raw.to_path_buf()
+    } else {
+        base_dir.join(raw)
     };
 
     // Symlink-escape check: if both the candidate and the base exist, compare
     // their canonicalized forms. Non-existent paths (not-yet-created outputs,
     // for example) skip the check — there is no filesystem state to trust or
     // distrust yet.
+    //
+    // On Windows, `canonicalize` returns extended-length `\\?\` verbatim paths.
+    // A directory junction's target can canonicalize to a different prefix form
+    // than the base, so both sides are passed through `strip_verbatim_prefix`
+    // before the `starts_with` comparison to ensure the prefix never skews the
+    // containment test. On Unix the strip is a no-op.
     if let (Ok(resolved_canon), Ok(base_canon)) = (
         std::fs::canonicalize(&resolved),
         std::fs::canonicalize(base_dir),
     ) && !allow_absolute
-        && !resolved_canon.starts_with(&base_canon)
+        && !strip_verbatim_prefix(&resolved_canon).starts_with(strip_verbatim_prefix(&base_canon))
     {
         return Err(sec_diag(format!(
             "path escapes base directory via symlink: {raw:?} -> {resolved_canon:?}"
@@ -133,6 +149,73 @@ pub fn validate_path(
     }
 
     Ok(ValidatedPath(resolved))
+}
+
+/// Strip a Windows `\\?\` extended-length (verbatim) prefix from a canonical
+/// path so two canonicalized paths can be compared on equal footing.
+///
+/// `std::fs::canonicalize` returns verbatim paths on Windows (`\\?\C:\dir`,
+/// `\\?\UNC\server\share`). A directory junction's resolved target may carry a
+/// different prefix form than the base directory's, which would make a plain
+/// `Path::starts_with` containment test spuriously fail (false-reject) or, in
+/// principle, pass (false-accept). Normalizing both operands through this
+/// function removes the prefix as a confounder before the comparison.
+///
+/// On non-Windows targets this is the identity function: POSIX canonical paths
+/// carry no verbatim prefix.
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &Path) -> &Path {
+    path
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> &Path {
+    use std::path::Prefix;
+
+    let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
+        return path;
+    };
+    let stripped = match prefix.kind() {
+        // `\\?\C:\rest` -> `C:\rest`: drop the leading `\\?\`.
+        Prefix::VerbatimDisk(_) => path
+            .as_os_str()
+            .to_str()
+            .and_then(|s| s.strip_prefix(r"\\?\"))
+            .map(Path::new),
+        // `\\?\UNC\server\share\rest` -> `\server\share\rest`: drop only the
+        // `\\?\UNC` portion, leaving a borrowed sub-slice. The base and target
+        // share this rewriting, so the comparison stays sound even though the
+        // result is not a fully-formed UNC path on its own.
+        Prefix::VerbatimUNC(_, _) => path
+            .as_os_str()
+            .to_str()
+            .and_then(|s| s.strip_prefix(r"\\?\UNC"))
+            .map(Path::new),
+        // `\\?\rest` (bare verbatim): drop the `\\?\`.
+        Prefix::Verbatim(_) => path
+            .as_os_str()
+            .to_str()
+            .and_then(|s| s.strip_prefix(r"\\?\"))
+            .map(Path::new),
+        // Non-verbatim prefixes (plain `C:\`, `\\server\share`) need no change.
+        _ => None,
+    };
+    stripped.unwrap_or(path)
+}
+
+/// Report whether `path` begins with a drive prefix or a root component.
+///
+/// Returns `true` for Unix absolute paths (`/x`), Windows drive-rooted paths
+/// (`C:\x`), Windows drive-relative paths (`C:x`), Windows root-relative paths
+/// (`\x`), and UNC/verbatim prefixes. These are exactly the forms that ignore a
+/// `base_dir` when joined, so the validator treats them all as non-relative.
+/// Strictly broader than [`Path::is_absolute`], which misses the drive-relative
+/// and root-relative Windows cases.
+fn is_drive_or_root_anchored(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
+    )
 }
 
 fn sec_diag(message: String) -> Diagnostic {
@@ -258,6 +341,11 @@ mod tests {
         assert!(err.message.contains("directory traversal"));
     }
 
+    // POSIX symlinks need no special privilege to create, so this test is
+    // Unix-only. The Windows junction equivalent lives in the `#[cfg(windows)]`
+    // tests below; gating the whole fn (rather than early-returning mid-body)
+    // keeps non-Unix builds free of unreachable-tail warnings.
+    #[cfg(unix)]
     #[test]
     fn test_validate_path_rejects_symlink_escape() {
         let outside = tempfile::tempdir().unwrap();
@@ -265,13 +353,7 @@ mod tests {
 
         let base = tempfile::tempdir().unwrap();
         let link = base.path().join("leak");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // On non-unix targets we can't create a symlink without admin rights.
-            return;
-        }
 
         let err = validate_path(Path::new("leak"), base.path(), false).unwrap_err();
         assert!(
@@ -281,9 +363,95 @@ mod tests {
         );
     }
 
+    // A directory junction inside `base` that points outside it must be caught
+    // by the canonicalization escape check. Junctions need no admin privilege
+    // to create (unlike symlinks), so this is the Windows analogue of the
+    // Unix-only symlink-escape test. Exercised by CI on the Windows runner.
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_path_rejects_junction_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "shh").unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let link = base.path().join("leak");
+
+        // `mklink /J` creates a directory junction without elevation.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .status()
+            .expect("failed to spawn mklink");
+        assert!(status.success(), "mklink /J did not succeed");
+
+        let err = validate_path(Path::new("leak\\secret.txt"), base.path(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
+        assert!(
+            err.message.contains("escapes base directory"),
+            "expected junction-escape diagnostic, got: {}",
+            err.message
+        );
+    }
+
+    // A legitimate path inside `base` must be accepted even though Windows
+    // `canonicalize` decorates both operands with a `\\?\` verbatim prefix. The
+    // `starts_with` containment test must see through the prefix; this guards
+    // against the false-reject failure mode the prefix could otherwise cause.
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_path_accepts_intra_base_despite_verbatim_prefix() {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("ok.txt"), "fine").unwrap();
+
+        let vp = validate_path(Path::new("sub\\ok.txt"), base.path(), false)
+            .expect("intra-base path must be accepted despite the \\\\?\\ prefix");
+        assert!(vp.as_path().ends_with("ok.txt"));
+    }
+
     #[test]
     fn test_path_reject_absolute() {
         let err = validate_path(Path::new("/tmp/out.csv"), &base(), false).unwrap_err();
+        assert!(err.message.contains("absolute path not allowed"));
+    }
+
+    // Windows drive-relative (`C:x`) and drive-rooted (`C:\x`) paths must be
+    // rejected when absolutes are disallowed. The former is the dangerous case:
+    // `Path::is_absolute()` reports `false` for it, so before the explicit
+    // prefix inspection it slipped the gate and discarded `base_dir` on join.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_drive_relative() {
+        let err = validate_path(Path::new("C:evil.csv"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
+        assert!(
+            err.message.contains("absolute path not allowed"),
+            "expected absolute-path rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_drive_rooted() {
+        let err = validate_path(Path::new("C:\\x"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
+        assert!(
+            err.message.contains("absolute path not allowed"),
+            "expected absolute-path rejection, got: {}",
+            err.message
+        );
+    }
+
+    // `\x` (root-relative to the current drive) is likewise non-relative and
+    // must not be joined onto `base_dir`.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_reject_windows_root_relative() {
+        let err = validate_path(Path::new("\\x"), &base(), false).unwrap_err();
+        assert_eq!(err.code, "E-SEC-001");
         assert!(err.message.contains("absolute path not allowed"));
     }
 

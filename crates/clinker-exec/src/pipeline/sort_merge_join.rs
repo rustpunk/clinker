@@ -1436,14 +1436,17 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             args.matched_driver_orders.insert(driver_order);
                             *args.emitted_since_check = args.emitted_since_check.saturating_add(1);
                             if *args.emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                if args.budget.should_abort() {
+                                let used = crate::pipeline::combine::combine_output_buffer_bytes(
+                                    args.output,
+                                ) as u64;
+                                if args.budget.should_abort_local(used) {
                                     return Err(PipelineError::MemoryBudgetExceeded {
                                         node: name.to_string(),
-                                        used: args.budget.peak_rss().unwrap_or(0),
+                                        used,
                                         limit: args.budget.hard_limit(),
                                         source: BudgetCategory::Arena,
                                         detail: Some(
-                                            "sort-merge combine probe RSS abort".to_string(),
+                                            "sort-merge output buffer exceeded budget".to_string(),
                                         ),
                                     });
                                 }
@@ -1508,13 +1511,18 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     args.matched_driver_orders.insert(driver_order);
                     *args.emitted_since_check = args.emitted_since_check.saturating_add(1);
                     if *args.emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                        if args.budget.should_abort() {
+                        let used =
+                            crate::pipeline::combine::combine_output_buffer_bytes(args.output)
+                                as u64;
+                        if args.budget.should_abort_local(used) {
                             return Err(PipelineError::MemoryBudgetExceeded {
                                 node: name.to_string(),
-                                used: args.budget.peak_rss().unwrap_or(0),
+                                used,
                                 limit: args.budget.hard_limit(),
                                 source: BudgetCategory::Arena,
-                                detail: Some("sort-merge combine probe RSS abort".to_string()),
+                                detail: Some(
+                                    "sort-merge output buffer exceeded budget".to_string(),
+                                ),
                             });
                         }
                         *args.emitted_since_check = 0;

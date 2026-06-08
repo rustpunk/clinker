@@ -888,5 +888,10 @@ pub(crate) fn apply_split_naming_wrapper(base_path: &str, naming: &str, seq: u32
         .replace("{ext}", ext)
         .replace("{seq:04}", &format!("{seq:04}"));
 
-    parent.join(filename).to_string_lossy().into_owned()
+    // Mirror the executor: forward-slash join so the result is identical
+    // across platforms (Windows `Path::join` would emit `\`).
+    match parent.to_str() {
+        Some(p) if !p.is_empty() => format!("{p}/{filename}"),
+        _ => filename,
+    }
 }

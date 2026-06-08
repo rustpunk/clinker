@@ -1,9 +1,17 @@
 //! Cross-platform RSS tracking and the central memory arbitrator.
 //!
-//! `rss_bytes()` returns the current process RSS via platform-native APIs:
-//! - Linux: `/proc/self/statm` (resident pages × page size)
-//! - macOS: `mach_task_basic_info` via `mach2` (pure Rust FFI)
-//! - Windows: `K32GetProcessMemoryInfo` via `windows-sys` (pure Rust FFI)
+//! `rss_bytes()` returns the memory the current process is accountable
+//! for via platform-native APIs. The per-platform quantity is chosen to
+//! match "memory this process is responsible for", not whatever each OS
+//! labels "resident":
+//! - Linux: `/proc/self/statm` (resident pages × page size) — a true RSS.
+//! - macOS: `phys_footprint` via `proc_pid_rusage` (pure Rust FFI) — the
+//!   figure Apple's tooling reports, correct under memory compression
+//!   where Mach `resident_size` both under- and over-counts.
+//! - Windows: `PrivateUsage` (commit charge) from
+//!   `PROCESS_MEMORY_COUNTERS_EX` via `windows-sys` (pure Rust FFI), not
+//!   `WorkingSetSize`, which the memory manager trims under pressure and
+//!   so reads low exactly when committed memory is highest.
 //! - Unsupported: returns `None`
 //!
 //! `MemoryArbitrator` is the single seat that governs every spill / abort
@@ -43,58 +51,55 @@ fn rss_bytes_impl() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn rss_bytes_impl() -> Option<u64> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::task::task_info;
-    use mach2::task_info::{
-        MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info,
-    };
-    use mach2::traps::mach_task_self;
-
-    // SAFETY: FFI call to mach kernel. `mach_task_self()` returns the current
-    // task port (always valid). `task_info` reads process memory stats into
-    // the zeroed struct. No aliasing or lifetime concerns — all data is copied.
-    unsafe {
-        let mut info = mach_task_basic_info::default();
-        let mut count: mach_msg_type_number_t = MACH_TASK_BASIC_INFO_COUNT;
-        let ret = task_info(
-            mach_task_self(),
-            MACH_TASK_BASIC_INFO,
-            &mut info as *mut mach_task_basic_info as *mut _,
-            &mut count,
-        );
-        if ret == KERN_SUCCESS {
-            Some(info.resident_size)
-        } else {
-            None
-        }
-    }
+    // `phys_footprint` (via `proc_pid_rusage`) is the figure Apple's own
+    // tooling treats as the memory a process is accountable for. Mach
+    // `resident_size` from `MACH_TASK_BASIC_INFO` is wrong for a memory
+    // budget under macOS memory compression: it excludes
+    // compressed-but-still-owned anonymous pages (under-counting toward an
+    // OOM the budget should have prevented) and includes shared framework
+    // pages (over-counting toward spurious spills).
+    super::sysstats::phys_footprint_bytes()
 }
 
 #[cfg(target_os = "windows")]
 fn rss_bytes_impl() -> Option<u64> {
     use std::mem;
     use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
+    // `PrivateUsage` (commit charge) from `PROCESS_MEMORY_COUNTERS_EX` is
+    // the right gate for a memory budget: it is the private, committed
+    // memory the process is accountable for. `WorkingSetSize` (physical
+    // resident pages) is aggressively trimmed by the Windows memory manager
+    // under system pressure, so it reads low — e.g. 300 MB while the
+    // process holds gigabytes of committed private memory — and fails to
+    // spill exactly when memory is exhausted.
+    //
+    // `K32GetProcessMemoryInfo` writes as many bytes as `cb` permits. The
+    // extended struct begins with the same fields as the base
+    // `PROCESS_MEMORY_COUNTERS` and appends the pagefile / `PrivateUsage`
+    // fields; passing the EX struct cast to the base pointer with `cb` set
+    // to the EX size is the documented idiom for reading `PrivateUsage`.
+    //
     // SAFETY: FFI call to Win32 API. `GetCurrentProcess()` returns a
     // pseudo-handle constant (-1) that is always valid and requires no
-    // `CloseHandle`. `K32GetProcessMemoryInfo` reads process memory stats
-    // into the zeroed struct. `cb` must be set to the struct size before the
-    // call for version compatibility.
+    // `CloseHandle`. The pointer cast is sound: `PROCESS_MEMORY_COUNTERS_EX`
+    // is `#[repr(C)]` and layout-compatible with `PROCESS_MEMORY_COUNTERS`
+    // for the leading fields, and `cb` is the EX size so the kernel writes
+    // the full EX struct.
     unsafe {
         let handle = GetCurrentProcess();
-        let mut pmc: PROCESS_MEMORY_COUNTERS = mem::zeroed();
-        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
+        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         let ok = K32GetProcessMemoryInfo(
             handle,
-            &mut pmc,
-            mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            &mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
         );
         if ok != 0 {
-            Some(pmc.WorkingSetSize as u64)
+            Some(pmc.PrivateUsage as u64)
         } else {
             None
         }
@@ -752,13 +757,26 @@ impl MemoryArbitrator {
         }
     }
 
-    /// True when current RSS exceeds the soft spill threshold. Also
-    /// updates `peak_rss` as a side-effect and runs one arbitration
-    /// round; the round is a no-op when no consumers are registered.
-    /// False when RSS cannot be measured (sentinel `0`).
+    /// True when EITHER current RSS or the pull-mode charged-byte sum
+    /// exceeds the soft spill threshold. Also updates `peak_rss` as a
+    /// side-effect and runs one arbitration round; the round is a no-op
+    /// when no consumers are registered.
+    ///
+    /// The charged-byte arm is the RSS-independent backstop: when
+    /// `rss_bytes()` returns `None` (unsupported target, the wasm build,
+    /// or a transient platform-API failure) `peak_rss` stays at the
+    /// sentinel `0`, so an RSS-only gate would be permanently false and
+    /// the budget would silently become a no-op that OOMs instead of
+    /// spilling. Summing the registered consumers' live bytes keeps the
+    /// budget degrading to a heuristic ceiling rather than to nothing —
+    /// grace-hash partitions and inter-stage `node_buffers` slots mirror
+    /// their footprint into a registered handle, so their growth trips
+    /// this arm even with no RSS reading.
     pub fn should_spill(&self) -> bool {
         self.observe();
-        let tripped = self.peak_rss.load(Ordering::Relaxed) > self.soft_limit();
+        let soft = self.soft_limit();
+        let tripped =
+            self.peak_rss.load(Ordering::Relaxed) > soft || self.sum_consumer_usage() > soft;
         if tripped {
             // Drive the round-trip: the elected victim is paused
             // (back-pressureable) or asked to spill (everything else).
@@ -785,9 +803,15 @@ impl MemoryArbitrator {
     /// refilling, the dispatch loop blocks on `recv`, and the pipeline
     /// deadlocks. The streaming path's back-pressure is the bounded
     /// inter-stage channel, not a pause signal.
+    ///
+    /// Trips on EITHER RSS or the pull-mode charged-byte sum crossing the
+    /// soft limit, so a streaming stage still spills its in-flight batch
+    /// when `rss_bytes()` is unavailable (see [`Self::should_spill`] for
+    /// why the charged-byte arm is the RSS-independent backstop).
     pub fn should_spill_self(&self) -> bool {
         self.observe();
-        self.peak_rss.load(Ordering::Relaxed) > self.soft_limit()
+        let soft = self.soft_limit();
+        self.peak_rss.load(Ordering::Relaxed) > soft || self.sum_consumer_usage() > soft
     }
 
     /// Soft spill threshold in absolute bytes.
@@ -829,12 +853,38 @@ impl MemoryArbitrator {
         self.hard_limit() - self.soft_limit()
     }
 
-    /// True when RSS exceeds the hard limit. Check periodically in
-    /// probe loops (every 10K output records) to prevent unbounded
-    /// fan-out from blowing the ceiling between spill polls.
+    /// True when EITHER RSS or the pull-mode charged-byte sum exceeds the
+    /// hard limit. Check periodically in probe loops (every 10K output
+    /// records) to prevent unbounded fan-out from blowing the ceiling
+    /// between spill polls.
+    ///
+    /// The charged-byte arm is the RSS-independent backstop: see
+    /// [`Self::should_spill`]. Without it the hard-abort gate is
+    /// permanently false whenever `rss_bytes()` returns `None`, so a join
+    /// or aggregate grows unbounded until the OS kills the process instead
+    /// of aborting cleanly under the configured budget.
     pub fn should_abort(&self) -> bool {
         self.observe();
-        self.peak_rss.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
+        let hard = self.limit.load(Ordering::Relaxed);
+        self.peak_rss.load(Ordering::Relaxed) > hard || self.sum_consumer_usage() > hard
+    }
+
+    /// True when the hard limit is breached by RSS, by the pull-mode
+    /// charged-byte sum, or by an operator-supplied `local_bytes`
+    /// estimate of in-progress state that is not yet reflected in a
+    /// registered consumer handle.
+    ///
+    /// The combine equi-join build loop registers its `MemoryConsumer`
+    /// wrapper with a zero-seeded handle and only mirrors the table's
+    /// footprint into it *after* the build completes, so the build loop's
+    /// growing bytes are invisible to [`Self::sum_consumer_usage`] while
+    /// the build runs. Passing the running `partial_memory_bytes` here is
+    /// the RSS-independent gate for that window — it aborts the build when
+    /// the in-memory table alone exceeds the budget, even on a target
+    /// where `rss_bytes()` returns `None`. Mirrors the arena's own
+    /// `local_bytes_used > hard_limit` self-trigger.
+    pub fn should_abort_local(&self, local_bytes: u64) -> bool {
+        local_bytes > self.limit.load(Ordering::Relaxed) || self.should_abort()
     }
 
     /// Peak RSS observed so far, or `None` on platforms where
@@ -1194,23 +1244,32 @@ mod tests {
         assert!(!handle.is_paused());
     }
 
+    /// RSS measurement must return a real positive figure on every
+    /// first-class target — Linux, macOS, and Windows — all of which CI now
+    /// executes. A regression to `None` or `0` in any platform FFI path
+    /// fails this test on that platform's runner rather than passing
+    /// vacuously. The whole `fn` is gated to the supported targets so an
+    /// unsupported-target build (where `rss_bytes()` is `None` by design)
+    /// excludes the test at compile time instead of early-returning out of
+    /// the body — a `cfg` gate, never a mid-body skip.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_rss_bytes_returns_some() {
         let rss = rss_bytes();
-        // On Linux (our CI), this should return Some.
-        // On unsupported platforms, this test is a no-op.
-        if cfg!(target_os = "linux") {
-            assert!(rss.is_some(), "rss_bytes() should return Some on Linux");
-            assert!(rss.unwrap() > 0, "RSS should be positive");
-        }
+        assert!(
+            rss.is_some(),
+            "rss_bytes() must return Some on a first-class target"
+        );
+        assert!(rss.unwrap() > 0, "RSS must be positive for a live process");
     }
 
+    /// A 64 MiB touched allocation must never lower this process's reported
+    /// memory on any first-class target. Gated to the supported targets for
+    /// the same reason as [`test_rss_bytes_returns_some`].
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_rss_bytes_increases_after_alloc() {
-        if rss_bytes().is_none() {
-            return; // Skip on unsupported platforms
-        }
-        let before = rss_bytes().unwrap();
+        let before = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
         // Allocate 64 MiB and touch every page so the pages are resident.
         // A delta-threshold assertion (`after >= before + N`) flakes under a
         // loaded harness: a concurrent test thread can free more than the
@@ -1228,10 +1287,82 @@ mod tests {
             i += page;
         }
         std::hint::black_box(&big_vec);
-        let after = rss_bytes().unwrap();
+        let after = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
         assert!(
             after >= before,
             "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
+        );
+    }
+
+    /// Touch every page of a heap buffer so the pages are committed and
+    /// resident, then keep the buffer alive across the read. Returns the
+    /// buffer so the caller controls its drop point.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn touch_pages(bytes: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = vec![0u8; bytes];
+        let page = 4096;
+        let mut i = 0;
+        while i < v.len() {
+            v[i] = 1;
+            i += page;
+        }
+        std::hint::black_box(&v);
+        v
+    }
+
+    /// On macOS, `rss_bytes()` reports `phys_footprint`, which rises when a
+    /// large allocation is touched. A delta-threshold assertion would flake
+    /// under harness churn (a sibling test thread can free more than this
+    /// probe commits between samples), so the direction-of-change check is
+    /// `after_alloc >= before` — a touched 64 MiB allocation never lowers
+    /// the footprint. Runs on the macOS CI runner.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_phys_footprint_rises_after_touched_alloc() {
+        let before = rss_bytes().expect("phys_footprint must be readable on macOS");
+        assert!(
+            before > 0,
+            "phys_footprint must be positive for a live process"
+        );
+        let buf = touch_pages(64 * 1024 * 1024);
+        let after_alloc = rss_bytes().expect("phys_footprint must be readable on macOS");
+        assert!(
+            after_alloc >= before,
+            "a touched 64 MiB allocation must not lower phys_footprint, \
+             before={before} after_alloc={after_alloc}"
+        );
+        drop(buf);
+    }
+
+    /// On Windows, `rss_bytes()` reports `PrivateUsage` (commit charge).
+    /// Committing and touching a large private allocation raises commit
+    /// charge; freeing it lowers commit charge — unlike `WorkingSetSize`,
+    /// which the memory manager can trim independently of the allocation's
+    /// lifetime. The assertion checks `after_alloc >= before` (commit
+    /// charge never drops on a fresh touched allocation) and
+    /// `after_free <= after_alloc` (releasing committed pages cannot raise
+    /// commit charge). Runs on the Windows CI runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_private_usage_tracks_commit_charge() {
+        let before = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            before > 0,
+            "PrivateUsage must be positive for a live process"
+        );
+        let buf = touch_pages(64 * 1024 * 1024);
+        let after_alloc = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            after_alloc >= before,
+            "a touched 64 MiB private allocation must raise commit charge, \
+             before={before} after_alloc={after_alloc}"
+        );
+        drop(buf);
+        let after_free = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            after_free <= after_alloc,
+            "freeing committed pages must not raise commit charge, \
+             after_alloc={after_alloc} after_free={after_free}"
         );
     }
 
@@ -1284,35 +1415,129 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_arbitrator_below_threshold() {
+    fn should_spill_trips_on_charged_bytes_without_rss() {
+        // RSS-independent backstop. A 100 GiB hard limit puts the soft
+        // threshold (80 GiB) far above any real test-process RSS, so the
+        // RSS arm of `should_spill` can never trip — whatever `observe()`
+        // samples stays below the soft limit. That isolates the
+        // charged-byte arm: it is the faithful Linux proxy for a platform
+        // where `rss_bytes()` returns `None` (there the RSS arm is also
+        // permanently below-threshold, just for a different reason). A
+        // registered consumer holding more than the soft limit must trip
+        // the gate through that arm alone.
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        // Test process RSS should be well under 410MB (80% of 512MB)
-        if rss_bytes().is_some() {
-            assert!(!arbitrator.should_spill());
-        }
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let soft = arbitrator.soft_limit();
+        assert!(!arbitrator.should_spill(), "empty registry must not trip");
+        // Whatever RSS `observe()` just sampled is below the soft limit, so
+        // only the charged-byte arm can be responsible for any trip below.
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < soft),
+            "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        assert!(
+            arbitrator.should_spill(),
+            "charged bytes over the soft limit must trip should_spill via the RSS-independent arm"
+        );
     }
 
     #[test]
-    fn test_memory_arbitrator_above_threshold() {
-        // Limit of 1MB — any running process exceeds this
-        let arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        if rss_bytes().is_some() {
-            assert!(arbitrator.should_spill());
-        }
+    fn should_abort_trips_on_charged_bytes_without_rss() {
+        // Same RSS-independent backstop for the hard-abort gate; the 100
+        // GiB hard limit keeps the RSS arm inert (see the sibling
+        // should_spill test for why this isolates the charged-byte arm).
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let hard = arbitrator.hard_limit();
+        assert!(!arbitrator.should_abort(), "empty registry must not abort");
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < hard),
+            "test invariant: real RSS must stay under the hard limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(hard + 1, 0, 0)));
+        assert!(
+            arbitrator.should_abort(),
+            "charged bytes over the hard limit must trip should_abort via the RSS-independent arm"
+        );
     }
 
+    #[test]
+    fn should_abort_local_trips_on_operator_bytes_without_rss() {
+        // The combine build loop's gate: in-progress bytes that are not yet
+        // in any registered consumer handle must still abort the build when
+        // they exceed the hard limit, independent of RSS. The registry is
+        // empty here (the build's handle is zero-seeded until build
+        // completes) and the 100 GiB limit keeps the RSS arm inert, so only
+        // the `local_bytes` arm can fire.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let hard = arbitrator.hard_limit();
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+        assert!(
+            !arbitrator.should_abort_local(hard),
+            "local bytes at exactly the limit must not abort"
+        );
+        assert!(
+            arbitrator.should_abort_local(hard + 1),
+            "local bytes over the hard limit must abort with the RSS arm inert and no registered consumer"
+        );
+    }
+
+    #[test]
+    fn should_spill_self_trips_on_charged_bytes_without_rss() {
+        // The streaming-stage variant carries the same backstop so a
+        // streaming batch still spills itself when RSS is unavailable. The
+        // 100 GiB limit keeps the RSS arm inert.
+        let arbitrator =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let soft = arbitrator.soft_limit();
+        assert!(!arbitrator.should_spill_self());
+        assert!(
+            arbitrator.peak_rss().is_none_or(|rss| rss < soft),
+            "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
+        );
+        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        assert!(arbitrator.should_spill_self());
+    }
+
+    /// Below-threshold behavior: a 512 MiB budget (410 MiB soft) is far
+    /// above the test harness's own footprint on every first-class target,
+    /// so `should_spill` must stay false with no consumers registered.
+    /// Gated to the supported targets so the assertion runs unconditionally
+    /// on each runner.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn test_memory_arbitrator_below_threshold() {
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        assert!(!arbitrator.should_spill());
+    }
+
+    /// Above-threshold behavior: a 1 MiB budget is below any live process's
+    /// reported memory on every first-class target, so the RSS arm of
+    /// `should_spill` must trip. Gated to the supported targets so the
+    /// assertion runs unconditionally on each runner.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn test_memory_arbitrator_above_threshold() {
+        let arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        assert!(arbitrator.should_spill());
+    }
+
+    /// `observe()` must seed and non-decreasingly raise `peak_rss` on
+    /// every first-class target. Gated to the supported targets so the
+    /// assertions run unconditionally on each runner instead of
+    /// early-returning when RSS is unavailable.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_peak_rss_tracked() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        if rss_bytes().is_none() {
-            return; // Skip on unsupported platforms
-        }
         arbitrator.observe();
         assert!(
             arbitrator.peak_rss().is_some(),
-            "peak_rss should be set after observe()"
+            "peak_rss must be set after observe() on a first-class target"
         );
         let first_peak = arbitrator.peak_rss().unwrap();
         arbitrator.observe();

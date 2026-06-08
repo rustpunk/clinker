@@ -1,3 +1,4 @@
+pub mod bom;
 pub mod counting;
 pub mod csv;
 pub mod envelope;

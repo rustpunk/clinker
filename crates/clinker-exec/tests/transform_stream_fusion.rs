@@ -511,13 +511,20 @@ nodes:
     assert_eq!(a_lines, expected_a);
     assert_eq!(b_lines, expected_b);
 
-    // Slow branch's drain is ~250 ms. Total pipeline runtime must
-    // stay well under the worst-case serialization of two slow drains
-    // (~500 ms) — 700 ms gives generous CI jitter headroom while still
-    // bounding the regression.
+    // Slow branch's drain is ~250 ms. Total pipeline runtime must stay well
+    // under the worst-case serialization of two slow drains (~500 ms). The
+    // fused/serial separation is only ~1.4x, narrower than the several-fold
+    // inflation CI runners (macOS especially) impose on short sleeps, so a
+    // fixed bound cannot hold on both platforms. Calibrate to this platform's
+    // measured sleep cost so the assertion tests the separation, not absolute
+    // wall time.
+    let cal = Instant::now();
+    std::thread::sleep(Duration::from_millis(50));
+    let slack = (cal.elapsed().as_secs_f64() / 0.050).max(1.0);
+    let bound = Duration::from_secs_f64(0.700 * slack);
     assert!(
-        elapsed < Duration::from_millis(700),
-        "pipeline took {elapsed:?}, expected < 700 ms — \
+        elapsed < bound,
+        "pipeline took {elapsed:?} (slack {slack:.1}x, bound {bound:?}) — \
          two-branch fused transforms appear to be serializing on the slow \
          Source's drain. With fusion the slow branch's transform_a arm \
          consumes src_a's live channel without blocking src_b's parallel ingest."

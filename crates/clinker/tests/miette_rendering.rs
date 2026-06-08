@@ -140,14 +140,21 @@ nodes:
 /// Create an ephemeral per-test temp directory under the system
 /// temp root. Avoids adding a `tempfile` dev-dep.
 fn tempdir_path() -> std::path::PathBuf {
+    // A per-process atomic counter guarantees a distinct directory per call.
+    // pid + timestamp alone can collide on a platform whose clock resolution
+    // is coarser than the nanosecond unit (macOS), letting two concurrent
+    // tests share one directory and clobber each other's fixtures.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut base = std::env::temp_dir();
     let name = format!(
-        "clinker-miette-test-{}-{}",
+        "clinker-miette-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     );
     base.push(name);
     std::fs::create_dir_all(&base).expect("create tempdir");

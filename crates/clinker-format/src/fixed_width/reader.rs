@@ -21,6 +21,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use chrono::NaiveDate;
+
+use crate::bom::SkipBom;
 use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
@@ -44,7 +46,10 @@ impl Default for FixedWidthReaderConfig {
 /// Byte-offset extraction with per-field UTF-8 validation and type coercion.
 /// Schema injected at construction (constructor injection pattern).
 pub struct FixedWidthReader<R: Read> {
-    reader: BufReader<R>,
+    // Source wrapped in `SkipBom` so a leading UTF-8 BOM (Windows utf8
+    // export) is dropped before byte-offset extraction, which would
+    // otherwise shift every field of the first record.
+    reader: BufReader<SkipBom<R>>,
     fields: Vec<ResolvedField>,
     schema: Arc<Schema>,
     config: FixedWidthReaderConfig,
@@ -138,7 +143,7 @@ impl<R: Read> FixedWidthReader<R> {
             .unwrap_or(0);
 
         Ok(Self {
-            reader: BufReader::new(reader),
+            reader: BufReader::new(SkipBom::new(reader)),
             fields: resolved,
             schema,
             config,
@@ -417,6 +422,48 @@ mod tests {
         assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(rec.get("date"), Some(&Value::String("20240115".into())));
 
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fixedwidth_strips_leading_bom() {
+        // A leading UTF-8 BOM (Windows utf8 export) must be dropped before
+        // byte-offset extraction, or it shifts every field of the first row.
+        let mut data = crate::bom::UTF8_BOM.to_vec();
+        data.extend_from_slice(b"00042Alice               20240115\n");
+
+        let fields = vec![
+            {
+                let mut f = field("id");
+                f.field_type = Some(FieldType::Integer);
+                f.start = Some(0);
+                f.width = Some(5);
+                f.justify = Some(Justify::Right);
+                f.pad = Some("0".into());
+                f
+            },
+            {
+                let mut f = field("name");
+                f.field_type = Some(FieldType::String);
+                f.start = Some(5);
+                f.width = Some(20);
+                f
+            },
+            {
+                let mut f = field("date");
+                f.field_type = Some(FieldType::String);
+                f.start = Some(25);
+                f.width = Some(8);
+                f
+            },
+        ];
+
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, FixedWidthReaderConfig::default()).unwrap();
+        let rec = reader.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("id"), Some(&Value::Integer(42)));
+        assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(rec.get("date"), Some(&Value::String("20240115".into())));
         assert!(reader.next_record().unwrap().is_none());
     }
 

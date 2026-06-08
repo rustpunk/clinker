@@ -334,5 +334,11 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
         .replace("{ext}", ext)
         .replace("{seq:04}", &format!("{seq:04}"));
 
-    parent.join(filename).to_string_lossy().into_owned()
+    // Join with a forward slash, not the OS separator: split output paths
+    // must be byte-identical across platforms — Windows `Path::join` would
+    // emit `\`, diverging from the forward-slash paths authored in config.
+    match parent.to_str() {
+        Some(p) if !p.is_empty() => format!("{p}/{filename}"),
+        _ => filename,
+    }
 }
