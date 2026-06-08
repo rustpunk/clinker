@@ -1,9 +1,17 @@
 //! Cross-platform RSS tracking and the central memory arbitrator.
 //!
-//! `rss_bytes()` returns the current process RSS via platform-native APIs:
-//! - Linux: `/proc/self/statm` (resident pages × page size)
-//! - macOS: `mach_task_basic_info` via `mach2` (pure Rust FFI)
-//! - Windows: `K32GetProcessMemoryInfo` via `windows-sys` (pure Rust FFI)
+//! `rss_bytes()` returns the memory the current process is accountable
+//! for via platform-native APIs. The per-platform quantity is chosen to
+//! match "memory this process is responsible for", not whatever each OS
+//! labels "resident":
+//! - Linux: `/proc/self/statm` (resident pages × page size) — a true RSS.
+//! - macOS: `phys_footprint` via `proc_pid_rusage` (pure Rust FFI) — the
+//!   figure Apple's tooling reports, correct under memory compression
+//!   where Mach `resident_size` both under- and over-counts.
+//! - Windows: `PrivateUsage` (commit charge) from
+//!   `PROCESS_MEMORY_COUNTERS_EX` via `windows-sys` (pure Rust FFI), not
+//!   `WorkingSetSize`, which the memory manager trims under pressure and
+//!   so reads low exactly when committed memory is highest.
 //! - Unsupported: returns `None`
 //!
 //! `MemoryArbitrator` is the single seat that governs every spill / abort
@@ -43,58 +51,55 @@ fn rss_bytes_impl() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn rss_bytes_impl() -> Option<u64> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::task::task_info;
-    use mach2::task_info::{
-        MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info,
-    };
-    use mach2::traps::mach_task_self;
-
-    // SAFETY: FFI call to mach kernel. `mach_task_self()` returns the current
-    // task port (always valid). `task_info` reads process memory stats into
-    // the zeroed struct. No aliasing or lifetime concerns — all data is copied.
-    unsafe {
-        let mut info = mach_task_basic_info::default();
-        let mut count: mach_msg_type_number_t = MACH_TASK_BASIC_INFO_COUNT;
-        let ret = task_info(
-            mach_task_self(),
-            MACH_TASK_BASIC_INFO,
-            &mut info as *mut mach_task_basic_info as *mut _,
-            &mut count,
-        );
-        if ret == KERN_SUCCESS {
-            Some(info.resident_size)
-        } else {
-            None
-        }
-    }
+    // `phys_footprint` (via `proc_pid_rusage`) is the figure Apple's own
+    // tooling treats as the memory a process is accountable for. Mach
+    // `resident_size` from `MACH_TASK_BASIC_INFO` is wrong for a memory
+    // budget under macOS memory compression: it excludes
+    // compressed-but-still-owned anonymous pages (under-counting toward an
+    // OOM the budget should have prevented) and includes shared framework
+    // pages (over-counting toward spurious spills).
+    super::sysstats::phys_footprint_bytes()
 }
 
 #[cfg(target_os = "windows")]
 fn rss_bytes_impl() -> Option<u64> {
     use std::mem;
     use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
+    // `PrivateUsage` (commit charge) from `PROCESS_MEMORY_COUNTERS_EX` is
+    // the right gate for a memory budget: it is the private, committed
+    // memory the process is accountable for. `WorkingSetSize` (physical
+    // resident pages) is aggressively trimmed by the Windows memory manager
+    // under system pressure, so it reads low — e.g. 300 MB while the
+    // process holds gigabytes of committed private memory — and fails to
+    // spill exactly when memory is exhausted.
+    //
+    // `K32GetProcessMemoryInfo` writes as many bytes as `cb` permits. The
+    // extended struct begins with the same fields as the base
+    // `PROCESS_MEMORY_COUNTERS` and appends the pagefile / `PrivateUsage`
+    // fields; passing the EX struct cast to the base pointer with `cb` set
+    // to the EX size is the documented idiom for reading `PrivateUsage`.
+    //
     // SAFETY: FFI call to Win32 API. `GetCurrentProcess()` returns a
     // pseudo-handle constant (-1) that is always valid and requires no
-    // `CloseHandle`. `K32GetProcessMemoryInfo` reads process memory stats
-    // into the zeroed struct. `cb` must be set to the struct size before the
-    // call for version compatibility.
+    // `CloseHandle`. The pointer cast is sound: `PROCESS_MEMORY_COUNTERS_EX`
+    // is `#[repr(C)]` and layout-compatible with `PROCESS_MEMORY_COUNTERS`
+    // for the leading fields, and `cb` is the EX size so the kernel writes
+    // the full EX struct.
     unsafe {
         let handle = GetCurrentProcess();
-        let mut pmc: PROCESS_MEMORY_COUNTERS = mem::zeroed();
-        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
+        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         let ok = K32GetProcessMemoryInfo(
             handle,
-            &mut pmc,
-            mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            &mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
         );
         if ok != 0 {
-            Some(pmc.WorkingSetSize as u64)
+            Some(pmc.PrivateUsage as u64)
         } else {
             None
         }
@@ -1232,6 +1237,78 @@ mod tests {
         assert!(
             after >= before,
             "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
+        );
+    }
+
+    /// Touch every page of a heap buffer so the pages are committed and
+    /// resident, then keep the buffer alive across the read. Returns the
+    /// buffer so the caller controls its drop point.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn touch_pages(bytes: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = vec![0u8; bytes];
+        let page = 4096;
+        let mut i = 0;
+        while i < v.len() {
+            v[i] = 1;
+            i += page;
+        }
+        std::hint::black_box(&v);
+        v
+    }
+
+    /// On macOS, `rss_bytes()` reports `phys_footprint`, which rises when a
+    /// large allocation is touched. A delta-threshold assertion would flake
+    /// under harness churn (a sibling test thread can free more than this
+    /// probe commits between samples), so the direction-of-change check is
+    /// `after_alloc >= before` — a touched 64 MiB allocation never lowers
+    /// the footprint. Runs on the macOS CI runner.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_phys_footprint_rises_after_touched_alloc() {
+        let before = rss_bytes().expect("phys_footprint must be readable on macOS");
+        assert!(
+            before > 0,
+            "phys_footprint must be positive for a live process"
+        );
+        let buf = touch_pages(64 * 1024 * 1024);
+        let after_alloc = rss_bytes().expect("phys_footprint must be readable on macOS");
+        assert!(
+            after_alloc >= before,
+            "a touched 64 MiB allocation must not lower phys_footprint, \
+             before={before} after_alloc={after_alloc}"
+        );
+        drop(buf);
+    }
+
+    /// On Windows, `rss_bytes()` reports `PrivateUsage` (commit charge).
+    /// Committing and touching a large private allocation raises commit
+    /// charge; freeing it lowers commit charge — unlike `WorkingSetSize`,
+    /// which the memory manager can trim independently of the allocation's
+    /// lifetime. The assertion checks `after_alloc >= before` (commit
+    /// charge never drops on a fresh touched allocation) and
+    /// `after_free <= after_alloc` (releasing committed pages cannot raise
+    /// commit charge). Runs on the Windows CI runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_private_usage_tracks_commit_charge() {
+        let before = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            before > 0,
+            "PrivateUsage must be positive for a live process"
+        );
+        let buf = touch_pages(64 * 1024 * 1024);
+        let after_alloc = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            after_alloc >= before,
+            "a touched 64 MiB private allocation must raise commit charge, \
+             before={before} after_alloc={after_alloc}"
+        );
+        drop(buf);
+        let after_free = rss_bytes().expect("PrivateUsage must be readable on Windows");
+        assert!(
+            after_free <= after_alloc,
+            "freeing committed pages must not raise commit charge, \
+             after_alloc={after_alloc} after_free={after_free}"
         );
     }
 

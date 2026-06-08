@@ -172,12 +172,15 @@ struct RusageInfoV4 {
 }
 
 #[cfg(target_os = "macos")]
-fn io_counters_impl() -> Option<IoCounters> {
-    const RUSAGE_INFO_V4: i32 = 4;
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV4) -> i32;
-    }
+const RUSAGE_INFO_V4: i32 = 4;
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV4) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn rusage_info_v4() -> Option<RusageInfoV4> {
     // SAFETY: FFI to libproc. We pass our own pid and a properly-sized,
     // zeroed `rusage_info_v4` buffer. `proc_pid_rusage` writes the struct
     // on success (return 0). We only read fields on success.
@@ -187,11 +190,27 @@ fn io_counters_impl() -> Option<IoCounters> {
         if proc_pid_rusage(pid, RUSAGE_INFO_V4, &mut info) != 0 {
             return None;
         }
-        Some(IoCounters {
-            read_bytes: info.ri_diskio_bytesread,
-            write_bytes: info.ri_diskio_byteswritten,
-        })
+        Some(info)
     }
+}
+
+/// Returns the current process's physical memory footprint in bytes
+/// (`ri_phys_footprint`), the figure Apple's own tooling reports as the
+/// memory a process is accountable for, or `None` when `proc_pid_rusage`
+/// fails. macOS-only; the memory budget reads this instead of Mach
+/// `resident_size`, which excludes compressed-but-owned anonymous pages
+/// and includes shared framework pages.
+#[cfg(target_os = "macos")]
+pub(crate) fn phys_footprint_bytes() -> Option<u64> {
+    rusage_info_v4().map(|info| info.ri_phys_footprint)
+}
+
+#[cfg(target_os = "macos")]
+fn io_counters_impl() -> Option<IoCounters> {
+    rusage_info_v4().map(|info| IoCounters {
+        read_bytes: info.ri_diskio_bytesread,
+        write_bytes: info.ri_diskio_byteswritten,
+    })
 }
 
 #[cfg(target_os = "windows")]
