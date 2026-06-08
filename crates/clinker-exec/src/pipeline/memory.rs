@@ -1244,23 +1244,32 @@ mod tests {
         assert!(!handle.is_paused());
     }
 
+    /// RSS measurement must return a real positive figure on every
+    /// first-class target — Linux, macOS, and Windows — all of which CI now
+    /// executes. A regression to `None` or `0` in any platform FFI path
+    /// fails this test on that platform's runner rather than passing
+    /// vacuously. The whole `fn` is gated to the supported targets so an
+    /// unsupported-target build (where `rss_bytes()` is `None` by design)
+    /// excludes the test at compile time instead of early-returning out of
+    /// the body — a `cfg` gate, never a mid-body skip.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_rss_bytes_returns_some() {
         let rss = rss_bytes();
-        // On Linux (our CI), this should return Some.
-        // On unsupported platforms, this test is a no-op.
-        if cfg!(target_os = "linux") {
-            assert!(rss.is_some(), "rss_bytes() should return Some on Linux");
-            assert!(rss.unwrap() > 0, "RSS should be positive");
-        }
+        assert!(
+            rss.is_some(),
+            "rss_bytes() must return Some on a first-class target"
+        );
+        assert!(rss.unwrap() > 0, "RSS must be positive for a live process");
     }
 
+    /// A 64 MiB touched allocation must never lower this process's reported
+    /// memory on any first-class target. Gated to the supported targets for
+    /// the same reason as [`test_rss_bytes_returns_some`].
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_rss_bytes_increases_after_alloc() {
-        if rss_bytes().is_none() {
-            return; // Skip on unsupported platforms
-        }
-        let before = rss_bytes().unwrap();
+        let before = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
         // Allocate 64 MiB and touch every page so the pages are resident.
         // A delta-threshold assertion (`after >= before + N`) flakes under a
         // loaded harness: a concurrent test thread can free more than the
@@ -1278,7 +1287,7 @@ mod tests {
             i += page;
         }
         std::hint::black_box(&big_vec);
-        let after = rss_bytes().unwrap();
+        let after = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
         assert!(
             after >= before,
             "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
@@ -1492,36 +1501,43 @@ mod tests {
         assert!(arbitrator.should_spill_self());
     }
 
+    /// Below-threshold behavior: a 512 MiB budget (410 MiB soft) is far
+    /// above the test harness's own footprint on every first-class target,
+    /// so `should_spill` must stay false with no consumers registered.
+    /// Gated to the supported targets so the assertion runs unconditionally
+    /// on each runner.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_below_threshold() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        // Test process RSS should be well under 410MB (80% of 512MB)
-        if rss_bytes().is_some() {
-            assert!(!arbitrator.should_spill());
-        }
+        assert!(!arbitrator.should_spill());
     }
 
+    /// Above-threshold behavior: a 1 MiB budget is below any live process's
+    /// reported memory on every first-class target, so the RSS arm of
+    /// `should_spill` must trip. Gated to the supported targets so the
+    /// assertion runs unconditionally on each runner.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_above_threshold() {
-        // Limit of 1MB — any running process exceeds this
         let arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        if rss_bytes().is_some() {
-            assert!(arbitrator.should_spill());
-        }
+        assert!(arbitrator.should_spill());
     }
 
+    /// `observe()` must seed and non-decreasingly raise `peak_rss` on
+    /// every first-class target. Gated to the supported targets so the
+    /// assertions run unconditionally on each runner instead of
+    /// early-returning when RSS is unavailable.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_peak_rss_tracked() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
-        if rss_bytes().is_none() {
-            return; // Skip on unsupported platforms
-        }
         arbitrator.observe();
         assert!(
             arbitrator.peak_rss().is_some(),
-            "peak_rss should be set after observe()"
+            "peak_rss must be set after observe() on a first-class target"
         );
         let first_peak = arbitrator.peak_rss().unwrap();
         arbitrator.observe();
