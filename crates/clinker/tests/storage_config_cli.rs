@@ -529,14 +529,22 @@ fn real_run_logs_per_stage_actual_spill() {
 }
 
 fn tempdir_path() -> std::path::PathBuf {
+    // A per-process atomic counter guarantees a distinct directory per call.
+    // pid + timestamp alone can collide: on a platform whose clock resolution
+    // is coarser than the nanosecond unit (macOS), two concurrent tests can
+    // read the same value, land in one shared directory, and leak one test's
+    // clinker.toml into the other's config discovery.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut base = std::env::temp_dir();
     let name = format!(
-        "clinker-storage-cli-{}-{}",
+        "clinker-storage-cli-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     );
     base.push(name);
     std::fs::create_dir_all(&base).expect("create tempdir");
