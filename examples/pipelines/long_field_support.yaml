@@ -1,0 +1,107 @@
+pipeline:
+  name: long_field_support
+
+# Demonstrates that Clinker handles LONG string fields (>23 bytes — past the
+# inline-storage boundary, so they take the Arc-backed heap representation)
+# correctly across every operator: a source reading 36-char UUIDs, postal
+# addresses, and free-text comments; a transform applying string methods to
+# those long fields; a combine keyed on a long UUID; and a writer that emits
+# the long values without truncation.
+#
+# Run from examples/pipelines/:
+#   cargo run -p clinker -- run long_field_support.yaml
+#
+# The companion short-field example (customer_etl.yaml) covers the dominant
+# small-field shape; this one proves the long-field arm.
+
+error_handling:
+  strategy: fail_fast
+
+nodes:
+  - type: source
+    name: tickets
+    description: Support tickets keyed by a 36-char ticket UUID and a 36-char agent UUID.
+    config:
+      name: tickets
+      type: csv
+      path: ./data/support_tickets.csv
+      options:
+        has_header: true
+      schema:
+        - { name: ticket_uuid, type: string }
+        - { name: agent_uuid, type: string }
+        - { name: priority, type: string }
+        - { name: shipping_address, type: string }
+        - { name: comment, type: string }
+
+  - type: source
+    name: agents
+    description: Support agents keyed by the same 36-char agent UUID.
+    config:
+      name: agents
+      type: csv
+      path: ./data/support_agents.csv
+      options:
+        has_header: true
+      schema:
+        - { name: agent_uuid, type: string }
+        - { name: agent_name, type: string }
+        - { name: region, type: string }
+
+  - type: transform
+    name: derive
+    description: |
+      String methods over the long comment/address/UUID fields. `upper`
+      uppercases the full address, `substring` slices an 8-char prefix out of
+      the 36-char UUID, `concat` splices two long fields, and `length` proves
+      the value survived ingest at full width.
+    input: tickets
+    config:
+      cxl: |
+        emit ticket_uuid = ticket_uuid
+        emit agent_uuid = agent_uuid
+        emit priority = priority
+        emit address_upper = shipping_address.upper()
+        emit uuid_prefix = ticket_uuid.substring(0, 8)
+        emit tagged_comment = priority.upper().concat(": ", comment)
+        emit comment_length = comment.length()
+
+  - type: transform
+    name: high_priority
+    description: Filter to high-priority tickets, keeping the long fields intact.
+    input: derive
+    config:
+      cxl: |
+        filter priority == "high"
+
+  - type: combine
+    name: enriched
+    description: |
+      Join the filtered tickets to their agent on the 36-char agent UUID — a
+      heap-backed (>23B) join key. The equi-join key round-trips through the
+      group-by key path, so a correct join proves long-string equality keying.
+    input:
+      t: high_priority
+      a: agents
+    config:
+      where: "t.agent_uuid == a.agent_uuid"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit ticket_uuid = t.ticket_uuid
+        emit uuid_prefix = t.uuid_prefix
+        emit agent_name = a.agent_name
+        emit region = a.region
+        emit address_upper = t.address_upper
+        emit tagged_comment = t.tagged_comment
+        emit comment_length = t.comment_length
+      propagate_ck: driver
+
+  - type: output
+    name: report
+    input: enriched
+    config:
+      name: report
+      type: csv
+      path: ./output/long_field_report.csv
+      include_unmapped: true

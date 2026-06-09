@@ -578,6 +578,66 @@ mod tests {
     }
 
     #[test]
+    fn test_long_field_string_is_arc_backed_shares_on_clone_and_roundtrips() {
+        // A 36-char UUID is the canonical long field shape (>23B, the SmolStr
+        // inline boundary), so it takes the Arc-backed heap repr rather than
+        // inline storage. This pins the three properties the long-field
+        // ownership model depends on: heap residency, refcount-sharing clones,
+        // and byte-exact serde — all of which only matter for the heap arm.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            uuid.len(),
+            36,
+            "the UUID shape must exceed the 23B inline cap"
+        );
+
+        let original = Value::String(uuid.into());
+        let Value::String(orig_str) = &original else {
+            panic!("constructed a String variant");
+        };
+        // >23B values live on the heap; heap_size charges exactly the byte
+        // length (no rounding, no Arc-header inclusion).
+        assert!(
+            orig_str.is_heap_allocated(),
+            "a 36-byte UUID must be Arc-backed, not inline"
+        );
+        assert_eq!(original.heap_size(), 36);
+
+        // Cloning a heap-backed String is an O(1) refcount bump, not a deep
+        // copy: the clone's bytes alias the original's allocation. Pointer
+        // identity of the backing `str` is the public-API proof of sharing —
+        // a deep copy would land at a different address.
+        let cloned = original.clone();
+        let Value::String(clone_str) = &cloned else {
+            panic!("clone preserves the String variant");
+        };
+        assert_eq!(
+            orig_str.as_str().as_ptr(),
+            clone_str.as_str().as_ptr(),
+            "a heap-backed SmolStr clone must share the Arc allocation, \
+             not copy the bytes"
+        );
+        assert_eq!(orig_str.as_str(), clone_str.as_str());
+
+        // The Arc-backed serde path must round-trip the bytes verbatim through
+        // postcard (the spill/reload wire format). Re-encoding the decoded
+        // value reproduces the exact same byte stream.
+        let bytes = postcard::to_stdvec(&original).expect("postcard serialize");
+        let decoded: Value = postcard::from_bytes(&bytes).expect("postcard deserialize");
+        assert_eq!(decoded, original);
+        let Value::String(decoded_str) = &decoded else {
+            panic!("decoded value is a String");
+        };
+        assert_eq!(decoded_str.as_str(), uuid);
+        assert!(
+            decoded_str.is_heap_allocated(),
+            "a >23B value stays Arc-backed across a serde round-trip"
+        );
+        let reencoded = postcard::to_stdvec(&decoded).expect("re-serialize decoded value");
+        assert_eq!(reencoded, bytes, "serde round-trip is byte-identical");
+    }
+
+    #[test]
     fn test_value_heap_size_array() {
         let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
         // Vec backing (capacity=2) + Integer heap (0) + inline String "ab" heap (0).
