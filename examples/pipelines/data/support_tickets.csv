@@ -1,0 +1,6 @@
+ticket_uuid,agent_uuid,priority,shipping_address,comment
+3f29c4b1-8a6e-4d2f-9c17-0b5e8a1d6e42,9b1d7c34-2e5a-4f80-a6c9-1d3b7e2f5a88,high,"1600 Pennsylvania Avenue NW, Washington, DC 20500","Customer reports the package arrived with a cracked screen and is requesting an expedited replacement before the weekend."
+a7e3f10c-5b29-4e6d-8f41-2c9a0d7b3e15,9b1d7c34-2e5a-4f80-a6c9-1d3b7e2f5a88,low,"350 Fifth Avenue, New York, NY 10118","Inquiry about whether the extended warranty covers accidental water damage; awaiting confirmation from the policy team."
+c2b8d6a4-1f37-4a90-b5e2-8d0c4f6a9b71,4d8a2f91-6c0e-4b73-9a15-7e3d1f8c2b60,high,"1 Infinite Loop, Cupertino, CA 95014","Duplicate charge appeared on the monthly statement after the failed checkout retried three times; needs a refund issued."
+e5f1a902-7c64-4d18-bb3a-0e9f2c5d8a37,4d8a2f91-6c0e-4b73-9a15-7e3d1f8c2b60,medium,"233 South Wacker Drive, Chicago, IL 60606","The mobile app crashes on launch after the latest update; reproduced on two separate devices running the current OS."
+b0c9e2f5-3d81-4a6b-9f27-5c1a8e0d4b93,7f2c5a18-9d3e-4061-b8a4-2c6f9e1d7a05,low,"1 Apple Park Way, Cupertino, CA 95014","Requesting clarification on the return window since the original order confirmation email listed conflicting dates."
