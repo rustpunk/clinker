@@ -330,9 +330,18 @@ impl Value {
     /// Used by SortBuffer for self-tracking allocation counting.
     /// Scalar variants (Null, Bool, Integer, Float, Date, DateTime) store
     /// data inline in the enum — zero heap allocation.
+    /// Strings store their bytes inline when short (<=23 bytes) and so
+    /// contribute zero heap; only heap-backed (Arc-allocated) strings charge
+    /// their byte length.
     pub fn heap_size(&self) -> usize {
         match self {
-            Value::String(s) => s.len(),
+            Value::String(s) => {
+                if s.is_heap_allocated() {
+                    s.len()
+                } else {
+                    0
+                }
+            }
             Value::Array(arr) => {
                 arr.capacity() * std::mem::size_of::<Value>()
                     + arr.iter().map(Value::heap_size).sum::<usize>()
@@ -552,20 +561,35 @@ mod tests {
 
     #[test]
     fn test_value_heap_size_string() {
-        assert_eq!(Value::String("hello".into()).heap_size(), 5);
+        // Short strings (<=23 bytes) live inline in the SmolStr — zero heap.
+        assert_eq!(Value::String("hello".into()).heap_size(), 0);
         assert_eq!(Value::String("".into()).heap_size(), 0);
-        assert_eq!(
-            Value::String("a longer string value".into()).heap_size(),
-            21
-        );
+        // 21 bytes is still inline (<=23) — contributes no heap.
+        assert_eq!(Value::String("a longer string value".into()).heap_size(), 0);
+        // 23 bytes is the inline boundary — still no heap.
+        let boundary = "x".repeat(23);
+        assert!(!smol_str::SmolStr::new(&boundary).is_heap_allocated());
+        assert_eq!(Value::String(boundary.as_str().into()).heap_size(), 0);
+        // 24+ bytes spills to the Arc-backed heap repr — charges its byte length.
+        let heap_backed = "this string is definitely longer than twenty-three bytes";
+        assert_eq!(heap_backed.len(), 56);
+        assert!(smol_str::SmolStr::new(heap_backed).is_heap_allocated());
+        assert_eq!(Value::String(heap_backed.into()).heap_size(), 56);
     }
 
     #[test]
     fn test_value_heap_size_array() {
         let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
-        // Vec backing (capacity=2) + Integer heap (0) + String "ab" heap (2).
-        let expected = 2 * std::mem::size_of::<Value>() + 2;
+        // Vec backing (capacity=2) + Integer heap (0) + inline String "ab" heap (0).
+        let expected = 2 * std::mem::size_of::<Value>();
         assert_eq!(arr.heap_size(), expected);
+
+        // A heap-backed element string adds its byte length on top of the Vec backing.
+        let long = "an element string well past the inline boundary of smolstr";
+        assert!(smol_str::SmolStr::new(long).is_heap_allocated());
+        let arr2 = Value::Array(vec![Value::Integer(1), Value::String(long.into())]);
+        let expected2 = 2 * std::mem::size_of::<Value>() + long.len();
+        assert_eq!(arr2.heap_size(), expected2);
     }
 
     #[test]

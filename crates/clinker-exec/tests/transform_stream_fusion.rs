@@ -764,17 +764,21 @@ fn fused_transform_charges_one_batch_not_full_stage() {
     const PER_ROW_LOWER: usize = 48;
     // Generous bytes-per-row upper bound for the in-flight ceiling.
     const PER_ROW_UPPER: usize = 256;
-    // Bounded in-flight capacity: the source ingest channel (1024), the
-    // streaming-output channel (256), and one in-transit batch's worth of
-    // headroom (256). The peak charged footprint cannot exceed this many
-    // records' worth of bytes regardless of the total input size — the bound
-    // is the live channel depths, not the full stage. The batch headroom
-    // covers the transient where a fast producer fills the bounded source
-    // channel to capacity before the consumer drains it; with zero-allocation
-    // inline storage for short fields the producer reaches that depth readily,
-    // so the slack reflects a full output-channel-sized batch rather than a
-    // fraction of one.
-    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 256;
+    // Bounded in-flight capacity, summed across the two registered memory
+    // consumers whose live charge the arbitrator peaks over:
+    //   - the source ingest channel, `crossbeam_channel::bounded(1024)` —
+    //     its `SourceConsumer` charge is `queued * per-record-bytes`, capped at
+    //     the channel's 1024-event depth;
+    //   - the streaming-output slot, `crossbeam_channel::bounded(256)` — the
+    //     fused Transform `add_bytes` a whole batch before sending its events,
+    //     so the slot's charged-but-undischarged footprint is at most the
+    //     channel's 256-event depth plus the one batch (`batch_size = 64`)
+    //     charged ahead of the blocking sends.
+    // Hence the tight ceiling is input_cap + output_cap + one real batch =
+    // 1024 + 256 + 64, independent of total input size. The last term is the
+    // fixture's `batch_size` (64), not the output channel depth — the channel
+    // depth is already the 256 term and must not be double-counted as a batch.
+    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 64;
 
     let yaml = r#"
 pipeline:
