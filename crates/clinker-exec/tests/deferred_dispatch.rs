@@ -852,7 +852,7 @@ o6,ENG,300
         e.original_record
             .values()
             .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR"))
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"))
     });
     assert!(
         hr_dlq.is_some(),

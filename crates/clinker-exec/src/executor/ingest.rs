@@ -425,12 +425,8 @@ fn drive_record_source(
                     } else {
                         clinker_record::Value::Null
                     };
-                    values.push(clinker_record::Value::String(
-                        file_arc.as_ref().to_string().into_boxed_str(),
-                    ));
-                    values.push(clinker_record::Value::String(
-                        source_name_arc.as_ref().to_string().into_boxed_str(),
-                    ));
+                    values.push(clinker_record::Value::from(file_arc.as_ref()));
+                    values.push(clinker_record::Value::from(source_name_arc.as_ref()));
                     values.push(event_time_value);
                     let mut widened_record =
                         clinker_record::Record::new(Arc::clone(&widened_schema), values);

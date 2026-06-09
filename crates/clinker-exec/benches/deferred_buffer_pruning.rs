@@ -40,7 +40,7 @@ fn build_wide_rows() -> Vec<(Record, u64)> {
     (0..ROW_COUNT)
         .map(|i| {
             let values: Vec<Value> = (0..WIDE_COLUMN_COUNT)
-                .map(|c| Value::String(format!("row{i}_col{c}").into_boxed_str()))
+                .map(|c| Value::String(format!("row{i}_col{c}").into()))
                 .collect();
             (Record::new(Arc::clone(&schema), values), i as u64)
         })

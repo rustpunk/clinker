@@ -130,8 +130,9 @@ const AUTO_COMPRESS_MIN_ROWS_PER_BATCH: u64 = 1024;
 /// Per-column byte estimate used to project a spilled batch's size from a
 /// schema's column count alone.
 ///
-/// A `Value` slot is 24 bytes; `32` adds a small heap allowance for the
-/// typical mix of short strings and fixed-width scalars a spilled row holds.
+/// A `Value` slot is 32 bytes (its widest variant is the 24-byte inline
+/// string plus the enum discriminant); short strings and fixed-width scalars
+/// carry no extra heap, so the per-column slot width alone is the estimate.
 /// The projection only has to land on the correct side of the 4 KiB
 /// threshold, so a coarse per-column constant is sufficient and keeps the
 /// heuristic a pure function of the schema width and batch size.

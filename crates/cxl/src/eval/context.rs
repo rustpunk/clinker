@@ -255,16 +255,16 @@ impl<'a> EvalContext<'a> {
     /// when the member name is not a builtin.
     pub fn resolve_source(&self, member: &str) -> Option<Value> {
         match member {
-            "file" => Some(Value::String(self.source_file.to_string().into())),
+            "file" => Some(Value::from(self.source_file.as_ref())),
             "row" => Some(Value::Integer(self.source_row as i64)),
-            "path" => Some(Value::String(self.source_path.to_string().into())),
+            "path" => Some(Value::from(self.source_path.as_ref())),
             "count" => Some(
                 self.source_count
                     .map_or(Value::Null, |n| Value::Integer(n as i64)),
             ),
-            "batch" => Some(Value::String(self.source_batch.to_string().into())),
+            "batch" => Some(Value::from(self.source_batch.as_ref())),
             "ingestion_timestamp" => Some(Value::DateTime(self.ingestion_timestamp)),
-            "name" => Some(Value::String(self.source_name.to_string().into())),
+            "name" => Some(Value::from(self.source_name.as_ref())),
             other => self.stable.resolve_source_var(self.source_file, other),
         }
     }

@@ -645,7 +645,9 @@ pub fn dispatch_method(
 
         // ── Map ─────────────────────────────────────────────────
         "keys" => Ok(Some(match receiver {
-            Value::Map(m) => Value::Array(m.keys().map(|k| Value::String(k.clone())).collect()),
+            Value::Map(m) => {
+                Value::Array(m.keys().map(|k| Value::String(k.as_ref().into())).collect())
+            }
             _ => Value::Null,
         })),
         "values" => Ok(Some(match receiver {
@@ -665,7 +667,9 @@ pub fn dispatch_method(
         "set" => Ok(Some(match (receiver, args.first(), args.get(1)) {
             (Value::Map(m), Some(Value::String(key)), Some(val)) => {
                 let mut out = (**m).clone();
-                out.insert(key.clone(), val.clone());
+                // Map keys are independent `Box<str>`; build one from the
+                // field-value string.
+                out.insert(Box::from(key.as_str()), val.clone());
                 Value::Map(Box::new(out))
             }
             _ => Value::Null,
@@ -673,7 +677,7 @@ pub fn dispatch_method(
         "remove_field" => Ok(Some(match (receiver, args.first()) {
             (Value::Map(m), Some(Value::String(key))) => {
                 let mut out = (**m).clone();
-                out.shift_remove(key.as_ref());
+                out.shift_remove(key.as_str());
                 Value::Map(Box::new(out))
             }
             _ => Value::Null,

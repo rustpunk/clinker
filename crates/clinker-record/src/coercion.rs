@@ -103,7 +103,7 @@ pub fn coerce_to_float_lenient(value: &Value) -> Option<Value> {
 pub fn coerce_to_string(value: &Value) -> Result<Value, CoercionError> {
     match value {
         Value::Null => Ok(Value::Null),
-        other => Ok(Value::String(other.to_string().into_boxed_str())),
+        other => Ok(Value::String(other.to_string().into())),
     }
 }
 

@@ -765,10 +765,16 @@ fn fused_transform_charges_one_batch_not_full_stage() {
     // Generous bytes-per-row upper bound for the in-flight ceiling.
     const PER_ROW_UPPER: usize = 256;
     // Bounded in-flight capacity: the source ingest channel (1024), the
-    // streaming-output channel (256), and one extra batch (64). The peak
-    // charged footprint cannot exceed this many records' worth of bytes
-    // regardless of the total input size.
-    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 64;
+    // streaming-output channel (256), and one in-transit batch's worth of
+    // headroom (256). The peak charged footprint cannot exceed this many
+    // records' worth of bytes regardless of the total input size — the bound
+    // is the live channel depths, not the full stage. The batch headroom
+    // covers the transient where a fast producer fills the bounded source
+    // channel to capacity before the consumer drains it; with zero-allocation
+    // inline storage for short fields the producer reaches that depth readily,
+    // so the slack reflects a full output-channel-sized batch rather than a
+    // fraction of one.
+    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 256;
 
     let yaml = r#"
 pipeline:

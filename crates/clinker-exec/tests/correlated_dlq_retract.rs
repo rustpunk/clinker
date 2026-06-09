@@ -901,7 +901,7 @@ O6,ENG,200,6
             .filter(|d| {
                 d.trigger
                     && d.original_record.values().iter().any(
-                        |v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "O3"),
+                        |v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "O3"),
                     )
             })
             .collect();

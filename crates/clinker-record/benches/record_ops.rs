@@ -16,7 +16,7 @@ fn make_values(n: usize) -> Vec<Value> {
             if i % 2 == 0 {
                 Value::Integer(i as i64 * 42)
             } else {
-                Value::String(format!("value_{i}").into_boxed_str())
+                Value::String(format!("value_{i}").into())
             }
         })
         .collect()
@@ -132,7 +132,7 @@ fn bench_value_from_string(c: &mut Criterion) {
     for len in [8, 64, 512] {
         let s: String = "x".repeat(len);
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
-            b.iter(|| Value::String(black_box(s.clone()).into_boxed_str()));
+            b.iter(|| Value::String(black_box(s.clone()).into()));
         });
     }
     group.finish();

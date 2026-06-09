@@ -159,7 +159,7 @@ vars:
     );
     assert_eq!(
         result.pipeline_vars.get("cutoff_date"),
-        Some(&Value::String("2026-01-01".to_string().into_boxed_str())),
+        Some(&Value::from("2026-01-01")),
     );
 }
 
@@ -240,10 +240,7 @@ vars:
         .source_vars
         .get("orders")
         .expect("orders source has overrides");
-    assert_eq!(
-        inner.get("ingest_label"),
-        Some(&Value::String("staging".to_string().into_boxed_str())),
-    );
+    assert_eq!(inner.get("ingest_label"), Some(&Value::from("staging")),);
 }
 
 #[test]
@@ -341,7 +338,7 @@ vars:
     );
     assert_eq!(
         result.record_vars.get("tier"),
-        Some(&Value::String("platinum".to_string().into_boxed_str())),
+        Some(&Value::from("platinum")),
     );
 }
 
@@ -367,10 +364,7 @@ vars:
             .iter()
             .all(|d| !matches!(d.severity, Severity::Error))
     );
-    assert_eq!(
-        result.record_vars.get("region"),
-        Some(&Value::String("west".to_string().into_boxed_str())),
-    );
+    assert_eq!(result.record_vars.get("region"), Some(&Value::from("west")),);
 }
 
 // ── Cross-cutting ──────────────────────────────────────────────────────

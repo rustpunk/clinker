@@ -42,6 +42,12 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
+# Field-value string storage for `Value::String`: short strings (<=23 bytes,
+# the dominant ETL field shape) live inline with zero heap allocation; longer
+# strings are Arc-backed for O(1) shared clones. The `serde` feature is left
+# off — the hand-written `Value` (de)serialize impls go through `&str`, so the
+# wire form is unchanged. Maintained in-tree at rust-lang/rust-analyzer/lib/smol_str.
+smol_str = "0.3"
 tracing = "0.1"
 arc-swap = "1.9"
 static_assertions = "1"

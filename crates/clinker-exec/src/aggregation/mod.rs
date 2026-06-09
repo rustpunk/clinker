@@ -188,7 +188,7 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
     match lit {
         LiteralValue::Int(n) => Value::Integer(*n),
         LiteralValue::Float(f) => Value::Float(*f),
-        LiteralValue::String(s) => Value::String(s.clone()),
+        LiteralValue::String(s) => Value::String(s.as_ref().into()),
         LiteralValue::Bool(b) => Value::Bool(*b),
         LiteralValue::Date(d) => Value::Date(*d),
         LiteralValue::Null => Value::Null,

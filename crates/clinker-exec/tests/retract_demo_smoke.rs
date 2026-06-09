@@ -265,7 +265,7 @@ fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
             && e.original_record
                 .values()
                 .iter()
-                .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "O08"))
+                .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "O08"))
     });
     assert!(
         upstream_trigger.is_some(),
@@ -290,7 +290,7 @@ fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
             .original_record
             .values()
             .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR"));
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"));
         assert!(
             department_is_hr,
             "every post-aggregate trigger row belongs to the HR department; got: {entry:?}",

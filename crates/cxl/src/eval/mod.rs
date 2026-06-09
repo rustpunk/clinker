@@ -1289,7 +1289,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                     }
                 }
                 (Value::Map(m), Value::String(key)) => {
-                    m.get(key.as_ref()).cloned().unwrap_or(Value::Null)
+                    m.get(key.as_str()).cloned().unwrap_or(Value::Null)
                 }
                 _ => Value::Null,
             })
@@ -1503,7 +1503,7 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
     match lit {
         LiteralValue::Int(n) => Value::Integer(*n),
         LiteralValue::Float(f) => Value::Float(*f),
-        LiteralValue::String(s) => Value::String(s.clone()),
+        LiteralValue::String(s) => Value::String(s.as_ref().into()),
         LiteralValue::Date(d) => Value::Date(*d),
         LiteralValue::Bool(b) => Value::Bool(*b),
         LiteralValue::Null => Value::Null,
