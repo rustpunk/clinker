@@ -15,6 +15,35 @@ fn empty_row() -> Row {
     Row::closed(indexmap::IndexMap::new(), Span::new(0, 0))
 }
 
+/// Run a typed program through the canonical [`ProgramEvaluator`] and
+/// return its field-target emit map. The test corpus uses only
+/// `emit name = expr` statements, so the result is exactly the
+/// `output` map [`ProgramEvaluator::eval_record`] builds for the
+/// `EvalResult::Emit` variant — the single statement-level evaluator
+/// is now the only expression-evaluation path the tests exercise.
+fn run_fields<'w, S: RecordStorage + 'w>(
+    typed: TypedProgram,
+    ctx: &EvalContext<'_>,
+    resolver: &dyn crate::resolve::FieldResolver,
+    window: Option<&dyn clinker_record::WindowContext<'w, S>>,
+) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
+    let has_distinct = typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, crate::ast::Statement::Distinct { .. }));
+    let mut evaluator = ProgramEvaluator::new(std::sync::Arc::new(typed), has_distinct);
+    match evaluator.eval_record(ctx, resolver, window)? {
+        EvalResult::Emit { fields, .. } => Ok(fields),
+        EvalResult::EmitMany { records } => Ok(records
+            .into_iter()
+            .next()
+            .map(|r| r.fields)
+            .unwrap_or_default()),
+        EvalResult::Skip(_) => Ok(indexmap::IndexMap::new()),
+    }
+}
+
 /// Dummy storage for no-window evaluation tests.
 struct NullStorage;
 impl RecordStorage for NullStorage {
@@ -58,7 +87,7 @@ fn eval_ok(
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(record);
-    eval_program::<NullStorage>(&typed, &ctx, &resolver, None)
+    run_fields::<NullStorage>(typed, &ctx, &resolver, None)
         .unwrap_or_else(|e| panic!("Eval error: {}", e))
 }
 
@@ -319,7 +348,7 @@ fn test_eval_conversion_strict() {
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
-    let result = eval_program::<NullStorage>(&typed, &ctx, &resolver, None);
+    let result = run_fields::<NullStorage>(typed, &ctx, &resolver, None);
     assert!(
         result.is_err(),
         "Expected conversion error for \"abc\".to_int()"
@@ -371,7 +400,7 @@ fn test_eval_regex_precompiled() {
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
-    let output = eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+    let output = run_fields::<NullStorage>(typed, &ctx, &resolver, None).unwrap();
     assert_eq!(output.get("val"), Some(&Value::Bool(true)));
 }
 
@@ -656,7 +685,7 @@ mod any_every {
         let storage = RowsStorage { rows: partition };
         let resolver = HashMapResolver::new(HashMap::new());
         let window = RowsWindow { storage: &storage };
-        eval_program::<RowsStorage>(&typed, &ctx, &resolver, Some(&window))
+        run_fields::<RowsStorage>(typed, &ctx, &resolver, Some(&window))
             .unwrap_or_else(|e| panic!("eval: {}", e))
             .into_values()
             .next()
@@ -1063,7 +1092,7 @@ mod ranking_and_value {
             storage: &storage,
             current_pos,
         };
-        eval_program::<KeyedRows>(&typed, &ctx, &resolver, Some(&window))
+        run_fields::<KeyedRows>(typed, &ctx, &resolver, Some(&window))
             .unwrap_or_else(|e| panic!("eval: {}", e))
     }
 

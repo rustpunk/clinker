@@ -309,19 +309,66 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
 
     let resolver = HashMapResolver::new(record_map);
 
-    match cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None) {
-        Ok(output) => {
-            let json_out: serde_json::Map<String, serde_json::Value> = output
+    // The REPL drives the same statement-level evaluator the engine uses
+    // per record, so `filter`, `distinct`, and `emit each` behave exactly
+    // as they would inside a Transform node rather than being silently
+    // ignored. `distinct` needs the dedup set allocated up front.
+    let has_distinct = typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, cxl::ast::Statement::Distinct { .. }));
+    let mut evaluator = cxl::eval::ProgramEvaluator::new(std::sync::Arc::new(typed), has_distinct);
+
+    match evaluator.eval_record::<NullStorage>(&ctx, &resolver, None) {
+        Ok(cxl::eval::EvalResult::Emit { fields, .. }) => {
+            print_record_json(fields);
+        }
+        Ok(cxl::eval::EvalResult::EmitMany { records }) => {
+            // `emit each` fan-out: one input record produced several output
+            // records, so emit a JSON array to keep the output a single
+            // valid JSON value.
+            let json_array: Vec<serde_json::Value> = records
                 .into_iter()
-                .map(|(k, v)| (k, value_to_json(v)))
+                .map(|r| {
+                    serde_json::Value::Object(
+                        r.fields
+                            .into_iter()
+                            .map(|(k, v)| (k, value_to_json(v)))
+                            .collect(),
+                    )
+                })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(json_array)).unwrap()
+            );
+        }
+        Ok(cxl::eval::EvalResult::Skip(reason)) => {
+            // A `filter` predicate or `distinct` check excluded the record;
+            // stdout stays a valid (empty) JSON object so downstream tooling
+            // can still parse it, with the reason noted on stderr.
+            let why = match reason {
+                cxl::eval::SkipReason::Filtered => "filtered by predicate",
+                cxl::eval::SkipReason::Duplicate => "dropped as duplicate (distinct)",
+            };
+            eprintln!("note: record {}", why);
+            println!("{{}}");
         }
         Err(e) => {
             eprintln!("error[eval]: {}", e);
             process::exit(1);
         }
     }
+}
+
+/// Print a CXL field map as a pretty-printed JSON object on stdout.
+fn print_record_json(fields: indexmap::IndexMap<String, Value>) {
+    let json_out: serde_json::Map<String, serde_json::Value> = fields
+        .into_iter()
+        .map(|(k, v)| (k, value_to_json(v)))
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
 }
 
 /// Parse a field value string, inferring type: integer → float → bool → null → string.
@@ -759,7 +806,11 @@ mod tests {
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
-        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        let mut evaluator = cxl::eval::ProgramEvaluator::new(std::sync::Arc::new(typed), false);
+        let output = evaluator
+            .eval_record::<NullStorage>(&ctx, &resolver, None)
+            .unwrap()
+            .into_fields();
         assert_eq!(output.get("result"), Some(&Value::Integer(3)));
     }
 
@@ -815,7 +866,11 @@ mod tests {
         };
 
         let resolver = HashMapResolver::new(fields);
-        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        let mut evaluator = cxl::eval::ProgramEvaluator::new(std::sync::Arc::new(typed), false);
+        let output = evaluator
+            .eval_record::<NullStorage>(&ctx, &resolver, None)
+            .unwrap()
+            .into_fields();
         assert_eq!(output.get("total"), Some(&Value::Float(31.5)));
     }
 

@@ -527,9 +527,11 @@ mod tests {
         };
         let stable = eval::StableEvalContext::test_default();
         let ctx = eval::EvalContext::test_default_borrowed(&stable);
-        let result =
-            eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None)
-                .unwrap();
+        let mut evaluator = eval::ProgramEvaluator::new(std::sync::Arc::new(typed), false);
+        let result = evaluator
+            .eval_record::<crate::pipeline::arena::Arena>(&ctx, &resolver, None)
+            .unwrap()
+            .into_fields();
         assert_eq!(
             result.get("x"),
             Some(&Value::String("EMP001".into())),
