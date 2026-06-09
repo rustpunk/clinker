@@ -80,7 +80,7 @@ fn bench_index_build(c: &mut Criterion) {
         let minimals: Vec<MinimalRecord> = (0..record_count)
             .map(|i| {
                 MinimalRecord::new(vec![
-                    Value::String(format!("g{}", i % num_groups).into_boxed_str()),
+                    Value::String(format!("g{}", i % num_groups).into()),
                     Value::Integer(i as i64),
                 ])
             })
@@ -115,7 +115,7 @@ fn bench_index_lookup(c: &mut Criterion) {
     let minimals: Vec<MinimalRecord> = (0..record_count)
         .map(|i| {
             MinimalRecord::new(vec![
-                Value::String(format!("g{}", i % num_groups).into_boxed_str()),
+                Value::String(format!("g{}", i % num_groups).into()),
                 Value::Integer(i as i64),
             ])
         })

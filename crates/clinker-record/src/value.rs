@@ -1,5 +1,6 @@
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use indexmap::IndexMap;
+use smol_str::SmolStr;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -9,12 +10,20 @@ pub enum Value {
     Bool(bool),
     Integer(i64),
     Float(f64),
-    String(Box<str>),
+    /// Field-value string. Short values (<=23 bytes — the dominant ETL field
+    /// shape) live inline in the enum with zero heap allocation; longer values
+    /// are Arc-backed, so cloning a long string is an O(1) refcount bump rather
+    /// than an allocation + copy. `SmolStr` is 24 bytes wide with no spare
+    /// niche, so it widens `Value` to 32 bytes (see `test_value_enum_size`);
+    /// the trade buys away one heap allocation per short value, which is the
+    /// term that moves the RSS / spill threshold.
+    String(SmolStr),
     Date(NaiveDate),
     DateTime(NaiveDateTime),
     Array(Vec<Value>),
     /// Nested key-value map (ordered, insertion-preserving).
-    /// Box<IndexMap> is 8 bytes — enum stays at 24 bytes (Vec<Value> is already 24).
+    /// `Box<IndexMap>` is 8 bytes; the enum width is set by `String(SmolStr)`
+    /// and `Array(Vec<Value>)`, not by this variant.
     Map(Box<IndexMap<Box<str>, Value>>),
 }
 
@@ -54,7 +63,7 @@ impl Serialize for Value {
             Value::Integer(n) => serializer.serialize_newtype_variant("Value", 2, "Integer", n),
             Value::Float(f) => serializer.serialize_newtype_variant("Value", 3, "Float", f),
             Value::String(s) => {
-                serializer.serialize_newtype_variant("Value", 4, "String", s.as_ref())
+                serializer.serialize_newtype_variant("Value", 4, "String", s.as_str())
             }
             Value::Date(d) => {
                 // days from proleptic Gregorian ordinal (1 = 0001-01-01)
@@ -109,7 +118,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
             3 => Ok(Value::Float(va.newtype_variant()?)),
             4 => {
                 let s: std::string::String = va.newtype_variant()?;
-                Ok(Value::String(s.into_boxed_str()))
+                Ok(Value::String(SmolStr::from(s)))
             }
             5 => {
                 let days: i32 = va.newtype_variant()?;
@@ -259,6 +268,32 @@ impl fmt::Display for Value {
     }
 }
 
+// ── String-variant constructors (policy-enforcing) ─────────────────────────
+//
+// `From<&str>`, `From<String>`, and `From<SmolStr>` build the `String` variant.
+// There is deliberately NO `From<Box<str>>`: a `Box<str>` field value (the old
+// owning representation) must fail to compile rather than silently allocate and
+// box, which is the type-level enforcement that the inline/Arc-backed `SmolStr`
+// representation is the single field-value string path.
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::String(SmolStr::new(s))
+    }
+}
+
+impl From<std::string::String> for Value {
+    fn from(s: std::string::String) -> Self {
+        Value::String(SmolStr::from(s))
+    }
+}
+
+impl From<SmolStr> for Value {
+    fn from(s: SmolStr) -> Self {
+        Value::String(s)
+    }
+}
+
 /// Shared `Value::Null` sentinel used by `FieldResolver` implementations
 /// that need to hand out a `&Value` for a logically-absent field.
 ///
@@ -295,9 +330,18 @@ impl Value {
     /// Used by SortBuffer for self-tracking allocation counting.
     /// Scalar variants (Null, Bool, Integer, Float, Date, DateTime) store
     /// data inline in the enum — zero heap allocation.
+    /// Strings store their bytes inline when short (<=23 bytes) and so
+    /// contribute zero heap; only heap-backed (Arc-allocated) strings charge
+    /// their byte length.
     pub fn heap_size(&self) -> usize {
         match self {
-            Value::String(s) => s.len(),
+            Value::String(s) => {
+                if s.is_heap_allocated() {
+                    s.len()
+                } else {
+                    0
+                }
+            }
             Value::Array(arr) => {
                 arr.capacity() * std::mem::size_of::<Value>()
                     + arr.iter().map(Value::heap_size).sum::<usize>()
@@ -517,20 +561,35 @@ mod tests {
 
     #[test]
     fn test_value_heap_size_string() {
-        assert_eq!(Value::String("hello".into()).heap_size(), 5);
+        // Short strings (<=23 bytes) live inline in the SmolStr — zero heap.
+        assert_eq!(Value::String("hello".into()).heap_size(), 0);
         assert_eq!(Value::String("".into()).heap_size(), 0);
-        assert_eq!(
-            Value::String("a longer string value".into()).heap_size(),
-            21
-        );
+        // 21 bytes is still inline (<=23) — contributes no heap.
+        assert_eq!(Value::String("a longer string value".into()).heap_size(), 0);
+        // 23 bytes is the inline boundary — still no heap.
+        let boundary = "x".repeat(23);
+        assert!(!smol_str::SmolStr::new(&boundary).is_heap_allocated());
+        assert_eq!(Value::String(boundary.as_str().into()).heap_size(), 0);
+        // 24+ bytes spills to the Arc-backed heap repr — charges its byte length.
+        let heap_backed = "this string is definitely longer than twenty-three bytes";
+        assert_eq!(heap_backed.len(), 56);
+        assert!(smol_str::SmolStr::new(heap_backed).is_heap_allocated());
+        assert_eq!(Value::String(heap_backed.into()).heap_size(), 56);
     }
 
     #[test]
     fn test_value_heap_size_array() {
         let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
-        // Vec backing (capacity=2) + Integer heap (0) + String "ab" heap (2).
-        let expected = 2 * std::mem::size_of::<Value>() + 2;
+        // Vec backing (capacity=2) + Integer heap (0) + inline String "ab" heap (0).
+        let expected = 2 * std::mem::size_of::<Value>();
         assert_eq!(arr.heap_size(), expected);
+
+        // A heap-backed element string adds its byte length on top of the Vec backing.
+        let long = "an element string well past the inline boundary of smolstr";
+        assert!(smol_str::SmolStr::new(long).is_heap_allocated());
+        let arr2 = Value::Array(vec![Value::Integer(1), Value::String(long.into())]);
+        let expected2 = 2 * std::mem::size_of::<Value>() + long.len();
+        assert_eq!(arr2.heap_size(), expected2);
     }
 
     #[test]
@@ -655,7 +714,15 @@ mod tests {
 
     #[test]
     fn test_value_enum_size() {
-        assert_eq!(std::mem::size_of::<Value>(), 24);
+        // `SmolStr` is itself 24 bytes (a 23-byte inline buffer + 1-byte length
+        // tag) and exposes no spare niche for the outer `Value` discriminant,
+        // so the enum is 32 bytes — one machine word wider than the prior
+        // `Box<str>` (16-byte) representation. The width is paid back at the
+        // heap: short field values (<=23 bytes, the dominant ETL shape) carry
+        // zero heap allocation instead of one per value, and long values clone
+        // by refcount. The per-`Value` byte-cost model keys off this constant,
+        // so it tracks the real width automatically.
+        assert_eq!(std::mem::size_of::<Value>(), 32);
     }
 
     #[test]

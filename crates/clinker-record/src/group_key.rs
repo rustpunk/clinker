@@ -40,7 +40,10 @@ impl GroupByKey {
         match self {
             GroupByKey::Null => Value::Null,
             GroupByKey::Int(n) => Value::Integer(*n),
-            GroupByKey::Str(s) => Value::String(s.clone()),
+            // `GroupByKey::Str` keeps its own `Box<str>` (it is an independent
+            // HashMap/HashSet key); convert through `&str` to the inline/Arc-
+            // backed field-value string when materializing the group key.
+            GroupByKey::Str(s) => Value::String(s.as_ref().into()),
             GroupByKey::Bool(b) => Value::Bool(*b),
             GroupByKey::Date(d) => Value::Date(*d),
             GroupByKey::DateTime(dt) => Value::DateTime(*dt),
@@ -146,7 +149,9 @@ pub fn value_to_group_key(
             Ok(Some(GroupByKey::Float((*i as f64).to_bits())))
         }
 
-        Value::String(s) => Ok(Some(GroupByKey::Str(s.clone()))),
+        // Materialize an owned `Box<str>` key from the field-value string;
+        // `GroupByKey` keys must own independently of the source `Value`.
+        Value::String(s) => Ok(Some(GroupByKey::Str(Box::from(s.as_str())))),
         Value::Bool(b) => Ok(Some(GroupByKey::Bool(*b))),
         Value::Date(d) => Ok(Some(GroupByKey::Date(*d))),
         Value::DateTime(dt) => Ok(Some(GroupByKey::DateTime(*dt))),

@@ -10,6 +10,7 @@ bench-alloc = []
 
 [dependencies]
 clinker-record = { workspace = true }
+smol_str = { workspace = true }
 fastrand = "2"
 blake3 = { workspace = true }
 glob = "0.3"

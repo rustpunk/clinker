@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 ahash = { workspace = true }
 indexmap = { workspace = true }
+smol_str = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

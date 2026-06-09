@@ -250,7 +250,7 @@ fn post_aggregate_window_recompute_corrects_running_total() {
             .original_record
             .values()
             .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR")),
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR")),
         "trigger record must carry department=HR"
     );
     assert!(
@@ -258,7 +258,7 @@ fn post_aggregate_window_recompute_corrects_running_total() {
             .original_record
             .values()
             .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "north")),
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "north")),
         "trigger record must carry region=north"
     );
 

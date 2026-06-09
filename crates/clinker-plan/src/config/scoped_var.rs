@@ -275,7 +275,7 @@ pub fn coerce_scoped_var_default(
         (
             ScopedVarType::String | ScopedVarType::Date | ScopedVarType::DateTime,
             serde_json::Value::String(s),
-        ) => Value::String(s.clone().into_boxed_str()),
+        ) => Value::String(s.as_str().into()),
         _ => unreachable!("check_scoped_var_default should reject mismatched defaults"),
     }
 }

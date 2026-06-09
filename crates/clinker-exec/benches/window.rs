@@ -17,7 +17,7 @@ fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u64>) {
     for i in 0..partition_size {
         minimals.push(MinimalRecord::new(vec![
             Value::Float(rng.f64() * 10_000.0),
-            Value::String(format!("cat_{}", i % 50).into_boxed_str()),
+            Value::String(format!("cat_{}", i % 50).into()),
         ]));
     }
     let positions: Vec<u64> = (0..partition_size as u64).collect();

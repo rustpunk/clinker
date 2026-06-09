@@ -13,7 +13,7 @@
 //! Per-row admission cost is the `estimate_node_buffer_bytes`
 //! formula in `executor/dispatch.rs`: `size_of::<Value>() * cols +
 //! size_of::<(Record, u64)>()`. For the 5-column schema below this
-//! resolves to ~264 B/row, so 2 000 rows charge ~528 KiB — under the
+//! resolves to ~216 B/row, so 2 000 rows charge ~432 KiB — under the
 //! 1 MiB hard limit but well above the 819 KiB soft floor against
 //! which the RSS check is compared.
 //!

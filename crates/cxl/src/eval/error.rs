@@ -204,9 +204,7 @@ impl EvalError {
 /// `triggering_value` column.
 pub fn extract_triggering_value(kind: &EvalErrorKind) -> Option<Value> {
     match kind {
-        EvalErrorKind::ConversionFailed { value, .. } => {
-            Some(Value::String(Box::<str>::from(value.as_str())))
-        }
+        EvalErrorKind::ConversionFailed { value, .. } => Some(Value::from(value.as_str())),
         EvalErrorKind::IndexOutOfBounds { index, .. } => Some(Value::Integer(*index)),
         EvalErrorKind::ArityMismatch { got, .. } => Some(Value::Integer(*got as i64)),
         EvalErrorKind::TypeMismatch { .. }
@@ -302,7 +300,7 @@ mod tests {
                 value: "not-a-number".to_string(),
                 target: "int",
             }),
-            Some(Value::String(Box::<str>::from("not-a-number")))
+            Some(Value::from("not-a-number"))
         );
         assert_eq!(
             extract_triggering_value(&EvalErrorKind::IndexOutOfBounds {

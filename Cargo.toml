@@ -42,6 +42,18 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
+# Field-value string storage for `Value::String`: short strings (<=23 bytes,
+# the dominant ETL field shape) live inline with zero heap allocation; longer
+# strings are Arc-backed for O(1) shared clones. The `serde` feature is left
+# off — the hand-written `Value` (de)serialize impls go through `&str`, so the
+# wire form is unchanged. `default-features = false` with only `std` enabled
+# keeps smol_str's optional `borsh` feature off, so borsh is never compiled
+# into the build graph (we never serialize via borsh); `std` preserves the
+# inline + Arc storage and the AsRef<str>/From impls the code relies on. (Cargo
+# still lists borsh under smol_str in Cargo.lock as a declared-but-unactivated
+# optional dep; it compiles nowhere — confirmed via `cargo tree -i borsh`.)
+# Maintained in-tree at rust-lang/rust-analyzer/lib/smol_str.
+smol_str = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 arc-swap = "1.9"
 static_assertions = "1"

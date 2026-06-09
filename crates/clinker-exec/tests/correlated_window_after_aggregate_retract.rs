@@ -330,7 +330,7 @@ O6,ENG,300
             .original_record
             .values()
             .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR")),
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR")),
         "trigger record must be the HR aggregate output row"
     );
     assert!(

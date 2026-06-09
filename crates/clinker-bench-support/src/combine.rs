@@ -10,6 +10,7 @@
 //! columns of deterministic length.
 
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 /// Generates two correlated record sets for combine benchmarks.
@@ -72,7 +73,7 @@ impl CombineDataGen {
     /// Deterministically generate an ASCII-lowercase string from a row index
     /// and column index. Fixed length 8 — wide enough for unique-ish output
     /// within a bench but cheap to allocate.
-    fn det_string(row: usize, col: usize) -> Box<str> {
+    fn det_string(row: usize, col: usize) -> SmolStr {
         const LEN: usize = 8;
         let mut bytes = [0u8; LEN];
         // Mix row and col into a 32-bit lane, then peel off 5-bit (a-z +
@@ -85,7 +86,7 @@ impl CombineDataGen {
             mix = mix.rotate_left(7).wrapping_add(1);
         }
         // SAFETY: all bytes in [b'a', b'a' + 25], always valid ASCII.
-        unsafe { String::from_utf8_unchecked(bytes.to_vec()) }.into_boxed_str()
+        SmolStr::new(unsafe { std::str::from_utf8_unchecked(&bytes) })
     }
 
     /// Build a record with the given integer key and deterministic string
