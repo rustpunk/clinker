@@ -2,6 +2,12 @@ pub mod builtins_impl;
 pub mod context;
 pub mod error;
 
+// Compile-once-to-closures evaluator. Built and exercised only by the
+// differential harness in this slice; it is wired into the per-record
+// hot path in a later slice, at which point this gate is removed.
+#[cfg(test)]
+pub mod compiled;
+
 #[cfg(test)]
 mod tests;
 

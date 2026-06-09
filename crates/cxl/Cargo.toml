@@ -19,6 +19,7 @@ serde = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "eval"
