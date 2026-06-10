@@ -8,17 +8,20 @@
 //! sequence of vtable calls with no central dispatch `match` and no
 //! re-indexing of the typed program's side tables.
 //!
-//! This slice covers the scalar core plus the record-shaped method
-//! surface: literals, field and system access, binary/unary arithmetic
-//! and comparison, the three-valued Kleene `and`/`or`, conditionals
-//! (`if`/`match`/coalesce), the non-fan-out statement forms (`let`,
-//! `emit`, `filter`, `trace`, `use`, expression statements), the
-//! record-level builtins reached through `dispatch_method`, and the
+//! The module lowers the full row-level node vocabulary: literals, field
+//! and system access, binary/unary arithmetic and comparison, the
+//! three-valued Kleene `and`/`or`, conditionals (`if`/`match`/coalesce),
+//! the record-level builtins reached through `dispatch_method`, the
 //! closure-bearing array builtins (`filter`/`map`/`find`/`any`/
-//! `flat_map`). Window access, `distinct`, and `emit each` are not
-//! lowered here; their lowering returns an [`EvalError`] rather than a
-//! silently-wrong value, so a program reaching one of those nodes fails
-//! loudly instead of diverging from the tree-walk.
+//! `flat_map`), window reads (aggregate / positional-chain / rank /
+//! predicate-fold leaves), and every statement form (`let`, `emit` to all
+//! four targets, `filter`, `distinct`, `trace`, `use`, expression
+//! statements, and `emit each` fan-out). The only nodes that do not
+//! lower are `AggCall` / `AggSlot` / `GroupKey`: an `AggCall` is rewritten
+//! away before a `TypedProgram` exists, and `AggSlot` / `GroupKey` live
+//! only in the finalize residual (which has its own evaluator), so none
+//! has a row node and reaching one is a loud error rather than a silent
+//! value.
 //!
 //! Builtins are not reimplemented: a `MethodCall` node lowers to a call
 //! into the same `dispatch_method` the tree-walk uses, so the
@@ -33,17 +36,21 @@
 //! eval / remove / restore sequence the tree-walk uses (including the
 //! remove on the error path).
 //!
-//! The produced [`CompiledProgram`] is parameterized by the record
-//! storage backend `S` because window reads (a later slice) borrow the
-//! arena through `WindowContext<'w, S>`; carrying `S` on the compiled
-//! tree keeps that lifetime path honest when it lands. The scalar-core
-//! closures never touch the window, but the type threads through so the
-//! frame shape does not change when window nodes are added.
+//! Window reads stay leaf loads from the captured
+//! `Option<&dyn WindowContext<'w, S>>`, evaluated synchronously while the
+//! `'w` borrow is live — never lowered to a value-producing op whose
+//! result is stored and re-read. The `$window.<fn>().<field>` chain
+//! compiles to a single node that resolves the field off the positional
+//! `RecordView` with no intermediate `Value` for the row, preserving the
+//! zero-copy lifetime path. `distinct`'s dedup set and the partition key
+//! it is scoped to are *not* part of the immutable compiled program: they
+//! live in a separate [`EvalState`] the caller threads by `&mut`, so one
+//! compiled program can be shared across records and threads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use clinker_record::{RecordStorage, Value};
+use clinker_record::{GroupByKey, RecordStorage, Value, value_to_group_key};
 use regex::Regex;
 
 use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, TraceLevel, UnaryOp};
@@ -54,30 +61,75 @@ use crate::typecheck::pass::TypedProgram;
 use super::builtins_impl::dispatch_method;
 use super::context::EvalContext;
 use super::error::{EvalError, EvalErrorKind};
-use super::{EvalResult, SkipReason};
+use super::{EvalResult, SkipReason, group_key_error_to_eval_error};
 
 /// Per-record evaluation frame threaded into every compiled closure.
 ///
-/// Holds the immutable references the scalar core reads (the typed
-/// program, the per-record context, the field resolver, the optional
-/// window context) plus the mutable `env` scratch map for let-bindings.
-/// Mirrors the argument bundle the tree-walk's `eval_expr` threads, so
-/// a compiled node's body is a direct transcription of the matching
-/// tree-walk arm.
+/// Holds the immutable references the scalar core and window leaves read
+/// (the per-record context, the field resolver, the optional window
+/// context) plus the mutable `env` scratch map for let-bindings. Mirrors
+/// the argument bundle the tree-walk's `eval_expr` threads, so a compiled
+/// node's body is a direct transcription of the matching tree-walk arm.
 ///
-/// `typed` and `window` are retained even though the scalar core does
-/// not read them: the deferred-node lowering paths (method calls with
-/// `typed.regexes`, window access through `window`) will read them when
-/// they land, and keeping the fields on the frame avoids reshaping it
-/// then.
+/// The typed program is not carried: every node-keyed side-table read
+/// (the pre-compiled regex) is resolved by value at lowering, so nothing
+/// at run time re-indexes the typed program. `window` is read by the
+/// window-leaf nodes; it stays an `Option` because a transform without
+/// analytic windows evaluates with `None`, exactly as the tree-walk does.
 pub struct Frame<'a, 'w, S: RecordStorage + 'w> {
-    #[allow(dead_code)]
-    typed: &'a TypedProgram,
     ctx: &'a EvalContext<'a>,
     resolver: &'a dyn FieldResolver,
-    #[allow(dead_code)]
     window: Option<&'a dyn WindowContext<'w, S>>,
     env: HashMap<String, Value>,
+}
+
+/// Mutable cross-record evaluation state threaded into `eval_record`.
+///
+/// The compiled program is immutable (it is shared, potentially behind an
+/// `Arc`, across records and threads), so `distinct`'s dedup set and the
+/// window-partition key it is scoped to live here rather than on the
+/// program. The caller owns one of these per evaluator instance and hands
+/// it to `eval_record` by `&mut`, mirroring how the tree-walk keeps
+/// `distinct_seen` / `current_partition_key` on `ProgramEvaluator`.
+pub struct EvalState {
+    /// Seen distinct keys for the current partition. `None` when the
+    /// program has no `distinct` statement, matching the tree-walk's
+    /// allocation-gated set.
+    distinct_seen: Option<HashSet<Vec<GroupByKey>>>,
+    /// The partition key the dedup set is currently scoped to. A change
+    /// clears `distinct_seen` (window-scoped distinct), so a new
+    /// partition starts deduping from empty.
+    current_partition_key: Option<Vec<GroupByKey>>,
+    /// Per-record `emit each` fan-out ceiling. When a fan-out body's
+    /// running emit count reaches this, the originating record errors
+    /// with `ExpansionLimitExceeded` rather than expanding unboundedly.
+    max_expansion: u64,
+}
+
+impl EvalState {
+    /// Build the mutable state for a program. `has_distinct` gates the
+    /// dedup-set allocation so a program without `distinct` pays nothing;
+    /// `max_expansion` is the `emit each` per-record fan-out ceiling.
+    pub fn new(has_distinct: bool, max_expansion: u64) -> Self {
+        Self {
+            distinct_seen: has_distinct.then(HashSet::new),
+            current_partition_key: None,
+            max_expansion,
+        }
+    }
+
+    /// Make the partition key the dedup set is scoped to `key`, clearing
+    /// the set on a change. Mirrors `ProgramEvaluator::set_partition`:
+    /// distinct is window-partition-scoped, so crossing a partition
+    /// boundary resets dedup rather than carrying it across partitions.
+    pub fn set_partition(&mut self, key: &[GroupByKey]) {
+        if self.current_partition_key.as_deref() != Some(key) {
+            if let Some(seen) = &mut self.distinct_seen {
+                seen.clear();
+            }
+            self.current_partition_key = Some(key.to_vec());
+        }
+    }
 }
 
 /// A lowered expression node: a closure producing a [`Value`] from a
@@ -90,36 +142,55 @@ type CompiledExpr<S> = Box<dyn for<'a, 'w> Fn(&mut Frame<'a, 'w, S>) -> Result<V
 enum StmtFlow {
     /// Statement completed; continue to the next one.
     Continue,
-    /// Statement short-circuited the whole record (a `filter` predicate
-    /// that did not evaluate to `true`). The carried reason matches the
-    /// tree-walk's [`SkipReason`].
+    /// Statement short-circuited the whole record. The carried reason
+    /// distinguishes a `filter` non-true predicate ([`SkipReason::Filtered`])
+    /// from a `distinct` duplicate ([`SkipReason::Duplicate`]), matching
+    /// the tree-walk's two short-circuit points.
     Skip(SkipReason),
 }
 
-/// Mutable output channels a statement writes into.
+/// Mutable per-record run state a statement mutates.
 ///
-/// Separated from the read-only [`Frame`] fields so the two-channel
-/// shape of [`EvalResult`] (field output vs `$record.*` writes) is
-/// explicit, and so `$pipeline.*` / `$source.*` writes route straight
-/// through the shared context exactly as the tree-walk does.
-struct StmtOut {
+/// Bundles the two output channels (field output vs `$record.*` writes —
+/// the two-channel shape of [`EvalResult`]), the `emit each` fan-out
+/// accumulator, and a `&mut` borrow of the cross-record [`EvalState`]
+/// (distinct dedup). `$pipeline.*` / `$source.*` writes route straight
+/// through the frame's context, so they never appear here. Threading one
+/// struct keeps every compiled-statement closure a uniform two-argument
+/// shape regardless of which channel it writes.
+struct StmtOut<'s> {
     fields: indexmap::IndexMap<String, Value>,
     record_vars: indexmap::IndexMap<String, Value>,
+    /// Records produced by `emit each` blocks this record. Non-empty at
+    /// end-of-program promotes the result to [`EvalResult::EmitMany`].
+    fan_out: Vec<super::EmitOne>,
+    /// Running fan-out cardinality across all `emit each` blocks for this
+    /// record, checked against [`EvalState::max_expansion`].
+    expansion_count: u64,
+    /// Cross-record dedup state, borrowed for the duration of the record.
+    state: &'s mut EvalState,
 }
 
-/// A lowered statement: a closure that mutates the output channels
-/// and/or the frame's env and reports whether the record should
-/// continue or be skipped.
-type CompiledStmt<S> =
-    Box<dyn for<'a, 'w> Fn(&mut Frame<'a, 'w, S>, &mut StmtOut) -> Result<StmtFlow, EvalError>>;
+/// A lowered statement: a closure that mutates the per-record run state
+/// and/or the frame's env and reports whether the record should continue
+/// or be skipped.
+type CompiledStmt<S> = Box<
+    dyn for<'a, 'w, 's> Fn(&mut Frame<'a, 'w, S>, &mut StmtOut<'s>) -> Result<StmtFlow, EvalError>,
+>;
 
 /// A CXL program lowered to a sequence of compiled statements.
 ///
 /// Built once via [`compile`] and run per record via
 /// [`Self::eval_record`], which reproduces the tree-walk's
-/// `eval_record_inner` control flow: statements run in order, a
-/// `filter` short-circuit returns `Skip`, and the accumulated field /
-/// record-var channels become an [`EvalResult::Emit`].
+/// `eval_record_inner` control flow: statements run in order, a `filter`
+/// or `distinct` short-circuit returns `Skip`, an `emit each` block
+/// fans out into [`EvalResult::EmitMany`], and otherwise the accumulated
+/// field / record-var channels become an [`EvalResult::Emit`].
+///
+/// The program is immutable; the per-evaluator dedup state lives in a
+/// separate [`EvalState`] the caller threads by `&mut`, so one compiled
+/// program can be shared across records and threads while each has its
+/// own distinct set.
 pub struct CompiledProgram<S: RecordStorage + 'static> {
     statements: Vec<CompiledStmt<S>>,
 }
@@ -127,26 +198,29 @@ pub struct CompiledProgram<S: RecordStorage + 'static> {
 impl<S: RecordStorage + 'static> CompiledProgram<S> {
     /// Evaluate one record through the compiled program.
     ///
-    /// Reproduces `ProgramEvaluator::eval_record_inner` for the scalar
-    /// core: a fresh env and output channels per record, in-order
-    /// statement execution, `filter` short-circuit to
-    /// [`EvalResult::Skip`], and an [`EvalResult::Emit`] carrying the
-    /// field and `$record.*` channels. `emit each` fan-out is not
-    /// lowered in this slice, so this entry never produces
-    /// [`EvalResult::EmitMany`].
+    /// Reproduces `ProgramEvaluator::eval_record_inner`: a fresh env and
+    /// output channels per record, in-order statement execution, `filter`
+    /// / `distinct` short-circuit to [`EvalResult::Skip`], `emit each`
+    /// fan-out to [`EvalResult::EmitMany`], and otherwise an
+    /// [`EvalResult::Emit`] carrying the field and `$record.*` channels.
+    ///
+    /// `state` carries the cross-record dedup set; a `distinct` program
+    /// must be evaluated with the same `EvalState` across the records of
+    /// a partition (and `EvalState::set_partition` called at each
+    /// partition boundary) for dedup to be correct, mirroring the
+    /// tree-walk's `ProgramEvaluator`.
     ///
     /// The error boundary (filling `source_row` / `source_expr` on a
     /// surfaced [`EvalError`]) stays with the caller, matching the
     /// tree-walk where `eval_record` wraps `eval_record_inner`.
     pub fn eval_record<'a, 'w>(
         &self,
-        typed: &'a TypedProgram,
         ctx: &'a EvalContext<'a>,
         resolver: &'a dyn FieldResolver,
         window: Option<&'a dyn WindowContext<'w, S>>,
+        state: &mut EvalState,
     ) -> Result<EvalResult, EvalError> {
         let mut frame = Frame {
-            typed,
             ctx,
             resolver,
             window,
@@ -155,6 +229,9 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
         let mut out = StmtOut {
             fields: indexmap::IndexMap::new(),
             record_vars: indexmap::IndexMap::new(),
+            fan_out: Vec::new(),
+            expansion_count: 0,
+            state,
         };
         for stmt in &self.statements {
             match stmt(&mut frame, &mut out)? {
@@ -162,10 +239,16 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
                 StmtFlow::Skip(reason) => return Ok(EvalResult::Skip(reason)),
             }
         }
-        Ok(EvalResult::Emit {
-            fields: out.fields,
-            record_vars: Box::new(out.record_vars),
-        })
+        if out.fan_out.is_empty() {
+            Ok(EvalResult::Emit {
+                fields: out.fields,
+                record_vars: Box::new(out.record_vars),
+            })
+        } else {
+            Ok(EvalResult::EmitMany {
+                records: out.fan_out,
+            })
+        }
     }
 }
 
@@ -175,11 +258,9 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
 /// through lowering (not run time) so that node-keyed side data — the
 /// pre-compiled regex in `typed.regexes[node_id]` — is captured by value
 /// into the method node's closure at compile time, never re-indexed per
-/// record. Window access, `distinct`, and `emit each` remain out of
-/// scope for this slice: lowering one of those produces a statement /
-/// expression closure that returns an [`EvalError`] at run time rather
-/// than a silently-wrong value, so a divergence from the tree-walk
-/// surfaces as a hard error instead of corrupt output.
+/// record. The resulting program is immutable; `distinct`'s cross-record
+/// dedup state lives in a separate [`EvalState`] the caller threads into
+/// [`CompiledProgram::eval_record`].
 pub fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProgram<S> {
     let statements = typed
         .program
@@ -190,17 +271,31 @@ pub fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProg
     CompiledProgram { statements }
 }
 
-/// Construct the closure that signals an unsupported node, anchored on
-/// the node's span. Used for every deferred node so reaching one fails
-/// loudly with a precise location instead of diverging silently.
-fn unsupported_expr<S: RecordStorage + 'static>(what: &'static str, span: Span) -> CompiledExpr<S> {
-    Box::new(move |_frame| Err(unsupported_error(what, span)))
+/// Whether a typed program contains a top-level `distinct` statement.
+///
+/// Drives [`EvalState`] dedup-set allocation: a program with no
+/// `distinct` never allocates the set, exactly as the tree-walk's
+/// `has_distinct` flag gates `ProgramEvaluator`'s set. `distinct` is a
+/// top-level statement only (the parser rejects it inside `emit each`),
+/// so a flat scan of the top-level statements is exhaustive.
+pub fn program_has_distinct(typed: &TypedProgram) -> bool {
+    typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Distinct { .. }))
 }
 
-fn unsupported_error(what: &'static str, span: Span) -> EvalError {
+/// Reachability error for a node that cannot appear in a compiled
+/// program. `AggCall` / `AggSlot` / `GroupKey` are rewritten away by
+/// `extract_aggregates` before a `TypedProgram` exists (or live only in
+/// the finalize residual, which has its own evaluator), so reaching one
+/// here means a malformed program slipped past typecheck; surface a loud
+/// typed error at its span rather than a silent value.
+fn unreachable_node_error(what: &'static str, span: Span) -> EvalError {
     EvalError::new(
         EvalErrorKind::TypeMismatch {
-            expected: "scalar-core node",
+            expected: "row-level node",
             got: what,
         },
         span,
@@ -302,18 +397,178 @@ fn compile_stmt<S: RecordStorage + 'static>(
                 Ok(StmtFlow::Continue)
             })
         }
-        // Deferred to a later slice: `distinct` needs the evaluator's
-        // dedup state and `emit each` needs the fan-out accumulator,
-        // neither of which the scalar-core frame carries. Fail loudly
-        // rather than treat them as no-ops (which would diverge from the
-        // tree-walk's actual behavior).
-        Statement::Distinct { span, .. } => {
-            let span = *span;
-            Box::new(move |_frame, _out| Err(unsupported_error("distinct statement", span)))
+        Statement::Distinct { field, .. } => {
+            // The dedup key is computed exactly as the tree-walk's
+            // `build_distinct_key`: a named `distinct by <field>` keys on
+            // that one field (env-bound value preferred over the input
+            // field), a bare `distinct` keys on every input field in
+            // resolver order. Conversion goes through `value_to_group_key`
+            // (never a raw `Value`) so `f64::to_bits` / NaN handling and
+            // the `GroupKeyError` surface match the tree-walk bit for bit.
+            let field: Option<String> = field.as_ref().map(|f| f.to_string());
+            Box::new(move |frame, out| {
+                let key = build_distinct_key(field.as_deref(), &frame.env, frame.resolver)?;
+                let seen = out.state.distinct_seen.as_mut().expect(
+                    "distinct statement requires EvalState allocated with has_distinct = true",
+                );
+                // Check membership before any emit — `distinct` never
+                // reaches a downstream `Emit` for a duplicate.
+                if seen.insert(key) {
+                    Ok(StmtFlow::Continue)
+                } else {
+                    Ok(StmtFlow::Skip(SkipReason::Duplicate))
+                }
+            })
         }
-        Statement::EmitEach { span, .. } => {
+        Statement::EmitEach {
+            binding,
+            source,
+            body,
+            span,
+            ..
+        } => {
+            let binding = binding.to_string();
+            let source = compile_expr::<S>(typed, source);
             let span = *span;
-            Box::new(move |_frame, _out| Err(unsupported_error("emit each statement", span)))
+            // The body is a restricted sub-program: only let / emit /
+            // trace / use / expression statements. `filter` / `distinct` /
+            // nested `emit each` are rejected at compile time with the
+            // same span-anchored error the tree-walk raises at run time,
+            // so an ill-formed body fails identically.
+            let body: Vec<CompiledStmt<S>> = body
+                .iter()
+                .map(|s| compile_emit_each_body_stmt(typed, s))
+                .collect();
+            Box::new(move |frame, out| {
+                let source_val = source(frame)?;
+                let elements = match source_val {
+                    Value::Array(arr) => arr,
+                    // A null source fans out zero records — the block is a
+                    // no-op, continuing to the next statement.
+                    Value::Null => return Ok(StmtFlow::Continue),
+                    other => {
+                        return Err(EvalError::new(
+                            EvalErrorKind::TypeMismatch {
+                                expected: "Array",
+                                got: other.type_name(),
+                            },
+                            span,
+                        ));
+                    }
+                };
+                for element in elements {
+                    // Ceiling check before binding/evaluating the element:
+                    // an oversized fan-out errors before unbounded work,
+                    // matching the tree-walk's pre-body check.
+                    if out.expansion_count >= out.state.max_expansion {
+                        return Err(EvalError::new(
+                            EvalErrorKind::ExpansionLimitExceeded {
+                                limit: out.state.max_expansion,
+                            },
+                            span,
+                        ));
+                    }
+                    frame.env.insert(binding.clone(), element);
+                    // Seed each emitted record with the field / record-var
+                    // writes already produced before this block — a
+                    // top-level `emit name = ...` preceding the fan-out
+                    // applies to every record it produces.
+                    let mut iter = StmtOut {
+                        fields: out.fields.clone(),
+                        record_vars: out.record_vars.clone(),
+                        fan_out: Vec::new(),
+                        expansion_count: 0,
+                        state: &mut *out.state,
+                    };
+                    for stmt in &body {
+                        // A restricted body never skips or fans out, so the
+                        // flow result is always `Continue`; an error
+                        // propagates with the per-element binding still in
+                        // env (per-record scratch, discarded on error).
+                        stmt(frame, &mut iter)?;
+                    }
+                    frame.env.remove(binding.as_str());
+                    out.fan_out.push(super::EmitOne {
+                        fields: iter.fields,
+                        record_vars: Box::new(iter.record_vars),
+                    });
+                    out.expansion_count += 1;
+                }
+                Ok(StmtFlow::Continue)
+            })
+        }
+    }
+}
+
+/// Compile one statement of an `emit each` body. The body surface is
+/// restricted to let / emit / trace / use / expression statements;
+/// `filter` / `distinct` / nested `emit each` are rejected here at
+/// compile time with the same span-anchored type error the tree-walk
+/// raises at run time, so an ill-formed body diverges from neither
+/// evaluator. The returned closure shares the same `StmtOut` shape as a
+/// top-level statement but only ever reports `Continue`.
+fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    stmt: &Statement,
+) -> CompiledStmt<S> {
+    match stmt {
+        Statement::Let { .. }
+        | Statement::Emit { .. }
+        | Statement::Trace { .. }
+        | Statement::UseStmt { .. }
+        | Statement::ExprStmt { .. } => compile_stmt(typed, stmt),
+        Statement::Filter { span, .. }
+        | Statement::Distinct { span, .. }
+        | Statement::EmitEach { span, .. } => {
+            let span = *span;
+            Box::new(move |_frame, _out| {
+                Err(EvalError::new(
+                    EvalErrorKind::TypeMismatch {
+                        expected: "let / emit / trace inside emit each body",
+                        got: "filter / distinct / nested emit_each",
+                    },
+                    span,
+                ))
+            })
+        }
+    }
+}
+
+/// Build the dedup key for a `distinct` statement, identically to the
+/// tree-walk's `ProgramEvaluator::build_distinct_key`.
+///
+/// A named field resolves from the let-bound env first, then the input
+/// record (null when absent); a bare `distinct` keys on every input field
+/// in resolver iteration order. Each value goes through
+/// `value_to_group_key` so NaN / `f64::to_bits` canonicalization and the
+/// `GroupKeyError → EvalError` mapping match the tree-walk.
+fn build_distinct_key(
+    field: Option<&str>,
+    env: &HashMap<String, Value>,
+    resolver: &dyn FieldResolver,
+) -> Result<Vec<GroupByKey>, EvalError> {
+    match field {
+        Some(name) => {
+            let val: &Value = match env.get(name) {
+                Some(v) => v,
+                None => resolver.resolve(name).unwrap_or(&clinker_record::NULL),
+            };
+            match value_to_group_key(val, name, None, 0) {
+                Ok(Some(gk)) => Ok(vec![gk]),
+                Ok(None) => Ok(vec![GroupByKey::Null]),
+                Err(e) => Err(group_key_error_to_eval_error(e)),
+            }
+        }
+        None => {
+            let mut key = Vec::new();
+            for (name, val) in resolver.iter_fields() {
+                match value_to_group_key(val, name, None, 0) {
+                    Ok(Some(gk)) => key.push(gk),
+                    Ok(None) => key.push(GroupByKey::Null),
+                    Err(e) => return Err(group_key_error_to_eval_error(e)),
+                }
+            }
+            Ok(key)
         }
     }
 }
@@ -507,23 +762,44 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                 ))
             })
         }
-        // Deferred to a later slice. These compile to a loud-error leaf
-        // so a program reaching one fails at its precise span rather
-        // than producing a value that silently diverges from the
-        // tree-walk.
-        Expr::WindowCall { span, .. } => unsupported_expr("window call", *span),
-        Expr::AggCall { span, .. } => unsupported_expr("aggregate call", *span),
-        Expr::AggSlot { span, .. } => unsupported_expr("aggregate slot", *span),
-        Expr::GroupKey { span, .. } => unsupported_expr("group-by key", *span),
+        // A bare `$window.<fn>(..)` is a leaf load from the captured
+        // window context. Aggregate / positional / rank / predicate-fold
+        // builtins all lower here; the postfix `.field` chain form is
+        // intercepted one level up in `compile_method_call`.
+        Expr::WindowCall {
+            function,
+            args,
+            span,
+            ..
+        } => compile_window_call(typed, function, args, *span),
+        // `AggCall` is rewritten away by `extract_aggregates` before a
+        // `TypedProgram` exists, and `AggSlot` / `GroupKey` live only in
+        // the finalize residual (which has its own evaluator) — none has a
+        // row node. Reaching one means a malformed program slipped past
+        // typecheck; surface a loud error at its span, matching the
+        // tree-walk's row-level rejection.
+        Expr::AggCall { span, .. } => {
+            let span = *span;
+            Box::new(move |_frame| Err(unreachable_node_error("aggregate function call", span)))
+        }
+        Expr::AggSlot { span, .. } => {
+            let span = *span;
+            Box::new(move |_frame| Err(unreachable_node_error("aggregate slot reference", span)))
+        }
+        Expr::GroupKey { span, .. } => {
+            let span = *span;
+            Box::new(move |_frame| Err(unreachable_node_error("group-by key reference", span)))
+        }
     }
 }
 
 /// Lower a method call. Three shapes dispatch here:
 ///
 /// - `$window.<fn>(..).<field>` chains (an `args`-less method on a
-///   `first`/`last`/`lag`/`lead` window call) read the window context
-///   and are deferred to the window slice — they lower to a loud-error
-///   leaf rather than route through `dispatch_method`.
+///   `first`/`last`/`lag`/`lead` window call) lower to a single
+///   [`compile_window_chain_field`] leaf that reads the positional window
+///   row and resolves `<field>` off it directly — no intermediate
+///   `Value` for the row, preserving the zero-copy lifetime path.
 /// - The closure-bearing array builtins (`filter`/`map`/`find`/`any`/
 ///   `flat_map` whose first argument is a closure) lower to a
 ///   [`compile_maplike`] host loop over a separately-compiled closure
@@ -543,14 +819,17 @@ fn compile_method_call<S: RecordStorage + 'static>(
     span: Span,
 ) -> CompiledExpr<S> {
     // `$window.<fn>(..).<field>` chains resolve a field off a positional
-    // window row without a `Value` round-trip; they need the live window
-    // borrow and so belong to the window slice. Detect the exact shape
-    // the tree-walk intercepts and defer it loudly.
+    // window row without a `Value` round-trip. Detect the exact shape the
+    // tree-walk intercepts and lower it to a single window-leaf node.
     if args.is_empty()
-        && let Expr::WindowCall { function, .. } = receiver
+        && let Expr::WindowCall {
+            function,
+            args: window_args,
+            ..
+        } = receiver
         && matches!(&**function, "first" | "last" | "lag" | "lead")
     {
-        return unsupported_expr("window chain access", span);
+        return compile_window_chain_field(typed, function, window_args, method, span);
     }
 
     // Closure-bearing array builtins: dispatch by name + closure-shaped
@@ -597,6 +876,245 @@ fn compile_method_call<S: RecordStorage + 'static>(
                 span,
             )),
         }
+    })
+}
+
+/// Lower a `$window.<fn>(..).<field>` chain to a single window-leaf node.
+///
+/// The positional window function (`first`/`last`/`lag`/`lead`) returns a
+/// `RecordView` borrowing the arena; the chain resolves `<field>` off that
+/// view directly, with no intermediate `Value` for the row (a `Value`
+/// cannot carry the arena borrow). `lag`/`lead` take an integer offset
+/// argument — non-integer or absent defaults to `1`, matching the
+/// tree-walk. A missing window context surfaces the same typed error the
+/// tree-walk raises. The result is the resolved field value, or `Null`
+/// when the positional row is out of range or the field is absent.
+fn compile_window_chain_field<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    function: &str,
+    window_args: &[Expr],
+    field: &str,
+    span: Span,
+) -> CompiledExpr<S> {
+    let function: Box<str> = function.into();
+    let field: Box<str> = field.into();
+    // `lag`/`lead` read their offset from the first window arg; compile it
+    // once so the per-record path only evaluates, never re-walks.
+    let offset_arg: Option<CompiledExpr<S>> =
+        window_args.first().map(|a| compile_expr::<S>(typed, a));
+    Box::new(move |frame| {
+        let w = frame.window.ok_or_else(|| {
+            EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "window context",
+                    got: "none",
+                },
+                span,
+            )
+        })?;
+        let view = match &*function {
+            "first" => w.first(),
+            "last" => w.last(),
+            "lag" | "lead" => {
+                let offset = match &offset_arg {
+                    Some(arg) => match arg(frame)? {
+                        Value::Integer(n) => n.max(0) as usize,
+                        _ => 1,
+                    },
+                    None => 1,
+                };
+                if &*function == "lag" {
+                    w.lag(offset)
+                } else {
+                    w.lead(offset)
+                }
+            }
+            _ => unreachable!("compile_window_chain_field gated by function name"),
+        };
+        // Resolve the field directly off the borrowed view — no `Value`
+        // round-trip for the row.
+        Ok(view
+            .and_then(|row| row.resolve(&field).cloned())
+            .unwrap_or(Value::Null))
+    })
+}
+
+/// Lower a bare `$window.<fn>(..)` call to a leaf load from the captured
+/// window context. Mirrors the tree-walk's `WindowCall` arm exactly:
+///
+/// - Aggregate builtins (`sum`/`avg`/`min`/`max`/`cumulative_sum`/
+///   `collect`/`distinct`) read the field name from a `FieldRef` first
+///   argument (anything else → `Null`).
+/// - Cardinality / rank builtins (`count`/`row_number`/`rank`/
+///   `dense_rank`) take no field.
+/// - `first_value`/`last_value` read a field name like the aggregates.
+/// - Positional builtins (`first`/`last`/`lag`/`lead`) without a `.field`
+///   chain return `Null` — the meaningful form is the chain, handled by
+///   [`compile_window_chain_field`].
+/// - Predicate folds (`any`/`every`/`exists`/`not_exists`) run a compiled
+///   predicate sub-program over each partition record with the same
+///   three-valued Kleene collapse the tree-walk uses.
+///
+/// A missing window context surfaces the same typed error as the
+/// tree-walk; an unimplemented registered name is a loud error rather
+/// than a silent `Null`.
+fn compile_window_call<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    function: &str,
+    args: &[Expr],
+    span: Span,
+) -> CompiledExpr<S> {
+    /// The field name of a `FieldRef` first argument, captured at
+    /// lowering. Aggregate window builtins key on this; a non-`FieldRef`
+    /// argument resolves to `None` (→ `Null` at run time), matching the
+    /// tree-walk's `if let Some(FieldRef) = args.first()` guard.
+    fn field_arg(args: &[Expr]) -> Option<Box<str>> {
+        match args.first() {
+            Some(Expr::FieldRef { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    let function: Box<str> = function.into();
+    let field = field_arg(args);
+
+    // Predicate folds compile their predicate sub-program once and run it
+    // per partition record; everything else is a direct trait call.
+    if matches!(&*function, "any" | "every" | "exists" | "not_exists") {
+        let predicate = args.first().map(|p| compile_expr::<S>(typed, p));
+        let invert = &*function == "not_exists";
+        let want_any = matches!(&*function, "any" | "exists");
+        return Box::new(move |frame| {
+            let w = frame.window.ok_or_else(|| window_missing_error(span))?;
+            let predicate = predicate.as_ref().ok_or_else(|| {
+                EvalError::new(
+                    EvalErrorKind::ArityMismatch {
+                        name: function.to_string(),
+                        expected: 1,
+                        got: 0,
+                    },
+                    span,
+                )
+            })?;
+            window_predicate_fold(frame, w, predicate, invert, want_any)
+        });
+    }
+
+    Box::new(move |frame| {
+        let w = frame.window.ok_or_else(|| window_missing_error(span))?;
+        let agg = |f: &dyn Fn(&str) -> Value| match &field {
+            Some(name) => f(name),
+            None => Value::Null,
+        };
+        match &*function {
+            "count" => Ok(Value::Integer(w.count())),
+            "sum" => Ok(agg(&|n| w.sum(n))),
+            "cumulative_sum" => Ok(agg(&|n| w.cumulative_sum(n))),
+            "avg" => Ok(agg(&|n| w.avg(n))),
+            "min" => Ok(agg(&|n| w.min(n))),
+            "max" => Ok(agg(&|n| w.max(n))),
+            // A bare positional builtin (no `.field`) is a row reference
+            // `Value` cannot carry; the chain form is intercepted upstream.
+            "first" | "last" | "lag" | "lead" => Ok(Value::Null),
+            "collect" => Ok(agg(&|n| w.collect(n))),
+            "distinct" => Ok(agg(&|n| w.distinct(n))),
+            "row_number" => Ok(Value::Integer(w.row_number())),
+            "rank" => Ok(Value::Integer(w.rank())),
+            "dense_rank" => Ok(Value::Integer(w.dense_rank())),
+            "first_value" => Ok(agg(&|n| w.first_value(n))),
+            "last_value" => Ok(agg(&|n| w.last_value(n))),
+            // A registered name with no evaluator arm is a hard error, not
+            // a silent Null — matching the tree-walk's catch-all.
+            _ => Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "registered $window function",
+                    got: "unimplemented evaluator arm",
+                },
+                span,
+            )),
+        }
+    })
+}
+
+/// The "no window context available" error, shared by the window-leaf
+/// nodes so the message and span match the tree-walk's.
+fn window_missing_error(span: Span) -> EvalError {
+    EvalError::new(
+        EvalErrorKind::TypeMismatch {
+            expected: "window context",
+            got: "none",
+        },
+        span,
+    )
+}
+
+/// Run a `$window` predicate fold (`any`/`every`/`exists`/`not_exists`)
+/// over every record in the partition, collapsing the per-row predicate
+/// results with the same three-valued Kleene logic as `BinOp::And/Or`.
+///
+/// The predicate is evaluated against each partition record as the field
+/// resolver, sharing the outer frame's env and window — exactly the
+/// tree-walk's `eval_expr(predicate, .., &row, window, env)` shape. A
+/// `true` short-circuits `any`/`exists`; a `false` short-circuits
+/// `every`/`not_exists`; any null / non-bool row result taints the fold
+/// to `Null` unless a short-circuit already fired. With no taint the
+/// result is the iterated-operator identity (`false` for any/exists,
+/// `true` for every/not_exists).
+fn window_predicate_fold<'a, 'w, S: RecordStorage + 'w>(
+    frame: &mut Frame<'a, 'w, S>,
+    w: &dyn WindowContext<'w, S>,
+    predicate: &CompiledExpr<S>,
+    invert: bool,
+    want_any: bool,
+) -> Result<Value, EvalError> {
+    // Move env out of the outer frame so each partition-record sub-frame
+    // can share and mutate it, then restore it after the fold — the env is
+    // threaded by value through `Frame`, so this mirrors the tree-walk's
+    // single shared `&mut env` without a per-row clone.
+    let mut env = std::mem::take(&mut frame.env);
+    let ctx = frame.ctx;
+    let window = frame.window;
+    let mut found_null = false;
+    let mut short_circuit: Option<Value> = None;
+    for i in 0..w.partition_len() {
+        let row = w.partition_record(i);
+        let mut sub = Frame {
+            ctx,
+            resolver: &row,
+            window,
+            env,
+        };
+        let raw = predicate(&mut sub);
+        env = std::mem::take(&mut sub.env);
+        let raw = match raw {
+            Ok(v) => v,
+            Err(e) => {
+                frame.env = env;
+                return Err(e);
+            }
+        };
+        let v = match (invert, raw) {
+            (true, Value::Bool(b)) => Value::Bool(!b),
+            (_, other) => other,
+        };
+        match v {
+            Value::Bool(true) if want_any => {
+                short_circuit = Some(Value::Bool(true));
+                break;
+            }
+            Value::Bool(false) if !want_any => {
+                short_circuit = Some(Value::Bool(false));
+                break;
+            }
+            Value::Bool(_) => {}
+            _ => found_null = true,
+        }
+    }
+    frame.env = env;
+    Ok(match short_circuit {
+        Some(v) => v,
+        None if found_null => Value::Null,
+        None => Value::Bool(!want_any),
     })
 }
 

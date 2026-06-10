@@ -667,7 +667,7 @@ fn stmt_span(stmt: &Statement) -> Span {
 }
 
 /// Convert a GroupKeyError to an EvalError.
-fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
+pub(super) fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
     let got = match &e {
         GroupKeyError::NanInGroupBy { .. } => "NaN",
         GroupKeyError::TypeMismatch { got, .. } => got,
