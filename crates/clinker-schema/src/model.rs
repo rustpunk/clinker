@@ -59,6 +59,7 @@ pub enum SourceFormat {
     Jsonl,
     Xml,
     Parquet,
+    Edifact,
 }
 
 impl SourceFormat {
@@ -71,6 +72,7 @@ impl SourceFormat {
             Self::Jsonl => "jsonl",
             Self::Xml => "xml",
             Self::Parquet => "parquet",
+            Self::Edifact => "edifact",
         }
     }
 
@@ -81,6 +83,7 @@ impl SourceFormat {
             Self::Json | Self::Jsonl => FormatCategory::Json,
             Self::Xml => FormatCategory::Xml,
             Self::Parquet => FormatCategory::Parquet,
+            Self::Edifact => FormatCategory::Edifact,
         }
     }
 }
@@ -92,6 +95,7 @@ pub enum FormatCategory {
     Json,
     Xml,
     Parquet,
+    Edifact,
 }
 
 /// A single field in a schema.

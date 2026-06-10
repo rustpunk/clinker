@@ -14,7 +14,7 @@ Output nodes write processed records to files. They are the terminal nodes of a 
     path: "./output/result.csv"
 ```
 
-The `type:` field selects the output format: `csv`, `json`, `xml`, or `fixed_width`.
+The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, or `edifact`.
 
 ## Field control
 
@@ -190,6 +190,33 @@ Metadata fields are prefixed with `meta.` in the output.
 ```
 
 Fixed-width output requires a format schema defining field positions and widths.
+
+### EDIFACT
+
+```yaml
+- type: output
+  name: edi_out
+  input: messages
+  config:
+    name: edi_out
+    type: edifact
+    path: "./out/result.edi"
+    options:
+      interchange: ["UNOA:1", "SENDER", "RECEIVER", "240101:1200", "REF1"]
+      message_type: "ORDERS:D:96A:UN"
+      write_una: false
+      segment_newline: true
+```
+
+The EDIFACT writer reconstructs the interchange envelope around emitted
+records, recomputing the `UNT`/`UNZ` control counts and echoing the
+control references, and release-escapes any element data that carries a
+service character. The `UNB` header comes from `interchange` (literal
+elements) or `interchange_from_doc` (echoed from a `$doc` section). An
+interchange is a single envelope, so an `edifact` output cannot be
+combined with a `split:` block — the combination is rejected at
+config-validation time (`E323`). See [EDIFACT Format](edifact.md) for the
+full option reference, the record schema, and the round-trip semantics.
 
 ## Sort order
 

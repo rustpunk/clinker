@@ -83,16 +83,40 @@ budget.
 
 Each section declares how the reader locates its payload:
 
-| Format | `extract:` key   | Value                                            |
-| ------ | ---------------- | ------------------------------------------------ |
-| XML    | `xml_path`       | Slash-path to the section element, e.g. `/doc/Head` |
-| JSON   | `json_pointer`   | RFC 6901 pointer, e.g. `/Head`                   |
+| Format  | `extract:` key   | Value                                            |
+| ------- | ---------------- | ------------------------------------------------ |
+| XML     | `xml_path`       | Slash-path to the section element, e.g. `/doc/Head` |
+| JSON    | `json_pointer`   | RFC 6901 pointer, e.g. `/Head`                   |
+| EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
 
-Declaring an `xml_path` section against a JSON source (or vice versa)
-is a configuration error and fails fast when the source opens, rather
-than silently producing empty sections. CSV and fixed-width sources do
-not yet support envelope extraction; declaring envelope sections on
-those formats is a no-op today.
+Declaring an `xml_path` section against a JSON source (or vice versa),
+or a `segment` extract against XML/JSON, is a configuration error and
+fails fast when the source opens, rather than silently producing empty
+sections. CSV and fixed-width sources do not yet support envelope
+extraction; declaring envelope sections on those formats is a no-op
+today.
+
+### EDIFACT `segment` extract
+
+An EDIFACT source exposes its interchange header `UNB` as an envelope
+section. The section's field names are the positional element keys
+`e01`, `e02`, … :
+
+```yaml
+envelope:
+  sections:
+    interchange:
+      extract: { segment: "UNB" }
+      fields:
+        e05: string          # interchange control reference
+```
+
+Only the `UNB` header is extractable. EDIFACT is scanned as a flat byte
+stream with only the header pre-read, so trailer segments (`UNT`, `UNZ`)
+that arrive after the body are **not** envelope sections — their control
+counts are validated inline by the reader instead. A `segment` extract
+naming any tag other than `UNB` is rejected at startup. See
+[EDIFACT Format](edifact.md) for the full reference.
 
 A JSON example:
 

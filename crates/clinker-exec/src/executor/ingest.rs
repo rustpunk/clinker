@@ -6,6 +6,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
+use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
@@ -43,6 +44,10 @@ fn build_format_reader(
             let fields = extract_field_defs(input)?;
             let config = build_fw_reader_config(opts.as_ref());
             Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
+        }
+        clinker_plan::config::InputFormat::Edifact(opts) => {
+            let config = build_edifact_reader_config(opts.as_ref());
+            Ok(Box::new(EdifactReader::new(reader, config)))
         }
     }
 }
@@ -589,6 +594,18 @@ fn build_fw_reader_config(
         && let Some(ref sep) = opts.line_separator
     {
         config.line_separator = sep.clone();
+    }
+    config
+}
+
+fn build_edifact_reader_config(
+    opts: Option<&clinker_plan::config::EdifactInputOptions>,
+) -> EdifactReaderConfig {
+    let mut config = EdifactReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(max) = opts.max_elements
+    {
+        config.max_elements = max;
     }
     config
 }

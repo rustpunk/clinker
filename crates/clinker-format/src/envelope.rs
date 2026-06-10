@@ -12,6 +12,10 @@
 //! variants surface as a format error so a config-wrong-for-format
 //! mistake fails fast.
 
+use clinker_record::{
+    DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, Value, coerce_to_bool, coerce_to_date,
+    coerce_to_datetime, coerce_to_float, coerce_to_int, coerce_to_string,
+};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +69,13 @@ pub enum EnvelopeExtract {
     /// must be a JSON object; its top-level keys become the section's
     /// `fields` map.
     JsonPointer(String),
+    /// Flat-file service segment tag (e.g. `UNB` for an EDIFACT
+    /// interchange header). The named segment's positional data elements
+    /// become the section's `fields` map keyed `e01`, `e02`, … . Only
+    /// segments the reader can resolve from its bounded header pre-scan
+    /// are extractable; trailer segments that arrive after body streaming
+    /// are validated by the reader, not exposed as envelope sections.
+    Segment(String),
 }
 
 /// Field type vocabulary mirrored from CXL's typechecker — small
@@ -78,4 +89,54 @@ pub enum EnvelopeFieldType {
     Bool,
     Date,
     DateTime,
+}
+
+/// Coerce raw `(name, string)` pairs extracted from a source's envelope
+/// into the section's declared field schema.
+///
+/// Shared by every reader that extracts envelope sections (XML element
+/// payloads, EDIFACT positional service-segment elements). Unknown raw
+/// fields are dropped silently — the section schema is the contract.
+/// Missing declared fields are not reported here; they evaluate to
+/// [`Value::Null`] via the `DocumentContext::get_section_field`
+/// `Option`-to-`Null` mapping at CXL eval time. The first non-empty
+/// observation wins when a raw name repeats.
+///
+/// # Errors
+///
+/// Returns the coercion-failure message (section, field, declared type,
+/// observed value) as a `String` so each caller can wrap it in its own
+/// format-specific [`FormatError`] variant.
+pub(crate) fn coerce_section_fields(
+    raw: Vec<(String, String)>,
+    schema: &IndexMap<String, EnvelopeFieldType>,
+) -> Result<IndexMap<Box<str>, Value>, String> {
+    let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
+    let mut by_name: IndexMap<&str, &str> = IndexMap::with_capacity(raw.len());
+    for (k, v) in &raw {
+        by_name.entry(k.as_str()).or_insert(v.as_str());
+    }
+    for (field, ty) in schema {
+        let raw_str = match by_name.get(field.as_str()) {
+            Some(s) if !s.is_empty() => *s,
+            _ => continue,
+        };
+        let value = Value::String(raw_str.into());
+        let coerced = match ty {
+            EnvelopeFieldType::String => coerce_to_string(&value),
+            EnvelopeFieldType::Int => coerce_to_int(&value),
+            EnvelopeFieldType::Float => coerce_to_float(&value),
+            EnvelopeFieldType::Bool => coerce_to_bool(&value),
+            EnvelopeFieldType::Date => coerce_to_date(&value, DEFAULT_DATE_FORMATS),
+            EnvelopeFieldType::DateTime => coerce_to_datetime(&value, DEFAULT_DATETIME_FORMATS),
+        }
+        .map_err(|e| {
+            format!(
+                "envelope section field {field:?} (declared type {ty:?}): \
+                 cannot coerce value {raw_str:?}: {e}"
+            )
+        })?;
+        out.insert(Box::from(field.as_str()), coerced);
+    }
+    Ok(out)
 }

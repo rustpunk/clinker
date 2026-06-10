@@ -335,6 +335,13 @@ impl FormatReader for JsonReader {
                          against a JSON source. Use `json_pointer` for JSON envelope sections."
                     )));
                 }
+                EnvelopeExtract::Segment(_) => {
+                    return Err(FormatError::Json(format!(
+                        "envelope section {name:?}: declared `segment` extract \
+                         against a JSON source. The `segment` extract is for \
+                         flat-file formats (EDIFACT); use `json_pointer` for JSON."
+                    )));
+                }
             };
             let node = match root.pointer(pointer) {
                 Some(n) => n,
@@ -761,6 +768,22 @@ mod tests {
         let mut reader = reader_from_str(r#"{"records":[]}"#, default_config());
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Json(msg) if msg.contains("xml_path")));
+    }
+
+    #[test]
+    fn prepare_document_rejects_segment_extract() {
+        use crate::envelope::EnvelopeSection;
+        let mut cfg = EnvelopeConfig::default();
+        cfg.sections.insert(
+            "Bad".into(),
+            EnvelopeSection {
+                extract: EnvelopeExtract::Segment("UNB".into()),
+                fields: IndexMap::new(),
+            },
+        );
+        let mut reader = reader_from_str(r#"{"records":[]}"#, default_config());
+        let err = reader.prepare_document(&cfg).unwrap_err();
+        assert!(matches!(err, FormatError::Json(msg) if msg.contains("segment")));
     }
 
     #[test]

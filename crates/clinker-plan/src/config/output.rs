@@ -180,3 +180,34 @@ pub struct FixedWidthOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_separator: Option<LineSeparator>,
 }
+
+/// EDIFACT output options.
+///
+/// The writer reconstructs the interchange envelope around emitted
+/// records. The `UNB` header comes from `interchange` (literal elements)
+/// or, when that is unset, is echoed from the `$doc` section named by
+/// `interchange_from_doc` for round-trip reconstruction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EdifactOutputOptions {
+    /// Literal `UNB` data elements written verbatim. Takes precedence
+    /// over `interchange_from_doc` when both are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interchange: Option<Vec<String>>,
+    /// Name of a `$doc` section to echo the `UNB` elements from (the
+    /// reader's positional `UNB` envelope section), enabling EDIFACT
+    /// round-trip reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interchange_from_doc: Option<String>,
+    /// Fallback message type when a record carries no `msg_type` column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    /// Emit a leading `UNA` service-string-advice segment. Defaults to
+    /// `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_una: Option<bool>,
+    /// Write a newline after each segment terminator for readability.
+    /// Defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_newline: Option<bool>,
+}
