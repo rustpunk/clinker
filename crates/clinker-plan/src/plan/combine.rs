@@ -190,7 +190,7 @@ impl DecomposedPredicate {
 ///
 /// Stores full [`Expr`] pairs (drill D14), not field names — enables
 /// expression-based hash keys (e.g. `lower(orders.region) ==
-/// lower(products.region)`) from day one. C.2 `KeyExtractor` compiles
+/// lower(products.region)`) from day one. The `KeyExtractor` compiles
 /// these `Expr` nodes against the supplied [`TypedProgram`] (which routes
 /// regex-cache lookups) once at construction and evaluates the resulting
 /// closures at build/probe time.

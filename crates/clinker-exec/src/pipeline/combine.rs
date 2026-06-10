@@ -398,7 +398,7 @@ pub(crate) struct CombineKernelOutput {
 /// conjuncts against a single `Record`.
 ///
 /// Each `EqualityConjunct` is compiled as a trivial single-emit wrapper at
-/// `bind_combine` time (C.2.4); the extractor lowers each key expression to
+/// `bind_combine` time; the extractor lowers each key expression to
 /// a [`CompiledScalar`] once at construction and replays the resulting
 /// closures per record — the same compile-once primitive the hash
 /// aggregator uses. No `ProgramEvaluator` allocation per extraction, no
