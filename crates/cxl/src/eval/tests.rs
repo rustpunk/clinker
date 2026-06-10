@@ -1650,6 +1650,209 @@ mod intra_record {
     }
 
     #[test]
+    fn nested_set_replaces_existing_leaf() {
+        let out = run(
+            "emit updated = doc.set(\"address.city\", \"NYC\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "address",
+                    map(vec![
+                        ("city", Value::String("LA".into())),
+                        ("zip", Value::String("90001".into())),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("updated"),
+                    Some(&map(vec![(
+                        "address",
+                        map(vec![
+                            ("city", Value::String("NYC".into())),
+                            ("zip", Value::String("90001".into())),
+                        ]),
+                    )]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_auto_creates_missing_intermediates() {
+        let out = run(
+            "emit built = doc.set(\"a.b.c\", 7)",
+            &["doc"],
+            HashMap::from([("doc".into(), map(vec![]))]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("built"),
+                    Some(&map(vec![(
+                        "a",
+                        map(vec![("b", map(vec![("c", Value::Integer(7))]))]),
+                    )]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_type_conflict_returns_null() {
+        // `a` exists but is a scalar, so descending into `a.b` is a hard
+        // conflict: the whole op returns Null.
+        let out = run(
+            "emit r = doc.set(\"a.b\", 1)",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("a", Value::String("scalar".into()))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("r"), Some(&Value::Null));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_into_existing_array_element() {
+        let out = run(
+            "emit r = doc.set(\"items[1].name\", \"X\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "items",
+                    arr(vec![
+                        map(vec![("name", Value::String("a".into()))]),
+                        map(vec![("name", Value::String("b".into()))]),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![(
+                        "items",
+                        arr(vec![
+                            map(vec![("name", Value::String("a".into()))]),
+                            map(vec![("name", Value::String("X".into()))]),
+                        ]),
+                    )]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_array_index_past_end_returns_null() {
+        // Index 5 is past the 2-element array → Null for the whole op, with no
+        // silent auto-grow.
+        let out = run(
+            "emit r = doc.set(\"items[5].name\", \"X\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "items",
+                    arr(vec![
+                        map(vec![("name", Value::String("a".into()))]),
+                        map(vec![("name", Value::String("b".into()))]),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("r"), Some(&Value::Null));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_field_into_array_returns_null() {
+        // `items` is an array; a field segment against it is a type conflict.
+        let out = run(
+            "emit r = doc.set(\"items.name\", \"X\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("items", arr(vec![Value::Integer(1)]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("r"), Some(&Value::Null));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_set_does_not_mutate_receiver() {
+        // `.set` is copy-on-write: emitting both the original and the mutated
+        // path must show the original untouched.
+        let out = run(
+            "emit before = doc\nemit after = doc.set(\"a.b\", 9)",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("a", map(vec![("b", Value::Integer(1))]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("before"),
+                    Some(&map(vec![("a", map(vec![("b", Value::Integer(1))]))]))
+                );
+                assert_eq!(
+                    fields.get("after"),
+                    Some(&map(vec![("a", map(vec![("b", Value::Integer(9))]))]))
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_key_set_still_inserts_at_top_level() {
+        // The bare-key fast path must be unchanged by the nested-path work.
+        let out = run(
+            "emit r = doc.set(\"k\", 1)",
+            &["doc"],
+            HashMap::from([("doc".into(), map(vec![]))]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(fields.get("r"), Some(&map(vec![("k", Value::Integer(1))])));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn array_remove_returns_new_array_without_index() {
         let out = run(
             "emit val = nums.remove(1)",

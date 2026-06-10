@@ -142,6 +142,17 @@ Drop the `explode` transform and route `filter_lines` directly to the Output. Ea
 
 When the per-element transformation is simple enough to fit in a single closure body, [`flat_map`](../cxl/builtins-array.md#flat_mapit--array---array) collapses the filter + project + explode pattern into one expression. It produces a flat array, which downstream nodes still see as a single field on the input record; the explicit `emit each` is what produces multiple output records.
 
+### Rewrite a nested field in place with `.set`
+
+When you want to keep the record at order grain but mutate a value buried inside it, the [`set`](../cxl/builtins-map.md#nested-paths) map method takes a dotted/indexed path and rewrites a single leaf, leaving every sibling untouched:
+
+```yaml
+    cxl: |
+      emit order = order.set("items[0].sku", "A-100").set("ship.region", "us-east")
+```
+
+The first `set` overwrites the SKU of the first item; the second writes `ship.region`, auto-creating the `ship` map if the order had no `ship` field yet. Because `set` is copy-on-write, this builds a fresh order document without disturbing the upstream binding. A path that conflicts with the existing shape (descending into a scalar, or an array index past the end) yields `null` for that `set` rather than partially writing -- guard with [`catch`](../cxl/builtins-introspection.md) if a path may not match every record.
+
 ## See also
 
 - [Closures](../cxl/closures.md) -- the `it => body` form.

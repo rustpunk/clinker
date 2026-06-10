@@ -103,5 +103,5 @@ Builders and accessors for `Value::Map` payloads. All map methods return new map
 |--------|-------------|
 | `keys`, `values` | List map keys / values as arrays |
 | `merge` | Union of two maps (right wins on conflict) |
-| `set` | Insert / replace a single entry |
+| `set` | Insert / replace an entry, by single key or by a nested `a.b[0].c` path |
 | `remove_field` | Drop a single entry by key |
