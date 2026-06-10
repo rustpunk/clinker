@@ -21,8 +21,8 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::edifact::RAW_ELEMENTS_KEY;
 use crate::edifact::tokenizer::{ParsedSegment, SegmentTokenizer, split_segment};
+use crate::edifact::{RAW_ELEMENTS_KEY, unb_control_reference};
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -61,7 +61,8 @@ pub struct EdifactReader<R: Read> {
     initialized: bool,
     /// Raw `UNB` data elements, stashed at init for envelope serving.
     unb_elements: Vec<String>,
-    /// `UNB` interchange control reference (UNB element 5), echoed by
+    /// `UNB` interchange control reference (data element 0020), located
+    /// structurally after the mandatory leading composites and echoed by
     /// `UNZ` for round-trip integrity validation.
     unb_control_ref: Option<String>,
     /// State of the message currently being streamed, if any.
@@ -123,10 +124,12 @@ impl<R: Read> EdifactReader<R> {
                 parsed.tag
             )));
         }
-        // UNB control reference is data element 5 (index 4). It may be
-        // absent in degenerate fixtures; absence disables the UNZ-echo
-        // check rather than failing the parse.
-        self.unb_control_ref = parsed.elements.get(4).cloned();
+        // Locate the interchange control reference structurally — after
+        // the four mandatory leading composites — rather than at a fixed
+        // index, so an empty optional element ahead of it does not cause
+        // the wrong element to be read. Absence in a degenerate header
+        // disables the UNZ-echo check rather than failing the parse.
+        self.unb_control_ref = unb_control_reference(&parsed.elements).map(str::to_owned);
         self.unb_elements = parsed.elements;
         Ok(())
     }
@@ -592,6 +595,39 @@ mod tests {
             match r.next_record() {
                 Ok(Some(_)) => continue,
                 Ok(None) => panic!("expected control ref mismatch"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::Edifact(m) if m.contains("does not echo the UNB")));
+    }
+
+    #[test]
+    fn unb_control_ref_located_past_empty_padding_element_validates() {
+        // The UNB carries an empty optional element (index 4) ahead of
+        // the control reference, shifting "REF1" to index 5. A fixed
+        // index-4 lookup reads the empty padding and spuriously rejects
+        // this internally consistent interchange (UNZ correctly echoes
+        // "REF1"); the structural locator finds the real reference.
+        let data = "UNB+UNOA:1+S+R+240101:1200++REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'";
+        let recs = collect(data);
+        // One body BGM record streams; no spurious control-ref rejection.
+        assert_eq!(recs.len(), 2); // UNH, BGM
+        assert_eq!(recs[1].get("seg_id"), Some(&Value::String("BGM".into())));
+    }
+
+    #[test]
+    fn shifted_control_ref_still_rejects_genuine_unz_mismatch() {
+        // With the control reference shifted to index 5 by empty padding,
+        // a UNZ that does *not* echo it must still be rejected — the
+        // structural locator must not weaken the echo check.
+        let data = "UNB+UNOA:1+S+R+240101:1200++REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+WRONGREF'";
+        let mut r = reader(data);
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected control ref mismatch for shifted reference"),
                 Err(e) => break e,
             }
         };

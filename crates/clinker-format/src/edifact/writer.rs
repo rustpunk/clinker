@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
 
-use crate::edifact::RAW_ELEMENTS_KEY;
 use crate::edifact::tokenizer::Delimiters;
+use crate::edifact::{RAW_ELEMENTS_KEY, unb_control_reference};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
@@ -167,9 +167,14 @@ impl<W: Write> EdifactWriter<W> {
         }
 
         let unb_elements = self.resolve_unb_elements(record)?;
-        // The UNB control reference (element 5, index 4) is echoed in
-        // the UNZ trailer; default to empty when the header is short.
-        self.unb_control_ref = unb_elements.get(4).cloned().unwrap_or_default();
+        // Echo the same control reference into the UNZ trailer that the
+        // reader validates against, located structurally (after the
+        // mandatory leading composites) so an empty optional element in
+        // the header does not push the trailer out of sync with it.
+        // Default to empty when the header carries no control reference.
+        self.unb_control_ref = unb_control_reference(&unb_elements)
+            .unwrap_or_default()
+            .to_owned();
         self.write_segment("UNB", &unb_elements)?;
         Ok(())
     }
@@ -657,6 +662,53 @@ mod tests {
         // reference (the 5th data element, index 4) and is self-consistent
         // with the reconstructed UNB, so a re-read validates.
         assert!(out.contains("UNZ+1+240101:1200'"), "{out}");
+    }
+
+    #[test]
+    fn unz_echoes_control_ref_shifted_past_empty_padding() {
+        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use indexmap::IndexMap;
+
+        // A UNB with all four mandatory leading composites populated plus
+        // an empty optional element (index 4) ahead of the control
+        // reference, which shifts "REF1" to index 5. A fixed index-4
+        // echo would emit the empty padding into UNZ, producing a trailer
+        // that contradicts its own header; the structural locator echoes
+        // the real reference so the output validates on re-read.
+        let s = schema();
+        let raw = RecVal::Array(vec![
+            RecVal::String("UNOA:1".into()),
+            RecVal::String("S".into()),
+            RecVal::String("R".into()),
+            RecVal::String("240101:1200".into()),
+            RecVal::String("".into()),
+            RecVal::String("REF1".into()),
+        ]);
+        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        unb.insert(super::RAW_ELEMENTS_KEY.into(), raw);
+        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
+        record.set_doc_ctx(ctx);
+
+        let cfg = EdifactWriterConfig {
+            interchange_from_doc: Some("unb".into()),
+            segment_newline: false,
+            ..Default::default()
+        };
+        let out = write_all(cfg, &[record], &s);
+        assert!(
+            out.starts_with("UNB+UNOA:1+S+R+240101:1200++REF1'"),
+            "UNB header not reconstructed verbatim: {out}"
+        );
+        // UNZ echoes the structurally-located control reference, not the
+        // empty padding at index 4, so the trailer matches its header.
+        assert!(out.contains("UNZ+1+REF1'"), "{out}");
     }
 
     #[test]

@@ -140,6 +140,15 @@ corruption signal):
   messages in the interchange.
 - **`UNZ` control reference** — must echo the `UNB` control reference.
 
+The `UNB` control reference (data element 0020) is located by its
+structural position — the first data element after the four mandatory
+leading composites (syntax identifier, sender, recipient, date/time) —
+rather than at a fixed element index. An interchange that carries an
+empty optional element ahead of the control reference (shifting it past
+the fifth position) therefore validates and round-trips correctly: the
+reader reads the real reference and the writer echoes the same one into
+`UNZ`, so the trailer never contradicts its own header.
+
 A missing `UNZ` at end of input is a truncation error; content after the
 `UNZ` trailer is rejected.
 
