@@ -14,6 +14,7 @@
 - [Pipeline YAML Structure](pipeline/structure.md)
 - [Source Nodes](pipeline/source.md)
 - [EDIFACT Format](pipeline/edifact.md)
+- [X12 Format](pipeline/x12.md)
 - [Network Sources (REST)](pipeline/source-network.md)
 - [Auto-Widen & Schema Drift](pipeline/auto-widen.md)
 - [Transform Nodes](pipeline/transform.md)

@@ -16,6 +16,7 @@ pub enum InputFormat {
     Xml(Option<XmlInputOptions>),
     FixedWidth(Option<FixedWidthInputOptions>),
     Edifact(Option<EdifactInputOptions>),
+    X12(Option<X12InputOptions>),
 }
 
 impl InputFormat {
@@ -27,6 +28,7 @@ impl InputFormat {
             InputFormat::Xml(_) => "xml",
             InputFormat::FixedWidth(_) => "fixed_width",
             InputFormat::Edifact(_) => "edifact",
+            InputFormat::X12(_) => "x12",
         }
     }
 
@@ -48,6 +50,7 @@ impl OutputFormat {
             OutputFormat::Xml(_) => "xml",
             OutputFormat::FixedWidth(_) => "fixed_width",
             OutputFormat::Edifact(_) => "edifact",
+            OutputFormat::X12(_) => "x12",
         }
     }
 }
@@ -61,6 +64,7 @@ pub enum OutputFormat {
     Xml(Option<XmlOutputOptions>),
     FixedWidth(Option<FixedWidthOutputOptions>),
     Edifact(Option<EdifactOutputOptions>),
+    X12(Option<X12OutputOptions>),
 }
 
 /// Supported format types.

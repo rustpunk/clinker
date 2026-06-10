@@ -88,6 +88,7 @@ Each section declares how the reader locates its payload:
 | XML     | `xml_path`       | Slash-path to the section element, e.g. `/doc/Head` |
 | JSON    | `json_pointer`   | RFC 6901 pointer, e.g. `/Head`                   |
 | EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
+| X12     | `segment`        | A service-segment tag — only `ISA` (GS/ST surface as nested levels) |
 
 Declaring an `xml_path` section against a JSON source (or vice versa),
 or a `segment` extract against XML/JSON, is a configuration error and
@@ -182,25 +183,30 @@ through several branches closes downstream exactly once).
 ## Nested (multi-level) envelopes
 
 Some formats wrap their records in *several* envelope levels, one inside
-another. EDI X12 is the canonical example: an **interchange** (ISA/IEA)
-contains one or more **functional groups** (GS/GE), each containing one
-or more **transaction sets** (ST/SE), each containing the records. A
-single file can carry multiple interchanges back to back.
+another. EDI X12 is the canonical example and the first format that
+implements this: an **interchange** (ISA/IEA) contains one or more
+**functional groups** (GS/GE), each containing one or more **transaction
+sets** (ST/SE), each containing the records. A single file can carry
+multiple interchanges back to back. See [X12 Format](x12.md) for the full
+reference.
 
 A reader for such a format opens and closes each nested level as it
 crosses the corresponding envelope boundary mid-file. Each level
-contributes its own sections to `$doc`, under names *you* choose for that
-level. There is no new `$doc` syntax for nesting — every level's sections
-are read through the same two-level `$doc.<section>.<field>` lookup. Give
-each level a distinct section name and a record inside the innermost
-level sees them all:
+contributes its own sections to `$doc`. There is no new `$doc` syntax for
+nesting — every level's sections are read through the same two-level
+`$doc.<section>.<field>` lookup. A record inside the innermost level sees
+every enclosing level's sections at once. For X12 the interchange header is
+a *declared* `segment: "ISA"` envelope section (you choose its name), while
+the `GS` group and `ST` set surface automatically as the reader-supplied
+sections `functional_group` and `transaction_set`, each keyed by positional
+`eNN` elements:
 
 ```yaml
 project:
-  - interchange_control: $doc.interchange.control_ref   # ISA level
-  - functional_id:       $doc.group.functional_id       # GS level
-  - transaction_type:    $doc.transaction.set_id         # ST level
-  - claim_amount:        amount                          # body field
+  - interchange_control: $doc.interchange.e13        # ISA13, declared section
+  - functional_id:       $doc.functional_group.e01   # GS01 (reader-supplied)
+  - transaction_type:    $doc.transaction_set.e01     # ST01 (reader-supplied)
+  - claim_amount:        amount                       # body field
 ```
 
 A record streamed inside the ST level resolves the ST section, the

@@ -14,7 +14,7 @@ Output nodes write processed records to files. They are the terminal nodes of a 
     path: "./output/result.csv"
 ```
 
-The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, or `edifact`.
+The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, or `x12`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; see [EDIFACT Format](edifact.md) and [X12 Format](x12.md).
 
 ## Field control
 
@@ -65,7 +65,7 @@ Set `include_correlation_keys: true` to surface the shadow columns in the writer
 
 ### Writer rejection of `Value::Map` payloads
 
-CSV, XML, and fixed-width writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
+CSV, XML, fixed-width, EDIFACT, and X12 writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
 
 The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
 

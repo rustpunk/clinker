@@ -17,6 +17,12 @@ pub enum FormatError {
     /// constraint (bad UNA, UNT/UNZ count mismatch, control-ref echo
     /// mismatch, truncation, unsupported UNG/UNE grouping).
     Edifact(String),
+    /// An X12 parse, envelope-count, or malformed-segment failure. Carries
+    /// a precise message naming the offending control segment or
+    /// constraint (truncated ISA header, SE/GE/IEA count mismatch,
+    /// control-number echo mismatch, truncation, a delimiter byte in data
+    /// that X12 cannot escape).
+    X12(String),
     InvalidRecord {
         row: u64,
         message: String,
@@ -61,6 +67,7 @@ impl fmt::Display for FormatError {
             Self::Xml(msg) => write!(f, "XML error: {msg}"),
             Self::FixedWidth(msg) => write!(f, "fixed-width error: {msg}"),
             Self::Edifact(msg) => write!(f, "EDIFACT error: {msg}"),
+            Self::X12(msg) => write!(f, "X12 error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }

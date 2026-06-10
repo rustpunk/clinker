@@ -229,6 +229,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E335" => Some(include_str!("../../../../docs/explain/E335.md")),
         "E336" => Some(include_str!("../../../../docs/explain/E336.md")),
         "E337" => Some(include_str!("../../../../docs/explain/E337.md")),
+        "E338" => Some(include_str!("../../../../docs/explain/E338.md")),
         "E323" => Some(include_str!("../../../../docs/explain/E323.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
         "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
@@ -412,6 +413,16 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_code_e338_x12_split_rejected() {
+        let doc = explain_code("E338").unwrap();
+        assert!(doc.contains("E338"));
+        // The doc must name the three-tier envelope so the user sees why a
+        // single interchange cannot span split files.
+        assert!(doc.contains("ISA..IEA"));
+        assert!(doc.contains("split"));
+    }
+
+    #[test]
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
@@ -422,7 +433,8 @@ mod tests {
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E150b", "E150c",
             "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
             "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323", "E330", "E331",
-            "E332", "E333", "E334", "E335", "E336", "E337", "E15Y", "W101", "W302", "W305", "W306",
+            "E332", "E333", "E334", "E335", "E336", "E337", "E338", "E15Y", "W101", "W302", "W305",
+            "W306",
         ];
         let required_sections = [
             "## What it means",

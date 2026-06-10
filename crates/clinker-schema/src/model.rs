@@ -60,6 +60,7 @@ pub enum SourceFormat {
     Xml,
     Parquet,
     Edifact,
+    X12,
 }
 
 impl SourceFormat {
@@ -73,6 +74,7 @@ impl SourceFormat {
             Self::Xml => "xml",
             Self::Parquet => "parquet",
             Self::Edifact => "edifact",
+            Self::X12 => "x12",
         }
     }
 
@@ -84,6 +86,7 @@ impl SourceFormat {
             Self::Xml => FormatCategory::Xml,
             Self::Parquet => FormatCategory::Parquet,
             Self::Edifact => FormatCategory::Edifact,
+            Self::X12 => FormatCategory::X12,
         }
     }
 }
@@ -96,6 +99,7 @@ pub enum FormatCategory {
     Xml,
     Parquet,
     Edifact,
+    X12,
 }
 
 /// A single field in a schema.

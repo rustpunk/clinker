@@ -12,6 +12,7 @@ use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
 use clinker_format::traits::FormatReader;
+use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
 };
@@ -48,6 +49,10 @@ fn build_format_reader(
         clinker_plan::config::InputFormat::Edifact(opts) => {
             let config = build_edifact_reader_config(opts.as_ref());
             Ok(Box::new(EdifactReader::new(reader, config)))
+        }
+        clinker_plan::config::InputFormat::X12(opts) => {
+            let config = build_x12_reader_config(opts.as_ref());
+            Ok(Box::new(X12Reader::new(reader, config)))
         }
     }
 }
@@ -789,6 +794,18 @@ fn build_edifact_reader_config(
     opts: Option<&clinker_plan::config::EdifactInputOptions>,
 ) -> EdifactReaderConfig {
     let mut config = EdifactReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(max) = opts.max_elements
+    {
+        config.max_elements = max;
+    }
+    config
+}
+
+fn build_x12_reader_config(
+    opts: Option<&clinker_plan::config::X12InputOptions>,
+) -> X12ReaderConfig {
+    let mut config = X12ReaderConfig::default();
     if let Some(opts) = opts
         && let Some(max) = opts.max_elements
     {

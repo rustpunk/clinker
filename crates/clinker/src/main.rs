@@ -92,8 +92,8 @@ Use --field to trace where a composition config value comes from across all \
 configuration layers (composition defaults, channel defaults, channel fixed). \
 Use --code to look up the documentation for a diagnostic code (composition codes \
 E101–E108, combine codes E300-E319 and W302/W305/W306, memory codes E310-E312, \
-spill codes E320/E321, storage-validation codes E330-E334, staging-copy codes \
-E335-E337, and W101).",
+spill codes E320/E321, EDI output-split codes E323/E338, storage-validation \
+codes E330-E334, staging-copy codes E335-E337, and W101).",
         after_long_help = "\
 EXAMPLES:
   # Show provenance for a composition config field
@@ -1991,7 +1991,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 return Err(format!(
                     "unknown diagnostic code '{code}'. Valid codes: E101-E108, E150b-E150e, \
-                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E337, \
+                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E338, \
                      W101/W302/W305/W306"
                 )
                 .into());

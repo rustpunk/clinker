@@ -14,6 +14,7 @@ use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConf
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::traits::FormatWriter;
+use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use clinker_plan::config::{OutputConfig, OutputFormat};
 use clinker_plan::error::PipelineError;
@@ -121,6 +122,21 @@ fn build_edifact_writer_config(
         interchange_from_doc: opts.and_then(|o| o.interchange_from_doc.clone()),
         message_type: opts.and_then(|o| o.message_type.clone()),
         write_una: opts.and_then(|o| o.write_una).unwrap_or(false),
+        segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
+    }
+}
+
+fn build_x12_writer_config(
+    opts: Option<&clinker_plan::config::X12OutputOptions>,
+) -> X12WriterConfig {
+    // `segment_newline` defaults to `true` (readable per-segment lines).
+    // The struct literal expresses it up front so an unset option falls
+    // through to the documented default.
+    X12WriterConfig {
+        interchange: opts.and_then(|o| o.interchange.clone()),
+        interchange_from_doc: opts.and_then(|o| o.interchange_from_doc.clone()),
+        group_header: opts.and_then(|o| o.group_header.clone()),
+        set_type: opts.and_then(|o| o.set_type.clone()),
         segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
     }
 }
@@ -247,6 +263,16 @@ fn build_writer_factory(
                     counting_writer,
                     schema,
                     edi_config.clone(),
+                )))
+            })
+        }
+        OutputFormat::X12(opts) => {
+            let x12_config = build_x12_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(X12Writer::new(
+                    counting_writer,
+                    schema,
+                    x12_config.clone(),
                 )))
             })
         }
