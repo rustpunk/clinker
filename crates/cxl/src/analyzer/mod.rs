@@ -144,7 +144,7 @@ fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mu
         Statement::UseStmt { .. } => {}
         Statement::Filter { predicate, .. } => walk_expr(predicate, calls, fields, None),
         Statement::Distinct { .. } => {}
-        Statement::EmitEach { source, body, .. } => {
+        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
             walk_expr(source, calls, fields, None);
             for inner in body {
                 walk_statement(inner, calls, fields);

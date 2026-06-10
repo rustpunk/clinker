@@ -207,13 +207,21 @@ impl<'a> Resolver<'a> {
                 source,
                 body,
                 ..
+            }
+            | Statement::ExplodeOuter {
+                binding,
+                source,
+                body,
+                ..
             } => {
                 // Resolve the source expression in the outer scope; the
                 // binding only becomes visible inside the body. The
                 // binding is registered as a let-var so FieldRef
                 // resolution will find it before falling back to the
                 // input schema; pop it on exit to keep let_vars accurate
-                // for subsequent statements outside the EmitEach block.
+                // for subsequent statements outside the fan-out block.
+                // The outer variant resolves identically — only its
+                // empty/null-source runtime behavior differs.
                 self.resolve_expr(source);
                 let saved_len = self.let_vars.len();
                 self.let_vars.push(binding.to_string());

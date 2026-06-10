@@ -107,11 +107,26 @@ pub enum Statement {
         body: Vec<Statement>,
         span: Span,
     },
+    /// Outer fan-out statement: `emit each <binding> in <source> outer { <body> }`.
+    /// Identical to [`Statement::EmitEach`] for a non-empty array source,
+    /// but a null or empty-array source still emits the trigger row once
+    /// with `binding` bound to null rather than emitting zero records —
+    /// the outer-join (`LATERAL VIEW OUTER EXPLODE`) shape that preserves
+    /// a trigger row carrying no array elements. Nesting is rejected at
+    /// parse time, the same as `emit each`.
+    ExplodeOuter {
+        node_id: NodeId,
+        binding: Box<str>,
+        source: Expr,
+        body: Vec<Statement>,
+        span: Span,
+    },
 }
 
 /// Visit every `Statement::Emit { target: Field, .. }` reachable from
-/// `stmts`, descending through `Statement::EmitEach.body`. The visitor
-/// receives `(name, expr)` for each field-targeted emit.
+/// `stmts`, descending through `Statement::EmitEach.body` and
+/// `Statement::ExplodeOuter.body`. The visitor receives `(name, expr)`
+/// for each field-targeted emit.
 ///
 /// Use anywhere downstream code collects the bare field names a CXL
 /// program writes to the record stream. A non-recursive walker is
@@ -129,20 +144,24 @@ pub fn for_each_field_emit<'a>(stmts: &'a [Statement], visit: &mut dyn FnMut(&'a
                 target: EmitTarget::Field,
                 ..
             } => visit(name.as_ref(), expr),
-            Statement::EmitEach { body, .. } => for_each_field_emit(body, visit),
+            Statement::EmitEach { body, .. } | Statement::ExplodeOuter { body, .. } => {
+                for_each_field_emit(body, visit)
+            }
             _ => {}
         }
     }
 }
 
 /// True when `stmts` contains at least one `Statement::Emit` (any
-/// target), recursing through `Statement::EmitEach.body`. Mirrors the
-/// "does this program emit anything" check while staying coherent in
-/// the presence of fan-out.
+/// target), recursing through `Statement::EmitEach.body` and
+/// `Statement::ExplodeOuter.body`. Mirrors the "does this program emit
+/// anything" check while staying coherent in the presence of fan-out.
 pub fn contains_emit(stmts: &[Statement]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         Statement::Emit { .. } => true,
-        Statement::EmitEach { body, .. } => contains_emit(body),
+        Statement::EmitEach { body, .. } | Statement::ExplodeOuter { body, .. } => {
+            contains_emit(body)
+        }
         _ => false,
     })
 }

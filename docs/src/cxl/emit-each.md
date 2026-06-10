@@ -1,6 +1,6 @@
 # Emit Each
 
-The `emit each` statement fans one input record into multiple output records -- one per element of an array on the input. The body emits the fields each output record carries.
+The `emit each` statement fans one input record into multiple output records -- one per element of an array on the input. The body emits the fields each output record carries. A trailing [`outer`](#preserving-the-trigger-row-outer) modifier preserves the trigger row when the array is empty or null.
 
 ## Syntax
 
@@ -52,6 +52,55 @@ The body reads both `it` (the current element) and `order_id` (an outer record f
 If the source array has N elements, `emit each` produces exactly N output records. Empty array sources produce zero records. A `null` source also produces zero records -- no DLQ entry, no error -- mirroring the explode-on-null convention used elsewhere in CXL.
 
 A non-array, non-null source raises a runtime type-mismatch error and routes the originating record to the DLQ.
+
+## Preserving the trigger row: `outer`
+
+A trailing `outer` modifier switches `emit each` to its outer-join variant. The grammar is identical except for the keyword after the source:
+
+```
+emit each <binding> in <source> outer {
+  <statements>
+}
+```
+
+The only behavioral difference is what happens when the source is `null` or an empty array. Plain `emit each` drops the trigger row entirely (zero output records). The `outer` variant instead emits the trigger row **once**, with `<binding>` bound to `null`:
+
+| Source       | `emit each ...`         | `emit each ... outer`                       |
+| ------------ | ----------------------- | ------------------------------------------- |
+| 3-element    | 3 records               | 3 records (identical)                       |
+| empty array  | 0 records               | 1 record, binding = `null`                  |
+| `null`       | 0 records               | 1 record, binding = `null`                  |
+
+This is the shape SQL engines spell `LATERAL VIEW OUTER EXPLODE` (Spark, Hive) or an outer `UNNEST` (DuckDB): "for each tag on this article emit a tagged row, **but keep articles that have no tags**."
+
+Using the worked example above with an order that carries no items:
+
+```ndjson
+{"order_id":"O-2","items":[]}
+```
+
+```yaml
+- type: transform
+  name: explode_outer
+  input: orders
+  config:
+    cxl: |
+      emit each it in items outer {
+        emit order_id = order_id
+        emit sku = it["sku"]
+        emit price = it["price"]
+      }
+```
+
+produces a single record that keeps `order_id` while the per-item fields read through the null binding:
+
+```ndjson
+{"order_id":"O-2","sku":null,"price":null}
+```
+
+Outer-record fields (like `order_id`) and any `emit` statements preceding the block still apply to the preserved trigger row, so an `outer` row is never bare.
+
+The source type rule is slightly wider than plain `emit each`: a statically-`null` source is accepted (it is the case the variant exists to handle), alongside arrays and `Any`. Everything else in this page — the `max_expansion` cap, the no-nesting rule, the body-statement restrictions — applies unchanged to the `outer` variant.
 
 ## Output schema
 

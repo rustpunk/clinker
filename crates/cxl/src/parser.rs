@@ -425,11 +425,14 @@ impl Parser {
         })
     }
 
-    /// Parse `emit each <binding> in <source> { <body> }`. Called from
-    /// [`Self::parse_emit`] after the `each` keyword has been peeked
-    /// (but not consumed). `nid` and `start` are taken from the parent's
-    /// allocator so the resulting `Statement::EmitEach` carries the
-    /// same NodeId/Span origin as a plain `emit`.
+    /// Parse `emit each <binding> in <source> { <body> }`, or its
+    /// outer-join variant `emit each <binding> in <source> outer
+    /// { <body> }`. Called from [`Self::parse_emit`] after the `each`
+    /// keyword has been peeked (but not consumed). `nid` and `start` are
+    /// taken from the parent's allocator so the resulting statement
+    /// carries the same NodeId/Span origin as a plain `emit`. A trailing
+    /// `outer` modifier yields [`Statement::ExplodeOuter`]; its absence
+    /// yields [`Statement::EmitEach`].
     fn parse_emit_each(&mut self, nid: NodeId, start: Span) -> Result<Statement, ParseError> {
         if self.in_emit_each {
             return Err(self.error(
@@ -480,6 +483,18 @@ impl Parser {
             }
         }
         let source = self.parse_expr(0)?;
+
+        // Detect the trailing `outer` modifier — the outer-join variant
+        // that preserves the trigger row when the source is null/empty.
+        // `outer` is a bare identifier (not a reserved keyword), so it is
+        // only meaningful in this position; `parse_expr` above stops at it
+        // because an identifier carries no infix binding power, leaving it
+        // as the current token between the source and the `{`.
+        let is_outer = matches!(self.peek(), Token::Ident(name) if name.as_ref() == "outer");
+        if is_outer {
+            self.advance(); // consume 'outer' ident
+        }
+
         self.expect_token(&Token::LBrace, "'{'")?;
 
         self.in_emit_each = true;
@@ -499,13 +514,24 @@ impl Parser {
         let end_span = self.current_span();
         self.expect_token(&Token::RBrace, "'}'")?;
 
-        Ok(Statement::EmitEach {
-            node_id: nid,
-            binding: binding.into(),
-            source,
-            body,
-            span: Span::new(start.start as usize, end_span.end as usize),
-        })
+        let span = Span::new(start.start as usize, end_span.end as usize);
+        if is_outer {
+            Ok(Statement::ExplodeOuter {
+                node_id: nid,
+                binding: binding.into(),
+                source,
+                body,
+                span,
+            })
+        } else {
+            Ok(Statement::EmitEach {
+                node_id: nid,
+                binding: binding.into(),
+                source,
+                body,
+                span,
+            })
+        }
     }
 
     fn parse_filter(&mut self) -> Result<Statement, ParseError> {
@@ -2603,6 +2629,80 @@ mod tests {
                 assert!(matches!(&**lhs, Expr::FieldRef { name, .. } if &**name == "sum"));
             }
             _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_each_without_outer_is_emit_each() {
+        let r = parse_ok("emit each it in items {\n  emit val = it\n}");
+        match first_stmt(&r) {
+            Statement::EmitEach { binding, .. } => assert_eq!(&**binding, "it"),
+            other => panic!("expected EmitEach, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_each_outer_modifier_is_explode_outer() {
+        // The trailing non-reserved `outer` identifier selects the
+        // outer-join variant. The source expression parses greedily and
+        // stops at `outer` because a bare identifier carries no infix
+        // binding power.
+        let r = parse_ok("emit each it in items outer {\n  emit val = it\n}");
+        match first_stmt(&r) {
+            Statement::ExplodeOuter {
+                binding, source, ..
+            } => {
+                assert_eq!(&**binding, "it");
+                // `outer` must not have been absorbed into the source.
+                assert!(
+                    matches!(source, Expr::FieldRef { name, .. } if &**name == "items"),
+                    "source should be the `items` FieldRef, got {:?}",
+                    std::mem::discriminant(source)
+                );
+            }
+            other => panic!(
+                "expected ExplodeOuter, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_each_outer_with_named_binding() {
+        let r = parse_ok("emit each tag in tags outer {\n  emit t = tag\n}");
+        match first_stmt(&r) {
+            Statement::ExplodeOuter { binding, .. } => assert_eq!(&**binding, "tag"),
+            other => panic!(
+                "expected ExplodeOuter, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_parse_emit_each_source_named_outer_is_not_explode_outer() {
+        // A source field literally named `outer` is consumed by the
+        // source `parse_expr`; the modifier check then sees `{`, not a
+        // trailing `outer`, so this is a plain EmitEach over
+        // `FieldRef("outer")`, never ExplodeOuter. The modifier only
+        // fires when an `outer` identifier sits *between* the source
+        // expression and the `{`.
+        let r = parse_ok("emit each it in outer {\n  emit val = it\n}");
+        match first_stmt(&r) {
+            Statement::EmitEach {
+                binding, source, ..
+            } => {
+                assert_eq!(&**binding, "it");
+                assert!(
+                    matches!(source, Expr::FieldRef { name, .. } if &**name == "outer"),
+                    "source should be the `outer` FieldRef, got {:?}",
+                    std::mem::discriminant(source)
+                );
+            }
+            other => panic!(
+                "expected EmitEach over FieldRef(\"outer\"), got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 }

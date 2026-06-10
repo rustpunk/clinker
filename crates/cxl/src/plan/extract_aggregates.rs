@@ -104,12 +104,12 @@ pub fn extract_aggregates(
                 // ExprStmt in aggregate mode is meaningless and
                 // already rejected upstream.
             }
-            Statement::EmitEach { span, .. } => {
-                // emit_each fan-out has no defined meaning at an aggregate
-                // boundary — finalize() emits one record per group, so a
-                // body Emit's fan-out shape cannot collapse onto a single
-                // group key. Reject at extraction time with the same
-                // shape `Distinct` uses.
+            Statement::EmitEach { span, .. } | Statement::ExplodeOuter { span, .. } => {
+                // Fan-out (plain or outer) has no defined meaning at an
+                // aggregate boundary — finalize() emits one record per
+                // group, so a body Emit's fan-out shape cannot collapse
+                // onto a single group key. Reject at extraction time with
+                // the same shape `Distinct` uses.
                 diagnostics.push(diag_distinct_in_aggregate(*span));
             }
         }
