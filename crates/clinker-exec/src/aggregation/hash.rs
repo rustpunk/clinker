@@ -117,7 +117,7 @@ pub struct HashAggregator {
     factory: AccumulatorFactory,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
-    /// Pre-aggregation row filter (D9), lowered once at construction.
+    /// Pre-aggregation row filter, lowered once at construction.
     /// `None` when the aggregate CXL has no `Statement::Filter`.
     pre_agg_filter: Option<CompiledScalar>,
     /// Per-slot binding arguments lowered once at construction, in
