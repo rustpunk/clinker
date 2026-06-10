@@ -421,10 +421,20 @@ fn assert_per_source_fifo_n(body: &[String], prefixes: &[char]) {
 /// 2. **No starvation:** every source's final record (`{prefix}-10`)
 ///    reaches output. If the merge dropped a closed receiver early,
 ///    a source's tail would go missing.
-/// 3. **Parallel ingest, not serialized:** total wall-clock runtime
-///    is bounded by the slowest source's runtime plus modest
-///    overhead — `concat`-style serialization across the four would
-///    sum to ~850 ms; live interleave should land well under that.
+/// 3. **Parallel ingest, not serialized:** the slow sources' records
+///    are temporally intermixed in the output rather than emitted as
+///    four declaration-ordered contiguous blocks. Concretely, the two
+///    slowest sources' output-position spans overlap — `concat`-style
+///    serialization would emit all of `src_c` before any of `src_d`,
+///    leaving the spans disjoint and ordered. This is a structural
+///    witness, not a wall-clock one: it depends only on the relative
+///    order the readiness-driven `select` produces, so uniform CI
+///    runner slowdown cannot flip it. (Earlier revisions asserted an
+///    absolute runtime bound calibrated from one `sleep` sample; the
+///    parallel/serial wall-clock separation is only ~1.7x — narrower
+///    than the several-fold inflation CI runners impose on short
+///    sleeps — so a wall-clock bound either flaps or, widened enough
+///    to stop flapping, rubber-stamps a fully serialized run.)
 /// 4. **No single source monopolizes a contiguous tail:** in
 ///    particular, the slowest source's records spread across the
 ///    second half of the output. (The fastest source's records
@@ -509,21 +519,50 @@ fn interleave_fairness_under_four_predecessors() {
         );
     }
 
-    // Invariant 3 — parallel ingest. Slowest source alone runs
-    // 10 × 50 ms = ~500 ms; `concat`-style serialization across
-    // all four would sum to ~850 ms. The parallel/serial separation is only
-    // ~1.7x, narrower than the several-fold inflation CI runners (macOS
-    // especially) impose on short sleeps — so a fixed bound cannot hold on
-    // both platforms. Calibrate to this platform's measured sleep cost so the
-    // assertion tests the separation, not absolute wall time.
-    let cal = Instant::now();
-    std::thread::sleep(Duration::from_millis(50));
-    let slack = (cal.elapsed().as_secs_f64() / 0.050).max(1.0);
-    let bound = Duration::from_secs_f64(0.800 * slack);
+    // Invariant 3 — parallel ingest, asserted structurally on output
+    // order rather than wall time. The two slowest sources, src_c
+    // (25 ms/row, ~250 ms total) and src_d (50 ms/row, ~500 ms total),
+    // are both still producing late in the run, so the readiness-driven
+    // `select` necessarily interleaves them: src_d's first record (its
+    // reader sleeps 50 ms, then emits — well before src_c finishes
+    // ~250 ms later) lands earlier in the output than src_c's last
+    // record. Their output-position spans therefore overlap.
+    //
+    // `concat`-style serialization is the regression this rejects: it
+    // drains predecessors in declaration order (all of src_c, then all
+    // of src_d), leaving src_d's minimum position strictly after src_c's
+    // maximum — disjoint, ordered spans with no overlap. The check below
+    // fails on exactly that shape. Because it reads relative order, not
+    // elapsed time, uniform runner slowdown shifts every record's
+    // arrival together and cannot flip the inequality.
+    let first_pos = |prefix: char| {
+        body.iter()
+            .position(|r| tag_of(r).starts_with(&format!("{prefix}-")))
+            .unwrap_or_else(|| panic!("src_{prefix} has no record in output {body:?}"))
+    };
+    let last_pos = |prefix: char| {
+        body.iter()
+            .rposition(|r| tag_of(r).starts_with(&format!("{prefix}-")))
+            .unwrap_or_else(|| panic!("src_{prefix} has no record in output {body:?}"))
+    };
+    let d_first = first_pos('d');
+    let c_last = last_pos('c');
     assert!(
-        elapsed < bound,
-        "pipeline took {elapsed:?} (slack {slack:.1}x, bound {bound:?}) — \
-         predecessors appear to be serialized rather than ingested in parallel"
+        d_first < c_last,
+        "src_d's first record is at position {d_first}, at or after src_c's \
+         last at {c_last}: the two slowest sources' output spans do not \
+         overlap, so the merge drained one source before the other rather \
+         than ingesting them in parallel. output: {body:?}"
+    );
+
+    // Anti-hang ceiling: a pure deadlock guard, deliberately far above
+    // the ~500 ms run so runner inflation never approaches it. It does
+    // NOT discriminate parallel from serial ingest — Invariant 3 above
+    // owns that — it only fails if the merge wedges.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "pipeline took {elapsed:?}, expected well under 30s — the merge \
+         appears to have hung rather than drained",
     );
 
     // Invariant 4 — the slowest source's records span the second
