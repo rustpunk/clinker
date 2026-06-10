@@ -755,10 +755,12 @@ dependencies = [
  "criterion",
  "indexmap",
  "miette",
+ "proptest",
  "regex",
  "serde",
  "static_assertions",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

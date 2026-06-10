@@ -1,11 +1,12 @@
 use clinker_bench_support::{CxlComplexity, MEDIUM, RecordFactory, SMALL};
-use clinker_record::{RecordStorage, Schema, Value};
+use clinker_record::{Record, RecordStorage, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use cxl::eval::ProgramEvaluator;
 use cxl::eval::context::{EvalContext, StableEvalContext};
 use cxl::lexer::Span;
 use cxl::parser::Parser;
 use cxl::resolve::{HashMapResolver, resolve_program};
+use cxl::typecheck::TypedProgram;
 use cxl::typecheck::{Row, type_check};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ impl RecordStorage for NullStorage {
 }
 
 /// Compile a CXL source string into a TypedProgram.
-fn compile(source: &str, fields: &[&str]) -> cxl::typecheck::TypedProgram {
+fn compile(source: &str, fields: &[&str]) -> TypedProgram {
     let parsed = Parser::parse(source);
     assert!(
         parsed.errors.is_empty(),
@@ -45,7 +46,7 @@ fn compile(source: &str, fields: &[&str]) -> cxl::typecheck::TypedProgram {
 }
 
 /// Build a HashMapResolver from a Record.
-fn resolver_from_record(record: &clinker_record::Record, schema: &Schema) -> HashMapResolver {
+fn resolver_from_record(record: &Record, schema: &Schema) -> HashMapResolver {
     let mut map = HashMap::new();
     for col in schema.columns() {
         if let Some(val) = record.get(col) {
@@ -55,15 +56,35 @@ fn resolver_from_record(record: &clinker_record::Record, schema: &Schema) -> Has
     HashMapResolver::new(map)
 }
 
-// ── Simple emit ────────────────────────────────────────────────────
+/// Drive one full pass over `records` through a freshly-built evaluator. A
+/// fresh evaluator per iteration mirrors the per-node construction the
+/// executor does and keeps the compiled-program build cost inside the
+/// measured window — the one-time lowering is amortized over the pass.
+fn run_path(typed: &Arc<TypedProgram>, records: &[Record], schema: &Schema, ctx: &EvalContext<'_>) {
+    let mut evaluator = ProgramEvaluator::new(Arc::clone(typed), false);
+    for rec in records {
+        let resolver = resolver_from_record(rec, schema);
+        let result = evaluator.eval_record::<NullStorage>(ctx, &resolver, None);
+        black_box(&result);
+    }
+}
 
-fn bench_eval_simple_emit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_simple_emit");
-    let complexity = CxlComplexity::Simple;
-    let typed = Arc::new(compile(complexity.source(), &complexity.required_fields()));
+/// Benchmark `source` at each record count, emitting `<group>/<count>`
+/// ids.
+fn bench_counts(
+    c: &mut Criterion,
+    group_name: &str,
+    source: &str,
+    fields: &[&str],
+    field_count: usize,
+    str_len: usize,
+    null_ratio: f64,
+) {
+    let mut group = c.benchmark_group(group_name);
+    let typed = Arc::new(compile(source, fields));
 
     for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
+        let mut factory = RecordFactory::new(field_count, str_len, null_ratio, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
         let stable = StableEvalContext::test_default();
@@ -71,117 +92,58 @@ fn bench_eval_simple_emit(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
         });
     }
     group.finish();
+}
+
+// ── Simple emit ────────────────────────────────────────────────────
+
+fn bench_eval_simple_emit(c: &mut Criterion) {
+    let complexity = CxlComplexity::Simple;
+    bench_counts(
+        c,
+        "eval_simple_emit",
+        complexity.source(),
+        &complexity.required_fields(),
+        10,
+        16,
+        0.0,
+    );
 }
 
 // ── String methods ─────────────────────────────────────────────────
 
 fn bench_eval_string_methods(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_string_methods");
     let source = r#"
 emit out = f1.upper().trim().replace("A", "X")
 "#;
-    let typed = Arc::new(compile(source, &["f1"]));
-
-    for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 32, 0.0, 42);
-        let records = factory.generate(count);
-        let schema = factory.schema().clone();
-        let stable = StableEvalContext::test_default();
-        let ctx = EvalContext::test_default_borrowed(&stable);
-
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
-        });
-    }
-    group.finish();
+    bench_counts(c, "eval_string_methods", source, &["f1"], 10, 32, 0.0);
 }
 
 // ── Numeric chain ──────────────────────────────────────────────────
 
 fn bench_eval_numeric_chain(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_numeric_chain");
     let source = r#"
 let x = f0 + f2 * 3
 emit out = x.to_float().round(2).abs()
 "#;
-    let typed = Arc::new(compile(source, &["f0", "f2"]));
-
-    for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
-        let records = factory.generate(count);
-        let schema = factory.schema().clone();
-        let stable = StableEvalContext::test_default();
-        let ctx = EvalContext::test_default_borrowed(&stable);
-
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
-        });
-    }
-    group.finish();
+    bench_counts(c, "eval_numeric_chain", source, &["f0", "f2"], 10, 16, 0.0);
 }
 
 // ── Conditional ────────────────────────────────────────────────────
 
 fn bench_eval_conditional(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_conditional");
     let source = r#"
 emit out = if f0 > 500000 then "high" else if f0 > 250000 then "medium" else "low"
 "#;
-    let typed = Arc::new(compile(source, &["f0"]));
-
-    for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
-        let records = factory.generate(count);
-        let schema = factory.schema().clone();
-        let stable = StableEvalContext::test_default();
-        let ctx = EvalContext::test_default_borrowed(&stable);
-
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
-        });
-    }
-    group.finish();
+    bench_counts(c, "eval_conditional", source, &["f0"], 10, 16, 0.0);
 }
 
 // ── Match expression ───────────────────────────────────────────────
 
 fn bench_eval_match(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_match");
     let source = r#"
 emit out = match f1 {
     "alpha" => 1
@@ -192,28 +154,7 @@ emit out = match f1 {
     _ => 0
 }
 "#;
-    let typed = Arc::new(compile(source, &["f1"]));
-
-    for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
-        let records = factory.generate(count);
-        let schema = factory.schema().clone();
-        let stable = StableEvalContext::test_default();
-        let ctx = EvalContext::test_default_borrowed(&stable);
-
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
-        });
-    }
-    group.finish();
+    bench_counts(c, "eval_match", source, &["f1"], 10, 16, 0.0);
 }
 
 // ── Coalesce with varying null ratios ──────────────────────────────
@@ -235,14 +176,7 @@ emit out = f1 ?? f3 ?? f5 ?? "default"
 
         group.throughput(Throughput::Elements(SMALL as u64));
         group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
         });
     }
     group.finish();
@@ -272,14 +206,7 @@ fn bench_eval_filter(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(SMALL as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &label, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
         });
     }
     group.finish();
@@ -288,30 +215,16 @@ fn bench_eval_filter(c: &mut Criterion) {
 // ── Full realistic transform ───────────────────────────────────────
 
 fn bench_eval_full_transform(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eval_full_transform");
     let complexity = CxlComplexity::Complex;
-    let typed = Arc::new(compile(complexity.source(), &complexity.required_fields()));
-
-    for count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(20, 32, 0.05, 42);
-        let records = factory.generate(count);
-        let schema = factory.schema().clone();
-        let stable = StableEvalContext::test_default();
-        let ctx = EvalContext::test_default_borrowed(&stable);
-
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
-            b.iter(|| {
-                let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
-                for rec in &records {
-                    let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
-                    black_box(&_result);
-                }
-            });
-        });
-    }
-    group.finish();
+    bench_counts(
+        c,
+        "eval_full_transform",
+        complexity.source(),
+        &complexity.required_fields(),
+        20,
+        32,
+        0.05,
+    );
 }
 
 criterion_group!(
