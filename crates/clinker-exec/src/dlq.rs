@@ -707,9 +707,10 @@ mod tests {
     /// A per-source DLQ path that differs from the pipeline-wide path only in
     /// case must share *one* writer bucket on a case-insensitive filesystem
     /// (they name one physical file), while remaining two distinct buckets on a
-    /// case-sensitive one. The expectation is conditioned on the working
-    /// directory's actual case-sensitivity — probed the same way the
-    /// partitioner does — so the assertion is deterministic on every CI runner.
+    /// case-sensitive one. The expectation is conditioned on an isolated temp
+    /// directory's actual case-sensitivity — probed the same way the partitioner
+    /// does — so the assertion is deterministic on every CI runner regardless of
+    /// the process-global working directory other parallel tests may change.
     #[test]
     fn test_partition_collapses_case_variant_paths_only_when_filesystem_folds() {
         let schema = make_schema();
@@ -734,17 +735,28 @@ mod tests {
         // `src_b` routes to a case-variant of the pipeline-wide path.
         let entries = vec![mk("src_a"), mk("src_b")];
 
+        // Absolute paths inside an owned temp directory, not bare filenames. A
+        // bare filename resolves the case-sensitivity probe against the
+        // process-global current directory, which sibling tests running on other
+        // threads can mutate or contend on — making this test's probe race with
+        // the partitioner's own probe and flake. A fresh temp dir is stable and
+        // private to this test, so both probes observe one filesystem and the
+        // verdict is deterministic under parallel execution.
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("errors.csv");
+        let upper = dir.path().join("Errors.csv");
+
         let mut per_source = std::collections::BTreeMap::new();
         per_source.insert(
             "src_b".to_string(),
             clinker_plan::config::DlqPerSourceConfig {
-                path: Some("Errors.csv".to_string()),
+                path: Some(upper.to_string_lossy().into_owned()),
                 max_rate: None,
                 min_records: None,
             },
         );
         let cfg = clinker_plan::config::DlqConfig {
-            path: Some("errors.csv".to_string()),
+            path: Some(lower.to_string_lossy().into_owned()),
             include_reason: None,
             include_source_row: None,
             max_rate: None,
@@ -752,22 +764,21 @@ mod tests {
             per_source,
         };
 
-        let case_sensitive =
-            clinker_plan::config::case_sensitive_dir(Path::new("errors.csv")).unwrap_or(true);
+        let case_sensitive = clinker_plan::config::case_sensitive_dir(&lower).unwrap_or(true);
         let buckets = partition_dlq_entries(&entries, &cfg);
 
         if case_sensitive {
             // Two distinct files: separate buckets, one entry each.
             assert_eq!(buckets.len(), 2);
-            assert_eq!(buckets[0].0, PathBuf::from("errors.csv"));
-            assert_eq!(buckets[1].0, PathBuf::from("Errors.csv"));
+            assert_eq!(buckets[0].0, lower);
+            assert_eq!(buckets[1].0, upper);
             assert_eq!(buckets[0].1.len(), 1);
             assert_eq!(buckets[1].1.len(), 1);
         } else {
             // One physical file: both entries collapse into the single
             // pipeline-wide bucket (first claimant of the key).
             assert_eq!(buckets.len(), 1);
-            assert_eq!(buckets[0].0, PathBuf::from("errors.csv"));
+            assert_eq!(buckets[0].0, lower);
             assert_eq!(
                 buckets[0].1.len(),
                 2,
