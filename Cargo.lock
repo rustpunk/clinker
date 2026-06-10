@@ -760,6 +760,7 @@ dependencies = [
  "serde",
  "static_assertions",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

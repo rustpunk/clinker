@@ -20,6 +20,7 @@ serde = { workspace = true }
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true }
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "eval"

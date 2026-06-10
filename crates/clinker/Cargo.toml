@@ -20,7 +20,7 @@ serde-saphyr = { workspace = true }
 chrono = { workspace = true }
 num_cpus = "1"
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v7"] }
 miette = { workspace = true }
 tempfile = { workspace = true }

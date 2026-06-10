@@ -2222,6 +2222,160 @@ fn assert_agree_with_vars(
     tree_proj
 }
 
+// ── Differential corpus: the `trace` log channel ──────────────────────
+
+/// One captured `trace` event: the level the statement chose and the
+/// rendered message text. The differential assertion compares a
+/// `Vec<CapturedTrace>` produced by each evaluator; `source_row` /
+/// `source_file` ride along on the same event but the message and level
+/// are the channel a wrong-level or wrong-guard compiled node would
+/// corrupt, so those two are what the test pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedTrace {
+    level: tracing::Level,
+    message: String,
+}
+
+/// Pulls the `message` field out of a `trace`/`debug`/... event. The
+/// `tracing` macro records the format string under the well-known
+/// `message` field name; every other field on the event (`source_row`,
+/// `source_file`) is ignored because the level and message are the
+/// fidelity channel under test.
+struct MessageVisitor(Option<String>);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = Some(value.to_string());
+        }
+    }
+}
+
+/// A `tracing` layer that appends every event's `(level, message)` to a
+/// shared buffer. Installed via `with_default` around one eval call so
+/// the two evaluators never write to the same buffer concurrently.
+struct CapturingLayer(Arc<std::sync::Mutex<Vec<CapturedTrace>>>);
+
+impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = MessageVisitor(None);
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(CapturedTrace {
+            level: *event.metadata().level(),
+            message: visitor.0.unwrap_or_default(),
+        });
+    }
+}
+
+/// Run one record through `evaluator` with a capturing subscriber scoped
+/// to just this call, returning the trace events emitted. `with_default`
+/// installs the subscriber for the current thread only for the duration
+/// of the closure, so the two evaluators' captures stay isolated.
+fn capture_traces(
+    evaluator: &mut ProgramEvaluator,
+    ctx: &EvalContext<'_>,
+    resolver: &HashMapResolver,
+) -> Vec<CapturedTrace> {
+    use tracing_subscriber::layer::SubscriberExt;
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CapturingLayer(Arc::clone(&captured)));
+    tracing::subscriber::with_default(subscriber, || {
+        // Discard the EvalResult — fields/skip/error fidelity is the
+        // differential harness's job; this helper isolates the trace
+        // channel. The corpus programs emit cleanly, so a clean evaluate
+        // is expected on both paths.
+        let _ = evaluator
+            .eval_record::<NullStorage>(ctx, resolver, None)
+            .expect("trace-fidelity program evaluates cleanly");
+    });
+    Arc::try_unwrap(captured).unwrap().into_inner().unwrap()
+}
+
+/// The `trace` statement's emitted log line and level must agree across
+/// the tree-walk and the compiled evaluator. This is the one fidelity
+/// channel the `EvalResult`-comparing differential harness cannot see:
+/// `trace` writes to the `tracing` sink, not to `fields` / `$record` /
+/// `$pipeline`, so a compiled node that fired at the wrong level, dropped
+/// a guarded trace, or rendered a different computed message would pass
+/// the harness yet corrupt observability.
+///
+/// Each case carries a guard plus a computed (concatenated, field-derived)
+/// message so both the guard-branch and the message-evaluation paths are
+/// exercised: a guard that passes, a guard that suppresses, an explicit
+/// level, and a multi-statement program whose two traces must appear in
+/// order.
+#[test]
+fn trace_channel_agrees_across_evaluators() {
+    let cases: &[(&str, &[&str], HashMap<String, Value>)] = &[
+        // Guard true → the warn-level trace fires with a computed message.
+        (
+            "trace warn if amount > 100 \"high amount: \" + amount.to_string()\nemit ok = 1",
+            &["amount"],
+            HashMap::from([("amount".to_string(), Value::Integer(250))]),
+        ),
+        // Guard false → no trace event on either path.
+        (
+            "trace warn if amount > 100 \"high amount: \" + amount.to_string()\nemit ok = 1",
+            &["amount"],
+            HashMap::from([("amount".to_string(), Value::Integer(50))]),
+        ),
+        // Unguarded info-level trace with a field-interpolated message.
+        (
+            "trace info \"row \" + label\nemit ok = 1",
+            &["label"],
+            HashMap::from([("label".to_string(), Value::from("alpha"))]),
+        ),
+        // Two traces at distinct levels must appear in statement order.
+        (
+            "trace debug \"first\"\ntrace error if amount > 0 \"second: \" + amount.to_string()\nemit ok = 1",
+            &["amount"],
+            HashMap::from([("amount".to_string(), Value::Integer(7))]),
+        ),
+        // Default-level (bare `trace`) with a non-string computed message,
+        // which both paths render via the `{:?}` debug fallback.
+        (
+            "trace \"value=\" + (amount * 2).to_string()\nemit ok = 1",
+            &["amount"],
+            HashMap::from([("amount".to_string(), Value::Integer(21))]),
+        ),
+    ];
+
+    for (src, fields, record) in cases {
+        let stable_tw = StableEvalContext::test_default();
+        let stable_c = StableEvalContext::test_default();
+        let resolver = HashMapResolver::new(record.clone());
+        let has_distinct = program_has_distinct(&type_program(src, fields));
+
+        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
+        let mut tree_eval =
+            ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
+        let tree_traces = capture_traces(&mut tree_eval, &ctx_tw, &resolver);
+
+        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
+        let mut comp_eval =
+            ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
+        comp_eval.set_use_compiled(true);
+        let comp_traces = capture_traces(&mut comp_eval, &ctx_c, &resolver);
+
+        assert_eq!(
+            tree_traces, comp_traces,
+            "trace lines/levels diverged on `{src}`",
+        );
+    }
+}
+
 /// `$source.<member>` builtins and `$doc.<section>.<field>` resolve
 /// without a declared registry; both evaluators agree, including the
 /// `Null` an empty envelope resolves `$doc` to.
