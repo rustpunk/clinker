@@ -2,6 +2,7 @@ pub mod accumulator;
 pub mod coercion;
 pub mod counters;
 pub mod document_context;
+pub mod field_str;
 pub mod group_key;
 pub mod minimal;
 pub mod provenance;
@@ -22,6 +23,7 @@ pub use counters::{PipelineCounters, RetractionCounters};
 pub use document_context::{
     DocumentContext, DocumentId, synthetic_document_context, synthetic_document_context_ref,
 };
+pub use field_str::FieldStr;
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};
 pub use minimal::MinimalRecord;
 pub use provenance::RecordProvenance;

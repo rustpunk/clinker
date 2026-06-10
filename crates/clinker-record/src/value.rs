@@ -1,6 +1,6 @@
+use crate::field_str::FieldStr;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use indexmap::IndexMap;
-use smol_str::SmolStr;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -12,12 +12,18 @@ pub enum Value {
     Float(f64),
     /// Field-value string. Short values (<=23 bytes — the dominant ETL field
     /// shape) live inline in the enum with zero heap allocation; longer values
-    /// are Arc-backed, so cloning a long string is an O(1) refcount bump rather
-    /// than an allocation + copy. `SmolStr` is 24 bytes wide with no spare
-    /// niche, so it widens `Value` to 32 bytes (see `test_value_enum_size`);
-    /// the trade buys away one heap allocation per short value, which is the
-    /// term that moves the RSS / spill threshold.
-    String(SmolStr),
+    /// are `Arc`-backed by default, so cloning a long string is an O(1) refcount
+    /// bump rather than an allocation + copy. Columns a source schema flags
+    /// long-and-unique instead take the `Box`-backed header-free arm, dropping
+    /// the `Arc` refcount header that is pure overhead when a value never
+    /// repeats — see [`FieldStr`]. The arm is a storage hint only: equality,
+    /// ordering, hashing, and grouping all compare via the underlying `str`, so
+    /// a shared and a unique value of equal content behave identically.
+    /// `FieldStr` is 24 bytes wide with no spare niche, so it widens `Value` to
+    /// 32 bytes (see `test_value_enum_size`); the trade buys away one heap
+    /// allocation per short value, which is the term that moves the RSS / spill
+    /// threshold.
+    String(FieldStr),
     Date(NaiveDate),
     DateTime(NaiveDateTime),
     Array(Vec<Value>),
@@ -117,8 +123,13 @@ impl<'de> Visitor<'de> for ValueVisitor {
             2 => Ok(Value::Integer(va.newtype_variant()?)),
             3 => Ok(Value::Float(va.newtype_variant()?)),
             4 => {
+                // Reconstruct the DEFAULT (inline-or-shared) arm. The wire form
+                // carries only the UTF-8 bytes — no arm tag — so a value that
+                // spilled from the unique arm reloads as the default arm with
+                // identical content. The arm is an in-memory footprint hint that
+                // does not survive serialization, by design.
                 let s: std::string::String = va.newtype_variant()?;
-                Ok(Value::String(SmolStr::from(s)))
+                Ok(Value::String(FieldStr::from(s)))
             }
             5 => {
                 let days: i32 = va.newtype_variant()?;
@@ -270,27 +281,28 @@ impl fmt::Display for Value {
 
 // ── String-variant constructors (policy-enforcing) ─────────────────────────
 //
-// `From<&str>`, `From<String>`, and `From<SmolStr>` build the `String` variant.
-// There is deliberately NO `From<Box<str>>`: a `Box<str>` field value (the old
-// owning representation) must fail to compile rather than silently allocate and
-// box, which is the type-level enforcement that the inline/Arc-backed `SmolStr`
-// representation is the single field-value string path.
+// `From<&str>`, `From<String>`, and `From<SmolStr>` build the `String` variant
+// in the DEFAULT inline-or-`Arc`-shared arm, byte-for-byte the prior behavior.
+// The header-free `Box`-unique arm is reachable only through
+// [`Value::string_unique`], driven by the source schema's long-unique flag —
+// never by an ambient `From` conversion — so default construction never silently
+// changes representation.
 
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
-        Value::String(SmolStr::new(s))
+        Value::String(FieldStr::new(s))
     }
 }
 
 impl From<std::string::String> for Value {
     fn from(s: std::string::String) -> Self {
-        Value::String(SmolStr::from(s))
+        Value::String(FieldStr::from(s))
     }
 }
 
-impl From<SmolStr> for Value {
-    fn from(s: SmolStr) -> Self {
-        Value::String(s)
+impl From<smol_str::SmolStr> for Value {
+    fn from(s: smol_str::SmolStr) -> Self {
+        Value::String(FieldStr::from(s))
     }
 }
 
@@ -331,17 +343,11 @@ impl Value {
     /// Scalar variants (Null, Bool, Integer, Float, Date, DateTime) store
     /// data inline in the enum — zero heap allocation.
     /// Strings store their bytes inline when short (<=23 bytes) and so
-    /// contribute zero heap; only heap-backed (Arc-allocated) strings charge
-    /// their byte length.
+    /// contribute zero heap; heap-backed strings (the `Arc`-shared default arm
+    /// or the `Box`-unique arm) charge their byte length.
     pub fn heap_size(&self) -> usize {
         match self {
-            Value::String(s) => {
-                if s.is_heap_allocated() {
-                    s.len()
-                } else {
-                    0
-                }
-            }
+            Value::String(s) => s.heap_size(),
             Value::Array(arr) => {
                 arr.capacity() * std::mem::size_of::<Value>()
                     + arr.iter().map(Value::heap_size).sum::<usize>()
@@ -354,6 +360,18 @@ impl Value {
             }
             _ => 0,
         }
+    }
+
+    /// Build a `String` value in the header-free `Box`-unique arm.
+    ///
+    /// Used by the reader path for source columns a `.schema.yaml` flags
+    /// long-and-unique: such values never repeat across records, so the
+    /// `Arc` refcount header of the default shared arm would be pure overhead.
+    /// The resulting value compares, orders, hashes, and groups identically to
+    /// a default-arm value of the same content — the arm is a footprint hint,
+    /// not a distinct value domain.
+    pub fn string_unique(s: &str) -> Self {
+        Value::String(FieldStr::new_unique(s))
     }
 
     /// Create a Map from an iterator of key-value pairs.
@@ -561,29 +579,30 @@ mod tests {
 
     #[test]
     fn test_value_heap_size_string() {
-        // Short strings (<=23 bytes) live inline in the SmolStr — zero heap.
+        use crate::field_str::INLINE_CAP;
+        // Short strings (<=23 bytes) live inline in the FieldStr — zero heap.
         assert_eq!(Value::String("hello".into()).heap_size(), 0);
         assert_eq!(Value::String("".into()).heap_size(), 0);
         // 21 bytes is still inline (<=23) — contributes no heap.
         assert_eq!(Value::String("a longer string value".into()).heap_size(), 0);
         // 23 bytes is the inline boundary — still no heap.
-        let boundary = "x".repeat(23);
-        assert!(!smol_str::SmolStr::new(&boundary).is_heap_allocated());
+        let boundary = "x".repeat(INLINE_CAP);
         assert_eq!(Value::String(boundary.as_str().into()).heap_size(), 0);
-        // 24+ bytes spills to the Arc-backed heap repr — charges its byte length.
+        // 24+ bytes spills to the Arc-backed default heap arm — charges its
+        // byte length.
         let heap_backed = "this string is definitely longer than twenty-three bytes";
         assert_eq!(heap_backed.len(), 56);
-        assert!(smol_str::SmolStr::new(heap_backed).is_heap_allocated());
+        assert!(heap_backed.len() > INLINE_CAP);
         assert_eq!(Value::String(heap_backed.into()).heap_size(), 56);
     }
 
     #[test]
     fn test_long_field_string_is_arc_backed_shares_on_clone_and_roundtrips() {
-        // A 36-char UUID is the canonical long field shape (>23B, the SmolStr
-        // inline boundary), so it takes the Arc-backed heap repr rather than
-        // inline storage. This pins the three properties the long-field
-        // ownership model depends on: heap residency, refcount-sharing clones,
-        // and byte-exact serde — all of which only matter for the heap arm.
+        // A 36-char UUID is the canonical long field shape (>23B, the FieldStr
+        // inline boundary), so the default constructor takes the Arc-backed
+        // shared arm rather than inline storage. This pins the three properties
+        // the long-field ownership model depends on: heap residency,
+        // refcount-sharing clones, and byte-exact serde.
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         assert_eq!(
             uuid.len(),
@@ -596,14 +615,19 @@ mod tests {
             panic!("constructed a String variant");
         };
         // >23B values live on the heap; heap_size charges exactly the byte
-        // length (no rounding, no Arc-header inclusion).
+        // length (no rounding, no Arc-header inclusion). A non-zero heap_size
+        // is the public-API proof of heap residency.
         assert!(
-            orig_str.is_heap_allocated(),
+            orig_str.heap_size() > 0,
             "a 36-byte UUID must be Arc-backed, not inline"
+        );
+        assert!(
+            !orig_str.is_unique(),
+            "the default constructor takes the shared arm, not the unique arm"
         );
         assert_eq!(original.heap_size(), 36);
 
-        // Cloning a heap-backed String is an O(1) refcount bump, not a deep
+        // Cloning a shared-arm String is an O(1) refcount bump, not a deep
         // copy: the clone's bytes alias the original's allocation. Pointer
         // identity of the backing `str` is the public-API proof of sharing —
         // a deep copy would land at a different address.
@@ -614,7 +638,7 @@ mod tests {
         assert_eq!(
             orig_str.as_str().as_ptr(),
             clone_str.as_str().as_ptr(),
-            "a heap-backed SmolStr clone must share the Arc allocation, \
+            "a shared-arm FieldStr clone must share the Arc allocation, \
              not copy the bytes"
         );
         assert_eq!(orig_str.as_str(), clone_str.as_str());
@@ -630,8 +654,12 @@ mod tests {
         };
         assert_eq!(decoded_str.as_str(), uuid);
         assert!(
-            decoded_str.is_heap_allocated(),
+            decoded_str.heap_size() > 0,
             "a >23B value stays Arc-backed across a serde round-trip"
+        );
+        assert!(
+            !decoded_str.is_unique(),
+            "deserialize reconstructs the default arm, never the unique arm"
         );
         let reencoded = postcard::to_stdvec(&decoded).expect("re-serialize decoded value");
         assert_eq!(reencoded, bytes, "serde round-trip is byte-identical");
@@ -645,8 +673,8 @@ mod tests {
         assert_eq!(arr.heap_size(), expected);
 
         // A heap-backed element string adds its byte length on top of the Vec backing.
-        let long = "an element string well past the inline boundary of smolstr";
-        assert!(smol_str::SmolStr::new(long).is_heap_allocated());
+        let long = "an element string well past the inline boundary of the field type";
+        assert!(long.len() > crate::field_str::INLINE_CAP);
         let arr2 = Value::Array(vec![Value::Integer(1), Value::String(long.into())]);
         let expected2 = 2 * std::mem::size_of::<Value>() + long.len();
         assert_eq!(arr2.heap_size(), expected2);
@@ -774,15 +802,58 @@ mod tests {
 
     #[test]
     fn test_value_enum_size() {
-        // `SmolStr` is itself 24 bytes (a 23-byte inline buffer + 1-byte length
-        // tag) and exposes no spare niche for the outer `Value` discriminant,
-        // so the enum is 32 bytes — one machine word wider than the prior
-        // `Box<str>` (16-byte) representation. The width is paid back at the
+        // `FieldStr` is itself 24 bytes (a 23-byte inline buffer + 1-byte
+        // discriminant) and exposes no spare niche for the outer `Value`
+        // discriminant, so the enum is 32 bytes. The width is paid back at the
         // heap: short field values (<=23 bytes, the dominant ETL shape) carry
-        // zero heap allocation instead of one per value, and long values clone
-        // by refcount. The per-`Value` byte-cost model keys off this constant,
-        // so it tracks the real width automatically.
+        // zero heap allocation instead of one per value, long values clone by
+        // refcount in the default shared arm, and schema-flagged long-unique
+        // values drop the Arc header in the Box-unique arm — all within the
+        // same 24-byte payload. The per-`Value` byte-cost model keys off this
+        // constant, so it tracks the real width automatically.
         assert_eq!(std::mem::size_of::<Value>(), 32);
+    }
+
+    #[test]
+    fn test_value_string_unique_arm_collapses_to_default_on_serde() {
+        // A schema-flagged long-unique value takes the header-free Box arm
+        // in memory, but the wire form carries only the UTF-8 bytes (the arm
+        // is an in-memory footprint hint, not part of the value's identity).
+        // A unique-arm value and a default-arm value of the same content must
+        // therefore serialize to byte-identical streams, and a spilled unique
+        // value must reload as the default arm with content intact.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let unique = Value::string_unique(uuid);
+        let default = Value::String(uuid.into());
+
+        let Value::String(u) = &unique else {
+            unreachable!()
+        };
+        assert!(u.is_unique(), "string_unique must take the Box-unique arm");
+
+        // Cross-arm equality: the two values are equal despite different arms.
+        assert_eq!(unique, default);
+
+        // Wire bytes are identical regardless of arm.
+        let unique_bytes = postcard::to_stdvec(&unique).expect("serialize unique");
+        let default_bytes = postcard::to_stdvec(&default).expect("serialize default");
+        assert_eq!(
+            unique_bytes, default_bytes,
+            "the storage arm must not leak into the wire form"
+        );
+
+        // Spill round-trip: a unique value reloads as the default arm, content
+        // intact (the wire carries no arm tag to reconstruct the Box arm).
+        let decoded: Value = postcard::from_bytes(&unique_bytes).expect("deserialize");
+        assert_eq!(decoded, unique);
+        let Value::String(d) = &decoded else {
+            unreachable!()
+        };
+        assert_eq!(d.as_str(), uuid);
+        assert!(
+            !d.is_unique(),
+            "deserialize reconstructs the default arm, not the unique arm"
+        );
     }
 
     #[test]
