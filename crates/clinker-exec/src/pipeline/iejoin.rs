@@ -606,10 +606,10 @@ pub(crate) fn execute_combine_iejoin(
     let mut unmatched_drivers: Vec<usize> = Vec::new();
 
     // Per-record key extraction is the expensive part of the pre-scan:
-    // every record runs the CXL eq-key and range-key programs through
-    // `eval_expr`. The extractors are stateless (`&self`, a fresh
-    // per-call `env`) and `EvalContext` is read-only, so the extraction
-    // parallelizes across the shared kernel pool. Each record yields an
+    // every record runs the compiled CXL eq-key and range-key closures.
+    // The extractors are stateless (`&self`) and `EvalContext` is
+    // read-only, so the extraction parallelizes across the shared kernel
+    // pool. Each record yields an
     // independent `RecordScan`; the routing loops below replay those
     // outcomes in strict ascending index order, so the partition vectors
     // and `unmatched_drivers` end up byte-identical to a sequential scan.
@@ -1226,8 +1226,7 @@ fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineErr
 }
 
 /// Placeholder `RecordStorage` for windowless body / residual
-/// evaluation. Same role as `executor::mod::NullStorage` and
-/// `pipeline::combine::NullStorage`.
+/// evaluation. Same role as `executor::mod::NullStorage`.
 struct NullStorage;
 
 impl clinker_record::RecordStorage for NullStorage {

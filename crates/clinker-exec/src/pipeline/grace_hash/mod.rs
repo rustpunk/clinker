@@ -721,8 +721,8 @@ pub(crate) fn execute_combine_grace_hash(
     //
     // Partition placement, the byte-driven spill decisions, and the
     // arbitrator mirroring inside `add_build_record` are order-sensitive
-    // and must stay sequential. The expensive part — running the CXL
-    // build-key program per record through `eval_expr` and hashing the
+    // and must stay sequential. The expensive part — running the compiled
+    // CXL build-key closures per record and hashing the
     // composite key — is independent per record, so it parallelizes
     // across the shared kernel pool. The hashed records are then fed into
     // `add_build_record` in input order, so the resulting partition table
