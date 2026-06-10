@@ -29,12 +29,6 @@ impl RecordStorage for NullStorage {
     }
 }
 
-/// The two per-record evaluation paths benchmarked side by side. The
-/// compiled path is selected on `ProgramEvaluator` via `set_use_compiled`;
-/// running both under the same workload makes the parity ratio a direct
-/// read of the compiled-vs-tree-walk timings.
-const PATHS: [(&str, bool); 2] = [("tree_walk", false), ("compiled", true)];
-
 /// Compile a CXL source string into a TypedProgram.
 fn compile(source: &str, fields: &[&str]) -> TypedProgram {
     let parsed = Parser::parse(source);
@@ -62,20 +56,12 @@ fn resolver_from_record(record: &Record, schema: &Schema) -> HashMapResolver {
     HashMapResolver::new(map)
 }
 
-/// Drive one full pass over `records` through a freshly-built evaluator on
-/// the requested path. A fresh evaluator per iteration mirrors the
-/// per-node construction the executor does and keeps the compiled-program
-/// build cost inside the measured window — the compiled path must clear
-/// the tree-walk including that one-time lowering.
-fn run_path(
-    typed: &Arc<TypedProgram>,
-    records: &[Record],
-    schema: &Schema,
-    ctx: &EvalContext<'_>,
-    use_compiled: bool,
-) {
+/// Drive one full pass over `records` through a freshly-built evaluator. A
+/// fresh evaluator per iteration mirrors the per-node construction the
+/// executor does and keeps the compiled-program build cost inside the
+/// measured window — the one-time lowering is amortized over the pass.
+fn run_path(typed: &Arc<TypedProgram>, records: &[Record], schema: &Schema, ctx: &EvalContext<'_>) {
     let mut evaluator = ProgramEvaluator::new(Arc::clone(typed), false);
-    evaluator.set_use_compiled(use_compiled);
     for rec in records {
         let resolver = resolver_from_record(rec, schema);
         let result = evaluator.eval_record::<NullStorage>(ctx, &resolver, None);
@@ -83,9 +69,8 @@ fn run_path(
     }
 }
 
-/// Benchmark `source` over both paths at each record count, emitting
-/// `<group>/<path>/<count>` ids so the parity ratio reads directly off the
-/// two paths' timings for the same workload.
+/// Benchmark `source` at each record count, emitting `<group>/<count>`
+/// ids.
 fn bench_counts(
     c: &mut Criterion,
     group_name: &str,
@@ -106,11 +91,9 @@ fn bench_counts(
         let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
-        for (path_label, use_compiled) in PATHS {
-            group.bench_with_input(BenchmarkId::new(path_label, count), &count, |b, _| {
-                b.iter(|| run_path(&typed, &records, &schema, &ctx, use_compiled));
-            });
-        }
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
+        });
     }
     group.finish();
 }
@@ -192,15 +175,9 @@ emit out = f1 ?? f3 ?? f5 ?? "default"
         let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(SMALL as u64));
-        for (path_label, use_compiled) in PATHS {
-            group.bench_with_input(
-                BenchmarkId::new(format!("{path_label}_null_pct"), null_pct),
-                &null_pct,
-                |b, _| {
-                    b.iter(|| run_path(&typed, &records, &schema, &ctx, use_compiled));
-                },
-            );
-        }
+        group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
+        });
     }
     group.finish();
 }
@@ -228,11 +205,9 @@ fn bench_eval_filter(c: &mut Criterion) {
         let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(SMALL as u64));
-        for (path_label, use_compiled) in PATHS {
-            group.bench_with_input(BenchmarkId::new(path_label, label), &label, |b, _| {
-                b.iter(|| run_path(&typed, &records, &schema, &ctx, use_compiled));
-            });
-        }
+        group.bench_with_input(BenchmarkId::from_parameter(label), &label, |b, _| {
+            b.iter(|| run_path(&typed, &records, &schema, &ctx));
+        });
     }
     group.finish();
 }

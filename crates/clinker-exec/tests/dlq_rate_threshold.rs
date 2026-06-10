@@ -148,8 +148,7 @@ error_handling:
             .map(|e| e.source_name.as_ref())
             .collect::<Vec<_>>()
     );
-    // The eval failed inside `emit ratio = ...`. The emit-statement
-    // boundary in `cxl::eval::ProgramEvaluator::eval_record_inner`
+    // The eval failed inside `emit ratio = ...`. The compiled emit node
     // attaches the target field name to `EvalError.triggering_field`,
     // so every DLQ entry derived from an emit-statement subexpression
     // names the offending column.

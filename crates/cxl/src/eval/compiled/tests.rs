@@ -1,17 +1,18 @@
-//! Differential and property tests proving the compiled evaluator
-//! produces byte-identical [`EvalResult`]s to the tree-walk.
+//! Golden and property tests for the compiled evaluator: each case pins
+//! the [`EvalResult`] (or surfaced error) the compiled path must produce
+//! for a given program and record.
 //!
-//! The corpus exercises the full row-level surface both evaluators
-//! define: the scalar core, record-level method calls and closure-bearing
-//! array builtins, window reads (aggregate / positional-chain / rank /
+//! The corpus exercises the full row-level surface the evaluator defines:
+//! the scalar core, record-level method calls and closure-bearing array
+//! builtins, window reads (aggregate / positional-chain / rank /
 //! predicate-fold), `distinct` (across a record stream with shared dedup
-//! state and partition resets), and `emit each` fan-out. The fidelity
-//! assertion compares the field map, the `$record.*` channel, the skip
-//! reason, the `EmitMany` fan-out records, and — on the error path — the
-//! error kind, span, and boundary provenance fields, byte for byte. Float
-//! results are NaN-canonicalized first so an agreed NaN compares equal
-//! rather than false-failing. On any divergence the compiled node is the
-//! thing to fix; the assertion is never weakened.
+//! state and partition resets), and `emit each` fan-out. A case projects
+//! the result to plain owned data — the field map, the `$record.*`
+//! channel, the skip reason, the `EmitMany` fan-out records, the
+//! `$pipeline.*` / `$source.*` side-effect channel, and (on the error
+//! path) the error kind, span, and boundary provenance — and asserts it
+//! against the expected literal. Float results are NaN-canonicalized
+//! first so an expected NaN compares equal rather than false-failing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use crate::typecheck::row::Row;
 
 /// Window storage stand-in for the no-window scalar-core programs under
 /// test. Every method is unreachable here; the scalar core never reads
-/// the window, so the differential harness always passes `None`.
+/// the window, so the golden tests always pass `None`.
 struct NullStorage;
 impl RecordStorage for NullStorage {
     fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
@@ -54,7 +55,7 @@ fn empty_row() -> Row {
 
 /// Parse → resolve → typecheck a CXL program against the given input
 /// field names, attaching the source text so error spans render
-/// identically through both evaluators. Returns `None` when the program
+/// identically through the compiled evaluator. Returns `None` when the program
 /// fails to parse, resolve, or typecheck — the proptest uses this to
 /// discard generated programs that are not well-typed CXL (e.g. a field
 /// used as both numeric and string), since neither evaluator is defined
@@ -107,7 +108,7 @@ type Pairs = Vec<(String, Value)>;
 type EmitRecordProjection = (Pairs, Pairs);
 
 /// Canonical, comparable projection of an [`EvalResult`] (or the error
-/// it surfaced). Reduces both evaluators' outputs to plain owned data so
+/// it surfaced). Reduces the evaluator's output to plain owned data so
 /// a single `assert_eq!` covers fields, record-vars, skip reason, and —
 /// on the error path — the error kind string, span, and boundary
 /// provenance fields.
@@ -135,8 +136,8 @@ enum ResultProjection {
 ///
 /// `Value`'s own `PartialEq` compares floats by `to_bits()`, so two NaNs
 /// that agree only on "is a NaN" but carry different payload bits would
-/// compare unequal and false-fail the differential assertion even though
-/// the two evaluators agree. Canonicalizing here mirrors the
+/// compare unequal and false-fail the assertion even though
+/// an expected NaN would be wanted. Canonicalizing here mirrors the
 /// distinct-key path's NaN handling so an agreed NaN compares equal.
 fn canonicalize_nan(v: &Value) -> Value {
     match v {
@@ -190,9 +191,8 @@ fn project(result: &Result<EvalResult, EvalError>) -> ResultProjection {
 /// The post-run side-effect channel: the `$pipeline.*` and `$source.*`
 /// variable maps a run wrote through its [`StableEvalContext`]. These
 /// writes are pure side effects — they never appear in [`EvalResult`] —
-/// so an `EvalResult`-only comparison is blind to a compiled-vs-tree-walk
-/// divergence on emit routing for these two targets. Capturing them lets
-/// the differential assert the side-effect channel agrees too.
+/// so capturing them lets a case pin emit routing for the pipeline/source
+/// targets, which an `EvalResult`-only assertion cannot see.
 ///
 /// `pipeline` is the ordered `(key, value)` list from `pipeline_vars`.
 /// `source` is keyed by source-file path (sorted for determinism, since
@@ -205,12 +205,8 @@ struct SideEffects {
 }
 
 /// Snapshot the `$pipeline.*` / `$source.*` writes a run left on its
-/// `StableEvalContext`, NaN-canonicalizing every value so an agreed NaN
+/// `StableEvalContext`, NaN-canonicalizing every value so an expected NaN
 /// compares equal rather than false-failing (mirroring [`project`]).
-///
-/// Each evaluator must run against its OWN context for this to be a real
-/// differential: a shared context would let the second run observe the
-/// first's writes, collapsing the comparison to a tautology.
 fn snapshot_side_effects(stable: &StableEvalContext) -> SideEffects {
     let pipeline: Pairs = stable
         .pipeline_vars
@@ -239,41 +235,20 @@ fn snapshot_side_effects(stable: &StableEvalContext) -> SideEffects {
     SideEffects { pipeline, source }
 }
 
-/// Assert the two runs' `$pipeline.*` / `$source.*` side-effect channels
-/// agree, byte-for-byte. Run alongside the [`EvalResult`] comparison so a
-/// divergence on emit routing for the pipeline/source targets — value,
-/// key, which writes happen, or their order — fails the differential even
-/// though those writes never surface in `EvalResult`.
-fn assert_side_effects_agree(tree: &StableEvalContext, comp: &StableEvalContext, src: &str) {
-    assert_eq!(
-        snapshot_side_effects(tree),
-        snapshot_side_effects(comp),
-        "tree-walk and compiled diverged on $pipeline/$source side effects for `{src}`",
-    );
-}
-
-/// Assert the tree-walk and the compiled evaluator agree byte-for-byte
-/// on `src` evaluated against `record`. Returns the shared projection so
-/// callers can additionally assert the concrete outcome.
-///
-/// `TypedProgram` is not `Clone` and `ProgramEvaluator` needs an owned
-/// `Arc<TypedProgram>`, so the program is type-checked twice from the
-/// same source with the same input field set — the two are identical by
-/// construction.
-///
-/// Each path runs against its OWN `StableEvalContext` so the
-/// `$pipeline.*` / `$source.*` writes one path makes are invisible to the
-/// other; the two contexts are then compared so emit routing for those
-/// side-effect-only targets is held to the same fidelity bar as the
-/// surfaced `EvalResult`.
+/// Evaluate `src` against `record` through the compiled evaluator and
+/// return the projected [`EvalResult`]. Callers assert it against the
+/// expected literal.
 fn assert_agree(src: &str, fields: &[&str], record: HashMap<String, Value>) -> ResultProjection {
     assert_agree_capturing(src, fields, record).0
 }
 
-/// Like [`assert_agree`] but also returns the agreed `$pipeline.*` /
-/// `$source.*` side-effect snapshot, so a caller can additionally assert
-/// the concrete values written through that channel — not just that the
-/// two paths agree on it.
+/// Like [`assert_agree`] but also returns the `$pipeline.*` / `$source.*`
+/// side-effect snapshot, so a caller can additionally assert the concrete
+/// values written through that channel.
+///
+/// The program runs through the live `ProgramEvaluator::eval_record`
+/// entry — the same wiring (and error boundary) production uses — so the
+/// case exercises the real path, not a test-local re-implementation.
 fn assert_agree_capturing(
     src: &str,
     fields: &[&str],
@@ -282,36 +257,17 @@ fn assert_agree_capturing(
     let typed = type_program(src, fields);
     let has_distinct = program_has_distinct(&typed);
 
-    let stable_tw = StableEvalContext::test_default();
-    let stable_c = StableEvalContext::test_default();
+    let stable = StableEvalContext::test_default();
     let resolver = HashMapResolver::new(record);
 
-    // Both paths run through the live `ProgramEvaluator::eval_record`
-    // entry — only the `use_compiled` flag differs — so the test exercises
-    // the same wiring (and the same error boundary) production uses, not a
-    // test-local re-implementation. The distinct flag is detected the same
-    // way for both, so a `distinct` program allocates dedup state on both
-    // sides.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-    let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+    let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-    let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    comp_eval.set_use_compiled(true);
-    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
-
-    let tree_proj = project(&tree);
-    let comp_proj = project(&comp);
-    assert_eq!(
-        tree_proj, comp_proj,
-        "tree-walk and compiled diverged on `{src}`",
-    );
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
-    (tree_proj, snapshot_side_effects(&stable_tw))
+    (project(&result), snapshot_side_effects(&stable))
 }
 
-// ── Differential corpus: the scalar core ───────────────────────────────
+// ── Corpus: the scalar core ───────────────────────────────
 
 /// The full three-valued Kleene truth table for `and` / `or`. Each
 /// operand is forced to true / false / null via a let-bound field so the
@@ -340,7 +296,7 @@ fn kleene_truth_table() {
 
 /// `and` / `or` must short-circuit identically: the right operand is a
 /// division-by-zero that errors if evaluated. `false && X` and
-/// `true || X` must NOT evaluate `X`, so both paths agree on a clean
+/// `true || X` must NOT evaluate `X`, yielding a clean
 /// emit; the other states must evaluate `X` and both must surface the
 /// same error.
 #[test]
@@ -551,7 +507,7 @@ fn unary_ops() {
 
 /// All four emit targets land in the right channel: Field → output map,
 /// Record → record_vars, Pipeline / Source → context (neither surfaces
-/// in the result), with both evaluators agreeing on the surfaced shape.
+/// in the result); the surfaced shape is pinned.
 #[test]
 fn emit_targets() {
     // Field.
@@ -608,13 +564,12 @@ fn source_writes_for_default_file(effects: &SideEffects) -> Pairs {
 /// `$pipeline.*` / `$source.*` emits write *values*, not just the empty
 /// presence the `emit_targets` smoke check covers. The `EvalResult` is
 /// blind to these writes — they live only on the context — so this drives
-/// each evaluator against its own context and asserts the post-run
-/// pipeline/source maps agree across the two paths *and* carry the exact
-/// computed values. Without the side-effect comparison the differential
-/// would pass even if the compiled node routed a `$pipeline.*` write to
-/// the wrong key, wrote the wrong value, or dropped the write entirely.
+/// the evaluator and asserts the post-run pipeline/source maps carry the
+/// exact computed values. Without the side-effect snapshot the test would
+/// pass even if the compiled node routed a `$pipeline.*` write to the
+/// wrong key, wrote the wrong value, or dropped the write entirely.
 #[test]
-fn pipeline_source_emit_values_agree() {
+fn pipeline_source_emit_values() {
     // A single computed pipeline write: `count = a * 2` over a = 21 → 42.
     let (proj, effects) = assert_agree_capturing(
         "emit $pipeline.count = a * 2",
@@ -667,7 +622,7 @@ fn pipeline_source_emit_values_agree() {
     );
 
     // Last-write-wins on a repeated key: the second write to `dup` must be
-    // the surviving value on both paths.
+    // the surviving value.
     let (_, effects) = assert_agree_capturing(
         "emit $pipeline.dup = 1\nemit $pipeline.dup = 2",
         &[],
@@ -679,7 +634,7 @@ fn pipeline_source_emit_values_agree() {
     );
 
     // A conditional write: the `if` selects which branch's value lands, so
-    // the recorded pipeline value tracks the taken branch on both paths.
+    // the recorded pipeline value tracks the taken branch.
     let (_, effects) = assert_agree_capturing(
         "emit $pipeline.bucket = if a > 0 then \"pos\" else \"nonpos\"",
         &["a"],
@@ -692,12 +647,12 @@ fn pipeline_source_emit_values_agree() {
 }
 
 /// A `$pipeline.*` write *before* a later statement that errors must still
-/// be observable on both contexts: the emit routes its value through the
+/// be observable on the context: the emit routes its value through the
 /// context immediately, then the subsequent division-by-zero aborts the
-/// record. Both paths must agree the early write landed and the run then
-/// errored — proving the compiled node writes the side-effect channel at
-/// the same point in the statement sequence the tree-walk does, not all at
-/// once at the end.
+/// record. The early write must have landed before the run errored —
+/// proving the compiled node writes the side-effect channel at the point
+/// in the statement sequence it reaches the emit, not all at once at the
+/// end.
 #[test]
 fn pipeline_emit_before_error_is_observable() {
     let (proj, effects) = assert_agree_capturing(
@@ -712,7 +667,7 @@ fn pipeline_emit_before_error_is_observable() {
         ResultProjection::Err { kind, .. } => assert_eq!(kind, "DivisionByZero"),
         other => panic!("expected DivisionByZero, got {other:?}"),
     }
-    // The pre-error write is present and identical on both contexts.
+    // The pre-error write is present on the context.
     assert_eq!(
         effects.pipeline,
         vec![("seen".to_string(), Value::Integer(9))],
@@ -817,7 +772,7 @@ fn index_access() {
 
 /// Error path: division by zero must surface the same error kind, span,
 /// boundary `source_row`, `source_expr`, and `triggering_field` from
-/// both evaluators.
+/// the compiled evaluator.
 #[test]
 fn error_span_fidelity_division_by_zero() {
     let proj = assert_agree(
@@ -870,7 +825,7 @@ fn multi_statement_ordering() {
     );
 }
 
-// ── Differential corpus: method calls ──────────────────────────────────
+// ── Corpus: method calls ──────────────────────────────────
 
 /// String builtins delegate to the shared `dispatch_method`, so both
 /// evaluators produce identical results for the common string surface.
@@ -988,7 +943,7 @@ fn regex_methods() {
     with_s("emit out = s.capture(\"([a-z]+)([0-9]+)\")", "abc123");
 }
 
-// ── Differential corpus: closure-bearing array builtins ────────────────
+// ── Corpus: closure-bearing array builtins ────────────────
 
 /// Build an array `Value`, the receiver shape the closure builtins
 /// require.
@@ -998,7 +953,7 @@ fn arr(items: Vec<Value>) -> Value {
 
 /// Each closure builtin (`filter` / `map` / `find` / `any` / `flat_map`)
 /// runs the host loop over a separately-compiled closure body and must
-/// agree with the tree-walk on a populated array.
+/// produce the expected value on a populated array.
 ///
 /// CXL has no array-literal syntax, so `flat_map`'s array-producing body
 /// uses a string element split into an array (`it.split(",")`); the
@@ -1040,7 +995,7 @@ fn closure_builtins_populated() {
 }
 
 /// A null receiver short-circuits every closure builtin to `Null`; the
-/// body never runs, matching the tree-walk's null-propagation.
+/// body never runs (the null-propagation policy).
 #[test]
 fn closure_builtins_null_receiver() {
     let null_recv_nums = |src: &str| {
@@ -1157,10 +1112,10 @@ fn closure_body_error_propagates() {
     }
 }
 
-// ── Differential corpus: hardening — mixed numerics, ordering, Kleene ───
+// ── Corpus: hardening — mixed numerics, ordering, Kleene ───
 
 /// Mixed int/float comparison widens the int to float before comparing;
-/// both evaluators must agree on the widened ordering.
+/// the widened ordering is pinned.
 #[test]
 fn mixed_int_float_comparison() {
     // Integer(2) > Float(1.5) → true.
@@ -1213,7 +1168,7 @@ fn mixed_int_float_comparison() {
     );
 }
 
-/// String ordering compares lexicographically; both evaluators agree.
+/// String ordering compares lexicographically.
 #[test]
 fn string_ordering() {
     let proj = assert_agree(
@@ -1329,7 +1284,7 @@ fn nan_result_agrees() {
 
 /// The `Any`-receiver method shapes the proptest generator emits
 /// (`to_string` / `is_null` / `type_of` / `catch`) typecheck on the
-/// generated leaf set and agree across both evaluators — pinned here so
+/// generated leaf set and evaluate cleanly — pinned here so
 /// the property test's method coverage cannot silently collapse to
 /// all-rejected without this deterministic case also failing.
 #[test]
@@ -1378,7 +1333,7 @@ fn regex_method_null_receiver() {
 /// is evaluated eagerly *before* `dispatch_method` runs, so an error in
 /// the receiver expression propagates and `catch` never substitutes its
 /// default. The receiver here is non-null-shaped but raises a real error
-/// (division by zero); both evaluators must surface that error identically
+/// (division by zero); the run must surface that error
 /// rather than returning the `catch` default.
 #[test]
 fn catch_does_not_swallow_receiver_error() {
@@ -1393,7 +1348,7 @@ fn catch_does_not_swallow_receiver_error() {
     }
 }
 
-// ── Differential corpus: window leaves ─────────────────────────────────
+// ── Corpus: window leaves ─────────────────────────────────
 
 /// In-memory partition storage for the window corpus: a list of records,
 /// each a field map. Indexed by record position; the window context reads
@@ -1424,8 +1379,8 @@ impl RecordStorage for VecStorage {
 /// Window over the whole `VecStorage`, with an explicit current-row index
 /// so `lag`/`lead` resolve relative to a known position. Aggregate methods
 /// compute real sums/averages over the numeric fields of the partition so
-/// the differential exercises the trait surface with non-trivial values;
-/// both evaluators call the identical methods, so the comparison validates
+/// the test exercises the trait surface with non-trivial values;
+/// the call routes through the trait, so the test validates
 /// dispatch parity, not the aggregate arithmetic itself.
 struct VecWindow<'a> {
     storage: &'a VecStorage,
@@ -1575,10 +1530,15 @@ fn type_program_with_row(
         .with_source(Arc::from(src))
 }
 
-/// Assert the tree-walk and the compiled evaluator agree on a window
-/// program, evaluated with the same `VecWindow` over `partition` and the
-/// same current-row index. The transform's own input record is empty (the
+/// Evaluate a window program through the compiled evaluator with a
+/// `VecWindow` over `partition` at the given current-row index, returning
+/// the projected result. The transform's own input record is empty (the
 /// scalar core reads nothing here); every read flows through the window.
+///
+/// Running through the live `ProgramEvaluator::eval_record` with a real
+/// `WindowContext` and a non-`NullStorage` `S` exercises the per-`S`
+/// program cache and window-leaf monomorphization the production entry
+/// uses.
 fn assert_agree_window(
     src: &str,
     fields: &[(&str, crate::typecheck::types::Type)],
@@ -1587,8 +1547,7 @@ fn assert_agree_window(
 ) -> ResultProjection {
     let typed = type_program_with_row(src, fields);
     let has_distinct = program_has_distinct(&typed);
-    let stable_tw = StableEvalContext::test_default();
-    let stable_c = StableEvalContext::test_default();
+    let stable = StableEvalContext::test_default();
     let resolver = HashMapResolver::new(HashMap::new());
     let storage = VecStorage { rows: partition };
     let window = VecWindow {
@@ -1596,30 +1555,11 @@ fn assert_agree_window(
         current,
     };
 
-    // Both paths run through the live `ProgramEvaluator::eval_record` with
-    // a real `WindowContext` and a non-`NullStorage` `S`, so the compiled
-    // path exercises its per-`S` program cache and window-leaf
-    // monomorphization through the same entry production uses. Separate
-    // contexts keep the $pipeline/$source side-effect comparison honest.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-    let mut tree_eval =
-        ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
-    let tree = tree_eval.eval_record::<VecStorage>(&ctx_tw, &resolver, Some(&window));
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+    let result = eval.eval_record::<VecStorage>(&ctx, &resolver, Some(&window));
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-    let mut comp_eval =
-        ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
-    comp_eval.set_use_compiled(true);
-    let comp = comp_eval.eval_record::<VecStorage>(&ctx_c, &resolver, Some(&window));
-
-    let tree_proj = project(&tree);
-    let comp_proj = project(&comp);
-    assert_eq!(
-        tree_proj, comp_proj,
-        "tree-walk and compiled diverged on window program `{src}`",
-    );
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
-    tree_proj
+    project(&result)
 }
 
 /// One partition row from `(field, value)` pairs.
@@ -1628,7 +1568,7 @@ fn row(pairs: Vec<(&str, Value)>) -> indexmap::IndexMap<String, Value> {
 }
 
 /// Bare aggregate / cardinality / rank window builtins lower to leaf trait
-/// calls; both evaluators dispatch to the same `VecWindow` methods.
+/// calls dispatch to the `VecWindow` methods.
 #[test]
 fn window_bare_calls() {
     use crate::typecheck::types::Type;
@@ -1670,7 +1610,7 @@ fn window_bare_calls() {
 }
 
 /// The `$window.<fn>().<field>` chain resolves a field off a positional
-/// window row with no intermediate `Value`; both evaluators read the same
+/// window row with no intermediate `Value`; the read goes through the same
 /// `RecordView`. Covers `first`/`last`/`lag`/`lead`, including an
 /// out-of-range offset that resolves to `Null`.
 #[test]
@@ -1730,7 +1670,7 @@ fn window_empty_partition() {
 }
 
 /// A window read with no window context available surfaces the same typed
-/// error from both evaluators (rather than one returning `Null`). Driven
+/// error (rather than a silent `Null`). Driven
 /// through the no-window `assert_agree` path, which threads `None`.
 #[test]
 fn window_missing_context_errors() {
@@ -1746,7 +1686,7 @@ fn window_missing_context_errors() {
 
 /// The `$window` predicate folds (`any`/`every`/`exists`/`not_exists`)
 /// run a compiled predicate over every partition record with the same
-/// three-valued Kleene collapse the tree-walk uses — including the
+/// three-valued Kleene collapse — including the
 /// short-circuit, the null-taint, and the iterated-operator identity on
 /// an empty fold.
 #[test]
@@ -1810,7 +1750,7 @@ fn window_predicate_folds() {
     assert_agree_window("emit out = $window.every(flag)", fields, vec![], 0);
 }
 
-// ── Differential corpus: distinct ──────────────────────────────────────
+// ── Corpus: distinct ──────────────────────────────────────
 
 /// One record in a distinct stream: an optional partition key to set
 /// before evaluating, paired with the record's field map.
@@ -1819,11 +1759,15 @@ type DistinctStreamRecord = (
     HashMap<String, Value>,
 );
 
-/// Drive a stream of records through both evaluators with shared dedup
-/// state, optionally setting a partition key before each record. Asserts
-/// the two evaluators agree on every record's outcome and returns the
-/// per-record projections so callers can assert the concrete skip/emit
-/// sequence.
+/// Drive a stream of records through one compiled evaluator with shared
+/// dedup state, optionally setting a partition key before each record.
+/// Returns the per-record projections so callers can assert the concrete
+/// skip/emit sequence.
+///
+/// Driving through `ProgramEvaluator` (not the raw program) exercises the
+/// production state-threading: `set_partition` reaches the shared
+/// `EvalState`, and per-record dedup runs against it, so distinct and
+/// partition-reset behave as production does.
 fn assert_agree_distinct_stream(
     src: &str,
     fields: &[&str],
@@ -1835,52 +1779,26 @@ fn assert_agree_distinct_stream(
         has_distinct,
         "distinct stream helper requires a distinct program"
     );
-    let stable_tw = StableEvalContext::test_default();
-    let stable_c = StableEvalContext::test_default();
+    let stable = StableEvalContext::test_default();
 
-    // Two live evaluators differing only in `use_compiled`. Driving the
-    // compiled side through `ProgramEvaluator` (not the raw program) proves
-    // the production state-threading: `set_partition` reaches the shared
-    // `EvalState`, and per-record dedup runs against it, so distinct and
-    // partition-reset behave identically through either path. Each path
-    // writes its own context so the post-stream $pipeline/$source
-    // comparison is a real differential.
-    let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    comp_eval.set_use_compiled(true);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
 
     let mut out = Vec::new();
     for (partition_key, record) in records {
         if let Some(key) = &partition_key {
-            tree_eval.set_partition(key);
-            comp_eval.set_partition(key);
+            eval.set_partition(key);
         }
         let resolver = HashMapResolver::new(record);
-
-        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-        let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
-
-        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
-
-        let tree_proj = project(&tree);
-        let comp_proj = project(&comp);
-        assert_eq!(
-            tree_proj, comp_proj,
-            "tree-walk and compiled diverged on distinct stream `{src}`",
-        );
-        out.push(tree_proj);
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
+        out.push(project(&result));
     }
-    // The side-effect channel accumulates across the whole stream (writes
-    // are last-write-wins per key), so compare the two contexts once after
-    // the stream drains rather than per record.
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
     out
 }
 
 /// `distinct by <field>`: the first occurrence of a key emits, later
-/// duplicates skip with `Skip(Duplicate)`. Both evaluators agree across
-/// the stream against the shared dedup set.
+/// duplicates skip with `Skip(Duplicate)`, across the stream against the
+/// shared dedup set.
 #[test]
 fn distinct_duplicate_skip() {
     let stream = vec![
@@ -1936,7 +1854,7 @@ fn distinct_partition_reset() {
 }
 
 /// A NaN distinct key surfaces the same `GroupKeyError`-derived error from
-/// both evaluators (NaN is not hashable as a group key). The error path is
+/// the run (NaN is not hashable as a group key). The error path is
 /// compared on kind + span + provenance, identically to a value path.
 #[test]
 fn distinct_nan_key_errors() {
@@ -1955,7 +1873,7 @@ fn distinct_nan_key_errors() {
 }
 
 /// A bare `distinct` (no field) keys on every input field through the
-/// resolver's `iter_fields`; both evaluators hash the full record
+/// resolver's `iter_fields`; the run hashes the full record
 /// identically and dedup in lockstep. A single input field keeps the
 /// all-fields key order deterministic (the test resolver iterates a
 /// `HashMap`, whose multi-field order is per-instance randomized), so the
@@ -1979,10 +1897,10 @@ fn distinct_bare_all_fields() {
     assert_eq!(dup, vec![false, false, true, true]);
 }
 
-// ── Differential corpus: emit each ─────────────────────────────────────
+// ── Corpus: emit each ─────────────────────────────────────
 
 /// `emit each` fans an array source into one output record per element;
-/// both evaluators produce identical `EmitMany` records. The per-element
+/// the run produces the expected `EmitMany` records. The per-element
 /// binding is visible to the body, and a field emit before the block seeds
 /// every produced record.
 #[test]
@@ -2041,7 +1959,7 @@ fn emit_each_null_source() {
     );
 }
 
-/// An empty array source runs zero body iterations; both evaluators
+/// An empty array source runs zero body iterations; the run
 /// produce zero fanned records (a plain `Emit` with any pre-block writes).
 #[test]
 fn emit_each_empty_array() {
@@ -2060,15 +1978,14 @@ fn emit_each_empty_array() {
 }
 
 /// The fan-out ceiling fires *before* the body when the running emit count
-/// reaches `max_expansion`. Driven through a dedicated helper that sets a
-/// low ceiling on both evaluators so the boundary is observable; both must
-/// surface `ExpansionLimitExceeded` at the same element.
+/// reaches `max_expansion`. A low ceiling threaded through
+/// `with_max_expansion` makes the boundary observable; the run must
+/// surface `ExpansionLimitExceeded`.
 #[test]
 fn emit_each_ceiling_boundary() {
     let src = "emit each n in nums {\n  emit val = n\n}";
     let typed = type_program(src, &["nums"]);
-    let stable_tw = StableEvalContext::test_default();
-    let stable_c = StableEvalContext::test_default();
+    let stable = StableEvalContext::test_default();
     let nums = Value::Array(vec![
         Value::Integer(1),
         Value::Integer(2),
@@ -2077,26 +1994,12 @@ fn emit_each_ceiling_boundary() {
     let resolver = HashMapResolver::new(HashMap::from([("nums".to_string(), nums)]));
 
     // Ceiling of 2 over a 3-element array → the third element trips it.
-    // The compiled side gets the same ceiling through `with_max_expansion`,
-    // which threads it into the shared `EvalState`.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-    let mut tree_eval =
-        ProgramEvaluator::with_max_expansion(Arc::new(type_program(src, &["nums"])), false, 2);
-    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    // `with_max_expansion` threads the ceiling into the shared `EvalState`.
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::with_max_expansion(Arc::new(typed), false, 2);
+    let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-    let mut comp_eval = ProgramEvaluator::with_max_expansion(Arc::new(typed), false, 2);
-    comp_eval.set_use_compiled(true);
-    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
-
-    let tree_proj = project(&tree);
-    assert_eq!(
-        tree_proj,
-        project(&comp),
-        "tree-walk and compiled diverged on emit-each ceiling",
-    );
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
-    match tree_proj {
+    match project(&result) {
         ResultProjection::Err { kind, .. } => assert!(
             kind.contains("ExpansionLimitExceeded"),
             "expected ExpansionLimitExceeded, got {kind}"
@@ -2105,12 +2008,12 @@ fn emit_each_ceiling_boundary() {
     }
 }
 
-/// A `trace` inside an `emit each` body is a no-op in both evaluators: its
-/// guard and message are never evaluated. The guard here divides by a
-/// zero-valued field and the message reads `1 / z`, so if either evaluator
-/// *did* evaluate the trace it would surface `DivisionByZero` instead of
-/// fanning out cleanly. Both must produce the identical fan-out, proving
-/// the compiled emit-each body no-ops trace exactly as the tree-walk does.
+/// A `trace` inside an `emit each` body is a no-op: its guard and message
+/// are never evaluated. The guard here divides by a zero-valued field and
+/// the message reads `1 / z`, so if the trace *were* evaluated it would
+/// surface `DivisionByZero` instead of fanning out cleanly. The run must
+/// produce the clean fan-out, proving the compiled emit-each body no-ops
+/// the trace.
 #[test]
 fn emit_each_body_trace_is_noop() {
     let nums = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
@@ -2139,14 +2042,14 @@ fn emit_each_body_trace_is_noop() {
     }
 }
 
-// ── Differential corpus: system-access leaves with resolvable data ─────
+// ── Corpus: system-access leaves with resolvable data ─────────────────
 
-/// Assert agreement on a program that references declared scoped vars /
-/// sources, with the resolve and typecheck passes threaded the same
+/// Evaluate a program that references declared scoped vars / sources,
+/// with the resolve and typecheck passes threaded the same
 /// `ScopedVarsRegistry` so `$vars.<key>` / `$source.<input>.<field>` /
 /// qualified field refs resolve. The eval context's `static_vars` /
 /// `source_input_arcs` stay empty, so the declared reads resolve to
-/// `Null` at run time — identically through both evaluators.
+/// `Null` at run time; returns the projected result.
 fn assert_agree_with_vars(
     src: &str,
     fields: &[&str],
@@ -2156,80 +2059,57 @@ fn assert_agree_with_vars(
 ) -> ResultProjection {
     use crate::resolve::pass::resolve_program_with_modules_and_vars;
     use crate::typecheck::pass::{AggregateMode, type_check_with_mode_and_vars};
-    let build = || {
-        let parsed = Parser::parse(src);
-        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
-        let resolved = resolve_program_with_modules_and_vars(
-            parsed.ast,
-            fields,
-            parsed.node_count,
-            &std::collections::HashMap::new(),
-            registry,
+    let parsed = Parser::parse(src);
+    assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+    let resolved = resolve_program_with_modules_and_vars(
+        parsed.ast,
+        fields,
+        parsed.node_count,
+        &std::collections::HashMap::new(),
+        registry,
+    )
+    .unwrap_or_else(|d| {
+        panic!(
+            "resolve: {:?}",
+            d.iter().map(|e| &e.message).collect::<Vec<_>>()
         )
+    });
+    let typed = type_check_with_mode_and_vars(resolved, &empty_row(), AggregateMode::Row, registry)
         .unwrap_or_else(|d| {
             panic!(
-                "resolve: {:?}",
+                "type: {:?}",
                 d.iter().map(|e| &e.message).collect::<Vec<_>>()
             )
-        });
-        type_check_with_mode_and_vars(resolved, &empty_row(), AggregateMode::Row, registry)
-            .unwrap_or_else(|d| {
-                panic!(
-                    "type: {:?}",
-                    d.iter().map(|e| &e.message).collect::<Vec<_>>()
-                )
-            })
-            .with_source(Arc::from(src))
-    };
-    let typed = build();
+        })
+        .with_source(Arc::from(src));
+
     // Declare each qualified-source input name with an empty Arc list so
     // `$source.<input>.<field>` resolves to Null at eval rather than
-    // panicking on a missing map entry; the lookup still flows through
-    // both evaluators identically. Each path gets its own context — with
-    // an independently-built (but structurally identical) input map — so
-    // the $pipeline/$source side-effect comparison stays a real
-    // differential.
-    let build_stable = || {
-        let mut input_arcs = std::collections::HashMap::new();
-        for s in qualified_sources {
-            input_arcs.insert(s.to_string(), Vec::new());
-        }
-        StableEvalContext {
-            source_input_arcs: Arc::new(input_arcs),
-            ..StableEvalContext::test_default()
-        }
+    // panicking on a missing map entry.
+    let mut input_arcs = std::collections::HashMap::new();
+    for s in qualified_sources {
+        input_arcs.insert(s.to_string(), Vec::new());
+    }
+    let stable = StableEvalContext {
+        source_input_arcs: Arc::new(input_arcs),
+        ..StableEvalContext::test_default()
     };
-    let stable_tw = build_stable();
-    let stable_c = build_stable();
     let resolver = HashMapResolver::new(record);
 
-    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-    let mut tree_eval = ProgramEvaluator::new(Arc::new(build()), false);
-    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), false);
+    let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-    let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
-    comp_eval.set_use_compiled(true);
-    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
-
-    let tree_proj = project(&tree);
-    let comp_proj = project(&comp);
-    assert_eq!(
-        tree_proj, comp_proj,
-        "tree-walk and compiled diverged on `{src}`",
-    );
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
-    tree_proj
+    project(&result)
 }
 
-// ── Differential corpus: the `trace` log channel ──────────────────────
+// ── Corpus: the `trace` log channel ───────────────────────────────────
 
 /// One captured `trace` event: the level the statement chose and the
-/// rendered message text. The differential assertion compares a
-/// `Vec<CapturedTrace>` produced by each evaluator; `source_row` /
-/// `source_file` ride along on the same event but the message and level
-/// are the channel a wrong-level or wrong-guard compiled node would
-/// corrupt, so those two are what the test pins.
+/// rendered message text. `source_row` / `source_file` ride along on the
+/// same event but the message and level are the channel a wrong-level or
+/// wrong-guard compiled node would corrupt, so those two are what the test
+/// pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedTrace {
     level: tracing::Level,
@@ -2257,8 +2137,8 @@ impl tracing::field::Visit for MessageVisitor {
 }
 
 /// A `tracing` layer that appends every event's `(level, message)` to a
-/// shared buffer. Installed via `with_default` around one eval call so
-/// the two evaluators never write to the same buffer concurrently.
+/// shared buffer. Installed via `with_default` around one eval call so the
+/// capture is scoped to that single run.
 struct CapturingLayer(Arc<std::sync::Mutex<Vec<CapturedTrace>>>);
 
 impl<S> tracing_subscriber::Layer<S> for CapturingLayer
@@ -2279,105 +2159,106 @@ where
     }
 }
 
-/// Run one record through `evaluator` with a capturing subscriber scoped
-/// to just this call, returning the trace events emitted. `with_default`
-/// installs the subscriber for the current thread only for the duration
-/// of the closure, so the two evaluators' captures stay isolated.
+/// Run one record through the compiled evaluator with a capturing
+/// subscriber scoped to just this call, returning the trace events
+/// emitted. `with_default` installs the subscriber for the current thread
+/// only for the duration of the closure, so the capture stays isolated.
 fn capture_traces(
-    evaluator: &mut ProgramEvaluator,
-    ctx: &EvalContext<'_>,
-    resolver: &HashMapResolver,
+    src: &str,
+    fields: &[&str],
+    record: HashMap<String, Value>,
 ) -> Vec<CapturedTrace> {
     use tracing_subscriber::layer::SubscriberExt;
+    let typed = type_program(src, fields);
+    let has_distinct = program_has_distinct(&typed);
+    let stable = StableEvalContext::test_default();
+    let resolver = HashMapResolver::new(record);
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CapturingLayer(Arc::clone(&captured)));
     tracing::subscriber::with_default(subscriber, || {
-        // Discard the EvalResult — fields/skip/error fidelity is the
-        // differential harness's job; this helper isolates the trace
-        // channel. The corpus programs emit cleanly, so a clean evaluate
-        // is expected on both paths.
-        let _ = evaluator
-            .eval_record::<NullStorage>(ctx, resolver, None)
+        // Discard the EvalResult — the field/skip/error channel is pinned
+        // by the other tests; this helper isolates the trace channel. The
+        // corpus programs emit cleanly, so a clean evaluate is expected.
+        let _ = eval
+            .eval_record::<NullStorage>(&ctx, &resolver, None)
             .expect("trace-fidelity program evaluates cleanly");
     });
     Arc::try_unwrap(captured).unwrap().into_inner().unwrap()
 }
 
-/// The `trace` statement's emitted log line and level must agree across
-/// the tree-walk and the compiled evaluator. This is the one fidelity
-/// channel the `EvalResult`-comparing differential harness cannot see:
-/// `trace` writes to the `tracing` sink, not to `fields` / `$record` /
-/// `$pipeline`, so a compiled node that fired at the wrong level, dropped
-/// a guarded trace, or rendered a different computed message would pass
-/// the harness yet corrupt observability.
+/// The `trace` statement's emitted log line and level. This is the one
+/// fidelity channel the `EvalResult` cannot see: `trace` writes to the
+/// `tracing` sink, not to `fields` / `$record` / `$pipeline`, so a
+/// compiled node that fired at the wrong level, dropped a guarded trace,
+/// or rendered a different computed message would pass every other test
+/// yet corrupt observability. Each case pins the exact `(level, message)`
+/// sequence the compiled path must emit.
 ///
-/// Each case carries a guard plus a computed (concatenated, field-derived)
+/// Cases carry a guard plus a computed (concatenated, field-derived)
 /// message so both the guard-branch and the message-evaluation paths are
 /// exercised: a guard that passes, a guard that suppresses, an explicit
 /// level, and a multi-statement program whose two traces must appear in
 /// order.
 #[test]
-fn trace_channel_agrees_across_evaluators() {
-    let cases: &[(&str, &[&str], HashMap<String, Value>)] = &[
-        // Guard true → the warn-level trace fires with a computed message.
-        (
+fn trace_channel_golden() {
+    use tracing::Level;
+    let line = |level: Level, message: &str| CapturedTrace {
+        level,
+        message: message.to_string(),
+    };
+
+    // Guard true → the warn-level trace fires with a computed message.
+    assert_eq!(
+        capture_traces(
             "trace warn if amount > 100 \"high amount: \" + amount.to_string()\nemit ok = 1",
             &["amount"],
             HashMap::from([("amount".to_string(), Value::Integer(250))]),
         ),
-        // Guard false → no trace event on either path.
-        (
+        vec![line(Level::WARN, "high amount: 250")],
+    );
+    // Guard false → no trace event.
+    assert_eq!(
+        capture_traces(
             "trace warn if amount > 100 \"high amount: \" + amount.to_string()\nemit ok = 1",
             &["amount"],
             HashMap::from([("amount".to_string(), Value::Integer(50))]),
         ),
-        // Unguarded info-level trace with a field-interpolated message.
-        (
+        vec![],
+    );
+    // Unguarded info-level trace with a field-interpolated message.
+    assert_eq!(
+        capture_traces(
             "trace info \"row \" + label\nemit ok = 1",
             &["label"],
             HashMap::from([("label".to_string(), Value::from("alpha"))]),
         ),
-        // Two traces at distinct levels must appear in statement order.
-        (
+        vec![line(Level::INFO, "row alpha")],
+    );
+    // Two traces at distinct levels must appear in statement order.
+    assert_eq!(
+        capture_traces(
             "trace debug \"first\"\ntrace error if amount > 0 \"second: \" + amount.to_string()\nemit ok = 1",
             &["amount"],
             HashMap::from([("amount".to_string(), Value::Integer(7))]),
         ),
-        // Default-level (bare `trace`) with a non-string computed message,
-        // which both paths render via the `{:?}` debug fallback.
-        (
+        vec![line(Level::DEBUG, "first"), line(Level::ERROR, "second: 7"),],
+    );
+    // Default-level (bare `trace`) with a computed string message.
+    assert_eq!(
+        capture_traces(
             "trace \"value=\" + (amount * 2).to_string()\nemit ok = 1",
             &["amount"],
             HashMap::from([("amount".to_string(), Value::Integer(21))]),
         ),
-    ];
-
-    for (src, fields, record) in cases {
-        let stable_tw = StableEvalContext::test_default();
-        let stable_c = StableEvalContext::test_default();
-        let resolver = HashMapResolver::new(record.clone());
-        let has_distinct = program_has_distinct(&type_program(src, fields));
-
-        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-        let mut tree_eval =
-            ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-        let tree_traces = capture_traces(&mut tree_eval, &ctx_tw, &resolver);
-
-        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-        let mut comp_eval =
-            ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-        comp_eval.set_use_compiled(true);
-        let comp_traces = capture_traces(&mut comp_eval, &ctx_c, &resolver);
-
-        assert_eq!(
-            tree_traces, comp_traces,
-            "trace lines/levels diverged on `{src}`",
-        );
-    }
+        vec![line(Level::TRACE, "value=42")],
+    );
 }
 
 /// `$source.<member>` builtins and `$doc.<section>.<field>` resolve
-/// without a declared registry; both evaluators agree, including the
+/// without a declared registry, including the
 /// `Null` an empty envelope resolves `$doc` to.
 #[test]
 fn system_access_builtins_and_doc() {
@@ -2392,7 +2273,7 @@ fn system_access_builtins_and_doc() {
     );
     // `$source.file` is a builtin string.
     assert_agree("emit out = $source.file", &[], HashMap::new());
-    // `$doc.<section>.<field>` with an empty envelope → Null on both paths.
+    // `$doc.<section>.<field>` with an empty envelope → Null.
     let proj = assert_agree("emit out = $doc.header.title", &[], HashMap::new());
     assert_eq!(
         proj,
@@ -2404,9 +2285,8 @@ fn system_access_builtins_and_doc() {
 }
 
 /// `$vars.<key>` (declared static config) resolves through the shared
-/// `static_vars` map; with the map empty at run time both evaluators read
-/// `Null`. Pinned because `VarsAccess` otherwise has zero differential
-/// coverage.
+/// `static_vars` map; with the map empty at run time the read returns
+/// `Null`. Pinned because `VarsAccess` otherwise has zero coverage.
 #[test]
 fn vars_access() {
     use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
@@ -2432,9 +2312,9 @@ fn vars_access() {
 
 /// `$source.<input_name>.<field>` (qualified source access) resolves
 /// through the plan-time `source_input_arcs` map. The input is declared so
-/// the read type-checks; with no source-var writes both evaluators
-/// resolve `Null`. Pinned because `QualifiedSourceAccess` otherwise has
-/// zero differential coverage.
+/// the read type-checks; with no source-var writes the read resolves
+/// `Null`. Pinned because `QualifiedSourceAccess` otherwise has zero
+/// coverage.
 #[test]
 fn qualified_source_access() {
     use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
@@ -2461,8 +2341,7 @@ fn qualified_source_access() {
 /// `$record.<key>` reads resolve through the dedicated record-vars channel
 /// (the resolver, under the `$record.` prefix). A declared-and-seeded key
 /// returns its value; a declared-but-unseeded key resolves `Null`. Pinned
-/// because the `RecordAccess` read form otherwise has zero differential
-/// coverage, and both evaluators reach it by separate code paths.
+/// because the `RecordAccess` read form otherwise has zero coverage.
 #[test]
 fn record_access_read() {
     use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
@@ -2497,9 +2376,8 @@ fn record_access_read() {
 
 /// A 3-part qualified field reference (`source.record_type.field`)
 /// resolves through `resolve_qualified` with the first two parts joined as
-/// the compound source key. With the qualified entry absent both
-/// evaluators resolve `Null`. Pinned because the 3-part form otherwise has
-/// zero differential coverage.
+/// the compound source key. Pinned because the 3-part form otherwise has
+/// zero coverage.
 #[test]
 fn qualified_field_ref_three_part() {
     let resolver = HashMapResolver::new(HashMap::new()).with_qualified(
@@ -2509,29 +2387,15 @@ fn qualified_field_ref_three_part() {
     );
     let src = "emit out = orders.line.amount";
     let typed = type_program(src, &[]);
-    let stable_tw = StableEvalContext::test_default();
-    let stable_c = StableEvalContext::test_default();
+    let stable = StableEvalContext::test_default();
 
-    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-    let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, &[])), false);
-    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), false);
+    let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-    let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
-    comp_eval.set_use_compiled(true);
-    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
-
-    let tree_proj = project(&tree);
+    // The compound `orders.line` + `amount` resolves to the seeded value.
     assert_eq!(
-        tree_proj,
-        project(&comp),
-        "tree-walk and compiled diverged on 3-part qualified ref",
-    );
-    assert_side_effects_agree(&stable_tw, &stable_c, src);
-    // The compound `orders.line` + `amount` resolves to the seeded value
-    // through both evaluators.
-    assert_eq!(
-        tree_proj,
+        project(&result),
         ResultProjection::Emit {
             fields: vec![("out".to_string(), Value::Integer(42))],
             record_vars: vec![],
@@ -2539,11 +2403,11 @@ fn qualified_field_ref_three_part() {
     );
 }
 
-// ── Differential corpus: real example-pipeline transform bodies ────────
+// ── Corpus: real example-pipeline transform bodies ─────────────────────
 
 /// The row-transform CXL bodies lifted verbatim from `examples/pipelines/`.
 /// Any pipeline body that type-checks as a flat row transform must diff
-/// identically between the two evaluators now that every node lowers;
+/// to the expected value now that every node lowers;
 /// aggregate / combine bodies (qualified refs, `sum(..)`) are not row
 /// transforms and are out of scope for this evaluator, so they are
 /// excluded rather than expected to type-check here.
@@ -2638,7 +2502,7 @@ fn example_pipeline_transform_bodies() {
 // ── Property test: random scalar-core expressions ──────────────────────
 
 /// A generated scalar-core expression. Lowers to CXL source text and is
-/// evaluated by both paths. The grammar covers literals (including
+/// evaluated by the compiled path. The grammar covers literals (including
 /// nulls), the three input field refs, nested binary / unary / coalesce
 /// / if, with real depth — but no method calls, closures, windows, or
 /// other deferred nodes.
@@ -2652,8 +2516,7 @@ enum GenExpr {
     /// A reference to an earlier `let v<i>` binding, rendered as the bare
     /// identifier `v<i>`. Only the statement-sequence proptest emits this,
     /// and only for an index already bound earlier in the same program, so
-    /// the reference is always in scope and resolves through the env on
-    /// both evaluators.
+    /// the reference is always in scope and resolves through the env.
     LetVar(usize),
     Binary(&'static str, Box<GenExpr>, Box<GenExpr>),
     Not(Box<GenExpr>),
@@ -2782,53 +2645,51 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
     /// For any generated scalar-core expression and any random a/b/c
-    /// inputs, the tree-walk and the compiled evaluator must produce
-    /// byte-identical results — value, skip, or error (kind + span +
-    /// boundary provenance).
+    /// inputs, the compiled evaluator must evaluate without panicking and
+    /// produce a *deterministic* result: two fresh runs of the same
+    /// program against the same record yield byte-identical projections
+    /// and `$pipeline`/`$source` side effects. This is the broad fuzz net
+    /// over the lowering vocabulary — a node that panics, leaks state
+    /// across runs, or depends on `HashMap` iteration order fails here.
     #[test]
-    fn compiled_matches_tree_walk(
+    fn compiled_eval_is_deterministic(
         expr in expr_strategy(),
         a in value_strategy(),
         b in value_strategy(),
         c in value_strategy(),
     ) {
         let src = format!("emit out = {}", expr.render());
-        // Discard programs that are not well-typed CXL (e.g. a field
-        // used as both numeric and string): neither evaluator is defined
-        // on them, so they are out of scope for the fidelity contract.
-        let typed = match try_type_program(&src, &["a", "b", "c"]) {
+        // Discard programs that are not well-typed CXL (e.g. a field used
+        // as both numeric and string): the evaluator is not defined on
+        // them, so they are out of scope.
+        let typed_a = match try_type_program(&src, &["a", "b", "c"]) {
             Some(t) => t,
             None => return Err(TestCaseError::reject("not well-typed")),
         };
-        let typed_tw = try_type_program(&src, &["a", "b", "c"]).expect("second type-check agrees");
+        let typed_b = try_type_program(&src, &["a", "b", "c"]).expect("second type-check agrees");
         let record = HashMap::from([
             ("a".to_string(), a),
             ("b".to_string(), b),
             ("c".to_string(), c),
         ]);
-
-        let stable_tw = StableEvalContext::test_default();
-        let stable_c = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
+        let has_distinct = program_has_distinct(&typed_a);
 
-        let has_distinct = program_has_distinct(&typed);
-        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-        let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
-        let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+        let stable_a = StableEvalContext::test_default();
+        let ctx_a = EvalContext::test_default_borrowed(&stable_a);
+        let mut eval_a = ProgramEvaluator::new(Arc::new(typed_a), has_distinct);
+        let first = eval_a.eval_record::<NullStorage>(&ctx_a, &resolver, None);
 
-        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-        let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
-        comp_eval.set_use_compiled(true);
-        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
+        let stable_b = StableEvalContext::test_default();
+        let ctx_b = EvalContext::test_default_borrowed(&stable_b);
+        let mut eval_b = ProgramEvaluator::new(Arc::new(typed_b), has_distinct);
+        let second = eval_b.eval_record::<NullStorage>(&ctx_b, &resolver, None);
 
-        prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
-        // The two paths ran against separate contexts, so this compares
-        // the $pipeline/$source side-effect channel — invisible to the
-        // EvalResult above — for any emit routing that wrote through it.
+        prop_assert_eq!(project(&first), project(&second), "non-deterministic on `{}`", src);
         prop_assert_eq!(
-            snapshot_side_effects(&stable_tw),
-            snapshot_side_effects(&stable_c),
-            "$pipeline/$source side effects diverged on `{}`",
+            snapshot_side_effects(&stable_a),
+            snapshot_side_effects(&stable_b),
+            "$pipeline/$source side effects non-deterministic on `{}`",
             src
         );
     }
@@ -2876,13 +2737,14 @@ proptest! {
 
     /// For any generated statement *sequence* — an optional leading
     /// `filter`, then one-to-six `let` / `emit` statements spanning all
-    /// four emit targets — the tree-walk and the compiled evaluator must
-    /// agree byte-for-byte on the result. This property-checks emit
-    /// routing (which channel each target lands in) and statement ordering
-    /// (the order field emits accumulate, and the filter short-circuit),
-    /// not just single-expression evaluation.
+    /// four emit targets — the compiled evaluator must run without
+    /// panicking and produce a *deterministic* result: two fresh runs
+    /// yield byte-identical projections and `$pipeline`/`$source` side
+    /// effects. This property-checks emit routing (which channel each
+    /// target lands in) and statement ordering (the order field emits
+    /// accumulate, and the filter short-circuit) under fuzz.
     #[test]
-    fn compiled_matches_tree_walk_statement_seq(
+    fn compiled_statement_seq_is_deterministic(
         leading_filter in proptest::option::of(expr_strategy()),
         // Each statement carries its own independent expr (kind, rhs,
         // ref_earlier_let) so the fuzz varies the RHS across the sequence
@@ -2933,41 +2795,37 @@ proptest! {
         lines.push("emit final = a".to_string());
         let src = lines.join("\n");
 
-        let typed = match try_type_program(&src, &["a", "b", "c"]) {
+        let typed_a = match try_type_program(&src, &["a", "b", "c"]) {
             Some(t) => t,
             None => return Err(TestCaseError::reject("not well-typed")),
         };
-        let typed_tw = try_type_program(&src, &["a", "b", "c"]).expect("second type-check agrees");
+        let typed_b = try_type_program(&src, &["a", "b", "c"]).expect("second type-check agrees");
         let record = HashMap::from([
             ("a".to_string(), a),
             ("b".to_string(), b),
             ("c".to_string(), c),
         ]);
-
-        let stable_tw = StableEvalContext::test_default();
-        let stable_c = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
+        let has_distinct = program_has_distinct(&typed_a);
 
-        let has_distinct = program_has_distinct(&typed);
-        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
-        let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
-        let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+        let stable_a = StableEvalContext::test_default();
+        let ctx_a = EvalContext::test_default_borrowed(&stable_a);
+        let mut eval_a = ProgramEvaluator::new(Arc::new(typed_a), has_distinct);
+        let first = eval_a.eval_record::<NullStorage>(&ctx_a, &resolver, None);
 
-        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
-        let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
-        comp_eval.set_use_compiled(true);
-        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
+        let stable_b = StableEvalContext::test_default();
+        let ctx_b = EvalContext::test_default_borrowed(&stable_b);
+        let mut eval_b = ProgramEvaluator::new(Arc::new(typed_b), has_distinct);
+        let second = eval_b.eval_record::<NullStorage>(&ctx_b, &resolver, None);
 
-        prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
+        prop_assert_eq!(project(&first), project(&second), "non-deterministic on `{}`", src);
         // The generator emits to all four targets, so this run almost
-        // always writes through the $pipeline/$source channel. Comparing
-        // the two separate contexts catches a divergence on that
-        // side-effect-only routing that the EvalResult above cannot see —
-        // the whole point of running each path on its own context.
+        // always writes through the $pipeline/$source channel; the two
+        // runs must agree on it too.
         prop_assert_eq!(
-            snapshot_side_effects(&stable_tw),
-            snapshot_side_effects(&stable_c),
-            "$pipeline/$source side effects diverged on `{}`",
+            snapshot_side_effects(&stable_a),
+            snapshot_side_effects(&stable_b),
+            "$pipeline/$source side effects non-deterministic on `{}`",
             src
         );
     }

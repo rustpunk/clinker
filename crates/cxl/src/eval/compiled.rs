@@ -1,12 +1,15 @@
 //! Compile-once-to-closures evaluator for the CXL scalar core.
 //!
-//! Where the tree-walk in [`super`] re-matches every `Expr`/`Statement`
-//! variant on every record, this module lowers a [`TypedProgram`] a
-//! single time into a tree of boxed closures. Each closure captures its
-//! already-resolved children and any node-keyed side data (span, baked
-//! literal) *by value* at lowering time, so per-record evaluation is a
-//! sequence of vtable calls with no central dispatch `match` and no
-//! re-indexing of the typed program's side tables.
+//! This module is the per-record evaluator for the transform hot path. A
+//! naive evaluator re-matches every `Expr`/`Statement` variant on every
+//! record; instead this lowers a [`TypedProgram`] a single time into a
+//! tree of boxed closures. Each closure captures its already-resolved
+//! children and any node-keyed side data (span, baked literal) *by value*
+//! at lowering time, so per-record evaluation is a sequence of vtable
+//! calls with no central dispatch `match` and no re-indexing of the typed
+//! program's side tables. (The recursive [`super::eval_expr`] matcher
+//! survives only for the aggregation and Combine engines, which evaluate
+//! single expressions outside the row path.)
 //!
 //! The module lowers the full row-level node vocabulary: literals, field
 //! and system access, binary/unary arithmetic and comparison, the
@@ -24,17 +27,16 @@
 //! value.
 //!
 //! Builtins are not reimplemented: a `MethodCall` node lowers to a call
-//! into the same `dispatch_method` the tree-walk uses, so the
-//! null-receiver gate (and its four exceptions `is_null` / `type_of` /
-//! `is_empty` / `catch`), regex methods, and every string / numeric /
-//! date method share one implementation. The pre-compiled regex for a
-//! method node is captured by value at lowering from
-//! `typed.regexes[node_id]`, never recompiled per record. A closure
-//! builtin compiles its closure body to a *separate* compiled
-//! sub-program and runs the host loop in Rust, binding the closure
-//! parameter through the shared `env` with the same save / insert /
-//! eval / remove / restore sequence the tree-walk uses (including the
-//! remove on the error path).
+//! into the shared [`dispatch_method`], so the null-receiver gate (and
+//! its four exceptions `is_null` / `type_of` / `is_empty` / `catch`),
+//! regex methods, and every string / numeric / date method share one
+//! implementation. The pre-compiled regex for a method node is captured
+//! by value at lowering from `typed.regexes[node_id]`, never recompiled
+//! per record. A closure builtin compiles its closure body to a
+//! *separate* compiled sub-program and runs the host loop in Rust,
+//! binding the closure parameter through the shared `env` with a save /
+//! insert / eval / remove / restore sequence, including the remove on the
+//! error path so the env is left undisturbed.
 //!
 //! Window reads stay leaf loads from the captured
 //! `Option<&dyn WindowContext<'w, S>>`, evaluated synchronously while the
@@ -67,15 +69,13 @@ use super::{EvalResult, SkipReason, group_key_error_to_eval_error};
 ///
 /// Holds the immutable references the scalar core and window leaves read
 /// (the per-record context, the field resolver, the optional window
-/// context) plus the mutable `env` scratch map for let-bindings. Mirrors
-/// the argument bundle the tree-walk's `eval_expr` threads, so a compiled
-/// node's body is a direct transcription of the matching tree-walk arm.
+/// context) plus the mutable `env` scratch map for let-bindings.
 ///
 /// The typed program is not carried: every node-keyed side-table read
 /// (the pre-compiled regex) is resolved by value at lowering, so nothing
 /// at run time re-indexes the typed program. `window` is read by the
 /// window-leaf nodes; it stays an `Option` because a transform without
-/// analytic windows evaluates with `None`, exactly as the tree-walk does.
+/// analytic windows evaluates with `None`.
 struct Frame<'a, 'w, S: RecordStorage + 'w> {
     ctx: &'a EvalContext<'a>,
     resolver: &'a dyn FieldResolver,
@@ -88,13 +88,12 @@ struct Frame<'a, 'w, S: RecordStorage + 'w> {
 /// The compiled program is immutable (it is shared, potentially behind an
 /// `Arc`, across records and threads), so `distinct`'s dedup set and the
 /// window-partition key it is scoped to live here rather than on the
-/// program. The caller owns one of these per evaluator instance and hands
-/// it to `eval_record` by `&mut`, mirroring how the tree-walk keeps
-/// `distinct_seen` / `current_partition_key` on `ProgramEvaluator`.
+/// program. The owning `ProgramEvaluator` holds one of these per instance
+/// and hands it to `eval_record` by `&mut`.
 pub(crate) struct EvalState {
     /// Seen distinct keys for the current partition. `None` when the
-    /// program has no `distinct` statement, matching the tree-walk's
-    /// allocation-gated set.
+    /// program has no `distinct` statement, so a program without
+    /// `distinct` allocates no set.
     distinct_seen: Option<HashSet<Vec<GroupByKey>>>,
     /// The partition key the dedup set is currently scoped to. A change
     /// clears `distinct_seen` (window-scoped distinct), so a new
@@ -140,28 +139,6 @@ impl EvalState {
         }
         self.current_partition_key = None;
     }
-
-    /// The per-record `emit each` fan-out ceiling. The tree-walk reads this
-    /// through the shared state so both evaluation paths enforce one
-    /// ceiling, set once at construction.
-    pub(super) fn max_expansion(&self) -> u64 {
-        self.max_expansion
-    }
-
-    /// Record `key` as seen for the current partition, returning whether it
-    /// was newly inserted (`true`) or a duplicate (`false`). The tree-walk
-    /// and the compiled `Distinct` node both dedup through this one set, so
-    /// switching paths cannot change which rows a `distinct` keeps.
-    ///
-    /// Panics if the state was built with `has_distinct = false`; a program
-    /// reaching a `distinct` statement is always built with the set
-    /// allocated, mirroring the tree-walk's `expect`.
-    pub(super) fn distinct_insert(&mut self, key: Vec<GroupByKey>) -> bool {
-        self.distinct_seen
-            .as_mut()
-            .expect("distinct statement requires EvalState allocated with has_distinct = true")
-            .insert(key)
-    }
 }
 
 /// A lowered expression node: a closure producing a [`Value`] from a
@@ -176,8 +153,8 @@ enum StmtFlow {
     Continue,
     /// Statement short-circuited the whole record. The carried reason
     /// distinguishes a `filter` non-true predicate ([`SkipReason::Filtered`])
-    /// from a `distinct` duplicate ([`SkipReason::Duplicate`]), matching
-    /// the tree-walk's two short-circuit points.
+    /// from a `distinct` duplicate ([`SkipReason::Duplicate`]) — the two
+    /// statement forms that can drop a record mid-program.
     Skip(SkipReason),
 }
 
@@ -213,11 +190,10 @@ type CompiledStmt<S> = Box<
 /// A CXL program lowered to a sequence of compiled statements.
 ///
 /// Built once via [`compile`] and run per record via
-/// [`Self::eval_record`], which reproduces the tree-walk's
-/// `eval_record_inner` control flow: statements run in order, a `filter`
-/// or `distinct` short-circuit returns `Skip`, an `emit each` block
-/// fans out into [`EvalResult::EmitMany`], and otherwise the accumulated
-/// field / record-var channels become an [`EvalResult::Emit`].
+/// [`Self::eval_record`]: statements run in order, a `filter` or
+/// `distinct` short-circuit returns `Skip`, an `emit each` block fans out
+/// into [`EvalResult::EmitMany`], and otherwise the accumulated field /
+/// record-var channels become an [`EvalResult::Emit`].
 ///
 /// The program is immutable; the per-evaluator dedup state lives in a
 /// separate [`EvalState`] the caller threads by `&mut`, so one compiled
@@ -230,21 +206,21 @@ pub(crate) struct CompiledProgram<S: RecordStorage + 'static> {
 impl<S: RecordStorage + 'static> CompiledProgram<S> {
     /// Evaluate one record through the compiled program.
     ///
-    /// Reproduces `ProgramEvaluator::eval_record_inner`: a fresh env and
-    /// output channels per record, in-order statement execution, `filter`
-    /// / `distinct` short-circuit to [`EvalResult::Skip`], `emit each`
-    /// fan-out to [`EvalResult::EmitMany`], and otherwise an
-    /// [`EvalResult::Emit`] carrying the field and `$record.*` channels.
+    /// A fresh env and output channels per record, in-order statement
+    /// execution, `filter` / `distinct` short-circuit to
+    /// [`EvalResult::Skip`], `emit each` fan-out to
+    /// [`EvalResult::EmitMany`], and otherwise an [`EvalResult::Emit`]
+    /// carrying the field and `$record.*` channels.
     ///
     /// `state` carries the cross-record dedup set; a `distinct` program
     /// must be evaluated with the same `EvalState` across the records of
     /// a partition (and `EvalState::set_partition` called at each
-    /// partition boundary) for dedup to be correct, mirroring the
-    /// tree-walk's `ProgramEvaluator`.
+    /// partition boundary) for dedup to be correct.
     ///
     /// The error boundary (filling `source_row` / `source_expr` on a
-    /// surfaced [`EvalError`]) stays with the caller, matching the
-    /// tree-walk where `eval_record` wraps `eval_record_inner`.
+    /// surfaced [`EvalError`]) stays with the caller in
+    /// `ProgramEvaluator::eval_record`, so a leaf node constructs its
+    /// error with only its own span.
     pub(crate) fn eval_record<'a, 'w>(
         &self,
         ctx: &'a EvalContext<'a>,
@@ -305,13 +281,12 @@ pub(crate) fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> Compi
 
 /// Whether a typed program contains a top-level `distinct` statement.
 ///
-/// Drives the differential harness's [`EvalState`] dedup-set allocation:
-/// it derives `has_distinct` the same way production callers do (a flat
-/// scan for a top-level `distinct` — the parser rejects `distinct` inside
-/// `emit each`, so the scan is exhaustive) so both evaluators dedup over
-/// the same set. Production code threads `has_distinct` from the
-/// transform's compiled metadata rather than rescanning, so this helper
-/// exists only for the test harness.
+/// Drives the golden tests' [`EvalState`] dedup-set allocation: it derives
+/// `has_distinct` the same way production callers do (a flat scan for a
+/// top-level `distinct` — the parser rejects `distinct` inside `emit
+/// each`, so the scan is exhaustive). Production code threads
+/// `has_distinct` from the transform's compiled metadata rather than
+/// rescanning, so this helper exists only for the test suite.
 #[cfg(test)]
 pub fn program_has_distinct(typed: &TypedProgram) -> bool {
     typed
@@ -358,9 +333,8 @@ fn compile_stmt<S: RecordStorage + 'static>(
             let target = *target;
             let value = compile_expr(typed, expr);
             Box::new(move |frame, out| {
-                // Mirror the tree-walk: stamp the emit's field name onto
-                // any surfaced error so DLQ entries name the column under
-                // computation.
+                // Stamp the emit's field name onto any surfaced error so
+                // DLQ entries name the column under computation.
                 let v = value(frame).map_err(|mut e| {
                     if e.triggering_field.is_none() {
                         e.triggering_field = Some(Arc::clone(&name));
@@ -433,13 +407,12 @@ fn compile_stmt<S: RecordStorage + 'static>(
             })
         }
         Statement::Distinct { field, .. } => {
-            // The dedup key is computed exactly as the tree-walk's
-            // `build_distinct_key`: a named `distinct by <field>` keys on
-            // that one field (env-bound value preferred over the input
-            // field), a bare `distinct` keys on every input field in
-            // resolver order. Conversion goes through `value_to_group_key`
-            // (never a raw `Value`) so `f64::to_bits` / NaN handling and
-            // the `GroupKeyError` surface match the tree-walk bit for bit.
+            // The dedup key: a named `distinct by <field>` keys on that one
+            // field (env-bound value preferred over the input field), a
+            // bare `distinct` keys on every input field in resolver order.
+            // Conversion goes through `value_to_group_key` (never a raw
+            // `Value`) so `f64::to_bits` / NaN handling and the
+            // `GroupKeyError` surface are deterministic.
             let field: Option<String> = field.as_ref().map(|f| f.to_string());
             Box::new(move |frame, out| {
                 let key = build_distinct_key(field.as_deref(), &frame.env, frame.resolver)?;
@@ -467,9 +440,10 @@ fn compile_stmt<S: RecordStorage + 'static>(
             let span = *span;
             // The body is a restricted sub-program: only let / emit /
             // trace / use / expression statements. `filter` / `distinct` /
-            // nested `emit each` are rejected at compile time with the
-            // same span-anchored error the tree-walk raises at run time,
-            // so an ill-formed body fails identically.
+            // nested `emit each` are rejected at compile time with a
+            // span-anchored type error — a fan-out block applies once per
+            // outer record, so a body filter/distinct has no representable
+            // meaning.
             let body: Vec<CompiledStmt<S>> = body
                 .iter()
                 .map(|s| compile_emit_each_body_stmt(typed, s))
@@ -493,8 +467,7 @@ fn compile_stmt<S: RecordStorage + 'static>(
                 };
                 for element in elements {
                     // Ceiling check before binding/evaluating the element:
-                    // an oversized fan-out errors before unbounded work,
-                    // matching the tree-walk's pre-body check.
+                    // an oversized fan-out errors before unbounded work.
                     if out.expansion_count >= out.state.max_expansion {
                         return Err(EvalError::new(
                             EvalErrorKind::ExpansionLimitExceeded {
@@ -538,17 +511,15 @@ fn compile_stmt<S: RecordStorage + 'static>(
 /// Compile one statement of an `emit each` body. The body surface is
 /// restricted to let / emit / trace / use / expression statements;
 /// `filter` / `distinct` / nested `emit each` are rejected here at
-/// compile time with the same span-anchored type error the tree-walk
-/// raises at run time, so an ill-formed body diverges from neither
-/// evaluator. The returned closure shares the same `StmtOut` shape as a
-/// top-level statement but only ever reports `Continue`.
+/// compile time with a span-anchored type error. The returned closure
+/// shares the same `StmtOut` shape as a top-level statement but only ever
+/// reports `Continue`.
 ///
 /// `trace` and `use` are compiled to bare `Continue` no-ops here, *not*
-/// routed through `compile_stmt`. The tree-walk's `eval_emit_each_body`
-/// matches both as no-ops and never evaluates the trace guard or message,
-/// so routing them through the full top-level `Trace` closure — which
-/// evaluates both and could surface an error the tree-walk never sees —
-/// would diverge.
+/// routed through `compile_stmt`: inside a fan-out body a `trace`'s guard
+/// and message are never evaluated, so routing it through the full
+/// top-level `Trace` closure (which evaluates both) could surface a
+/// spurious error from a guard/message that should not run.
 fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     stmt: &Statement,
@@ -577,14 +548,13 @@ fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
     }
 }
 
-/// Build the dedup key for a `distinct` statement, identically to the
-/// tree-walk's `ProgramEvaluator::build_distinct_key`.
+/// Build the dedup key for a `distinct` statement.
 ///
 /// A named field resolves from the let-bound env first, then the input
 /// record (null when absent); a bare `distinct` keys on every input field
 /// in resolver iteration order. Each value goes through
 /// `value_to_group_key` so NaN / `f64::to_bits` canonicalization and the
-/// `GroupKeyError → EvalError` mapping match the tree-walk.
+/// `GroupKeyError → EvalError` mapping are deterministic.
 fn build_distinct_key(
     field: Option<&str>,
     env: &HashMap<String, Value>,
@@ -619,9 +589,8 @@ fn build_distinct_key(
 fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -> CompiledExpr<S> {
     match expr {
         Expr::Literal { value, .. } => {
-            // Bake the literal's Value once at lowering; cloning a baked
-            // Value per record is the same clone the tree-walk pays in
-            // `literal_to_value`, but without re-matching the variant.
+            // Bake the literal's Value once at lowering; per record this
+            // is one `Value` clone with no variant re-match.
             let baked = literal_to_value(value);
             Box::new(move |_frame| Ok(baked.clone()))
         }
@@ -705,8 +674,7 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
         }
         Expr::RecordAccess { field, .. } => {
             // `$record.<key>` reads route through the resolver under the
-            // `$record.` prefix, matching the tree-walk so the dedicated
-            // record-vars channel resolves identically.
+            // `$record.` prefix — the dedicated record-vars channel.
             let key = format!("$record.{field}");
             Box::new(move |frame| Ok(frame.resolver.resolve(&key).cloned().unwrap_or(Value::Null)))
         }
@@ -792,7 +760,7 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
         // the argument of a closure-bearing array builtin, where
         // `compile_method_call` consumes it directly rather than routing
         // through here. Reaching this arm means the closure escaped that
-        // position; surface the same error the tree-walk does.
+        // position; surface a type error rather than a value.
         Expr::Closure { span, .. } => {
             let span = *span;
             Box::new(move |_frame| {
@@ -819,8 +787,7 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
         // `TypedProgram` exists, and `AggSlot` / `GroupKey` live only in
         // the finalize residual (which has its own evaluator) — none has a
         // row node. Reaching one means a malformed program slipped past
-        // typecheck; surface a loud error at its span, matching the
-        // tree-walk's row-level rejection.
+        // typecheck; surface a loud error at its span rather than a value.
         Expr::AggCall { span, .. } => {
             let span = *span;
             Box::new(move |_frame| Err(unreachable_node_error("aggregate function call", span)))
@@ -862,8 +829,8 @@ fn compile_method_call<S: RecordStorage + 'static>(
     span: Span,
 ) -> CompiledExpr<S> {
     // `$window.<fn>(..).<field>` chains resolve a field off a positional
-    // window row without a `Value` round-trip. Detect the exact shape the
-    // tree-walk intercepts and lower it to a single window-leaf node.
+    // window row without a `Value` round-trip. Detect this exact shape and
+    // lower it to a single window-leaf node.
     if args.is_empty()
         && let Expr::WindowCall {
             function,
@@ -875,9 +842,9 @@ fn compile_method_call<S: RecordStorage + 'static>(
         return compile_window_chain_field(typed, function, window_args, method, span);
     }
 
-    // Closure-bearing array builtins: dispatch by name + closure-shaped
-    // first argument, mirroring the tree-walk so a string-regex
-    // `.find("pattern")` still routes to the regex builtin below.
+    // Closure-bearing array builtins: dispatch by name *and* a
+    // closure-shaped first argument, so a string-regex `.find("pattern")`
+    // still routes to the regex builtin below.
     if matches!(method, "filter" | "map" | "find" | "any" | "flat_map")
         && matches!(args.first(), Some(Expr::Closure { .. }))
     {
@@ -888,9 +855,9 @@ fn compile_method_call<S: RecordStorage + 'static>(
     let arg_exprs: Vec<CompiledExpr<S>> =
         args.iter().map(|a| compile_expr::<S>(typed, a)).collect();
     let method: Box<str> = method.into();
-    // Capture the node's pre-compiled regex by value once, at lowering.
-    // The tree-walk re-indexes `typed.regexes[node_id]` on every record;
-    // baking it into the closure makes that a one-time cost.
+    // Capture the node's pre-compiled regex by value once, at lowering, so
+    // the `typed.regexes[node_id]` side-table read is a one-time cost
+    // rather than a per-record re-index.
     let regex: Option<Regex> = typed
         .regexes
         .get(node_id.0 as usize)
@@ -928,10 +895,10 @@ fn compile_method_call<S: RecordStorage + 'static>(
 /// `RecordView` borrowing the arena; the chain resolves `<field>` off that
 /// view directly, with no intermediate `Value` for the row (a `Value`
 /// cannot carry the arena borrow). `lag`/`lead` take an integer offset
-/// argument — non-integer or absent defaults to `1`, matching the
-/// tree-walk. A missing window context surfaces the same typed error the
-/// tree-walk raises. The result is the resolved field value, or `Null`
-/// when the positional row is out of range or the field is absent.
+/// argument — non-integer or absent defaults to `1`. A missing window
+/// context surfaces a typed error. The result is the resolved field
+/// value, or `Null` when the positional row is out of range or the field
+/// is absent.
 fn compile_window_chain_field<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     function: &str,
@@ -983,7 +950,7 @@ fn compile_window_chain_field<S: RecordStorage + 'static>(
 }
 
 /// Lower a bare `$window.<fn>(..)` call to a leaf load from the captured
-/// window context. Mirrors the tree-walk's `WindowCall` arm exactly:
+/// window context:
 ///
 /// - Aggregate builtins (`sum`/`avg`/`min`/`max`/`cumulative_sum`/
 ///   `collect`/`distinct`) read the field name from a `FieldRef` first
@@ -995,12 +962,11 @@ fn compile_window_chain_field<S: RecordStorage + 'static>(
 ///   chain return `Null` — the meaningful form is the chain, handled by
 ///   [`compile_window_chain_field`].
 /// - Predicate folds (`any`/`every`/`exists`/`not_exists`) run a compiled
-///   predicate sub-program over each partition record with the same
-///   three-valued Kleene collapse the tree-walk uses.
+///   predicate sub-program over each partition record with a three-valued
+///   Kleene collapse.
 ///
-/// A missing window context surfaces the same typed error as the
-/// tree-walk; an unimplemented registered name is a loud error rather
-/// than a silent `Null`.
+/// A missing window context surfaces a typed error; an unimplemented
+/// registered name is a loud error rather than a silent `Null`.
 fn compile_window_call<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     function: &str,
@@ -1009,8 +975,7 @@ fn compile_window_call<S: RecordStorage + 'static>(
 ) -> CompiledExpr<S> {
     /// The field name of a `FieldRef` first argument, captured at
     /// lowering. Aggregate window builtins key on this; a non-`FieldRef`
-    /// argument resolves to `None` (→ `Null` at run time), matching the
-    /// tree-walk's `if let Some(FieldRef) = args.first()` guard.
+    /// argument resolves to `None` (→ `Null` at run time).
     fn field_arg(args: &[Expr]) -> Option<Box<str>> {
         match args.first() {
             Some(Expr::FieldRef { name, .. }) => Some(name.clone()),
@@ -1067,7 +1032,7 @@ fn compile_window_call<S: RecordStorage + 'static>(
             "first_value" => Ok(agg(&|n| w.first_value(n))),
             "last_value" => Ok(agg(&|n| w.last_value(n))),
             // A registered name with no evaluator arm is a hard error, not
-            // a silent Null — matching the tree-walk's catch-all.
+            // a silent Null.
             _ => Err(EvalError::new(
                 EvalErrorKind::TypeMismatch {
                     expected: "registered $window function",
@@ -1080,7 +1045,7 @@ fn compile_window_call<S: RecordStorage + 'static>(
 }
 
 /// The "no window context available" error, shared by the window-leaf
-/// nodes so the message and span match the tree-walk's.
+/// nodes so the message and span are uniform.
 fn window_missing_error(span: Span) -> EvalError {
     EvalError::new(
         EvalErrorKind::TypeMismatch {
@@ -1096,8 +1061,7 @@ fn window_missing_error(span: Span) -> EvalError {
 /// results with the same three-valued Kleene logic as `BinOp::And/Or`.
 ///
 /// The predicate is evaluated against each partition record as the field
-/// resolver, sharing the outer frame's env and window — exactly the
-/// tree-walk's `eval_expr(predicate, .., &row, window, env)` shape. A
+/// resolver, sharing the outer frame's env and window. A
 /// `true` short-circuits `any`/`exists`; a `false` short-circuits
 /// `every`/`not_exists`; any null / non-bool row result taints the fold
 /// to `Null` unless a short-circuit already fired. With no taint the
@@ -1111,9 +1075,8 @@ fn window_predicate_fold<'a, 'w, S: RecordStorage + 'w>(
     want_any: bool,
 ) -> Result<Value, EvalError> {
     // Move env out of the outer frame so each partition-record sub-frame
-    // can share and mutate it, then restore it after the fold — the env is
-    // threaded by value through `Frame`, so this mirrors the tree-walk's
-    // single shared `&mut env` without a per-row clone.
+    // can share and mutate it, then restore it after the fold — one shared
+    // env threaded through every row, with no per-row clone.
     let mut env = std::mem::take(&mut frame.env);
     let ctx = frame.ctx;
     let window = frame.window;
@@ -1167,12 +1130,11 @@ fn window_predicate_fold<'a, 'w, S: RecordStorage + 'w>(
 ///
 /// The closure body is a distinct [`CompiledExpr`] — not inlined into
 /// the receiver's node — so it re-runs per element with the closure
-/// parameter freshly bound. Binding goes through the shared `env` with
-/// the exact save / insert / eval / remove / restore sequence the
-/// tree-walk's `dispatch_closure_method` uses, including the remove on
-/// the error path so a failing body never leaves the parameter bound.
-/// A null receiver short-circuits to `Null` and the body never runs,
-/// matching the tree-walk's null-propagation for these builtins.
+/// parameter freshly bound. Binding goes through the shared `env` with a
+/// save / insert / eval / remove / restore sequence, including the remove
+/// on the error path so a failing body never leaves the parameter bound.
+/// A null receiver short-circuits to `Null` and the body never runs (the
+/// null-propagation policy for these builtins).
 fn compile_maplike<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     receiver: &Expr,
@@ -1186,8 +1148,8 @@ fn compile_maplike<S: RecordStorage + 'static>(
     let (param, body): (Box<str>, CompiledExpr<S>) = match args.first() {
         Some(Expr::Closure { param, body, .. }) => (param.clone(), compile_expr::<S>(typed, body)),
         // Unreachable in practice (the caller gates on a closure-shaped
-        // first arg), but surface the same shape error the tree-walk
-        // raises rather than panic if the invariant is ever violated.
+        // first arg), but surface a type error rather than panic if the
+        // invariant is ever violated.
         _ => {
             return Box::new(move |_frame| {
                 Err(EvalError::new(
@@ -1223,9 +1185,9 @@ fn compile_maplike<S: RecordStorage + 'static>(
             let body_val = body(frame);
             // Always remove the per-iteration binding, then propagate any
             // body error. The shadowed `previous` is restored only after
-            // the loop completes — matching the tree-walk, which on the
-            // error path leaves the env with the param unbound (the env
-            // is per-record scratch, discarded once the error surfaces).
+            // the loop completes — on the error path the env is left with
+            // the param unbound, which is harmless since the env is
+            // per-record scratch discarded once the error surfaces.
             frame.env.remove(param.as_ref());
             let body_val = body_val?;
             match kind {
@@ -1361,7 +1323,7 @@ fn compile_binary<S: RecordStorage + 'static>(
 /// Lower a `match` expression to a guarded chain. The value form
 /// compares each arm pattern against the scrutinee with `values_equal`;
 /// the condition form runs each arm pattern as a boolean guard. Both
-/// fall through to `Null` when no arm matches, matching the tree-walk.
+/// fall through to `Null` when no arm matches.
 fn compile_match<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     subject: Option<&Expr>,
@@ -1579,7 +1541,8 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
 }
 
 /// Emit a `trace` line at the resolved level with the record's source
-/// provenance attached, matching the tree-walk's tracing call shape.
+/// provenance (`source_row` / `source_file`) attached as structured
+/// fields.
 fn emit_trace(level: TraceLevel, ctx: &EvalContext<'_>, msg: &str) {
     match level {
         TraceLevel::Trace => tracing::trace!(

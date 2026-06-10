@@ -1,8 +1,8 @@
 //! End-to-end coverage for the compiled CXL evaluator on the live
 //! production transform hot loop.
 //!
-//! The per-record transform path constructs its `ProgramEvaluator` with
-//! the compiled program selected, so any pipeline whose transform body
+//! The per-record transform path constructs its `ProgramEvaluator` and
+//! runs the compiled program, so any pipeline whose transform body
 //! carries non-trivial CXL exercises the compiled evaluator through the
 //! full stack — YAML parse → DAG compile → executor dispatch → writer —
 //! with no test-local re-wiring. These tests drive a real multi-record
@@ -169,9 +169,9 @@ nodes:
 
 /// `distinct by` running across the live compiled path: cross-record
 /// dedup state lives on the per-transform `ProgramEvaluator` the executor
-/// constructs, so the compiled evaluator must dedup the record stream
-/// identically to the tree-walk. Exact-duplicate keys collapse to one
-/// row; the first occurrence wins.
+/// constructs, so the compiled evaluator dedups the record stream across
+/// records. Exact-duplicate keys collapse to one row; the first
+/// occurrence wins.
 #[test]
 fn compiled_path_distinct_dedups_record_stream() {
     let yaml = r#"

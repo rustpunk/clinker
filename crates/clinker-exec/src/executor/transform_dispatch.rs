@@ -103,17 +103,14 @@ pub(crate) fn dispatch_transform(
         }
     };
 
+    // The compiled program is the per-record evaluator for the transform
+    // hot loop: it lowers each statement to a closure once and skips the
+    // per-record AST re-match a recursive tree-walk would pay.
     let mut evaluator = ProgramEvaluator::with_max_expansion(
         Arc::clone(&ctx.compiled_transforms[transform_idx].typed),
         ctx.compiled_transforms[transform_idx].has_distinct(),
         ctx.compiled_transforms[transform_idx].max_expansion,
     );
-    // The compiled program is the live per-record evaluator for the
-    // transform hot loop; it lowers each statement to a closure once and
-    // skips the per-record AST re-match the tree-walk pays. The tree-walk
-    // remains reachable behind this flag only as the differential
-    // oracle until it is retired.
-    evaluator.set_use_compiled(true);
 
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)

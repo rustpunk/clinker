@@ -3,11 +3,8 @@ pub mod context;
 pub mod error;
 
 // Compile-once-to-closures evaluator. `ProgramEvaluator` compiles a
-// program into a `CompiledProgram` and can run either this path or the
-// tree-walk per record, selected by a runtime flag. Both paths coexist
-// only while the compiled path is being proven byte-identical to the
-// tree-walk; once it is the sole evaluator the tree-walk and the flag go
-// away, leaving this module the only scalar core.
+// program into a `CompiledProgram` on first use and runs it per record;
+// this module is the sole per-record scalar core.
 pub(crate) mod compiled;
 
 #[cfg(test)]
@@ -17,9 +14,9 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
+use clinker_record::{GroupByKey, GroupKeyError, Value};
 
-use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, UnaryOp};
+use crate::ast::{BinOp, Expr, LiteralValue, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
@@ -101,15 +98,14 @@ pub enum SkipReason {
     Duplicate,
 }
 
-/// Stateful CXL evaluator wrapping a compiled program.
+/// Immutable references threaded through [`eval_expr`]'s recursive descent.
 ///
-/// Bundle of the immutable references the evaluator threads through
-/// every recursive descent: the typed program (for node-id-keyed type
-/// and regex tables), the per-record `EvalContext` (source/row/vars),
-/// the field resolver (record-field lookup), and the optional window
-/// context (analytic-window-scoped reads). The mutable `env`
-/// (let-binding scratch) stays separate so the mutation contract is
-/// explicit at every call site.
+/// Bundles the typed program (for node-id-keyed type and regex tables),
+/// the per-record `EvalContext` (source/row/vars), the field resolver
+/// (record-field lookup), and the optional window context
+/// (analytic-window-scoped reads). The mutable `env` (let-binding scratch)
+/// is passed separately so the mutation contract is explicit at every call
+/// site.
 #[derive(Copy, Clone)]
 struct EvalEnv<'a, 'w, S: RecordStorage + 'w> {
     typed: &'a TypedProgram,
@@ -123,21 +119,14 @@ struct EvalEnv<'a, 'w, S: RecordStorage + 'w> {
 /// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
 pub struct ProgramEvaluator {
     typed: Arc<TypedProgram>,
-    /// Distinct dedup set, partition key, and `emit each` ceiling, shared
-    /// by both evaluation paths. Threading one state object means
-    /// `set_partition` and per-record dedup behave identically whether a
-    /// record runs through the tree-walk or the compiled program.
+    /// Distinct dedup set, partition key, and `emit each` ceiling. The
+    /// compiled program is immutable and threads this mutable state by
+    /// `&mut` so `set_partition` and per-record dedup live on the
+    /// evaluator, not the program.
     state: EvalState,
     /// Whether this program has any distinct statements. Gates the dedup
     /// set's allocation inside `state`.
     has_distinct: bool,
-    /// Selects the per-record evaluator: `true` runs the compiled program,
-    /// `false` runs the tree-walk. Transitional — both evaluators are kept
-    /// only while the compiled path is being proven byte-identical to the
-    /// tree-walk; the tree-walk (and this flag) are removed once the
-    /// compiled path is the sole evaluator. Default `false` keeps every
-    /// existing caller on the tree-walk until the cutover.
-    use_compiled: bool,
     /// Compiled programs, one per record-storage type the evaluator is
     /// called with. `eval_record` is generic over `S` and a single
     /// evaluator instance is called with several `S` (e.g. `NullStorage`
@@ -170,17 +159,8 @@ impl ProgramEvaluator {
             typed,
             state: EvalState::new(has_distinct, max_expansion),
             has_distinct,
-            use_compiled: false,
             compiled_cache: HashMap::new(),
         }
-    }
-
-    /// Switch this evaluator between the tree-walk and the compiled
-    /// program. Transitional: the A/B switch the differential test and the
-    /// bench parity gate flip, removed with the tree-walk once the compiled
-    /// path is the sole evaluator.
-    pub fn set_use_compiled(&mut self, use_compiled: bool) {
-        self.use_compiled = use_compiled;
     }
 
     /// Called before eval_record when transform has windows.
@@ -208,18 +188,22 @@ impl ProgramEvaluator {
 
     /// Evaluate a record through the full program, returning Emit or Skip.
     ///
-    /// Wraps the inner walk in a boundary `map_err` that attaches the
-    /// current `source_row` and the program's `source` text to any
-    /// [`EvalError`] surfaced from a subexpression, so DLQ entries and
-    /// miette diagnostics downstream carry "row N: ..." context and an
-    /// underlined source span without every internal constructor having
-    /// to thread those fields manually. The boundary is identical whether
-    /// the record runs through the compiled program or the tree-walk, so a
-    /// surfaced error carries the same provenance through either path.
+    /// Compiles the program into a `CompiledProgram<S>` on first use of
+    /// each storage type `S`, caches it by `TypeId`, and runs it; the
+    /// cross-record dedup state in `self.state` (the same object
+    /// `set_partition` mutates) is threaded by `&mut` so a `distinct`
+    /// program dedups across the record stream.
     ///
-    /// `S` is `'static` because the compiled path caches one
-    /// `CompiledProgram<S>` per storage type keyed by `TypeId`; every real
-    /// storage (`NullStorage`, the window arena) is already `'static`.
+    /// Wraps the run in a boundary `map_err` that attaches the current
+    /// `source_row` and the program's `source` text to any [`EvalError`]
+    /// surfaced from a subexpression, so DLQ entries and miette diagnostics
+    /// downstream carry "row N: ..." context and an underlined source span
+    /// without every internal constructor having to thread those fields
+    /// manually.
+    ///
+    /// `S` is `'static` because the cache holds one `CompiledProgram<S>`
+    /// per storage type keyed by `TypeId`; every real storage
+    /// (`NullStorage`, the window arena) is already `'static`.
     pub fn eval_record<'w, S: RecordStorage + 'static>(
         &mut self,
         ctx: &EvalContext<'_>,
@@ -228,372 +212,25 @@ impl ProgramEvaluator {
     ) -> Result<EvalResult, EvalError> {
         let source_row = ctx.source_row;
         let source_expr = self.typed.source.clone();
-        let inner = if self.use_compiled {
-            self.eval_record_compiled(ctx, resolver, window)
-        } else {
-            self.eval_record_inner(ctx, resolver, window)
-        };
-        inner.map_err(move |mut e| {
-            if e.source_row.is_none() {
-                e.source_row = Some(source_row);
-            }
-            if e.source_expr.is_none()
-                && let Some(s) = source_expr
-            {
-                e.source_expr = Some(s);
-            }
-            e
-        })
-    }
-
-    /// Run one record through the compiled program for storage `S`,
-    /// building and caching that program on first use of each `S`.
-    ///
-    /// The cross-record dedup state lives in `self.state`, the same object
-    /// the tree-walk and `set_partition` use, so a `distinct` program
-    /// dedups identically through either path. No boundary stamping here —
-    /// the shared boundary in `eval_record` wraps this call, matching the
-    /// tree-walk's `eval_record_inner`.
-    fn eval_record_compiled<'w, S: RecordStorage + 'static>(
-        &mut self,
-        ctx: &EvalContext<'_>,
-        resolver: &dyn FieldResolver,
-        window: Option<&dyn WindowContext<'w, S>>,
-    ) -> Result<EvalResult, EvalError> {
         let program = self
             .compiled_cache
             .entry(TypeId::of::<S>())
             .or_insert_with(|| Box::new(compiled::compile::<S>(&self.typed)))
             .downcast_ref::<CompiledProgram<S>>()
             .expect("compiled cache keyed by TypeId<S> always holds a CompiledProgram<S>");
-        let ctx_ref: &EvalContext<'_> = ctx;
-        program.eval_record(ctx_ref, resolver, window, &mut self.state)
-    }
-
-    fn eval_record_inner<'w, S: RecordStorage + 'w>(
-        &mut self,
-        ctx: &EvalContext<'_>,
-        resolver: &dyn FieldResolver,
-        window: Option<&dyn WindowContext<'w, S>>,
-    ) -> Result<EvalResult, EvalError> {
-        let mut env: HashMap<String, Value> = HashMap::new();
-        let mut output = indexmap::IndexMap::new();
-        let mut record_var_writes: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        // Fan-out accumulator: populated by `emit each` blocks. When
-        // non-empty at end-of-program, the evaluator returns
-        // `EvalResult::EmitMany` with these records (plus any
-        // trailing top-level `emit name = ...` writes folded into
-        // each emitted record's `fields` map). `expansion_count`
-        // tracks the running fan-out cardinality so the per-record
-        // `max_expansion` ceiling can route oversized expansions to
-        // DLQ before unbounded work happens.
-        let mut fan_out: Vec<EmitOne> = Vec::new();
-        let mut expansion_count: u64 = 0;
-        // Read the fan-out ceiling once: it is fixed for the evaluator's
-        // lifetime, and the shared `state` it lives on is borrowed mutably
-        // by the distinct arm, so capturing it up front keeps the borrow
-        // local to the one statement that needs it.
-        let max_expansion = self.state.max_expansion();
-
-        // Index-loop over statements rather than `for stmt in &...` —
-        // the `emit each` arm needs `&mut self` to call its body
-        // walker, which conflicts with the immutable iterator borrow.
-        // Cloning the Arc<TypedProgram> bumps a refcount once but lets
-        // each arm reborrow from the cloned handle without contending
-        // for the inner borrow on `self.typed`.
-        let typed = Arc::clone(&self.typed);
-        for stmt in &typed.program.statements {
-            match stmt {
-                Statement::Filter { predicate, .. } => {
-                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &mut env)?;
-                    if val != Value::Bool(true) {
-                        return Ok(EvalResult::Skip(SkipReason::Filtered));
-                    }
+        program
+            .eval_record(ctx, resolver, window, &mut self.state)
+            .map_err(move |mut e| {
+                if e.source_row.is_none() {
+                    e.source_row = Some(source_row);
                 }
-                Statement::Distinct { field, .. } => {
-                    let key = self.build_distinct_key(field.as_deref(), &env, resolver)?;
-                    if !self.state.distinct_insert(key) {
-                        return Ok(EvalResult::Skip(SkipReason::Duplicate));
-                    }
+                if e.source_expr.is_none()
+                    && let Some(s) = source_expr
+                {
+                    e.source_expr = Some(s);
                 }
-                Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
-                    env.insert(name.to_string(), val);
-                }
-                Statement::Emit {
-                    name, expr, target, ..
-                } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)
-                        .map_err(|mut e| {
-                            if e.triggering_field.is_none() {
-                                e.triggering_field = Some(Arc::from(&**name));
-                            }
-                            e
-                        })?;
-                    match target {
-                        EmitTarget::Field => {
-                            output.insert(name.to_string(), val);
-                        }
-                        EmitTarget::Pipeline => {
-                            ctx.stable.set_pipeline_var(name, val);
-                        }
-                        EmitTarget::Source => {
-                            ctx.stable.set_source_var(ctx.source_file, name, val);
-                        }
-                        EmitTarget::Record => {
-                            record_var_writes.insert(name.to_string(), val);
-                        }
-                    }
-                }
-                Statement::Trace {
-                    level,
-                    guard,
-                    message,
-                    ..
-                } => {
-                    let should_trace = if let Some(g) = guard {
-                        matches!(
-                            eval_expr(g, &self.typed, ctx, resolver, window, &mut env)?,
-                            Value::Bool(true)
-                        )
-                    } else {
-                        true
-                    };
-                    if should_trace {
-                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &mut env)?;
-                        let msg_str = match &msg {
-                            Value::String(s) => s.to_string(),
-                            other => format!("{:?}", other),
-                        };
-                        match level.unwrap_or(crate::ast::TraceLevel::Trace) {
-                            crate::ast::TraceLevel::Trace => tracing::trace!(
-                                source_row = ctx.source_row,
-                                source_file = %ctx.source_file,
-                                "{}", msg_str
-                            ),
-                            crate::ast::TraceLevel::Debug => tracing::debug!(
-                                source_row = ctx.source_row,
-                                source_file = %ctx.source_file,
-                                "{}", msg_str
-                            ),
-                            crate::ast::TraceLevel::Info => tracing::info!(
-                                source_row = ctx.source_row,
-                                source_file = %ctx.source_file,
-                                "{}", msg_str
-                            ),
-                            crate::ast::TraceLevel::Warn => tracing::warn!(
-                                source_row = ctx.source_row,
-                                source_file = %ctx.source_file,
-                                "{}", msg_str
-                            ),
-                            crate::ast::TraceLevel::Error => tracing::error!(
-                                source_row = ctx.source_row,
-                                source_file = %ctx.source_file,
-                                "{}", msg_str
-                            ),
-                        }
-                    }
-                }
-                Statement::UseStmt { .. } => {}
-                Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, &self.typed, ctx, resolver, window, &mut env)?;
-                }
-                Statement::EmitEach { .. } => {
-                    // Statement borrow into self.typed.program would conflict
-                    // with `&mut self` inside the body walker; the body is
-                    // hoisted out by pointer here so the iterator can be
-                    // dropped before the body walker re-borrows self.
-                    let (binding_name, source_expr, body_stmts, span_val) = match stmt {
-                        Statement::EmitEach {
-                            binding,
-                            source,
-                            body,
-                            span,
-                            ..
-                        } => (binding.clone(), source.clone(), body.clone(), *span),
-                        _ => unreachable!(),
-                    };
-                    let source_val =
-                        eval_expr(&source_expr, &self.typed, ctx, resolver, window, &mut env)?;
-                    let elements = match source_val {
-                        Value::Array(arr) => arr,
-                        Value::Null => continue,
-                        other => {
-                            return Err(EvalError::new(
-                                EvalErrorKind::TypeMismatch {
-                                    expected: "Array",
-                                    got: other.type_name(),
-                                },
-                                span_val,
-                            ));
-                        }
-                    };
-                    for element in elements {
-                        if expansion_count >= max_expansion {
-                            return Err(EvalError::new(
-                                EvalErrorKind::ExpansionLimitExceeded {
-                                    limit: max_expansion,
-                                },
-                                span_val,
-                            ));
-                        }
-                        env.insert(binding_name.to_string(), element);
-                        let mut iter_fields = indexmap::IndexMap::new();
-                        let mut iter_record_vars: indexmap::IndexMap<String, Value> =
-                            indexmap::IndexMap::new();
-                        // Seed each iteration with any field-target
-                        // emits already produced before this fan-out:
-                        // top-level `emit name = ...` writes prior to
-                        // the `emit each` block apply to every emitted
-                        // record.
-                        for (k, v) in &output {
-                            iter_fields.insert(k.clone(), v.clone());
-                        }
-                        for (k, v) in &record_var_writes {
-                            iter_record_vars.insert(k.clone(), v.clone());
-                        }
-                        let eval_env = EvalEnv {
-                            typed: &self.typed,
-                            ctx,
-                            resolver,
-                            window,
-                        };
-                        Self::eval_emit_each_body(
-                            &body_stmts,
-                            eval_env,
-                            &mut env,
-                            &mut iter_fields,
-                            &mut iter_record_vars,
-                        )?;
-                        env.remove(binding_name.as_ref());
-                        fan_out.push(EmitOne {
-                            fields: iter_fields,
-                            record_vars: Box::new(iter_record_vars),
-                        });
-                        expansion_count += 1;
-                    }
-                }
-            }
-        }
-        if !fan_out.is_empty() {
-            Ok(EvalResult::EmitMany { records: fan_out })
-        } else {
-            Ok(EvalResult::Emit {
-                fields: output,
-                record_vars: Box::new(record_var_writes),
+                e
             })
-        }
-    }
-
-    /// Evaluate the body statements of an `emit each` block once with
-    /// the binding already inserted into `env`. Mirrors a stripped-down
-    /// version of [`Self::eval_record_inner`] — body statements may
-    /// not be `EmitEach` (parser enforces no nesting) or `Filter` /
-    /// `Distinct` (a fan-out block applies once per outer record, so a
-    /// body filter/distinct would silently divide work between
-    /// branches the engine can't represent; reject at runtime as a
-    /// type-mismatch surfaced through the boundary `map_err`).
-    fn eval_emit_each_body<'w, S: RecordStorage + 'w>(
-        body: &[Statement],
-        eval_env: EvalEnv<'_, 'w, S>,
-        env: &mut HashMap<String, Value>,
-        fields: &mut indexmap::IndexMap<String, Value>,
-        record_vars: &mut indexmap::IndexMap<String, Value>,
-    ) -> Result<(), EvalError> {
-        let EvalEnv {
-            typed,
-            ctx,
-            resolver,
-            window,
-        } = eval_env;
-        for stmt in body {
-            match stmt {
-                Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, typed, ctx, resolver, window, env)?;
-                    env.insert(name.to_string(), val);
-                }
-                Statement::Emit {
-                    name, expr, target, ..
-                } => {
-                    let val =
-                        eval_expr(expr, typed, ctx, resolver, window, env).map_err(|mut e| {
-                            if e.triggering_field.is_none() {
-                                e.triggering_field = Some(Arc::from(&**name));
-                            }
-                            e
-                        })?;
-                    match target {
-                        EmitTarget::Field => {
-                            fields.insert(name.to_string(), val);
-                        }
-                        EmitTarget::Pipeline => {
-                            ctx.stable.set_pipeline_var(name, val);
-                        }
-                        EmitTarget::Source => {
-                            ctx.stable.set_source_var(ctx.source_file, name, val);
-                        }
-                        EmitTarget::Record => {
-                            record_vars.insert(name.to_string(), val);
-                        }
-                    }
-                }
-                Statement::Trace { .. } | Statement::UseStmt { .. } => {}
-                Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, typed, ctx, resolver, window, env)?;
-                }
-                Statement::Filter { .. }
-                | Statement::Distinct { .. }
-                | Statement::EmitEach { .. } => {
-                    return Err(EvalError::new(
-                        EvalErrorKind::TypeMismatch {
-                            expected: "let / emit / trace inside emit each body",
-                            got: "filter / distinct / nested emit_each",
-                        },
-                        stmt_span(stmt),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Build the distinct key for a record.
-    fn build_distinct_key(
-        &self,
-        field: Option<&str>,
-        env: &HashMap<String, Value>,
-        resolver: &dyn FieldResolver,
-    ) -> Result<Vec<GroupByKey>, EvalError> {
-        match field {
-            Some(name) => {
-                // Resolve from let-bindings first, then input fields.
-                // `value_to_group_key` takes `&Value`, so the env and
-                // resolver hits can feed it by borrow without cloning;
-                // the null fallback hands out a reference to the
-                // shared `clinker_record::NULL` sentinel.
-                let val: &Value = match env.get(name) {
-                    Some(v) => v,
-                    None => resolver.resolve(name).unwrap_or(&clinker_record::NULL),
-                };
-                match value_to_group_key(val, name, None, 0) {
-                    Ok(Some(gk)) => Ok(vec![gk]),
-                    Ok(None) => Ok(vec![GroupByKey::Null]),
-                    Err(e) => Err(group_key_error_to_eval_error(e)),
-                }
-            }
-            None => {
-                // Bare distinct — hash all input fields
-                let mut key = Vec::new();
-                for (name, val) in resolver.iter_fields() {
-                    match value_to_group_key(val, name, None, 0) {
-                        Ok(Some(gk)) => key.push(gk),
-                        Ok(None) => key.push(GroupByKey::Null),
-                        Err(e) => return Err(group_key_error_to_eval_error(e)),
-                    }
-                }
-                Ok(key)
-            }
-        }
     }
 }
 
@@ -695,23 +332,6 @@ fn dispatch_closure_method<'w, S: RecordStorage + 'w>(
         "any" => Value::Bool(found_any),
         _ => unreachable!(),
     })
-}
-
-/// Recover the span of a [`Statement`] variant. Used inside
-/// `emit each` body validation to anchor a runtime error on the
-/// offending body statement when its variant is forbidden inside the
-/// block.
-fn stmt_span(stmt: &Statement) -> Span {
-    match stmt {
-        Statement::Let { span, .. }
-        | Statement::Emit { span, .. }
-        | Statement::Trace { span, .. }
-        | Statement::UseStmt { span, .. }
-        | Statement::ExprStmt { span, .. }
-        | Statement::Filter { span, .. }
-        | Statement::Distinct { span, .. }
-        | Statement::EmitEach { span, .. } => *span,
-    }
 }
 
 /// Convert a GroupKeyError to an EvalError.
