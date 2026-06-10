@@ -58,6 +58,25 @@ Returns a new map with `key` set to `value`. If the key was already present, its
 
 `stamped` is `{"name":"Alice","tier":"gold","since":"2021-04","region":"us-east"}`.
 
+#### Nested paths
+
+`key` may be a dotted/indexed path that descends into nested maps and arrays, so a single `set` writes into a deep document. Dots separate map keys; a `[n]` suffix indexes an array.
+
+```yaml
+    cxl: |
+      emit moved = profile.set("address.city", "NYC")
+      emit relabel = order.set("items[0].sku", "A-100")
+```
+
+- **Auto-create.** Missing intermediate map segments are created as empty maps, so a path can build structure that does not yet exist. `{}.set("a.b.c", 7)` returns `{"a":{"b":{"c":7}}}`. This is what lets `set` assemble a nested document from scratch (matching jq `setpath` and Bloblang assignment).
+- **Type conflict -> null.** If an intermediate segment already exists but is the wrong kind for the next step -- descending into a key whose value is a scalar, indexing a map with `[n]`, or naming a field on an array -- the whole operation returns `null`. Nothing is partially written.
+- **Array index past the end -> null.** Indexing past the last element returns `null` for the whole operation; arrays are never silently grown. The path can only overwrite an array slot that already exists.
+- **A bare key is a single key, not a path.** `"region"` writes the top-level `region`. Only `.` and `[n]` introduce nesting; a key with neither behaves exactly as before.
+
+For `profile = {"name":"Alice","address":{"city":"LA"}}`, `profile.set("address.city", "NYC")` is `{"name":"Alice","address":{"city":"NYC"}}` -- the sibling `name` and any other `address` keys are preserved.
+
+> **Known limitation.** Because `.` and `[` are path syntax, `set` cannot target a key whose name *literally* contains a `.` or `[` (for example a JSON field literally named `"a.b"`). To write such a key, build it with [`merge`](#mergeother-map---map) and a map literal; to remove it, use [`remove_field`](#remove_fieldkey-string---map), which matches the exact key string.
+
 ### remove_field(key: String) -> Map
 
 Returns a new map without `key`. If the key was absent, the receiver is returned unchanged.

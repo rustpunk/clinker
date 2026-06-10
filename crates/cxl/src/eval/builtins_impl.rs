@@ -666,11 +666,10 @@ pub fn dispatch_method(
         })),
         "set" => Ok(Some(match (receiver, args.first(), args.get(1)) {
             (Value::Map(m), Some(Value::String(key)), Some(val)) => {
-                let mut out = (**m).clone();
-                // Map keys are independent `Box<str>`; build one from the
-                // field-value string.
-                out.insert(Box::from(key.as_str()), val.clone());
-                Value::Map(Box::new(out))
+                // A bare key (no `.` / `[n]`) inserts at the top level. A
+                // dotted/indexed path descends, auto-creating missing
+                // intermediate Maps; see `map_set_path` for the conflict rules.
+                map_set_path(m, key.as_str(), val)
             }
             _ => Value::Null,
         })),
@@ -684,6 +683,135 @@ pub fn dispatch_method(
         })),
 
         _ => Ok(None), // Unknown method
+    }
+}
+
+// ── `.set` path navigation ──────────────────────────────────
+//
+// `.set` accepts a dotted/indexed path as its key so a single call can write
+// into a nested document: `m.set("address.city", "NYC")`, `m.set("items[0].sku",
+// "x")`. The receiver is copy-on-write — every level on the write path is cloned,
+// the upstream binding is never mutated.
+
+/// One step along a `.set` path: a map key or an array position.
+enum PathSeg<'a> {
+    /// Field lookup into a `Value::Map` by string key.
+    Field(&'a str),
+    /// Positional access into a `Value::Array` by zero-based index.
+    Index(usize),
+}
+
+/// Splits a `.set` key into navigation segments.
+///
+/// `.`-separated names become [`PathSeg::Field`]; a `[n]` suffix on a name or
+/// on a prior index becomes [`PathSeg::Index`], so `a.b[0].c` parses as
+/// `[Field("a"), Field("b"), Index(0), Field("c")]`. Returns `None` for a
+/// malformed bracket group (empty, non-numeric, or unterminated) so the whole
+/// `.set` resolves to `Null` rather than guessing intent. An empty field name
+/// (a leading/trailing/doubled `.`) is a real key — a map can hold `""` — so it
+/// is preserved rather than rejected.
+fn parse_set_path(key: &str) -> Option<Vec<PathSeg<'_>>> {
+    let bytes = key.as_bytes();
+    let mut segs = Vec::new();
+    let mut i = 0;
+    // A path opens with a field name; thereafter each step is either `.field`
+    // or `[index]`, both of which this loop consumes from the current cursor.
+    let mut field_start = 0;
+    let mut in_field = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' if in_field => {
+                segs.push(PathSeg::Field(&key[field_start..i]));
+                i += 1;
+                field_start = i;
+            }
+            b'[' => {
+                if in_field {
+                    segs.push(PathSeg::Field(&key[field_start..i]));
+                }
+                let close = key[i + 1..].find(']')? + i + 1;
+                let idx: usize = key[i + 1..close].parse().ok()?;
+                segs.push(PathSeg::Index(idx));
+                i = close + 1;
+                // A `]` is followed by either `.field`, another `[index]`, or
+                // end-of-path — never a bare field name glued onto the bracket.
+                if i < bytes.len() {
+                    match bytes[i] {
+                        b'.' => {
+                            i += 1;
+                            field_start = i;
+                            in_field = true;
+                        }
+                        b'[' => in_field = false,
+                        _ => return None,
+                    }
+                } else {
+                    in_field = false;
+                }
+            }
+            _ => {
+                in_field = true;
+                i += 1;
+            }
+        }
+    }
+    if in_field {
+        segs.push(PathSeg::Field(&key[field_start..]));
+    }
+    Some(segs)
+}
+
+/// Sets `val` at `key` within map `m`, returning a fresh `Value::Map`.
+///
+/// Missing intermediate map segments are auto-created as empty maps, so a path
+/// can build structure that does not yet exist (jq `setpath` / Bloblang
+/// convention). Returns `Value::Null` for the whole operation on a hard
+/// conflict — an existing intermediate is present but the wrong kind for the
+/// next segment (e.g. indexing a map, or fielding an array) — and on an array
+/// index past the end (no silent auto-grow). A malformed path string is also
+/// `Null`.
+fn map_set_path(m: &indexmap::IndexMap<Box<str>, Value>, key: &str, val: &Value) -> Value {
+    let Some(segs) = parse_set_path(key) else {
+        return Value::Null;
+    };
+    let mut root = Value::Map(Box::new(m.clone()));
+    if set_in(&mut root, &segs, val) {
+        root
+    } else {
+        Value::Null
+    }
+}
+
+/// Writes `val` at the path `segs` inside `target`, descending in place into
+/// the caller's already-cloned copy. Returns `false` on any conflict so the
+/// caller can discard the partial copy and yield `Null` for the whole `.set`.
+fn set_in(target: &mut Value, segs: &[PathSeg<'_>], val: &Value) -> bool {
+    let Some((head, rest)) = segs.split_first() else {
+        *target = val.clone();
+        return true;
+    };
+    match (head, target) {
+        (PathSeg::Field(name), Value::Map(map)) => {
+            if rest.is_empty() {
+                map.insert(Box::from(*name), val.clone());
+                true
+            } else {
+                // Auto-create a missing intermediate as an empty map so the
+                // path can build structure; an existing wrong-kind child trips
+                // the conflict check one level down.
+                let child = map
+                    .entry(Box::from(*name))
+                    .or_insert_with(|| Value::Map(Box::new(indexmap::IndexMap::new())));
+                set_in(child, rest, val)
+            }
+        }
+        (PathSeg::Index(idx), Value::Array(items)) => match items.get_mut(*idx) {
+            Some(child) => set_in(child, rest, val),
+            None => false, // index past the end → Null, no auto-grow
+        },
+        // Field-into-array, index-into-map, or any scalar where a container is
+        // required: a hard type conflict.
+        _ => false,
     }
 }
 
