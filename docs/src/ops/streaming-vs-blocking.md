@@ -9,25 +9,33 @@ This distinction is what makes Clinker a bounded-memory executor: a pipeline's p
 
 ## Which stages stream
 
-A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer.
+A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is either a sink `Output` writer or an `Aggregate`'s ingest — see [Streaming into an Aggregate](#streaming-into-an-aggregate) below.
 
 Two stages stream *and* bound their own footprint to one batch, because they pull records off a live upstream channel and forward each batch without ever building a full result:
 
 - **Source → Transform → Output** fused chains. A non-windowed Transform whose only upstream is a single Source and whose only downstream is a single sink Output consumes that Source's records directly and hands each batch to the Output's writer thread over a back-pressured channel; neither the Transform nor the Output materializes the whole record set. A Transform that fans out to multiple consumers, feeds another operator, or roots a window keeps the buffered (materialized) path.
 - **`Merge` in `interleave` mode** fed entirely by Sources. The merge reads each Source's live stream and forwards records as they arrive.
 
-These stages stream their output to a single downstream Output too — sparing the second copy and overlapping the writer — but each still builds its full result first, so its own working set is not bounded to one batch:
+These stages stream their output to a single downstream consumer too — sparing the second copy and overlapping the consumer — but each still builds its full result first, so its own working set is not bounded to one batch:
 
 - **Single-branch `Route`**. A Route with exactly one branch feeding one sink Output streams that branch's records to the writer thread. A multi-branch Route forks records across several successor buffers and stays materialized.
 - **`Merge` in `concat` mode, or `interleave` fed by non-Source inputs**, feeding one sink Output. The merge drains its predecessors' buffers in order (concat) or round-robin (interleave) into the merged result, then streams it.
 - **`streaming`-strategy `Aggregate`** feeding one sink Output. When the planner certifies the aggregate's input is pre-sorted on the group key, it finalizes the group rows and streams them rather than buffering them for a downstream arm.
 - **`Combine` probe side** (hash build-probe strategy) feeding one sink Output. The build relation stays fully materialized in the hash table; the matched probe output streams to the writer.
 
-Each of these requires the producer to feed exactly one downstream Output and to root no window; a producer that roots a window keeps the materialized path because the window arena needs the producer's full output to build.
+Each of these requires the producer to feed exactly one downstream consumer and to root no window; a producer that roots a window keeps the materialized path because the window arena needs the producer's full output to build.
 
 - **Every `Output`**. A sink writes records to its configured writer and never buffers a whole stage.
 
 Document-boundary punctuations (`DocumentOpen` / `DocumentClose`, the signals behind [`$doc.*`](../pipeline/envelope-and-doc-context.md)) flow inline with records through streaming stages, preserving their order: a document's close always trails the document's last record, even when the document's records span several batches.
+
+### Streaming into an Aggregate
+
+The streaming consumer above is usually a sink `Output`. It can also be an `Aggregate`'s *ingest*: when an eligible producer (a fused `Source → Transform`, a single-branch `Route`, a non-fused `Merge`, or a `streaming`-strategy `Aggregate`) feeds exactly one downstream `Aggregate`, the producer streams record-at-a-time into the aggregate's `add_record` over a back-pressured channel rather than the aggregate pre-draining the producer's whole output from a charged buffer. The producer reports `buffer: streaming` and `--explain` shows no `node_buffer` edge between it and the aggregate.
+
+This streams the aggregate's *ingest* half only — the producer no longer needs a charged inter-stage slot, and a slow aggregate (one that is spilling, say) paces the producer through the bounded channel. The aggregate's *finalize* half stays blocking by nature: a `group_by` value depends on every member, so the group table accumulates the whole input and emits only after the channel closes (end of input). Spill stays driven by RSS pressure, never by channel depth, exactly as on the materialized path.
+
+Two aggregate shapes keep the materialized ingest, because their finalize is not a single forward pass: a **time-windowed** aggregate runs a multi-pass per-window algorithm over the whole input, and a **relaxed correlation-key** aggregate retains its group state for the correlation-commit phase. Both show `buffer: materialized` on the edge into them.
 
 ## Which stages block
 

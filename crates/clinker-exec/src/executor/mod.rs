@@ -1206,6 +1206,28 @@ impl PipelineExecutor {
             );
         fused_sources.extend(extra_fused_sources);
 
+        // Streaming Aggregate-ingest edges (issue #299). Each entry is a
+        // `producer → Aggregate` edge whose ingest streams: the producer
+        // runs inside the Aggregate's dispatch turn, streaming each batch
+        // into a bounded channel a scoped thread drains via `add_record`.
+        // Correlation buffering routes every record through the
+        // `CorrelationCommit` terminal, so it disables streaming
+        // pipeline-wide — mirror the same short-circuit the streaming-Output
+        // spec computation uses so the explain annotation and the runtime
+        // ingest path agree.
+        let streaming_aggregate_ingest_edges: HashMap<
+            petgraph::graph::NodeIndex,
+            petgraph::graph::NodeIndex,
+        > = if config.any_source_has_correlation_key() {
+            HashMap::new()
+        } else {
+            clinker_plan::plan::execution::compute_streaming_aggregate_ingest_edges(
+                plan,
+                &fused_transforms,
+                &init_phase_set,
+            )
+        };
+
         // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
         // grace-hash partition build, IEJoin, sort-merge). Sized off the
         // pipeline's `concurrency.threads` knob; `0`/absent defers to
@@ -1360,6 +1382,7 @@ impl PipelineExecutor {
             in_deferred_dispatch: false,
             streaming_output_senders,
             streaming_output_nodes,
+            streaming_aggregate_ingest_edges,
             streaming_output_tasks,
             streaming_charge_consumers,
             kernel_pool,
