@@ -1,23 +1,28 @@
-//! The streaming-output writer thread and its per-Output spec.
+//! The streaming-consumer substrate and its sole `Output` instantiation.
 //!
-//! Installs the fused producer → single-`Output` chains that the plan's
-//! streaming-fusion analysis flagged as bypassing a `node_buffers` slot,
-//! moving each such Output's writer onto its own thread fed by a bounded
-//! channel. The eligibility verdict comes from the plan layer's
-//! `streaming_output_producer`, so this runtime install can never disagree
-//! with the `--explain` buffer-class annotation.
+//! Installs the fused producer → single streaming-consumer chains that the
+//! plan's streaming-fusion analysis flagged as bypassing a `node_buffers`
+//! slot, moving each such consumer onto its own thread fed by a bounded
+//! channel. The channel-drain + per-record-discharge skeleton
+//! ([`drain_streaming_channel`]) is parameterized over a
+//! [`StreamingConsumer`], with [`OutputStreamConsumer`] (a file-writer)
+//! as the sole instantiation today. The eligibility verdict comes from the
+//! plan layer's `certify_streaming_edge`, so this runtime install can never
+//! disagree with the `--explain` buffer-class annotation.
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use clinker_record::Schema;
+use clinker_record::{Record, Schema};
 
 use clinker_format::traits::FormatWriter;
 use clinker_plan::config::{OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::streaming_output_producer;
+use clinker_plan::plan::execution::certify_streaming_edge;
 
+use super::stream_event::{Punctuation, StreamEvent};
 use super::{WriterRegistry, build_format_writer, dispatch, stage_metrics};
 
 /// Identify fused producer → single `Output` chains eligible for
@@ -35,10 +40,12 @@ use super::{WriterRegistry, build_format_writer, dispatch, stage_metrics};
 /// `node_buffers` slot, so peak inter-stage memory for that stage is one
 /// bounded batch rather than its whole output.
 ///
-/// Eligibility is decided by [`streaming_output_producer`] (the shared
+/// Eligibility is decided by [`certify_streaming_edge`] (the shared
 /// plan-derived predicate); this function adds the runtime writer-
 /// registry checks (the writer must be a registered single writer, not a
-/// fan-out) and packages the owned per-task metadata.
+/// fan-out) and packages the owned per-task metadata. It is the `Output`
+/// instantiation of the generalized substrate: the writer-registry guard,
+/// `out_cfg`, and projection metadata are all Output-specific.
 ///
 /// Returns the list of streaming specs (one per qualifying Output). Empty
 /// for pipelines that don't match the topology, leaving every Output on
@@ -69,16 +76,16 @@ pub(super) fn compute_streaming_output_specs(
             continue;
         };
         let Some(producer_idx) =
-            streaming_output_producer(plan, output_idx, fused_transforms, init_phase_set)
+            certify_streaming_edge(plan, output_idx, fused_transforms, init_phase_set)
         else {
             continue;
         };
 
         // Runtime writer-registry checks: the writer must be registered
         // as a single writer, never a fan-out. (The plan-derived
-        // fan-out / split exclusions live in `streaming_output_producer`
-        // so the explain surface agrees; this is the runtime-only
-        // registry confirmation.)
+        // fan-out / split exclusions live in `certify_streaming_edge`'s
+        // Output arm so the explain surface agrees; this is the
+        // runtime-only registry confirmation.)
         if !writers.single.contains_key(output_name) || writers.fan_out.contains_key(output_name) {
             continue;
         }
@@ -184,52 +191,70 @@ impl StreamingOutputTaskOutput {
     }
 }
 
-/// Streaming-output writer thread body. Drains the crossbeam `Receiver`
-/// populated by the fused `Merge.interleave` arm, projects each record
-/// through `project_output_from_record`, lazily constructs the writer on
-/// the first record, calls `Writer::write_record` per record, and
-/// flushes at channel close. Errors are accumulated rather than aborting
-/// the loop so the dispatcher can surface them alongside any sibling
-/// `output_errors`. See [`StreamingOutputSpec`] for the eligibility
-/// predicate and https://github.com/rustpunk/clinker/issues/72 for the
-/// rationale.
-pub(super) fn streaming_output(
-    rx: crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-    raw_writer: Box<dyn Write + Send>,
-    spec: StreamingOutputSpec,
-    charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-) -> StreamingOutputTaskOutput {
-    use crate::projection::project_output_from_record;
+/// A streaming consumer plugged into [`drain_streaming_channel`].
+///
+/// The skeleton owns the channel recv loop, the per-record memory
+/// discharge, the back-pressure semantics, and the deadlock-safe
+/// drain-on-fatal; the consumer owns only what to do with each event.
+/// Consumers are single-threaded — the skeleton drives one consumer per
+/// streaming thread, so `&mut self` is the only mutation path and the
+/// peak inter-stage footprint is one bounded batch.
+///
+/// `Output` (file writer) is the sole implementation today; future
+/// streaming consumers (an `Aggregate` ingest, a `Combine` probe) plug in
+/// as additional implementations without re-deriving the recv loop.
+pub(super) trait StreamingConsumer {
+    /// Handle one body record (already discharged from the shared charge
+    /// handle by the skeleton). Return [`ControlFlow::Continue`] to keep
+    /// draining or [`ControlFlow::Break`] on a fatal consumer error; on
+    /// `Break` the skeleton drains the rest of the channel (so the bounded
+    /// producer `send` never deadlocks), zeroes the charge, and returns
+    /// without calling [`StreamingConsumer::on_close`].
+    fn on_record(&mut self, record: Record, row_num: u64) -> ControlFlow<()>;
 
-    let mut out = StreamingOutputTaskOutput {
-        records_written: 0,
-        records_emitted: 0,
-        seen_row_nums: HashSet::new(),
-        write_timer: stage_metrics::CumulativeTimer::new(),
-        projection_timer: stage_metrics::CumulativeTimer::new(),
-        errors: Vec::new(),
-        stage_metrics: Vec::new(),
-    };
-    let cxl_emit_names_opt: Option<&[String]> = if spec.cxl_emit_names.is_empty() {
-        None
-    } else {
-        Some(&spec.cxl_emit_names)
-    };
+    /// Handle one document-boundary punctuation. Carries no memory
+    /// discharge — punctuations contribute zero to
+    /// `EventBatch::estimated_bytes`, so the record-only discharge stays
+    /// symmetric.
+    fn on_punctuation(&mut self, punct: Punctuation);
 
-    let mut scan_timer_slot: Option<stage_metrics::StageTimer> = Some(
-        stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan),
-    );
-    let mut writer: Option<Box<dyn FormatWriter>> = None;
-    let mut raw_writer_slot: Option<Box<dyn Write + Send>> = Some(raw_writer);
+    /// Finalize at channel disconnect (every sender dropped). Called
+    /// exactly once on the clean-drain path, never after an `on_record`
+    /// `Break`.
+    fn on_close(&mut self);
+}
 
+/// Drain a streaming consumer's bounded channel to disconnect, applying
+/// the per-record memory discharge and deadlock-safe fatal handling that
+/// every streaming consumer shares.
+///
+/// Streaming, not blocking: back-pressure flows consumer → producer →
+/// Source through the bounded channel, and the per-batch admit/discharge
+/// model keeps the slot's live byte count tracking only the batches in
+/// flight, never the whole stage. For each body record the skeleton
+/// discharges the record's `record_byte_cost` from `charge_handle` *before*
+/// handing it to [`StreamingConsumer::on_record`] — the consume half of the
+/// producer's per-batch `EventBatch::estimated_bytes` charge, so a fully
+/// drained stream nets the counter back to zero. On an `on_record`
+/// `Break`, the skeleton drains the rest of the channel (so the producer's
+/// bounded `send` never blocks forever on a dead consumer) and pins the
+/// charge to zero without finalizing the consumer. On clean disconnect it
+/// finalizes the consumer, then pins the charge to zero defensively so a
+/// heuristic mismatch between the batch charge and the per-record discharge
+/// can never leave a stale positive charge for the post-join arbitrator
+/// read.
+pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
+    rx: &crossbeam_channel::Receiver<StreamEvent>,
+    charge_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
+    consumer: &mut C,
+) {
     while let Ok(event) = rx.recv() {
-        // Streaming output is terminal — it writes records straight to
-        // disk. Punctuations are consumed here; per-document writer
-        // finalization (envelope header/footer streaming reconstruction
-        // on `DocumentClose`) is a follow-up filed under #91 backlog.
         let (record, rn) = match event {
-            crate::executor::stream_event::StreamEvent::Record(r, rn) => (r, rn),
-            crate::executor::stream_event::StreamEvent::Punctuation(_) => continue,
+            StreamEvent::Record(r, rn) => (r, rn),
+            StreamEvent::Punctuation(p) => {
+                consumer.on_punctuation(p);
+                continue;
+            }
         };
         // Discharge this record's per-row cost from the shared charge
         // handle — the consume half of the per-batch admit/discharge
@@ -237,111 +262,362 @@ pub(super) fn streaming_output(
         // `EventBatch::estimated_bytes` on flush; subtracting each
         // record's `record_byte_cost` as it drains keeps the slot's live
         // count tracking exactly what is still buffered between producer
-        // and writer. The formula matches the producer's charge, so a
-        // fully-drained stream nets the counter back to zero.
+        // and consumer. The formula matches the producer's charge, so a
+        // fully-drained stream nets the counter back to zero. It runs
+        // before `on_record` so a consumer that drops the record still
+        // accounts for it.
         charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
             record.schema().column_count(),
         ));
-        if let Some(expected) = spec.expected_input_schema.as_ref()
+        if consumer.on_record(record, rn).is_break() {
+            // Drain the rest of the channel so the producer's bounded
+            // `send` doesn't deadlock — the skeleton must keep consuming
+            // until every sender drops even when the consumer is dead,
+            // otherwise the producer blocks forever on a full bounded
+            // channel. The consumer is not finalized: a fatal `on_record`
+            // already abandoned its work.
+            while rx.recv().is_ok() {}
+            // Nothing is buffered downstream once the channel drains, so
+            // zero the slot's charge unconditionally — the fatal path never
+            // discharged the records it dropped on the floor above.
+            charge_handle.set_bytes(0);
+            return;
+        }
+    }
+
+    // Channel closed — every sender dropped (`recv` returned `Err`), so no
+    // more records will arrive. Let the consumer finalize (flush a writer,
+    // emit a final group), then pin the charge to zero.
+    consumer.on_close();
+    charge_handle.set_bytes(0);
+}
+
+/// The `Output` instantiation of [`StreamingConsumer`]: projects each
+/// record through `project_output_from_record`, lazily constructs the
+/// format writer on the first record, calls `Writer::write_record` per
+/// record, and flushes at channel close. Errors are accumulated into
+/// `out` rather than aborting so the dispatcher can surface them alongside
+/// any sibling `output_errors`.
+struct OutputStreamConsumer {
+    spec: StreamingOutputSpec,
+    out: StreamingOutputTaskOutput,
+    /// Pending `SchemaScan` timer, finished on the first writer build (or
+    /// on close for the empty-stream case).
+    scan_timer_slot: Option<stage_metrics::StageTimer>,
+    /// Lazily built on the first record's projected schema.
+    writer: Option<Box<dyn FormatWriter>>,
+    /// Holds the raw sink until the first record triggers the lazy build.
+    raw_writer_slot: Option<Box<dyn Write + Send>>,
+}
+
+impl OutputStreamConsumer {
+    fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingOutputSpec) -> Self {
+        Self {
+            spec,
+            out: StreamingOutputTaskOutput {
+                records_written: 0,
+                records_emitted: 0,
+                seen_row_nums: HashSet::new(),
+                write_timer: stage_metrics::CumulativeTimer::new(),
+                projection_timer: stage_metrics::CumulativeTimer::new(),
+                errors: Vec::new(),
+                stage_metrics: Vec::new(),
+            },
+            scan_timer_slot: Some(stage_metrics::StageTimer::new(
+                stage_metrics::StageName::SchemaScan,
+            )),
+            writer: None,
+            raw_writer_slot: Some(raw_writer),
+        }
+    }
+}
+
+impl StreamingConsumer for OutputStreamConsumer {
+    fn on_record(&mut self, record: Record, row_num: u64) -> ControlFlow<()> {
+        use crate::projection::project_output_from_record;
+
+        let cxl_emit_names_opt: Option<&[String]> = if self.spec.cxl_emit_names.is_empty() {
+            None
+        } else {
+            Some(&self.spec.cxl_emit_names)
+        };
+
+        if let Some(expected) = self.spec.expected_input_schema.as_ref()
             && let Err(err) = crate::executor::schema_check::check_input_schema(
                 expected,
                 record.schema(),
-                &spec.output_name,
+                &self.spec.output_name,
                 "output",
-                &spec.producer_name,
+                &self.spec.producer_name,
             )
         {
-            out.errors.push(err);
-            continue;
+            self.out.errors.push(err);
+            return ControlFlow::Continue(());
         }
 
         let projected = {
-            let _guard = out.projection_timer.guard();
-            project_output_from_record(&record, &spec.out_cfg, cxl_emit_names_opt)
+            let _guard = self.out.projection_timer.guard();
+            project_output_from_record(&record, &self.spec.out_cfg, cxl_emit_names_opt)
         };
 
-        // Lazy writer construction: defer until we have the first
-        // record's projected schema so the writer's column list matches
-        // what `project_output_from_record` actually emits (same source
-        // of truth as the buffered Output arm at dispatch.rs's
-        // `output_schema = Arc::clone(projected.schema())`).
-        if writer.is_none() {
-            let raw = raw_writer_slot
+        // Lazy writer construction: defer until we have the first record's
+        // projected schema so the writer's column list matches what
+        // `project_output_from_record` actually emits (same source of truth
+        // as the buffered Output arm at dispatch.rs's `output_schema =
+        // Arc::clone(projected.schema())`).
+        if self.writer.is_none() {
+            let raw = self
+                .raw_writer_slot
                 .take()
                 .expect("raw_writer_slot is Some until first record arrives");
             let schema = Arc::clone(projected.schema());
-            match build_format_writer(&spec.out_cfg, raw, schema) {
+            match build_format_writer(&self.spec.out_cfg, raw, schema) {
                 Ok(w) => {
-                    writer = Some(w);
-                    if let Some(timer) = scan_timer_slot.take() {
-                        out.stage_metrics.push(timer.finish(1, 1));
+                    self.writer = Some(w);
+                    if let Some(timer) = self.scan_timer_slot.take() {
+                        self.out.stage_metrics.push(timer.finish(1, 1));
                     }
                 }
                 Err(e) => {
-                    out.errors.push(e);
-                    if let Some(timer) = scan_timer_slot.take() {
-                        out.stage_metrics.push(timer.finish(0, 0));
+                    self.out.errors.push(e);
+                    if let Some(timer) = self.scan_timer_slot.take() {
+                        self.out.stage_metrics.push(timer.finish(0, 0));
                     }
-                    // Drain the rest of the channel so the Merge arm's
-                    // bounded `send` doesn't deadlock — the streaming
-                    // thread must keep consuming until every sender drops
-                    // even when the writer is dead, otherwise the Merge
-                    // producer blocks forever on a full bounded channel.
-                    while rx.recv().is_ok() {}
-                    // Nothing is buffered downstream once the channel
-                    // drains, so zero the slot's charge unconditionally —
-                    // the error path never discharged the records it
-                    // dropped on the floor above.
-                    charge_handle.set_bytes(0);
-                    return out;
+                    return ControlFlow::Break(());
                 }
             }
         }
 
         let write_result = {
-            let _guard = out.write_timer.guard();
-            writer
+            let _guard = self.out.write_timer.guard();
+            self.writer
                 .as_mut()
                 .expect("writer is Some after lazy construction")
                 .write_record(&projected)
         };
         match write_result {
             Ok(()) => {
-                out.records_written += 1;
-                out.records_emitted += 1;
-                out.seen_row_nums.insert(rn);
+                self.out.records_written += 1;
+                self.out.records_emitted += 1;
+                self.out.seen_row_nums.insert(row_num);
+                ControlFlow::Continue(())
             }
             Err(e) => {
-                out.errors.push(PipelineError::from(e));
-                while rx.recv().is_ok() {}
-                charge_handle.set_bytes(0);
-                return out;
+                self.out.errors.push(PipelineError::from(e));
+                ControlFlow::Break(())
             }
         }
     }
 
-    // Channel closed — every sender dropped (`recv` returned `Err`),
-    // so no more records will arrive. Flush whatever the writer has
-    // buffered. `writer.is_none()` is the empty-stream case (zero
-    // records arrived); matches the buffered path's
-    // `if unbuffered.is_empty() { return Ok(()); }` short-circuit.
-    if let Some(timer) = scan_timer_slot.take() {
-        out.stage_metrics.push(timer.finish(0, 0));
+    fn on_punctuation(&mut self, _punct: Punctuation) {
+        // Streaming output is terminal — it writes records straight to
+        // disk, so a document boundary needs no writer action here.
+        // Per-document writer finalization (envelope header/footer
+        // streaming reconstruction on `DocumentClose`) is a separate piece
+        // of work; until then punctuations are discarded, byte-for-byte
+        // matching the buffered Output path.
     }
-    if let Some(mut w) = writer {
-        let flush_result = {
-            let _guard = out.write_timer.guard();
-            w.flush()
-        };
-        if let Err(e) = flush_result {
-            out.errors.push(PipelineError::from(e));
+
+    fn on_close(&mut self) {
+        // Flush whatever the writer has buffered. `writer.is_none()` is the
+        // empty-stream case (zero records arrived); matches the buffered
+        // path's `if unbuffered.is_empty() { return Ok(()); }` short-circuit
+        // — the pending scan timer is still finished so the stage metric is
+        // emitted with zero rows.
+        if let Some(timer) = self.scan_timer_slot.take() {
+            self.out.stage_metrics.push(timer.finish(0, 0));
+        }
+        if let Some(w) = self.writer.as_mut() {
+            let flush_result = {
+                let _guard = self.out.write_timer.guard();
+                w.flush()
+            };
+            if let Err(e) = flush_result {
+                self.out.errors.push(PipelineError::from(e));
+            }
         }
     }
-    // The channel is fully drained, so nothing is in flight; the
-    // per-record discharge above should have zeroed the counter already.
-    // Pin it to zero defensively so a heuristic mismatch between the
-    // batch charge and the per-record discharge can never leave a stale
-    // positive charge for the post-join arbitrator read.
-    charge_handle.set_bytes(0);
-    out
+}
+
+/// Streaming-output writer thread body — the `Output` instantiation of the
+/// generalized streaming-consumer substrate. Builds an
+/// [`OutputStreamConsumer`] over the writer lifecycle and drives it with
+/// [`drain_streaming_channel`], returning the folded-back per-task
+/// counters. See [`StreamingOutputSpec`] for the eligibility predicate and
+/// https://github.com/rustpunk/clinker/issues/72 for the rationale.
+pub(super) fn streaming_output(
+    rx: crossbeam_channel::Receiver<StreamEvent>,
+    raw_writer: Box<dyn Write + Send>,
+    spec: StreamingOutputSpec,
+    charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+) -> StreamingOutputTaskOutput {
+    let mut consumer = OutputStreamConsumer::new(raw_writer, spec);
+    drain_streaming_channel(&rx, &charge_handle, &mut consumer);
+    consumer.out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::node_buffer::record_byte_cost;
+    use crate::executor::stream_event::PunctuationKind;
+    use crate::pipeline::memory::ConsumerHandle;
+    use clinker_record::{Schema, Value, synthetic_document_context};
+    use std::sync::Arc;
+
+    /// One-column record used to size the per-record discharge against
+    /// `record_byte_cost(1)`.
+    fn rec(id: i64) -> Record {
+        Record::new(
+            Arc::new(Schema::new(vec!["id".into()])),
+            vec![Value::Integer(id)],
+        )
+    }
+
+    /// Records every event the skeleton routes, so a test can assert
+    /// arrival order, `on_close` invocation count, and the `Break` cutoff.
+    /// `break_at_row` makes `on_record` return `Break` on the matching row
+    /// number, exercising the deadlock-safe drain-on-fatal path.
+    struct Recorder {
+        records: Vec<u64>,
+        puncts: Vec<PunctuationKind>,
+        closes: usize,
+        break_at_row: Option<u64>,
+    }
+
+    impl Recorder {
+        fn new(break_at_row: Option<u64>) -> Self {
+            Self {
+                records: Vec::new(),
+                puncts: Vec::new(),
+                closes: 0,
+                break_at_row,
+            }
+        }
+    }
+
+    impl StreamingConsumer for Recorder {
+        fn on_record(&mut self, _record: Record, row_num: u64) -> ControlFlow<()> {
+            self.records.push(row_num);
+            if self.break_at_row == Some(row_num) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+
+        fn on_punctuation(&mut self, punct: Punctuation) {
+            self.puncts.push(punct.kind());
+        }
+
+        fn on_close(&mut self) {
+            self.closes += 1;
+        }
+    }
+
+    #[test]
+    fn full_drain_nets_charge_to_zero_and_preserves_order() {
+        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let charge = ConsumerHandle::new();
+        let n = 4u64;
+        // Mirror the producer's per-batch admit: charge the whole stream
+        // up front, then let the skeleton discharge each record as it
+        // drains.
+        charge.add_bytes(record_byte_cost(1) * n);
+        for rn in 0..n {
+            tx.send(StreamEvent::record(rec(rn as i64), rn)).unwrap();
+        }
+        drop(tx);
+
+        let mut consumer = Recorder::new(None);
+        drain_streaming_channel(&rx, &charge, &mut consumer);
+
+        assert_eq!(consumer.records, vec![0, 1, 2, 3], "records seen in order");
+        assert_eq!(consumer.closes, 1, "on_close fires once on clean drain");
+        assert_eq!(charge.bytes(), 0, "full drain nets the charge to zero");
+    }
+
+    #[test]
+    fn break_drains_channel_zeroes_charge_and_skips_close() {
+        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let charge = ConsumerHandle::new();
+        let n = 5u64;
+        charge.add_bytes(record_byte_cost(1) * n);
+        for rn in 0..n {
+            tx.send(StreamEvent::record(rec(rn as i64), rn)).unwrap();
+        }
+        drop(tx);
+
+        // Break on row 1: rows 2..5 remain in the channel and must be
+        // drained so a bounded producer `send` could not deadlock.
+        let mut consumer = Recorder::new(Some(1));
+        drain_streaming_channel(&rx, &charge, &mut consumer);
+
+        assert_eq!(
+            consumer.records,
+            vec![0, 1],
+            "stops handing records at Break"
+        );
+        assert_eq!(
+            consumer.closes, 0,
+            "on_close is skipped after a fatal Break"
+        );
+        assert_eq!(charge.bytes(), 0, "charge is zeroed even on the fatal path");
+        assert!(rx.try_recv().is_err(), "remaining events are drained");
+    }
+
+    #[test]
+    fn punctuations_route_without_discharge_in_arrival_order() {
+        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let charge = ConsumerHandle::new();
+        // Charge only the single record; punctuations contribute nothing.
+        charge.add_bytes(record_byte_cost(1));
+        let doc = synthetic_document_context();
+        tx.send(StreamEvent::punctuation(Punctuation::document_open(
+            Arc::clone(&doc),
+        )))
+        .unwrap();
+        tx.send(StreamEvent::record(rec(0), 0)).unwrap();
+        tx.send(StreamEvent::punctuation(Punctuation::document_close(
+            Arc::clone(&doc),
+        )))
+        .unwrap();
+        drop(tx);
+
+        let mut consumer = Recorder::new(None);
+        drain_streaming_channel(&rx, &charge, &mut consumer);
+
+        assert_eq!(
+            consumer.puncts,
+            vec![
+                PunctuationKind::DocumentOpen,
+                PunctuationKind::DocumentClose
+            ],
+            "punctuations routed in arrival order"
+        );
+        assert_eq!(consumer.records, vec![0]);
+        assert_eq!(
+            charge.bytes(),
+            0,
+            "only the record discharged — punctuations carry no cost"
+        );
+    }
+
+    #[test]
+    fn disconnect_fires_close_once_then_zeroes_charge() {
+        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let charge = ConsumerHandle::new();
+        // Empty stream: no records charged, immediate disconnect.
+        drop(tx);
+
+        let mut consumer = Recorder::new(None);
+        drain_streaming_channel(&rx, &charge, &mut consumer);
+
+        assert!(consumer.records.is_empty(), "no records on an empty stream");
+        assert_eq!(
+            consumer.closes, 1,
+            "on_close fires exactly once on disconnect"
+        );
+        assert_eq!(charge.bytes(), 0);
+    }
 }
