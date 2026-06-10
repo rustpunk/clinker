@@ -1942,17 +1942,160 @@ mod intra_record {
     }
 
     #[test]
-    fn nested_emit_each_rejected_by_parser() {
-        let result =
-            Parser::parse("emit each it in nums {\n  emit each x in others { emit val = x }\n}");
-        assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.message.contains("emit_each cannot be nested")),
-            "expected nested emit_each parse error, got: {:?}",
-            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
+    fn nested_emit_each_fans_out_within_fan_out() {
+        // Two-level fan-out for one trigger row: the outer iterates
+        // `groups`, the inner iterates each group's `items`, producing one
+        // leaf record per (group, item). The inner binding reads the
+        // current element while the outer binding stays visible.
+        let out = run(
+            "emit each g in groups {\n  emit each it in g {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![
+                    arr(vec![Value::Integer(1), Value::Integer(2)]),
+                    arr(vec![Value::Integer(3)]),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 3, "2 + 1 leaf records");
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Integer(2)));
+                assert_eq!(records[2].fields.get("val"), Some(&Value::Integer(3)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_outer_binding_visible_in_inner_body() {
+        // The outer binding (`g`) must remain readable inside the inner
+        // fan-out body alongside the inner binding (`it`).
+        let out = run(
+            "emit each g in groups {\n  emit each it in g {\n    emit pair = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![arr(vec![Value::Integer(10), Value::Integer(20)])]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].fields.get("pair"), Some(&Value::Integer(10)));
+                assert_eq!(records[1].fields.get("pair"), Some(&Value::Integer(20)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_pre_block_emits_apply_to_every_leaf() {
+        // A top-level emit before the outer block, and an emit inside the
+        // outer body before the inner block, both apply to every leaf
+        // record the nested fan-out produces.
+        let out = run(
+            "emit kept = 9\nemit each g in groups {\n  emit gid = 7\n  emit each it in g {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![arr(vec![Value::Integer(1), Value::Integer(2)])]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 2);
+                for r in &records {
+                    assert_eq!(r.fields.get("kept"), Some(&Value::Integer(9)));
+                    assert_eq!(r.fields.get("gid"), Some(&Value::Integer(7)));
+                }
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Integer(2)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_max_expansion_is_cumulative() {
+        // The cap counts leaf records across both nesting levels, not
+        // per-level. Three groups of two items = six leaves; a cap of 5
+        // trips on the sixth.
+        let groups = arr(vec![
+            arr(vec![Value::Integer(1), Value::Integer(2)]),
+            arr(vec![Value::Integer(3), Value::Integer(4)]),
+            arr(vec![Value::Integer(5), Value::Integer(6)]),
+        ]);
+        let err = run_with_max_expansion(
+            "emit each g in groups {\n  emit each it in g {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([("groups".into(), groups)]),
+            5,
+        )
+        .expect_err("expected cumulative ExpansionLimitExceeded across nesting");
+        match err.kind {
+            crate::eval::EvalErrorKind::ExpansionLimitExceeded { limit } => {
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected ExpansionLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_inner_null_source_emits_no_leaf_for_that_group() {
+        // A plain inner `emit each` over a null/empty group fans out zero
+        // leaves for that group while sibling groups still expand.
+        let out = run(
+            "emit each g in groups {\n  emit each it in g {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![
+                    arr(vec![Value::Integer(1)]),
+                    Value::Null,
+                    arr(vec![Value::Integer(2)]),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 2, "null group contributes no leaf");
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Integer(2)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_same_binding_name_restores_outer_after_inner() {
+        // The inner block reuses the outer binding name (`it`). After the
+        // inner loop the outer `it` must be restored so a trailing
+        // outer-body emit still reads the outer element, not a leftover
+        // inner value.
+        let out = run(
+            "emit each it in groups {\n  emit each it in it {\n    emit leaf = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![arr(vec![Value::Integer(1), Value::Integer(2)])]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].fields.get("leaf"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("leaf"), Some(&Value::Integer(2)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2086,16 +2229,70 @@ mod intra_record {
     }
 
     #[test]
-    fn nested_explode_outer_rejected_by_parser() {
-        let result = Parser::parse(
-            "emit each it in nums outer {\n  emit each x in others outer { emit val = x }\n}",
-        );
+    fn nested_explode_outer_preserves_trigger_row_for_empty_inner_group() {
+        // Inner `outer` over an empty group preserves one trigger row with
+        // the inner binding bound to null, instead of dropping the group.
+        let out = run(
+            "emit each g in groups {\n  emit each it in g outer {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([(
+                "groups".into(),
+                arr(vec![arr(vec![Value::Integer(1)]), arr(vec![])]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                // First group: one leaf (val=1). Second group is empty, but
+                // the inner `outer` still emits one null-bound trigger row.
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Null));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_outer_outer_null_top_source_preserves_single_trigger_row() {
+        // A null top-level source under `outer` synthesizes one null
+        // element; the nested inner `outer` over that null binding then
+        // preserves a single trigger row with both bindings null.
+        let out = run(
+            "emit each g in groups outer {\n  emit each it in g outer {\n    emit val = it\n  }\n}",
+            &["groups"],
+            HashMap::from([("groups".into(), Value::Null)]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Null));
+            }
+            other => panic!("expected single preserved trigger row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_emit_each_too_deep_rejected_by_parser() {
+        // Fan-out nesting is bounded (32 levels) so adversarial input
+        // cannot overflow the parser's statement recursion. Build 40
+        // nested `emit each` blocks and confirm the depth guard fires.
+        let mut src = String::new();
+        for i in 0..40 {
+            src.push_str(&format!("emit each b{i} in arr{i} {{\n"));
+        }
+        src.push_str("emit val = 1\n");
+        for _ in 0..40 {
+            src.push_str("}\n");
+        }
+        let result = Parser::parse(&src);
         assert!(
             result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("emit_each cannot be nested")),
-            "expected nested fan-out parse error, got: {:?}",
+                .any(|e| e.message.contains("nesting too deep")),
+            "expected emit-each depth-limit parse error, got: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }

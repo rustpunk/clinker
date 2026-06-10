@@ -50,12 +50,23 @@ pub struct Parser {
     errors: Vec<ParseError>,
     depth: u32,
     next_id: u32,
-    /// Tracks whether parser is currently inside the body of an
-    /// `emit each` block. Nested `emit each` is forbidden so the
-    /// per-record fan-out remains a single flat expansion; the
-    /// `max_expansion` ceiling is the only gate on output cardinality.
-    in_emit_each: bool,
+    /// Current `emit each` block nesting depth. Fan-out may nest (an
+    /// `emit each` inside another `emit each` body, fanning out within
+    /// fan-out for one trigger row); the cumulative `max_expansion`
+    /// ceiling — not a parser-level ban — gates total output cardinality.
+    /// The depth is still capped at [`MAX_EMIT_EACH_DEPTH`] so adversarial
+    /// input cannot drive `parse_emit_each`'s statement recursion into a
+    /// stack overflow, the same stack-safety guarantee `depth` gives the
+    /// expression parser.
+    emit_each_depth: u32,
 }
+
+/// Maximum `emit each` block nesting depth. Bounds `parse_emit_each`'s
+/// statement-level recursion so deeply nested fan-out in malicious input
+/// cannot overflow the parser stack. Real document fan-out (article →
+/// section → tag) is a handful of levels; 32 is far beyond any legitimate
+/// pipeline yet small enough to keep recursion shallow.
+const MAX_EMIT_EACH_DEPTH: u32 = 32;
 
 // Binding power pairs (left_bp, right_bp).
 // Lower number = looser binding. Right-associative: right_bp < left_bp.
@@ -123,7 +134,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
-            in_emit_each: false,
+            emit_each_depth: 0,
         };
         let start_span = parser.current_span();
         let mut statements = Vec::new();
@@ -180,7 +191,7 @@ impl Parser {
             errors: Vec::new(),
             depth: 0,
             next_id: 0,
-            in_emit_each: false,
+            emit_each_depth: 0,
         };
         let start_span = parser.current_span();
         let mut functions = Vec::new();
@@ -432,13 +443,16 @@ impl Parser {
     /// taken from the parent's allocator so the resulting statement
     /// carries the same NodeId/Span origin as a plain `emit`. A trailing
     /// `outer` modifier yields [`Statement::ExplodeOuter`]; its absence
-    /// yields [`Statement::EmitEach`].
+    /// yields [`Statement::EmitEach`]. Fan-out may nest — an `emit each`
+    /// body may itself contain `emit each` blocks — bounded by
+    /// [`MAX_EMIT_EACH_DEPTH`] so adversarial input cannot overflow the
+    /// statement-recursion stack.
     fn parse_emit_each(&mut self, nid: NodeId, start: Span) -> Result<Statement, ParseError> {
-        if self.in_emit_each {
+        if self.emit_each_depth >= MAX_EMIT_EACH_DEPTH {
             return Err(self.error(
-                "emit_each cannot be nested inside another emit_each",
-                "Nested fan-out would compound expansion ratios without a clear cardinality bound — the per-record max_expansion limit governs flat fan-out only",
-                "Flatten the producer (e.g. precompute the cross product into a single array) and emit once",
+                "emit each nesting too deep (max 32 levels)",
+                "Deeply nested fan-out is bounded to keep parser recursion stack-safe; legitimate document fan-out is only a few levels deep",
+                "Flatten part of the nesting (e.g. precompute a flattened array with .flat_map) and fan out over fewer levels",
             ));
         }
 
@@ -497,20 +511,24 @@ impl Parser {
 
         self.expect_token(&Token::LBrace, "'{'")?;
 
-        self.in_emit_each = true;
+        // Enter one nesting level. A nested `emit each` inside the body
+        // re-enters here and increments again; on the error path the
+        // depth is restored so a recoverable parse does not leak a
+        // permanently-elevated depth into sibling statements.
+        self.emit_each_depth += 1;
         let mut body = Vec::new();
         self.skip_newlines();
         while *self.peek() != Token::RBrace && !self.at_eof() {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
                 Err(e) => {
-                    self.in_emit_each = false;
+                    self.emit_each_depth -= 1;
                     return Err(e);
                 }
             }
             self.skip_newlines();
         }
-        self.in_emit_each = false;
+        self.emit_each_depth -= 1;
         let end_span = self.current_span();
         self.expect_token(&Token::RBrace, "'}'")?;
 
@@ -2674,6 +2692,27 @@ mod tests {
             Statement::ExplodeOuter { binding, .. } => assert_eq!(&**binding, "tag"),
             other => panic!(
                 "expected ExplodeOuter, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_emit_each_is_accepted() {
+        // Nesting is no longer a parse error: an `emit each` body may
+        // contain another `emit each`, parsed as a body statement.
+        let r =
+            parse_ok("emit each g in groups {\n  emit each it in g {\n    emit val = it\n  }\n}");
+        match first_stmt(&r) {
+            Statement::EmitEach { body, .. } => {
+                assert!(
+                    matches!(body.first(), Some(Statement::EmitEach { .. })),
+                    "expected a nested EmitEach in the body, got {:?}",
+                    body.first().map(std::mem::discriminant)
+                );
+            }
+            other => panic!(
+                "expected outer EmitEach, got {:?}",
                 std::mem::discriminant(other)
             ),
         }

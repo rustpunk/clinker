@@ -104,6 +104,13 @@ pub(crate) struct EvalState {
     /// running emit count reaches this, the originating record errors
     /// with `ExpansionLimitExceeded` rather than expanding unboundedly.
     max_expansion: u64,
+    /// Records this input has fanned out so far, summed across every
+    /// nesting level of `emit each` / `emit each ... outer`. The ceiling
+    /// is cumulative, not per-level: an article → section → tag fan-out
+    /// charges every emitted leaf against one budget so nesting cannot
+    /// multiply past `max_expansion` undetected. Reset to zero at the
+    /// start of each [`CompiledProgram::eval_record`].
+    expansion_count: u64,
 }
 
 impl EvalState {
@@ -115,6 +122,7 @@ impl EvalState {
             distinct_seen: has_distinct.then(HashSet::new),
             current_partition_key: None,
             max_expansion,
+            expansion_count: 0,
         }
     }
 
@@ -271,11 +279,15 @@ struct StmtOut<'s> {
     record_vars: indexmap::IndexMap<String, Value>,
     /// Records produced by `emit each` blocks this record. Non-empty at
     /// end-of-program promotes the result to [`EvalResult::EmitMany`].
+    /// A nested `emit each` body runs against a child `StmtOut` whose
+    /// `fan_out` collects that level's records; the parent lifts them
+    /// into its own `fan_out` so every leaf record reaches the top.
     fan_out: Vec<super::EmitOne>,
-    /// Running fan-out cardinality across all `emit each` blocks for this
-    /// record, checked against [`EvalState::max_expansion`].
-    expansion_count: u64,
-    /// Cross-record dedup state, borrowed for the duration of the record.
+    /// Cross-record dedup state plus the cumulative fan-out counter,
+    /// borrowed for the duration of the record. The expansion count lives
+    /// on [`EvalState`] (not here) so it accumulates across nesting levels:
+    /// each nested `emit each` body shares the same `state`, charging every
+    /// leaf record against one cumulative `max_expansion` budget.
     state: &'s mut EvalState,
 }
 
@@ -333,11 +345,14 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
             window,
             env: HashMap::new(),
         };
+        // The cumulative fan-out budget is per input record; reset it
+        // before any `emit each` block runs so one record's expansion
+        // never charges against the next.
+        state.expansion_count = 0;
         let mut out = StmtOut {
             fields: indexmap::IndexMap::new(),
             record_vars: indexmap::IndexMap::new(),
             fan_out: Vec::new(),
-            expansion_count: 0,
             state,
         };
         for stmt in &self.statements {
@@ -537,9 +552,15 @@ fn compile_stmt<S: RecordStorage + 'static>(
             let binding = binding.to_string();
             let source = compile_expr::<S>(typed, source);
             let span = *span;
-            // The body is a restricted sub-program: only let / emit /
-            // trace / use / expression statements. `filter` / `distinct` /
-            // nested `emit each` are rejected at compile time with a
+            // Whether the body itself fans out (a nested `emit each` /
+            // `emit each ... outer` statement). Decides how a leaf record
+            // is collected — see `run_fan_out`. A property of the body
+            // shape, so it is computed once here, not re-derived per record.
+            let body_fans_out = body_has_fan_out(body);
+            // The body is a restricted sub-program: let / emit / trace /
+            // use / expression statements plus nested `emit each` /
+            // `emit each ... outer` (fan-out within fan-out). `filter` /
+            // `distinct` are still rejected at compile time with a
             // span-anchored type error — a fan-out block applies once per
             // outer record, so a body filter/distinct has no representable
             // meaning.
@@ -564,43 +585,7 @@ fn compile_stmt<S: RecordStorage + 'static>(
                         ));
                     }
                 };
-                for element in elements {
-                    // Ceiling check before binding/evaluating the element:
-                    // an oversized fan-out errors before unbounded work.
-                    if out.expansion_count >= out.state.max_expansion {
-                        return Err(EvalError::new(
-                            EvalErrorKind::ExpansionLimitExceeded {
-                                limit: out.state.max_expansion,
-                            },
-                            span,
-                        ));
-                    }
-                    frame.env.insert(binding.clone(), element);
-                    // Seed each emitted record with the field / record-var
-                    // writes already produced before this block — a
-                    // top-level `emit name = ...` preceding the fan-out
-                    // applies to every record it produces.
-                    let mut iter = StmtOut {
-                        fields: out.fields.clone(),
-                        record_vars: out.record_vars.clone(),
-                        fan_out: Vec::new(),
-                        expansion_count: 0,
-                        state: &mut *out.state,
-                    };
-                    for stmt in &body {
-                        // A restricted body never skips or fans out, so the
-                        // flow result is always `Continue`; an error
-                        // propagates with the per-element binding still in
-                        // env (per-record scratch, discarded on error).
-                        stmt(frame, &mut iter)?;
-                    }
-                    frame.env.remove(binding.as_str());
-                    out.fan_out.push(super::EmitOne {
-                        fields: iter.fields,
-                        record_vars: Box::new(iter.record_vars),
-                    });
-                    out.expansion_count += 1;
-                }
+                run_fan_out(frame, out, &binding, &body, body_fans_out, elements, span)?;
                 Ok(StmtFlow::Continue)
             })
         }
@@ -614,9 +599,10 @@ fn compile_stmt<S: RecordStorage + 'static>(
             let binding = binding.to_string();
             let source = compile_expr::<S>(typed, source);
             let span = *span;
-            // Same restricted body surface as `emit each`: only let / emit
-            // / trace / use / expression statements; filter / distinct /
-            // nested fan-out are rejected at compile time.
+            let body_fans_out = body_has_fan_out(body);
+            // Same restricted body surface as `emit each`: let / emit /
+            // trace / use / expression statements plus nested fan-out;
+            // filter / distinct are rejected at compile time.
             let body: Vec<CompiledStmt<S>> = body
                 .iter()
                 .map(|s| compile_emit_each_body_stmt(typed, s))
@@ -650,47 +636,152 @@ fn compile_stmt<S: RecordStorage + 'static>(
                     elements
                 };
 
-                for element in elements {
-                    // Ceiling check before binding/evaluating the element:
-                    // an oversized fan-out errors before unbounded work.
-                    if out.expansion_count >= out.state.max_expansion {
-                        return Err(EvalError::new(
-                            EvalErrorKind::ExpansionLimitExceeded {
-                                limit: out.state.max_expansion,
-                            },
-                            span,
-                        ));
-                    }
-                    frame.env.insert(binding.clone(), element);
-                    let mut iter = StmtOut {
-                        fields: out.fields.clone(),
-                        record_vars: out.record_vars.clone(),
-                        fan_out: Vec::new(),
-                        expansion_count: 0,
-                        state: &mut *out.state,
-                    };
-                    for stmt in &body {
-                        stmt(frame, &mut iter)?;
-                    }
-                    frame.env.remove(binding.as_str());
-                    out.fan_out.push(super::EmitOne {
-                        fields: iter.fields,
-                        record_vars: Box::new(iter.record_vars),
-                    });
-                    out.expansion_count += 1;
-                }
+                run_fan_out(frame, out, &binding, &body, body_fans_out, elements, span)?;
                 Ok(StmtFlow::Continue)
             })
         }
     }
 }
 
+/// Drive one `emit each` / `emit each ... outer` block: bind each element,
+/// run the (already-compiled) body, and lift the produced records into
+/// `out.fan_out`. Shared by both fan-out statements — they differ only in
+/// how their caller derives `elements` (a null source is zero records for
+/// `emit each`, one null-bound trigger row for the `outer` variant), so
+/// every behavior past element derivation is identical.
+///
+/// Nested fan-out: each element runs against a child [`StmtOut`] seeded
+/// with the records emitted before this block. `body_fans_out` (computed
+/// once at compile time by [`body_has_fan_out`]) selects how a leaf is
+/// collected:
+///
+/// - **Body fans out** (it contains a nested `emit each` / `... outer`):
+///   the child's `fan_out` *is* this element's output — zero or more leaf
+///   records. They are moved up into the parent's `fan_out`, so a deeply
+///   nested article → section → tag expansion surfaces every leaf at the
+///   top, and a nested block that produces nothing (a plain inner
+///   `emit each` over a null/empty group) correctly contributes no leaf.
+/// - **Body does not fan out**: the body produced exactly one leaf record
+///   (its field / record-var channels), which is pushed directly.
+///
+/// This distinction must be a compile-time property of the body, not a
+/// runtime `iter.fan_out.is_empty()` test: a nested fan-out that emits
+/// zero records leaves `fan_out` empty yet must still contribute nothing,
+/// not a spurious single record.
+///
+/// The `max_expansion` ceiling is **cumulative** across nesting levels:
+/// every leaf record (whether produced here or by a nested block) charges
+/// against `state.expansion_count`, and the leaf-level check fires before
+/// the element's work, so an oversized fan-out errors before unbounded
+/// allocation and nesting cannot multiply the budget. The binding is
+/// save/restored around the loop so a same-named outer binding survives a
+/// nested block that rebinds it (`emit each it in a { emit each it in b }`).
+fn run_fan_out<'a, 'w, S: RecordStorage + 'static>(
+    frame: &mut Frame<'a, 'w, S>,
+    out: &mut StmtOut<'_>,
+    binding: &str,
+    body: &[CompiledStmt<S>],
+    body_fans_out: bool,
+    elements: Vec<Value>,
+    span: Span,
+) -> Result<(), EvalError> {
+    // Save any same-named binding shadowed by this block (a nested
+    // fan-out reusing the binding name, or a record field). The loop's
+    // result is computed first, then the binding is restored on every
+    // exit path below — so the restore is written once, not duplicated at
+    // each early return.
+    let shadowed = frame.env.remove(binding);
+    let mut result = Ok(());
+    for element in elements {
+        // For a leaf body (no nested fan-out) each element yields exactly
+        // one record; charge the cumulative budget before doing the work
+        // so an oversized fan-out errors before unbounded allocation. A
+        // nesting body defers the check to its inner leaves.
+        if !body_fans_out && out.state.expansion_count >= out.state.max_expansion {
+            result = Err(EvalError::new(
+                EvalErrorKind::ExpansionLimitExceeded {
+                    limit: out.state.max_expansion,
+                },
+                span,
+            ));
+            break;
+        }
+        frame.env.insert(binding.to_string(), element);
+        // Seed each emitted record with the field / record-var writes
+        // already produced before this block — a top-level
+        // `emit name = ...` preceding the fan-out applies to every record
+        // it produces. The child shares `out.state`, so its cumulative
+        // expansion count and dedup set are the parent's.
+        let mut iter = StmtOut {
+            fields: out.fields.clone(),
+            record_vars: out.record_vars.clone(),
+            fan_out: Vec::new(),
+            state: &mut *out.state,
+        };
+        let mut body_err = None;
+        for stmt in body {
+            // A restricted body never skips, and a nested fan-out reports
+            // `Continue` after collecting into `iter.fan_out`, so the flow
+            // result is always `Continue` on success.
+            if let Err(e) = stmt(frame, &mut iter) {
+                body_err = Some(e);
+                break;
+            }
+        }
+        // Move the child's owned channels out so its `&mut out.state`
+        // borrow ends here, freeing `out.state` for the append below.
+        let StmtOut {
+            fields: iter_fields,
+            record_vars: iter_record_vars,
+            fan_out: mut iter_fan_out,
+            state: _,
+        } = iter;
+        if let Some(e) = body_err {
+            result = Err(e);
+            break;
+        }
+        if body_fans_out {
+            // The nested fan-out already charged each inner leaf against
+            // the cumulative budget; lift its records (zero or more) up.
+            out.fan_out.append(&mut iter_fan_out);
+        } else {
+            out.fan_out.push(super::EmitOne {
+                fields: iter_fields,
+                record_vars: Box::new(iter_record_vars),
+            });
+            out.state.expansion_count += 1;
+        }
+    }
+    frame.env.remove(binding);
+    if let Some(prev) = shadowed {
+        frame.env.insert(binding.to_string(), prev);
+    }
+    result
+}
+
+/// Whether a fan-out body contains a top-level `emit each` /
+/// `emit each ... outer` statement — i.e. whether running the body
+/// produces its output records via the child's `fan_out` channel rather
+/// than a single field map. Computed once at compile time so
+/// [`run_fan_out`] never re-derives it per record. Only the immediate
+/// level matters; a fan-out nested two levels down is reached transitively
+/// through this same body's nested block.
+fn body_has_fan_out(body: &[Statement]) -> bool {
+    body.iter().any(|s| {
+        matches!(
+            s,
+            Statement::EmitEach { .. } | Statement::ExplodeOuter { .. }
+        )
+    })
+}
+
 /// Compile one statement of an `emit each` body. The body surface is
-/// restricted to let / emit / trace / use / expression statements;
-/// `filter` / `distinct` / nested `emit each` are rejected here at
-/// compile time with a span-anchored type error. The returned closure
-/// shares the same `StmtOut` shape as a top-level statement but only ever
-/// reports `Continue`.
+/// let / emit / trace / use / expression statements plus nested fan-out
+/// (`emit each` / `emit each ... outer`); `filter` / `distinct` are
+/// rejected here at compile time with a span-anchored type error. The
+/// returned closure shares the same `StmtOut` shape as a top-level
+/// statement; a nested fan-out reports `Continue` after collecting its
+/// records into the child `StmtOut.fan_out`.
 ///
 /// `trace` and `use` are compiled to bare `Continue` no-ops here, *not*
 /// routed through `compile_stmt`: inside a fan-out body a `trace`'s guard
@@ -705,19 +796,21 @@ fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
         Statement::Trace { .. } | Statement::UseStmt { .. } => {
             Box::new(|_frame, _out| Ok(StmtFlow::Continue))
         }
-        Statement::Let { .. } | Statement::Emit { .. } | Statement::ExprStmt { .. } => {
-            compile_stmt(typed, stmt)
-        }
-        Statement::Filter { span, .. }
-        | Statement::Distinct { span, .. }
-        | Statement::EmitEach { span, .. }
-        | Statement::ExplodeOuter { span, .. } => {
+        // Nested fan-out is a first-class body statement: its compiled
+        // closure collects into the child `StmtOut.fan_out`, which the
+        // surrounding `run_fan_out` lifts up a level.
+        Statement::Let { .. }
+        | Statement::Emit { .. }
+        | Statement::ExprStmt { .. }
+        | Statement::EmitEach { .. }
+        | Statement::ExplodeOuter { .. } => compile_stmt(typed, stmt),
+        Statement::Filter { span, .. } | Statement::Distinct { span, .. } => {
             let span = *span;
             Box::new(move |_frame, _out| {
                 Err(EvalError::new(
                     EvalErrorKind::TypeMismatch {
-                        expected: "let / emit / trace inside emit each body",
-                        got: "filter / distinct / nested emit_each",
+                        expected: "let / emit / trace / nested emit each inside emit each body",
+                        got: "filter / distinct",
                     },
                     span,
                 ))

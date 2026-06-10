@@ -996,51 +996,48 @@ impl<'a> TypeChecker<'a> {
             .collect();
 
         for stmt in &program.statements {
-            match stmt {
-                Statement::Emit { expr, .. } => {
-                    self.agg_function_depth = 0;
-                    self.walk_agg_ctx(expr, &let_exprs);
-                }
-                // Let bindings are checked through their usage sites
-                // (PostgreSQL-style alias expansion): a bare non-grouped
-                // field in a let body is only an error if the let var is
-                // referenced outside an aggregate function.
-                Statement::Let { .. } => {}
-                Statement::Filter { predicate, .. } => {
-                    // Filter in an aggregate transform acts as a row-level
-                    // gate (WHERE semantics). AggCalls here are rejected in
-                    // both modes — GroupBy also rejects because aggregates
-                    // belong in HAVING (not supported), matching PostgreSQL.
-                    self.agg_function_depth = 0;
-                    self.walk_agg_ctx_row_only(predicate);
-                }
-                Statement::EmitEach { source, body, .. }
-                | Statement::ExplodeOuter { source, body, .. } => {
-                    // Fan-out (plain or outer) is a row-level operation:
-                    // the source must not contain aggregates, and body
-                    // statements obey the same context rules as the
-                    // surrounding block.
-                    self.agg_function_depth = 0;
-                    self.walk_agg_ctx_row_only(source);
-                    // Recurse the body via the existing dispatch by
-                    // wrapping each body statement through the same
-                    // pattern.
-                    for stmt in body {
-                        match stmt {
-                            Statement::Emit { expr, .. } => {
-                                self.agg_function_depth = 0;
-                                self.walk_agg_ctx(expr, &let_exprs);
-                            }
-                            Statement::Filter { predicate, .. } => {
-                                self.agg_function_depth = 0;
-                                self.walk_agg_ctx_row_only(predicate);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
+            self.check_aggregate_context_stmt(stmt, &let_exprs);
+        }
+    }
+
+    /// Enforce aggregate-context rules on one statement, recursing through
+    /// `emit each` / `emit each ... outer` bodies — including a fan-out
+    /// nested inside another fan-out, so a nested block's emits and the
+    /// aggregate calls inside them are never invisible to this check. A
+    /// non-recursive walker that handled only the immediate body silently
+    /// admitted aggregates buried one fan-out level deeper.
+    fn check_aggregate_context_stmt(&mut self, stmt: &Statement, let_exprs: &[Expr]) {
+        match stmt {
+            Statement::Emit { expr, .. } => {
+                self.agg_function_depth = 0;
+                self.walk_agg_ctx(expr, let_exprs);
             }
+            // Let bindings are checked through their usage sites
+            // (PostgreSQL-style alias expansion): a bare non-grouped
+            // field in a let body is only an error if the let var is
+            // referenced outside an aggregate function.
+            Statement::Let { .. } => {}
+            Statement::Filter { predicate, .. } => {
+                // Filter in an aggregate transform acts as a row-level
+                // gate (WHERE semantics). AggCalls here are rejected in
+                // both modes — GroupBy also rejects because aggregates
+                // belong in HAVING (not supported), matching PostgreSQL.
+                self.agg_function_depth = 0;
+                self.walk_agg_ctx_row_only(predicate);
+            }
+            Statement::EmitEach { source, body, .. }
+            | Statement::ExplodeOuter { source, body, .. } => {
+                // Fan-out (plain or outer) is a row-level operation: the
+                // source must not contain aggregates, and body statements
+                // — at every nesting level — obey the same context rules
+                // as the surrounding block.
+                self.agg_function_depth = 0;
+                self.walk_agg_ctx_row_only(source);
+                for inner in body {
+                    self.check_aggregate_context_stmt(inner, let_exprs);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1840,6 +1837,23 @@ mod tests {
     fn test_agg_in_row_context_rejected() {
         let errs = row_err("emit total = sum(amount)", &["amount"]);
         assert!(errs.iter().any(|d| d.message.contains("sum")));
+    }
+
+    #[test]
+    fn test_agg_inside_nested_emit_each_body_row_context_rejected() {
+        // The aggregate-context walker must descend through both fan-out
+        // levels: an aggregate call buried in a body nested two `emit each`
+        // blocks deep is still forbidden in a row-level transform. A
+        // walker that handled only the immediate body would let this slip.
+        let errs = row_err(
+            "emit each g in groups {\n  emit each it in g {\n    emit bad = sum(it)\n  }\n}",
+            &["groups"],
+        );
+        assert!(
+            errs.iter().any(|d| d.message.contains("sum")),
+            "expected the buried aggregate to be rejected, got: {:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

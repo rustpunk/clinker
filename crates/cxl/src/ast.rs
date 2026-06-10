@@ -99,7 +99,10 @@ pub enum Statement {
     /// Evaluates `source` to a `Value::Array`, then for each element runs
     /// `body` with `binding` bound to the element value. Body emit
     /// statements produce one output record per iteration. Null source
-    /// emits zero records. Nesting is rejected at parse time.
+    /// emits zero records. The body may contain further `emit each` /
+    /// `emit each ... outer` blocks — fan-out within fan-out for one
+    /// trigger row — governed by one cumulative `max_expansion` budget
+    /// across all nesting levels.
     EmitEach {
         node_id: NodeId,
         binding: Box<str>,
@@ -112,8 +115,8 @@ pub enum Statement {
     /// but a null or empty-array source still emits the trigger row once
     /// with `binding` bound to null rather than emitting zero records —
     /// the outer-join (`LATERAL VIEW OUTER EXPLODE`) shape that preserves
-    /// a trigger row carrying no array elements. Nesting is rejected at
-    /// parse time, the same as `emit each`.
+    /// a trigger row carrying no array elements. The body may nest
+    /// further fan-out blocks, the same as `emit each`.
     ExplodeOuter {
         node_id: NodeId,
         binding: Box<str>,
@@ -133,8 +136,8 @@ pub enum Statement {
 /// silently wrong for programs whose only output emits live inside
 /// `emit each` — bind-schema, executor route resolution, and the
 /// transform write-set all diverge from runtime behavior, surfacing as
-/// schema mismatches at the first downstream operator. The parser
-/// rejects nesting, so a single level of recursion suffices.
+/// schema mismatches at the first downstream operator. Fan-out may
+/// nest, so the descent recurses to arbitrary depth.
 pub fn for_each_field_emit<'a>(stmts: &'a [Statement], visit: &mut dyn FnMut(&'a str, &'a Expr)) {
     for stmt in stmts {
         match stmt {
