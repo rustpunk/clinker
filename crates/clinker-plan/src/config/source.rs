@@ -548,3 +548,14 @@ pub struct EdifactInputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_elements: Option<usize>,
 }
+
+/// X12 input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct X12InputOptions {
+    /// Number of positional `eNN` element columns on the record schema.
+    /// A body segment carrying more data elements than this is rejected
+    /// with guidance rather than silently truncated. Defaults to 32.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_elements: Option<usize>,
+}

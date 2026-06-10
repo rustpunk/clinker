@@ -80,7 +80,7 @@ shares repeated values instead of storing each copy independently.
 A source declaration has two independent layers:
 
 - **Transport** (`transport:`) selects *where* the records come from. The only transport today is `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
-- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`.
+- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`.
 
 ```yaml
 - type: source
@@ -98,7 +98,7 @@ A `file` transport requires **exactly one** file matcher (`path`, `glob`, `regex
 
 ## Format types
 
-The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`, `edifact`.
+The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`.
 
 The `edifact` format reads UN/EDIFACT interchanges; it has its own
 reference page covering the segment-record schema, delimiter discovery,
@@ -107,6 +107,11 @@ envelope sections, and control-count validation. See
 (default 32) — the number of positional `eNN` element columns on the
 record schema; a segment with more data elements than that is rejected
 rather than truncated.
+
+The `x12` format reads ANSI ASC X12 interchanges with their three-tier
+`ISA..IEA` → `GS..GE` → `ST..SE` envelope, surfacing all three tiers as
+nested `$doc` sections. It shares the same `max_elements` input option and
+has its own reference page. See [X12 Format](x12.md).
 
 ### CSV
 

@@ -8,6 +8,7 @@ pub mod fixed_width;
 pub mod json;
 pub mod splitting;
 pub mod traits;
+pub mod x12;
 pub mod xml;
 
 pub use counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};

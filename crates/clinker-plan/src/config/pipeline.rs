@@ -2242,6 +2242,7 @@ pub(crate) fn lower_node_to_plan_node(
                 strategy: CombineStrategy::HashBuildProbe,
                 driving_input: String::new(),
                 build_inputs: Vec::new(),
+                driving_upstream: None,
                 predicate_summary,
                 match_mode: config.match_mode,
                 on_miss: config.on_miss,
@@ -2513,6 +2514,27 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             return Err(ConfigError::Validation(format!(
                 "[E323] output '{}': `edifact` output cannot be combined with `split` — \
                  an EDIFACT interchange is a single UNB..UNZ envelope and cannot be \
+                 divided across files; remove the `split` block or choose a splittable \
+                 format",
+                output.name
+            )));
+        }
+    }
+
+    // An X12 interchange is likewise a single three-tier envelope:
+    // ISA..IEA wraps GS..GE groups wrapping ST..SE sets, and every trailer
+    // count (SE/GE/IEA) is recomputed and written only at end of stream.
+    // Byte-limit file splitting flushes (and therefore finalizes) the
+    // writer mid-stream, sealing the interchange after the first file and
+    // emitting later records — and their fresh ST/GS headers — after the
+    // IEA trailer. There is no meaningful way to split one interchange
+    // across files, so reject the combination up front rather than emit a
+    // structurally corrupt interchange that still reports run success.
+    for output in config.output_configs() {
+        if matches!(output.format, OutputFormat::X12(_)) && output.split.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "[E338] output '{}': `x12` output cannot be combined with `split` — \
+                 an X12 interchange is a single ISA..IEA envelope and cannot be \
                  divided across files; remove the `split` block or choose a splittable \
                  format",
                 output.name

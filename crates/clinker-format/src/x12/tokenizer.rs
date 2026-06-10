@@ -1,0 +1,475 @@
+//! ANSI ASC X12 segment tokenizer: ISA-driven delimiter discovery and
+//! delimiter-aware splitting.
+//!
+//! An X12 interchange is a flat byte stream of segments terminated by the
+//! segment terminator. Each segment splits into a tag and data elements on
+//! the element (data) separator; an element splits into components on the
+//! sub-element (component) separator. Unlike EDIFACT, X12 declares its
+//! delimiters in a fixed-length 106-byte `ISA` header rather than an
+//! optional service-string advice, and X12 has **no** release/escape
+//! character — a data value that contains a delimiter byte is
+//! unrepresentable, so the writer rejects it rather than corrupt the
+//! interchange.
+//!
+//! Delimiter discovery reads three bytes at fixed structural positions of
+//! the ISA: the element separator is the byte immediately after the `ISA`
+//! tag (index 3), the sub-element separator is the `ISA16` byte (index
+//! 104), and the segment terminator is the byte immediately after `ISA16`
+//! (index 105). Splitting the 106-byte ISA on the discovered element
+//! separator yields the 16 ISA elements, so downstream code locates
+//! `ISA13` (the interchange control number) as the 13th element rather
+//! than by an absolute byte offset.
+//!
+//! Memory model: the tokenizer reads one segment at a time from a buffered
+//! source into a bounded scratch buffer. A hard per-segment byte cap turns
+//! a missing terminator (truncated / corrupt input) into an error rather
+//! than letting the buffer grow without limit.
+
+use std::io::{BufRead, Read};
+
+use crate::error::FormatError;
+
+/// Hard ceiling on a single segment's raw byte length. A real X12 segment
+/// is well under a kilobyte; this cap exists only so a stream with no
+/// terminator byte fails fast instead of buffering the whole file into one
+/// "segment".
+pub(crate) const MAX_SEGMENT_BYTES: usize = 64 * 1024;
+
+/// The fixed byte length of an `ISA` interchange header, terminator
+/// included. The header is read as one 106-byte slice; the three
+/// delimiters live at structural positions within it.
+pub(crate) const ISA_LEN: usize = 106;
+
+/// 0-based index of the element (data) separator within the ISA — the
+/// byte immediately following the three-character `ISA` tag.
+const ISA_ELEMENT_SEP_IDX: usize = 3;
+
+/// 0-based index of the `ISA16` sub-element (component) separator within
+/// the ISA — the last single-byte element of the header.
+const ISA_SUBELEMENT_SEP_IDX: usize = 104;
+
+/// 0-based index of the segment terminator within the ISA — the byte
+/// immediately following `ISA16`.
+const ISA_TERMINATOR_IDX: usize = 105;
+
+/// The three X12 service delimiters discovered from the fixed `ISA`
+/// header.
+///
+/// X12 has no release/escape character, so a delimiter byte appearing in
+/// data is unrepresentable; the writer rejects such a value rather than
+/// emit a structurally corrupt interchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Delimiters {
+    /// Data-element separator (between elements of a segment).
+    pub element: u8,
+    /// Sub-element / component separator (within a composite element).
+    /// Stored but never split on: element text is kept verbatim, so a
+    /// composite element rides inside one element string intact.
+    pub subelement: u8,
+    /// Segment terminator.
+    pub terminator: u8,
+}
+
+/// Streaming X12 segment reader.
+///
+/// Wraps a buffered source and yields one raw segment string at a time
+/// (terminator stripped, inter-segment CR/LF whitespace stripped). The
+/// delimiters are discovered once from the fixed 106-byte `ISA` header on
+/// the first read.
+pub(crate) struct SegmentTokenizer<R: Read> {
+    reader: R,
+    delimiters: Delimiters,
+    initialized: bool,
+}
+
+impl<R: BufRead> SegmentTokenizer<R> {
+    /// Build a tokenizer over a buffered source. Delimiter discovery is
+    /// deferred to the first [`Self::next_segment`] call so the `ISA`
+    /// header scan and the first segment read share one pass.
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            // A placeholder until the ISA is read; never used because the
+            // first read initializes from the header before splitting.
+            delimiters: Delimiters {
+                element: b'*',
+                subelement: b':',
+                terminator: b'~',
+            },
+            initialized: false,
+        }
+    }
+
+    /// The active delimiter set, valid only after the first read has
+    /// resolved the `ISA` header.
+    pub(crate) fn delimiters(&self) -> Delimiters {
+        self.delimiters
+    }
+
+    /// Consume CR/LF (and surrounding spaces/tabs producers sometimes add)
+    /// between segments for readability. Stops at the first byte that
+    /// could begin a segment tag.
+    fn skip_inter_segment_whitespace(&mut self) -> Result<(), FormatError> {
+        loop {
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let mut consumed = 0;
+            for &b in buf {
+                if b == b'\r' || b == b'\n' {
+                    consumed += 1;
+                } else {
+                    break;
+                }
+            }
+            if consumed == 0 {
+                return Ok(());
+            }
+            self.reader.consume(consumed);
+        }
+    }
+
+    /// Read and consume the fixed 106-byte `ISA` header, returning its raw
+    /// bytes and resolving the delimiter set from it.
+    ///
+    /// A 106-byte `ISA` segment declares the element separator (index 3),
+    /// the sub-element separator (`ISA16`, index 104), and the segment
+    /// terminator (index 105). The header bytes are consumed, and any CR/LF
+    /// the producer wrote after the terminator is skipped so the next read
+    /// starts cleanly at the `GS`. The reader's `ensure_initialized` guards
+    /// against a second call, so this runs exactly once before any
+    /// [`Self::next_segment`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::X12`] when the stream does not begin with a
+    /// full 106-byte `ISA` header (a truncated or non-X12 stream leaves the
+    /// delimiter set undefined, so nothing downstream can be tokenized).
+    pub(crate) fn read_isa_header(&mut self) -> Result<Vec<u8>, FormatError> {
+        // Read exactly ISA_LEN bytes. `fill_buf` may return a short slice
+        // when the source delivers the header across multiple reads, so
+        // accumulate until the header is whole or the stream ends.
+        let mut header: Vec<u8> = Vec::with_capacity(ISA_LEN);
+        while header.len() < ISA_LEN {
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() {
+                return Err(FormatError::X12(format!(
+                    "truncated ISA header: need {ISA_LEN} bytes at the stream start, \
+                     read {}; the interchange is empty, corrupt, or not X12",
+                    header.len()
+                )));
+            }
+            let want = ISA_LEN - header.len();
+            let take = want.min(buf.len());
+            header.extend_from_slice(&buf[..take]);
+            self.reader.consume(take);
+        }
+
+        if !header.starts_with(b"ISA") {
+            return Err(FormatError::X12(format!(
+                "interchange must begin with an ISA header, found {:?}",
+                String::from_utf8_lossy(&header[..3.min(header.len())])
+            )));
+        }
+
+        self.delimiters = Delimiters {
+            element: header[ISA_ELEMENT_SEP_IDX],
+            subelement: header[ISA_SUBELEMENT_SEP_IDX],
+            terminator: header[ISA_TERMINATOR_IDX],
+        };
+        self.initialized = true;
+        // Drop the trailing terminator (and any CR/LF a producer wrote
+        // after it) so the next read starts cleanly at GS.
+        self.skip_inter_segment_whitespace()?;
+        Ok(header)
+    }
+
+    /// Read the next raw segment (terminator-delimited), or `None` at
+    /// clean end of stream.
+    ///
+    /// The terminator byte is consumed but not returned. X12 has no
+    /// release/escape mechanism, so every terminator byte is a segment
+    /// boundary. CR/LF between segments is dropped; CR/LF inside an
+    /// element is preserved.
+    pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
+        debug_assert!(
+            self.initialized,
+            "read_isa_header must run before next_segment"
+        );
+        self.skip_inter_segment_whitespace()?;
+
+        let terminator = self.delimiters.terminator;
+        let mut raw: Vec<u8> = Vec::new();
+
+        loop {
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() {
+                // EOF. A non-empty pending buffer means a final segment
+                // with no terminator — truncation, not a clean end.
+                if raw.is_empty() {
+                    return Ok(None);
+                }
+                return Err(FormatError::X12(format!(
+                    "unterminated final segment ({} bytes read with no segment terminator); \
+                     the interchange is truncated",
+                    raw.len()
+                )));
+            }
+
+            let mut consumed = 0;
+            let mut finished = false;
+            for &b in buf {
+                consumed += 1;
+                if b == terminator {
+                    finished = true;
+                    break;
+                }
+                raw.push(b);
+            }
+            self.reader.consume(consumed);
+
+            if raw.len() > MAX_SEGMENT_BYTES {
+                return Err(FormatError::X12(format!(
+                    "segment exceeded the {MAX_SEGMENT_BYTES}-byte cap without a terminator; \
+                     the interchange is malformed or the segment terminator is misconfigured"
+                )));
+            }
+
+            if finished {
+                let segment = strip_edge_whitespace(&raw);
+                let text = String::from_utf8(segment).map_err(|e| {
+                    FormatError::X12(format!(
+                        "segment is not valid UTF-8: {e}. Non-UTF-8 charsets are not supported"
+                    ))
+                })?;
+                return Ok(Some(text));
+            }
+        }
+    }
+}
+
+/// Drop CR/LF that bracket a raw segment body. Interior CR/LF is left
+/// intact — only the readability newlines a producer wraps around the
+/// terminator are insignificant.
+fn strip_edge_whitespace(raw: &[u8]) -> Vec<u8> {
+    let start = raw
+        .iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|&b| b != b'\r' && b != b'\n')
+        .map(|p| p + 1)
+        .unwrap_or(start);
+    raw[start..end].to_vec()
+}
+
+/// A parsed segment: its tag plus its data elements.
+///
+/// The sub-element (component) separator is *not* split or decoded:
+/// element text keeps it verbatim, so a composite element `A:B:C` stays
+/// one element string `"A:B:C"`. The positional element model
+/// deliberately works above component resolution. X12 has no release
+/// mechanism, so no escape decoding occurs — element text is the raw bytes
+/// between element separators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedSegment {
+    pub tag: String,
+    pub elements: Vec<String>,
+}
+
+/// Split a raw segment string into its tag and element values on the
+/// element separator.
+///
+/// The tag is the first part; the remainder are data elements. An
+/// unescaped sub-element separator is kept verbatim (it is part of the
+/// element's internal composite structure). X12 has no release character,
+/// so every element-separator byte splits.
+pub(crate) fn split_segment(raw: &str, delims: &Delimiters) -> ParsedSegment {
+    let element = delims.element;
+    let bytes = raw.as_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+
+    for &b in bytes {
+        if b == element {
+            parts.push(bytes_to_string(&current));
+            current.clear();
+        } else {
+            current.push(b);
+        }
+    }
+    parts.push(bytes_to_string(&current));
+
+    let mut iter = parts.into_iter();
+    let tag = iter.next().unwrap_or_default();
+    let elements = iter.collect();
+    ParsedSegment { tag, elements }
+}
+
+/// Split the fixed `ISA` header bytes into the `ISA` tag plus its 16 data
+/// elements on the discovered element separator.
+///
+/// The header is split structurally (on the element separator), not by
+/// absolute byte offset, so a consumer reads `ISA13` (the interchange
+/// control number) as element index 12 regardless of any producer
+/// padding quirk — mirroring the rest of the parser's
+/// locate-by-structure discipline.
+pub(crate) fn split_isa(header: &[u8], delims: &Delimiters) -> ParsedSegment {
+    // The header's final byte is the segment terminator; trim it so the
+    // last element (ISA16) is not contaminated by it.
+    let body = if header.last() == Some(&delims.terminator) {
+        &header[..header.len() - 1]
+    } else {
+        header
+    };
+    let text = String::from_utf8_lossy(body).into_owned();
+    split_segment(&text, delims)
+}
+
+/// Reassemble interior `current` bytes into a `String`. The input is a
+/// UTF-8-validated segment slice, so this is lossless.
+fn bytes_to_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A minimal valid ISA header (default `*` element, `:` sub-element,
+    /// `~` terminator), 106 bytes, followed by a GS segment.
+    fn isa_header() -> String {
+        // Build the canonical 106-byte ISA with `*` separators and `~`
+        // terminator; the control number is "000000001".
+        let isa = "ISA*00*          *00*          *ZZ*SENDER         \
+                   *ZZ*RECEIVER       *240101*1200*U*00401*000000001*0*P*:~";
+        assert_eq!(isa.len(), ISA_LEN, "ISA fixture must be 106 bytes");
+        isa.to_string()
+    }
+
+    fn tok(data: &[u8]) -> SegmentTokenizer<Cursor<Vec<u8>>> {
+        SegmentTokenizer::new(Cursor::new(data.to_vec()))
+    }
+
+    #[test]
+    fn isa_header_declares_delimiters() {
+        let data = format!("{}GS*PO*S*R*20240101*1200*1*X*004010~", isa_header());
+        let mut t = tok(data.as_bytes());
+        let header = t.read_isa_header().unwrap();
+        let d = t.delimiters();
+        assert_eq!(d.element, b'*');
+        assert_eq!(d.subelement, b':');
+        assert_eq!(d.terminator, b'~');
+        let parsed = split_isa(&header, &d);
+        assert_eq!(parsed.tag, "ISA");
+        assert_eq!(parsed.elements.len(), 16, "ISA carries 16 elements");
+        // ISA13 (interchange control number) is element index 12.
+        assert_eq!(parsed.elements[12], "000000001");
+        // ISA16 (the sub-element separator) is the last element.
+        assert_eq!(parsed.elements[15], ":");
+    }
+
+    #[test]
+    fn custom_delimiters_discovered_from_isa() {
+        // Element separator '|', sub-element '^', terminator '\n'. Build a
+        // 106-byte ISA using those bytes.
+        let isa = "ISA|00|          |00|          |ZZ|SENDER         \
+                   |ZZ|RECEIVER       |240101|1200|U|00401|000000001|0|P|^\n";
+        assert_eq!(isa.len(), ISA_LEN);
+        let mut t = tok(isa.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let d = t.delimiters();
+        assert_eq!(d.element, b'|');
+        assert_eq!(d.subelement, b'^');
+        assert_eq!(d.terminator, b'\n');
+    }
+
+    #[test]
+    fn next_segment_after_isa_reads_gs() {
+        let data = format!("{}GS*PO*S*R*20240101*1200*1*X*004010~", isa_header());
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let gs = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&gs, &t.delimiters());
+        assert_eq!(parsed.tag, "GS");
+        assert_eq!(parsed.elements[0], "PO");
+    }
+
+    #[test]
+    fn composite_subelement_kept_verbatim() {
+        let data = format!("{}REF*ZZ*A:B:C~", isa_header());
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let seg = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&seg, &t.delimiters());
+        assert_eq!(parsed.tag, "REF");
+        assert_eq!(parsed.elements, vec!["ZZ".to_string(), "A:B:C".to_string()]);
+    }
+
+    #[test]
+    fn crlf_between_segments_stripped() {
+        let data = format!(
+            "{}GS*PO*S*R*20240101*1200*1*X*004010~\r\nST*850*0001~\r\n",
+            isa_header()
+        );
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let gs = t.next_segment().unwrap().unwrap();
+        assert!(gs.starts_with("GS*"));
+        let st = t.next_segment().unwrap().unwrap();
+        assert_eq!(st, "ST*850*0001");
+        assert!(t.next_segment().unwrap().is_none());
+    }
+
+    #[test]
+    fn truncated_isa_errors() {
+        let mut t = tok(b"ISA*00*  ");
+        let err = t.read_isa_header().unwrap_err();
+        assert!(matches!(err, FormatError::X12(m) if m.contains("truncated ISA")));
+    }
+
+    #[test]
+    fn non_isa_start_errors() {
+        // 106 bytes that do not begin with ISA.
+        let data = "X".repeat(ISA_LEN);
+        let mut t = tok(data.as_bytes());
+        let err = t.read_isa_header().unwrap_err();
+        assert!(matches!(err, FormatError::X12(m) if m.contains("must begin with an ISA")));
+    }
+
+    #[test]
+    fn unterminated_final_segment_errors() {
+        let data = format!("{}GS*PO*S*R*20240101*1200*1*X*004010", isa_header());
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::X12(m) if m.contains("truncated")));
+    }
+
+    #[test]
+    fn unterminated_segment_hits_byte_cap() {
+        let data = format!("{}{}", isa_header(), "A".repeat(MAX_SEGMENT_BYTES + 10));
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_isa_header().unwrap();
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::X12(m) if m.contains("cap")));
+    }
+
+    #[test]
+    fn isa_split_across_buffer_boundaries() {
+        // A BufReader with a tiny capacity forces fill_buf to deliver the
+        // 106-byte header in fragments; initialization must still
+        // assemble the whole header.
+        use std::io::BufReader;
+        let data = format!("{}GS*PO*S*R*20240101*1200*1*X*004010~", isa_header());
+        let inner = Cursor::new(data.into_bytes());
+        let buffered = BufReader::with_capacity(16, inner);
+        let mut t = SegmentTokenizer::new(buffered);
+        let header = t.read_isa_header().unwrap();
+        assert_eq!(header.len(), ISA_LEN);
+        assert_eq!(t.delimiters().element, b'*');
+    }
+}

@@ -211,3 +211,40 @@ pub struct EdifactOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_newline: Option<bool>,
 }
+
+/// X12 output options.
+///
+/// The writer reconstructs the three-tier interchange envelope
+/// (`ISA..IEA` → `GS..GE` → `ST..SE`) around emitted records. The `ISA`
+/// header comes from `interchange` (literal elements) or, when that is
+/// unset, is echoed from the `$doc` section named by `interchange_from_doc`
+/// for round-trip reconstruction. The `GS` functional-group header comes
+/// from `group_header`; transaction sets are grouped on the `set_ref`
+/// column, and the `SE`/`GE`/`IEA` control counts are recomputed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct X12OutputOptions {
+    /// Literal `ISA` data elements (the 16 fixed-width ISA fields) written
+    /// verbatim. Takes precedence over `interchange_from_doc` when both
+    /// are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interchange: Option<Vec<String>>,
+    /// Name of a `$doc` section to echo the `ISA` elements from (the
+    /// reader's positional `ISA` envelope section), enabling X12
+    /// round-trip reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interchange_from_doc: Option<String>,
+    /// Literal `GS` functional-group header elements (`GS01..GS08`). The
+    /// `GS06` group control number is recomputed by the writer. Required
+    /// to wrap transaction sets in a functional group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_header: Option<Vec<String>>,
+    /// Fallback transaction set type (`ST01`) when a record carries no
+    /// `set_type` column value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_type: Option<String>,
+    /// Write a newline after each segment terminator for readability.
+    /// Defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_newline: Option<bool>,
+}
