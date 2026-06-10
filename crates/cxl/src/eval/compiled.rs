@@ -7,9 +7,10 @@
 //! children and any node-keyed side data (span, baked literal) *by value*
 //! at lowering time, so per-record evaluation is a sequence of vtable
 //! calls with no central dispatch `match` and no re-indexing of the typed
-//! program's side tables. (The recursive [`super::eval_expr`] matcher
-//! survives only for the aggregation and Combine engines, which evaluate
-//! single expressions outside the row path.)
+//! program's side tables. The same lowering backs both the full
+//! statement program ([`CompiledProgram`]) on the transform hot path and
+//! the single-expression [`CompiledScalar`] the aggregation and Combine
+//! engines evaluate per record outside any statement program or window.
 //!
 //! The module lowers the full row-level node vocabulary: literals, field
 //! and system access, binary/unary arithmetic and comparison, the
@@ -145,7 +146,105 @@ impl EvalState {
 /// [`Frame`]. Children and node-keyed side data are captured by value
 /// at lowering, so the body re-runs per record without re-walking the
 /// AST.
-type CompiledExpr<S> = Box<dyn for<'a, 'w> Fn(&mut Frame<'a, 'w, S>) -> Result<Value, EvalError>>;
+///
+/// The closure is `Send + Sync` because every value it captures —
+/// baked literals, pre-compiled regexes, child closures, method-name
+/// strings — is itself `Send + Sync`. This lets a [`CompiledScalar`]
+/// be shared by `&` across rayon workers (combine's build / probe key
+/// extraction runs the same compiled key closure on every worker).
+type CompiledExpr<S> =
+    Box<dyn for<'a, 'w> Fn(&mut Frame<'a, 'w, S>) -> Result<Value, EvalError> + Send + Sync>;
+
+/// Windowless storage backend for the single-expression evaluator.
+///
+/// The aggregation and Combine engines evaluate one scalar expression per
+/// record outside any analytic window, so [`CompiledScalar`] fixes the
+/// generic storage parameter to this zero-sized type and always evaluates
+/// with `window: None`. Every method is a vacuous answer because the
+/// `window` leg of the [`Frame`] is never populated, so no window leaf
+/// node ever calls back into it.
+struct NullScalarStorage;
+
+impl RecordStorage for NullScalarStorage {
+    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
+        None
+    }
+    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
+        None
+    }
+    fn available_fields(&self, _: u64) -> Vec<&str> {
+        Vec::new()
+    }
+    fn record_count(&self) -> u64 {
+        0
+    }
+}
+
+/// A single CXL expression lowered to a closure, evaluable per record.
+///
+/// This is the public single-expression counterpart to [`CompiledProgram`]:
+/// the aggregation and Combine engines hold scalar `Expr`s (pre-aggregation
+/// filters, aggregate-binding arguments, equi-join key expressions) that are
+/// evaluated once per record without any surrounding statement program or
+/// analytic window. [`compile_scalar`] lowers the `Expr` exactly once —
+/// baking literals, capturing pre-compiled regexes, resolving child closures
+/// — and [`Self::eval`] then runs that closure per record, eliminating the
+/// per-record `Expr` re-walk the recursive matcher paid.
+///
+/// The wrapped closure is the same boxed-closure lowering the per-record
+/// transform path uses, with its storage parameter fixed to the windowless
+/// [`NullScalarStorage`]; neither [`Frame`] nor [`CompiledExpr`] leaks across
+/// the crate boundary.
+pub struct CompiledScalar {
+    expr: CompiledExpr<NullScalarStorage>,
+}
+
+impl CompiledScalar {
+    /// Evaluate the compiled expression against one record.
+    ///
+    /// `resolver` supplies the record's field values and `ctx` the
+    /// per-record system context (`$pipeline.*` / `$source.*` / `$doc.*`,
+    /// clock). A fresh let-binding scratch map is allocated per call — empty
+    /// and therefore allocation-free until a closure builtin binds its
+    /// parameter — matching the semantics of evaluating a standalone
+    /// expression with no surrounding `let` statements.
+    ///
+    /// The error carries only the failing node's own span; callers that
+    /// surface it (DLQ entries, miette diagnostics) attach row / source-text
+    /// context at their boundary, mirroring [`CompiledProgram::eval_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`EvalError`] produced by the first failing subexpression
+    /// (arithmetic overflow, division by zero, type mismatch, unknown
+    /// method, and so on).
+    pub fn eval(
+        &self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+    ) -> Result<Value, EvalError> {
+        let mut frame = Frame::<NullScalarStorage> {
+            ctx,
+            resolver,
+            window: None,
+            env: HashMap::new(),
+        };
+        (self.expr)(&mut frame)
+    }
+}
+
+/// Lower a single CXL expression to a [`CompiledScalar`].
+///
+/// The typed program supplies the node-id-keyed side tables (the
+/// pre-compiled regex cache) consulted once during lowering; `expr` is the
+/// node to evaluate. Used by the aggregation and Combine engines, which
+/// evaluate scalar expressions per record outside any statement program or
+/// analytic window — see [`CompiledScalar`].
+pub fn compile_scalar(typed: &TypedProgram, expr: &Expr) -> CompiledScalar {
+    CompiledScalar {
+        expr: compile_expr::<NullScalarStorage>(typed, expr),
+    }
+}
 
 /// Control-flow outcome of running one compiled statement.
 enum StmtFlow {

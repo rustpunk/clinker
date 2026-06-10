@@ -190,10 +190,10 @@ impl DecomposedPredicate {
 ///
 /// Stores full [`Expr`] pairs (drill D14), not field names — enables
 /// expression-based hash keys (e.g. `lower(orders.region) ==
-/// lower(products.region)`) from day one. C.2 `KeyExtractor` evaluates
-/// these `Expr` nodes at build/probe time via `cxl::eval::eval_expr`,
-/// which routes regex-cache lookups through the supplied
-/// [`TypedProgram`].
+/// lower(products.region)`) from day one. C.2 `KeyExtractor` compiles
+/// these `Expr` nodes against the supplied [`TypedProgram`] (which routes
+/// regex-cache lookups) once at construction and evaluates the resulting
+/// closures at build/probe time.
 ///
 /// Both sides share a single [`Arc<TypedProgram>`] — the original
 /// where-clause program. The where-typecheck establishes regex caches

@@ -40,7 +40,6 @@ pub use error::{AggregateEvalError, HashAggError};
 pub use hash::{AccumulatorFactory, AggregateConsumer, AggregatorConfig, HashAggregator};
 pub use spill::{AggSpillFile, SpillState};
 
-use hash::NullStorage;
 pub(crate) use hash::{empty_global_fold_row, finalize_group_inner, group_by_sort_fields};
 
 use std::sync::Arc;
@@ -52,7 +51,7 @@ use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, Value};
 use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
-use cxl::eval::{EvalContext, EvalError, ProgramEvaluator, eval_expr};
+use cxl::eval::{CompiledScalar, EvalContext, EvalError, ProgramEvaluator};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
 use clinker_plan::error::PipelineError;
@@ -463,18 +462,68 @@ impl AggregateStream {
     }
 }
 
-/// Dispatch one `BindingArg` to its accumulator. Returns the heap-byte
-/// delta produced by the accumulator's `add` call so the hash aggregator
-/// can fold it into `value_heap_bytes`.
-pub(super) fn dispatch_binding(
+/// A [`BindingArg`] with every `Expr` leaf lowered once to a
+/// [`CompiledScalar`].
+///
+/// The aggregation hot loop folds one of these per accumulator slot per
+/// record. Lowering the `Expr` arms a single time at aggregator
+/// construction (via [`compile_binding_arg`]) removes the per-record
+/// expression re-walk and throwaway scratch map the recursive matcher
+/// paid; the `Field` / `Wildcard` fast paths stay a bare record index /
+/// constant. The tree mirrors [`BindingArg`] so a `Pair`
+/// (`weighted_avg(value, weight)`) still dispatches its two sides
+/// independently.
+pub(super) enum CompiledBindingArg {
+    /// Fast path: pre-resolved input field index (`sum(salary)`).
+    Field(u32),
+    /// `count(*)` — no per-row value.
+    Wildcard,
+    /// General path: a scalar expression lowered to a closure.
+    Expr(CompiledScalar),
+    /// Two-arg aggregate: `weighted_avg(value, weight)`.
+    Pair(Box<CompiledBindingArg>, Box<CompiledBindingArg>),
+}
+
+/// Lower a [`BindingArg`] tree to a [`CompiledBindingArg`], compiling each
+/// `Expr` leaf against `evaluator`'s typed program exactly once.
+pub(super) fn compile_binding_arg(
     arg: &BindingArg,
+    evaluator: &ProgramEvaluator,
+) -> CompiledBindingArg {
+    match arg {
+        BindingArg::Field(idx) => CompiledBindingArg::Field(*idx),
+        BindingArg::Wildcard => CompiledBindingArg::Wildcard,
+        BindingArg::Expr(e) => CompiledBindingArg::Expr(evaluator.compile_scalar(e)),
+        BindingArg::Pair(a, b) => CompiledBindingArg::Pair(
+            Box::new(compile_binding_arg(a, evaluator)),
+            Box::new(compile_binding_arg(b, evaluator)),
+        ),
+    }
+}
+
+/// Lower the bindings of a `CompiledAggregate` to their per-slot
+/// [`CompiledBindingArg`] form, in `bindings[]` order.
+pub(super) fn compile_binding_args(
+    bindings: &[AggregateBinding],
+    evaluator: &ProgramEvaluator,
+) -> Vec<CompiledBindingArg> {
+    bindings
+        .iter()
+        .map(|b| compile_binding_arg(&b.arg, evaluator))
+        .collect()
+}
+
+/// Dispatch one compiled binding arg to its accumulator. Returns the
+/// heap-byte delta produced by the accumulator's `add` call so the hash
+/// aggregator can fold it into `value_heap_bytes`.
+pub(super) fn dispatch_binding(
+    arg: &CompiledBindingArg,
     acc: &mut AccumulatorEnum,
     record: &Record,
     ctx: &EvalContext,
-    evaluator: &ProgramEvaluator,
 ) -> Result<usize, HashAggError> {
     match arg {
-        BindingArg::Field(idx) => {
+        CompiledBindingArg::Field(idx) => {
             let v = record
                 .values()
                 .get(*idx as usize)
@@ -482,16 +531,14 @@ pub(super) fn dispatch_binding(
                 .unwrap_or(Value::Null);
             Ok(acc.add(&v))
         }
-        BindingArg::Wildcard => Ok(acc.add(&Value::Null)),
-        BindingArg::Expr(e) => {
-            let mut env: std::collections::HashMap<String, Value> =
-                std::collections::HashMap::new();
-            let v = eval_expr::<NullStorage>(e, evaluator.typed(), ctx, record, None, &mut env)?;
+        CompiledBindingArg::Wildcard => Ok(acc.add(&Value::Null)),
+        CompiledBindingArg::Expr(e) => {
+            let v = e.eval(ctx, record)?;
             Ok(acc.add(&v))
         }
-        BindingArg::Pair(a, b) => {
-            let va = eval_binding_arg_value(a, record, ctx, evaluator)?;
-            let vb = eval_binding_arg_value(b, record, ctx, evaluator)?;
+        CompiledBindingArg::Pair(a, b) => {
+            let va = eval_binding_arg_value(a, record, ctx)?;
+            let vb = eval_binding_arg_value(b, record, ctx)?;
             acc.add_weighted(&va, &vb);
             Ok(0)
         }
@@ -499,31 +546,19 @@ pub(super) fn dispatch_binding(
 }
 
 pub(super) fn eval_binding_arg_value(
-    arg: &BindingArg,
+    arg: &CompiledBindingArg,
     record: &Record,
     ctx: &EvalContext,
-    evaluator: &ProgramEvaluator,
 ) -> Result<Value, HashAggError> {
     match arg {
-        BindingArg::Field(idx) => Ok(record
+        CompiledBindingArg::Field(idx) => Ok(record
             .values()
             .get(*idx as usize)
             .cloned()
             .unwrap_or(Value::Null)),
-        BindingArg::Wildcard => Ok(Value::Null),
-        BindingArg::Expr(e) => {
-            let mut env: std::collections::HashMap<String, Value> =
-                std::collections::HashMap::new();
-            Ok(eval_expr::<NullStorage>(
-                e,
-                evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &mut env,
-            )?)
-        }
-        BindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError::new(
+        CompiledBindingArg::Wildcard => Ok(Value::Null),
+        CompiledBindingArg::Expr(e) => Ok(e.eval(ctx, record)?),
+        CompiledBindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError::new(
             cxl::eval::EvalErrorKind::TypeMismatch {
                 expected: "scalar binding arg",
                 got: "nested Pair",
@@ -765,8 +800,13 @@ pub struct StreamingAggregator<Op: AccumulatorOp> {
     output_schema: Arc<Schema>,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
-    pre_agg_filter: Option<Expr>,
-    evaluator: ProgramEvaluator,
+    /// Pre-aggregation row filter (D9), lowered once at construction.
+    /// `None` when the aggregate CXL has no `Statement::Filter`.
+    pre_agg_filter: Option<CompiledScalar>,
+    /// Per-slot binding arguments lowered once at construction, in
+    /// `CompiledAggregate.bindings[]` order. Folded per record by the
+    /// `dispatch_binding` hot loop.
+    compiled_bindings: Vec<CompiledBindingArg>,
     transform_name: String,
     rows_seen: u64,
     boundary: crate::pipeline::streaming_merge::GroupBoundary,
@@ -791,7 +831,11 @@ impl StreamingAggregator<AddRaw> {
     ) -> Self {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
-        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let pre_agg_filter = compiled
+            .pre_agg_filter
+            .as_ref()
+            .map(|f| evaluator.compile_scalar(f));
+        let compiled_bindings = compile_binding_args(&compiled.bindings, &evaluator);
         let factory = AccumulatorFactory::new(compiled);
         let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
@@ -805,7 +849,7 @@ impl StreamingAggregator<AddRaw> {
             group_by_indices,
             group_by_fields,
             pre_agg_filter,
-            evaluator,
+            compiled_bindings,
             transform_name: transform_name.into(),
             rows_seen: 0,
             boundary,
@@ -834,20 +878,10 @@ impl StreamingAggregator<AddRaw> {
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
-        if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> =
-                std::collections::HashMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &mut env,
-            )?;
-            if v != Value::Bool(true) {
-                return Ok(());
-            }
+        if let Some(filter) = &self.pre_agg_filter
+            && filter.eval(ctx, record)? != Value::Bool(true)
+        {
+            return Ok(());
         }
         self.rows_seen = self.rows_seen.saturating_add(1);
 
@@ -881,9 +915,8 @@ impl StreamingAggregator<AddRaw> {
         // group, so we always construct a singleton and let the state
         // machine collapse it.
         let mut state = AggregatorGroupState::new(self.factory.create_accumulators());
-        let bindings = self.factory.compiled().bindings.clone();
-        for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
-            dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+        for (arg, acc) in self.compiled_bindings.iter().zip(state.row.iter_mut()) {
+            dispatch_binding(arg, acc, record, ctx)?;
         }
 
         // Seed `min_row_num` on the fresh per-group state; the boundary
@@ -1006,7 +1039,11 @@ impl StreamingAggregator<MergeState> {
     ) -> Self {
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
-        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let pre_agg_filter = compiled
+            .pre_agg_filter
+            .as_ref()
+            .map(|f| evaluator.compile_scalar(f));
+        let compiled_bindings = compile_binding_args(&compiled.bindings, &evaluator);
         let factory = AccumulatorFactory::new(compiled);
         let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
@@ -1020,7 +1057,7 @@ impl StreamingAggregator<MergeState> {
             group_by_indices,
             group_by_fields,
             pre_agg_filter,
-            evaluator,
+            compiled_bindings,
             transform_name: transform_name.into(),
             rows_seen: 0,
             boundary,

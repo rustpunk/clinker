@@ -13,9 +13,8 @@ use std::sync::Arc;
 use clinker_record::accumulator::{AccumulatorEnum, AccumulatorRow};
 use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
-use clinker_record::{GroupByKey, Record, RecordStorage, Value};
-use cxl::ast::Expr;
-use cxl::eval::{EvalContext, ProgramEvaluator, eval_expr};
+use clinker_record::{GroupByKey, Record, Value};
+use cxl::eval::{CompiledScalar, EvalContext, ProgramEvaluator};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
 use crate::pipeline::loser_tree::LoserTree;
@@ -26,26 +25,10 @@ use super::spill::{
     AggMergeEntry, AggSpillEntry, AggSpillFile, AggSpillReader, AggSpillWriter, SpillState,
 };
 use super::{
-    AggregateEvalScope, AggregatorGroupState, BufferedGroupState, SortRow, dispatch_binding,
-    eval_binding_arg_value, eval_expr_in_agg_scope, fold_buffered_state, merge_buffered_sidecars,
-    merge_group_sidecars,
+    AggregateEvalScope, AggregatorGroupState, BufferedGroupState, CompiledBindingArg, SortRow,
+    compile_binding_args, dispatch_binding, eval_binding_arg_value, eval_expr_in_agg_scope,
+    fold_buffered_state, merge_buffered_sidecars, merge_group_sidecars,
 };
-
-pub(super) struct NullStorage;
-impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
-        None
-    }
-    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
-        None
-    }
-    fn available_fields(&self, _: u64) -> Vec<&str> {
-        Vec::new()
-    }
-    fn record_count(&self) -> u64 {
-        0
-    }
-}
 
 /// Per-group prototype clone factory.
 ///
@@ -134,7 +117,13 @@ pub struct HashAggregator {
     factory: AccumulatorFactory,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
-    pre_agg_filter: Option<Expr>,
+    /// Pre-aggregation row filter (D9), lowered once at construction.
+    /// `None` when the aggregate CXL has no `Statement::Filter`.
+    pre_agg_filter: Option<CompiledScalar>,
+    /// Per-slot binding arguments lowered once at construction, in
+    /// `CompiledAggregate.bindings[]` order. Folded per record by the
+    /// `dispatch_binding` hot loop.
+    compiled_bindings: Vec<CompiledBindingArg>,
     value_heap_bytes: usize,
     memory_budget: usize,
     spill_files: Vec<AggSpillFile>,
@@ -147,7 +136,6 @@ pub struct HashAggregator {
     spill_compress: bool,
     output_schema: Arc<Schema>,
     transform_name: String,
-    evaluator: ProgramEvaluator,
     /// Source-row counter — incremented after the pre-agg filter accepts
     /// a record. Used by the global-fold empty-input special case in
     /// `finalize` (D12, D44).
@@ -255,7 +243,11 @@ impl HashAggregator {
         } = config;
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
-        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let pre_agg_filter = compiled
+            .pre_agg_filter
+            .as_ref()
+            .map(|f| evaluator.compile_scalar(f));
+        let compiled_bindings = compile_binding_args(&compiled.bindings, &evaluator);
         let requires_lineage = compiled.requires_lineage;
         let buffer_mode = compiled.requires_buffer_mode;
         debug_assert!(
@@ -292,6 +284,7 @@ impl HashAggregator {
             group_by_indices,
             group_by_fields,
             pre_agg_filter,
+            compiled_bindings,
             value_heap_bytes: 0,
             memory_budget,
             spill_files: Vec::new(),
@@ -300,7 +293,6 @@ impl HashAggregator {
             spill_compress,
             output_schema,
             transform_name,
-            evaluator,
             rows_seen: 0,
             max_groups,
             records_since_rss_check: 0,
@@ -443,20 +435,10 @@ impl HashAggregator {
             return self.add_record_buffered(record, row_num, ctx);
         }
         // 1. Pre-aggregation filter (D9).
-        if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> =
-                std::collections::HashMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &mut env,
-            )?;
-            if v != Value::Bool(true) {
-                return Ok(());
-            }
+        if let Some(filter) = &self.pre_agg_filter
+            && filter.eval(ctx, record)? != Value::Bool(true)
+        {
+            return Ok(());
         }
 
         // 2. Post-filter row counter (D44).
@@ -561,16 +543,19 @@ impl HashAggregator {
         // outpaces this Vec) or be impossible for bindings that close
         // over now-expired Transform locals. The non-lineage strict
         // path keeps the original tight per-binding dispatch.
-        let bindings = self.factory.compiled().bindings.clone();
         let mut delta: usize = 0;
         if lineage_active {
-            let mut row_values: Vec<Value> = Vec::with_capacity(bindings.len());
+            let mut row_values: Vec<Value> = Vec::with_capacity(self.compiled_bindings.len());
             let mut row_heap_bytes: usize = 0;
-            for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
-                match &binding.arg {
-                    BindingArg::Pair(a, b) => {
-                        let va = eval_binding_arg_value(a, record, ctx, &self.evaluator)?;
-                        let vb = eval_binding_arg_value(b, record, ctx, &self.evaluator)?;
+            for (arg, acc) in self
+                .compiled_bindings
+                .iter()
+                .zip(group_state.row.iter_mut())
+            {
+                match arg {
+                    CompiledBindingArg::Pair(a, b) => {
+                        let va = eval_binding_arg_value(a, record, ctx)?;
+                        let vb = eval_binding_arg_value(b, record, ctx)?;
                         // Lineage + Pair only co-occur on a relaxed-CK
                         // aggregate whose only Pair binding is
                         // WeightedAvg, which is BufferRequired and would
@@ -585,7 +570,7 @@ impl HashAggregator {
                         row_values.push(vb.clone());
                         acc.add_weighted(&va, &vb);
                     }
-                    BindingArg::Field(idx) => {
+                    CompiledBindingArg::Field(idx) => {
                         let v = record
                             .values()
                             .get(*idx as usize)
@@ -595,21 +580,12 @@ impl HashAggregator {
                         delta += acc.add(&v);
                         row_values.push(v);
                     }
-                    BindingArg::Wildcard => {
+                    CompiledBindingArg::Wildcard => {
                         delta += acc.add(&Value::Null);
                         row_values.push(Value::Null);
                     }
-                    BindingArg::Expr(e) => {
-                        let mut env: std::collections::HashMap<String, Value> =
-                            std::collections::HashMap::new();
-                        let v = eval_expr::<NullStorage>(
-                            e,
-                            self.evaluator.typed(),
-                            ctx,
-                            record,
-                            None,
-                            &mut env,
-                        )?;
+                    CompiledBindingArg::Expr(e) => {
+                        let v = e.eval(ctx, record)?;
                         row_heap_bytes = row_heap_bytes.saturating_add(v.heap_size());
                         delta += acc.add(&v);
                         row_values.push(v);
@@ -628,8 +604,12 @@ impl HashAggregator {
             self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
             group_state.retract_values.push(row_values);
         } else {
-            for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
-                delta += dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+            for (arg, acc) in self
+                .compiled_bindings
+                .iter()
+                .zip(group_state.row.iter_mut())
+            {
+                delta += dispatch_binding(arg, acc, record, ctx)?;
             }
         }
         self.add_value_heap_bytes(delta);
@@ -691,20 +671,10 @@ impl HashAggregator {
         ctx: &EvalContext,
     ) -> Result<(), HashAggError> {
         // 1. Pre-aggregation filter (same as fold-mode).
-        if let Some(filter) = &self.pre_agg_filter {
-            let mut env: std::collections::HashMap<String, Value> =
-                std::collections::HashMap::new();
-            let v = eval_expr::<NullStorage>(
-                filter,
-                self.evaluator.typed(),
-                ctx,
-                record,
-                None,
-                &mut env,
-            )?;
-            if v != Value::Bool(true) {
-                return Ok(());
-            }
+        if let Some(filter) = &self.pre_agg_filter
+            && filter.eval(ctx, record)? != Value::Bool(true)
+        {
+            return Ok(());
         }
 
         // 2. Post-filter row counter.
@@ -756,15 +726,14 @@ impl HashAggregator {
         //    bindings (`weighted_avg(value, weight)`) collapse into a
         //    two-Value inner vec so the rollback step can replay the
         //    exact same `(value, weight)` pair through `add_weighted`.
-        let bindings = self.factory.compiled().bindings.clone();
         let row_u64 = row_num;
-        let mut row_values: Vec<Value> = Vec::with_capacity(bindings.len());
+        let mut row_values: Vec<Value> = Vec::with_capacity(self.compiled_bindings.len());
         let mut row_heap_bytes: usize = 0;
-        for binding in bindings.iter() {
-            match &binding.arg {
-                BindingArg::Pair(a, b) => {
-                    let va = eval_binding_arg_value(a, record, ctx, &self.evaluator)?;
-                    let vb = eval_binding_arg_value(b, record, ctx, &self.evaluator)?;
+        for arg in self.compiled_bindings.iter() {
+            match arg {
+                CompiledBindingArg::Pair(a, b) => {
+                    let va = eval_binding_arg_value(a, record, ctx)?;
+                    let vb = eval_binding_arg_value(b, record, ctx)?;
                     row_heap_bytes = row_heap_bytes
                         .saturating_add(va.heap_size())
                         .saturating_add(vb.heap_size());
@@ -774,7 +743,7 @@ impl HashAggregator {
                     row_values.push(vb);
                 }
                 _ => {
-                    let v = eval_binding_arg_value(&binding.arg, record, ctx, &self.evaluator)?;
+                    let v = eval_binding_arg_value(arg, record, ctx)?;
                     row_heap_bytes = row_heap_bytes.saturating_add(v.heap_size());
                     row_values.push(v);
                 }

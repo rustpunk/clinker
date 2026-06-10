@@ -3089,9 +3089,9 @@ fn bind_combine(
 
     // Decompose predicate → DecomposedPredicate. The shared typed_where
     // Arc is threaded through so each EqualityConjunct captures the
-    // typed program needed by `cxl::eval::eval_expr` at runtime — no
-    // re-typecheck per side, since equality sub-`Expr`s preserve their
-    // NodeIds and the where-program's regex cache covers them.
+    // typed program the runtime key compilation needs — no re-typecheck
+    // per side, since equality sub-`Expr`s preserve their NodeIds and the
+    // where-program's regex cache covers them.
     let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span, scoped_vars) {
         Ok(d) => d,
         Err(type_diags) => {

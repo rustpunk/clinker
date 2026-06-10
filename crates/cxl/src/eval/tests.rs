@@ -561,6 +561,245 @@ fn test_log_level4_guard_short_circuits() {
 }
 
 // ---------------------------------------------------------------------------
+// CompiledScalar: the single-expression path used by aggregation + Combine
+//
+// The aggregation and Combine engines evaluate one scalar `Expr` per record
+// outside any statement program or analytic window via
+// `compile_scalar(...).eval(...)`. This corpus pins that path's result for
+// the windowless scalar surface those engines reach — literals, field refs,
+// three-valued Kleene `and`/`or`, comparison / arithmetic with null
+// propagation and overflow, coalesce, `if` / `match`, method calls
+// (including a pre-compiled regex), and the closure-bearing array builtins.
+// The retract / binding path needs these exact: a cached `retract_values`
+// row must replay byte-for-byte, so every case asserts a hard expected
+// value or error rather than a snapshot.
+// ---------------------------------------------------------------------------
+
+/// Expected outcome of evaluating one corpus case.
+enum Expected {
+    /// Exact value the compiled scalar must produce.
+    Yields(Value),
+    /// Substring the surfaced error's `Display` must contain.
+    FailsWith(&'static str),
+}
+
+/// Parse → resolve → typecheck `emit val = <expr>` and hand back the typed
+/// program plus the lone emit's expression, so a single scalar `Expr` can
+/// be lowered through `compile_scalar` with the node-id-keyed side tables
+/// (regex cache) the compiled path bakes in.
+fn typed_emit_expr(src: &str, fields: &[&str]) -> (TypedProgram, crate::ast::Expr) {
+    let full = format!("emit val = {src}");
+    let parsed = Parser::parse(&full);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors for {full:?}: {:?}",
+        parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    let resolved = resolve_program(parsed.ast, fields, parsed.node_count)
+        .unwrap_or_else(|d| panic!("resolve errors for {full:?}: {d:?}"));
+    let typed = type_check(resolved, &empty_row())
+        .unwrap_or_else(|d| panic!("type errors for {full:?}: {d:?}"))
+        .with_source(std::sync::Arc::from(full.as_str()));
+    let expr = match typed.program.statements.first() {
+        Some(crate::ast::Statement::Emit { expr, .. }) => expr.clone(),
+        other => panic!("expected a single emit statement, got {other:?}"),
+    };
+    (typed, expr)
+}
+
+/// One corpus case: expression source, declared input field names, the
+/// record's `(field, value)` pairs, and the expected outcome. The record
+/// is an owned `Vec` because `Value` payloads (`String`, `Array`) are not
+/// const-promotable, so they cannot live in a `'static` slice literal.
+type ScalarCase = (
+    &'static str,
+    &'static [&'static str],
+    Vec<(&'static str, Value)>,
+    Expected,
+);
+
+#[test]
+fn compiled_scalar_evaluates_windowless_surface() {
+    // Each case exercises a distinct lowering arm the aggregation / Combine
+    // scalar expressions can reach.
+    let cases: Vec<ScalarCase> = vec![
+        // Literals.
+        ("42", &[], vec![], Expected::Yields(Value::Integer(42))),
+        ("3.5", &[], vec![], Expected::Yields(Value::Float(3.5))),
+        (
+            "\"hi\"",
+            &[],
+            vec![],
+            Expected::Yields(Value::String("hi".into())),
+        ),
+        ("true", &[], vec![], Expected::Yields(Value::Bool(true))),
+        ("null", &[], vec![], Expected::Yields(Value::Null)),
+        // Field refs (present + absent → null). `missing` is declared so
+        // resolution succeeds, but the record omits it so the eval takes
+        // the absent-field → null path.
+        (
+            "amount",
+            &["amount"],
+            vec![("amount", Value::Integer(7))],
+            Expected::Yields(Value::Integer(7)),
+        ),
+        (
+            "missing",
+            &["amount", "missing"],
+            vec![("amount", Value::Integer(7))],
+            Expected::Yields(Value::Null),
+        ),
+        // Arithmetic with null propagation + string concat.
+        (
+            "amount + 1",
+            &["amount"],
+            vec![("amount", Value::Integer(41))],
+            Expected::Yields(Value::Integer(42)),
+        ),
+        (
+            "amount + 1",
+            &["amount"],
+            vec![("amount", Value::Null)],
+            Expected::Yields(Value::Null),
+        ),
+        (
+            "a + b",
+            &["a", "b"],
+            vec![("a", Value::Float(1.5)), ("b", Value::Integer(2))],
+            Expected::Yields(Value::Float(3.5)),
+        ),
+        (
+            "first + last",
+            &["first", "last"],
+            vec![
+                ("first", Value::String("ab".into())),
+                ("last", Value::String("cd".into())),
+            ],
+            Expected::Yields(Value::String("abcd".into())),
+        ),
+        // Comparison + Kleene and/or with a null operand.
+        (
+            "amount > 10",
+            &["amount"],
+            vec![("amount", Value::Integer(5))],
+            Expected::Yields(Value::Bool(false)),
+        ),
+        // null and true → null (Kleene: null && true is unknown).
+        (
+            "flag and amount > 0",
+            &["flag", "amount"],
+            vec![("flag", Value::Null), ("amount", Value::Integer(3))],
+            Expected::Yields(Value::Null),
+        ),
+        // false or true → true.
+        (
+            "flag or amount > 0",
+            &["flag", "amount"],
+            vec![("flag", Value::Bool(false)), ("amount", Value::Integer(3))],
+            Expected::Yields(Value::Bool(true)),
+        ),
+        // null == null → true (equality never nulls).
+        (
+            "amount == null",
+            &["amount"],
+            vec![("amount", Value::Null)],
+            Expected::Yields(Value::Bool(true)),
+        ),
+        // Coalesce short-circuit (LHS resolves but is absent → null → RHS).
+        (
+            "missing ?? amount",
+            &["amount", "missing"],
+            vec![("amount", Value::Integer(9))],
+            Expected::Yields(Value::Integer(9)),
+        ),
+        // Conditional + match.
+        (
+            "if amount > 0 then \"pos\" else \"nonpos\"",
+            &["amount"],
+            vec![("amount", Value::Integer(-1))],
+            Expected::Yields(Value::String("nonpos".into())),
+        ),
+        (
+            "match status { \"A\" => \"active\", _ => \"other\" }",
+            &["status"],
+            vec![("status", Value::String("A".into()))],
+            Expected::Yields(Value::String("active".into())),
+        ),
+        // Unary negation.
+        (
+            "-amount",
+            &["amount"],
+            vec![("amount", Value::Integer(4))],
+            Expected::Yields(Value::Integer(-4)),
+        ),
+        // Method call (string).
+        (
+            "name.upper()",
+            &["name"],
+            vec![("name", Value::String("abc".into()))],
+            Expected::Yields(Value::String("ABC".into())),
+        ),
+        // Method call backed by a pre-compiled regex (the side-table the
+        // compiled path captures by value at lowering).
+        (
+            "code.matches(\"\\\\d+\")",
+            &["code"],
+            vec![("code", Value::String("123".into()))],
+            Expected::Yields(Value::Bool(true)),
+        ),
+        // Closure-bearing array builtin (env-threaded closure param).
+        (
+            "items.filter(it => it > 1)",
+            &["items"],
+            vec![(
+                "items",
+                Value::Array(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            )],
+            Expected::Yields(Value::Array(vec![Value::Integer(2), Value::Integer(3)])),
+        ),
+        // Division by zero surfaces a runtime error.
+        (
+            "amount / 0",
+            &["amount"],
+            vec![("amount", Value::Integer(8))],
+            Expected::FailsWith("zero"),
+        ),
+    ];
+
+    for (src, fields, record, expected) in cases {
+        let (typed, expr) = typed_emit_expr(src, fields);
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = HashMapResolver::new(
+            record
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        );
+
+        let got = compile_scalar(&typed, &expr).eval(&ctx, &resolver);
+
+        match (expected, got) {
+            (Expected::Yields(want), Ok(actual)) => {
+                assert_eq!(actual, want, "value mismatch for {src:?}")
+            }
+            (Expected::FailsWith(needle), Err(e)) => assert!(
+                e.to_string().contains(needle),
+                "error for {src:?} did not contain {needle:?}: {e}"
+            ),
+            (Expected::Yields(_), Err(e)) => panic!("expected a value for {src:?}, got error: {e}"),
+            (Expected::FailsWith(_), Ok(actual)) => {
+                panic!("expected an error for {src:?}, got value: {actual:?}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // $window.any / $window.every — three-valued logic
 //
 // Mirrors BinOp::And/Or in eval/mod.rs by construction. Tests use a

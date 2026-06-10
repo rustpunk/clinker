@@ -567,8 +567,8 @@ fn execute_combine_sort_merge_with_stats(
     let mut driver_unmatched_orders: Vec<RecordOrder> = Vec::new();
     let mut driver_unmatched_records: Vec<(Record, RecordOrder)> = Vec::new();
 
-    // Range-key extraction runs the CXL range program per record through
-    // `eval_expr` — the costly part of Phase A. `extract_range_key` is
+    // Range-key extraction runs the compiled CXL range closures per
+    // record — the costly part of Phase A. `extract_range_key` is
     // stateless (`&self` extractor, a per-call key buffer) and
     // `EvalContext` is read-only, so the extraction parallelizes across
     // the shared kernel pool. The routing loop replays the owned

@@ -28,13 +28,12 @@
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
-use clinker_record::{Record, RecordStorage, Value};
+use clinker_record::{Record, Value};
 use cxl::ast::Expr;
-use cxl::eval::{EvalContext, EvalError, eval_expr};
+use cxl::eval::{CompiledScalar, EvalContext, EvalError, compile_scalar};
 use cxl::resolve::traits::FieldResolver;
 use cxl::typecheck::TypedProgram;
 use hashbrown::HashTable;
-use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
@@ -398,15 +397,12 @@ pub(crate) struct CombineKernelOutput {
 /// Evaluates the scalar key expression for one side of a combine's equality
 /// conjuncts against a single `Record`.
 ///
-/// **Why two fields per program, not one:** CXL's `eval_expr` takes `(&Expr,
-/// &TypedProgram, …)` — the `TypedProgram` provides the type/resolution
-/// context (NodeId table, regex cache, binding table) while the `Expr`
-/// identifies the specific expression node to evaluate. Because each
-/// `EqualityConjunct` is compiled as a trivial single-emit wrapper at
-/// `bind_combine` time (C.2.4), the extractor stores each `(typed, expr)`
-/// pair side-by-side and replays them through the free `eval_expr` entry
-/// point — the same hot-path primitive used by the hash aggregator. No
-/// `ProgramEvaluator` allocation per extraction, no `IndexMap` churn.
+/// Each `EqualityConjunct` is compiled as a trivial single-emit wrapper at
+/// `bind_combine` time (C.2.4); the extractor lowers each key expression to
+/// a [`CompiledScalar`] once at construction and replays the resulting
+/// closures per record — the same compile-once primitive the hash
+/// aggregator uses. No `ProgramEvaluator` allocation per extraction, no
+/// per-record expression re-walk.
 ///
 /// **One extractor per side:** the driving side and the build side each get
 /// their own `KeyExtractor`. Same number of programs (one per equality
@@ -423,15 +419,7 @@ pub(crate) struct CombineKernelOutput {
 /// `CombineHashTable` be safely shared across concurrent probe workers in
 /// Phase C.3+.
 pub struct KeyExtractor {
-    programs: Vec<KeyProgram>,
-}
-
-/// One (typed program, key expression) pair. Holds `typed` as an `Arc` so
-/// multiple `KeyExtractor`s or concurrent extraction workers can share the
-/// compiled artifact without cloning it.
-struct KeyProgram {
-    typed: Arc<TypedProgram>,
-    expr: Expr,
+    programs: Vec<CompiledScalar>,
 }
 
 impl KeyExtractor {
@@ -442,7 +430,7 @@ impl KeyExtractor {
         Self {
             programs: programs
                 .into_iter()
-                .map(|(typed, expr)| KeyProgram { typed, expr })
+                .map(|(typed, expr)| compile_scalar(&typed, &expr))
                 .collect(),
         }
     }
@@ -470,10 +458,8 @@ impl KeyExtractor {
     /// "build"` context via [`CombineError::KeyEvalFailed`].
     ///
     /// **Window context:** combine's key extraction runs outside any
-    /// window, so `window: None` is passed through. The `NullStorage`
-    /// type parameter satisfies the generic bound without materializing
-    /// any storage — identical to the pattern used by the aggregator's
-    /// free `eval_expr` calls (`crates/clinker-exec/src/aggregation.rs`).
+    /// window, so the compiled key closures evaluate windowless — the
+    /// [`CompiledScalar`] path never populates a window context.
     pub fn extract(
         &self,
         ctx: &EvalContext<'_>,
@@ -494,36 +480,10 @@ impl KeyExtractor {
         resolver: &dyn FieldResolver,
         out: &mut Vec<Value>,
     ) -> Result<(), EvalError> {
-        let mut env: HashMap<String, Value> = HashMap::new();
-        for kp in &self.programs {
-            let v = eval_expr::<NullStorage>(&kp.expr, &kp.typed, ctx, resolver, None, &mut env)?;
-            out.push(v);
+        for program in &self.programs {
+            out.push(program.eval(ctx, resolver)?);
         }
         Ok(())
-    }
-}
-
-/// Placeholder `RecordStorage` for windowless expression evaluation. Every
-/// method returns an empty result; the trait object is never queried
-/// because `KeyExtractor::extract` passes `window: None`. This satisfies
-/// the `S: RecordStorage` type parameter on [`eval_expr`] the same way
-/// `executor/mod.rs:260` and `aggregation.rs:49` do for their own
-/// windowless call sites — each module declares its own zero-sized type
-/// rather than exposing a shared one from cxl.
-struct NullStorage;
-
-impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
-        None
-    }
-    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
-        None
-    }
-    fn available_fields(&self, _: u64) -> Vec<&str> {
-        vec![]
-    }
-    fn record_count(&self) -> u64 {
-        0
     }
 }
 
@@ -1312,10 +1272,9 @@ mod tests {
 
     #[test]
     fn test_key_extractor_missing_field_resolves_to_null() {
-        // CXL's FieldRef semantics per eval_expr line 399:
-        //   `resolver.resolve(name).unwrap_or(Value::Null)`.
-        // So a missing field yields Null — the hash path treats this as
-        // a NULL key and the probe short-circuits (3VL).
+        // CXL's FieldRef semantics: a `resolver.resolve(name)` miss
+        // yields Null, so a missing field produces a NULL key — the hash
+        // path treats this as a NULL key and the probe short-circuits (3VL).
         use cxl::resolve::HashMapResolver;
         let (typed, expr) = compile_key("emit k = x", &["x"], &[("x", cxl::typecheck::Type::Int)]);
         let extractor = KeyExtractor::new(vec![(typed, expr)]);
