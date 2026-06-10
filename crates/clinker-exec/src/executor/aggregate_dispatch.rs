@@ -81,6 +81,53 @@ pub(crate) fn dispatch_aggregation(
         "aggregation",
         name,
     )?;
+
+    // Streaming-ingest fast path (issue #299): when `pred` is the certified
+    // streaming producer for this Aggregate (top-level plan only — a
+    // composition body shares the `NodeIndex` space but installs no ingest
+    // edges), drive `add_record` off a bounded channel the producer fills
+    // rather than pre-draining its whole output from a charged
+    // `node_buffers` slot. Strict aggregates only: relaxed-CK and
+    // time-windowed shapes were excluded by `certify_streaming_edge`, so
+    // this never collides with the retain / multi-window branches below.
+    let streaming_ingest_producer: Option<NodeIndex> = if ctx.current_body_node_input_refs.is_none()
+        && !is_relaxed
+        && !is_time_windowed
+        && ctx
+            .streaming_aggregate_ingest_edges
+            .get(&pred)
+            .is_some_and(|&agg| agg == node_idx)
+    {
+        Some(pred)
+    } else {
+        None
+    };
+
+    let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+
+    if let Some(producer_idx) = streaming_ingest_producer {
+        let ingest = run_streaming_aggregate_ingest(
+            ctx,
+            current_dag,
+            node_idx,
+            producer_idx,
+            name,
+            agg_strategy,
+            compiled,
+            output_schema,
+        )?;
+        return finalize_aggregate_emit(
+            ctx,
+            current_dag,
+            node_idx,
+            name,
+            agg_timer,
+            ingest.input_count,
+            ingest.out_rows,
+            ingest.puncts,
+        );
+    }
+
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -152,7 +199,6 @@ pub(crate) fn dispatch_aggregation(
         .spill_compress
         .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
 
-    let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
     let input_count = input.len() as u64;
 
     let out_rows: Vec<AggSortRow> = if is_time_windowed {
@@ -470,6 +516,35 @@ pub(crate) fn dispatch_aggregation(
         agg_out
     };
 
+    finalize_aggregate_emit(
+        ctx,
+        current_dag,
+        node_idx,
+        name,
+        agg_timer,
+        input_count,
+        out_rows,
+        input_puncts,
+    )
+}
+
+/// Emit a strict aggregate's finalized rows: record the stage timer, then
+/// route `out_rows` to the deferred-region slot, the streaming-Output
+/// handoff, or a charged `node_buffers` slot, forwarding `input_puncts` at
+/// the output tail. Shared by the materialized ingest path and the
+/// streaming-ingest path ([`run_streaming_aggregate_ingest`]) — both
+/// produce the same finalized `out_rows`, so the emit half is identical.
+#[allow(clippy::too_many_arguments)]
+fn finalize_aggregate_emit(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+    agg_timer: stage_metrics::StageTimer,
+    input_count: u64,
+    out_rows: Vec<crate::aggregation::SortRow>,
+    input_puncts: Vec<crate::executor::stream_event::Punctuation>,
+) -> Result<(), PipelineError> {
     ctx.collector
         .record(agg_timer.finish(input_count, out_rows.len() as u64));
     if let Some(region) = current_dag.deferred_region_at_producer(node_idx) {
@@ -568,6 +643,315 @@ pub(crate) fn dispatch_aggregation(
     }
 
     Ok(())
+}
+
+/// Per-record side effects a streaming-ingest scoped thread cannot apply
+/// directly (it holds no `&mut ExecutorContext`), replayed onto the
+/// dispatcher after the scope joins. Ordering within each vector is the
+/// channel arrival order, so the replay reproduces the materialized
+/// path's cursor / DLQ sequencing exactly.
+struct StreamingIngestEffects {
+    /// `(source_name, row_num)` for each successfully ingested record —
+    /// replayed via [`advance_cursor`] so rollback cursors and watermark
+    /// liveness match the drain-to-`Vec` path.
+    cursor_advances: Vec<(Arc<str>, u64)>,
+    /// `(record, row_num, error_message)` for each `add_record` failure
+    /// under `Continue` / `BestEffort`, replayed via the dispatcher's DLQ
+    /// routing after join. `FailFast` surfaces the error eagerly instead.
+    add_errors: Vec<(Record, u64, String)>,
+}
+
+/// Streaming-ingest result handed back to [`dispatch_aggregation`]: the
+/// finalized group rows, the document-boundary punctuations forwarded at
+/// the output tail, and the count of records the producer fed in.
+struct StreamingIngestOutput {
+    out_rows: Vec<crate::aggregation::SortRow>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    input_count: u64,
+}
+
+/// Drive a strict (non-relaxed, non-time-windowed) Aggregate's ingest off
+/// a bounded channel the producer fills, instead of pre-draining the
+/// producer's whole output from a charged `node_buffers` slot.
+///
+/// Streaming, not blocking on its ingest half: the producer runs inside
+/// this call on the dispatch thread (its own topo turn was short-circuited
+/// by [`crate::executor::dispatch::dispatch_plan_node`]), streaming each
+/// batch into the channel, while a scoped thread drives `add_record` off
+/// the receiver. The bounded `send` is the back-pressure pivot — a slow
+/// `add_record` (e.g. a hash aggregate spilling) stalls the producer and
+/// lets the upstream Source channel fill. The finalize half stays blocking:
+/// the scoped thread runs `finalize` once the channel disconnects (every
+/// sender dropped at the producer arm's clean exit), then returns the
+/// finalized rows. Document-boundary punctuations are collected and
+/// forwarded at the output tail — byte-identical to the materialized hash
+/// path, whose per-document group flush is a separate follow-up.
+///
+/// The scoped thread holds no `&mut ExecutorContext`; it accumulates cursor
+/// advances and `add_record` DLQ errors into [`StreamingIngestEffects`],
+/// replayed on the dispatch thread after the scope joins so rollback
+/// cursors, watermark liveness, and DLQ sequencing match the drain-to-`Vec`
+/// path exactly. Spill stays RSS-triggered inside `add_record` /
+/// `finalize`, never channel-depth-triggered.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_aggregate_ingest(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    producer_idx: NodeIndex,
+    name: &str,
+    agg_strategy: AggregateStrategy,
+    compiled: &Arc<cxl::plan::CompiledAggregate>,
+    output_schema: &Arc<Schema>,
+) -> Result<StreamingIngestOutput, PipelineError> {
+    use crate::aggregation::SortRow as AggSortRow;
+    use crate::executor::stream_event::StreamEvent;
+    use cxl::eval::EvalContext;
+
+    let expected_input = current_dag.graph[node_idx]
+        .expected_input_schema_in(current_dag)
+        .cloned();
+    let upstream_name = current_dag.graph[producer_idx].name().to_string();
+
+    // Build the per-aggregation runtime artifacts (mirrors the materialized
+    // path): the executor owns the evaluator + spill metadata; the wrapper
+    // enum owns the engine. Register exactly one `AggregateConsumer` so the
+    // growing group state contributes to `sum_consumer_usage` while it is
+    // live, and unregister it after `finalize` consumes the stream.
+    let transform_idx = ctx.transform_by_name.get(name).copied();
+    let evaluator = match transform_idx {
+        Some(idx) => ProgramEvaluator::with_max_expansion(
+            Arc::clone(&ctx.compiled_transforms[idx].typed),
+            ctx.compiled_transforms[idx].has_distinct(),
+            ctx.compiled_transforms[idx].max_expansion,
+        ),
+        None => {
+            return Err(PipelineError::Internal {
+                op: "aggregation",
+                node: name.to_string(),
+                detail: "no compiled transform found for aggregate node".to_string(),
+            });
+        }
+    };
+    let spill_schema = compiled
+        .group_by_fields
+        .iter()
+        .map(|s| Box::<str>::from(s.as_str()))
+        .chain([
+            Box::<str>::from("__acc_state"),
+            Box::<str>::from("__meta_tracker"),
+        ])
+        .collect::<SchemaBuilder>()
+        .build();
+    let mem_limit = parse_memory_limit(ctx.config);
+    let spill_compress = ctx
+        .spill_compress
+        .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
+
+    let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+    let agg_consumer_id =
+        ctx.memory_budget
+            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(
+                agg_consumer_handle.clone(),
+            )));
+    let mut stream = crate::aggregation::AggregateStream::for_node(
+        agg_strategy,
+        crate::aggregation::AggregatorConfig {
+            compiled: Arc::clone(compiled),
+            evaluator,
+            output_schema: Arc::clone(output_schema),
+            spill_schema,
+            memory_budget: mem_limit,
+            spill_dir: Some(ctx.spill_root_path.to_path_buf()),
+            spill_compress,
+            transform_name: name.to_string(),
+            consumer_handle: agg_consumer_handle,
+        },
+    )?;
+
+    // Install the producer's streaming sender + per-batch charge consumer
+    // keyed by the producer's index, so its dispatch arm streams into our
+    // channel with no producer-side change (the same `take_streaming_sender`
+    // path the streaming-Output producers use). The charge handle's
+    // per-batch `add_bytes` on flush is netted to zero by the scoped
+    // thread's per-record `sub_bytes` discharge below; a 256-event bound
+    // mirrors the Source ingest channel so back-pressure paces both ends.
+    let (tx, rx) = crossbeam_channel::bounded::<StreamEvent>(256);
+    let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
+    let charge_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
+        crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+    ));
+    ctx.streaming_output_senders.insert(producer_idx, tx);
+    ctx.streaming_charge_consumers
+        .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
+
+    // Copy the stable-context reference out of `ctx` *before* the scope so
+    // the scoped thread borrows `&'a StableEvalContext` directly (shared,
+    // `Sync`) rather than through the `&mut ctx` the main thread holds for
+    // the producer redispatch — the two borrows are disjoint.
+    let stable = ctx.stable;
+    let source_batch_arc = ctx.source_batch_arc;
+    let ingestion_timestamp = ctx.source_ingestion_timestamp;
+    let strategy = ctx.config.error_handling.strategy;
+
+    let mut effects = StreamingIngestEffects {
+        cursor_advances: Vec::new(),
+        add_errors: Vec::new(),
+    };
+    let mut out_rows: Vec<AggSortRow> = Vec::with_capacity(64);
+    let mut puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+    let mut input_count: u64 = 0;
+
+    // Run the ingest recv loop and the producer concurrently. The scoped
+    // thread owns the `AggregateStream` and drains the channel; the main
+    // thread redispatches the producer (which streams into the channel and
+    // drops its sender at clean exit, disconnecting the channel). The
+    // producer's `?` error and the ingest thread's error both surface; the
+    // ingest thread always drains to disconnect first so a producer `send`
+    // can never deadlock on a dead consumer.
+    let finalize_ctx = ctx.merged_eval_ctx();
+    let ingest_result: Result<(), PipelineError> = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| -> Result<(), PipelineError> {
+            while let Ok(event) = rx.recv() {
+                let (record, rn) = match event {
+                    StreamEvent::Record(r, rn) => (r, rn),
+                    StreamEvent::Punctuation(p) => {
+                        // Collect for the output tail (byte-identical to the
+                        // materialized hash path; per-document flush is a
+                        // separate follow-up). Punctuations carry zero
+                        // charge, so no discharge here.
+                        puncts.push(p);
+                        continue;
+                    }
+                };
+                // Discharge this record's per-row cost — the consume half of
+                // the producer's per-batch admit. The formula matches the
+                // producer's charge so a fully-drained stream nets to zero.
+                charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
+                    record.schema().column_count(),
+                ));
+                input_count += 1;
+                if let Some(exp) = expected_input.as_ref() {
+                    check_input_schema(exp, record.schema(), name, "aggregation", &upstream_name)?;
+                }
+                let source_file_arc = source_file_arc_of(&record);
+                let source_name_arc = source_name_arc_of(&record);
+                // Mid-stream `$source.count` is `None` (defer-emit) — the
+                // total is unknown until the source disconnects, exactly as
+                // the per-record eval sites resolve it.
+                let eval_ctx = EvalContext {
+                    stable,
+                    source_file: &source_file_arc,
+                    source_row: rn,
+                    source_path: &source_file_arc,
+                    source_count: None,
+                    source_batch: source_batch_arc,
+                    ingestion_timestamp,
+                    source_name: &source_name_arc,
+                    doc_ctx: record.doc_ctx(),
+                };
+                match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
+                    Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
+                    Err(e) => match strategy {
+                        ErrorStrategy::FailFast => {
+                            // Drain the rest so the producer's bounded `send`
+                            // can't deadlock, then surface the error.
+                            while rx.recv().is_ok() {}
+                            return Err(e.into());
+                        }
+                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                            effects
+                                .add_errors
+                                .push((record, rn, format!("aggregate {name}: {e}")));
+                        }
+                    },
+                }
+            }
+            // Channel disconnected — every sender dropped at the producer
+            // arm's clean exit. Finalize the blocking half and return.
+            stream
+                .finalize(&finalize_ctx, &mut out_rows)
+                .map_err(PipelineError::from)
+        });
+
+        // Redispatch the producer on the main thread. Clear its ingest-edge
+        // entry first so the dispatcher's streaming-ingest short-circuit
+        // (which made the producer's own topo turn a no-op) does not fire
+        // again here — this is the one turn the producer must actually run.
+        // It takes the sender we installed and streams into the channel,
+        // dropping it at clean exit.
+        ctx.streaming_aggregate_ingest_edges.remove(&producer_idx);
+        let producer_result =
+            crate::executor::dispatch::dispatch_plan_node(ctx, current_dag, producer_idx);
+        // Belt-and-suspenders: ensure the channel disconnects even if a
+        // producer error left a sender lingering on `ctx`, so the ingest
+        // thread's `recv` returns `Err` and the join below cannot hang.
+        ctx.streaming_output_senders.remove(&producer_idx);
+
+        let ingest = handle.join().map_err(|_| PipelineError::Internal {
+            op: "aggregation",
+            node: name.to_string(),
+            detail: "streaming aggregate ingest thread panicked".to_string(),
+        })?;
+        producer_result.and(ingest)
+    });
+
+    // Charge bookkeeping is complete: the producer charged each batch and
+    // the ingest thread discharged each record. Pin to zero defensively (a
+    // heuristic mismatch between batch charge and per-record discharge must
+    // not leave a stale positive for the arbitrator), then unregister both
+    // the per-edge charge consumer and the aggregate consumer — `finalize`
+    // consumed the group state, so its bytes leave `sum_consumer_usage`.
+    charge_handle.set_bytes(0);
+    ctx.streaming_charge_consumers.remove(&producer_idx);
+    ctx.memory_budget.unregister_consumer(charge_consumer_id);
+    ctx.memory_budget.unregister_consumer(agg_consumer_id);
+
+    ingest_result?;
+
+    // Replay the per-record side effects the scoped thread accumulated. The
+    // cursor advances keep rollback / watermark state consistent; the DLQ
+    // errors route through the same `Continue` / `BestEffort` path the
+    // materialized ingest loop uses.
+    for (source_name_arc, rn) in std::mem::take(&mut effects.cursor_advances) {
+        advance_cursor(ctx, &source_name_arc, rn);
+    }
+    for (record, rn, message) in std::mem::take(&mut effects.add_errors) {
+        let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
+        let routed = record_error_to_buffer_if_grouped(
+            ctx,
+            &record,
+            rn,
+            clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
+            message.clone(),
+            stage.clone(),
+            None,
+        );
+        if !routed {
+            let source_name = source_name_arc_of(&record);
+            push_dlq(
+                ctx,
+                DlqEntry {
+                    source_row: rn,
+                    category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
+                    error_message: message,
+                    original_record: record,
+                    stage,
+                    route: None,
+                    trigger: true,
+                    source_name,
+                    triggering_field: None,
+                    triggering_value: None,
+                },
+            )?;
+        }
+    }
+
+    Ok(StreamingIngestOutput {
+        out_rows,
+        puncts,
+        input_count,
+    })
 }
 
 /// Immutable build configuration for a time-windowed aggregate, shared

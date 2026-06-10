@@ -846,6 +846,23 @@ pub(crate) struct ExecutorContext<'a> {
     /// buffered batch to drain. Empty when no streaming chain
     /// qualified.
     pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
+
+    /// `producer → Aggregate` edges whose ingest streams. Keyed by the
+    /// producer's `NodeIndex`, valued by the consuming `Aggregate`'s
+    /// `NodeIndex`. Computed once at executor entry from the plan's fusion
+    /// analysis ([`certify_streaming_edge`] with an `Aggregation`
+    /// consumer).
+    ///
+    /// The producer's own topo turn is short-circuited (the dispatcher
+    /// skips a node whose index is a key here): the producer instead runs
+    /// inside the consuming Aggregate's dispatch turn, on the main thread,
+    /// streaming each batch into a bounded channel while a scoped thread
+    /// drives `add_record` off the receiver. Running the producer inside
+    /// the consumer's turn is what keeps the bounded `send` from
+    /// dead-locking — the drain side is live before the producer's first
+    /// flush, and back-pressure flows Aggregate-ingest → producer →
+    /// Source. Empty for pipelines with no streaming-ingest Aggregate.
+    pub(crate) streaming_aggregate_ingest_edges: HashMap<NodeIndex, NodeIndex>,
     /// `JoinHandle`s for spawned streaming-output writer threads. Owned
     /// by the dispatcher so the end-of-DAG join surface (in
     /// `execute_dag_branching`) folds per-thread counter / timer /
@@ -2469,6 +2486,19 @@ pub(crate) fn dispatch_plan_node(
     // One guard, two pass modes — the architectural payoff of routing
     // both passes through the same operator arms.
     if !ctx.in_deferred_dispatch && current_dag.is_deferred_consumer(node_idx) {
+        return Ok(());
+    }
+    // Streaming-ingest producer short-circuit. A producer feeding a
+    // streaming-ingest Aggregate runs inside that Aggregate's dispatch turn
+    // (on the main thread, streaming into the bounded channel a scoped
+    // ingest thread drains), so its own topo turn is a no-op — mirroring the
+    // streaming-Output producer-stays / consumer-no-ops split, inverted. The
+    // composition-body guard matches `take_streaming_sender`: a body
+    // operator's index can collide with a top-level producer's, and only the
+    // top-level plan installs ingest edges.
+    if ctx.current_body_node_input_refs.is_none()
+        && ctx.streaming_aggregate_ingest_edges.contains_key(&node_idx)
+    {
         return Ok(());
     }
     let node = current_dag.graph[node_idx].clone();

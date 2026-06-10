@@ -287,6 +287,45 @@ pub fn classify_stream_nodes(
         .collect()
 }
 
+/// Identify every `producer → Aggregate` edge whose ingest streams:
+/// the producer feeds `add_record` per record over a bounded channel
+/// rather than the Aggregate pre-draining the producer's whole output
+/// from a charged `node_buffers` slot. Returns a map from the producer's
+/// `NodeIndex` to the consuming Aggregate's `NodeIndex`.
+///
+/// This is the [`certify_streaming_edge`] predicate applied with each
+/// `Aggregation` node as the consumer; the producer-kind half of the
+/// predicate (fused `Source → Transform`, non-fused `Merge`, single-branch
+/// `Route`, streaming-strategy `Aggregate`) is shared with the `Output`
+/// consumer, so the same fusion analysis decides both. The runtime
+/// installs one bounded channel per returned edge: the producer arm
+/// streams into it during its own dispatch turn, and the Aggregate arm
+/// drains it via a back-pressured recv loop — so a slow producer paces
+/// the Aggregate's ingest and no inter-stage slot is charged for the edge.
+///
+/// Correlation buffering disables streaming pipeline-wide (the
+/// `CorrelationCommit` terminal owns the writes), so the caller passes a
+/// fused-transform set computed only when correlation is inactive; an
+/// empty fused set leaves the map empty for those topologies.
+pub fn compute_streaming_aggregate_ingest_edges(
+    plan: &ExecutionPlanDag,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> {
+    let mut edges = HashMap::new();
+    for agg_idx in plan.graph.node_indices() {
+        if !matches!(&plan.graph[agg_idx], PlanNode::Aggregation { .. }) {
+            continue;
+        }
+        if let Some(producer_idx) =
+            certify_streaming_edge(plan, agg_idx, fused_transforms, init_phase_set)
+        {
+            edges.insert(producer_idx, agg_idx);
+        }
+    }
+    edges
+}
+
 /// Certify a `producer → consumer` edge for the streaming substrate,
 /// returning the producer's `NodeIndex` when the edge streams, or `None`
 /// when it stays materialized.
@@ -401,10 +440,11 @@ pub fn certify_streaming_edge(
         return None;
     }
 
-    // Consumer-kind dispatch. `Output` is the sole certified consumer kind
-    // today; every other kind falls through to `None`. The guards here are
-    // the consumer-specific half of the predicate (the producer-kind half
-    // is the `match` on `producer_idx` below).
+    // Consumer-kind dispatch. `Output` (the file-writer sink) and
+    // `Aggregation` (the per-record ingest half of a GROUP BY) are the
+    // certified consumer kinds; every other kind falls through to `None`.
+    // The guards here are the consumer-specific half of the predicate (the
+    // producer-kind half is the `match` on `producer_idx` below).
     match &plan.graph[consumer_idx] {
         PlanNode::Output { resolved, .. } => {
             let payload = resolved.as_deref()?;
@@ -414,6 +454,37 @@ pub fn certify_streaming_edge(
             // runtime surfaces agree without consulting the runtime writer
             // registry.
             if payload.fan_out_per_source_file || payload.output.split.is_some() {
+                return None;
+            }
+        }
+        PlanNode::Aggregation {
+            config, compiled, ..
+        } => {
+            // The ingest half streams: an eligible producer feeds
+            // `add_record` per record over the bounded channel rather than
+            // pre-draining the producer's whole output from a charged
+            // `node_buffers` slot. The finalize half stays blocking (it
+            // accumulates every group before emitting) — that is the
+            // operator's nature, not a buffer this lifts.
+            //
+            // Two aggregate shapes keep the materialized ingest:
+            //
+            // - Relaxed-CK aggregates (`requires_lineage` /
+            //   `requires_buffer_mode`) retain their hash state for the
+            //   correlation-commit phase, which re-`retract` + re-finalize
+            //   the same instance; streaming ingest would have to hand that
+            //   live state across a thread boundary and back, so the commit
+            //   path keeps draining a materialized slot.
+            // - Time-windowed aggregates run a multi-pass per-window (and,
+            //   for sessions, global-sort) algorithm over the whole input
+            //   batch, which is incompatible with a single forward
+            //   record-at-a-time pass.
+            //
+            // Both are plan-derived flags, so the explain buffer-class
+            // annotation and the runtime ingest path agree without
+            // inspecting runtime state.
+            let is_relaxed = compiled.requires_lineage || compiled.requires_buffer_mode;
+            if is_relaxed || config.time_window.is_some() {
                 return None;
             }
         }

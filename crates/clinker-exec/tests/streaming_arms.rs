@@ -31,6 +31,20 @@
 //! streaming handoff preserves per-document ordering end-to-end. (The
 //! substrate's trailing-`DocumentClose`-across-batch-splits invariant is
 //! pinned in isolation by `executor::batch_handoff`'s unit tests.)
+//!
+//! A second family covers the streaming-ingest *consumer*: an eligible
+//! producer streams record-at-a-time into an `Aggregate`'s `add_record`
+//! over the bounded channel rather than the Aggregate pre-draining the
+//! producer's whole output from a charged `node_buffers` slot. The
+//! producer runs inside the Aggregate's dispatch turn (its own topo turn a
+//! no-op), streaming each batch while a scoped thread drives ingest; the
+//! Aggregate finalizes on channel disconnect. These tests pin the same two
+//! properties — the producer reports `buffer: streaming` and emits no
+//! `node_buffer` edge to the Aggregate, and the aggregated value matches
+//! the materialized path — across `Source → Transform → Aggregate` and
+//! `Merge → Aggregate` shapes, plus a back-pressure regression that drives
+//! far more records than the bounded channel holds (a deadlock would hang
+//! the run rather than complete).
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
@@ -79,10 +93,11 @@ fn properties_block(explain: &str, slug: &str) -> String {
 }
 
 /// Assert the producer named `producer_slug` is classified `streaming`
-/// and emits no charged `node_buffer` edge to `output_slug` — the
+/// and emits no charged `node_buffer` edge to `consumer_slug` — the
 /// user-observable proof that its output never crosses a spill-eligible
-/// inter-stage buffer.
-fn assert_streaming_to_output(explain: &str, producer_slug: &str, output_slug: &str) {
+/// inter-stage buffer. `consumer_slug` is any downstream sink: an
+/// `output.*` writer or an `aggregation.*` streaming-ingest consumer.
+fn assert_streaming_to_output(explain: &str, producer_slug: &str, consumer_slug: &str) {
     let block = properties_block(explain, producer_slug);
     assert!(
         block.contains("buffer: streaming"),
@@ -92,11 +107,11 @@ fn assert_streaming_to_output(explain: &str, producer_slug: &str, output_slug: &
         !block.contains("buffer: materialized"),
         "{producer_slug} must not be materialized:\n{block}"
     );
-    let edge = format!("edge {producer_slug} -> {output_slug}");
+    let edge = format!("edge {producer_slug} -> {consumer_slug}");
     assert!(
         !explain.contains(&edge),
         "a streaming {producer_slug} must emit no node_buffer edge to its \
-         Output (the whole point: no charged inter-stage slot), got:\n{explain}"
+         consumer (the whole point: no charged inter-stage slot), got:\n{explain}"
     );
 }
 
@@ -725,4 +740,295 @@ nodes:
              bled across documents through the streaming Merge handoff)"
         );
     }
+}
+
+/// A fused `Source → Transform` whose sole downstream is a (strict, hash)
+/// `Aggregate` streams record-at-a-time into the Aggregate's ingest rather
+/// than pre-draining its whole output from a charged `node_buffers` slot.
+/// The Transform reports `buffer: streaming` and emits no `node_buffer`
+/// edge to the Aggregate, and the grouped totals match the materialized
+/// path exactly. The `group_by: [dept]` keeps the aggregate on the hash
+/// strategy (no pre-sorted ordering), so this exercises the hash ingest.
+#[test]
+fn fused_transform_streams_ingest_into_aggregate() {
+    let yaml = r#"
+pipeline:
+  name: streaming_agg_ingest
+nodes:
+  - type: source
+    name: sales
+    config:
+      name: sales
+      type: csv
+      path: ./sales.csv
+      options: { has_header: true }
+      schema:
+        - { name: dept, type: string }
+        - { name: amount, type: string }
+        - { name: status, type: string }
+  - type: transform
+    name: active_only
+    input: sales
+    config:
+      cxl: |
+        filter status == "active"
+        emit dept = dept
+        emit amount = amount
+  - type: aggregate
+    name: totals
+    input: active_only
+    config:
+      group_by: [dept]
+      cxl: |
+        emit dept = dept
+        emit total = sum(amount.to_int())
+        emit n = count(*)
+  - type: output
+    name: out
+    input: totals
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    let explain = explain_of(&config, &plan);
+    // The aggregate stays on the hash strategy (grouped, unsorted input).
+    assert!(
+        explain.contains("[aggregation:hash] totals"),
+        "expected a grouped aggregate over unsorted input to resolve hash, \
+         got:\n{explain}"
+    );
+    // The fused Transform streams its ingest into the Aggregate: no charged
+    // node_buffer edge crosses transform.active_only -> aggregation.totals.
+    assert_streaming_to_output(&explain, "transform.active_only", "aggregation.totals");
+
+    // a:10+30=40 (n=2), b:20+40=60 (n=2); one inactive row filtered out.
+    let csv = "dept,amount,status\n\
+        a,10,active\n\
+        b,20,active\n\
+        a,30,active\n\
+        b,40,active\n\
+        a,99,inactive\n";
+    let readers: SourceReaders = HashMap::from([(
+        "sales".to_string(),
+        clinker_exec::executor::SourceInput::Files(vec![fast_slot("sales", csv)]),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("fused transform streams ingest into aggregate");
+    let mut lines = body_lines(&buf);
+    lines.sort();
+    assert_eq!(lines.len(), 2, "two groups expected: {lines:?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("a,40,2")),
+        "dept a total diverged from the materialized path: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("b,60,2")),
+        "dept b total diverged from the materialized path: {lines:?}"
+    );
+    assert_eq!(report.counters.dlq_count, 0);
+}
+
+/// A non-fused `Merge` (`concat` of two Transform outputs) whose sole
+/// downstream is a strict `Aggregate` streams the merged stream into the
+/// Aggregate's ingest. The Merge reports `buffer: streaming` and emits no
+/// `node_buffer` edge to the Aggregate, and the global total over both
+/// branches matches the materialized path.
+#[test]
+fn nonfused_merge_streams_ingest_into_aggregate() {
+    let yaml = r#"
+pipeline:
+  name: streaming_merge_agg_ingest
+nodes:
+  - type: source
+    name: sa
+    config:
+      name: sa
+      type: csv
+      path: ./sa.csv
+      schema:
+        - { name: amount, type: string }
+  - type: source
+    name: sb
+    config:
+      name: sb
+      type: csv
+      path: ./sb.csv
+      schema:
+        - { name: amount, type: string }
+  - type: transform
+    name: ta
+    input: sa
+    config:
+      cxl: |
+        emit amount = amount
+  - type: transform
+    name: tb
+    input: sb
+    config:
+      cxl: |
+        emit amount = amount
+  - type: merge
+    name: m
+    inputs: [ta, tb]
+    config:
+      mode: concat
+  - type: aggregate
+    name: totals
+    input: m
+    config:
+      group_by: []
+      cxl: |
+        emit total = sum(amount.to_int())
+        emit n = count(*)
+  - type: output
+    name: out
+    input: totals
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    assert_streaming_to_output(&explain_of(&config, &plan), "merge.m", "aggregation.totals");
+
+    let sa = "amount\n10\n20\n30\n";
+    let sb = "amount\n40\n50\n";
+    let readers: SourceReaders = HashMap::from([
+        (
+            "sa".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sa.csv",
+                Box::new(Cursor::new(sa.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "sb".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sb.csv",
+                Box::new(Cursor::new(sb.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("non-fused merge streams ingest into aggregate");
+    let lines = body_lines(&buf);
+    assert_eq!(lines.len(), 1, "global aggregate emits one row: {lines:?}");
+    // 10+20+30+40+50 = 150 over 5 records.
+    assert!(
+        lines[0].starts_with("150,5"),
+        "merged global aggregate diverged: {}",
+        lines[0]
+    );
+    assert_eq!(report.counters.dlq_count, 0);
+}
+
+/// Streaming ingest must not deadlock under back-pressure: the producer's
+/// bounded `send` blocks when the channel fills, and the Aggregate's scoped
+/// ingest thread drains it concurrently. Drive far more records than the
+/// 256-event channel bound through a fused `Source → Transform → Aggregate`
+/// chain — a deadlock would hang the run rather than complete. The global
+/// `count` must equal every input row, and the run must finish.
+#[test]
+fn aggregate_ingest_no_deadlock_under_backpressure() {
+    const ROWS: usize = 5_000;
+    let yaml = r#"
+pipeline:
+  name: streaming_agg_ingest_backpressure
+  batch_size: 64
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: ./events.csv
+      options: { has_header: true }
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: string }
+  - type: transform
+    name: pass
+    input: events
+    config:
+      cxl: |
+        emit amount = amount
+  - type: aggregate
+    name: totals
+    input: pass
+    config:
+      group_by: []
+      cxl: |
+        emit total = sum(amount.to_int())
+        emit n = count(*)
+  - type: output
+    name: out
+    input: totals
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    assert_streaming_to_output(
+        &explain_of(&config, &plan),
+        "transform.pass",
+        "aggregation.totals",
+    );
+
+    let mut csv = String::from("id,amount\n");
+    let mut expected_total: i64 = 0;
+    for i in 1..=ROWS {
+        csv.push_str(&format!("e-{i},{i}\n"));
+        expected_total += i as i64;
+    }
+    let readers: SourceReaders = HashMap::from([(
+        "events".to_string(),
+        clinker_exec::executor::SourceInput::Files(vec![fast_slot("events", &csv)]),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("streaming aggregate ingest must not deadlock under back-pressure");
+    let lines = body_lines(&buf);
+    assert_eq!(lines.len(), 1, "global aggregate emits one row: {lines:?}");
+    assert!(
+        lines[0].starts_with(&format!("{expected_total},{ROWS}")),
+        "back-pressured aggregate ingest dropped/duplicated records: {}",
+        lines[0]
+    );
+    assert_eq!(report.counters.total_count as usize, ROWS);
+    assert_eq!(report.counters.dlq_count, 0);
 }
