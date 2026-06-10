@@ -187,6 +187,71 @@ fn project(result: &Result<EvalResult, EvalError>) -> ResultProjection {
     }
 }
 
+/// The post-run side-effect channel: the `$pipeline.*` and `$source.*`
+/// variable maps a run wrote through its [`StableEvalContext`]. These
+/// writes are pure side effects — they never appear in [`EvalResult`] —
+/// so an `EvalResult`-only comparison is blind to a compiled-vs-tree-walk
+/// divergence on emit routing for these two targets. Capturing them lets
+/// the differential assert the side-effect channel agrees too.
+///
+/// `pipeline` is the ordered `(key, value)` list from `pipeline_vars`.
+/// `source` is keyed by source-file path (sorted for determinism, since
+/// the underlying store is a `HashMap`), each entry carrying that file's
+/// ordered `(key, value)` list.
+#[derive(Debug, PartialEq)]
+struct SideEffects {
+    pipeline: Pairs,
+    source: Vec<(String, Pairs)>,
+}
+
+/// Snapshot the `$pipeline.*` / `$source.*` writes a run left on its
+/// `StableEvalContext`, NaN-canonicalizing every value so an agreed NaN
+/// compares equal rather than false-failing (mirroring [`project`]).
+///
+/// Each evaluator must run against its OWN context for this to be a real
+/// differential: a shared context would let the second run observe the
+/// first's writes, collapsing the comparison to a tautology.
+fn snapshot_side_effects(stable: &StableEvalContext) -> SideEffects {
+    let pipeline: Pairs = stable
+        .pipeline_vars
+        .read()
+        .expect("pipeline_vars lock poisoned")
+        .iter()
+        .map(|(k, v)| (k.clone(), canonicalize_nan(v)))
+        .collect();
+    let mut source: Vec<(String, Pairs)> = stable
+        .source_vars
+        .read()
+        .expect("source_vars lock poisoned")
+        .iter()
+        .map(|(file, vars)| {
+            let pairs: Pairs = vars
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_nan(v)))
+                .collect();
+            (file.to_string(), pairs)
+        })
+        .collect();
+    // The source store is a `HashMap`, so its iteration order is
+    // per-instance randomized; sort by file path so two snapshots compare
+    // structurally rather than by incidental bucket order.
+    source.sort_by(|a, b| a.0.cmp(&b.0));
+    SideEffects { pipeline, source }
+}
+
+/// Assert the two runs' `$pipeline.*` / `$source.*` side-effect channels
+/// agree, byte-for-byte. Run alongside the [`EvalResult`] comparison so a
+/// divergence on emit routing for the pipeline/source targets — value,
+/// key, which writes happen, or their order — fails the differential even
+/// though those writes never surface in `EvalResult`.
+fn assert_side_effects_agree(tree: &StableEvalContext, comp: &StableEvalContext, src: &str) {
+    assert_eq!(
+        snapshot_side_effects(tree),
+        snapshot_side_effects(comp),
+        "tree-walk and compiled diverged on $pipeline/$source side effects for `{src}`",
+    );
+}
+
 /// Assert the tree-walk and the compiled evaluator agree byte-for-byte
 /// on `src` evaluated against `record`. Returns the shared projection so
 /// callers can additionally assert the concrete outcome.
@@ -195,11 +260,30 @@ fn project(result: &Result<EvalResult, EvalError>) -> ResultProjection {
 /// `Arc<TypedProgram>`, so the program is type-checked twice from the
 /// same source with the same input field set — the two are identical by
 /// construction.
+///
+/// Each path runs against its OWN `StableEvalContext` so the
+/// `$pipeline.*` / `$source.*` writes one path makes are invisible to the
+/// other; the two contexts are then compared so emit routing for those
+/// side-effect-only targets is held to the same fidelity bar as the
+/// surfaced `EvalResult`.
 fn assert_agree(src: &str, fields: &[&str], record: HashMap<String, Value>) -> ResultProjection {
+    assert_agree_capturing(src, fields, record).0
+}
+
+/// Like [`assert_agree`] but also returns the agreed `$pipeline.*` /
+/// `$source.*` side-effect snapshot, so a caller can additionally assert
+/// the concrete values written through that channel — not just that the
+/// two paths agree on it.
+fn assert_agree_capturing(
+    src: &str,
+    fields: &[&str],
+    record: HashMap<String, Value>,
+) -> (ResultProjection, SideEffects) {
     let typed = type_program(src, fields);
     let has_distinct = program_has_distinct(&typed);
 
-    let stable = StableEvalContext::test_default();
+    let stable_tw = StableEvalContext::test_default();
+    let stable_c = StableEvalContext::test_default();
     let resolver = HashMapResolver::new(record);
 
     // Both paths run through the live `ProgramEvaluator::eval_record`
@@ -208,11 +292,11 @@ fn assert_agree(src: &str, fields: &[&str], record: HashMap<String, Value>) -> R
     // test-local re-implementation. The distinct flag is detected the same
     // way for both, so a `distinct` program allocates dedup state on both
     // sides.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable);
+    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
     let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
     let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable);
+    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
     let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
     comp_eval.set_use_compiled(true);
     let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
@@ -223,7 +307,8 @@ fn assert_agree(src: &str, fields: &[&str], record: HashMap<String, Value>) -> R
         tree_proj, comp_proj,
         "tree-walk and compiled diverged on `{src}`",
     );
-    tree_proj
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
+    (tree_proj, snapshot_side_effects(&stable_tw))
 }
 
 // ── Differential corpus: the scalar core ───────────────────────────────
@@ -505,6 +590,132 @@ fn emit_targets() {
             fields: vec![],
             record_vars: vec![],
         },
+    );
+}
+
+/// Convenience: the `$source.*` writes captured for the default test
+/// source file, since every no-window `assert_agree` run keys source
+/// writes under the same `test.csv` placeholder.
+fn source_writes_for_default_file(effects: &SideEffects) -> Pairs {
+    effects
+        .source
+        .iter()
+        .find(|(file, _)| file == "test.csv")
+        .map(|(_, pairs)| pairs.clone())
+        .unwrap_or_default()
+}
+
+/// `$pipeline.*` / `$source.*` emits write *values*, not just the empty
+/// presence the `emit_targets` smoke check covers. The `EvalResult` is
+/// blind to these writes — they live only on the context — so this drives
+/// each evaluator against its own context and asserts the post-run
+/// pipeline/source maps agree across the two paths *and* carry the exact
+/// computed values. Without the side-effect comparison the differential
+/// would pass even if the compiled node routed a `$pipeline.*` write to
+/// the wrong key, wrote the wrong value, or dropped the write entirely.
+#[test]
+fn pipeline_source_emit_values_agree() {
+    // A single computed pipeline write: `count = a * 2` over a = 21 → 42.
+    let (proj, effects) = assert_agree_capturing(
+        "emit $pipeline.count = a * 2",
+        &["a"],
+        HashMap::from([("a".to_string(), Value::Integer(21))]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![],
+            record_vars: vec![],
+        },
+    );
+    assert_eq!(
+        effects.pipeline,
+        vec![("count".to_string(), Value::Integer(42))],
+    );
+    assert!(effects.source.is_empty());
+
+    // A single computed source write under the default source file.
+    let (_, effects) = assert_agree_capturing(
+        "emit $source.tag = label.upper()",
+        &["label"],
+        HashMap::from([("label".to_string(), Value::String("hot".into()))]),
+    );
+    assert!(effects.pipeline.is_empty());
+    assert_eq!(
+        source_writes_for_default_file(&effects),
+        vec![("tag".to_string(), Value::String("HOT".into()))],
+    );
+
+    // Multiple writes to both channels in one program; insertion order is
+    // preserved on the pipeline channel, so the two `$pipeline.*` keys
+    // appear in statement order.
+    let (_, effects) = assert_agree_capturing(
+        "emit $pipeline.first = a\nemit $source.s = a + 1\nemit $pipeline.second = a + 100",
+        &["a"],
+        HashMap::from([("a".to_string(), Value::Integer(5))]),
+    );
+    assert_eq!(
+        effects.pipeline,
+        vec![
+            ("first".to_string(), Value::Integer(5)),
+            ("second".to_string(), Value::Integer(105)),
+        ],
+    );
+    assert_eq!(
+        source_writes_for_default_file(&effects),
+        vec![("s".to_string(), Value::Integer(6))],
+    );
+
+    // Last-write-wins on a repeated key: the second write to `dup` must be
+    // the surviving value on both paths.
+    let (_, effects) = assert_agree_capturing(
+        "emit $pipeline.dup = 1\nemit $pipeline.dup = 2",
+        &[],
+        HashMap::new(),
+    );
+    assert_eq!(
+        effects.pipeline,
+        vec![("dup".to_string(), Value::Integer(2))],
+    );
+
+    // A conditional write: the `if` selects which branch's value lands, so
+    // the recorded pipeline value tracks the taken branch on both paths.
+    let (_, effects) = assert_agree_capturing(
+        "emit $pipeline.bucket = if a > 0 then \"pos\" else \"nonpos\"",
+        &["a"],
+        HashMap::from([("a".to_string(), Value::Integer(-3))]),
+    );
+    assert_eq!(
+        effects.pipeline,
+        vec![("bucket".to_string(), Value::String("nonpos".into()))],
+    );
+}
+
+/// A `$pipeline.*` write *before* a later statement that errors must still
+/// be observable on both contexts: the emit routes its value through the
+/// context immediately, then the subsequent division-by-zero aborts the
+/// record. Both paths must agree the early write landed and the run then
+/// errored — proving the compiled node writes the side-effect channel at
+/// the same point in the statement sequence the tree-walk does, not all at
+/// once at the end.
+#[test]
+fn pipeline_emit_before_error_is_observable() {
+    let (proj, effects) = assert_agree_capturing(
+        "emit $pipeline.seen = a\nemit out = 1 / z",
+        &["a", "z"],
+        HashMap::from([
+            ("a".to_string(), Value::Integer(9)),
+            ("z".to_string(), Value::Integer(0)),
+        ]),
+    );
+    match proj {
+        ResultProjection::Err { kind, .. } => assert_eq!(kind, "DivisionByZero"),
+        other => panic!("expected DivisionByZero, got {other:?}"),
+    }
+    // The pre-error write is present and identical on both contexts.
+    assert_eq!(
+        effects.pipeline,
+        vec![("seen".to_string(), Value::Integer(9))],
     );
 }
 
@@ -1376,7 +1587,8 @@ fn assert_agree_window(
 ) -> ResultProjection {
     let typed = type_program_with_row(src, fields);
     let has_distinct = program_has_distinct(&typed);
-    let stable = StableEvalContext::test_default();
+    let stable_tw = StableEvalContext::test_default();
+    let stable_c = StableEvalContext::test_default();
     let resolver = HashMapResolver::new(HashMap::new());
     let storage = VecStorage { rows: partition };
     let window = VecWindow {
@@ -1387,13 +1599,14 @@ fn assert_agree_window(
     // Both paths run through the live `ProgramEvaluator::eval_record` with
     // a real `WindowContext` and a non-`NullStorage` `S`, so the compiled
     // path exercises its per-`S` program cache and window-leaf
-    // monomorphization through the same entry production uses.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable);
+    // monomorphization through the same entry production uses. Separate
+    // contexts keep the $pipeline/$source side-effect comparison honest.
+    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
     let mut tree_eval =
         ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
     let tree = tree_eval.eval_record::<VecStorage>(&ctx_tw, &resolver, Some(&window));
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable);
+    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
     let mut comp_eval =
         ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
     comp_eval.set_use_compiled(true);
@@ -1405,6 +1618,7 @@ fn assert_agree_window(
         tree_proj, comp_proj,
         "tree-walk and compiled diverged on window program `{src}`",
     );
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
     tree_proj
 }
 
@@ -1621,13 +1835,16 @@ fn assert_agree_distinct_stream(
         has_distinct,
         "distinct stream helper requires a distinct program"
     );
-    let stable = StableEvalContext::test_default();
+    let stable_tw = StableEvalContext::test_default();
+    let stable_c = StableEvalContext::test_default();
 
     // Two live evaluators differing only in `use_compiled`. Driving the
     // compiled side through `ProgramEvaluator` (not the raw program) proves
     // the production state-threading: `set_partition` reaches the shared
     // `EvalState`, and per-record dedup runs against it, so distinct and
-    // partition-reset behave identically through either path.
+    // partition-reset behave identically through either path. Each path
+    // writes its own context so the post-stream $pipeline/$source
+    // comparison is a real differential.
     let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
     let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
     comp_eval.set_use_compiled(true);
@@ -1640,10 +1857,10 @@ fn assert_agree_distinct_stream(
         }
         let resolver = HashMapResolver::new(record);
 
-        let ctx_tw = EvalContext::test_default_borrowed(&stable);
+        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
         let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-        let ctx_c = EvalContext::test_default_borrowed(&stable);
+        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
         let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         let tree_proj = project(&tree);
@@ -1654,6 +1871,10 @@ fn assert_agree_distinct_stream(
         );
         out.push(tree_proj);
     }
+    // The side-effect channel accumulates across the whole stream (writes
+    // are last-write-wins per key), so compare the two contexts once after
+    // the stream drains rather than per record.
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
     out
 }
 
@@ -1846,7 +2067,8 @@ fn emit_each_empty_array() {
 fn emit_each_ceiling_boundary() {
     let src = "emit each n in nums {\n  emit val = n\n}";
     let typed = type_program(src, &["nums"]);
-    let stable = StableEvalContext::test_default();
+    let stable_tw = StableEvalContext::test_default();
+    let stable_c = StableEvalContext::test_default();
     let nums = Value::Array(vec![
         Value::Integer(1),
         Value::Integer(2),
@@ -1857,12 +2079,12 @@ fn emit_each_ceiling_boundary() {
     // Ceiling of 2 over a 3-element array → the third element trips it.
     // The compiled side gets the same ceiling through `with_max_expansion`,
     // which threads it into the shared `EvalState`.
-    let ctx_tw = EvalContext::test_default_borrowed(&stable);
+    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
     let mut tree_eval =
         ProgramEvaluator::with_max_expansion(Arc::new(type_program(src, &["nums"])), false, 2);
     let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable);
+    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
     let mut comp_eval = ProgramEvaluator::with_max_expansion(Arc::new(typed), false, 2);
     comp_eval.set_use_compiled(true);
     let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
@@ -1873,6 +2095,7 @@ fn emit_each_ceiling_boundary() {
         project(&comp),
         "tree-walk and compiled diverged on emit-each ceiling",
     );
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
     match tree_proj {
         ResultProjection::Err { kind, .. } => assert!(
             kind.contains("ExpansionLimitExceeded"),
@@ -1959,26 +2182,32 @@ fn assert_agree_with_vars(
             .with_source(Arc::from(src))
     };
     let typed = build();
-    let stable = StableEvalContext::test_default();
     // Declare each qualified-source input name with an empty Arc list so
     // `$source.<input>.<field>` resolves to Null at eval rather than
     // panicking on a missing map entry; the lookup still flows through
-    // both evaluators identically.
-    let mut input_arcs = std::collections::HashMap::new();
-    for s in qualified_sources {
-        input_arcs.insert(s.to_string(), Vec::new());
-    }
-    let stable = StableEvalContext {
-        source_input_arcs: Arc::new(input_arcs),
-        ..stable
+    // both evaluators identically. Each path gets its own context — with
+    // an independently-built (but structurally identical) input map — so
+    // the $pipeline/$source side-effect comparison stays a real
+    // differential.
+    let build_stable = || {
+        let mut input_arcs = std::collections::HashMap::new();
+        for s in qualified_sources {
+            input_arcs.insert(s.to_string(), Vec::new());
+        }
+        StableEvalContext {
+            source_input_arcs: Arc::new(input_arcs),
+            ..StableEvalContext::test_default()
+        }
     };
+    let stable_tw = build_stable();
+    let stable_c = build_stable();
     let resolver = HashMapResolver::new(record);
 
-    let ctx_tw = EvalContext::test_default_borrowed(&stable);
+    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
     let mut tree_eval = ProgramEvaluator::new(Arc::new(build()), false);
     let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable);
+    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
     let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
     comp_eval.set_use_compiled(true);
     let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
@@ -1989,6 +2218,7 @@ fn assert_agree_with_vars(
         tree_proj, comp_proj,
         "tree-walk and compiled diverged on `{src}`",
     );
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
     tree_proj
 }
 
@@ -2123,17 +2353,16 @@ fn qualified_field_ref_three_part() {
         "amount",
         Value::Integer(42),
     );
-    let typed = type_program("emit out = orders.line.amount", &[]);
-    let stable = StableEvalContext::test_default();
+    let src = "emit out = orders.line.amount";
+    let typed = type_program(src, &[]);
+    let stable_tw = StableEvalContext::test_default();
+    let stable_c = StableEvalContext::test_default();
 
-    let ctx_tw = EvalContext::test_default_borrowed(&stable);
-    let mut tree_eval = ProgramEvaluator::new(
-        Arc::new(type_program("emit out = orders.line.amount", &[])),
-        false,
-    );
+    let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
+    let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, &[])), false);
     let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-    let ctx_c = EvalContext::test_default_borrowed(&stable);
+    let ctx_c = EvalContext::test_default_borrowed(&stable_c);
     let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
     comp_eval.set_use_compiled(true);
     let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
@@ -2144,6 +2373,7 @@ fn qualified_field_ref_three_part() {
         project(&comp),
         "tree-walk and compiled diverged on 3-part qualified ref",
     );
+    assert_side_effects_agree(&stable_tw, &stable_c, src);
     // The compound `orders.line` + `amount` resolves to the seeded value
     // through both evaluators.
     assert_eq!(
@@ -2423,20 +2653,30 @@ proptest! {
             ("c".to_string(), c),
         ]);
 
-        let stable = StableEvalContext::test_default();
+        let stable_tw = StableEvalContext::test_default();
+        let stable_c = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
 
         let has_distinct = program_has_distinct(&typed);
-        let ctx_tw = EvalContext::test_default_borrowed(&stable);
+        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
         let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
         let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-        let ctx_c = EvalContext::test_default_borrowed(&stable);
+        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
         let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
         comp_eval.set_use_compiled(true);
         let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
+        // The two paths ran against separate contexts, so this compares
+        // the $pipeline/$source side-effect channel — invisible to the
+        // EvalResult above — for any emit routing that wrote through it.
+        prop_assert_eq!(
+            snapshot_side_effects(&stable_tw),
+            snapshot_side_effects(&stable_c),
+            "$pipeline/$source side effects diverged on `{}`",
+            src
+        );
     }
 }
 
@@ -2550,19 +2790,31 @@ proptest! {
             ("c".to_string(), c),
         ]);
 
-        let stable = StableEvalContext::test_default();
+        let stable_tw = StableEvalContext::test_default();
+        let stable_c = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
 
         let has_distinct = program_has_distinct(&typed);
-        let ctx_tw = EvalContext::test_default_borrowed(&stable);
+        let ctx_tw = EvalContext::test_default_borrowed(&stable_tw);
         let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
         let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-        let ctx_c = EvalContext::test_default_borrowed(&stable);
+        let ctx_c = EvalContext::test_default_borrowed(&stable_c);
         let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
         comp_eval.set_use_compiled(true);
         let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
+        // The generator emits to all four targets, so this run almost
+        // always writes through the $pipeline/$source channel. Comparing
+        // the two separate contexts catches a divergence on that
+        // side-effect-only routing that the EvalResult above cannot see —
+        // the whole point of running each path on its own context.
+        prop_assert_eq!(
+            snapshot_side_effects(&stable_tw),
+            snapshot_side_effects(&stable_c),
+            "$pipeline/$source side effects diverged on `{}`",
+            src
+        );
     }
 }
