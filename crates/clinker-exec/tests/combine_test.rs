@@ -662,11 +662,13 @@ mod tests {
         assert_eq!(driver, "orders", "first declared input drives by default");
     }
 
-    /// C.2.4.1 gate: every `EqualityConjunct` produced by predicate
-    /// decomposition carries an `Arc<TypedProgram>` on each side. Both
-    /// sides share the where-clause TypedProgram (same `Arc`), so the
-    /// runtime `KeyExtractor` can call `cxl::eval::eval_expr` against
-    /// the shared regex cache without per-side re-typecheck.
+    /// Every `EqualityConjunct` produced by predicate decomposition carries
+    /// an `Arc<TypedProgram>` on each side, and both sides share the
+    /// where-clause TypedProgram (same `Arc`). That shared typing is what
+    /// lets the runtime `KeyExtractor` compile each equality sub-expression
+    /// to a `CompiledScalar` once in `KeyExtractor::new` and replay the
+    /// resulting closures in `extract` — no per-side re-typecheck, and the
+    /// compiled scalar reuses the where-clause's regex cache.
     #[test]
     fn test_combine_equality_program_compiled() {
         let (artifacts, diags) = compile_combine_fixture("two_input_equi");
