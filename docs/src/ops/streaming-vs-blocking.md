@@ -9,7 +9,7 @@ This distinction is what makes Clinker a bounded-memory executor: a pipeline's p
 
 ## Which stages stream
 
-A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is either a sink `Output` writer or an `Aggregate`'s ingest — see [Streaming into an Aggregate](#streaming-into-an-aggregate) below.
+A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is a sink `Output` writer, an `Aggregate`'s ingest, or a hash build-probe `Combine`'s probe (driver) side — see [Streaming into an Aggregate](#streaming-into-an-aggregate) and [Streaming into a Combine probe](#streaming-into-a-combine-probe) below.
 
 Two stages stream *and* bound their own footprint to one batch, because they pull records off a live upstream channel and forward each batch without ever building a full result:
 
@@ -36,6 +36,12 @@ The streaming consumer above is usually a sink `Output`. It can also be an `Aggr
 This streams the aggregate's *ingest* half only — the producer no longer needs a charged inter-stage slot, and a slow aggregate (one that is spilling, say) paces the producer through the bounded channel. The aggregate's *finalize* half stays blocking by nature: a `group_by` value depends on every member, so the group table accumulates the whole input and emits only after the channel closes (end of input). Spill stays driven by RSS pressure, never by channel depth, exactly as on the materialized path.
 
 Two aggregate shapes keep the materialized ingest, because their finalize is not a single forward pass: a **time-windowed** aggregate runs a multi-pass per-window algorithm over the whole input, and a **relaxed correlation-key** aggregate retains its group state for the correlation-commit phase. Both show `buffer: materialized` on the edge into them.
+
+### Streaming into a Combine probe
+
+A producer can also stream into a hash build-probe `Combine`'s *probe* (driver) side. When an eligible producer (a fused `Source → Transform`, a single-branch `Route`, a non-fused `Merge`, a `streaming`-strategy `Aggregate`, or another hash build-probe `Combine`) is the Combine's driver input, the producer streams record-at-a-time into the probe kernel over a back-pressured channel rather than the Combine pre-draining the driver's whole output from a charged buffer. The driver producer reports `buffer: streaming` and `--explain` shows no `node_buffer` edge between it and the Combine. Only the `HashBuildProbe` strategy qualifies — the range, sort-merge, and grace-hash kernels re-sort or re-scan the driver and stay materialized.
+
+This streams the Combine's *probe* half only. The build side stays fully materialized: the engine builds the complete hash table on the main thread *before* the driver producer streams its first record, so the probe never matches against an incomplete index. The probe consumer runs on its own thread, so a slow driver paces the probe through the bounded channel and a slow probe (a large fan-out) back-pressures the driver. The build relation's footprint is the hash table, exactly as on the materialized path; the streaming handoff spares only the driver's inter-stage slot. Per-source dead-letter rewind, memory accounting, and output are byte-identical to the materialized path.
 
 ## Which stages block
 

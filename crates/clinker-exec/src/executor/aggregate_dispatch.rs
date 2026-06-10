@@ -769,21 +769,12 @@ fn run_streaming_aggregate_ingest(
         },
     )?;
 
-    // Install the producer's streaming sender + per-batch charge consumer
-    // keyed by the producer's index, so its dispatch arm streams into our
-    // channel with no producer-side change (the same `take_streaming_sender`
-    // path the streaming-Output producers use). The charge handle's
-    // per-batch `add_bytes` on flush is netted to zero by the scoped
-    // thread's per-record `sub_bytes` discharge below; a 256-event bound
-    // mirrors the Source ingest channel so back-pressure paces both ends.
-    let (tx, rx) = crossbeam_channel::bounded::<StreamEvent>(256);
-    let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
-    let charge_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-        crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
-    ));
-    ctx.streaming_output_senders.insert(producer_idx, tx);
-    ctx.streaming_charge_consumers
-        .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
+    // Install the bounded streaming-ingest channel keyed by the producer's
+    // index, so its dispatch arm streams into it with no producer-side
+    // change. The scoped thread's per-record `sub_bytes` discharge below
+    // nets the producer's per-batch charge to zero.
+    let (rx, charge_handle, charge_consumer_id) =
+        ctx.install_streaming_ingest_channel(producer_idx);
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,

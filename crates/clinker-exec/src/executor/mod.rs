@@ -1228,6 +1228,28 @@ impl PipelineExecutor {
             )
         };
 
+        // Streaming Combine probe-side ingest edges (issue #300). Each
+        // entry is a `driver-producer → Combine` edge whose probe ingest
+        // streams: the driver producer runs inside the Combine's dispatch
+        // turn, streaming each batch into a bounded channel the probe
+        // consumer drains on its own thread — after the build side is
+        // materialized into the hash table. Correlation buffering disables
+        // streaming pipeline-wide, mirroring the Aggregate-ingest and
+        // streaming-Output short-circuits so the explain annotation and the
+        // runtime probe path agree.
+        let streaming_combine_probe_edges: HashMap<
+            petgraph::graph::NodeIndex,
+            petgraph::graph::NodeIndex,
+        > = if config.any_source_has_correlation_key() {
+            HashMap::new()
+        } else {
+            clinker_plan::plan::execution::compute_streaming_combine_probe_edges(
+                plan,
+                &fused_transforms,
+                &init_phase_set,
+            )
+        };
+
         // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
         // grace-hash partition build, IEJoin, sort-merge). Sized off the
         // pipeline's `concurrency.threads` knob; `0`/absent defers to
@@ -1383,6 +1405,7 @@ impl PipelineExecutor {
             streaming_output_senders,
             streaming_output_nodes,
             streaming_aggregate_ingest_edges,
+            streaming_combine_probe_edges,
             streaming_output_tasks,
             streaming_charge_consumers,
             kernel_pool,
@@ -1442,13 +1465,28 @@ impl PipelineExecutor {
                 .copied()
                 .filter(|idx| !init_phase_set.contains(idx))
                 .collect();
-            let mut seq = scheduled_pass_order(plan, &ctx.memory_budget, &init_phase_set);
-            seq.extend(scheduled_pass_order(plan, &ctx.memory_budget, &runtime_set));
+            let mut seq = scheduled_pass_order(
+                plan,
+                &ctx.memory_budget,
+                &init_phase_set,
+                &ctx.streaming_combine_probe_edges,
+            );
+            seq.extend(scheduled_pass_order(
+                plan,
+                &ctx.memory_budget,
+                &runtime_set,
+                &ctx.streaming_combine_probe_edges,
+            ));
             seq
         } else {
             let all: HashSet<petgraph::graph::NodeIndex> =
                 plan.topo_order.iter().copied().collect();
-            scheduled_pass_order(plan, &ctx.memory_budget, &all)
+            scheduled_pass_order(
+                plan,
+                &ctx.memory_budget,
+                &all,
+                &ctx.streaming_combine_probe_edges,
+            )
         };
 
         let walk_result: Result<(), PipelineError> = (|| {

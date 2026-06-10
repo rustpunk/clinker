@@ -241,8 +241,11 @@ pub fn classify_stream_nodes(
     // annotation matches.
     let correlation_active = config.any_source_has_correlation_key();
 
-    // A fused Transform streams iff some streaming-eligible Output names
-    // it as its producer. Collect those producer indices once.
+    // A producer streams iff some streaming-eligible consumer (Output,
+    // Aggregate ingest, or Combine probe) certifies it as its producer.
+    // `certify_streaming_edge` returns the producer index for every
+    // certified consumer kind, so collecting it across all node indices
+    // yields every streaming producer in one pass.
     let streaming_producers: HashSet<petgraph::graph::NodeIndex> = if correlation_active {
         HashSet::new()
     } else {
@@ -263,10 +266,11 @@ pub fn classify_stream_nodes(
                     StreamClass::Streaming
                 }
                 // Any producer the eligibility predicate accepts as
-                // feeding a streaming Output — fused Transform, non-fused
+                // feeding a streaming consumer (Output writer, Aggregate
+                // ingest, or Combine probe) — fused Transform, non-fused
                 // Merge, single-branch Route, streaming Aggregate, inline
-                // Combine probe — streams its output to the writer thread
-                // and admits no `node_buffers` slot, so it renders
+                // Combine probe — streams its output over the bounded
+                // channel and admits no `node_buffers` slot, so it renders
                 // `streaming`. The predicate already excluded blocking
                 // strategies (hash Aggregate, range/sort-merge/grace
                 // Combine) and window roots, so this branch only fires for
@@ -326,98 +330,112 @@ pub fn compute_streaming_aggregate_ingest_edges(
     edges
 }
 
+/// Identify every `producer → Combine(driver)` edge whose probe-side
+/// ingest streams: the driver (probe-side) producer feeds the hash-probe
+/// kernel per record over a bounded channel rather than the Combine arm
+/// pre-draining the driver's whole output from a charged `node_buffers`
+/// slot. Returns a map from the driver producer's `NodeIndex` to the
+/// consuming `Combine`'s `NodeIndex`.
+///
+/// This is the [`certify_streaming_edge`] predicate applied with each
+/// `Combine` node as the consumer. The build side stays fully
+/// materialized inside the arm — it is the hash table the probe reads —
+/// so only the probe (driver) ingest lifts, and only for the
+/// `HashBuildProbe` strategy (range / sort-merge / grace-hash re-sort or
+/// re-scan the driver and stay blocking). The predicate resolves the
+/// driver predecessor from the plan-stamped `driving_upstream` index, so a
+/// Combine's build edge is never mistaken for the streaming edge.
+///
+/// The runtime installs one bounded channel per returned edge: the Combine
+/// arm materializes the build-side hash table on the main thread, spawns
+/// the probe consumer on its own thread, then redispatches the driver
+/// producer (which streams into the channel during the Combine's dispatch
+/// turn). Build-before-probe holds because the hash table is complete
+/// before the driver producer's first send; a slow driver paces the probe
+/// over the bounded channel and no inter-stage slot is charged for the
+/// edge.
+///
+/// Correlation buffering disables streaming pipeline-wide (the
+/// `CorrelationCommit` terminal owns the writes), so the caller passes a
+/// fused-transform set computed only when correlation is inactive.
+pub fn compute_streaming_combine_probe_edges(
+    plan: &ExecutionPlanDag,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
+    init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
+) -> HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> {
+    let mut edges = HashMap::new();
+    for combine_idx in plan.graph.node_indices() {
+        if !matches!(&plan.graph[combine_idx], PlanNode::Combine { .. }) {
+            continue;
+        }
+        if let Some(producer_idx) =
+            certify_streaming_edge(plan, combine_idx, fused_transforms, init_phase_set)
+        {
+            edges.insert(producer_idx, combine_idx);
+        }
+    }
+    edges
+}
+
 /// Certify a `producer → consumer` edge for the streaming substrate,
 /// returning the producer's `NodeIndex` when the edge streams, or `None`
 /// when it stays materialized.
 ///
-/// `consumer_idx` names the downstream streaming consumer; today the only
-/// certified consumer kind is `PlanNode::Output`, but the eligibility
-/// shell is consumer-generic so future streaming consumers (a streaming
-/// `Aggregate` ingest, a `Combine` probe) plug in as additional certifying
-/// arms without re-deriving the producer analysis. A streaming consumer's
-/// work moves into a `std::thread` that consumes a bounded crossbeam
-/// channel; the producer arm sends records into that channel as it
-/// produces them, so back-pressure flows consumer → producer → Source and
-/// no inter-stage `node_buffers` slot is charged. This function is the
+/// `consumer_idx` names the downstream streaming consumer. Three consumer
+/// kinds are certified: `Output` (the file-writer sink), `Aggregation`
+/// (the per-record ingest half of a strict GROUP BY), and `Combine` (the
+/// probe-side ingest half of a hash build-probe join). A streaming
+/// consumer's work moves into a `std::thread` that consumes a bounded
+/// crossbeam channel; the producer arm sends records into that channel as
+/// it produces them, so back-pressure flows consumer → producer → Source
+/// and no inter-stage `node_buffers` slot is charged. This function is the
 /// single plan-derived eligibility predicate both the runtime spawn path
 /// and the `--explain` buffer-class annotation ([`classify_stream_nodes`])
 /// consult, so the explain annotation can never disagree with what the
 /// dispatcher does.
 ///
-/// Common eligibility (independent of producer kind):
+/// Common eligibility (independent of consumer or producer kind):
 ///
 /// - The consumer is not in the init-phase ancestor closure.
-/// - The consumer has exactly one incoming edge.
 ///
-/// Consumer = `Output` (the sole certified consumer kind today):
+/// Consumer-specific eligibility, and how each resolves its producer:
 ///
-/// - The Output is not a per-source-file fan-out writer and its config
-///   declares no `split:` block — both own their own writer lifecycle
-///   and are incompatible with the single streaming writer task.
+/// - `Output`: not a per-source-file fan-out writer and no `split:` block
+///   (both own their own writer lifecycle, incompatible with the single
+///   streaming writer task). Producer = its sole incoming edge.
+/// - `Aggregation`: strict only — not relaxed-CK (`requires_lineage` /
+///   `requires_buffer_mode`, which retains state for the correlation
+///   commit) and not time-windowed (multi-pass over the whole batch).
+///   Producer = its sole incoming edge.
+/// - `Combine`: strategy `HashBuildProbe` only (range / sort-merge /
+///   grace-hash re-sort or re-scan the driver and stay blocking). A
+///   Combine is fan-in (build edge + driver edge), so its producer is the
+///   plan-stamped `driving_upstream` (probe-side) predecessor, not a sole
+///   incoming edge; `None` when the driver could not be resolved to a
+///   direct predecessor.
 ///
-/// Every other consumer node kind returns `None`: the consumer-specific
-/// guards above are conjunctive, so no producer edge into a non-`Output`
-/// consumer is certified until that consumer kind grows its own arm.
+/// Every other consumer node kind returns `None`.
 ///
-/// Producer = fused `Merge.interleave` (issue #72):
+/// The resolved producer is then certified by [`certify_linear_producer`],
+/// which admits these producer kinds (each must have exactly one outgoing
+/// edge — into this consumer — and root no node-anchored window arena,
+/// because a window rooted at the producer needs the producer's full
+/// output materialized and streaming would starve it):
 ///
-/// - The predecessor is a `PlanNode::Merge` in `interleave` mode whose
-///   every direct predecessor is a fused Source, with exactly one
-///   outgoing edge (this Output).
-///
-/// Producer = fused `Source → Transform` (the bounded per-batch
-/// inter-stage handoff):
-///
-/// - The predecessor is a `PlanNode::Transform` that
-///   `compute_transform_fused_sources` classified as fused (its sole
-///   upstream is a single-outgoing Source it streams off directly), with
-///   exactly one outgoing edge (this Output).
-/// - The Transform roots no node-anchored window arena. A window rooted
-///   at this Transform needs the Transform's full output materialized to
-///   build the arena, so streaming would starve it; such a Transform
-///   stays on the buffered path.
-///
-/// Producer = non-fused `Merge` (concat, or interleave with non-Source
-/// inputs):
-///
-/// - The Merge feeds only this Output and roots no window arena. The
-///   arm drains its predecessors' `node_buffers` slots in declaration
-///   order (concat) or round-robin (interleave) into the merged result,
-///   then streams that result to the writer thread rather than admitting
-///   it to its own charged `node_buffers` slot. (The fused
-///   Merge.interleave path streams record-by-record off the live Source
-///   channels instead and is the only Merge whose footprint is one
-///   batch.)
-///
-/// Producer = single-branch `Route`:
-///
-/// - The Route has exactly one outgoing edge (its sole branch) and that
-///   edge feeds this Output, and the Route roots no window arena. A
-///   multi-branch Route forks records across several successor slots and
-///   stays on the materialized fan-out path so each branch keeps its own
-///   slot — only a Route with a single downstream consumer is a linear
-///   producer the streaming writer can drain.
-///
-/// Producer = streaming-strategy `Aggregate`:
-///
-/// - The aggregate resolved to [`crate::plan::types::AggregateStrategy::Streaming`] (the
-///   planner certified pre-sorted input), feeds only this Output, and
-///   roots no window arena. Hash aggregation stays blocking: it must
-///   accumulate every group before emitting, so it cannot stream.
-///
-/// Producer = `Combine` probe-side (`HashBuildProbe`):
-///
-/// - The combine resolved to [`CombineStrategy::HashBuildProbe`], feeds
-///   only this Output, and roots no window arena. The build side stays
-///   fully materialized inside the arm; only the probe-side emit streams.
-///   Range / sort-merge / grace-hash strategies are blocking and stay
-///   materialized.
-///
-/// Common to every non-`Output` producer kind below: the producer must
-/// have exactly one outgoing edge (this Output) and root no node-anchored
-/// window arena, because a window rooted at the producer needs the
-/// producer's full output materialized to build the arena and streaming
-/// would starve it.
+/// - fused `Merge.interleave` (issue #72): a `PlanNode::Merge` in
+///   `interleave` mode whose every direct predecessor is a fused Source.
+/// - non-fused `Merge` (concat, or interleave with non-Source inputs):
+///   the arm drains its predecessors' `node_buffers` slots and forwards
+///   each record to the consumer rather than admitting its own slot.
+/// - fused `Source → Transform`: a `PlanNode::Transform` that
+///   `compute_transform_fused_sources` classified as fused.
+/// - single-branch `Route`: exactly one outgoing edge into this consumer.
+/// - streaming-strategy `Aggregate`
+///   ([`crate::plan::types::AggregateStrategy::Streaming`]): emits one
+///   group per sort-key boundary; hash aggregation stays blocking.
+/// - hash build-probe `Combine`
+///   ([`CombineStrategy::HashBuildProbe`]): only the probe-side emit
+///   streams; the build side stays materialized inside the arm.
 ///
 /// Correlation buffering disables streaming pipeline-wide — the
 /// `CorrelationCommit` terminal owns the writes — so the caller short-
@@ -429,7 +447,6 @@ pub fn certify_streaming_edge(
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
 ) -> Option<petgraph::graph::NodeIndex> {
     use crate::plan::combine::CombineStrategy;
-    use crate::plan::types::AggregateStrategy;
 
     // Consumer-generic eligibility, hoisted ahead of the consumer-kind
     // dispatch because every certifying arm shares it: an init-phase
@@ -440,12 +457,20 @@ pub fn certify_streaming_edge(
         return None;
     }
 
-    // Consumer-kind dispatch. `Output` (the file-writer sink) and
-    // `Aggregation` (the per-record ingest half of a GROUP BY) are the
-    // certified consumer kinds; every other kind falls through to `None`.
-    // The guards here are the consumer-specific half of the predicate (the
-    // producer-kind half is the `match` on `producer_idx` below).
-    match &plan.graph[consumer_idx] {
+    // Consumer-kind dispatch resolves the producer (probe-side) index per
+    // consumer kind, then defers to `certify_linear_producer` for the
+    // shared producer-kind half. `Output` (file-writer sink), `Aggregation`
+    // (the per-record ingest half of a GROUP BY), and `Combine` (the
+    // probe-side ingest half of a hash build-probe join) are the certified
+    // consumer kinds; every other kind falls through to `None`.
+    //
+    // `Output` and `Aggregation` are linear consumers with exactly one
+    // incoming edge, so they share the generic single-incoming guard.
+    // `Combine` is fan-in by construction (build edge + driver edge), so it
+    // resolves its driver predecessor directly from the plan-stamped
+    // `driving_upstream` index instead — the single-incoming guard would
+    // reject it.
+    let producer_idx: petgraph::graph::NodeIndex = match &plan.graph[consumer_idx] {
         PlanNode::Output { resolved, .. } => {
             let payload = resolved.as_deref()?;
             // Per-source-file fan-out and split writers own their own file
@@ -456,6 +481,7 @@ pub fn certify_streaming_edge(
             if payload.fan_out_per_source_file || payload.output.split.is_some() {
                 return None;
             }
+            single_incoming_producer(plan, consumer_idx)?
         }
         PlanNode::Aggregation {
             config, compiled, ..
@@ -487,11 +513,48 @@ pub fn certify_streaming_edge(
             if is_relaxed || config.time_window.is_some() {
                 return None;
             }
+            single_incoming_producer(plan, consumer_idx)?
+        }
+        PlanNode::Combine {
+            strategy,
+            driving_upstream,
+            ..
+        } => {
+            // The probe (driver) ingest half streams: the driver producer
+            // feeds the probe kernel per record over the bounded channel
+            // rather than the arm pre-draining the driver's whole output
+            // from a charged `node_buffers` slot. The build side stays
+            // fully materialized inside the arm — it is the hash table the
+            // probe reads, complete before the first probe — so only the
+            // probe-side ingest lifts. Range / sort-merge / grace-hash
+            // joins re-sort or re-scan the driver and stay blocking.
+            if !matches!(strategy, CombineStrategy::HashBuildProbe) {
+                return None;
+            }
+            // Resolve the driver predecessor from the plan-stamped index
+            // rather than the incoming edges: a Combine has both a build
+            // edge and a driver edge, so it never has exactly one incoming
+            // neighbor. `driving_upstream` is `None` when the strategy
+            // post-pass could not resolve the driver to a direct
+            // predecessor (e.g. an N-ary decomposition step whose driver is
+            // a synthetic intermediate) — decline streaming for those.
+            (*driving_upstream)?
         }
         _ => return None,
-    }
+    };
 
-    // Exactly one incoming edge.
+    certify_linear_producer(plan, producer_idx, fused_transforms)
+}
+
+/// Resolve the sole incoming producer of a linear (single-fan-in)
+/// streaming consumer, or `None` when the consumer has zero or more than
+/// one incoming edge. Used by the `Output` / `Aggregation` consumer arms,
+/// whose streaming model moves a single upstream producer's live channel
+/// into the consumer; a consumer with fan-in cannot do that.
+fn single_incoming_producer(
+    plan: &ExecutionPlanDag,
+    consumer_idx: petgraph::graph::NodeIndex,
+) -> Option<petgraph::graph::NodeIndex> {
     let mut incoming = plan
         .graph
         .neighbors_directed(consumer_idx, petgraph::Direction::Incoming);
@@ -499,6 +562,28 @@ pub fn certify_streaming_edge(
     if incoming.next().is_some() {
         return None;
     }
+    Some(producer_idx)
+}
+
+/// Certify the producer-kind half of a streaming edge: given the resolved
+/// producer index, return `Some(producer_idx)` when the producer is a
+/// linear streaming source (fused `Merge.interleave`, non-fused `Merge`,
+/// fused `Source → Transform`, single-branch `Route`, streaming-strategy
+/// `Aggregate`, or hash build-probe `Combine`) feeding only the consumer
+/// and rooting no node-anchored window arena, or `None` otherwise.
+///
+/// Shared by every consumer arm of [`certify_streaming_edge`] so the
+/// producer eligibility rules are derived once. A window rooted at the
+/// producer needs the producer's full output materialized to build the
+/// arena, so a streaming producer must root no node-anchored window —
+/// enforced uniformly here.
+fn certify_linear_producer(
+    plan: &ExecutionPlanDag,
+    producer_idx: petgraph::graph::NodeIndex,
+    fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
+) -> Option<petgraph::graph::NodeIndex> {
+    use crate::plan::combine::CombineStrategy;
+    use crate::plan::types::AggregateStrategy;
 
     // A window rooted at the producer needs the producer's full output
     // materialized to build the arena, so a streaming producer must root
@@ -521,7 +606,7 @@ pub fn certify_streaming_edge(
             // its predecessors' `node_buffers` slots and forwards each
             // record to the writer thread. Both route their emit through
             // the streaming sender — the runtime arm picks the path — so
-            // every Merge with a single downstream Output and no window
+            // every Merge with a single downstream consumer and no window
             // root is eligible regardless of fusion.
             let has_predecessor = plan
                 .graph
@@ -538,7 +623,7 @@ pub fn certify_streaming_edge(
         }
         PlanNode::Transform { .. } => {
             // The Transform must be a fused Source→Transform that feeds
-            // only this Output and roots no node-anchored window arena.
+            // only this consumer and roots no node-anchored window arena.
             if !fused_transforms.contains(&producer_idx)
                 || !has_single_outgoing(plan, producer_idx)
                 || roots_window(producer_idx)
@@ -549,7 +634,7 @@ pub fn certify_streaming_edge(
         }
         PlanNode::Route { .. } => {
             // Single-branch Route: exactly one outgoing edge (this
-            // Output). A multi-branch Route forks across successor slots
+            // consumer). A multi-branch Route forks across successor slots
             // and stays materialized.
             if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
                 return None;
@@ -558,7 +643,7 @@ pub fn certify_streaming_edge(
         }
         PlanNode::Aggregation { strategy, .. } => {
             // Streaming aggregation emits one group per sort-key
-            // boundary, so it can stream to the writer; hash aggregation
+            // boundary, so it can stream to the consumer; hash aggregation
             // must accumulate every group before emitting and stays
             // blocking.
             if !matches!(strategy, AggregateStrategy::Streaming) {

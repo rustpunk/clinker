@@ -23,7 +23,7 @@ pub use graph_util::{compute_init_phase_node_set, single_predecessor};
 pub use streaming_class::{
     StreamClass, certify_streaming_edge, classify_stream_nodes,
     compute_merge_interleave_fused_sources, compute_streaming_aggregate_ingest_edges,
-    compute_transform_fused_sources,
+    compute_streaming_combine_probe_edges, compute_transform_fused_sources,
 };
 
 use std::collections::{BTreeSet, HashMap};
@@ -293,6 +293,19 @@ pub enum PlanNode {
         /// the driver, in declaration order. Empty when the driver has
         /// not yet been selected.
         build_inputs: Vec<String>,
+        /// `NodeIndex` of the driving (probe-side) predecessor in the DAG,
+        /// resolved from `driving_input` against the combine's incoming
+        /// neighbors during the `select_combine_strategies` post-pass.
+        /// `None` until that pass runs (or when the driver predecessor
+        /// could not be resolved — e.g. an N-ary decomposition step whose
+        /// driver is a synthetic intermediate not present as a direct
+        /// neighbor). The probe-side streaming-ingest predicate
+        /// ([`certify_streaming_edge`]) reads this to identify the driver
+        /// predecessor without `CompileArtifacts` access, because combine
+        /// edges carry `port: None` and the predicate cannot map an input
+        /// qualifier back to a node any other way.
+        #[serde(skip)]
+        driving_upstream: Option<petgraph::graph::NodeIndex>,
         /// Shape-only projection of the decomposed `where:` predicate
         /// (equalities count, ranges count, residual presence). Populated
         /// at lowering time from `CompileArtifacts.combine_predicates[name]`;
