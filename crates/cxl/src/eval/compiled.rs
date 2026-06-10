@@ -76,7 +76,7 @@ use super::{EvalResult, SkipReason, group_key_error_to_eval_error};
 /// at run time re-indexes the typed program. `window` is read by the
 /// window-leaf nodes; it stays an `Option` because a transform without
 /// analytic windows evaluates with `None`, exactly as the tree-walk does.
-pub struct Frame<'a, 'w, S: RecordStorage + 'w> {
+struct Frame<'a, 'w, S: RecordStorage + 'w> {
     ctx: &'a EvalContext<'a>,
     resolver: &'a dyn FieldResolver,
     window: Option<&'a dyn WindowContext<'w, S>>,
@@ -91,7 +91,7 @@ pub struct Frame<'a, 'w, S: RecordStorage + 'w> {
 /// program. The caller owns one of these per evaluator instance and hands
 /// it to `eval_record` by `&mut`, mirroring how the tree-walk keeps
 /// `distinct_seen` / `current_partition_key` on `ProgramEvaluator`.
-pub struct EvalState {
+pub(crate) struct EvalState {
     /// Seen distinct keys for the current partition. `None` when the
     /// program has no `distinct` statement, matching the tree-walk's
     /// allocation-gated set.
@@ -110,7 +110,7 @@ impl EvalState {
     /// Build the mutable state for a program. `has_distinct` gates the
     /// dedup-set allocation so a program without `distinct` pays nothing;
     /// `max_expansion` is the `emit each` per-record fan-out ceiling.
-    pub fn new(has_distinct: bool, max_expansion: u64) -> Self {
+    pub(crate) fn new(has_distinct: bool, max_expansion: u64) -> Self {
         Self {
             distinct_seen: has_distinct.then(HashSet::new),
             current_partition_key: None,
@@ -122,13 +122,45 @@ impl EvalState {
     /// the set on a change. Mirrors `ProgramEvaluator::set_partition`:
     /// distinct is window-partition-scoped, so crossing a partition
     /// boundary resets dedup rather than carrying it across partitions.
-    pub fn set_partition(&mut self, key: &[GroupByKey]) {
+    pub(crate) fn set_partition(&mut self, key: &[GroupByKey]) {
         if self.current_partition_key.as_deref() != Some(key) {
             if let Some(seen) = &mut self.distinct_seen {
                 seen.clear();
             }
             self.current_partition_key = Some(key.to_vec());
         }
+    }
+
+    /// Clear the dedup set and forget the current partition, returning the
+    /// state to the shape it had at construction. Mirrors
+    /// `ProgramEvaluator::reset_distinct` for evaluator reuse across files.
+    pub(crate) fn reset(&mut self) {
+        if let Some(seen) = &mut self.distinct_seen {
+            seen.clear();
+        }
+        self.current_partition_key = None;
+    }
+
+    /// The per-record `emit each` fan-out ceiling. The tree-walk reads this
+    /// through the shared state so both evaluation paths enforce one
+    /// ceiling, set once at construction.
+    pub(super) fn max_expansion(&self) -> u64 {
+        self.max_expansion
+    }
+
+    /// Record `key` as seen for the current partition, returning whether it
+    /// was newly inserted (`true`) or a duplicate (`false`). The tree-walk
+    /// and the compiled `Distinct` node both dedup through this one set, so
+    /// switching paths cannot change which rows a `distinct` keeps.
+    ///
+    /// Panics if the state was built with `has_distinct = false`; a program
+    /// reaching a `distinct` statement is always built with the set
+    /// allocated, mirroring the tree-walk's `expect`.
+    pub(super) fn distinct_insert(&mut self, key: Vec<GroupByKey>) -> bool {
+        self.distinct_seen
+            .as_mut()
+            .expect("distinct statement requires EvalState allocated with has_distinct = true")
+            .insert(key)
     }
 }
 
@@ -191,7 +223,7 @@ type CompiledStmt<S> = Box<
 /// separate [`EvalState`] the caller threads by `&mut`, so one compiled
 /// program can be shared across records and threads while each has its
 /// own distinct set.
-pub struct CompiledProgram<S: RecordStorage + 'static> {
+pub(crate) struct CompiledProgram<S: RecordStorage + 'static> {
     statements: Vec<CompiledStmt<S>>,
 }
 
@@ -213,7 +245,7 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
     /// The error boundary (filling `source_row` / `source_expr` on a
     /// surfaced [`EvalError`]) stays with the caller, matching the
     /// tree-walk where `eval_record` wraps `eval_record_inner`.
-    pub fn eval_record<'a, 'w>(
+    pub(crate) fn eval_record<'a, 'w>(
         &self,
         ctx: &'a EvalContext<'a>,
         resolver: &'a dyn FieldResolver,
@@ -261,7 +293,7 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
 /// record. The resulting program is immutable; `distinct`'s cross-record
 /// dedup state lives in a separate [`EvalState`] the caller threads into
 /// [`CompiledProgram::eval_record`].
-pub fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProgram<S> {
+pub(crate) fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProgram<S> {
     let statements = typed
         .program
         .statements
@@ -273,11 +305,14 @@ pub fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProg
 
 /// Whether a typed program contains a top-level `distinct` statement.
 ///
-/// Drives [`EvalState`] dedup-set allocation: a program with no
-/// `distinct` never allocates the set, exactly as the tree-walk's
-/// `has_distinct` flag gates `ProgramEvaluator`'s set. `distinct` is a
-/// top-level statement only (the parser rejects it inside `emit each`),
-/// so a flat scan of the top-level statements is exhaustive.
+/// Drives the differential harness's [`EvalState`] dedup-set allocation:
+/// it derives `has_distinct` the same way production callers do (a flat
+/// scan for a top-level `distinct` — the parser rejects `distinct` inside
+/// `emit each`, so the scan is exhaustive) so both evaluators dedup over
+/// the same set. Production code threads `has_distinct` from the
+/// transform's compiled metadata rather than rescanning, so this helper
+/// exists only for the test harness.
+#[cfg(test)]
 pub fn program_has_distinct(typed: &TypedProgram) -> bool {
     typed
         .program

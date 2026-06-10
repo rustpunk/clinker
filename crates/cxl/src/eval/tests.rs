@@ -21,7 +21,7 @@ fn empty_row() -> Row {
 /// `output` map [`ProgramEvaluator::eval_record`] builds for the
 /// `EvalResult::Emit` variant — the single statement-level evaluator
 /// is now the only expression-evaluation path the tests exercise.
-fn run_fields<'w, S: RecordStorage + 'w>(
+fn run_fields<'w, S: RecordStorage + 'static>(
     typed: TypedProgram,
     ctx: &EvalContext<'_>,
     resolver: &dyn crate::resolve::FieldResolver,

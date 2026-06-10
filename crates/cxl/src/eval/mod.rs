@@ -2,16 +2,19 @@ pub mod builtins_impl;
 pub mod context;
 pub mod error;
 
-// Compile-once-to-closures evaluator. Built and exercised only by the
-// differential harness in this slice; it is wired into the per-record
-// hot path in a later slice, at which point this gate is removed.
-#[cfg(test)]
-pub mod compiled;
+// Compile-once-to-closures evaluator. `ProgramEvaluator` compiles a
+// program into a `CompiledProgram` and can run either this path or the
+// tree-walk per record, selected by a runtime flag. Both paths coexist
+// only while the compiled path is being proven byte-identical to the
+// tree-walk; once it is the sole evaluator the tree-walk and the flag go
+// away, leaving this module the only scalar core.
+pub(crate) mod compiled;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
@@ -20,6 +23,8 @@ use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
+
+use compiled::{CompiledProgram, EvalState};
 
 pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
 pub use error::{EvalError, EvalErrorKind, extract_triggering_value};
@@ -118,18 +123,30 @@ struct EvalEnv<'a, 'w, S: RecordStorage + 'w> {
 /// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
 pub struct ProgramEvaluator {
     typed: Arc<TypedProgram>,
-    /// HashSet for distinct dedup. None when no distinct statement present.
-    distinct_seen: Option<HashSet<Vec<GroupByKey>>>,
-    /// Current partition key for window-scoped distinct.
-    current_partition_key: Option<Vec<GroupByKey>>,
-    /// Whether this program has any distinct statements.
+    /// Distinct dedup set, partition key, and `emit each` ceiling, shared
+    /// by both evaluation paths. Threading one state object means
+    /// `set_partition` and per-record dedup behave identically whether a
+    /// record runs through the tree-walk or the compiled program.
+    state: EvalState,
+    /// Whether this program has any distinct statements. Gates the dedup
+    /// set's allocation inside `state`.
     has_distinct: bool,
-    /// Cap on records produced by a single per-record evaluation via
-    /// `emit each` fan-out. When the running count of body emits
-    /// exceeds this value, the originating record is routed to DLQ
-    /// (`DlqErrorCategory::ExpansionLimitExceeded`). Mirrors the
-    /// transform's YAML `max_expansion` setting (default 10_000).
-    max_expansion: u64,
+    /// Selects the per-record evaluator: `true` runs the compiled program,
+    /// `false` runs the tree-walk. Transitional — both evaluators are kept
+    /// only while the compiled path is being proven byte-identical to the
+    /// tree-walk; the tree-walk (and this flag) are removed once the
+    /// compiled path is the sole evaluator. Default `false` keeps every
+    /// existing caller on the tree-walk until the cutover.
+    use_compiled: bool,
+    /// Compiled programs, one per record-storage type the evaluator is
+    /// called with. `eval_record` is generic over `S` and a single
+    /// evaluator instance is called with several `S` (e.g. `NullStorage`
+    /// for non-windowed records, the window arena's storage for windowed
+    /// ones), so the compiled program — whose window leaves are
+    /// monomorphized over `S` — is built lazily on first use of each `S`
+    /// and cached by its `TypeId`. The boxed value is a `CompiledProgram<S>`
+    /// downcast back to the concrete type at the call site.
+    compiled_cache: HashMap<TypeId, Box<dyn Any>>,
 }
 
 impl ProgramEvaluator {
@@ -151,34 +168,30 @@ impl ProgramEvaluator {
     ) -> Self {
         Self {
             typed,
-            distinct_seen: if has_distinct {
-                Some(HashSet::new())
-            } else {
-                None
-            },
-            current_partition_key: None,
+            state: EvalState::new(has_distinct, max_expansion),
             has_distinct,
-            max_expansion,
+            use_compiled: false,
+            compiled_cache: HashMap::new(),
         }
+    }
+
+    /// Switch this evaluator between the tree-walk and the compiled
+    /// program. Transitional: the A/B switch the differential test and the
+    /// bench parity gate flip, removed with the tree-walk once the compiled
+    /// path is the sole evaluator.
+    pub fn set_use_compiled(&mut self, use_compiled: bool) {
+        self.use_compiled = use_compiled;
     }
 
     /// Called before eval_record when transform has windows.
     /// Clears distinct set on partition change.
     pub fn set_partition(&mut self, key: &[GroupByKey]) {
-        if self.current_partition_key.as_deref() != Some(key) {
-            if let Some(seen) = &mut self.distinct_seen {
-                seen.clear();
-            }
-            self.current_partition_key = Some(key.to_vec());
-        }
+        self.state.set_partition(key);
     }
 
     /// Reset distinct state (between files or when reusing evaluator).
     pub fn reset_distinct(&mut self) {
-        if let Some(seen) = &mut self.distinct_seen {
-            seen.clear();
-        }
-        self.current_partition_key = None;
+        self.state.reset();
     }
 
     /// Whether this program has any distinct statements.
@@ -200,8 +213,14 @@ impl ProgramEvaluator {
     /// [`EvalError`] surfaced from a subexpression, so DLQ entries and
     /// miette diagnostics downstream carry "row N: ..." context and an
     /// underlined source span without every internal constructor having
-    /// to thread those fields manually.
-    pub fn eval_record<'w, S: RecordStorage + 'w>(
+    /// to thread those fields manually. The boundary is identical whether
+    /// the record runs through the compiled program or the tree-walk, so a
+    /// surfaced error carries the same provenance through either path.
+    ///
+    /// `S` is `'static` because the compiled path caches one
+    /// `CompiledProgram<S>` per storage type keyed by `TypeId`; every real
+    /// storage (`NullStorage`, the window arena) is already `'static`.
+    pub fn eval_record<'w, S: RecordStorage + 'static>(
         &mut self,
         ctx: &EvalContext<'_>,
         resolver: &dyn FieldResolver,
@@ -209,18 +228,46 @@ impl ProgramEvaluator {
     ) -> Result<EvalResult, EvalError> {
         let source_row = ctx.source_row;
         let source_expr = self.typed.source.clone();
-        self.eval_record_inner(ctx, resolver, window)
-            .map_err(move |mut e| {
-                if e.source_row.is_none() {
-                    e.source_row = Some(source_row);
-                }
-                if e.source_expr.is_none()
-                    && let Some(s) = source_expr
-                {
-                    e.source_expr = Some(s);
-                }
-                e
-            })
+        let inner = if self.use_compiled {
+            self.eval_record_compiled(ctx, resolver, window)
+        } else {
+            self.eval_record_inner(ctx, resolver, window)
+        };
+        inner.map_err(move |mut e| {
+            if e.source_row.is_none() {
+                e.source_row = Some(source_row);
+            }
+            if e.source_expr.is_none()
+                && let Some(s) = source_expr
+            {
+                e.source_expr = Some(s);
+            }
+            e
+        })
+    }
+
+    /// Run one record through the compiled program for storage `S`,
+    /// building and caching that program on first use of each `S`.
+    ///
+    /// The cross-record dedup state lives in `self.state`, the same object
+    /// the tree-walk and `set_partition` use, so a `distinct` program
+    /// dedups identically through either path. No boundary stamping here —
+    /// the shared boundary in `eval_record` wraps this call, matching the
+    /// tree-walk's `eval_record_inner`.
+    fn eval_record_compiled<'w, S: RecordStorage + 'static>(
+        &mut self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+        window: Option<&dyn WindowContext<'w, S>>,
+    ) -> Result<EvalResult, EvalError> {
+        let program = self
+            .compiled_cache
+            .entry(TypeId::of::<S>())
+            .or_insert_with(|| Box::new(compiled::compile::<S>(&self.typed)))
+            .downcast_ref::<CompiledProgram<S>>()
+            .expect("compiled cache keyed by TypeId<S> always holds a CompiledProgram<S>");
+        let ctx_ref: &EvalContext<'_> = ctx;
+        program.eval_record(ctx_ref, resolver, window, &mut self.state)
     }
 
     fn eval_record_inner<'w, S: RecordStorage + 'w>(
@@ -242,6 +289,11 @@ impl ProgramEvaluator {
         // DLQ before unbounded work happens.
         let mut fan_out: Vec<EmitOne> = Vec::new();
         let mut expansion_count: u64 = 0;
+        // Read the fan-out ceiling once: it is fixed for the evaluator's
+        // lifetime, and the shared `state` it lives on is borrowed mutably
+        // by the distinct arm, so capturing it up front keeps the borrow
+        // local to the one statement that needs it.
+        let max_expansion = self.state.max_expansion();
 
         // Index-loop over statements rather than `for stmt in &...` —
         // the `emit each` arm needs `&mut self` to call its body
@@ -260,11 +312,7 @@ impl ProgramEvaluator {
                 }
                 Statement::Distinct { field, .. } => {
                     let key = self.build_distinct_key(field.as_deref(), &env, resolver)?;
-                    let seen = self
-                        .distinct_seen
-                        .as_mut()
-                        .expect("distinct statement requires ProgramEvaluator with distinct state");
-                    if !seen.insert(key) {
+                    if !self.state.distinct_insert(key) {
                         return Ok(EvalResult::Skip(SkipReason::Duplicate));
                     }
                 }
@@ -381,10 +429,10 @@ impl ProgramEvaluator {
                         }
                     };
                     for element in elements {
-                        if expansion_count >= self.max_expansion {
+                        if expansion_count >= max_expansion {
                             return Err(EvalError::new(
                                 EvalErrorKind::ExpansionLimitExceeded {
-                                    limit: self.max_expansion,
+                                    limit: max_expansion,
                                 },
                                 span_val,
                             ));

@@ -19,10 +19,10 @@ use std::sync::Arc;
 use clinker_record::{RecordStorage, Value};
 use proptest::prelude::*;
 
-use super::{CompiledProgram, EvalState, compile, program_has_distinct};
+use super::program_has_distinct;
 use crate::eval::context::{EvalContext, StableEvalContext};
 use crate::eval::error::EvalError;
-use crate::eval::{DEFAULT_MAX_EXPANSION, EvalResult, ProgramEvaluator, SkipReason};
+use crate::eval::{EvalResult, ProgramEvaluator, SkipReason};
 use crate::parser::Parser;
 use crate::resolve::HashMapResolver;
 use crate::resolve::pass::resolve_program;
@@ -96,40 +96,6 @@ fn type_program(src: &str, fields: &[&str]) -> TypedProgram {
             )
         })
         .with_source(Arc::from(src))
-}
-
-/// Run the compiled program through the same outermost error boundary
-/// the tree-walk's `ProgramEvaluator::eval_record` applies — stamping
-/// `source_row` / `source_expr` onto a surfaced error — so the two
-/// evaluators are compared on identical boundary provenance.
-///
-/// `window` and `state` are threaded explicitly so the same helper drives
-/// the no-window scalar corpus (`None` window), the window corpus (a
-/// concrete `WindowContext`), and the multi-record distinct corpus (a
-/// shared `EvalState` across records).
-fn compiled_eval_record<S: RecordStorage + 'static>(
-    program: &CompiledProgram<S>,
-    typed: &TypedProgram,
-    ctx: &EvalContext<'_>,
-    resolver: &dyn crate::resolve::traits::FieldResolver,
-    window: Option<&dyn crate::resolve::traits::WindowContext<'_, S>>,
-    state: &mut crate::eval::compiled::EvalState,
-) -> Result<EvalResult, EvalError> {
-    let source_row = ctx.source_row;
-    let source_expr = typed.source.clone();
-    program
-        .eval_record(ctx, resolver, window, state)
-        .map_err(move |mut e| {
-            if e.source_row.is_none() {
-                e.source_row = Some(source_row);
-            }
-            if e.source_expr.is_none()
-                && let Some(s) = source_expr
-            {
-                e.source_expr = Some(s);
-            }
-            e
-        })
 }
 
 /// Ordered `(key, value)` pairs from an emit channel, captured for
@@ -236,19 +202,20 @@ fn assert_agree(src: &str, fields: &[&str], record: HashMap<String, Value>) -> R
     let stable = StableEvalContext::test_default();
     let resolver = HashMapResolver::new(record);
 
-    // Tree-walk path through the public, boundary-wrapped entry. The
-    // distinct flag is detected the same way the compiled path detects it,
-    // so a `distinct` program allocates dedup state on both sides.
+    // Both paths run through the live `ProgramEvaluator::eval_record`
+    // entry — only the `use_compiled` flag differs — so the test exercises
+    // the same wiring (and the same error boundary) production uses, not a
+    // test-local re-implementation. The distinct flag is detected the same
+    // way for both, so a `distinct` program allocates dedup state on both
+    // sides.
     let ctx_tw = EvalContext::test_default_borrowed(&stable);
-    let mut evaluator = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    let tree = evaluator.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
+    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
-    // Compiled path through the same boundary wrapper, with an `EvalState`
-    // allocated under the same distinct flag.
     let ctx_c = EvalContext::test_default_borrowed(&stable);
-    let program = compile::<NullStorage>(&typed);
-    let mut state = EvalState::new(has_distinct, DEFAULT_MAX_EXPANSION);
-    let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+    let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
+    comp_eval.set_use_compiled(true);
+    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
     let tree_proj = project(&tree);
     let comp_proj = project(&comp);
@@ -1417,22 +1384,20 @@ fn assert_agree_window(
         current,
     };
 
+    // Both paths run through the live `ProgramEvaluator::eval_record` with
+    // a real `WindowContext` and a non-`NullStorage` `S`, so the compiled
+    // path exercises its per-`S` program cache and window-leaf
+    // monomorphization through the same entry production uses.
     let ctx_tw = EvalContext::test_default_borrowed(&stable);
-    let mut evaluator =
+    let mut tree_eval =
         ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
-    let tree = evaluator.eval_record::<VecStorage>(&ctx_tw, &resolver, Some(&window));
+    let tree = tree_eval.eval_record::<VecStorage>(&ctx_tw, &resolver, Some(&window));
 
     let ctx_c = EvalContext::test_default_borrowed(&stable);
-    let program = compile::<VecStorage>(&typed);
-    let mut state = EvalState::new(has_distinct, DEFAULT_MAX_EXPANSION);
-    let comp = compiled_eval_record(
-        &program,
-        &typed,
-        &ctx_c,
-        &resolver,
-        Some(&window),
-        &mut state,
-    );
+    let mut comp_eval =
+        ProgramEvaluator::new(Arc::new(type_program_with_row(src, fields)), has_distinct);
+    comp_eval.set_use_compiled(true);
+    let comp = comp_eval.eval_record::<VecStorage>(&ctx_c, &resolver, Some(&window));
 
     let tree_proj = project(&tree);
     let comp_proj = project(&comp);
@@ -1658,15 +1623,20 @@ fn assert_agree_distinct_stream(
     );
     let stable = StableEvalContext::test_default();
 
+    // Two live evaluators differing only in `use_compiled`. Driving the
+    // compiled side through `ProgramEvaluator` (not the raw program) proves
+    // the production state-threading: `set_partition` reaches the shared
+    // `EvalState`, and per-record dedup runs against it, so distinct and
+    // partition-reset behave identically through either path.
     let mut tree_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
-    let program = compile::<NullStorage>(&typed);
-    let mut state = EvalState::new(has_distinct, DEFAULT_MAX_EXPANSION);
+    let mut comp_eval = ProgramEvaluator::new(Arc::new(type_program(src, fields)), has_distinct);
+    comp_eval.set_use_compiled(true);
 
     let mut out = Vec::new();
     for (partition_key, record) in records {
         if let Some(key) = &partition_key {
             tree_eval.set_partition(key);
-            state.set_partition(key);
+            comp_eval.set_partition(key);
         }
         let resolver = HashMapResolver::new(record);
 
@@ -1674,7 +1644,7 @@ fn assert_agree_distinct_stream(
         let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
         let ctx_c = EvalContext::test_default_borrowed(&stable);
-        let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         let tree_proj = project(&tree);
         let comp_proj = project(&comp);
@@ -1885,15 +1855,17 @@ fn emit_each_ceiling_boundary() {
     let resolver = HashMapResolver::new(HashMap::from([("nums".to_string(), nums)]));
 
     // Ceiling of 2 over a 3-element array → the third element trips it.
+    // The compiled side gets the same ceiling through `with_max_expansion`,
+    // which threads it into the shared `EvalState`.
     let ctx_tw = EvalContext::test_default_borrowed(&stable);
     let mut tree_eval =
         ProgramEvaluator::with_max_expansion(Arc::new(type_program(src, &["nums"])), false, 2);
     let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
     let ctx_c = EvalContext::test_default_borrowed(&stable);
-    let program = compile::<NullStorage>(&typed);
-    let mut state = EvalState::new(false, 2);
-    let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+    let mut comp_eval = ProgramEvaluator::with_max_expansion(Arc::new(typed), false, 2);
+    comp_eval.set_use_compiled(true);
+    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
     let tree_proj = project(&tree);
     assert_eq!(
@@ -2003,13 +1975,13 @@ fn assert_agree_with_vars(
     let resolver = HashMapResolver::new(record);
 
     let ctx_tw = EvalContext::test_default_borrowed(&stable);
-    let mut evaluator = ProgramEvaluator::new(Arc::new(build()), false);
-    let tree = evaluator.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let mut tree_eval = ProgramEvaluator::new(Arc::new(build()), false);
+    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
     let ctx_c = EvalContext::test_default_borrowed(&stable);
-    let program = compile::<NullStorage>(&typed);
-    let mut state = EvalState::new(false, DEFAULT_MAX_EXPANSION);
-    let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+    let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
+    comp_eval.set_use_compiled(true);
+    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
     let tree_proj = project(&tree);
     let comp_proj = project(&comp);
@@ -2155,16 +2127,16 @@ fn qualified_field_ref_three_part() {
     let stable = StableEvalContext::test_default();
 
     let ctx_tw = EvalContext::test_default_borrowed(&stable);
-    let mut evaluator = ProgramEvaluator::new(
+    let mut tree_eval = ProgramEvaluator::new(
         Arc::new(type_program("emit out = orders.line.amount", &[])),
         false,
     );
-    let tree = evaluator.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+    let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
     let ctx_c = EvalContext::test_default_borrowed(&stable);
-    let program = compile::<NullStorage>(&typed);
-    let mut state = EvalState::new(false, DEFAULT_MAX_EXPANSION);
-    let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+    let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), false);
+    comp_eval.set_use_compiled(true);
+    let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
     let tree_proj = project(&tree);
     assert_eq!(
@@ -2257,14 +2229,26 @@ fn example_pipeline_transform_bodies() {
             HashMap::from([("priority_level".to_string(), Value::String("urgent".into()))]),
         ),
     ];
+    // Fail-closed: every listed body must type-check as a flat row
+    // transform and diff identically. A silent skip would let a body that
+    // stops type-checking (a grammar change, a renamed builtin) vanish from
+    // the corpus unnoticed, so a non-typeable body is a hard failure here,
+    // and the run count is asserted equal to the case count so a dropped
+    // case cannot pass as a no-op.
+    let case_count = cases.len();
+    let mut ran = 0usize;
     for (src, fields, record) in cases {
-        // Skip any body that does not type-check as a flat row transform
-        // (e.g. one referencing a builtin this corpus does not feed); the
-        // ones that type-check must diff identically.
-        if try_type_program(src, fields).is_some() {
-            assert_agree(src, fields, record);
-        }
+        assert!(
+            try_type_program(src, fields).is_some(),
+            "corpus body failed to type-check as a flat row transform: `{src}`"
+        );
+        assert_agree(src, fields, record);
+        ran += 1;
     }
+    assert_eq!(
+        ran, case_count,
+        "every corpus body must run; ran {ran} of {case_count}"
+    );
 }
 
 // ── Property test: random scalar-core expressions ──────────────────────
@@ -2442,14 +2426,15 @@ proptest! {
         let stable = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
 
+        let has_distinct = program_has_distinct(&typed);
         let ctx_tw = EvalContext::test_default_borrowed(&stable);
-        let mut evaluator = ProgramEvaluator::new(Arc::new(typed_tw), false);
-        let tree = evaluator.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+        let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
+        let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
         let ctx_c = EvalContext::test_default_borrowed(&stable);
-        let program = compile::<NullStorage>(&typed);
-        let mut state = EvalState::new(program_has_distinct(&typed), DEFAULT_MAX_EXPANSION);
-        let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+        let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+        comp_eval.set_use_compiled(true);
+        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
     }
@@ -2568,14 +2553,15 @@ proptest! {
         let stable = StableEvalContext::test_default();
         let resolver = HashMapResolver::new(record);
 
+        let has_distinct = program_has_distinct(&typed);
         let ctx_tw = EvalContext::test_default_borrowed(&stable);
-        let mut evaluator = ProgramEvaluator::new(Arc::new(typed_tw), false);
-        let tree = evaluator.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
+        let mut tree_eval = ProgramEvaluator::new(Arc::new(typed_tw), has_distinct);
+        let tree = tree_eval.eval_record::<NullStorage>(&ctx_tw, &resolver, None);
 
         let ctx_c = EvalContext::test_default_borrowed(&stable);
-        let program = compile::<NullStorage>(&typed);
-        let mut state = EvalState::new(program_has_distinct(&typed), DEFAULT_MAX_EXPANSION);
-        let comp = compiled_eval_record(&program, &typed, &ctx_c, &resolver, None, &mut state);
+        let mut comp_eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+        comp_eval.set_use_compiled(true);
+        let comp = comp_eval.eval_record::<NullStorage>(&ctx_c, &resolver, None);
 
         prop_assert_eq!(project(&tree), project(&comp), "diverged on `{}`", src);
     }
