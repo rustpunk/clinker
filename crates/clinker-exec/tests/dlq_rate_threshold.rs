@@ -588,22 +588,53 @@ nodes:
 /// resolve to one physical file on a case-insensitive filesystem and must
 /// collide there — while remaining two distinct files (no collision) on a
 /// case-sensitive one. The expectation is therefore conditioned on the *actual*
-/// case-sensitivity of the test's working directory, probed the same way the
-/// validator does, so the assertion is deterministic on every CI runner: it
-/// requires the collision on case-insensitive macOS/Windows runners and forbids
-/// the false positive on case-sensitive Linux runners.
+/// case-folding of the directory the writers target, so the assertion is
+/// deterministic on every CI runner: it requires the collision on
+/// case-insensitive macOS/Windows volumes and forbids the false positive on
+/// case-sensitive Linux ones.
+///
+/// Both the observation and the engine operate on the same isolated absolute
+/// directory. The DLQ paths are absolute paths inside a fresh temp dir, so the
+/// validator's collision check resolves its case-fold probe against *that* dir
+/// rather than the process-global cwd; and the ground truth is read by actually
+/// creating `errors.csv` there and asking whether its re-cased twin resolves to
+/// the same file. An earlier version sampled the case-folding of the ambient
+/// cwd with a separate probe, which raced the validator's own cwd probe under
+/// cargo's parallel, shared-cwd test execution: a transient probe failure in
+/// the engine falls back to "case-sensitive" (no collision) while the test's
+/// independent probe had already read the volume as case-insensitive, so the
+/// expectation and the engine disagreed intermittently on case-insensitive
+/// macOS runners. Anchoring both on one absolute dir removes that race.
 #[test]
 fn case_variant_dlq_paths_emit_e318_only_when_filesystem_folds_case() {
-    let yaml = r#"
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // Ground truth for *this* directory: create the lowercase DLQ file, then ask
+    // whether its uppercased twin resolves to the same physical file. This is
+    // the filesystem's real behavior in the exact directory the engine will key
+    // its collision check against — not an inference from a separate probe.
+    let lower = dir.path().join("errors.csv");
+    std::fs::write(&lower, b"").expect("create probe file");
+    let upper_twin = dir.path().join("ERRORS.CSV");
+    let folds_case = upper_twin.exists();
+    std::fs::remove_file(&lower).expect("remove probe file");
+
+    // Absolute DLQ paths inside the observed dir, differing only in case. The
+    // validator resolves `collision_key` against each path's parent — this temp
+    // dir — so its case-fold verdict matches `folds_case` above by construction.
+    let pipeline_dlq = dir.path().join("errors.csv");
+    let per_source_dlq = dir.path().join("Errors.csv");
+    let yaml = format!(
+        r#"
 pipeline:
   name: e318_case_collision
 error_handling:
   strategy: continue
   dlq:
-    path: errors.csv
+    path: {pipeline_dlq:?}
     per_source:
       src_a:
-        path: Errors.csv
+        path: {per_source_dlq:?}
 nodes:
   - type: source
     name: src_a
@@ -612,7 +643,7 @@ nodes:
       type: csv
       path: a.csv
       schema:
-        - { name: id, type: int }
+        - {{ name: id, type: int }}
   - type: output
     name: out
     input: src_a
@@ -620,17 +651,15 @@ nodes:
       name: out
       type: csv
       path: out.csv
-"#;
-    // Probe the working directory the validator will probe (paths resolve
-    // against cwd). `false` ⇒ case-insensitive ⇒ the two paths name one file.
-    let case_sensitive =
-        clinker_plan::config::case_sensitive_dir(std::path::Path::new("errors.csv"))
-            .unwrap_or(true);
+"#,
+        pipeline_dlq = pipeline_dlq.display(),
+        per_source_dlq = per_source_dlq.display(),
+    );
 
-    let config = parse_config(yaml).expect("parse");
+    let config = parse_config(&yaml).expect("parse");
     let result = config.compile(&CompileContext::default());
 
-    if case_sensitive {
+    if !folds_case {
         // Case-sensitive filesystem: `errors.csv` and `Errors.csv` are two
         // distinct files, so no path collision is raised. (The pipeline still
         // compiles; absence of an E318 *collision* diagnostic is the point.)
