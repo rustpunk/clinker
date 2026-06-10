@@ -1910,6 +1910,40 @@ fn emit_each_ceiling_boundary() {
     }
 }
 
+/// A `trace` inside an `emit each` body is a no-op in both evaluators: its
+/// guard and message are never evaluated. The guard here divides by a
+/// zero-valued field and the message reads `1 / z`, so if either evaluator
+/// *did* evaluate the trace it would surface `DivisionByZero` instead of
+/// fanning out cleanly. Both must produce the identical fan-out, proving
+/// the compiled emit-each body no-ops trace exactly as the tree-walk does.
+#[test]
+fn emit_each_body_trace_is_noop() {
+    let nums = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
+    let proj = assert_agree(
+        "emit each n in nums {\n  trace if (1 / z) == 0 \"would error: \" + (1 / z).to_string()\n  emit val = n\n}",
+        &["nums", "z"],
+        HashMap::from([
+            ("nums".to_string(), nums),
+            ("z".to_string(), Value::Integer(0)),
+        ]),
+    );
+    match proj {
+        ResultProjection::EmitMany { records } => {
+            assert_eq!(records.len(), 2, "trace must not abort the fan-out");
+            for (i, (fields, _)) in records.iter().enumerate() {
+                let expected = i as i64 + 1;
+                assert!(
+                    fields
+                        .iter()
+                        .any(|(k, v)| k == "val" && *v == Value::Integer(expected)),
+                    "record {i} missing val={expected}: {fields:?}"
+                );
+            }
+        }
+        other => panic!("expected EmitMany fan-out, got {other:?}"),
+    }
+}
+
 // ── Differential corpus: system-access leaves with resolvable data ─────
 
 /// Assert agreement on a program that references declared scoped vars /
@@ -2068,6 +2102,43 @@ fn qualified_source_access() {
     );
 }
 
+/// `$record.<key>` reads resolve through the dedicated record-vars channel
+/// (the resolver, under the `$record.` prefix). A declared-and-seeded key
+/// returns its value; a declared-but-unseeded key resolves `Null`. Pinned
+/// because the `RecordAccess` read form otherwise has zero differential
+/// coverage, and both evaluators reach it by separate code paths.
+#[test]
+fn record_access_read() {
+    use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
+    let mut registry = ScopedVarsRegistry::default();
+    registry
+        .record
+        .insert("tier".to_string(), ScopedVarType::String);
+    registry
+        .record
+        .insert("absent".to_string(), ScopedVarType::String);
+    // Seed only `tier` into the record-vars channel; `absent` is declared
+    // (so the read type-checks) but never written, so it must read `Null`.
+    let record = HashMap::from([("$record.tier".to_string(), Value::String("gold".into()))]);
+    let proj = assert_agree_with_vars(
+        "emit present = $record.tier\nemit missing = $record.absent",
+        &[],
+        &[],
+        &registry,
+        record,
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![
+                ("present".to_string(), Value::String("gold".into())),
+                ("missing".to_string(), Value::Null),
+            ],
+            record_vars: vec![],
+        },
+    );
+}
+
 /// A 3-part qualified field reference (`source.record_type.field`)
 /// resolves through `resolve_qualified` with the first two parts joined as
 /// the compound source key. With the qualified entry absent both
@@ -2135,7 +2206,12 @@ fn example_pipeline_transform_bodies() {
             HashMap::from([("lifetime_value".to_string(), Value::String("25000".into()))]),
         ),
         (
-            "emit _include = days_since(invoice_date) < 90",
+            // A fiscal-year derivation: parse a date field, then branch on
+            // its month/year. Exercises the date-method surface (to_date /
+            // month / year) as a real flat row transform — the prior
+            // `days_since(...)` free-function form has no CXL call syntax,
+            // so it never type-checked and was silently skipped.
+            "let parsed = invoice_date.to_date(\"%Y-%m-%d\")\nemit fiscal_year = if parsed.month() < 4 then parsed.year() else parsed.year() + 1",
             &["invoice_date"],
             HashMap::from([(
                 "invoice_date".to_string(),
@@ -2205,6 +2281,12 @@ enum GenExpr {
     NullLit,
     StrLit(String),
     Field(&'static str),
+    /// A reference to an earlier `let v<i>` binding, rendered as the bare
+    /// identifier `v<i>`. Only the statement-sequence proptest emits this,
+    /// and only for an index already bound earlier in the same program, so
+    /// the reference is always in scope and resolves through the env on
+    /// both evaluators.
+    LetVar(usize),
     Binary(&'static str, Box<GenExpr>, Box<GenExpr>),
     Not(Box<GenExpr>),
     Neg(Box<GenExpr>),
@@ -2234,6 +2316,7 @@ impl GenExpr {
             GenExpr::NullLit => "null".to_string(),
             GenExpr::StrLit(s) => format!("\"{s}\""),
             GenExpr::Field(name) => name.to_string(),
+            GenExpr::LetVar(i) => format!("v{i}"),
             GenExpr::Binary(op, l, r) => format!("({} {} {})", l.render(), op, r.render()),
             GenExpr::Not(e) => format!("(not {})", e.render()),
             GenExpr::Neg(e) => format!("(-{})", e.render()),
@@ -2422,25 +2505,46 @@ proptest! {
     #[test]
     fn compiled_matches_tree_walk_statement_seq(
         leading_filter in proptest::option::of(expr_strategy()),
-        stmts in proptest::collection::vec(0usize..5, 1..6),
-        filler in expr_strategy(),
+        // Each statement carries its own independent expr (kind, rhs,
+        // ref_earlier_let) so the fuzz varies the RHS across the sequence
+        // rather than reusing one shared filler for every statement.
+        stmts in proptest::collection::vec(
+            (0usize..5, expr_strategy(), any::<bool>()),
+            1..6,
+        ),
         a in value_strategy(),
         b in value_strategy(),
         c in value_strategy(),
     ) {
-        // Build the program text. The `filler` expr seeds each statement's
-        // RHS via `stmt_strategy`-equivalent rendering keyed by index.
         let mut lines: Vec<String> = Vec::new();
         if let Some(f) = &leading_filter {
             lines.push(format!("filter {}", f.render()));
         }
-        for (i, kind) in stmts.iter().enumerate() {
+        // Track which `let v<i>` indices are in scope so an emit RHS can
+        // reference an earlier binding — exercising env-read after env-write
+        // within one record's statement run, not just leaf field reads.
+        let mut bound_lets: Vec<usize> = Vec::new();
+        for (i, (kind, rhs, ref_earlier_let)) in stmts.iter().enumerate() {
+            // When the statement is an emit and asks to reference an earlier
+            // let, swap its RHS for the most recent in-scope `v<i>`; lets
+            // always use their freshly generated expr.
+            let rhs = if *kind != 0 && *ref_earlier_let {
+                match bound_lets.last() {
+                    Some(&j) => GenExpr::LetVar(j),
+                    None => rhs.clone(),
+                }
+            } else {
+                rhs.clone()
+            };
             let stmt = match kind {
-                0 => GenStmt::Let(i, filler.clone()),
-                1 => GenStmt::EmitField(i, filler.clone()),
-                2 => GenStmt::EmitRecord(i, filler.clone()),
-                3 => GenStmt::EmitPipeline(i, filler.clone()),
-                _ => GenStmt::EmitSource(i, filler.clone()),
+                0 => {
+                    bound_lets.push(i);
+                    GenStmt::Let(i, rhs)
+                }
+                1 => GenStmt::EmitField(i, rhs),
+                2 => GenStmt::EmitRecord(i, rhs),
+                3 => GenStmt::EmitPipeline(i, rhs),
+                _ => GenStmt::EmitSource(i, rhs),
             };
             lines.push(stmt.render());
         }

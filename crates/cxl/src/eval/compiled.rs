@@ -507,16 +507,24 @@ fn compile_stmt<S: RecordStorage + 'static>(
 /// raises at run time, so an ill-formed body diverges from neither
 /// evaluator. The returned closure shares the same `StmtOut` shape as a
 /// top-level statement but only ever reports `Continue`.
+///
+/// `trace` and `use` are compiled to bare `Continue` no-ops here, *not*
+/// routed through `compile_stmt`. The tree-walk's `eval_emit_each_body`
+/// matches both as no-ops and never evaluates the trace guard or message,
+/// so routing them through the full top-level `Trace` closure — which
+/// evaluates both and could surface an error the tree-walk never sees —
+/// would diverge.
 fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
     typed: &TypedProgram,
     stmt: &Statement,
 ) -> CompiledStmt<S> {
     match stmt {
-        Statement::Let { .. }
-        | Statement::Emit { .. }
-        | Statement::Trace { .. }
-        | Statement::UseStmt { .. }
-        | Statement::ExprStmt { .. } => compile_stmt(typed, stmt),
+        Statement::Trace { .. } | Statement::UseStmt { .. } => {
+            Box::new(|_frame, _out| Ok(StmtFlow::Continue))
+        }
+        Statement::Let { .. } | Statement::Emit { .. } | Statement::ExprStmt { .. } => {
+            compile_stmt(typed, stmt)
+        }
         Statement::Filter { span, .. }
         | Statement::Distinct { span, .. }
         | Statement::EmitEach { span, .. } => {
