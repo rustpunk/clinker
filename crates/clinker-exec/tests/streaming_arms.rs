@@ -17,7 +17,7 @@
 //! 1. **Memory model.** The producer reports `buffer: streaming` in
 //!    `--explain` and emits NO `node_buffer` edge to its Output. Because
 //!    the explain classifier is derived from the exact
-//!    `streaming_output_producer` predicate the runtime sender-install
+//!    `certify_streaming_edge` predicate the runtime sender-install
 //!    consults, the annotation reflects what the dispatcher does: the
 //!    producer's output is not admitted to a charged, spill-eligible slot
 //!    that the Output would re-drain.

@@ -21,8 +21,8 @@ pub use enforcer::*;
 pub use explain::*;
 pub use graph_util::{compute_init_phase_node_set, single_predecessor};
 pub use streaming_class::{
-    StreamClass, classify_stream_nodes, compute_merge_interleave_fused_sources,
-    compute_transform_fused_sources, streaming_output_producer,
+    StreamClass, certify_streaming_edge, classify_stream_nodes,
+    compute_merge_interleave_fused_sources, compute_transform_fused_sources,
 };
 
 use std::collections::{BTreeSet, HashMap};

@@ -542,7 +542,7 @@ nodes:
 /// no `node_buffer` edge is emitted out of it — a materialized Transform
 /// would report `buffer: materialized` and a `node_buffer (slot=N)` edge
 /// to the Output. Because the explain classification is derived from the
-/// exact `streaming_output_producer` predicate the runtime sender-install
+/// exact `certify_streaming_edge` predicate the runtime sender-install
 /// consults, this annotation reflects the dispatcher's runtime behavior.
 #[test]
 fn fused_transform_streams_to_output_without_charging_full_stage() {

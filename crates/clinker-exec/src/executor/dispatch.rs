@@ -1464,7 +1464,7 @@ pub(crate) fn admit_node_buffer(
 /// punctuations, so their relative position past the records is immaterial
 /// to the sink, and the within-records order — the FIFO the writer
 /// observes — is preserved by the batcher's append-only cut). Callers
-/// reach this only when [`super::streaming_output_producer`] certified the
+/// reach this only when [`super::certify_streaming_edge`] certified the
 /// producer roots no window and tees to no deferred region, so no
 /// materialized-tail bookkeeping is skipped that a downstream stage
 /// depends on.
@@ -2218,7 +2218,7 @@ pub(crate) fn transform_fused_consume(
     // non-fused Transform arm). In streaming mode both stay empty: the
     // batcher sink sends every event to the Output thread instead, and a
     // streaming-eligible Transform roots no window and tees to no region
-    // (enforced by `streaming_output_producer`), so the helper calls see
+    // (enforced by `certify_streaming_edge`), so the helper calls see
     // an empty slice and the slot is never admitted.
     //
     // The fused loop pushes each emitted record AND each document-boundary
@@ -2426,7 +2426,7 @@ pub(crate) fn transform_fused_consume(
     // inter-stage memory for this stage is one batch rather than the whole
     // output. The window-root / region-tee helpers are skipped because a
     // streaming-eligible Transform roots no node-anchored window and tees
-    // to no deferred region (enforced by `streaming_output_producer`), and
+    // to no deferred region (enforced by `certify_streaming_edge`), and
     // `output_records` is empty in this mode anyway.
     if streaming {
         return Ok(());

@@ -233,7 +233,7 @@ impl BufferClass {
 impl ExecutionPlanDag {
     fn classify_node_buffers(&self, config: &PipelineConfig) -> HashMap<NodeIndex, BufferClass> {
         // Delegate to the fusion classifier whose streaming verdict is
-        // decided by the same `streaming_output_producer` predicate the
+        // decided by the same `certify_streaming_edge` predicate the
         // runtime sender install consults, so the `--explain` annotation
         // can never drift from what the dispatcher actually streams.
         // `StreamClass` is the verdict; `BufferClass` is this surface's

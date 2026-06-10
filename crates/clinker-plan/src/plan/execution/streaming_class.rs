@@ -1,10 +1,12 @@
 //! Streaming fused-path analysis over a compiled plan.
 //!
-//! These predicates decide which producer → single-`Output` chains bypass a
-//! `node_buffers` slot and stream record-by-record to a writer thread. Both
-//! `--explain` (plan-only) and the runtime dispatcher consult the same
-//! predicates so the buffer-class annotation can never drift from what the
-//! dispatcher actually does.
+//! These predicates decide which `producer → streaming-consumer` edges
+//! bypass a `node_buffers` slot and stream record-by-record over a bounded
+//! channel. The consumer side is parameterized over consumer kind, with
+//! `Output` (a file-writer thread) as the sole certified consumer kind
+//! today. Both `--explain` (plan-only) and the runtime dispatcher consult
+//! the same predicates so the buffer-class annotation can never drift from
+//! what the dispatcher actually does.
 
 use std::collections::{HashMap, HashSet};
 
@@ -180,7 +182,7 @@ pub fn compute_transform_fused_sources(
 /// registers a `NodeBufferConsumer` and is spill-eligible.
 ///
 /// The non-trivial verdict — whether a fused Transform streams — is
-/// decided by [`streaming_output_producer`], the one predicate both
+/// decided by [`certify_streaming_edge`], the one predicate both
 /// [`classify_stream_nodes`] (the `--explain` annotation) and the runtime
 /// sender install consult. A Transform is `Streaming` here iff a streaming
 /// sender is installed for it at runtime, so the explain annotation can
@@ -206,7 +208,7 @@ pub enum StreamClass {
 ///   dispatch arm returns without admitting a buffer; the downstream
 ///   fused consumer takes the receiver directly.
 /// - A fused **Transform** whose single downstream is a streaming-
-///   eligible Output, as decided by [`streaming_output_producer`]. Such a
+///   eligible Output, as decided by [`certify_streaming_edge`]. Such a
 ///   Transform hands each bounded batch straight to the streaming Output
 ///   thread over a back-pressured channel and never admits a
 ///   `node_buffers` slot, so its peak inter-stage footprint is one batch
@@ -247,7 +249,7 @@ pub fn classify_stream_nodes(
         plan.graph
             .node_indices()
             .filter_map(|output_idx| {
-                streaming_output_producer(plan, output_idx, &fused_transforms, &init_phase)
+                certify_streaming_edge(plan, output_idx, &fused_transforms, &init_phase)
             })
             .collect()
     };
@@ -285,26 +287,38 @@ pub fn classify_stream_nodes(
         .collect()
 }
 
-/// Resolve the streaming producer for an `Output` node, or `None` when
-/// the Output is not streaming-eligible.
+/// Certify a `producer → consumer` edge for the streaming substrate,
+/// returning the producer's `NodeIndex` when the edge streams, or `None`
+/// when it stays materialized.
 ///
-/// A streaming Output's writer moves into a `std::thread` that consumes a
-/// bounded crossbeam channel; the producer arm sends records into that
-/// channel as it produces them, so back-pressure flows writer → producer
-/// → Source and no inter-stage `node_buffers` slot is charged. Two
-/// producer topologies qualify, and this function is the single
-/// plan-derived eligibility predicate both the runtime spawn path and the
-/// `--explain` buffer-class annotation ([`classify_stream_nodes`])
+/// `consumer_idx` names the downstream streaming consumer; today the only
+/// certified consumer kind is `PlanNode::Output`, but the eligibility
+/// shell is consumer-generic so future streaming consumers (a streaming
+/// `Aggregate` ingest, a `Combine` probe) plug in as additional certifying
+/// arms without re-deriving the producer analysis. A streaming consumer's
+/// work moves into a `std::thread` that consumes a bounded crossbeam
+/// channel; the producer arm sends records into that channel as it
+/// produces them, so back-pressure flows consumer → producer → Source and
+/// no inter-stage `node_buffers` slot is charged. This function is the
+/// single plan-derived eligibility predicate both the runtime spawn path
+/// and the `--explain` buffer-class annotation ([`classify_stream_nodes`])
 /// consult, so the explain annotation can never disagree with what the
 /// dispatcher does.
 ///
 /// Common eligibility (independent of producer kind):
 ///
-/// - The Output has exactly one incoming edge.
-/// - The Output is not in the init-phase ancestor closure.
+/// - The consumer is not in the init-phase ancestor closure.
+/// - The consumer has exactly one incoming edge.
+///
+/// Consumer = `Output` (the sole certified consumer kind today):
+///
 /// - The Output is not a per-source-file fan-out writer and its config
 ///   declares no `split:` block — both own their own writer lifecycle
 ///   and are incompatible with the single streaming writer task.
+///
+/// Every other consumer node kind returns `None`: the consumer-specific
+/// guards above are conjunctive, so no producer edge into a non-`Output`
+/// consumer is certified until that consumer kind grows its own arm.
 ///
 /// Producer = fused `Merge.interleave` (issue #72):
 ///
@@ -369,34 +383,47 @@ pub fn classify_stream_nodes(
 /// Correlation buffering disables streaming pipeline-wide — the
 /// `CorrelationCommit` terminal owns the writes — so the caller short-
 /// circuits before calling this.
-pub fn streaming_output_producer(
+pub fn certify_streaming_edge(
     plan: &ExecutionPlanDag,
-    output_idx: petgraph::graph::NodeIndex,
+    consumer_idx: petgraph::graph::NodeIndex,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
 ) -> Option<petgraph::graph::NodeIndex> {
     use crate::plan::combine::CombineStrategy;
     use crate::plan::types::AggregateStrategy;
 
-    let PlanNode::Output { resolved, .. } = &plan.graph[output_idx] else {
-        return None;
-    };
-    let payload = resolved.as_deref()?;
-    if init_phase_set.contains(&output_idx) {
+    // Consumer-generic eligibility, hoisted ahead of the consumer-kind
+    // dispatch because every certifying arm shares it: an init-phase
+    // consumer drives the bootstrap DAG (no streaming writer task), and a
+    // consumer with fan-in cannot move a single upstream producer's live
+    // channel into itself.
+    if init_phase_set.contains(&consumer_idx) {
         return None;
     }
-    // Per-source-file fan-out and split writers own their own file
-    // rotation lifecycle and cannot share the single streaming writer
-    // task. Both are plan-derived so the explain and runtime surfaces
-    // agree without consulting the runtime writer registry.
-    if payload.fan_out_per_source_file || payload.output.split.is_some() {
-        return None;
+
+    // Consumer-kind dispatch. `Output` is the sole certified consumer kind
+    // today; every other kind falls through to `None`. The guards here are
+    // the consumer-specific half of the predicate (the producer-kind half
+    // is the `match` on `producer_idx` below).
+    match &plan.graph[consumer_idx] {
+        PlanNode::Output { resolved, .. } => {
+            let payload = resolved.as_deref()?;
+            // Per-source-file fan-out and split writers own their own file
+            // rotation lifecycle and cannot share the single streaming
+            // writer task. Both are plan-derived so the explain and
+            // runtime surfaces agree without consulting the runtime writer
+            // registry.
+            if payload.fan_out_per_source_file || payload.output.split.is_some() {
+                return None;
+            }
+        }
+        _ => return None,
     }
 
     // Exactly one incoming edge.
     let mut incoming = plan
         .graph
-        .neighbors_directed(output_idx, petgraph::Direction::Incoming);
+        .neighbors_directed(consumer_idx, petgraph::Direction::Incoming);
     let producer_idx = incoming.next()?;
     if incoming.next().is_some() {
         return None;
