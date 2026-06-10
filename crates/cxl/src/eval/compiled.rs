@@ -8,16 +8,30 @@
 //! sequence of vtable calls with no central dispatch `match` and no
 //! re-indexing of the typed program's side tables.
 //!
-//! This slice covers the **scalar core** only — literals, field and
-//! system access, binary/unary arithmetic and comparison, the
-//! three-valued Kleene `and`/`or`, conditionals (`if`/`match`/
-//! coalesce), and the statement forms that do not fan out or call
-//! methods (`let`, `emit`, `filter`, `trace`, `use`, expression
-//! statements). Method calls, closure builtins, window access,
-//! `distinct`, and `emit each` are not lowered here; their lowering
-//! returns an [`EvalError`] rather than a silently-wrong value, so a
-//! program reaching one of those nodes fails loudly instead of
-//! diverging from the tree-walk.
+//! This slice covers the scalar core plus the record-shaped method
+//! surface: literals, field and system access, binary/unary arithmetic
+//! and comparison, the three-valued Kleene `and`/`or`, conditionals
+//! (`if`/`match`/coalesce), the non-fan-out statement forms (`let`,
+//! `emit`, `filter`, `trace`, `use`, expression statements), the
+//! record-level builtins reached through `dispatch_method`, and the
+//! closure-bearing array builtins (`filter`/`map`/`find`/`any`/
+//! `flat_map`). Window access, `distinct`, and `emit each` are not
+//! lowered here; their lowering returns an [`EvalError`] rather than a
+//! silently-wrong value, so a program reaching one of those nodes fails
+//! loudly instead of diverging from the tree-walk.
+//!
+//! Builtins are not reimplemented: a `MethodCall` node lowers to a call
+//! into the same `dispatch_method` the tree-walk uses, so the
+//! null-receiver gate (and its four exceptions `is_null` / `type_of` /
+//! `is_empty` / `catch`), regex methods, and every string / numeric /
+//! date method share one implementation. The pre-compiled regex for a
+//! method node is captured by value at lowering from
+//! `typed.regexes[node_id]`, never recompiled per record. A closure
+//! builtin compiles its closure body to a *separate* compiled
+//! sub-program and runs the host loop in Rust, binding the closure
+//! parameter through the shared `env` with the same save / insert /
+//! eval / remove / restore sequence the tree-walk uses (including the
+//! remove on the error path).
 //!
 //! The produced [`CompiledProgram`] is parameterized by the record
 //! storage backend `S` because window reads (a later slice) borrow the
@@ -30,12 +44,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::{RecordStorage, Value};
+use regex::Regex;
 
 use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, TraceLevel, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
+use super::builtins_impl::dispatch_method;
 use super::context::EvalContext;
 use super::error::{EvalError, EvalErrorKind};
 use super::{EvalResult, SkipReason};
@@ -153,16 +169,24 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
     }
 }
 
-/// Lower a typed program's scalar core into a [`CompiledProgram`].
+/// Lower a typed program into a [`CompiledProgram`].
 ///
-/// Each statement is lowered exactly once. Method calls, closure
-/// builtins, window access, `distinct`, and `emit each` are out of
+/// Each statement is lowered exactly once. The typed program is threaded
+/// through lowering (not run time) so that node-keyed side data — the
+/// pre-compiled regex in `typed.regexes[node_id]` — is captured by value
+/// into the method node's closure at compile time, never re-indexed per
+/// record. Window access, `distinct`, and `emit each` remain out of
 /// scope for this slice: lowering one of those produces a statement /
 /// expression closure that returns an [`EvalError`] at run time rather
 /// than a silently-wrong value, so a divergence from the tree-walk
 /// surfaces as a hard error instead of corrupt output.
 pub fn compile<S: RecordStorage + 'static>(typed: &TypedProgram) -> CompiledProgram<S> {
-    let statements = typed.program.statements.iter().map(compile_stmt).collect();
+    let statements = typed
+        .program
+        .statements
+        .iter()
+        .map(|stmt| compile_stmt(typed, stmt))
+        .collect();
     CompiledProgram { statements }
 }
 
@@ -183,11 +207,14 @@ fn unsupported_error(what: &'static str, span: Span) -> EvalError {
     )
 }
 
-fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S> {
+fn compile_stmt<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    stmt: &Statement,
+) -> CompiledStmt<S> {
     match stmt {
         Statement::Let { name, expr, .. } => {
             let name = name.to_string();
-            let value = compile_expr(expr);
+            let value = compile_expr(typed, expr);
             Box::new(move |frame, _out| {
                 let v = value(frame)?;
                 frame.env.insert(name.clone(), v);
@@ -199,7 +226,7 @@ fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S>
         } => {
             let name: Arc<str> = Arc::from(&**name);
             let target = *target;
-            let value = compile_expr(expr);
+            let value = compile_expr(typed, expr);
             Box::new(move |frame, out| {
                 // Mirror the tree-walk: stamp the emit's field name onto
                 // any surfaced error so DLQ entries name the column under
@@ -231,7 +258,7 @@ fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S>
             })
         }
         Statement::Filter { predicate, .. } => {
-            let pred = compile_expr(predicate);
+            let pred = compile_expr(typed, predicate);
             Box::new(move |frame, _out| {
                 // A predicate passes only when it is exactly `true`;
                 // `null` (and any non-bool) is not true, so it skips.
@@ -249,8 +276,8 @@ fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S>
             ..
         } => {
             let level = level.unwrap_or(TraceLevel::Trace);
-            let guard = guard.as_ref().map(|g| compile_expr(g));
-            let message = compile_expr(message);
+            let guard = guard.as_ref().map(|g| compile_expr(typed, g));
+            let message = compile_expr(typed, message);
             Box::new(move |frame, _out| {
                 let should_trace = match &guard {
                     Some(g) => matches!(g(frame)?, Value::Bool(true)),
@@ -269,7 +296,7 @@ fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S>
         }
         Statement::UseStmt { .. } => Box::new(|_frame, _out| Ok(StmtFlow::Continue)),
         Statement::ExprStmt { expr, .. } => {
-            let value = compile_expr(expr);
+            let value = compile_expr(typed, expr);
             Box::new(move |frame, _out| {
                 value(frame)?;
                 Ok(StmtFlow::Continue)
@@ -291,7 +318,7 @@ fn compile_stmt<S: RecordStorage + 'static>(stmt: &Statement) -> CompiledStmt<S>
     }
 }
 
-fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
+fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -> CompiledExpr<S> {
     match expr {
         Expr::Literal { value, .. } => {
             // Bake the literal's Value once at lowering; cloning a baked
@@ -389,21 +416,21 @@ fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
         Expr::Wildcard { .. } => Box::new(|_frame| Ok(Value::Bool(true))),
         Expr::Binary {
             op, lhs, rhs, span, ..
-        } => compile_binary(*op, lhs, rhs, *span),
+        } => compile_binary(typed, *op, lhs, rhs, *span),
         Expr::Unary {
             op, operand, span, ..
         } => {
             let op = *op;
             let span = *span;
-            let operand = compile_expr(operand);
+            let operand = compile_expr(typed, operand);
             Box::new(move |frame| {
                 let val = operand(frame)?;
                 apply_unary(op, val, span)
             })
         }
         Expr::Coalesce { lhs, rhs, .. } => {
-            let lhs = compile_expr(lhs);
-            let rhs = compile_expr(rhs);
+            let lhs = compile_expr(typed, lhs);
+            let rhs = compile_expr(typed, rhs);
             Box::new(move |frame| {
                 let left = lhs(frame)?;
                 if left.is_null() { rhs(frame) } else { Ok(left) }
@@ -415,9 +442,9 @@ fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
             else_branch,
             ..
         } => {
-            let condition = compile_expr(condition);
-            let then_branch = compile_expr(then_branch);
-            let else_branch = else_branch.as_ref().map(|e| compile_expr(e));
+            let condition = compile_expr(typed, condition);
+            let then_branch = compile_expr(typed, then_branch);
+            let else_branch = else_branch.as_ref().map(|e| compile_expr(typed, e));
             Box::new(move |frame| {
                 let cond = condition(frame)?;
                 if matches!(cond, Value::Bool(true)) {
@@ -429,12 +456,12 @@ fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
                 }
             })
         }
-        Expr::Match { subject, arms, .. } => compile_match(subject.as_deref(), arms),
+        Expr::Match { subject, arms, .. } => compile_match(typed, subject.as_deref(), arms),
         Expr::IndexAccess {
             receiver, index, ..
         } => {
-            let receiver = compile_expr(receiver);
-            let index = compile_expr(index);
+            let receiver = compile_expr(typed, receiver);
+            let index = compile_expr(typed, index);
             Box::new(move |frame| {
                 let recv = receiver(frame)?;
                 if recv.is_null() {
@@ -456,16 +483,251 @@ fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
                 })
             })
         }
+        Expr::MethodCall {
+            node_id,
+            receiver,
+            method,
+            args,
+            span,
+        } => compile_method_call(typed, *node_id, receiver, method, args, *span),
+        // A free-standing closure is never a value — it is only valid as
+        // the argument of a closure-bearing array builtin, where
+        // `compile_method_call` consumes it directly rather than routing
+        // through here. Reaching this arm means the closure escaped that
+        // position; surface the same error the tree-walk does.
+        Expr::Closure { span, .. } => {
+            let span = *span;
+            Box::new(move |_frame| {
+                Err(EvalError::new(
+                    EvalErrorKind::TypeMismatch {
+                        expected: "closure-bearing method argument",
+                        got: "free-standing closure",
+                    },
+                    span,
+                ))
+            })
+        }
         // Deferred to a later slice. These compile to a loud-error leaf
         // so a program reaching one fails at its precise span rather
         // than producing a value that silently diverges from the
         // tree-walk.
-        Expr::MethodCall { span, .. } => unsupported_expr("method call", *span),
         Expr::WindowCall { span, .. } => unsupported_expr("window call", *span),
-        Expr::Closure { span, .. } => unsupported_expr("closure", *span),
         Expr::AggCall { span, .. } => unsupported_expr("aggregate call", *span),
         Expr::AggSlot { span, .. } => unsupported_expr("aggregate slot", *span),
         Expr::GroupKey { span, .. } => unsupported_expr("group-by key", *span),
+    }
+}
+
+/// Lower a method call. Three shapes dispatch here:
+///
+/// - `$window.<fn>(..).<field>` chains (an `args`-less method on a
+///   `first`/`last`/`lag`/`lead` window call) read the window context
+///   and are deferred to the window slice — they lower to a loud-error
+///   leaf rather than route through `dispatch_method`.
+/// - The closure-bearing array builtins (`filter`/`map`/`find`/`any`/
+///   `flat_map` whose first argument is a closure) lower to a
+///   [`compile_maplike`] host loop over a separately-compiled closure
+///   body.
+/// - Every other method lowers to an eager evaluation of the receiver
+///   and all arguments followed by a single call into the shared
+///   `dispatch_method`, which owns the null-receiver gate (and its four
+///   exceptions) and the full builtin table. The pre-compiled regex for
+///   this node is captured by value here at lowering and handed to
+///   `dispatch_method` per record, never recompiled.
+fn compile_method_call<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    node_id: crate::ast::NodeId,
+    receiver: &Expr,
+    method: &str,
+    args: &[Expr],
+    span: Span,
+) -> CompiledExpr<S> {
+    // `$window.<fn>(..).<field>` chains resolve a field off a positional
+    // window row without a `Value` round-trip; they need the live window
+    // borrow and so belong to the window slice. Detect the exact shape
+    // the tree-walk intercepts and defer it loudly.
+    if args.is_empty()
+        && let Expr::WindowCall { function, .. } = receiver
+        && matches!(&**function, "first" | "last" | "lag" | "lead")
+    {
+        return unsupported_expr("window chain access", span);
+    }
+
+    // Closure-bearing array builtins: dispatch by name + closure-shaped
+    // first argument, mirroring the tree-walk so a string-regex
+    // `.find("pattern")` still routes to the regex builtin below.
+    if matches!(method, "filter" | "map" | "find" | "any" | "flat_map")
+        && matches!(args.first(), Some(Expr::Closure { .. }))
+    {
+        return compile_maplike(typed, receiver, method, args, span);
+    }
+
+    let receiver = compile_expr::<S>(typed, receiver);
+    let arg_exprs: Vec<CompiledExpr<S>> =
+        args.iter().map(|a| compile_expr::<S>(typed, a)).collect();
+    let method: Box<str> = method.into();
+    // Capture the node's pre-compiled regex by value once, at lowering.
+    // The tree-walk re-indexes `typed.regexes[node_id]` on every record;
+    // baking it into the closure makes that a one-time cost.
+    let regex: Option<Regex> = typed
+        .regexes
+        .get(node_id.0 as usize)
+        .and_then(|r| r.clone());
+
+    Box::new(move |frame| {
+        let recv_val = receiver(frame)?;
+        let mut arg_vals = Vec::with_capacity(arg_exprs.len());
+        for arg in &arg_exprs {
+            arg_vals.push(arg(frame)?);
+        }
+        match dispatch_method(
+            &recv_val,
+            &method,
+            &arg_vals,
+            regex.as_ref(),
+            span,
+            frame.ctx,
+        )? {
+            Some(val) => Ok(val),
+            None => Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "known method",
+                    got: "unknown",
+                },
+                span,
+            )),
+        }
+    })
+}
+
+/// Lower a closure-bearing array builtin (`filter`/`map`/`find`/`any`/
+/// `flat_map`) to a host loop in Rust over a separately-compiled closure
+/// body.
+///
+/// The closure body is a distinct [`CompiledExpr`] — not inlined into
+/// the receiver's node — so it re-runs per element with the closure
+/// parameter freshly bound. Binding goes through the shared `env` with
+/// the exact save / insert / eval / remove / restore sequence the
+/// tree-walk's `dispatch_closure_method` uses, including the remove on
+/// the error path so a failing body never leaves the parameter bound.
+/// A null receiver short-circuits to `Null` and the body never runs,
+/// matching the tree-walk's null-propagation for these builtins.
+fn compile_maplike<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
+    receiver: &Expr,
+    method: &str,
+    args: &[Expr],
+    span: Span,
+) -> CompiledExpr<S> {
+    let receiver = compile_expr::<S>(typed, receiver);
+    // The closure-shaped first argument is guaranteed by the caller; its
+    // param and body compile once here.
+    let (param, body): (Box<str>, CompiledExpr<S>) = match args.first() {
+        Some(Expr::Closure { param, body, .. }) => (param.clone(), compile_expr::<S>(typed, body)),
+        // Unreachable in practice (the caller gates on a closure-shaped
+        // first arg), but surface the same shape error the tree-walk
+        // raises rather than panic if the invariant is ever violated.
+        _ => {
+            return Box::new(move |_frame| {
+                Err(EvalError::new(
+                    EvalErrorKind::TypeMismatch {
+                        expected: "closure argument (`it => ...`)",
+                        got: "non-closure argument",
+                    },
+                    span,
+                ))
+            });
+        }
+    };
+    let kind = MapLikeKind::from_name(method);
+
+    Box::new(move |frame| {
+        let recv_val = receiver(frame)?;
+        if recv_val.is_null() {
+            return Ok(Value::Null);
+        }
+        let Value::Array(elements) = recv_val else {
+            return Ok(Value::Null);
+        };
+
+        // Save any shadowed binding so the closure param does not leak a
+        // record-scope value, restoring it after the loop.
+        let previous = frame.env.remove(param.as_ref());
+        let mut output: Vec<Value> = Vec::new();
+        let mut found: Option<Value> = None;
+        let mut found_any = false;
+
+        for element in &elements {
+            frame.env.insert(param.to_string(), element.clone());
+            let body_val = body(frame);
+            // Always remove the per-iteration binding, then propagate any
+            // body error. The shadowed `previous` is restored only after
+            // the loop completes — matching the tree-walk, which on the
+            // error path leaves the env with the param unbound (the env
+            // is per-record scratch, discarded once the error surfaces).
+            frame.env.remove(param.as_ref());
+            let body_val = body_val?;
+            match kind {
+                MapLikeKind::Filter => {
+                    if matches!(body_val, Value::Bool(true)) {
+                        output.push(element.clone());
+                    }
+                }
+                MapLikeKind::Map => output.push(body_val),
+                MapLikeKind::Find => {
+                    if matches!(body_val, Value::Bool(true)) {
+                        found = Some(element.clone());
+                        break;
+                    }
+                }
+                MapLikeKind::Any => {
+                    if matches!(body_val, Value::Bool(true)) {
+                        found_any = true;
+                        break;
+                    }
+                }
+                MapLikeKind::FlatMap => match body_val {
+                    Value::Array(inner) => output.extend(inner),
+                    Value::Null => {}
+                    other => output.push(other),
+                },
+            }
+        }
+
+        if let Some(prev) = previous {
+            frame.env.insert(param.to_string(), prev);
+        }
+
+        Ok(match kind {
+            MapLikeKind::Filter | MapLikeKind::Map | MapLikeKind::FlatMap => Value::Array(output),
+            MapLikeKind::Find => found.unwrap_or(Value::Null),
+            MapLikeKind::Any => Value::Bool(found_any),
+        })
+    })
+}
+
+/// The five closure-bearing array builtins, resolved from the method
+/// name once at lowering so the host loop branches on a dense enum
+/// rather than re-comparing the method string per element.
+#[derive(Clone, Copy)]
+enum MapLikeKind {
+    Filter,
+    Map,
+    Find,
+    Any,
+    FlatMap,
+}
+
+impl MapLikeKind {
+    fn from_name(method: &str) -> Self {
+        match method {
+            "filter" => MapLikeKind::Filter,
+            "map" => MapLikeKind::Map,
+            "find" => MapLikeKind::Find,
+            "any" => MapLikeKind::Any,
+            "flat_map" => MapLikeKind::FlatMap,
+            _ => unreachable!("compile_maplike gated by method name"),
+        }
     }
 }
 
@@ -473,13 +735,14 @@ fn compile_expr<S: RecordStorage + 'static>(expr: &Expr) -> CompiledExpr<S> {
 /// evaluate the right operand only when the three-valued Kleene table
 /// demands it; every other operator evaluates both operands eagerly.
 fn compile_binary<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
     op: BinOp,
     lhs: &Expr,
     rhs: &Expr,
     span: Span,
 ) -> CompiledExpr<S> {
-    let lhs = compile_expr::<S>(lhs);
-    let rhs = compile_expr::<S>(rhs);
+    let lhs = compile_expr::<S>(typed, lhs);
+    let rhs = compile_expr::<S>(typed, rhs);
     match op {
         // false && _ = false (RHS unread); true && x = x; null && false =
         // false, else null.
@@ -539,6 +802,7 @@ fn compile_binary<S: RecordStorage + 'static>(
 /// the condition form runs each arm pattern as a boolean guard. Both
 /// fall through to `Null` when no arm matches, matching the tree-walk.
 fn compile_match<S: RecordStorage + 'static>(
+    typed: &TypedProgram,
     subject: Option<&Expr>,
     arms: &[crate::ast::MatchArm],
 ) -> CompiledExpr<S> {
@@ -557,12 +821,12 @@ fn compile_match<S: RecordStorage + 'static>(
         .map(|arm| {
             if matches!(arm.pattern, Expr::Wildcard { .. }) {
                 CompiledArm::Wildcard {
-                    body: compile_expr(&arm.body),
+                    body: compile_expr(typed, &arm.body),
                 }
             } else {
                 CompiledArm::Guard {
-                    pattern: compile_expr(&arm.pattern),
-                    body: compile_expr(&arm.body),
+                    pattern: compile_expr(typed, &arm.pattern),
+                    body: compile_expr(typed, &arm.body),
                 }
             }
         })
@@ -570,7 +834,7 @@ fn compile_match<S: RecordStorage + 'static>(
 
     match subject {
         Some(scrutinee) => {
-            let scrutinee = compile_expr::<S>(scrutinee);
+            let scrutinee = compile_expr::<S>(typed, scrutinee);
             Box::new(move |frame| {
                 let scrutinee_val = scrutinee(frame)?;
                 for arm in &compiled_arms {

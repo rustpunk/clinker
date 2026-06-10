@@ -1,13 +1,16 @@
-//! Differential and property tests proving the compiled scalar-core
-//! evaluator produces byte-identical [`EvalResult`]s to the tree-walk.
+//! Differential and property tests proving the compiled evaluator
+//! produces byte-identical [`EvalResult`]s to the tree-walk.
 //!
-//! Every program here stays inside the scalar core (no method calls,
-//! closures, window access, `distinct`, or `emit each`) so both
-//! evaluators are defined on it. The fidelity assertion compares the
-//! field map, the `$record.*` channel, the skip reason, and — on the
-//! error path — the error kind, span, and boundary provenance fields,
-//! byte for byte. On any divergence the compiled node is the thing to
-//! fix; the assertion is never weakened.
+//! Every program here stays inside the surface both evaluators define —
+//! the scalar core plus the record-level method calls and closure-bearing
+//! array builtins this slice lowers — and avoids window access,
+//! `distinct`, and `emit each`, which are not yet compiled. The fidelity
+//! assertion compares the field map, the `$record.*` channel, the skip
+//! reason, and — on the error path — the error kind, span, and boundary
+//! provenance fields, byte for byte. Float results are NaN-canonicalized
+//! first so an agreed NaN compares equal rather than false-failing. On
+//! any divergence the compiled node is the thing to fix; the assertion is
+//! never weakened.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -154,9 +157,34 @@ enum ResultProjection {
     },
 }
 
+/// Replace every NaN float in `v` (including those nested inside arrays
+/// and maps) with one canonical NaN bit pattern.
+///
+/// `Value`'s own `PartialEq` compares floats by `to_bits()`, so two NaNs
+/// that agree only on "is a NaN" but carry different payload bits would
+/// compare unequal and false-fail the differential assertion even though
+/// the two evaluators agree. Canonicalizing here mirrors the
+/// distinct-key path's NaN handling so an agreed NaN compares equal.
+fn canonicalize_nan(v: &Value) -> Value {
+    match v {
+        Value::Float(f) if f.is_nan() => Value::Float(f64::NAN),
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_nan).collect()),
+        Value::Map(m) => {
+            let mut out: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+            for (k, mv) in m.iter() {
+                out.insert(k.clone(), canonicalize_nan(mv));
+            }
+            Value::Map(Box::new(out))
+        }
+        other => other.clone(),
+    }
+}
+
 fn project(result: &Result<EvalResult, EvalError>) -> ResultProjection {
     fn pairs(m: &indexmap::IndexMap<String, Value>) -> Pairs {
-        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        m.iter()
+            .map(|(k, v)| (k.clone(), canonicalize_nan(v)))
+            .collect()
     }
     match result {
         Ok(EvalResult::Emit {
@@ -652,6 +680,464 @@ fn multi_statement_ordering() {
     );
 }
 
+// ── Differential corpus: method calls ──────────────────────────────────
+
+/// String builtins delegate to the shared `dispatch_method`, so both
+/// evaluators produce identical results for the common string surface.
+#[test]
+fn string_methods() {
+    let with_s = |src: &str, s: &str| {
+        assert_agree(
+            src,
+            &["s"],
+            HashMap::from([("s".to_string(), Value::String(s.into()))]),
+        )
+    };
+    with_s("emit out = s.upper()", "abc");
+    with_s("emit out = s.lower()", "ABC");
+    with_s("emit out = s.trim()", "  hi  ");
+    with_s("emit out = s.length()", "hello");
+    with_s("emit out = s.contains(\"ell\")", "hello");
+    with_s("emit out = s.starts_with(\"he\")", "hello");
+    with_s("emit out = s.replace(\"l\", \"L\")", "hello");
+    with_s("emit out = s.substring(1, 3)", "hello");
+    // Chained string methods compose identically.
+    with_s("emit out = s.trim().upper()", "  hi  ");
+}
+
+/// Numeric builtins delegate to the shared `dispatch_method`.
+#[test]
+fn numeric_methods() {
+    let with_n =
+        |src: &str, n: Value| assert_agree(src, &["n"], HashMap::from([("n".to_string(), n)]));
+    with_n("emit out = n.abs()", Value::Integer(-7));
+    with_n("emit out = n.abs()", Value::Float(-2.5));
+    with_n("emit out = n.ceil()", Value::Float(2.1));
+    with_n("emit out = n.floor()", Value::Float(2.9));
+    with_n("emit out = n.round()", Value::Float(2.5));
+    with_n("emit out = n.to_float()", Value::Integer(3));
+    with_n("emit out = n.to_string()", Value::Integer(42));
+    with_n("emit out = n.min(10)", Value::Integer(3));
+    with_n("emit out = n.max(10)", Value::Integer(3));
+}
+
+/// The null-receiver gate: for every method *except* the four exceptions
+/// a null receiver short-circuits to `Null`, identically through both
+/// evaluators. The gate lives inside the shared `dispatch_method`, so the
+/// compiled node delegates to it rather than re-deriving the rule.
+#[test]
+fn method_null_receiver_gate() {
+    let null_recv =
+        |src: &str| assert_agree(src, &["s"], HashMap::from([("s".to_string(), Value::Null)]));
+    // Gated methods → Null.
+    for src in [
+        "emit out = s.upper()",
+        "emit out = s.length()",
+        "emit out = s.trim()",
+        "emit out = s.contains(\"x\")",
+    ] {
+        let proj = null_recv(src);
+        assert_eq!(
+            proj,
+            ResultProjection::Emit {
+                fields: vec![("out".to_string(), Value::Null)],
+                record_vars: vec![],
+            },
+            "null receiver should gate `{src}` to Null",
+        );
+    }
+}
+
+/// The four gate exceptions (`is_null` / `type_of` / `is_empty` /
+/// `catch`) run on a null receiver instead of short-circuiting — both
+/// evaluators must agree on the concrete (non-null) result.
+#[test]
+fn method_null_receiver_exceptions() {
+    let null_recv =
+        |src: &str| assert_agree(src, &["s"], HashMap::from([("s".to_string(), Value::Null)]));
+
+    // is_null → true on a null receiver.
+    let proj = null_recv("emit out = s.is_null()");
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+    // catch(default) → the default, since the receiver is null.
+    let proj = null_recv("emit out = s.catch(99)");
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Integer(99))],
+            record_vars: vec![],
+        },
+    );
+    // type_of / is_empty still run on the null receiver.
+    null_recv("emit out = s.type_of()");
+    null_recv("emit out = s.is_empty()");
+}
+
+/// Regex methods (`matches` / `find` / `capture`) use the pre-compiled
+/// regex captured by value at lowering. Both evaluators read the same
+/// `typed.regexes[node_id]` entry, so results agree.
+#[test]
+fn regex_methods() {
+    let with_s = |src: &str, s: &str| {
+        assert_agree(
+            src,
+            &["s"],
+            HashMap::from([("s".to_string(), Value::String(s.into()))]),
+        )
+    };
+    with_s("emit out = s.matches(\"^[a-z]+$\")", "abc");
+    with_s("emit out = s.matches(\"^[a-z]+$\")", "abc123");
+    with_s("emit out = s.find(\"[0-9]+\")", "abc123");
+    with_s("emit out = s.find(\"[0-9]+\")", "abc");
+    with_s("emit out = s.capture(\"([a-z]+)([0-9]+)\")", "abc123");
+}
+
+// ── Differential corpus: closure-bearing array builtins ────────────────
+
+/// Build an array `Value`, the receiver shape the closure builtins
+/// require.
+fn arr(items: Vec<Value>) -> Value {
+    Value::Array(items)
+}
+
+/// Each closure builtin (`filter` / `map` / `find` / `any` / `flat_map`)
+/// runs the host loop over a separately-compiled closure body and must
+/// agree with the tree-walk on a populated array.
+///
+/// CXL has no array-literal syntax, so `flat_map`'s array-producing body
+/// uses a string element split into an array (`it.split(",")`); the
+/// other four use an integer array.
+#[test]
+fn closure_builtins_populated() {
+    let nums = || {
+        arr(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ])
+    };
+    let with_nums = |src: &str| {
+        assert_agree(
+            src,
+            &["nums"],
+            HashMap::from([("nums".to_string(), nums())]),
+        )
+    };
+    with_nums("emit out = nums.filter(it => it > 1)");
+    with_nums("emit out = nums.map(it => it + 10)");
+    with_nums("emit out = nums.find(it => it > 1)");
+    with_nums("emit out = nums.any(it => it > 5)");
+    // find with no match falls through to Null.
+    with_nums("emit out = nums.find(it => it > 99)");
+    // any with no match is false.
+    with_nums("emit out = nums.any(it => it > 99)");
+
+    // flat_map flattens each element's array-valued body result.
+    assert_agree(
+        "emit out = strs.flat_map(it => it.split(\",\"))",
+        &["strs"],
+        HashMap::from([(
+            "strs".to_string(),
+            arr(vec![Value::String("a,b".into()), Value::String("c".into())]),
+        )]),
+    );
+}
+
+/// A null receiver short-circuits every closure builtin to `Null`; the
+/// body never runs, matching the tree-walk's null-propagation.
+#[test]
+fn closure_builtins_null_receiver() {
+    let null_recv_nums = |src: &str| {
+        let proj = assert_agree(
+            src,
+            &["nums"],
+            HashMap::from([("nums".to_string(), Value::Null)]),
+        );
+        assert_eq!(
+            proj,
+            ResultProjection::Emit {
+                fields: vec![("out".to_string(), Value::Null)],
+                record_vars: vec![],
+            },
+            "null receiver should gate `{src}` to Null",
+        );
+    };
+    null_recv_nums("emit out = nums.filter(it => it > 1)");
+    null_recv_nums("emit out = nums.map(it => it + 10)");
+    null_recv_nums("emit out = nums.find(it => it > 1)");
+    null_recv_nums("emit out = nums.any(it => it > 1)");
+
+    let proj = assert_agree(
+        "emit out = strs.flat_map(it => it.split(\",\"))",
+        &["strs"],
+        HashMap::from([("strs".to_string(), Value::Null)]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Null)],
+            record_vars: vec![],
+        },
+    );
+}
+
+/// An empty array runs no iterations: `filter` / `map` / `flat_map`
+/// return an empty array, `find` returns `Null`, `any` returns `false`.
+/// Both evaluators agree on the zero-iteration outcome.
+#[test]
+fn closure_builtins_empty_array() {
+    let with_empty = |src: &str| {
+        assert_agree(
+            src,
+            &["nums"],
+            HashMap::from([("nums".to_string(), arr(vec![]))]),
+        )
+    };
+    let proj = with_empty("emit out = nums.filter(it => it > 1)");
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), arr(vec![]))],
+            record_vars: vec![],
+        },
+    );
+    with_empty("emit out = nums.map(it => it + 1)");
+    let proj = with_empty("emit out = nums.find(it => it > 1)");
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Null)],
+            record_vars: vec![],
+        },
+    );
+    let proj = with_empty("emit out = nums.any(it => it > 1)");
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(false))],
+            record_vars: vec![],
+        },
+    );
+
+    // flat_map on an empty string array → empty array.
+    let proj = assert_agree(
+        "emit out = strs.flat_map(it => it.split(\",\"))",
+        &["strs"],
+        HashMap::from([("strs".to_string(), arr(vec![]))]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), arr(vec![]))],
+            record_vars: vec![],
+        },
+    );
+}
+
+/// A closure body that errors on one element propagates that error
+/// identically (kind + span + boundary provenance), and the per-element
+/// binding is removed on the error path so the env never leaks. The
+/// `find`-style early break is not reached because the error fires first.
+#[test]
+fn closure_body_error_propagates() {
+    let proj = assert_agree(
+        "emit out = nums.map(it => 1 / it)",
+        &["nums"],
+        HashMap::from([(
+            "nums".to_string(),
+            arr(vec![Value::Integer(1), Value::Integer(0)]),
+        )]),
+    );
+    match proj {
+        ResultProjection::Err {
+            kind,
+            triggering_field,
+            ..
+        } => {
+            assert_eq!(kind, "DivisionByZero");
+            assert_eq!(triggering_field.as_deref(), Some("out"));
+        }
+        other => panic!("expected error projection, got {other:?}"),
+    }
+}
+
+// ── Differential corpus: hardening — mixed numerics, ordering, Kleene ───
+
+/// Mixed int/float comparison widens the int to float before comparing;
+/// both evaluators must agree on the widened ordering.
+#[test]
+fn mixed_int_float_comparison() {
+    // Integer(2) > Float(1.5) → true.
+    let proj = assert_agree(
+        "emit out = a > b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::Integer(2)),
+            ("b".to_string(), Value::Float(1.5)),
+        ]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+    // Float(1.5) < Integer(2) → true.
+    let proj = assert_agree(
+        "emit out = a < b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::Float(1.5)),
+            ("b".to_string(), Value::Integer(2)),
+        ]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+    // Integer(2) == Float(2.0) → true (cross-type equality widens).
+    let proj = assert_agree(
+        "emit out = a == b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::Integer(2)),
+            ("b".to_string(), Value::Float(2.0)),
+        ]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+}
+
+/// String ordering compares lexicographically; both evaluators agree.
+#[test]
+fn string_ordering() {
+    let proj = assert_agree(
+        "emit out = a < b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::String("apple".into())),
+            ("b".to_string(), Value::String("banana".into())),
+        ]),
+    );
+    assert_eq!(
+        proj,
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+    assert_agree(
+        "emit out = a >= b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::String("zoo".into())),
+            ("b".to_string(), Value::String("zoo".into())),
+        ]),
+    );
+}
+
+/// The four `null or <bool>` Kleene cells, pinned deterministically:
+/// `null or true → true`, `null or false → null`, and the symmetric
+/// `null and false → false`, `null and true → null`.
+#[test]
+fn null_or_kleene_cells() {
+    let cell = |op: &str, b: Value| {
+        assert_agree(
+            &format!("emit out = a {op} b"),
+            &["a", "b"],
+            HashMap::from([("a".to_string(), Value::Null), ("b".to_string(), b)]),
+        )
+    };
+    // null or true → true.
+    assert_eq!(
+        cell("or", Value::Bool(true)),
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(true))],
+            record_vars: vec![],
+        },
+    );
+    // null or false → null.
+    assert_eq!(
+        cell("or", Value::Bool(false)),
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Null)],
+            record_vars: vec![],
+        },
+    );
+    // null and false → false.
+    assert_eq!(
+        cell("and", Value::Bool(false)),
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Bool(false))],
+            record_vars: vec![],
+        },
+    );
+    // null and true → null.
+    assert_eq!(
+        cell("and", Value::Bool(true)),
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Null)],
+            record_vars: vec![],
+        },
+    );
+}
+
+/// An agreed NaN result compares equal through the projection's NaN
+/// canonicalization rather than false-failing. `0.0 / 0.0` produces NaN
+/// from both evaluators; the projection maps it to a single canonical
+/// form so the assertion holds.
+#[test]
+fn nan_result_agrees() {
+    assert_agree(
+        "emit out = a / b",
+        &["a", "b"],
+        HashMap::from([
+            ("a".to_string(), Value::Float(0.0)),
+            ("b".to_string(), Value::Float(0.0)),
+        ]),
+    );
+}
+
+/// The `Any`-receiver method shapes the proptest generator emits
+/// (`to_string` / `is_null` / `type_of` / `catch`) typecheck on the
+/// generated leaf set and agree across both evaluators — pinned here so
+/// the property test's method coverage cannot silently collapse to
+/// all-rejected without this deterministic case also failing.
+#[test]
+fn generated_method_shapes_agree() {
+    let record = || {
+        HashMap::from([
+            ("a".to_string(), Value::Integer(5)),
+            ("b".to_string(), Value::String("x".into())),
+        ])
+    };
+    assert_agree("emit out = (a).to_string()", &["a", "b"], record());
+    assert_agree("emit out = (a).is_null()", &["a", "b"], record());
+    assert_agree("emit out = (a).type_of()", &["a", "b"], record());
+    assert_agree("emit out = ((a + 1)).to_string()", &["a", "b"], record());
+    assert_agree("emit out = (a).catch(b)", &["a", "b"], record());
+    assert_agree(
+        "emit out = ((a).is_null() or (a > 0))",
+        &["a", "b"],
+        record(),
+    );
+}
+
 // ── Property test: random scalar-core expressions ──────────────────────
 
 /// A generated scalar-core expression. Lowers to CXL source text and is
@@ -671,6 +1157,17 @@ enum GenExpr {
     Neg(Box<GenExpr>),
     Coalesce(Box<GenExpr>, Box<GenExpr>),
     If(Box<GenExpr>, Box<GenExpr>, Box<GenExpr>),
+    /// A zero-argument method on an arbitrary receiver. Restricted to the
+    /// `TypeTag::Any`-receiver builtins (`to_string` / `is_null` /
+    /// `type_of`) so the method does not constrain the receiver's type
+    /// and over-reject otherwise-valid generated programs. Exercises the
+    /// compiled `MethodCall` node and its delegation to `dispatch_method`
+    /// — including the null-receiver gate and its exceptions — over the
+    /// same nested receivers the scalar core generates.
+    Method(&'static str, Box<GenExpr>),
+    /// `catch(default)`: a one-argument `Any`-receiver method, exercising
+    /// the eager-argument path of the compiled `MethodCall` node.
+    Catch(Box<GenExpr>, Box<GenExpr>),
 }
 
 impl GenExpr {
@@ -695,6 +1192,10 @@ impl GenExpr {
                     t.render(),
                     e.render()
                 )
+            }
+            GenExpr::Method(name, recv) => format!("({}).{}()", recv.render(), name),
+            GenExpr::Catch(recv, default) => {
+                format!("({}).catch({})", recv.render(), default.render())
             }
         }
     }
@@ -749,6 +1250,13 @@ fn expr_strategy() -> impl Strategy<Value = GenExpr> {
                 Box::new(t),
                 Box::new(e)
             )),
+            (
+                prop_oneof![Just("to_string"), Just("is_null"), Just("type_of")],
+                inner.clone(),
+            )
+                .prop_map(|(name, recv)| GenExpr::Method(name, Box::new(recv))),
+            (inner.clone(), inner.clone())
+                .prop_map(|(recv, default)| GenExpr::Catch(Box::new(recv), Box::new(default))),
         ]
     })
 }
