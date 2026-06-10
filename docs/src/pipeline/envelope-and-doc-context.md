@@ -178,3 +178,56 @@ aggregate flush or trailer-count validation — fire at exactly the right
 point. Today the signals propagate through Source, Transform, Route,
 Sort, and Combine, and are reconciled at Merge (a document that fans in
 through several branches closes downstream exactly once).
+
+## Nested (multi-level) envelopes
+
+Some formats wrap their records in *several* envelope levels, one inside
+another. EDI X12 is the canonical example: an **interchange** (ISA/IEA)
+contains one or more **functional groups** (GS/GE), each containing one
+or more **transaction sets** (ST/SE), each containing the records. A
+single file can carry multiple interchanges back to back.
+
+A reader for such a format opens and closes each nested level as it
+crosses the corresponding envelope boundary mid-file. Each level
+contributes its own sections to `$doc`, under names *you* choose for that
+level. There is no new `$doc` syntax for nesting — every level's sections
+are read through the same two-level `$doc.<section>.<field>` lookup. Give
+each level a distinct section name and a record inside the innermost
+level sees them all:
+
+```yaml
+project:
+  - interchange_control: $doc.interchange.control_ref   # ISA level
+  - functional_id:       $doc.group.functional_id       # GS level
+  - transaction_type:    $doc.transaction.set_id         # ST level
+  - claim_amount:        amount                          # body field
+```
+
+A record streamed inside the ST level resolves the ST section, the
+enclosing GS section, and the outermost ISA section, all at once: each
+inner level inherits every enclosing level's sections as siblings in one
+flat namespace. If two levels declare a section with the *same* name, the
+innermost wins for records inside it — the same shadowing rule a nested
+scope follows in any language. Picking distinct per-level names (as above)
+keeps every level independently visible.
+
+Boundaries nest correctly through the pipeline: each level opens before
+the records inside it and closes after them, in strict innermost-first
+order. A level that fans in through several branches is still reconciled
+once at Merge, exactly like a single-level document.
+
+## Header-only interchanges
+
+A multi-level envelope file can legitimately carry an interchange whose
+body is empty — envelope structure (an interchange header, and possibly
+inner group headers) with zero records inside. Such an interchange still
+opens a document and emits its open/close boundaries, so downstream
+operators and trailer-count validation observe it just like any other
+document. The interchange's `$doc.*` sections are extracted and the
+boundaries flow even though no body record ever streams from it.
+
+The same holds for an empty *inner* envelope — an open/close pair with no
+records between — and for an inner envelope that opens or closes after the
+file's last body record. Every envelope boundary a reader signals is
+applied, whether or not a record follows it, so the document frame stays
+balanced end to end.

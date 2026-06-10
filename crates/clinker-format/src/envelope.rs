@@ -19,6 +19,40 @@ use clinker_record::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+/// A reader-driven envelope-nesting signal, queued by a multi-level
+/// format reader and drained by the source ingest driver after each
+/// `next_record`.
+///
+/// Single-level envelope formats (XML, JSON, EDIFACT) never produce
+/// these — their whole document is one `prepare_document` pre-scan, so
+/// the driver opens exactly one document per file. Multi-level formats
+/// (EDI X12 ISA → GS → ST) cross envelope boundaries *mid-file*: the
+/// reader emits `OpenLevel` when it enters a nested envelope and
+/// `CloseLevel` when it leaves one. The driver maps each `OpenLevel` to a
+/// child [`clinker_record::DocumentContext`] (carrying the level's
+/// extracted sections, layered as siblings over the enclosing levels) and
+/// a `DocumentOpen` punctuation, and each `CloseLevel` to the matching
+/// `DocumentClose`.
+///
+/// Events are inline with the record stream, not an out-of-band channel:
+/// the driver drains them in arrival order relative to records, so a
+/// level opens before the records inside it and closes after them. A
+/// trailing `OpenLevel`/`CloseLevel` pair with no records between (a
+/// header-only inner envelope, or a header-only interchange) is a
+/// legitimate, balanced shape the driver applies in full — it must not be
+/// skipped at end-of-input.
+#[derive(Debug, Clone)]
+pub enum EnvelopeEvent {
+    /// Enter a nested envelope level, carrying the sections the reader
+    /// extracted for it (already coerced to their declared field types,
+    /// keyed by user-declared section name). The driver opens a child
+    /// document context whose sections layer over the enclosing levels.
+    OpenLevel { sections: IndexMap<Box<str>, Value> },
+    /// Leave the innermost open nested envelope level. The driver closes
+    /// the matching document context.
+    CloseLevel,
+}
+
 /// Configuration for one source's envelope sections.
 ///
 /// Section keys are user-chosen identifiers — the engine reserves

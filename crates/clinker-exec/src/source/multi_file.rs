@@ -207,6 +207,18 @@ impl FormatReader for MultiFileFormatReader {
             .prepare_document(config)
     }
 
+    fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
+        // Forward the active per-file reader's nested-envelope boundaries.
+        // Each file is a self-contained document, so its inner levels open
+        // and close entirely within that file's stream; the wrapper never
+        // bridges a level across a file boundary. Before any file is
+        // materialized there are no events to drain.
+        match self.active.as_mut() {
+            Some(active) => active.take_envelope_events(),
+            None => Vec::new(),
+        }
+    }
+
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         // Materialize file 0 if we haven't yet.
         if self.active.is_none() {

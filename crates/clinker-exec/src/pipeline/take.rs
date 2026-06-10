@@ -42,6 +42,17 @@ impl<R: FormatReader> FormatReader for TakeReader<R> {
         }
         Ok(record)
     }
+
+    fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
+        // Forward the inner reader's nested-envelope boundaries so a
+        // `--dry-run -n N` over a multi-level source still frames the
+        // records it does emit. Once the record limit truncates the read
+        // the inner reader stops producing events; any envelope level left
+        // open at that point is closed by the ingest driver's
+        // end-of-input sweep, so a truncated dry-run never desyncs the
+        // downstream document stack.
+        self.inner.take_envelope_events()
+    }
 }
 
 #[cfg(test)]
