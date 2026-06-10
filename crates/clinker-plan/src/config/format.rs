@@ -15,6 +15,7 @@ pub enum InputFormat {
     Json(Option<JsonInputOptions>),
     Xml(Option<XmlInputOptions>),
     FixedWidth(Option<FixedWidthInputOptions>),
+    Edifact(Option<EdifactInputOptions>),
 }
 
 impl InputFormat {
@@ -25,6 +26,7 @@ impl InputFormat {
             InputFormat::Json(_) => "json",
             InputFormat::Xml(_) => "xml",
             InputFormat::FixedWidth(_) => "fixed_width",
+            InputFormat::Edifact(_) => "edifact",
         }
     }
 
@@ -45,6 +47,7 @@ impl OutputFormat {
             OutputFormat::Json(_) => "json",
             OutputFormat::Xml(_) => "xml",
             OutputFormat::FixedWidth(_) => "fixed_width",
+            OutputFormat::Edifact(_) => "edifact",
         }
     }
 }
@@ -57,6 +60,7 @@ pub enum OutputFormat {
     Json(Option<JsonOutputOptions>),
     Xml(Option<XmlOutputOptions>),
     FixedWidth(Option<FixedWidthOutputOptions>),
+    Edifact(Option<EdifactOutputOptions>),
 }
 
 /// Supported format types.

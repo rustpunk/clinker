@@ -18,13 +18,9 @@ use indexmap::IndexMap;
 use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
-use clinker_record::{
-    DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, Record, Schema, SchemaBuilder, Value,
-    coerce_to_bool, coerce_to_date, coerce_to_datetime, coerce_to_float, coerce_to_int,
-    coerce_to_string,
-};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
-use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
+use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 
@@ -423,6 +419,13 @@ impl FormatReader for XmlReader {
                          against an XML source. Use `xml_path` for XML envelope sections."
                     )));
                 }
+                EnvelopeExtract::Segment(_) => {
+                    return Err(FormatError::Xml(format!(
+                        "envelope section {name:?}: declared `segment` extract \
+                         against an XML source. The `segment` extract is for \
+                         flat-file formats (EDIFACT); use `xml_path` for XML."
+                    )));
+                }
             }
         }
 
@@ -455,7 +458,8 @@ impl FormatReader for XmlReader {
                             &self.config.attribute_prefix,
                             path_stack.len(),
                         )?;
-                        let typed = coerce_section_fields(payload, &section.fields)?;
+                        let typed = coerce_section_fields(payload, &section.fields)
+                            .map_err(FormatError::Xml)?;
                         captured.insert(Box::from(&**sec_name), typed);
                         // `read_section_payload` consumed the matched
                         // subtree up to its closing `End`. Pop the
@@ -475,7 +479,8 @@ impl FormatReader for XmlReader {
                         let mut payload: Vec<(String, String)> = Vec::new();
                         let attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                         payload.extend(attrs);
-                        let typed = coerce_section_fields(payload, &section.fields)?;
+                        let typed = coerce_section_fields(payload, &section.fields)
+                            .map_err(FormatError::Xml)?;
                         captured.insert(Box::from(&**sec_name), typed);
                     }
                     path_stack.pop();
@@ -614,50 +619,6 @@ fn read_section_payload(
     }
 }
 
-/// Coerce raw `(name, string)` pairs from envelope extraction into
-/// the section's declared field schema. Unknown fields are dropped
-/// silently (the section schema is the contract). Missing fields are
-/// not reported here — they evaluate to `Value::Null` via the
-/// `DocumentContext::get_section_field` `Option`-to-`Null` mapping at
-/// CXL eval time. Type-mismatch coercions surface as a format error
-/// citing the section, field, and observed value.
-fn coerce_section_fields(
-    raw: Vec<(String, String)>,
-    schema: &IndexMap<String, EnvelopeFieldType>,
-) -> Result<IndexMap<Box<str>, Value>, FormatError> {
-    let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
-    // Build a lookup so we coerce each raw value through the declared
-    // type. Multiple raw values for the same field name (rare, e.g.
-    // repeated elements) keep the first non-empty observation.
-    let mut by_name: IndexMap<&str, &str> = IndexMap::with_capacity(raw.len());
-    for (k, v) in &raw {
-        by_name.entry(k.as_str()).or_insert(v.as_str());
-    }
-    for (field, ty) in schema {
-        let raw_str = match by_name.get(field.as_str()) {
-            Some(s) if !s.is_empty() => *s,
-            _ => continue,
-        };
-        let value = Value::String(raw_str.into());
-        let coerced = match ty {
-            EnvelopeFieldType::String => coerce_to_string(&value),
-            EnvelopeFieldType::Int => coerce_to_int(&value),
-            EnvelopeFieldType::Float => coerce_to_float(&value),
-            EnvelopeFieldType::Bool => coerce_to_bool(&value),
-            EnvelopeFieldType::Date => coerce_to_date(&value, DEFAULT_DATE_FORMATS),
-            EnvelopeFieldType::DateTime => coerce_to_datetime(&value, DEFAULT_DATETIME_FORMATS),
-        }
-        .map_err(|e| {
-            FormatError::Xml(format!(
-                "envelope section field {field:?} (declared type {ty:?}): \
-                 cannot coerce value {raw_str:?}: {e}"
-            ))
-        })?;
-        out.insert(Box::from(field.as_str()), coerced);
-    }
-    Ok(out)
-}
-
 /// Simple type inference from string values (same rules as JSON).
 fn infer_value(s: &str) -> Value {
     if s.is_empty() {
@@ -681,6 +642,7 @@ fn infer_value(s: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::EnvelopeFieldType;
     use std::io::Cursor;
 
     fn reader_from_str(xml: &str, config: XmlReaderConfig) -> XmlReader {
@@ -801,6 +763,23 @@ mod tests {
         let mut reader = reader_from_str(xml, default_config_with_path("doc/a"));
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Xml(msg) if msg.contains("json_pointer")));
+    }
+
+    #[test]
+    fn prepare_document_rejects_segment_extract() {
+        use crate::envelope::EnvelopeSection;
+        let xml = r#"<doc><a><x>1</x></a></doc>"#;
+        let mut cfg = EnvelopeConfig::default();
+        cfg.sections.insert(
+            "Bad".into(),
+            EnvelopeSection {
+                extract: EnvelopeExtract::Segment("UNB".into()),
+                fields: IndexMap::new(),
+            },
+        );
+        let mut reader = reader_from_str(xml, default_config_with_path("doc/a"));
+        let err = reader.prepare_document(&cfg).unwrap_err();
+        assert!(matches!(err, FormatError::Xml(msg) if msg.contains("segment")));
     }
 
     #[test]

@@ -78,6 +78,7 @@
 //! | `E317`      | error    | `error_handling.dlq.per_source` key does not name a declared Source |
 //! | `E318`      | error    | `error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides |
 //! | `E322`      | error    | Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file |
+//! | `E323`      | error    | `edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope) |
 
 use crate::span::{FileId, Span};
 

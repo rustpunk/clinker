@@ -1,6 +1,7 @@
 pub mod bom;
 pub mod counting;
 pub mod csv;
+pub mod edifact;
 pub mod envelope;
 pub mod error;
 pub mod fixed_width;

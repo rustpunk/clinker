@@ -2499,6 +2499,27 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
+    // An EDIFACT interchange is a single envelope: every record sits
+    // inside one UNB..UNZ frame whose trailer counts are recomputed and
+    // written only at end of stream. Byte-limit file splitting flushes
+    // (and therefore finalizes) the writer mid-stream, which would seal
+    // the interchange after the first record and emit later records — and
+    // their fresh UNH headers — after the UNZ trailer. There is no
+    // meaningful way to split one interchange across files, so reject the
+    // combination up front rather than emit a structurally corrupt
+    // interchange that still reports run success.
+    for output in config.output_configs() {
+        if matches!(output.format, OutputFormat::Edifact(_)) && output.split.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "[E323] output '{}': `edifact` output cannot be combined with `split` — \
+                 an EDIFACT interchange is a single UNB..UNZ envelope and cannot be \
+                 divided across files; remove the `split` block or choose a splittable \
+                 format",
+                output.name
+            )));
+        }
+    }
+
     // Validate the flat `vars:` block (`$vars.<key>` static config)
     if let Some(ref vars) = config.pipeline.vars {
         for (name, decl) in vars {

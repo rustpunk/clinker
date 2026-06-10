@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use clinker_record::{Record, SchemaBuilder, Value};
 use indexmap::IndexMap;
@@ -109,7 +110,14 @@ pub fn project_output_from_record(
                 values.push(value.clone());
             }
         }
-        return Record::new(schema_builder.build(), values);
+        let mut out = Record::new(schema_builder.build(), values);
+        // The projected row is the same document's row — carry its
+        // envelope context forward so a writer that reconstructs the
+        // document envelope on output (e.g. EDIFACT `interchange_from_doc`
+        // echoing the source `UNB` header) can still resolve
+        // `$doc.<section>.<field>` after projection drops engine columns.
+        out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+        return out;
     }
 
     // Slow path: config requires rewriting field names / dropping
@@ -180,14 +188,18 @@ pub fn project_output_from_record(
         .collect::<SchemaBuilder>()
         .build();
     let values: Vec<Value> = fields.into_values().collect();
-    Record::new(schema, values)
+    let mut out = Record::new(schema, values);
+    // Same document's row after the rename/exclude rewrite — carry the
+    // envelope context forward so document-reconstructing writers still
+    // resolve `$doc.<section>.<field>` on the projected record.
+    out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clinker_record::Schema;
-    use std::sync::Arc;
 
     fn make_input() -> Record {
         // Schema is pre-widened to include every field the post-transform
@@ -533,6 +545,63 @@ mod tests {
         assert!(
             result.get("$widened").is_none(),
             "$widened slot must be stripped after expansion"
+        );
+    }
+
+    #[test]
+    fn fast_path_carries_doc_context_forward() {
+        use clinker_record::{DocumentContext, DocumentId};
+        use indexmap::IndexMap as RecIndexMap;
+
+        // The default Output config (no mapping/exclude, include_unmapped
+        // false, cxl_emit_names None) takes the fast path. A document-
+        // reconstructing writer downstream — e.g. EDIFACT
+        // `interchange_from_doc` echoing the source `UNB` — must still
+        // resolve `$doc.<section>.<field>` on the projected record, so the
+        // fast path has to carry the envelope context forward.
+        let schema = Arc::new(Schema::new(vec!["seg_id".into(), "e01".into()]));
+        let mut input = Record::new(
+            schema,
+            vec![Value::String("BGM".into()), Value::String("220".into())],
+        );
+        let mut unb: RecIndexMap<Box<str>, Value> = RecIndexMap::new();
+        unb.insert("e01".into(), Value::String("UNOA:1".into()));
+        let mut sections: RecIndexMap<Box<str>, Value> = RecIndexMap::new();
+        sections.insert("unb".into(), Value::Map(Box::new(unb)));
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        input.set_doc_ctx(Arc::clone(&ctx));
+
+        let config = OutputConfig {
+            name: "out".into(),
+            format: clinker_plan::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_unmapped: false,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_correlation_keys: false,
+            correlation_fanout_policy: None,
+            if_exists: Default::default(),
+            unique_suffix_width: 0,
+            write_meta: false,
+            schema: None,
+            split: None,
+            notes: None,
+        };
+
+        // cxl_emit_names None keeps drop_unmapped false, so needs_rewrite
+        // is false and the fast path runs.
+        let result = project_output_from_record(&input, &config, None);
+        assert_eq!(
+            result.doc_ctx().get_section_field("unb", "e01"),
+            Some(Value::String("UNOA:1".into())),
+            "fast path must carry the source document context forward"
         );
     }
 }

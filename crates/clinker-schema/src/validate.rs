@@ -130,6 +130,7 @@ fn validate_input(
         ),
         InputFormat::Xml(_) => schema.metadata.format == crate::model::SourceFormat::Xml,
         InputFormat::FixedWidth(_) => false, // No schema format match for fixed-width yet
+        InputFormat::Edifact(_) => schema.metadata.format == crate::model::SourceFormat::Edifact,
     };
 
     if !format_matches {

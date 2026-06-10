@@ -12,6 +12,11 @@ pub enum FormatError {
     Json(String),
     Xml(String),
     FixedWidth(String),
+    /// An EDIFACT parse, envelope-count, or malformed-segment failure.
+    /// Carries a precise message naming the offending control segment or
+    /// constraint (bad UNA, UNT/UNZ count mismatch, control-ref echo
+    /// mismatch, truncation, unsupported UNG/UNE grouping).
+    Edifact(String),
     InvalidRecord {
         row: u64,
         message: String,
@@ -55,6 +60,7 @@ impl fmt::Display for FormatError {
             Self::Json(msg) => write!(f, "JSON error: {msg}"),
             Self::Xml(msg) => write!(f, "XML error: {msg}"),
             Self::FixedWidth(msg) => write!(f, "fixed-width error: {msg}"),
+            Self::Edifact(msg) => write!(f, "EDIFACT error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }

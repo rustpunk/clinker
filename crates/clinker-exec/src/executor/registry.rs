@@ -9,6 +9,7 @@ use clinker_record::Schema;
 
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
+use clinker_format::edifact::writer::{EdifactWriter, EdifactWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
@@ -107,6 +108,21 @@ fn build_fw_writer_config(
         config.line_separator = sep.clone();
     }
     config
+}
+
+fn build_edifact_writer_config(
+    opts: Option<&clinker_plan::config::EdifactOutputOptions>,
+) -> EdifactWriterConfig {
+    // `segment_newline` defaults to `true` (readable per-segment lines);
+    // `write_una` to `false`. The struct literal expresses both up front
+    // so an unset option falls through to the documented default.
+    EdifactWriterConfig {
+        interchange: opts.and_then(|o| o.interchange.clone()),
+        interchange_from_doc: opts.and_then(|o| o.interchange_from_doc.clone()),
+        message_type: opts.and_then(|o| o.message_type.clone()),
+        write_una: opts.and_then(|o| o.write_una).unwrap_or(false),
+        segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
+    }
 }
 
 /// Extract `Vec<FieldDef>` from an output config's schema for fixed-width format.
@@ -222,6 +238,16 @@ fn build_writer_factory(
                     fields.clone(),
                     fw_config.clone(),
                 )?))
+            })
+        }
+        OutputFormat::Edifact(opts) => {
+            let edi_config = build_edifact_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(EdifactWriter::new(
+                    counting_writer,
+                    schema,
+                    edi_config.clone(),
+                )))
             })
         }
     }

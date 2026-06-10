@@ -7,6 +7,7 @@ use clinker_plan::config::{InputFormat, JsonFormat};
 #[derive(Debug)]
 pub enum FormatMappingError {
     UnsupportedJsonObject,
+    UnsupportedEdifact,
 }
 
 impl std::fmt::Display for FormatMappingError {
@@ -14,6 +15,9 @@ impl std::fmt::Display for FormatMappingError {
         match self {
             Self::UnsupportedJsonObject => {
                 f.write_str("JSON object format has no benchmark DataFormat equivalent")
+            }
+            Self::UnsupportedEdifact => {
+                f.write_str("EDIFACT format has no benchmark DataFormat equivalent")
             }
         }
     }
@@ -29,6 +33,7 @@ pub fn input_format_to_data_format(input: &InputFormat) -> Result<DataFormat, Fo
         InputFormat::Csv(_) => Ok(DataFormat::Csv),
         InputFormat::Xml(_) => Ok(DataFormat::Xml),
         InputFormat::FixedWidth(_) => Ok(DataFormat::FixedWidth),
+        InputFormat::Edifact(_) => Err(FormatMappingError::UnsupportedEdifact),
         InputFormat::Json(opts) => {
             let json_fmt = opts.as_ref().and_then(|o| o.format.as_ref());
             match json_fmt {
