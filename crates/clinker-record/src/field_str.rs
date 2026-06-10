@@ -259,11 +259,14 @@ impl FieldStr {
     }
 
     /// Returns true when the value is stored in the header-free unique arm
-    /// rather than the default inline-or-`Arc`-shared one. Lets the reader and
-    /// its tests confirm a schema-flagged column landed in the intended
-    /// representation; the arm is otherwise invisible through the `str` API.
+    /// rather than the default inline-or-`Arc`-shared one. The arm is otherwise
+    /// invisible through the `str` API, so this is a test-only observability
+    /// hook for in-crate unit tests that pin the intended representation; it is
+    /// not part of the production surface, and cross-crate tests assert the
+    /// arm's effect through observable clone semantics instead.
+    #[cfg(test)]
     #[inline]
-    pub fn is_unique(&self) -> bool {
+    pub(crate) fn is_unique(&self) -> bool {
         self.tag() == TAG_UNIQUE
     }
 }

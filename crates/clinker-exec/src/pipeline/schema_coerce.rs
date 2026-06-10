@@ -424,33 +424,61 @@ mod tests {
     }
 
     /// A `long_unique`-flagged column stores its values in the header-free
-    /// `Box`-backed arm; an unflagged column keeps the default policy.
+    /// `Box`-backed arm; an unflagged column keeps the default `Arc`-shared
+    /// policy. The two arms are distinguished here through observable clone
+    /// semantics rather than an internal arm probe: a unique-arm `FieldStr`
+    /// deep-copies its bytes on clone (a fresh allocation, a distinct `str`
+    /// pointer), whereas the default `Arc`-shared arm bumps a refcount and the
+    /// clone aliases the original allocation (pointer-identical `str`). Both
+    /// values exceed the 23-byte inline boundary, so neither lands inline.
     #[test]
     fn test_long_unique_column_lands_in_unique_arm() {
-        let schema = vec![col_unique("uuid", Type::String), col("name", Type::String)];
+        let schema = vec![
+            col_unique("uuid", Type::String),
+            col("name_uuid", Type::String),
+        ];
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let reader = csv_reader(&format!("uuid,name\n{uuid},Alice\n"));
+        let name = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let reader = csv_reader(&format!("uuid,name_uuid\n{uuid},{name}\n"));
         let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         match rec.get("uuid") {
             Some(Value::String(s)) => {
                 assert_eq!(s.as_str(), uuid);
-                assert!(s.is_unique(), "flagged column must take the unique arm");
+                assert!(s.heap_size() > 0, "a 36-byte UUID is never inline");
+                // Unique arm: a clone deep-copies into a fresh allocation, so
+                // the clone's backing `str` lives at a different address.
+                let cloned = s.clone();
+                assert_eq!(cloned.as_str(), s.as_str());
+                assert_ne!(
+                    cloned.as_str().as_ptr(),
+                    s.as_str().as_ptr(),
+                    "the flagged column's value must take the deep-copying unique arm"
+                );
             }
             other => panic!("expected String, got {other:?}"),
         }
-        // The unflagged neighbor keeps the default policy.
-        match rec.get("name") {
+        // The unflagged neighbor keeps the default `Arc`-shared policy: cloning
+        // shares the allocation, so the clone's `str` is pointer-identical.
+        match rec.get("name_uuid") {
             Some(Value::String(s)) => {
-                assert!(!s.is_unique(), "unflagged column must keep the default arm")
+                assert!(s.heap_size() > 0, "a 36-byte UUID is never inline");
+                let cloned = s.clone();
+                assert_eq!(
+                    cloned.as_str().as_ptr(),
+                    s.as_str().as_ptr(),
+                    "the unflagged column must keep the Arc-shared default arm"
+                );
             }
             other => panic!("expected String, got {other:?}"),
         }
     }
 
-    /// The default (no flag) leaves every string in the default arm — the
-    /// pre-existing behavior is byte-for-byte unchanged.
+    /// The default (no flag) leaves every string in the `Arc`-shared default
+    /// arm — the pre-existing behavior is byte-for-byte unchanged. Observed
+    /// through clone aliasing: a default-arm clone shares the original's
+    /// allocation rather than deep-copying as the unique arm would.
     #[test]
     fn test_unflagged_columns_keep_default_arm() {
         let schema = vec![col("uuid", Type::String)];
@@ -460,7 +488,15 @@ mod tests {
 
         let rec = coercing.next_record().unwrap().unwrap();
         match rec.get("uuid") {
-            Some(Value::String(s)) => assert!(!s.is_unique()),
+            Some(Value::String(s)) => {
+                assert!(s.heap_size() > 0, "a 36-byte UUID is never inline");
+                let cloned = s.clone();
+                assert_eq!(
+                    cloned.as_str().as_ptr(),
+                    s.as_str().as_ptr(),
+                    "an unflagged column clone must alias the Arc-shared allocation"
+                );
+            }
             other => panic!("expected String, got {other:?}"),
         }
     }

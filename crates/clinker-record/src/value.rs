@@ -306,12 +306,6 @@ impl From<smol_str::SmolStr> for Value {
     }
 }
 
-impl From<FieldStr> for Value {
-    fn from(s: FieldStr) -> Self {
-        Value::String(s)
-    }
-}
-
 /// Shared `Value::Null` sentinel used by `FieldResolver` implementations
 /// that need to hand out a `&Value` for a logically-absent field.
 ///
