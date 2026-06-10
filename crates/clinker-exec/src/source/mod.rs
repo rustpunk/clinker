@@ -13,7 +13,7 @@ pub mod multi_file;
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
-use clinker_format::{EnvelopeConfig, FormatError};
+use clinker_format::{EnvelopeConfig, EnvelopeEvent, FormatError};
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -62,6 +62,17 @@ pub trait RecordSource: Send {
         Ok(IndexMap::new())
     }
 
+    /// Drain the envelope-nesting events the source queued while serving
+    /// the most recent `next_record` (or its end-of-input transition).
+    /// Mirrors [`FormatReader::take_envelope_events`]: the ingest driver
+    /// polls this after every `next_record` and once at end-of-input,
+    /// opening/closing nested document contexts per event. The default
+    /// returns an empty `Vec` for transports without multi-level envelope
+    /// semantics (every transport shipping today).
+    fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
+        Vec::new()
+    }
+
     /// Hand the source its run shutdown handle so it can poll for
     /// cancellation at page/row-batch boundaries and stop cleanly
     /// (returning `Ok(None)` like a normal EOF). The ingest driver
@@ -95,6 +106,10 @@ impl RecordSource for Box<dyn FormatReader> {
         config: &EnvelopeConfig,
     ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
         (**self).prepare_document(config)
+    }
+
+    fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
+        (**self).take_envelope_events()
     }
 }
 

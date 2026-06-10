@@ -214,6 +214,14 @@ impl FormatReader for CoercingReader {
         // records only, so forward the pre-scan straight through.
         self.inner.prepare_document(config)
     }
+
+    fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
+        // Nested-envelope boundaries are a property of the raw source's
+        // structure, untouched by per-record type coercion — forward them
+        // verbatim so a multi-level source streamed through coercion keeps
+        // its envelope nesting.
+        self.inner.take_envelope_events()
+    }
 }
 
 /// Unwrap Nullable to get the inner type for coercion.

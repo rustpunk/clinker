@@ -81,6 +81,38 @@ impl DocumentContext {
         &self.source_file
     }
 
+    /// Open a nested envelope level beneath this one, flattening the
+    /// ancestry into a single sibling sections map.
+    ///
+    /// Multi-level envelope formats (EDI X12 ISA → GS → ST) nest
+    /// envelopes inside a file. Rather than chain `DocumentContext`s,
+    /// each inner level mints a fresh context that carries every section
+    /// the enclosing levels declared *plus* its own — all siblings in one
+    /// map. A record streamed inside the ST level therefore resolves the
+    /// ISA's `$doc.interchange.*`, the GS's `$doc.group.*`, and its own
+    /// `$doc.transaction.*` through the same two-level lookup, with no CXL
+    /// syntax change. Per-level section *names* keep the levels distinct;
+    /// a child section name that collides with an ancestor's shadows the
+    /// ancestor (innermost wins), matching the lexical-scope intuition.
+    ///
+    /// The new level gets a distinct [`DocumentId`] (so Merge dedup and
+    /// any per-document operator treat each level as its own document
+    /// frame) and inherits the parent's `source_file` (every level of one
+    /// file shares the file identity). Sections are cloned by `Arc`/`Value`
+    /// — envelope payloads are small (a few fields per level), so the copy
+    /// is O(declared sections), not O(body).
+    pub fn child(&self, id: DocumentId, sections: IndexMap<Box<str>, Value>) -> Self {
+        let mut merged = self.sections.clone();
+        for (name, payload) in sections {
+            merged.insert(name, payload);
+        }
+        Self {
+            id,
+            source_file: Arc::clone(&self.source_file),
+            sections: merged,
+        }
+    }
+
     /// Resolve `$doc.<section>.<field>` by chained lookup. Returns
     /// `None` if either the section is undeclared on this document or
     /// the field is missing from the section's payload. CXL eval maps
@@ -192,6 +224,68 @@ mod tests {
         assert!(ctx.get_section_field("Middle", "x").is_none());
         // Known section, unknown field.
         assert!(ctx.get_section_field("Head", "missing").is_none());
+    }
+
+    #[test]
+    fn child_layers_sibling_sections_and_inherits_file() {
+        let mut isa = IndexMap::new();
+        isa.insert(
+            Box::from("interchange"),
+            make_section(&[("control_ref", Value::String("000000001".into()))]),
+        );
+        let file: Arc<str> = Arc::from("claim.x12");
+        let parent = DocumentContext::new(DocumentId::next(), Arc::clone(&file), isa);
+
+        let mut gs = IndexMap::new();
+        gs.insert(
+            Box::from("group"),
+            make_section(&[("functional_id", Value::String("HC".into()))]),
+        );
+        let group_id = DocumentId::next();
+        let child = parent.child(group_id, gs);
+
+        // Distinct identity per level, shared file.
+        assert_ne!(child.id(), parent.id());
+        assert_eq!(child.id(), group_id);
+        assert!(Arc::ptr_eq(child.source_file(), &file));
+
+        // The child resolves BOTH its own section and the inherited
+        // ancestor section through the same two-level lookup — the
+        // flattened-sibling representation that lets nested levels read
+        // via distinct names with no $doc syntax change.
+        assert_eq!(
+            child.get_section_field("interchange", "control_ref"),
+            Some(Value::String("000000001".into()))
+        );
+        assert_eq!(
+            child.get_section_field("group", "functional_id"),
+            Some(Value::String("HC".into()))
+        );
+        // The parent never gained the child's section.
+        assert!(parent.get_section_field("group", "functional_id").is_none());
+    }
+
+    #[test]
+    fn child_section_name_collision_shadows_ancestor() {
+        let mut outer = IndexMap::new();
+        outer.insert(
+            Box::from("meta"),
+            make_section(&[("level", Value::String("interchange".into()))]),
+        );
+        let parent = DocumentContext::new(DocumentId::next(), Arc::from("f.x12"), outer);
+
+        let mut inner = IndexMap::new();
+        inner.insert(
+            Box::from("meta"),
+            make_section(&[("level", Value::String("transaction".into()))]),
+        );
+        let child = parent.child(DocumentId::next(), inner);
+
+        // Innermost wins on a name collision — lexical-scope intuition.
+        assert_eq!(
+            child.get_section_field("meta", "level"),
+            Some(Value::String("transaction".into()))
+        );
     }
 
     #[test]

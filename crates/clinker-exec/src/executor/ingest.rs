@@ -344,26 +344,25 @@ fn drive_record_source(
         let mut rn: u64 = 0;
         let mut total_count: u64 = 0;
         let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
-        // Per-file envelope context. Tracks the document currently
-        // being streamed; transitions to a new file emit `DocumentClose`
-        // for the previous context and `DocumentOpen` for the new one.
-        // Envelope sections are empty until reader-side pre-scan lands
-        // — CXL `$doc.<section>.<field>` against this context resolves
-        // to `Value::Null`, which is the streaming-resolver convention
-        // for an absent section.
-        let mut current_doc: Option<Arc<clinker_record::DocumentContext>> = None;
-        // A closed channel during punctuation delivery carries the same
-        // meaning as during record delivery — the consumer stopped pulling
-        // (shutdown unwind or early downstream completion). No further
-        // punctuation matters once the receiver is gone, so treat it as a
-        // benign no-op; the loop's record push breaks on the same signal.
-        let push_punct = |stream: &mut crate::executor::source_stream::SourceIngestChannel,
-                          punct: crate::executor::stream_event::Punctuation|
-         -> Result<(), PipelineError> {
-            match stream.push_punctuation(punct) {
-                Ok(()) | Err(crate::executor::source_stream::SourceStreamError::Closed) => Ok(()),
-            }
-        };
+        // Per-file envelope-level stack, outermost (file-level) first.
+        //
+        // A single-level source (XML, JSON, EDIFACT, plain CSV) holds at
+        // most one entry: the file-level document opened from the reader's
+        // pre-scan. A multi-level source (EDI X12 ISA → GS → ST) pushes a
+        // child context per nested `OpenLevel` event and pops it on the
+        // matching `CloseLevel`, so the stack depth tracks the live
+        // envelope nesting. The INNERMOST entry (`last()`) is the context
+        // every body record carries — its flattened sections expose every
+        // enclosing level's `$doc.<section>.<field>` through the unchanged
+        // two-level lookup. Envelope sections are empty until reader-side
+        // pre-scan lands; absent sections resolve to `Value::Null` per the
+        // streaming-resolver convention.
+        // The file currently being streamed is the `source_file` of the
+        // file-level document at the base of the stack (`doc_stack[0]`), so
+        // no separate file-tracking variable is needed — the stack is the
+        // single source of truth for both the live nesting and the open
+        // file's identity.
+        let mut doc_stack: Vec<Arc<clinker_record::DocumentContext>> = Vec::new();
         loop {
             match src_reader.next_record() {
                 Ok(Some(record)) => {
@@ -373,51 +372,35 @@ fn drive_record_source(
                         .current_source_file()
                         .cloned()
                         .unwrap_or_else(|| Arc::clone(&static_source_file));
-                    // Document boundary detection: on the first record,
-                    // or when the reader transitions to a new file, close
-                    // the previous document (if any) and open a fresh one
-                    // whose Arc is shared across all records of this file.
-                    let need_new_doc = match current_doc.as_ref() {
-                        None => true,
-                        Some(ctx) => !Arc::ptr_eq(ctx.source_file(), &file_arc),
-                    };
-                    if need_new_doc {
-                        if let Some(prev) = current_doc.take() {
-                            push_punct(
-                                &mut stream,
-                                crate::executor::stream_event::Punctuation::document_close(prev),
-                            )?;
-                        }
-                        // Pre-scan declared envelope sections for the new
-                        // file. Sources without `envelope:` config pass
-                        // an empty section map; the default trait impl
-                        // also returns an empty section map. Sections
-                        // populate before the first body record's
-                        // punctuation emits so every record carries the
-                        // same fully-populated context.
-                        let envelope_sections = match src_cfg.envelope.as_ref() {
-                            Some(cfg) => src_reader.prepare_document(cfg).map_err(|e| {
-                                PipelineError::Internal {
-                                    op: "envelope-pre-scan",
-                                    node: src_cfg.name.clone(),
-                                    detail: e.to_string(),
-                                }
-                            })?,
-                            None => indexmap::IndexMap::new(),
-                        };
-                        let new_ctx = Arc::new(clinker_record::DocumentContext::new(
-                            clinker_record::DocumentId::next(),
-                            Arc::clone(&file_arc),
-                            envelope_sections,
-                        ));
-                        push_punct(
+                    // Document boundary detection: on the first record, or
+                    // when the reader transitions to a new file, close the
+                    // prior file's whole level stack and open a fresh
+                    // file-level document whose Arc is shared across all
+                    // records of this file.
+                    if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                        open_file_level_doc(
+                            &src_cfg,
                             &mut stream,
-                            crate::executor::stream_event::Punctuation::document_open(Arc::clone(
-                                &new_ctx,
-                            )),
+                            &mut doc_stack,
+                            &mut src_reader,
+                            &file_arc,
                         )?;
-                        current_doc = Some(new_ctx);
                     }
+                    // Apply the envelope boundaries the reader crossed to
+                    // reach this record BEFORE stamping it, so the record
+                    // carries the innermost level it actually sits inside.
+                    // A reader queues `OpenLevel`/`CloseLevel` as it crosses
+                    // each envelope segment during `next_record`; draining
+                    // here puts every level opened ahead of this record on
+                    // the stack first, and pops every level that closed
+                    // before it.
+                    apply_envelope_events(
+                        &src_cfg,
+                        &mut stream,
+                        &mut doc_stack,
+                        &mut src_reader,
+                        &file_arc,
+                    )?;
                     let mut values: Vec<clinker_record::Value> = record.values().to_vec();
                     let event_time_value: clinker_record::Value = if let Some(idx) =
                         watermark_column_idx
@@ -435,7 +418,9 @@ fn drive_record_source(
                     values.push(event_time_value);
                     let mut widened_record =
                         clinker_record::Record::new(Arc::clone(&widened_schema), values);
-                    if let Some(ctx) = current_doc.as_ref() {
+                    // The record carries the INNERMOST open level, so its
+                    // `$doc.*` sees every enclosing envelope's sections.
+                    if let Some(ctx) = doc_stack.last() {
                         widened_record.set_doc_ctx(Arc::clone(ctx));
                     }
                     // A closed channel means the consumer stopped pulling —
@@ -448,17 +433,48 @@ fn drive_record_source(
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // End of input. The reader may still hold trailing
+                    // envelope events — a header-only interchange (envelope
+                    // structure, zero body records), or an inner envelope
+                    // that closed, or even one that opened, after the last
+                    // body record. Applying them here, NOT skipping them, is
+                    // load-bearing: a trailing `OpenLevel` left unapplied
+                    // would leave the level stack unbalanced and every
+                    // downstream `DocumentClose` count would be off,
+                    // aborting the run. This is the symmetric end of the
+                    // before-record drain above — every event a reader
+                    // queues is applied, whether a record follows it or not.
+                    //
+                    // The reader's own `current_source_file()` names the
+                    // file these trailing events belong to: a header-only
+                    // interchange for a NEW file (one whose body produced no
+                    // record) points here at that new file, and
+                    // `apply_envelope_events` then transitions to it,
+                    // closing the prior file's stack first. The static
+                    // fallback covers a single-file reader with no
+                    // per-record file identity.
+                    let file_arc = src_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    apply_envelope_events(
+                        &src_cfg,
+                        &mut stream,
+                        &mut doc_stack,
+                        &mut src_reader,
+                        &file_arc,
+                    )?;
+                    break;
+                }
                 Err(other) => return Err(other.into()),
             }
         }
-        // Close the last document (if any records were emitted).
-        if let Some(last) = current_doc.take() {
-            push_punct(
-                &mut stream,
-                crate::executor::stream_event::Punctuation::document_close(last),
-            )?;
-        }
+        // Close every level still open at end-of-input, innermost first.
+        // This balances both the file-level document and any nested level
+        // a reader left open (a truncated `--dry-run -n` read, or a reader
+        // that opens a level it never explicitly closes).
+        close_open_levels(&mut stream, &mut doc_stack)?;
         // Drop the sender so the dispatch-side `recv` returns `Err`
         // (channel disconnected) once the channel drains.
         drop(stream);
@@ -468,6 +484,177 @@ fn drive_record_source(
             watermark_observations,
         })
     }
+}
+
+/// `true` when no file-level document is open yet, or the open stack
+/// belongs to a different file than `file_arc` — i.e. the driver must open
+/// a fresh file-level document (closing the prior file's stack first)
+/// before streaming `file_arc`'s records or applying its envelope events.
+///
+/// The file-level document sits at the base of the stack (`doc_stack[0]`)
+/// and carries the file's `source_file` identity, so this is a pointer
+/// comparison against that base — the same `Arc::ptr_eq` discriminator the
+/// reader uses to mark file transitions.
+fn stack_belongs_to_other_file(
+    doc_stack: &[Arc<clinker_record::DocumentContext>],
+    file_arc: &Arc<str>,
+) -> bool {
+    match doc_stack.first() {
+        None => true,
+        Some(file_doc) => !Arc::ptr_eq(file_doc.source_file(), file_arc),
+    }
+}
+
+/// Push a document-boundary punctuation, treating a closed channel as a
+/// benign stop.
+///
+/// A closed channel during punctuation delivery carries the same meaning
+/// as during record delivery — the consumer dropped the receiver (a
+/// shutdown unwind or an early-completing downstream). No further
+/// punctuation matters once the receiver is gone, so the close is a no-op;
+/// the driver's record push breaks on the same signal.
+fn push_doc_punctuation(
+    stream: &mut crate::executor::source_stream::SourceIngestChannel,
+    punct: crate::executor::stream_event::Punctuation,
+) -> Result<(), PipelineError> {
+    match stream.push_punctuation(punct) {
+        Ok(()) | Err(crate::executor::source_stream::SourceStreamError::Closed) => Ok(()),
+    }
+}
+
+/// Close every open level on `doc_stack`, innermost first, draining it to
+/// empty.
+///
+/// Each `DocumentOpen` is balanced by exactly one `DocumentClose` in
+/// strict LIFO order. Used at a file transition (the prior file's stack
+/// closes before the next file opens) and at end-of-input.
+fn close_open_levels(
+    stream: &mut crate::executor::source_stream::SourceIngestChannel,
+    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+) -> Result<(), PipelineError> {
+    while let Some(level) = doc_stack.pop() {
+        push_doc_punctuation(
+            stream,
+            crate::executor::stream_event::Punctuation::document_close(level),
+        )?;
+    }
+    Ok(())
+}
+
+/// Open the file-level document for `file_arc`, closing the prior file's
+/// entire level stack first.
+///
+/// Runs the envelope pre-scan that populates the file-level sections (the
+/// head/tail metadata a single-level reader extracts), emits the
+/// file-level `DocumentOpen`, and seeds `doc_stack` with the new
+/// file-level context. The file-level document opens on whichever comes
+/// first for a file — its first body record or its first envelope event;
+/// a header-only interchange with no body still surfaces its envelope and
+/// boundaries (issue #395).
+///
+/// # Errors
+///
+/// Returns [`PipelineError::Internal`] if the reader's envelope pre-scan
+/// fails for a source that declares an `envelope:` config.
+fn open_file_level_doc(
+    src_cfg: &clinker_plan::config::SourceConfig,
+    stream: &mut crate::executor::source_stream::SourceIngestChannel,
+    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    src_reader: &mut Box<dyn crate::source::RecordSource>,
+    file_arc: &Arc<str>,
+) -> Result<(), PipelineError> {
+    close_open_levels(stream, doc_stack)?;
+    // Pre-scan declared envelope sections for the new file. Sources
+    // without `envelope:` config — and the default trait impl — return an
+    // empty section map. Sections populate before the `DocumentOpen`
+    // emits, so every record of this file carries the same fully-populated
+    // context.
+    let envelope_sections = match src_cfg.envelope.as_ref() {
+        Some(cfg) => src_reader
+            .prepare_document(cfg)
+            .map_err(|e| PipelineError::Internal {
+                op: "envelope-pre-scan",
+                node: src_cfg.name.clone(),
+                detail: e.to_string(),
+            })?,
+        None => indexmap::IndexMap::new(),
+    };
+    let new_ctx = Arc::new(clinker_record::DocumentContext::new(
+        clinker_record::DocumentId::next(),
+        Arc::clone(file_arc),
+        envelope_sections,
+    ));
+    push_doc_punctuation(
+        stream,
+        crate::executor::stream_event::Punctuation::document_open(Arc::clone(&new_ctx)),
+    )?;
+    doc_stack.push(new_ctx);
+    Ok(())
+}
+
+/// Apply the reader's pending nested-envelope events to the level stack.
+///
+/// `OpenLevel` mints a child of the current innermost level (flattening
+/// the enclosing sections in) and emits its `DocumentOpen`; `CloseLevel`
+/// pops the innermost nested level and emits its `DocumentClose`. A file
+/// that has not yet opened its file-level document opens it here before
+/// applying any nested event, so an envelope boundary with no preceding
+/// body record still frames the document (issue #395).
+///
+/// A stray `CloseLevel` that would pop the file-level document or
+/// underflow an empty stack is ignored: the file-transition / end-of-input
+/// sweep owns the file-level close, and a balanced reader never emits one.
+///
+/// # Errors
+///
+/// Returns [`PipelineError::Internal`] if opening the file-level document
+/// (when a nested event arrives before any record) triggers an envelope
+/// pre-scan failure.
+fn apply_envelope_events(
+    src_cfg: &clinker_plan::config::SourceConfig,
+    stream: &mut crate::executor::source_stream::SourceIngestChannel,
+    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    src_reader: &mut Box<dyn crate::source::RecordSource>,
+    file_arc: &Arc<str>,
+) -> Result<(), PipelineError> {
+    for event in src_reader.take_envelope_events() {
+        match event {
+            clinker_format::EnvelopeEvent::OpenLevel { sections } => {
+                // Open a fresh file-level document when none is open yet,
+                // or when the open stack belongs to a different file than
+                // this event — a trailing header-only interchange for a new
+                // file (one whose body produced no record) reaches the
+                // driver only through this path, so the file transition
+                // (closing the prior file's stack) must happen here too,
+                // not just on a record boundary. `open_file_level_doc`
+                // closes the stale stack before opening the new one.
+                if stack_belongs_to_other_file(doc_stack, file_arc) {
+                    open_file_level_doc(src_cfg, stream, doc_stack, src_reader, file_arc)?;
+                }
+                let parent = doc_stack.last().expect("file-level document opened above");
+                let child = Arc::new(parent.child(clinker_record::DocumentId::next(), sections));
+                push_doc_punctuation(
+                    stream,
+                    crate::executor::stream_event::Punctuation::document_open(Arc::clone(&child)),
+                )?;
+                doc_stack.push(child);
+            }
+            clinker_format::EnvelopeEvent::CloseLevel => {
+                // Keep the file-level document (index 0) — its close is the
+                // file-transition / EOF sweep's job — so only pop a
+                // genuinely nested level.
+                if doc_stack.len() > 1
+                    && let Some(level) = doc_stack.pop()
+                {
+                    push_doc_punctuation(
+                        stream,
+                        crate::executor::stream_event::Punctuation::document_close(level),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
@@ -608,4 +795,263 @@ fn build_edifact_reader_config(
         config.max_elements = max;
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    //! These tests observe the exact `StreamEvent` punctuation stream the
+    //! driver emits — the only place the document open/close boundaries
+    //! are visible before downstream operators consume them. End-to-end
+    //! pipeline tests assert on record counts and `$doc` resolution; they
+    //! cannot see whether a *record-less* boundary (a header-only
+    //! interchange, or a trailing empty inner envelope) was emitted at
+    //! all, because such a boundary contributes no record and no `$doc`
+    //! read. Draining the source channel here pins exactly that: that the
+    //! end-of-input drain emits the trailing/header-only document
+    //! boundaries instead of dropping them.
+
+    use super::*;
+    use crate::executor::stream_event::{PunctuationKind, StreamEvent};
+    use clinker_format::EnvelopeEvent;
+    use clinker_record::{Schema, SchemaBuilder, Value};
+    use indexmap::IndexMap;
+
+    /// A scripted step: emit a record, or queue an envelope boundary the
+    /// driver drains around the surrounding `next_record` call.
+    enum Step {
+        Open(&'static str),
+        Close,
+        Record(i64),
+    }
+
+    /// Replays a fixed [`Step`] script as a `RecordSource`, modeling a
+    /// multi-level envelope reader. Single pathless file (no per-record
+    /// file identity), so the driver uses one stable synthetic id.
+    struct ScriptedReader {
+        schema: Arc<Schema>,
+        steps: std::collections::VecDeque<Step>,
+        pending: Vec<EnvelopeEvent>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                schema: SchemaBuilder::with_capacity(1).with_field("id").build(),
+                steps: steps.into_iter().collect(),
+                pending: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::source::RecordSource for ScriptedReader {
+        fn schema(&mut self) -> Result<Arc<Schema>, clinker_format::FormatError> {
+            Ok(Arc::clone(&self.schema))
+        }
+
+        fn next_record(
+            &mut self,
+        ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+            while let Some(step) = self.steps.pop_front() {
+                match step {
+                    Step::Open(name) => {
+                        let mut field = IndexMap::new();
+                        field.insert(Box::from("tag"), Value::String(name.into()));
+                        let mut sections = IndexMap::new();
+                        sections.insert(Box::from(name), Value::Map(Box::new(field)));
+                        self.pending.push(EnvelopeEvent::OpenLevel { sections });
+                    }
+                    Step::Close => self.pending.push(EnvelopeEvent::CloseLevel),
+                    Step::Record(id) => {
+                        return Ok(Some(clinker_record::Record::new(
+                            Arc::clone(&self.schema),
+                            vec![Value::Integer(id)],
+                        )));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    /// One observed event from the driver's output channel, projected to
+    /// just what the boundary assertions need.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Observed {
+        Open,
+        Close,
+        Record(i64),
+    }
+
+    /// Minimal pathless CSV `SourceConfig` — the transport the driver
+    /// drives is supplied directly, so only the name/format matter.
+    fn pathless_source_config() -> clinker_plan::config::SourceConfig {
+        let yaml = r#"
+pipeline:
+  name: drive_test
+nodes:
+  - type: source
+    name: edi
+    config:
+      name: edi
+      type: csv
+      path: placeholder.csv
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out
+    input: edi
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        let mut config = clinker_plan::config::parse_config(yaml).expect("parse");
+        for spanned in &mut config.nodes {
+            if let clinker_plan::config::PipelineNode::Source { config: body, .. } =
+                &mut spanned.value
+            {
+                body.source.path = None;
+                return body.source.clone();
+            }
+        }
+        unreachable!("source node present")
+    }
+
+    /// Drive `drive_record_source` over the script and return the ordered
+    /// stream of records and document boundaries the driver emitted.
+    fn drive(steps: Vec<Step>) -> Vec<Observed> {
+        let src_cfg = pathless_source_config();
+        let reader: Box<dyn crate::source::RecordSource> = Box::new(ScriptedReader::new(steps));
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
+            crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+            handle,
+        );
+
+        // The script is far smaller than the channel capacity, so the
+        // driver never blocks on a full channel; it runs to completion on
+        // this thread and drops the sender, after which the receiver
+        // drains cleanly.
+        drive_record_source(src_cfg, reader, stream, None).expect("drive");
+
+        rx.iter()
+            .map(|ev| match ev {
+                StreamEvent::Record(rec, _) => match rec.values()[0] {
+                    Value::Integer(id) => Observed::Record(id),
+                    ref other => panic!("unexpected record value {other:?}"),
+                },
+                StreamEvent::Punctuation(p) => match p.kind() {
+                    PunctuationKind::DocumentOpen => Observed::Open,
+                    PunctuationKind::DocumentClose => Observed::Close,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_levels_emit_balanced_open_close_around_records() {
+        // ISA → GS → ST → record → close ST → close GS → close ISA.
+        let observed = drive(vec![
+            Step::Open("interchange"),
+            Step::Open("group"),
+            Step::Open("transaction"),
+            Step::Record(1),
+            Step::Close, // ST
+            Step::Close, // GS
+            Step::Close, // ISA
+        ]);
+        // File-level Open, then the three nested Opens, the record, the
+        // three nested Closes, and the file-level Close — every Open
+        // balanced by a Close, innermost first.
+        assert_eq!(
+            observed,
+            vec![
+                Observed::Open, // file-level document
+                Observed::Open, // interchange
+                Observed::Open, // group
+                Observed::Open, // transaction
+                Observed::Record(1),
+                Observed::Close, // transaction
+                Observed::Close, // group
+                Observed::Close, // interchange
+                Observed::Close, // file-level document
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_inner_envelope_after_last_record_emits_its_boundaries() {
+        // The desync regression, observed at the boundary stream: an inner
+        // envelope that OPENS and closes after the last body record. The
+        // end-of-input drain must emit that trailing open AND its close —
+        // reverting the drain to a bare `break` drops both, which this
+        // assertion catches.
+        let observed = drive(vec![
+            Step::Open("interchange"),
+            Step::Open("transaction"),
+            Step::Record(10),
+            Step::Close, // ST closes after its record
+            // Trailing inner envelope: opens and closes with no record
+            // between, after the file's final record.
+            Step::Open("transaction"),
+            Step::Close,
+            Step::Close, // ISA
+        ]);
+        assert_eq!(
+            observed,
+            vec![
+                Observed::Open, // file-level document
+                Observed::Open, // interchange
+                Observed::Open, // transaction
+                Observed::Record(10),
+                Observed::Close, // transaction
+                Observed::Open,  // trailing transaction — emitted by the EOF drain
+                Observed::Close, // trailing transaction close
+                Observed::Close, // interchange
+                Observed::Close, // file-level document
+            ]
+        );
+        // Three of the boundaries (the trailing inner open+close and the
+        // interchange close) are produced entirely by the end-of-input
+        // drain — there is no body record after the final close to carry
+        // them. A bare `break` at end-of-input would emit only the
+        // file-level close (the sweep), losing the trailing pair.
+        let opens = observed.iter().filter(|o| **o == Observed::Open).count();
+        let closes = observed.iter().filter(|o| **o == Observed::Close).count();
+        assert_eq!(opens, 4, "file + interchange + 2 transaction opens");
+        assert_eq!(closes, 4, "every open balanced by a close");
+    }
+
+    #[test]
+    fn header_only_interchange_emits_open_and_close_with_no_records() {
+        // Issue #395: a file carrying envelope structure but zero body
+        // records still opens a document and emits its open/close
+        // boundaries. The entire script is an interchange that opens and
+        // closes with nothing inside — every boundary here is produced by
+        // the end-of-input drain, since no record ever triggers the
+        // record-arm open.
+        let observed = drive(vec![Step::Open("interchange"), Step::Close]);
+        assert_eq!(
+            observed,
+            vec![
+                Observed::Open,  // file-level document, opened by the first envelope event
+                Observed::Open,  // interchange
+                Observed::Close, // interchange
+                Observed::Close, // file-level document
+            ],
+            "header-only interchange must surface its document boundaries"
+        );
+        // No records, but four boundary punctuations — the #395 fix. With
+        // the end-of-input drain reverted, zero punctuations are emitted
+        // and this vector would be empty.
+        assert!(
+            observed.iter().all(|o| *o != Observed::Record(0)),
+            "header-only interchange has no body records"
+        );
+        assert_eq!(observed.len(), 4);
+    }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::envelope::EnvelopeConfig;
+use crate::envelope::{EnvelopeConfig, EnvelopeEvent};
 use crate::error::FormatError;
 
 /// Streaming record reader. Yields records one at a time.
@@ -46,6 +46,25 @@ pub trait FormatReader: Send {
         _config: &EnvelopeConfig,
     ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
         Ok(IndexMap::new())
+    }
+
+    /// Drain the envelope-nesting events the reader queued while serving
+    /// the most recent `next_record` (or its end-of-input transition).
+    /// The source ingest driver polls this after every `next_record` and
+    /// once more at end-of-input, applying each [`EnvelopeEvent`] to its
+    /// document-level stack — `OpenLevel` opens a nested document context,
+    /// `CloseLevel` closes the innermost.
+    ///
+    /// Default impl returns an empty `Vec` — single-level envelope formats
+    /// (CSV, fixed-width, XML, JSON, EDIFACT) never nest mid-file, so they
+    /// open exactly one document per file via `prepare_document` and never
+    /// queue an event. Multi-level formats (EDI X12 ISA/GS/ST) override
+    /// this to surface their envelope boundaries. Wrappers holding an
+    /// inner reader (`CoercingReader`, `MultiFileFormatReader`,
+    /// `TakeReader`) must delegate so a nested-envelope source streamed
+    /// through them keeps emitting boundaries.
+    fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
+        Vec::new()
     }
 }
 
