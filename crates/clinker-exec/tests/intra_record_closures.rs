@@ -192,6 +192,128 @@ nodes:
     assert_eq!(prices, vec![10, 20, 5]);
 }
 
+/// Nested `emit each` fans out within fan-out for one trigger row: the
+/// outer iterates `groups`, the inner iterates each group's elements,
+/// producing one output record per (group, item) through the full
+/// executor path. Exercises the document-shape "article → section → tag"
+/// fan-out end to end.
+#[test]
+fn ndjson_nested_emit_each_fans_out_within_fan_out() {
+    let yaml = r#"
+pipeline:
+  name: nested_fanout
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      options:
+        format: ndjson
+      path: rows.ndjson
+      schema:
+        - { name: groups, type: any }
+  - type: transform
+    name: explode
+    input: rows
+    config:
+      cxl: |
+        emit each g in groups {
+          emit each it in g {
+            emit val = it
+          }
+        }
+  - type: output
+    name: out
+    input: explode
+    config:
+      name: out
+      type: json
+      options:
+        format: ndjson
+      path: out.json
+      include_unmapped: false
+      exclude: [groups]
+"#;
+    let payload = br#"{"groups":[[1,2],[3],[4,5,6]]}
+"#;
+    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        6,
+        "one record per (group, item): 2 + 1 + 3 = 6: {output:?}"
+    );
+    let vals: Vec<i64> = lines
+        .iter()
+        .map(|l| {
+            let r: serde_json::Value = serde_json::from_str(l).expect("ndjson line parses");
+            r.get("val").and_then(|v| v.as_i64()).expect("val")
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+}
+
+/// The `max_expansion` cap is cumulative across nesting levels: nested
+/// `emit each` charges every leaf record against one budget, so a deep
+/// fan-out that overflows in aggregate routes the originating record to
+/// the DLQ even when no single level exceeds the cap.
+#[test]
+fn nested_emit_each_cumulative_overflow_routes_to_expansion_dlq() {
+    let yaml = r#"
+pipeline:
+  name: nested_overflow
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      options:
+        format: ndjson
+      path: rows.ndjson
+      schema:
+        - { name: groups, type: any }
+  - type: transform
+    name: explode
+    input: rows
+    config:
+      max_expansion: 5
+      cxl: |
+        emit each g in groups {
+          emit each it in g {
+            emit val = it
+          }
+        }
+  - type: output
+    name: out
+    input: explode
+    config:
+      name: out
+      type: json
+      options:
+        format: ndjson
+      path: out.json
+"#;
+    // Three groups of two = six leaves; a cap of 5 trips on the sixth.
+    let payload = br#"{"groups":[[1,2],[3,4],[5,6]]}
+"#;
+    let (report, _output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let saw_expansion = report
+        .dlq_entries
+        .iter()
+        .any(|e| e.category.as_str() == "expansion_limit_exceeded");
+    assert!(
+        saw_expansion,
+        "cumulative nesting overflow must route to expansion_limit_exceeded: {:#?}",
+        report.dlq_entries
+    );
+}
+
 /// `max_expansion` (set on `TransformBody`) caps the cumulative number
 /// of records `emit each` can produce from a single original input. On
 /// exceed, the originating record routes to the DLQ with category

@@ -51,6 +51,8 @@ The body reads both `it` (the current element) and `order_id` (an outer record f
 
 If the source array has N elements, `emit each` produces exactly N output records. Empty array sources produce zero records. A `null` source also produces zero records -- no DLQ entry, no error -- mirroring the explode-on-null convention used elsewhere in CXL.
 
+When fan-out [nests](#nested-fan-out-fan-out-within-fan-out), the cardinalities multiply: an outer array of M elements whose inner arrays have N elements each produces up to M×N records. The cumulative [`max_expansion`](#safety-cap-max_expansion) cap bounds that product.
+
 A non-array, non-null source raises a runtime type-mismatch error and routes the originating record to the DLQ.
 
 ## Preserving the trigger row: `outer`
@@ -100,7 +102,7 @@ produces a single record that keeps `order_id` while the per-item fields read th
 
 Outer-record fields (like `order_id`) and any `emit` statements preceding the block still apply to the preserved trigger row, so an `outer` row is never bare.
 
-The source type rule is slightly wider than plain `emit each`: a statically-`null` source is accepted (it is the case the variant exists to handle), alongside arrays and `Any`. Everything else in this page — the `max_expansion` cap, the no-nesting rule, the body-statement restrictions — applies unchanged to the `outer` variant.
+The source type rule is slightly wider than plain `emit each`: a statically-`null` source is accepted (it is the case the variant exists to handle), alongside arrays and `Any`. Everything else in this page — the cumulative `max_expansion` cap, the [nesting](#nested-fan-out-fan-out-within-fan-out) rules, the body-statement restrictions — applies unchanged to the `outer` variant. The two variants compose freely: an `outer` block may nest inside a plain `emit each` block and vice versa.
 
 ## Output schema
 
@@ -108,25 +110,37 @@ The body's `emit` statements define the output record's field set, the same way 
 
 Fields written by the body shadow same-named fields on the originating input record.
 
-## Nested emit_each is rejected
+## Nested fan-out: fan-out within fan-out
 
-Each transform body may contain at most one level of `emit each`. The parser rejects an `emit each` inside another `emit each` body:
+An `emit each` body may itself contain `emit each` blocks — fan-out within fan-out for one trigger row. This is the canonical "for each article, for each section, for each tag, emit a row" shape:
 
 ```
-emit each it in items {
-  emit each sub in it["children"] { ... }   -- parse error
+emit each section in article["sections"] {
+  emit each tag in section["tags"] {
+    emit article_id = article_id
+    emit section = section["name"]
+    emit tag = tag
+  }
 }
 ```
 
-If you need a cartesian product, precompute the flattened array (for example with [`.flat_map`](builtins-array.md#flat_mapit--array---array)) and use a single `emit each` over the result.
+For one input article, this produces one output record per (section, tag) pair. The inner binding (`tag`) reads the current inner element; the outer binding (`section`) and any outer-record field (`article_id`) stay visible inside the inner body. A field name reused as both an outer and inner binding shadows lexically — the inner binding wins inside the inner body, and the outer value is restored when the inner block finishes.
+
+Emits are positional: an `emit` placed in the outer body *before* a nested block applies to every leaf record that block produces, but an `emit` placed *after* a nested block does not retroactively reach the records that block already emitted. Put the fields shared across leaves above the nested block.
+
+Plain and `outer` blocks compose in any order. An inner plain `emit each` over an empty or null array contributes no records for that branch, while an inner `emit each ... outer` preserves one trigger row (inner binding bound to `null`) — exactly the per-level semantics from the [single-level table](#preserving-the-trigger-row-outer), applied at each level.
+
+Nesting is bounded to 32 levels so that adversarially deep input cannot exhaust the parser stack; legitimate document fan-out is only a few levels deep. Beyond that bound, parsing fails with a "nesting too deep" diagnostic.
+
+The flat-array workaround (precompute a flattened array with [`.flat_map`](builtins-array.md#flat_mapit--array---array) and use a single `emit each`) is still available and may be clearer for a simple two-level cartesian product, but is no longer required.
 
 ## Body-statement restrictions
 
-Within the body, only `let`, `emit`, and `trace` are accepted. `filter`, `distinct`, and nested `emit each` are rejected at evaluation time -- a body filter would split work between branches the engine can't represent. Move filter/distinct logic into a downstream transform, or pre-filter the source array with `.filter` before the `emit each` block.
+Within the body, `let`, `emit`, `trace`, and nested `emit each` / `emit each ... outer` are accepted. `filter` and `distinct` are rejected at evaluation time -- a body filter would split work between branches the engine can't represent. Move filter/distinct logic into a downstream transform, or pre-filter the source array with `.filter` before the `emit each` block.
 
 ## Safety cap: `max_expansion`
 
-To bound fan-out, every transform body carries a `max_expansion` cap on the cumulative records `emit each` may produce from a single original input record. If the cap is exceeded, the originating record routes to the DLQ with category `expansion_limit_exceeded` instead of producing a truncated or unbounded result. The default cap is 10000.
+To bound fan-out, every transform body carries a `max_expansion` cap on the cumulative records `emit each` may produce from a single original input record. The cap is **cumulative across all nesting levels**: every leaf record a nested fan-out produces charges against one shared budget, so nesting cannot multiply past the cap undetected. If the cap is exceeded, the originating record routes to the DLQ with category `expansion_limit_exceeded` instead of producing a truncated or unbounded result. The default cap is 10000.
 
 See [Transform Nodes -> Expansion Cap](../pipeline/transform.md#expansion-cap-max_expansion) for the YAML field and tuning guidance.
 
