@@ -54,6 +54,13 @@ pub struct CoercingReader {
     /// slot, when present, gets `None` (no coercion — payload is a
     /// `Value::Map`).
     targets: Vec<Option<Type>>,
+    /// Per-output-column `long_unique` storage hint, indexed alongside
+    /// `targets`. When set for a column, its string values are stored in
+    /// the header-free `Box`-backed [`FieldStr`](clinker_record::FieldStr)
+    /// arm rather than the default inline-or-`Arc`-shared one. The `$widened`
+    /// sidecar slot is always `false` (its payload is a `Value::Map`, never a
+    /// top-level string).
+    long_unique: Vec<bool>,
     /// Position of the `$widened` sidecar column in `output_schema`,
     /// or `None` for `Drop` / `Reject` policies (no sidecar slot).
     widened_idx: Option<usize>,
@@ -87,6 +94,7 @@ impl CoercingReader {
                 }
             })
             .collect();
+        let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.long_unique).collect();
 
         let mut builder = SchemaBuilder::new();
         for c in schema_decl {
@@ -101,6 +109,7 @@ impl CoercingReader {
             builder =
                 builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
             targets.push(None);
+            long_unique.push(false);
             Some(idx)
         } else {
             None
@@ -112,6 +121,7 @@ impl CoercingReader {
             declared_names,
             output_schema,
             targets,
+            long_unique,
             widened_idx,
             policy,
             source_name: source_name.into(),
@@ -159,7 +169,20 @@ impl CoercingReader {
                 Some(target) => coerce_value(&raw, target).unwrap_or(raw),
                 None => raw,
             };
-            values.push(coerced);
+            // Honor the column's `long_unique` storage hint: rebuild a string
+            // value in the header-free `Box`-backed arm. Coercion runs first, so
+            // a column declared `string` (coercion target `None`) is the usual
+            // case; a value that failed numeric coercion and fell back to its
+            // string form is also re-homed. Non-string values are untouched.
+            let stored = if self.long_unique[i] {
+                match coerced {
+                    Value::String(s) => Value::string_unique(s.as_str()),
+                    other => other,
+                }
+            } else {
+                coerced
+            };
+            values.push(stored);
         }
         Ok(Record::new(Arc::clone(&self.output_schema), values))
     }
@@ -239,6 +262,15 @@ mod tests {
         ColumnDecl {
             name: name.to_string(),
             ty,
+            long_unique: false,
+        }
+    }
+
+    fn col_unique(name: &str, ty: Type) -> ColumnDecl {
+        ColumnDecl {
+            name: name.to_string(),
+            ty,
+            long_unique: true,
         }
     }
 
@@ -389,6 +421,60 @@ mod tests {
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get(WIDENED_SIDECAR_COLUMN), Some(&Value::Null));
+    }
+
+    /// A `long_unique`-flagged column stores its values in the header-free
+    /// `Box`-backed arm; an unflagged column keeps the default policy.
+    #[test]
+    fn test_long_unique_column_lands_in_unique_arm() {
+        let schema = vec![col_unique("uuid", Type::String), col("name", Type::String)];
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let reader = csv_reader(&format!("uuid,name\n{uuid},Alice\n"));
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        match rec.get("uuid") {
+            Some(Value::String(s)) => {
+                assert_eq!(s.as_str(), uuid);
+                assert!(s.is_unique(), "flagged column must take the unique arm");
+            }
+            other => panic!("expected String, got {other:?}"),
+        }
+        // The unflagged neighbor keeps the default policy.
+        match rec.get("name") {
+            Some(Value::String(s)) => {
+                assert!(!s.is_unique(), "unflagged column must keep the default arm")
+            }
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    /// The default (no flag) leaves every string in the default arm — the
+    /// pre-existing behavior is byte-for-byte unchanged.
+    #[test]
+    fn test_unflagged_columns_keep_default_arm() {
+        let schema = vec![col("uuid", Type::String)];
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let reader = csv_reader(&format!("uuid\n{uuid}\n"));
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        match rec.get("uuid") {
+            Some(Value::String(s)) => assert!(!s.is_unique()),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    /// A `long_unique` flag on a non-string column is inert: numeric coercion
+    /// runs and the value is not a string, so nothing is re-homed.
+    #[test]
+    fn test_long_unique_inert_on_numeric_column() {
+        let schema = vec![col_unique("n", Type::Int)];
+        let reader = csv_reader("n\n42\n");
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("n"), Some(&Value::Integer(42)));
     }
 
     /// Fixed-width sources are structurally incapable of producing

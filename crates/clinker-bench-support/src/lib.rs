@@ -15,8 +15,7 @@ pub mod combine;
 pub mod generators;
 pub mod io;
 
-use clinker_record::{Record, Schema, SchemaBuilder, Value};
-use smol_str::SmolStr;
+use clinker_record::{FieldStr, Record, Schema, SchemaBuilder, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -282,12 +281,12 @@ impl RecordFactory {
         (0..count).map(|_| self.next_record()).collect()
     }
 
-    fn random_string(&mut self) -> SmolStr {
+    fn random_string(&mut self) -> FieldStr {
         let bytes: Vec<u8> = (0..self.string_len)
             .map(|_| self.rng.u8(b'a'..=b'z'))
             .collect();
         // SAFETY: all bytes are ASCII a-z
-        SmolStr::new(unsafe { std::str::from_utf8_unchecked(&bytes) })
+        FieldStr::new(unsafe { std::str::from_utf8_unchecked(&bytes) })
     }
 }
 

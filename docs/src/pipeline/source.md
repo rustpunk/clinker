@@ -49,6 +49,32 @@ schema:
 | `any` | Unknown type -- field used in type-agnostic contexts |
 | `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
 
+### `long_unique` — storage hint for high-cardinality text
+
+A string column may carry an optional `long_unique: true` flag. It is an
+**advisory, opt-in storage hint**, not a type change: it tells the engine the
+column's values are *long and effectively unique* — never repeated across
+records — so it stores them in a leaner, header-free representation that drops
+the per-value bookkeeping the default representation keeps for values that
+might be shared. Typical candidates are UUIDs rendered as text, street
+addresses, and free-text comment or note fields.
+
+```yaml
+schema:
+  - { name: ticket_id,  type: string, long_unique: true }   # 36-char UUID
+  - { name: notes,      type: string, long_unique: true }   # free text
+  - { name: department, type: string }                      # low-cardinality, default
+```
+
+The flag changes only the in-memory footprint of the annotated column. The
+value's content, its comparison/grouping/join/sort behavior, and the on-disk
+encoding when a run spills to disk are all unchanged — a `long_unique` value
+compares and groups identically to the same text in any other column. Omitting
+the flag (the common case) leaves the default behavior untouched. Set it only
+when you know a column is genuinely high-cardinality free text; on a column
+whose values repeat, the default representation is the better choice because it
+shares repeated values instead of storing each copy independently.
+
 ## Transport vs format
 
 A source declaration has two independent layers:

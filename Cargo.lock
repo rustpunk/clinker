@@ -402,7 +402,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "smol_str",
  "tempfile",
 ]
 

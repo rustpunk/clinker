@@ -775,6 +775,18 @@ pub struct ColumnDecl {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: cxl::typecheck::Type,
+    /// Advisory storage hint: when set, the reader stores this column's string
+    /// values in the header-free `Box`-backed representation rather than the
+    /// default inline-or-`Arc`-shared one. Intended for high-cardinality
+    /// free-text columns whose values are long and effectively unique (UUIDs,
+    /// street addresses, comment fields), where the per-value `Arc` refcount
+    /// header is pure overhead because there is no sharing to amortize it
+    /// against. Opt-in and purely advisory — it changes the in-memory footprint
+    /// only; the value's content, comparison/grouping semantics, and on-disk
+    /// spill encoding are all unchanged. Omitting the key (the common case)
+    /// leaves the default policy and serializes to byte-identical YAML.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub long_unique: bool,
 }
 
 /// Policy for fields a reader discovers in an input record that the
@@ -2081,5 +2093,91 @@ nodes:
             .expect("aggregate node present");
         assert!(aggregate_body.time_window.is_none());
         assert!(aggregate_body.allowed_lateness.is_none());
+    }
+
+    /// Extract the declared columns of the first source node in a parsed
+    /// pipeline document.
+    fn source_columns(doc: &crate::config::PipelineConfig) -> &[ColumnDecl] {
+        doc.nodes
+            .iter()
+            .find_map(|spanned| match &spanned.value {
+                PipelineNode::Source { config, .. } => Some(config.schema.columns.as_slice()),
+                _ => None,
+            })
+            .expect("source node present")
+    }
+
+    /// The `long_unique` flag parses from the column declaration when present.
+    #[test]
+    fn column_decl_long_unique_flag_parses() {
+        let yaml = r#"
+pipeline:
+  name: lu_parse
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      path: data.csv
+      schema:
+        - { name: uuid, type: string, long_unique: true }
+        - { name: name, type: string }
+"#;
+        let doc: crate::config::PipelineConfig =
+            crate::yaml::from_str(yaml).expect("pipeline parses");
+        let cols = source_columns(&doc);
+        assert!(cols[0].long_unique, "flagged column carries the hint");
+        assert!(!cols[1].long_unique, "unflagged column defaults false");
+    }
+
+    /// Omitting the flag defaults it to false — the pre-existing YAML shape is
+    /// unchanged, so existing schemas keep parsing identically.
+    #[test]
+    fn column_decl_long_unique_defaults_false() {
+        let yaml = r#"
+pipeline:
+  name: lu_default
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      path: data.csv
+      schema:
+        - { name: uuid, type: string }
+"#;
+        let doc: crate::config::PipelineConfig =
+            crate::yaml::from_str(yaml).expect("pipeline parses");
+        assert!(!source_columns(&doc)[0].long_unique);
+    }
+
+    /// A `false` flag serializes to byte-identical output as a column that
+    /// never carried the key — the `skip_serializing_if` keeps un-tagged
+    /// columns wire-identical to pre-flag schemas.
+    #[test]
+    fn column_decl_unflagged_serializes_without_key() {
+        let plain = ColumnDecl {
+            name: "uuid".to_string(),
+            ty: cxl::typecheck::Type::String,
+            long_unique: false,
+        };
+        let json = serde_json::to_string(&plain).expect("serialize");
+        assert!(
+            !json.contains("long_unique"),
+            "an unflagged column must not emit the long_unique key, got: {json}"
+        );
+
+        let flagged = ColumnDecl {
+            name: "uuid".to_string(),
+            ty: cxl::typecheck::Type::String,
+            long_unique: true,
+        };
+        let json = serde_json::to_string(&flagged).expect("serialize");
+        assert!(
+            json.contains("long_unique"),
+            "a flagged column must emit the key, got: {json}"
+        );
     }
 }
