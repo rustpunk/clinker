@@ -46,12 +46,39 @@ pub(super) fn scheduled_pass_order(
     plan: &clinker_plan::plan::execution::ExecutionPlanDag,
     arbitrator: &crate::pipeline::memory::MemoryArbitrator,
     candidates: &HashSet<petgraph::graph::NodeIndex>,
+    combine_probe_edges: &std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+    >,
 ) -> Vec<petgraph::graph::NodeIndex> {
     use clinker_plan::plan::scheduling_hint::SchedulingHint;
 
     let mut emitted: HashSet<petgraph::graph::NodeIndex> = HashSet::with_capacity(candidates.len());
     let mut order: Vec<petgraph::graph::NodeIndex> = Vec::with_capacity(candidates.len());
     let hint: &dyn SchedulingHint = plan;
+
+    // Build-before-probe ordering (issue #300). A streaming-probe driver
+    // producer must not be selected until the consuming Combine's build-side
+    // predecessor cone has materialized — the Combine arm builds the hash
+    // table on the main thread before redispatching the driver, and pinning
+    // that order here keeps `--explain`'s dispatch sequence and the runtime
+    // coherent. The build side is every incoming neighbor of the Combine
+    // except the driver itself; a driver is gated until all such build
+    // predecessors that are in this pass's candidate set are emitted. This
+    // is acyclic because a certified driver is single-outgoing into the
+    // Combine and never feeds the build cone, so the build predecessors
+    // become runnable independently and eventually unblock the driver.
+    let build_ready = |driver: petgraph::graph::NodeIndex,
+                       emitted: &HashSet<petgraph::graph::NodeIndex>|
+     -> bool {
+        let Some(&combine_idx) = combine_probe_edges.get(&driver) else {
+            return true;
+        };
+        plan.graph
+            .neighbors_directed(combine_idx, petgraph::Direction::Incoming)
+            .filter(|&pred| pred != driver)
+            .all(|build_pred| !candidates.contains(&build_pred) || emitted.contains(&build_pred))
+    };
 
     // A node is runnable once every in-`candidates` predecessor is
     // already emitted. Recomputed each step from `emitted` so that
@@ -66,6 +93,7 @@ pub(super) fn scheduled_pass_order(
                     .neighbors_directed(idx, petgraph::Direction::Incoming)
                     .all(|pred| !candidates.contains(&pred) || emitted.contains(&pred))
             })
+            .filter(|&idx| build_ready(idx, &emitted))
             .collect();
 
         // The candidate set is the node set of an acyclic graph, so as

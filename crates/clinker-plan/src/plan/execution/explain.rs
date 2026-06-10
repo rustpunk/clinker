@@ -2000,6 +2000,7 @@ mod spill_projection_tests {
             strategy,
             driving_input: "a".to_string(),
             build_inputs: vec!["b".to_string()],
+            driving_upstream: None,
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: crate::config::pipeline_node::MatchMode::First,
             on_miss: crate::config::pipeline_node::OnMiss::NullFields,

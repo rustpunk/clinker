@@ -1032,3 +1032,470 @@ nodes:
     assert_eq!(report.counters.total_count as usize, ROWS);
     assert_eq!(report.counters.dlq_count, 0);
 }
+
+/// A fused `Source → Transform` whose sole downstream is the driver
+/// (probe) side of a hash build-probe `Combine` streams its records
+/// record-at-a-time into the probe rather than the Combine pre-draining
+/// the driver's whole output. The build side (`products`) stays
+/// materialized in the hash table; the driver Transform reports
+/// `buffer: streaming` and emits no `node_buffer` edge to the Combine, and
+/// the joined result matches the materialized path.
+#[test]
+fn fused_transform_streams_probe_into_combine() {
+    let yaml = r#"
+pipeline:
+  name: streaming_combine_probe
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: transform
+    name: norm
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+  - type: combine
+    name: c
+    input:
+      norm: norm
+      products: products
+    config:
+      where: "norm.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      drive: norm
+      cxl: |
+        emit order_id = norm.order_id
+        emit product_name = products.name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: c
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    // The fused Transform streams its probe into the Combine: no charged
+    // node_buffer edge from the driver Transform to the Combine.
+    assert_streaming_to_output(&explain_of(&config, &plan), "transform.norm", "combine.c");
+
+    let orders = "order_id,product_id\no1,p1\no2,p2\no3,p1\no4,p3\n";
+    let products = "product_id,name\np1,Prod1\np2,Prod2\n";
+    let readers: SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "orders.csv",
+                Box::new(Cursor::new(orders.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "products".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "products.csv",
+                Box::new(Cursor::new(products.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("fused transform streams probe into combine");
+    let mut lines = body_lines(&buf);
+    lines.sort();
+    // o1->Prod1, o2->Prod2, o3->Prod1 match; o4 (p3) misses and is skipped.
+    assert_eq!(
+        lines,
+        vec!["o1,Prod1", "o2,Prod2", "o3,Prod1"],
+        "streaming combine probe diverged from the materialized join"
+    );
+    assert_eq!(report.counters.dlq_count, 0);
+}
+
+/// A non-fused `Merge` whose sole downstream is the driver (probe) side of
+/// a hash build-probe `Combine` streams the merged stream into the probe.
+/// The Merge reports `buffer: streaming` and emits no `node_buffer` edge to
+/// the Combine, and the joined result over both merged driver inputs
+/// matches the materialized path.
+#[test]
+fn nonfused_merge_streams_probe_into_combine() {
+    let yaml = r#"
+pipeline:
+  name: streaming_merge_combine_probe
+nodes:
+  - type: source
+    name: oa
+    config:
+      name: oa
+      type: csv
+      path: ./oa.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: ob
+    config:
+      name: ob
+      type: csv
+      path: ./ob.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: transform
+    name: ta
+    input: oa
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+  - type: transform
+    name: tb
+    input: ob
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+  - type: merge
+    name: m
+    inputs: [ta, tb]
+    config:
+      mode: concat
+  - type: combine
+    name: c
+    input:
+      m: m
+      products: products
+    config:
+      where: "m.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      drive: m
+      cxl: |
+        emit order_id = m.order_id
+        emit product_name = products.name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: c
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    assert_streaming_to_output(&explain_of(&config, &plan), "merge.m", "combine.c");
+
+    let oa = "order_id,product_id\no1,p1\no2,p2\n";
+    let ob = "order_id,product_id\no3,p1\no4,p3\n";
+    let products = "product_id,name\np1,Prod1\np2,Prod2\n";
+    let readers: SourceReaders = HashMap::from([
+        (
+            "oa".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "oa.csv",
+                Box::new(Cursor::new(oa.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "ob".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "ob.csv",
+                Box::new(Cursor::new(ob.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "products".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "products.csv",
+                Box::new(Cursor::new(products.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("non-fused merge streams probe into combine");
+    let mut lines = body_lines(&buf);
+    lines.sort();
+    // o1->Prod1, o2->Prod2, o3->Prod1 match; o4 (p3) misses and is skipped.
+    assert_eq!(
+        lines,
+        vec!["o1,Prod1", "o2,Prod2", "o3,Prod1"],
+        "streaming merged combine probe diverged from the materialized join"
+    );
+    assert_eq!(report.counters.dlq_count, 0);
+}
+
+/// Streaming combine probe must not deadlock under back-pressure: the
+/// driver producer's bounded `send` blocks when the channel fills, and the
+/// probe consumer thread drains it concurrently — after the build side is
+/// materialized into the hash table. Drive far more driver rows than the
+/// 256-event channel bound through a fused `Source → Transform → Combine`
+/// chain; a deadlock would hang the run rather than complete. Every driver
+/// row matches the single build row, so the output row count equals the
+/// driver row count and the run must finish.
+#[test]
+fn combine_probe_no_deadlock_under_backpressure() {
+    const ROWS: usize = 5_000;
+    let yaml = r#"
+pipeline:
+  name: streaming_combine_probe_backpressure
+  batch_size: 64
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./orders.csv
+      options: { has_header: true }
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./products.csv
+      options: { has_header: true }
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: transform
+    name: norm
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+  - type: combine
+    name: c
+    input:
+      norm: norm
+      products: products
+    config:
+      where: "norm.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      drive: norm
+      cxl: |
+        emit order_id = norm.order_id
+        emit product_name = products.name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: c
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    assert_streaming_to_output(&explain_of(&config, &plan), "transform.norm", "combine.c");
+
+    // One build row (all driver rows share product_id `p1`) so every driver
+    // row matches exactly once — the output row count equals the driver row
+    // count.
+    let products = "product_id,name\np1,Prod1\n";
+    let mut orders = String::from("order_id,product_id\n");
+    for i in 1..=ROWS {
+        orders.push_str(&format!("o-{i},p1\n"));
+    }
+    let readers: SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![fast_slot("orders", &orders)]),
+        ),
+        (
+            "products".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![fast_slot("products", products)]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("streaming combine probe must not deadlock under back-pressure");
+    let lines = body_lines(&buf);
+    assert_eq!(
+        lines.len(),
+        ROWS,
+        "back-pressured combine probe dropped/duplicated rows"
+    );
+    assert_eq!(report.counters.dlq_count, 0);
+}
+
+/// Per-source dead-letter rewind must survive a streaming driver. A
+/// streaming-probe `Combine` whose matched body divides by zero on one
+/// driver row routes only that row to the DLQ under
+/// `error_handling: continue`, while the surviving driver rows reach the
+/// writer and the run completes. This exercises the streaming path's
+/// deferred-failure replay: the probe thread cannot touch the DLQ, so it
+/// accumulates the failure and the dispatch thread replays it through the
+/// same `dispatch_combine_output_error` rewind the materialized path uses,
+/// after merging the driver-side pre-fold snapshot floor.
+#[test]
+fn streaming_combine_probe_preserves_dlq_rewind() {
+    let yaml = r#"
+pipeline:
+  name: streaming_combine_probe_dlq
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: qty, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: divisor, type: int }
+  - type: transform
+    name: norm
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+        emit qty = qty
+  - type: combine
+    name: c
+    input:
+      norm: norm
+      products: products
+    config:
+      where: "norm.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      drive: norm
+      cxl: |
+        emit order_id = norm.order_id
+        emit ratio = norm.qty / products.divisor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: c
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    assert_streaming_to_output(&explain_of(&config, &plan), "transform.norm", "combine.c");
+
+    // Driver `o2` matches build `p2` whose divisor is 0 → the matched body
+    // `qty / divisor` divides by zero, routing o2 to the DLQ. o1 and o3
+    // (divisor 2) survive.
+    let orders = "order_id,product_id,qty\no1,p1,10\no2,p2,20\no3,p1,30\n";
+    let products = "product_id,divisor\np1,2\np2,0\n";
+    let readers: SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "orders.csv",
+                Box::new(Cursor::new(orders.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "products".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "products.csv",
+                Box::new(Cursor::new(products.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("streaming combine probe completes under continue strategy");
+    let mut lines = body_lines(&buf);
+    lines.sort();
+    // o1 -> 10/2 = 5, o3 -> 30/2 = 15 survive; o2 div-by-zero is DLQ'd.
+    assert_eq!(
+        lines,
+        vec!["o1,5", "o3,15"],
+        "surviving streaming-probe rows diverged"
+    );
+    // The matched-body failure routes two DLQ entries — the driver row
+    // (trigger) and its contributing build row (attribution) — exactly as
+    // the materialized path does via `dispatch_combine_output_error`.
+    assert_eq!(
+        report.counters.dlq_count, 2,
+        "the failing driver row and its matched build row both route to the DLQ"
+    );
+}

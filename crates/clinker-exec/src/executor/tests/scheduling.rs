@@ -138,7 +138,7 @@ fn no_estimates_reproduces_topo_order_exactly() {
         MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, MemoryArbitrator::default_policy());
     let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
 
-    let order = scheduled_pass_order(dag, &arbitrator, &all);
+    let order = scheduled_pass_order(dag, &arbitrator, &all, &std::collections::HashMap::new());
     assert_eq!(
         order, dag.topo_order,
         "with no estimates the scheduler must reproduce topo order exactly"
@@ -345,7 +345,7 @@ fn scheduler_elects_heavy_chain_source_before_lower_index_light_source() {
     // task specifies (no spill, no back-pressure, fully decoupled from RSS).
     let arbitrator = huge_budget_arbitrator();
     let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
-    let order = scheduled_pass_order(dag, &arbitrator, &all);
+    let order = scheduled_pass_order(dag, &arbitrator, &all, &std::collections::HashMap::new());
     let pos = |idx: NodeIndex| order.iter().position(|&n| n == idx).unwrap();
 
     assert!(

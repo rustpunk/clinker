@@ -903,16 +903,44 @@ pub(crate) fn select_combine_strategies_in_graph(
             CombineStrategy::HashBuildProbe
         };
 
+        // Resolve the driver predecessor's `NodeIndex` from the driving
+        // qualifier's `upstream_name`, matching it against the combine's
+        // incoming neighbors. The probe-side streaming-ingest predicate
+        // reads this index to identify the driver predecessor without
+        // `CompileArtifacts` access (combine edges carry `port: None`, so
+        // a qualifier cannot otherwise be mapped back to a node). Mirrors
+        // the executor's `predecessor_matches` resolution, including the
+        // `__correlation_sort_<source>` splice alias so the index resolves
+        // through an injected correlation Sort. Stays `None` when no
+        // incoming neighbor matches — e.g. an N-ary decomposition step
+        // whose driver is a synthetic intermediate not present as a direct
+        // predecessor; the streaming-ingest path declines those.
+        let driver_upstream = inputs.get(&driving).map(|ci| Arc::clone(&ci.upstream_name));
+        let resolved_driving_upstream: Option<NodeIndex> =
+            driver_upstream.and_then(|driver_name| {
+                graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .find(|&p| {
+                        let pname = graph[p].name();
+                        pname == driver_name.as_ref()
+                            || pname
+                                .strip_prefix(crate::plan::execution::CORRELATION_SORT_PREFIX)
+                                .is_some_and(|stripped| stripped == driver_name.as_ref())
+                    })
+            });
+
         if let PlanNode::Combine {
             strategy,
             driving_input,
             build_inputs,
+            driving_upstream,
             ..
         } = &mut graph[idx]
         {
             *strategy = chosen_strategy;
             *driving_input = driving;
             *build_inputs = build;
+            *driving_upstream = resolved_driving_upstream;
         }
     }
 }
@@ -1918,6 +1946,7 @@ pub(crate) fn decompose_nary_combines(
                         strategy: CombineStrategy::HashBuildProbe,
                         driving_input: String::new(),
                         build_inputs: Vec::new(),
+                        driving_upstream: None,
                         predicate_summary,
                         match_mode: MatchMode::All,
                         on_miss: OnMiss::Skip,
@@ -1938,6 +1967,7 @@ pub(crate) fn decompose_nary_combines(
                     strategy,
                     driving_input,
                     build_inputs,
+                    driving_upstream,
                     predicate_summary: ps,
                     match_mode: mm,
                     on_miss: om,
@@ -1951,6 +1981,11 @@ pub(crate) fn decompose_nary_combines(
                     *strategy = CombineStrategy::HashBuildProbe;
                     *driving_input = String::new();
                     *build_inputs = Vec::new();
+                    // The strategy post-pass re-resolves the driver
+                    // predecessor; clear the stale index so the invariant
+                    // "non-empty driving_input ⇒ driving_upstream resolved"
+                    // is not transiently violated between the two passes.
+                    *driving_upstream = None;
                     *ps = predicate_summary;
                     *mm = match_mode;
                     *om = on_miss;
@@ -2342,6 +2377,7 @@ mod tests {
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
             build_inputs: Vec::new(),
+            driving_upstream: None,
             predicate_summary,
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
@@ -2522,6 +2558,7 @@ mod tests {
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
             build_inputs: Vec::new(),
+            driving_upstream: None,
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
@@ -2655,6 +2692,7 @@ mod tests {
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
             build_inputs: Vec::new(),
+            driving_upstream: None,
             predicate_summary: CombinePredicateSummary::from_decomposed(
                 artifacts.combine_predicates.get(combine_name).unwrap(),
             ),

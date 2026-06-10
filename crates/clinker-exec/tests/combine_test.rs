@@ -4491,6 +4491,7 @@ nodes:
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
             build_inputs: Vec::new(),
+            driving_upstream: None,
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: clinker_plan::config::pipeline_node::MatchMode::First,
             on_miss: clinker_plan::config::pipeline_node::OnMiss::NullFields,

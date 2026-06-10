@@ -863,6 +863,26 @@ pub(crate) struct ExecutorContext<'a> {
     /// flush, and back-pressure flows Aggregate-ingest → producer →
     /// Source. Empty for pipelines with no streaming-ingest Aggregate.
     pub(crate) streaming_aggregate_ingest_edges: HashMap<NodeIndex, NodeIndex>,
+
+    /// `driver-producer → Combine` edges whose probe-side ingest streams.
+    /// Keyed by the driver (probe-side) producer's `NodeIndex`, valued by
+    /// the consuming `Combine`'s `NodeIndex`. Computed once at executor
+    /// entry from the plan's fusion analysis
+    /// ([`certify_streaming_edge`] with a `Combine` consumer, resolving
+    /// the driver via the plan-stamped `driving_upstream` index).
+    ///
+    /// The driver producer's own topo turn is short-circuited (the
+    /// dispatcher skips a node whose index is a key here): it instead runs
+    /// inside the consuming Combine's dispatch turn, on the main thread,
+    /// streaming each batch into a bounded channel while the probe consumer
+    /// drains it on its own thread. The build side is fully materialized
+    /// into the hash table on the main thread *before* the driver producer
+    /// is redispatched, so the probe never reads an incomplete table and
+    /// the bounded `send` cannot deadlock — the probe consumer is live
+    /// before the driver's first flush, and back-pressure flows probe →
+    /// driver → Source. Empty for pipelines with no streaming-probe
+    /// Combine.
+    pub(crate) streaming_combine_probe_edges: HashMap<NodeIndex, NodeIndex>,
     /// `JoinHandle`s for spawned streaming-output writer threads. Owned
     /// by the dispatcher so the end-of-DAG join surface (in
     /// `execute_dag_branching`) folds per-thread counter / timer /
@@ -1022,6 +1042,39 @@ impl<'a> ExecutorContext<'a> {
             return None;
         }
         self.streaming_output_senders.remove(&node_idx)
+    }
+
+    /// Install a bounded streaming-ingest channel for the producer at
+    /// `producer_idx`: register a per-edge `NodeBufferConsumer` charge
+    /// consumer, key the sender by the producer index so its dispatch arm
+    /// streams into the channel via the shared `take_streaming_sender`
+    /// path, and return the receiver, the charge handle, and the charge
+    /// consumer's id for later unregistration.
+    ///
+    /// Shared by the streaming-ingest consumers (Aggregate ingest, Combine
+    /// probe): both move a producer's emit onto a back-pressured channel a
+    /// consumer thread drains. The 256-event bound mirrors the Source
+    /// ingest channel so back-pressure paces both ends, and the per-batch
+    /// `add_bytes` the producer charges on flush is netted to zero by the
+    /// consumer's per-record `sub_bytes` discharge.
+    pub(crate) fn install_streaming_ingest_channel(
+        &mut self,
+        producer_idx: NodeIndex,
+    ) -> (
+        crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
+        Arc<crate::pipeline::memory::ConsumerHandle>,
+        crate::pipeline::memory::ConsumerId,
+    ) {
+        let (tx, rx) =
+            crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+        let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
+        let charge_consumer_id = self.memory_budget.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+        ));
+        self.streaming_output_senders.insert(producer_idx, tx);
+        self.streaming_charge_consumers
+            .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
+        (rx, charge_handle, charge_consumer_id)
     }
 
     /// Build the [`crate::executor::batch_handoff::StreamingChargeHandle`]
@@ -2498,6 +2551,19 @@ pub(crate) fn dispatch_plan_node(
     // top-level plan installs ingest edges.
     if ctx.current_body_node_input_refs.is_none()
         && ctx.streaming_aggregate_ingest_edges.contains_key(&node_idx)
+    {
+        return Ok(());
+    }
+    // Streaming-probe producer short-circuit. A driver (probe-side)
+    // producer feeding a streaming-probe Combine runs inside that Combine's
+    // dispatch turn — the Combine materializes its build-side hash table on
+    // the main thread, spawns the probe consumer on its own thread, then
+    // redispatches this driver producer to stream into the bounded channel.
+    // So the driver's own topo turn is a no-op here. Same composition-body
+    // guard as the Aggregate-ingest short-circuit: only the top-level plan
+    // installs probe edges.
+    if ctx.current_body_node_input_refs.is_none()
+        && ctx.streaming_combine_probe_edges.contains_key(&node_idx)
     {
         return Ok(());
     }
