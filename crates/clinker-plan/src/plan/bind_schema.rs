@@ -760,7 +760,7 @@ fn collect_scope_reads_in_statement(
             collect_scope_reads_in_expr(message, out);
         }
         Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
-        Statement::EmitEach { source, body, .. } => {
+        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
             collect_scope_reads_in_expr(source, out);
             for inner in body {
                 collect_scope_reads_in_statement(inner, out);
@@ -3375,7 +3375,7 @@ fn statement_exprs(stmt: &Statement) -> Vec<&Expr> {
             v
         }
         Statement::Distinct { .. } | Statement::UseStmt { .. } => Vec::new(),
-        Statement::EmitEach { source, body, .. } => {
+        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
             // Surface the source expression plus the expressions from
             // each body statement so qualified-ref walking covers the
             // entire fan-out block, not just the outer driver.
@@ -3723,7 +3723,7 @@ fn walk_statement_exprs(stmt: &Statement, cx: CombineWalkContext<'_>, diags: &mu
             walk_for_unknown_refs(message, cx, diags);
         }
         Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
-        Statement::EmitEach { source, body, .. } => {
+        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
             walk_for_unknown_refs(source, cx, diags);
             for inner in body {
                 walk_statement_exprs(inner, cx, diags);

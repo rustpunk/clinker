@@ -441,7 +441,8 @@ fn collect_field_refs_stmt(stmt: &cxl::ast::Statement, names: &mut Vec<String>) 
             }
             collect_field_refs_expr(message, names);
         }
-        cxl::ast::Statement::EmitEach { source, body, .. } => {
+        cxl::ast::Statement::EmitEach { source, body, .. }
+        | cxl::ast::Statement::ExplodeOuter { source, body, .. } => {
             collect_field_refs_expr(source, names);
             for inner in body {
                 collect_field_refs_stmt(inner, names);
@@ -598,6 +599,26 @@ fn format_statement(stmt: &cxl::ast::Statement) -> String {
                 .join("\n  ");
             format!(
                 "emit each {} in {} {{\n  {}\n}}",
+                binding,
+                format_expr(source),
+                body_str,
+            )
+        }
+        cxl::ast::Statement::ExplodeOuter {
+            binding,
+            source,
+            body,
+            ..
+        } => {
+            let body_str = body
+                .iter()
+                .map(format_statement)
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            // The trailing `outer` modifier distinguishes the variant that
+            // preserves the trigger row when the source is null/empty.
+            format!(
+                "emit each {} in {} outer {{\n  {}\n}}",
                 binding,
                 format_expr(source),
                 body_str,

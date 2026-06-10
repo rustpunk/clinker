@@ -604,6 +604,84 @@ fn compile_stmt<S: RecordStorage + 'static>(
                 Ok(StmtFlow::Continue)
             })
         }
+        Statement::ExplodeOuter {
+            binding,
+            source,
+            body,
+            span,
+            ..
+        } => {
+            let binding = binding.to_string();
+            let source = compile_expr::<S>(typed, source);
+            let span = *span;
+            // Same restricted body surface as `emit each`: only let / emit
+            // / trace / use / expression statements; filter / distinct /
+            // nested fan-out are rejected at compile time.
+            let body: Vec<CompiledStmt<S>> = body
+                .iter()
+                .map(|s| compile_emit_each_body_stmt(typed, s))
+                .collect();
+            Box::new(move |frame, out| {
+                let source_val = source(frame)?;
+                let elements = match source_val {
+                    Value::Array(arr) => arr,
+                    // A null source is treated as an empty array — the
+                    // outer variant's defining difference from `emit each`.
+                    Value::Null => Vec::new(),
+                    other => {
+                        return Err(EvalError::new(
+                            EvalErrorKind::TypeMismatch {
+                                expected: "Array",
+                                got: other.type_name(),
+                            },
+                            span,
+                        ));
+                    }
+                };
+
+                // The outer-join (`LATERAL VIEW OUTER EXPLODE`) shape:
+                // an empty/null source still emits the trigger row once
+                // with the binding bound to null, rather than emitting
+                // zero records. Driving the same per-element loop over a
+                // synthetic `[null]` keeps the two cases on one code path.
+                let elements = if elements.is_empty() {
+                    vec![Value::Null]
+                } else {
+                    elements
+                };
+
+                for element in elements {
+                    // Ceiling check before binding/evaluating the element:
+                    // an oversized fan-out errors before unbounded work.
+                    if out.expansion_count >= out.state.max_expansion {
+                        return Err(EvalError::new(
+                            EvalErrorKind::ExpansionLimitExceeded {
+                                limit: out.state.max_expansion,
+                            },
+                            span,
+                        ));
+                    }
+                    frame.env.insert(binding.clone(), element);
+                    let mut iter = StmtOut {
+                        fields: out.fields.clone(),
+                        record_vars: out.record_vars.clone(),
+                        fan_out: Vec::new(),
+                        expansion_count: 0,
+                        state: &mut *out.state,
+                    };
+                    for stmt in &body {
+                        stmt(frame, &mut iter)?;
+                    }
+                    frame.env.remove(binding.as_str());
+                    out.fan_out.push(super::EmitOne {
+                        fields: iter.fields,
+                        record_vars: Box::new(iter.record_vars),
+                    });
+                    out.expansion_count += 1;
+                }
+                Ok(StmtFlow::Continue)
+            })
+        }
     }
 }
 
@@ -632,7 +710,8 @@ fn compile_emit_each_body_stmt<S: RecordStorage + 'static>(
         }
         Statement::Filter { span, .. }
         | Statement::Distinct { span, .. }
-        | Statement::EmitEach { span, .. } => {
+        | Statement::EmitEach { span, .. }
+        | Statement::ExplodeOuter { span, .. } => {
             let span = *span;
             Box::new(move |_frame, _out| {
                 Err(EvalError::new(

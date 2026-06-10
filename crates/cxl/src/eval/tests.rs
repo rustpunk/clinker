@@ -1976,4 +1976,127 @@ mod intra_record {
             parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
+
+    // ── explode_outer (`emit each ... outer`) ──────────────────────
+    // The outer variant matches `emit each` on a non-empty array but
+    // preserves the trigger row (binding bound to null) when the source
+    // is null or empty.
+
+    #[test]
+    fn explode_outer_fans_out_one_per_element_when_non_empty() {
+        let out = run(
+            "emit each it in nums outer {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([(
+                "nums".into(),
+                arr(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 3);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Integer(1)));
+                assert_eq!(records[1].fields.get("val"), Some(&Value::Integer(2)));
+                assert_eq!(records[2].fields.get("val"), Some(&Value::Integer(3)));
+            }
+            other => panic!("expected EmitMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explode_outer_null_source_preserves_trigger_row_with_null_binding() {
+        let out = run(
+            "emit each it in nums outer {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), Value::Null)]),
+        )
+        .unwrap();
+        // Unlike `emit each` (which emits nothing on a null source), the
+        // outer variant emits exactly one record with the binding bound
+        // to null — the LATERAL VIEW OUTER EXPLODE shape.
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Null));
+            }
+            other => panic!("expected single EmitMany record on null source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explode_outer_empty_array_preserves_trigger_row_with_null_binding() {
+        let out = run(
+            "emit each it in nums outer {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), arr(vec![]))]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Null));
+            }
+            other => panic!("expected single EmitMany record on empty array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explode_outer_trigger_row_carries_pre_block_emits() {
+        // A top-level emit preceding the fan-out applies to the preserved
+        // trigger row too, so the outer-join row is never bare.
+        let out = run(
+            "emit kept = 7\nemit each it in nums outer {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), Value::Null)]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::EmitMany { records } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].fields.get("kept"), Some(&Value::Integer(7)));
+                assert_eq!(records[0].fields.get("val"), Some(&Value::Null));
+            }
+            other => {
+                panic!("expected single EmitMany record carrying pre-block emit, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn explode_outer_max_expansion_governs_non_empty_fan_out() {
+        let big: Vec<Value> = (0..20).map(Value::Integer).collect();
+        let err = run_with_max_expansion(
+            "emit each it in nums outer {\n  emit val = it\n}",
+            &["nums"],
+            HashMap::from([("nums".into(), arr(big))]),
+            5,
+        )
+        .expect_err("expected ExpansionLimitExceeded");
+        match err.kind {
+            crate::eval::EvalErrorKind::ExpansionLimitExceeded { limit } => {
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected ExpansionLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_explode_outer_rejected_by_parser() {
+        let result = Parser::parse(
+            "emit each it in nums outer {\n  emit each x in others outer { emit val = x }\n}",
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("emit_each cannot be nested")),
+            "expected nested fan-out parse error, got: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
 }

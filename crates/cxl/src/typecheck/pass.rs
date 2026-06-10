@@ -361,6 +361,26 @@ impl<'a> TypeChecker<'a> {
                     self.check_statement(stmt);
                 }
             }
+            Statement::ExplodeOuter { source, body, .. } => {
+                let source_ty = self.check_expr(source, false);
+                let inner = source_ty.unwrap_nullable();
+                // The outer variant additionally accepts a statically-null
+                // source: a null/empty array is the case it exists to
+                // handle — it preserves the trigger row with the binding
+                // bound to null rather than emitting nothing.
+                if !matches!(inner, Type::Array | Type::Any | Type::Null) {
+                    self.error(
+                        source.span(),
+                        format!(
+                            "emit_each ... outer requires an Array, Null, or Any source, got {source_ty}"
+                        ),
+                        Some("Use an Array-valued (or nullable Array) expression; the outer variant preserves the trigger row when that array is null or empty".into()),
+                    );
+                }
+                for stmt in body {
+                    self.check_statement(stmt);
+                }
+            }
         }
     }
 
@@ -994,10 +1014,12 @@ impl<'a> TypeChecker<'a> {
                     self.agg_function_depth = 0;
                     self.walk_agg_ctx_row_only(predicate);
                 }
-                Statement::EmitEach { source, body, .. } => {
-                    // emit_each is a row-level fan-out: the source must
-                    // not contain aggregates, and body statements obey
-                    // the same context rules as the surrounding block.
+                Statement::EmitEach { source, body, .. }
+                | Statement::ExplodeOuter { source, body, .. } => {
+                    // Fan-out (plain or outer) is a row-level operation:
+                    // the source must not contain aggregates, and body
+                    // statements obey the same context rules as the
+                    // surrounding block.
                     self.agg_function_depth = 0;
                     self.walk_agg_ctx_row_only(source);
                     // Recurse the body via the existing dispatch by
@@ -1392,8 +1414,9 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check that the program has at least one emit statement. Recurses
-    /// through `Statement::EmitEach.body` so a program whose only emits
-    /// live inside a fan-out block still counts as having emits.
+    /// through `Statement::EmitEach.body` and `Statement::ExplodeOuter.body`
+    /// so a program whose only emits live inside a fan-out block still
+    /// counts as having emits.
     fn check_emit_count(&mut self, program: &Program) {
         let has_emit = crate::ast::contains_emit(&program.statements);
         if !has_emit {
