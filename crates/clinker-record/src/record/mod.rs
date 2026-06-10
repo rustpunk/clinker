@@ -551,19 +551,19 @@ mod tests {
         let size = record.estimated_heap_size();
         // Vec backing: capacity(2) * sizeof(Value)
         let expected_backing = 2 * std::mem::size_of::<Value>();
-        // Short "hello" lives inline in the SmolStr (0 heap); Integer is 0 too.
+        // Short "hello" lives inline in the FieldStr (0 heap); Integer is 0 too.
         assert_eq!(size, expected_backing);
     }
 
     #[test]
     fn test_record_estimated_heap_size_heap_backed_string() {
         let schema = Arc::new(Schema::new(vec!["name".into(), "value".into()]));
-        let long = "a field value that exceeds the 23-byte inline capacity of smolstr";
-        assert!(smol_str::SmolStr::new(long).is_heap_allocated());
+        let long = "a field value that exceeds the 23-byte inline capacity of the field type";
+        assert!(long.len() > crate::field_str::INLINE_CAP);
         let record = Record::new(schema, vec![Value::String(long.into()), Value::Integer(42)]);
         let size = record.estimated_heap_size();
         let expected_backing = 2 * std::mem::size_of::<Value>();
-        // The heap-backed (Arc) string charges its byte length on top of the Vec backing.
+        // The heap-backed string charges its byte length on top of the Vec backing.
         assert_eq!(size, expected_backing + long.len());
     }
 }
