@@ -174,11 +174,31 @@ reflects the file that record came from.
 
 Document boundaries flow through the pipeline as inline punctuation
 signals (one when a document opens, one when it closes). These signals
-let document-scoped operators — for example a future per-document
-aggregate flush or trailer-count validation — fire at exactly the right
-point. Today the signals propagate through Source, Transform, Route,
-Sort, and Combine, and are reconciled at Merge (a document that fans in
-through several branches closes downstream exactly once).
+let document-scoped operators fire at exactly the right point. They
+propagate through Source, Transform, Route, Sort, and Combine, and are
+reconciled at Merge (a document that fans in through several branches
+closes downstream exactly once).
+
+### Per-document aggregation
+
+A grouped or global `Aggregate` reading a multi-document source produces
+**one set of grouped rows per document**, not a single aggregate spanning
+every document. When a document closes, the Aggregate finalizes and emits
+the groups belonging to that document, then drops their state before the
+next document accumulates — so a `glob:` source over twelve monthly files
+through a `group_by` Aggregate yields twelve independent monthly
+roll-ups, and only one document's groups are ever live at once (the
+others have already been emitted and freed, or have not yet started).
+
+This applies only when a document boundary actually reaches the
+Aggregate. A plain single-file source is one document, so it still emits
+one aggregate. A `Merge` that combines several distinct single-document
+sources does **not** forward a per-source close (it reconciles boundaries
+and emits a close only when *every* branch closed the same document), so
+those sources fold together into one cross-source aggregate — the same
+result you would get with no envelopes at all. To keep per-document
+roll-ups across files, feed the multi-file source straight into the
+Aggregate rather than merging distinct sources first.
 
 ## Nested (multi-level) envelopes
 
