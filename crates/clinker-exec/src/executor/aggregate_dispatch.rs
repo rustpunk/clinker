@@ -711,6 +711,33 @@ impl DocumentFlushAggregator {
         }
         Ok(())
     }
+
+    /// `true` when this aggregate is a global fold (no group-by columns).
+    /// A global fold owes one defaulted row per closing document even when
+    /// that document contributed zero records; a grouped fold owes nothing
+    /// for an empty document.
+    fn is_global_fold(&self) -> bool {
+        self.factory.compiled.group_by_fields.is_empty()
+    }
+}
+
+impl Drop for DocumentFlushAggregator {
+    /// Release the open table's arbitrator consumer on every exit path.
+    ///
+    /// `flush_current` takes `current` and unregisters the consumer on the
+    /// normal flush, so a cleanly-drained aggregator drops with
+    /// `current == None` and this is a no-op. An error return from the
+    /// ingest loop, by contrast, drops the aggregator with a table still
+    /// open; without this the open table's `AggregateConsumer` would linger
+    /// in the arbitrator's registry — the registry holds an independent
+    /// `Arc` keyed by `ConsumerId`, so dropping the `AggregateStream` alone
+    /// does not unregister it. `unregister_consumer` is idempotent, so even
+    /// a redundant call is harmless.
+    fn drop(&mut self) {
+        if let Some((_, consumer_id)) = self.current.take() {
+            self.factory.arbitrator.unregister_consumer(consumer_id);
+        }
+    }
 }
 
 /// Per-document group tables keyed by flush key, with a teardown that
@@ -1117,6 +1144,12 @@ fn run_streaming_aggregate_ingest(
     let mut out_rows: Vec<AggSortRow> = Vec::with_capacity(64);
     let mut puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut input_count: u64 = 0;
+    // Set once any `DocumentClose` flushes a table. The disconnect-time
+    // empty-input flush owes a global fold its single defaulted row only
+    // when no close already paid that debt — an all-empty-documents run
+    // flushes one defaulted row per close and must not gain an extra
+    // phantom row at the tail.
+    let mut flushed_close = false;
     let mut agg = DocumentFlushAggregator::new(factory);
 
     // Run the ingest recv loop and the producer concurrently. The scoped
@@ -1129,85 +1162,121 @@ fn run_streaming_aggregate_ingest(
     let finalize_ctx = ctx.merged_eval_ctx();
     let ingest_result: Result<(), PipelineError> = std::thread::scope(|scope| {
         let handle = scope.spawn(|| -> Result<(), PipelineError> {
-            while let Ok(event) = rx.recv() {
-                let (record, rn) = match event {
-                    StreamEvent::Record(r, rn) => (r, rn),
-                    StreamEvent::Punctuation(p) => {
-                        // A `DocumentClose` arriving in stream order means the
-                        // open document is fully delivered: flush its groups
-                        // now (its records arrived contiguously before this
-                        // boundary), then forward the boundary at the output
-                        // tail. Opens only forward. Punctuations carry zero
-                        // charge, so no discharge here.
-                        if p.kind() == crate::executor::stream_event::PunctuationKind::DocumentClose
-                            && let Err(e) = agg.flush_current(&finalize_ctx, &mut out_rows)
-                        {
-                            // The streaming-ingest arm aborts on a finalize
-                            // failure (no DLQ fallback, matching the prior
-                            // single-stream behavior); drain first so the
-                            // producer's bounded `send` can't deadlock.
-                            while rx.recv().is_ok() {}
-                            return Err(e.into());
+            // The recv body is a single fallible closure so EVERY error exit
+            // funnels through the one drain-then-return site below. `rx` lives
+            // in the outer function frame, not in this closure, so an early
+            // `?` return would NOT disconnect the channel — a producer blocked
+            // on the bounded `send` would then deadlock and the join would
+            // hang forever. Draining `rx` to disconnect before propagating any
+            // error closes that gap structurally: no `?` site inside the
+            // closure can reintroduce the non-draining asymmetry.
+            let mut drive = || -> Result<(), PipelineError> {
+                while let Ok(event) = rx.recv() {
+                    let (record, rn) = match event {
+                        StreamEvent::Record(r, rn) => (r, rn),
+                        StreamEvent::Punctuation(p) => {
+                            // A `DocumentClose` arriving in stream order means
+                            // the open document is fully delivered: flush its
+                            // groups now (its records arrived contiguously
+                            // before this boundary), then forward the boundary
+                            // at the output tail. A global fold owes one
+                            // defaulted row per closing document even when that
+                            // document contributed zero records, so force a
+                            // table open before flushing an empty global-fold
+                            // document — matching what a standalone empty run
+                            // emits. A grouped fold owes nothing for an empty
+                            // document, and a closing document that DID see
+                            // records already holds an open table, so neither
+                            // path gains a phantom row. Opens only forward.
+                            // Punctuations carry zero charge, so no discharge
+                            // here.
+                            if p.kind()
+                                == crate::executor::stream_event::PunctuationKind::DocumentClose
+                            {
+                                if agg.is_global_fold() {
+                                    agg.ensure_open()?;
+                                }
+                                agg.flush_current(&finalize_ctx, &mut out_rows)?;
+                                flushed_close = true;
+                            }
+                            puncts.push(p);
+                            continue;
                         }
-                        puncts.push(p);
-                        continue;
+                    };
+                    // Discharge this record's per-row cost — the consume half
+                    // of the producer's per-batch admit. The formula matches
+                    // the producer's charge so a fully-drained stream nets to
+                    // zero.
+                    charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
+                        record.schema().column_count(),
+                    ));
+                    input_count += 1;
+                    if let Some(exp) = expected_input.as_ref() {
+                        check_input_schema(
+                            exp,
+                            record.schema(),
+                            name,
+                            "aggregation",
+                            &upstream_name,
+                        )?;
                     }
-                };
-                // Discharge this record's per-row cost — the consume half of
-                // the producer's per-batch admit. The formula matches the
-                // producer's charge so a fully-drained stream nets to zero.
-                charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
-                    record.schema().column_count(),
-                ));
-                input_count += 1;
-                if let Some(exp) = expected_input.as_ref() {
-                    check_input_schema(exp, record.schema(), name, "aggregation", &upstream_name)?;
+                    let source_file_arc = source_file_arc_of(&record);
+                    let source_name_arc = source_name_arc_of(&record);
+                    // Mid-stream `$source.count` is `None` (defer-emit) — the
+                    // total is unknown until the source disconnects, exactly as
+                    // the per-record eval sites resolve it.
+                    let eval_ctx = EvalContext {
+                        stable,
+                        source_file: &source_file_arc,
+                        source_row: rn,
+                        source_path: &source_file_arc,
+                        source_count: None,
+                        source_batch: source_batch_arc,
+                        ingestion_timestamp,
+                        source_name: &source_name_arc,
+                        doc_ctx: record.doc_ctx(),
+                    };
+                    let stream = agg.stream()?;
+                    match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
+                        Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
+                        Err(e) => match strategy {
+                            ErrorStrategy::FailFast => return Err(e.into()),
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                effects.add_errors.push((
+                                    record,
+                                    rn,
+                                    format!("aggregate {name}: {e}"),
+                                ));
+                            }
+                        },
+                    }
                 }
-                let source_file_arc = source_file_arc_of(&record);
-                let source_name_arc = source_name_arc_of(&record);
-                // Mid-stream `$source.count` is `None` (defer-emit) — the
-                // total is unknown until the source disconnects, exactly as
-                // the per-record eval sites resolve it.
-                let eval_ctx = EvalContext {
-                    stable,
-                    source_file: &source_file_arc,
-                    source_row: rn,
-                    source_path: &source_file_arc,
-                    source_count: None,
-                    source_batch: source_batch_arc,
-                    ingestion_timestamp,
-                    source_name: &source_name_arc,
-                    doc_ctx: record.doc_ctx(),
-                };
-                let stream = agg.stream()?;
-                match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
-                    Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
-                    Err(e) => match strategy {
-                        ErrorStrategy::FailFast => {
-                            // Drain the rest so the producer's bounded `send`
-                            // can't deadlock, then surface the error.
-                            while rx.recv().is_ok() {}
-                            return Err(e.into());
-                        }
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            effects
-                                .add_errors
-                                .push((record, rn, format!("aggregate {name}: {e}")));
-                        }
-                    },
+                // Channel disconnected — every sender dropped at the producer
+                // arm's clean exit. A completely empty stream (no records, no
+                // forwarded close) opened no table; a global fold still owes
+                // one defaulted row, so force one open before the final flush.
+                // Gated on `!flushed_close` so an all-empty-documents run —
+                // whose per-document closes already each flushed a defaulted
+                // row — is not given an extra phantom row here. Then flush
+                // whatever is still open (the trailing document, the synthetic
+                // doc id of a no-envelope run, or the unreconciled-Merge
+                // remainder) and return.
+                if input_count == 0 && !flushed_close {
+                    agg.ensure_open()?;
                 }
+                agg.flush_current(&finalize_ctx, &mut out_rows)
+                    .map_err(PipelineError::from)
+            };
+            let result = drive();
+            if result.is_err() {
+                // Drain to disconnect before surfacing the error so a producer
+                // blocked on the bounded `send` cannot deadlock the join. The
+                // streaming-ingest arm aborts on any ingest error (schema
+                // mismatch, FailFast `add_record`, finalize failure) with no
+                // DLQ fallback, matching the prior single-stream behavior.
+                while rx.recv().is_ok() {}
             }
-            // Channel disconnected — every sender dropped at the producer
-            // arm's clean exit. An empty stream opened no table; a global
-            // fold still owes one defaulted row, so force one open before the
-            // final flush. Then flush whatever is still open (the trailing
-            // document, the synthetic doc id of a no-envelope run, or the
-            // unreconciled-Merge remainder) and return.
-            if input_count == 0 {
-                agg.ensure_open()?;
-            }
-            agg.flush_current(&finalize_ctx, &mut out_rows)
-                .map_err(PipelineError::from)
+            result
         });
 
         // Redispatch the producer on the main thread. Clear its ingest-edge
@@ -1236,9 +1305,12 @@ fn run_streaming_aggregate_ingest(
     // the ingest thread discharged each record. Pin to zero defensively (a
     // heuristic mismatch between batch charge and per-record discharge must
     // not leave a stale positive for the arbitrator), then unregister the
-    // per-edge charge consumer. Each per-document bucket's aggregate
-    // consumer already unregistered itself as that document flushed, so no
-    // aggregate consumer survives this arm.
+    // per-edge charge consumer. The per-document aggregate consumers are
+    // released separately: a flushed document unregisters its own as it
+    // finalizes, and `DocumentFlushAggregator`'s `Drop` releases any table
+    // still open when `agg` falls out of scope below — including on the
+    // error path, where `ingest_result?` returns before the success-path
+    // replay. So no aggregate consumer survives this arm on any exit.
     charge_handle.set_bytes(0);
     ctx.streaming_charge_consumers.remove(&producer_idx);
     ctx.memory_budget.unregister_consumer(charge_consumer_id);
