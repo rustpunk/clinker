@@ -713,6 +713,99 @@ impl DocumentFlushAggregator {
     }
 }
 
+/// Per-document group tables keyed by flush key, with a teardown that
+/// unregisters any table still present from the shared arbitrator.
+///
+/// Each built [`crate::aggregation::AggregateStream`] registers an
+/// [`crate::aggregation::AggregateConsumer`] keyed by a [`ConsumerId`]; the
+/// arbitrator's registry holds an independent `Arc`, so dropping the stream
+/// alone leaves its consumer charged against `sum_consumer_usage`. The
+/// per-document flush loop `remove`s and finalizes each table, then
+/// unregisters it explicitly — but an `add_record` `FailFast` error, a
+/// non-`Accumulator` finalize error, or a `factory.make()` failure can exit
+/// the routine with tables still live. This guard's `Drop` unregisters
+/// every still-present consumer on *every* exit, so an early `?` cannot
+/// strand a consumer in the registry. A normal completion `remove`s every
+/// key as it flushes, so the guard drops an empty map and is a no-op; a
+/// `remove`d-and-flushed table is gone from the map before drop, so no
+/// consumer is unregistered twice.
+struct RegisteredTables {
+    tables: HashMap<
+        DocumentId,
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+    >,
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+}
+
+impl RegisteredTables {
+    fn new(arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>) -> Self {
+        Self {
+            tables: HashMap::new(),
+            arbitrator,
+        }
+    }
+
+    /// Borrow the table for `key`, building (and registering) a fresh one
+    /// via `factory` when none exists yet. The freshly built consumer is
+    /// tracked by the guard the moment it lands in the map, so a later early
+    /// return unregisters it.
+    fn entry_or_make(
+        &mut self,
+        key: DocumentId,
+        factory: &DocAggregatorFactory,
+    ) -> Result<&mut crate::aggregation::AggregateStream, PipelineError> {
+        let entry = match self.tables.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(factory.make()?),
+        };
+        Ok(&mut entry.0)
+    }
+
+    /// Build (and register) a fresh table for `key` unconditionally. Used to
+    /// force a global fold's defaulted row for an empty document.
+    fn insert_fresh(
+        &mut self,
+        key: DocumentId,
+        factory: &DocAggregatorFactory,
+    ) -> Result<(), PipelineError> {
+        self.tables.insert(key, factory.make()?);
+        Ok(())
+    }
+
+    /// Take the table for `key` out of the guard, transferring its consumer
+    /// to the caller, which must unregister it after finalizing. Removing it
+    /// here is what keeps the guard's `Drop` from double-unregistering a
+    /// flushed table.
+    fn remove(
+        &mut self,
+        key: DocumentId,
+    ) -> Option<(
+        crate::aggregation::AggregateStream,
+        crate::pipeline::memory::ConsumerId,
+    )> {
+        self.tables.remove(&key)
+    }
+
+    /// Flush keys in ascending [`DocumentId`] order for deterministic emit
+    /// ordering across the leftover fold.
+    fn sorted_keys(&self) -> Vec<DocumentId> {
+        let mut keys: Vec<DocumentId> = self.tables.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+}
+
+impl Drop for RegisteredTables {
+    fn drop(&mut self) {
+        for (_, (_, consumer_id)) in self.tables.drain() {
+            self.arbitrator.unregister_consumer(consumer_id);
+        }
+    }
+}
+
 /// Drive a strict (non-relaxed, non-time-windowed) Aggregate with
 /// per-document group flush over a fully-drained input batch.
 ///
@@ -767,14 +860,20 @@ fn run_strict_aggregate_per_document(
         }
     };
 
-    let mut tables: HashMap<
-        DocumentId,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    > = HashMap::new();
+    // Hold the per-document tables behind a guard that unregisters any
+    // still-present consumer on drop. A `FailFast` add error, a non-
+    // `Accumulator` finalize error, or a `factory.make()` failure exits via
+    // `?` with tables still live; without the guard each would strand its
+    // arbitrator consumer in `sum_consumer_usage`. Normal completion removes
+    // every key as it flushes, so the guard drops empty.
+    let mut tables = RegisteredTables::new(Arc::clone(&factory.arbitrator));
     let mut out_rows: Vec<crate::aggregation::SortRow> = Vec::with_capacity(64);
+
+    // A global fold (no group-by) owes one defaulted row per closing
+    // document even when that document contributed zero records, matching a
+    // standalone empty single-file run; a grouped fold owes nothing for an
+    // empty document.
+    let is_global_fold = factory.compiled.group_by_fields.is_empty();
 
     for (record, row_num) in input {
         let key = flush_key(record.doc_ctx().id());
@@ -786,13 +885,8 @@ fn run_strict_aggregate_per_document(
             *row_num,
             record.doc_ctx(),
         );
-        let entry = match tables.entry(key) {
-            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => v.insert(factory.make()?),
-        };
-        let add_result = entry
-            .0
-            .add_record(record, *row_num, &eval_ctx, &mut out_rows);
+        let stream = tables.entry_or_make(key, &factory)?;
+        let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut out_rows);
         if add_result.is_ok() {
             advance_cursor(ctx, &source_name_arc, *row_num);
         }
@@ -806,31 +900,56 @@ fn run_strict_aggregate_per_document(
     // borrows only `'a`-lifetime data, so it survives the `&mut ctx` DLQ
     // routing between flushes.
     let finalize_ctx = ctx.merged_eval_ctx();
+    // Documents already flushed in this loop, so a duplicate `DocumentClose`
+    // for the same id does not synthesize a second global-fold row for a
+    // document that already emitted.
+    let mut flushed: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
     for p in input_puncts {
-        if p.kind() == PunctuationKind::DocumentClose
-            && let Some((stream, consumer_id)) = tables.remove(&p.doc_id())
-        {
+        if p.kind() != PunctuationKind::DocumentClose {
+            continue;
+        }
+        let doc_id = p.doc_id();
+        if !flushed.insert(doc_id) {
+            continue;
+        }
+        // A closing document that contributed records owns a table built
+        // lazily on its first record. One that contributed none has no table
+        // — for a global fold, build a fresh table so its defaulted row
+        // still emits; for a grouped fold, emit nothing.
+        let entry = match tables.remove(doc_id) {
+            Some(entry) => Some(entry),
+            None if is_global_fold => Some(factory.make()?),
+            None => None,
+        };
+        if let Some((stream, consumer_id)) = entry {
             let result = stream.finalize(&finalize_ctx, &mut out_rows);
             factory.arbitrator.unregister_consumer(consumer_id);
-            route_document_flush_result(ctx, name, input, output_schema, result)?;
+            // Attribute a finalize failure to a record from THIS document so
+            // the DLQ entry points at the document's own source file, not the
+            // batch's first document.
+            let attribution = document_attribution_record(input, doc_id);
+            route_document_flush_result(ctx, name, attribution, output_schema, result)?;
         }
     }
 
-    // An empty input opened no table; a global fold still owes its single
-    // defaulted row, so force the sentinel table open before the final
-    // flush. Gated on truly-empty input so a run whose only document
-    // already flushed on its close is not given a phantom global-fold row.
-    if input.is_empty() {
-        tables.insert(DocumentId::SYNTHETIC, factory.make()?);
+    // A wholly-empty input that flushed no closing document (the synthetic
+    // no-document case — a fused single-source run whose only document never
+    // forwarded a close) still owes its single defaulted row under a global
+    // fold, so force the sentinel table open before the final flush. The
+    // `flushed.is_empty()` guard keeps this from double-emitting when a
+    // closing document already produced the global-fold row in the punct-loop
+    // above (e.g. a global fold whose lone closing document flushed empty).
+    if input.is_empty() && flushed.is_empty() {
+        tables.insert_fresh(DocumentId::SYNTHETIC, &factory)?;
     }
     // Flush whatever is left in `DocumentId` order for deterministic emit
     // ordering: the sentinel (unreconciled / no-document remainder) and any
-    // closing document whose close never arrived.
+    // closing document whose close never arrived. This leftover fold spans
+    // no single document, so its DLQ attribution keeps the batch-first-record
+    // behavior.
     let finalize_ctx = ctx.merged_eval_ctx();
-    let mut remaining: Vec<DocumentId> = tables.keys().copied().collect();
-    remaining.sort_unstable();
-    for key in remaining {
-        let (stream, consumer_id) = tables.remove(&key).expect("key from this map");
+    for key in tables.sorted_keys() {
+        let (stream, consumer_id) = tables.remove(key).expect("key from this map");
         let result = stream.finalize(&finalize_ctx, &mut out_rows);
         factory.arbitrator.unregister_consumer(consumer_id);
         route_document_flush_result(ctx, name, input, output_schema, result)?;
@@ -839,13 +958,32 @@ fn run_strict_aggregate_per_document(
     Ok(out_rows)
 }
 
+/// Pick a representative record for a flushing document so a finalize-time
+/// DLQ entry is attributed to that document's source file, not the batch's
+/// first document. Returns the input slice narrowed to the first record
+/// whose `doc_ctx().id()` matches `doc_id`; when no record carries that id
+/// (an empty closing document), returns the whole slice so
+/// [`emit_aggregate_finalize_dlq`] keeps its existing first-record / node-
+/// name fallback.
+fn document_attribution_record(input: &[(Record, u64)], doc_id: DocumentId) -> &[(Record, u64)] {
+    match input.iter().position(|(r, _)| r.doc_ctx().id() == doc_id) {
+        Some(pos) => &input[pos..=pos],
+        None => input,
+    }
+}
+
 /// Route a document-flush finalize result: an `Accumulator` failure goes
 /// to the DLQ under `Continue` / `BestEffort` (mirroring the single-stream
 /// strict arm), `FailFast` and every other engine error propagate.
+///
+/// `attribution` is the input slice narrowed to the flushing document — a
+/// single record from that document, or the whole batch for the cross-
+/// document leftover fold — so a DLQ entry points at the document that
+/// actually failed rather than the batch's first document.
 fn route_document_flush_result(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    input: &[(Record, u64)],
+    attribution: &[(Record, u64)],
     output_schema: &Arc<Schema>,
     result: Result<(), crate::aggregation::HashAggError>,
 ) -> Result<(), PipelineError> {
@@ -865,7 +1003,7 @@ fn route_document_flush_result(
             ErrorStrategy::Continue | ErrorStrategy::BestEffort => emit_aggregate_finalize_dlq(
                 ctx,
                 name,
-                input,
+                attribution,
                 output_schema,
                 &transform,
                 &binding,
@@ -1826,19 +1964,26 @@ fn push_late_record(
 
 /// Emit an `AggregateFinalize` DLQ entry for an accumulator failure at
 /// finalize-time. Shared by the strict per-document flush, the relaxed-CK
-/// arm, and the tumbling/hopping/session windowed finalizers. Falls back
-/// to a synthetic record stamped with the node name when the input was
-/// empty (the failure has no real record to attribute to a Source).
+/// arm, and the tumbling/hopping/session windowed finalizers.
+///
+/// `records` carries the failure's source attribution: its first element
+/// stamps the DLQ entry's `original_record` and `source_name`. The
+/// per-document flush narrows it to a single record from the failing
+/// document so the entry points at that document's file; the windowed and
+/// relaxed-CK callers pass the whole batch (their failures span no single
+/// document). Falls back to a synthetic record stamped with the node name
+/// when `records` is empty (the failure has no real record to attribute to
+/// a Source).
 fn emit_aggregate_finalize_dlq(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    input: &[(Record, u64)],
+    records: &[(Record, u64)],
     output_schema: &Arc<Schema>,
     transform: &str,
     binding: &str,
     source: &clinker_record::accumulator::AccumulatorError,
 ) -> Result<(), PipelineError> {
-    let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
+    let (synthetic, source_name) = if let Some((rec, _)) = records.first() {
         let sn = source_name_arc_of(rec);
         (rec.clone(), sn)
     } else {
@@ -1862,4 +2007,82 @@ fn emit_aggregate_finalize_dlq(
             triggering_value: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_record::{DocumentContext, Value};
+    use indexmap::IndexMap;
+
+    fn record_in_document(doc_id: DocumentId, tag: &str) -> Record {
+        let schema = Arc::new(Schema::new(vec!["tag".into()]));
+        let mut record = Record::new(schema, vec![Value::from(tag)]);
+        record.set_doc_ctx(Arc::new(DocumentContext::new(
+            doc_id,
+            Arc::from("file.csv"),
+            IndexMap::new(),
+        )));
+        record
+    }
+
+    /// `document_attribution_record` narrows the batch to the first record of
+    /// the named document so a finalize-time DLQ entry is stamped with that
+    /// document's record, not the batch's first.
+    #[test]
+    fn attribution_narrows_to_the_named_document() {
+        let doc_a = DocumentId::next();
+        let doc_b = DocumentId::next();
+        let input = vec![
+            (record_in_document(doc_a, "a0"), 0),
+            (record_in_document(doc_a, "a1"), 1),
+            (record_in_document(doc_b, "b0"), 2),
+            (record_in_document(doc_b, "b1"), 3),
+        ];
+
+        // Document B narrows to B's first record, never A's.
+        let attr_b = document_attribution_record(&input, doc_b);
+        assert_eq!(
+            attr_b.len(),
+            1,
+            "narrowed to a single representative record"
+        );
+        assert_eq!(
+            attr_b[0].0.get("tag"),
+            Some(&Value::from("b0")),
+            "attribution points at document B's first record",
+        );
+
+        // Document A narrows to A's first record.
+        let attr_a = document_attribution_record(&input, doc_a);
+        assert_eq!(
+            attr_a[0].0.get("tag"),
+            Some(&Value::from("a0")),
+            "attribution points at document A's first record",
+        );
+    }
+
+    /// A document id absent from the batch (an empty closing document, or the
+    /// cross-document leftover fold) falls back to the whole slice so the DLQ
+    /// emitter keeps its first-record / node-name fallback.
+    #[test]
+    fn attribution_falls_back_to_whole_slice_when_document_absent() {
+        let doc_a = DocumentId::next();
+        let absent = DocumentId::next();
+        let input = vec![
+            (record_in_document(doc_a, "a0"), 0),
+            (record_in_document(doc_a, "a1"), 1),
+        ];
+
+        let attr = document_attribution_record(&input, absent);
+        assert_eq!(
+            attr.len(),
+            input.len(),
+            "an absent document keeps the whole slice for the existing fallback",
+        );
+
+        // The empty-input case yields an empty slice (no record to attribute).
+        let empty: Vec<(Record, u64)> = Vec::new();
+        assert!(document_attribution_record(&empty, absent).is_empty());
+    }
 }
