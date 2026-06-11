@@ -110,17 +110,45 @@ Available aggregate functions in CXL:
 
 ### Per-document aggregation
 
-When the source is document-aware — a `glob:` / `paths:` source that
-treats each file as its own document, or an enveloped format like XML or
-EDI — the Aggregate produces **one set of grouped rows per document**
-rather than a single aggregate spanning every file. Each document's
-groups finalize and emit at that document's close boundary, so a glob
-over twelve monthly files yields twelve independent monthly roll-ups, and
-only one document's groups are live in memory at a time. A plain
-single-file source is one document and still emits a single aggregate.
+Per-document aggregation works after **any upstream that forwards
+document boundaries** — a document-aware source (a `glob:` / `paths:`
+source that treats each file as its own document, or an enveloped format
+like XML or EDI), a `Merge`, or a `Combine`. The Aggregate produces **one
+set of grouped rows per document** rather than a single aggregate
+spanning every file. Each document's groups finalize and emit at that
+document's close boundary, so a glob over twelve monthly files yields
+twelve independent monthly roll-ups. A plain single-file source is one
+document and still emits a single aggregate. This holds **whether the
+Aggregate's upstream streams or materializes** its output — both flush
+per document.
+
+A `Merge` of distinct single-document sources now forwards each source's
+per-document close, so each source flushes its own roll-up. And
+per-document aggregation also works **after a `Combine`** on any join
+strategy — for example a driver `glob:` source joined to a lookup table,
+then a group-by Aggregate, yields one roll-up per driver document:
+
+```yaml
+nodes:
+  - type: source            # driver: each monthly file is a document
+    name: orders
+    config: { name: orders, type: csv, glob: "./orders/*.csv", schema: [ ... ] }
+  - type: source            # small lookup table
+    name: products
+    config: { name: products, type: csv, path: "./products.csv", schema: [ ... ] }
+  - type: combine
+    name: enrich
+    input: { orders: orders, products: products }
+    config: { where: "orders.product_id == products.product_id", match: first, on_miss: skip, propagate_ck: driver, cxl: "..." }
+  - type: aggregate
+    name: monthly_totals    # one roll-up per driver document (per month)
+    input: enrich
+    config: { group_by: [category], cxl: "..." }
+```
+
 See [Envelopes & Document Context](../pipeline/envelope-and-doc-context.md#per-document-aggregation)
-for the boundary rules (including how a `Merge` of distinct sources folds
-them back into one aggregate).
+for the boundary rules (including the one fused-interleave Merge exception
+that still folds distinct sources together).
 
 ### Strategy selection
 

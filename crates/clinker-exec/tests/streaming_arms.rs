@@ -844,8 +844,11 @@ nodes:
 /// A non-fused `Merge` (`concat` of two Transform outputs) whose sole
 /// downstream is a strict `Aggregate` streams the merged stream into the
 /// Aggregate's ingest. The Merge reports `buffer: streaming` and emits no
-/// `node_buffer` edge to the Aggregate, and the global total over both
-/// branches matches the materialized path.
+/// `node_buffer` edge to the Aggregate. Each branch carries its own
+/// single-file document, and the non-fused Merge forwards each document's
+/// close, so the streaming Aggregate buckets per document: a GLOBAL fold
+/// emits one row per source document, matching what feeding each branch to
+/// its own Aggregate would produce.
 #[test]
 fn nonfused_merge_streams_ingest_into_aggregate() {
     let yaml = r#"
@@ -935,13 +938,24 @@ nodes:
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
             .expect("non-fused merge streams ingest into aggregate");
-    let lines = body_lines(&buf);
-    assert_eq!(lines.len(), 1, "global aggregate emits one row: {lines:?}");
-    // 10+20+30+40+50 = 150 over 5 records.
+    let mut lines = body_lines(&buf);
+    lines.sort();
+    // sa.csv (10+20+30) and sb.csv (40+50) are two distinct documents. The
+    // non-fused Merge forwards each branch's document close, so the streaming
+    // Aggregate buckets per document and the global fold emits one row per
+    // document: 60 over 3 records, 90 over 2.
+    assert_eq!(
+        lines.len(),
+        2,
+        "global fold emits one row per source document: {lines:?}"
+    );
     assert!(
-        lines[0].starts_with("150,5"),
-        "merged global aggregate diverged: {}",
-        lines[0]
+        lines.iter().any(|l| l.starts_with("60,3")),
+        "sa document's global fold diverged: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("90,2")),
+        "sb document's global fold diverged: {lines:?}"
     );
     assert_eq!(report.counters.dlq_count, 0);
 }

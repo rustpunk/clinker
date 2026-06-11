@@ -305,3 +305,7 @@ With `drive: products`, the pipeline emits one row per product enriched with a m
 ## Memory considerations
 
 Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly 1.5-2x the raw CSV size in heap. A 50 MB product catalog typically uses 75-100 MB of hash-table memory. Tune with `--memory-limit`; see [Memory Tuning](../ops/memory.md) for spill thresholds and strategy overrides.
+
+## Document boundaries
+
+When the driver carries document boundaries -- a `glob:` source where each file is its own document -- the Combine forwards those boundaries to its output, so a per-document `Aggregate` after the join rolls up per driver document. See [Combine -- Document boundaries](../pipeline/combine.md#document-boundaries).

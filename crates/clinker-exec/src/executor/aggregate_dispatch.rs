@@ -634,108 +634,6 @@ impl DocAggregatorFactory {
     }
 }
 
-/// Single live group table that flushes on each document-close boundary,
-/// for the streaming-ingest path where boundaries arrive inline with
-/// records.
-///
-/// Holds at most one [`crate::aggregation::AggregateStream`] at a time —
-/// the open document's groups. On `DocumentClose` the current table
-/// finalizes, emits, and resets, so a fused single-source stream (whose
-/// boundaries arrive in document order) produces one set of grouped rows
-/// per document. A non-fused Merge instead delivers its forwarded
-/// punctuations after every record, so the lone table accumulates the
-/// whole stream and flushes once at the tail — folding unreconciled
-/// documents together exactly as a no-document run would.
-///
-/// Holding one table at a time keeps the peak footprint at a single
-/// document's group state (plus its arbitrator consumer), so per-document
-/// flush lowers peak memory rather than inflating it. The materialized
-/// drain-to-`Vec` path keys tables by document instead (see
-/// [`run_strict_aggregate_per_document`]) because its boundaries are split
-/// out of arrival order.
-struct DocumentFlushAggregator {
-    factory: DocAggregatorFactory,
-    current: Option<(
-        crate::aggregation::AggregateStream,
-        crate::pipeline::memory::ConsumerId,
-    )>,
-}
-
-impl DocumentFlushAggregator {
-    fn new(factory: DocAggregatorFactory) -> Self {
-        Self {
-            factory,
-            current: None,
-        }
-    }
-
-    /// Borrow the open table, building (and registering) a fresh one when
-    /// none is open.
-    fn stream(&mut self) -> Result<&mut crate::aggregation::AggregateStream, PipelineError> {
-        if self.current.is_none() {
-            self.current = Some(self.factory.make()?);
-        }
-        Ok(&mut self.current.as_mut().expect("just populated").0)
-    }
-
-    /// Finalize, emit, and reset the open table (if any). The next
-    /// `stream` call builds a fresh one for the following document. A
-    /// `DocumentClose` for a document that contributed no records finds no
-    /// open table and is a no-op.
-    fn flush_current(
-        &mut self,
-        finalize_ctx: &EvalContext,
-        out: &mut Vec<crate::aggregation::SortRow>,
-    ) -> Result<(), crate::aggregation::HashAggError> {
-        let Some((stream, consumer_id)) = self.current.take() else {
-            return Ok(());
-        };
-        let result = stream.finalize(finalize_ctx, out);
-        // `finalize` consumed the stream — its group bytes are gone, so
-        // unregister regardless of whether finalize succeeded.
-        self.factory.arbitrator.unregister_consumer(consumer_id);
-        result
-    }
-
-    /// Force an empty table into existence so an empty input still runs
-    /// one finalize. A global fold (no group-by) over empty input emits its
-    /// single defaulted row; an empty grouped fold emits nothing —
-    /// reproducing the single-stream finalize this replaced. Idempotent.
-    fn ensure_open(&mut self) -> Result<(), PipelineError> {
-        if self.current.is_none() {
-            self.current = Some(self.factory.make()?);
-        }
-        Ok(())
-    }
-
-    /// `true` when this aggregate is a global fold (no group-by columns).
-    /// A global fold owes one defaulted row per closing document even when
-    /// that document contributed zero records; a grouped fold owes nothing
-    /// for an empty document.
-    fn is_global_fold(&self) -> bool {
-        self.factory.compiled.group_by_fields.is_empty()
-    }
-}
-
-impl Drop for DocumentFlushAggregator {
-    /// Release the open table's arbitrator consumer on every exit path.
-    ///
-    /// `flush_current` takes `current` and unregisters the consumer on the
-    /// normal flush, so a cleanly-drained aggregator drops with
-    /// `current == None` and this is a no-op. An error return from the
-    /// ingest loop, by contrast, drops the aggregator with a table still
-    /// open; without this the open table's `AggregateConsumer` would linger
-    /// in the arbitrator's registry — the registry holds an independent
-    /// `Arc` keyed by `ConsumerId`, so dropping the `AggregateStream` alone
-    /// does not unregister it. `unregister_consumer` is idempotent, so even
-    /// a redundant call is harmless.
-    fn drop(&mut self) {
-        if let Some((_, consumer_id)) = self.current.take() {
-            self.factory.arbitrator.unregister_consumer(consumer_id);
-        }
-    }
-}
-
 /// Per-document group tables keyed by flush key, with a teardown that
 /// unregisters any table still present from the shared arbitrator.
 ///
@@ -1026,17 +924,40 @@ struct DocumentFlushCtx<'f> {
     output_schema: &'f Arc<Schema>,
 }
 
-/// Finalize one already-removed group table, release its arbitrator
-/// consumer, and route the finalize result through
-/// [`route_document_flush_result`]. Shared by the punct-loop (each closing
-/// document) and the leftover-loop (the sentinel + any never-closed
-/// document) in [`run_strict_aggregate_per_document`].
+/// Finalize one already-removed bucket: finalize its group state into `out`,
+/// then release its arbitrator consumer. `ctx`-free, so the streaming-ingest
+/// scoped thread (which holds no `&mut ExecutorContext`) can call it directly;
+/// the materialized path wraps it with DLQ routing in
+/// [`finalize_and_route_table`].
 ///
 /// The caller `remove`s the `(stream, consumer_id)` entry from
 /// [`RegisteredTables`] *before* calling this, so the guard no longer tracks
-/// it: unregistering here cannot double-unregister, and a `?` return from
-/// the routing cannot strand a consumer the guard already forgot. This keeps
-/// the guard's remove-before-unregister discipline intact across both loops.
+/// it: unregistering here cannot double-unregister, and an error return cannot
+/// strand a consumer the guard already forgot. `finalize` consumes the stream
+/// — its group bytes are gone — so the consumer is unregistered whether
+/// finalize succeeds or fails, and the finalize result is returned for the
+/// caller to route (materialized) or propagate as a hard error (streaming).
+fn finalize_bucket(
+    table: (
+        crate::aggregation::AggregateStream,
+        crate::pipeline::memory::ConsumerId,
+    ),
+    finalize_ctx: &EvalContext,
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    out: &mut Vec<crate::aggregation::SortRow>,
+) -> Result<(), crate::aggregation::HashAggError> {
+    let (stream, consumer_id) = table;
+    let result = stream.finalize(finalize_ctx, out);
+    arbitrator.unregister_consumer(consumer_id);
+    result
+}
+
+/// Finalize one already-removed group table, then route the finalize result
+/// through [`route_document_flush_result`]. Thin wrapper over
+/// [`finalize_bucket`] that adds the materialized path's DLQ routing. Shared
+/// by the punct-loop (each closing document) and the leftover-loop (the
+/// sentinel + any never-closed document) in
+/// [`run_strict_aggregate_per_document`].
 fn finalize_and_route_table(
     ctx: &mut ExecutorContext<'_>,
     flush: &DocumentFlushCtx<'_>,
@@ -1047,9 +968,7 @@ fn finalize_and_route_table(
     ),
     out_rows: &mut Vec<crate::aggregation::SortRow>,
 ) -> Result<(), PipelineError> {
-    let (stream, consumer_id) = table;
-    let result = stream.finalize(flush.finalize_ctx, out_rows);
-    flush.arbitrator.unregister_consumer(consumer_id);
+    let result = finalize_bucket(table, flush.finalize_ctx, flush.arbitrator, out_rows);
     route_document_flush_result(ctx, flush.name, attribution, flush.output_schema, result)
 }
 
@@ -1130,22 +1049,43 @@ struct StreamingIngestOutput {
 /// batch into the channel, while a scoped thread drives `add_record` off
 /// the receiver. The bounded `send` is the back-pressure pivot — a slow
 /// `add_record` (e.g. a hash aggregate spilling) stalls the producer and
-/// lets the upstream Source channel fill. Group state is bucketed per
-/// [`DocumentId`]: a `DocumentClose(D)` arriving in stream order flushes
-/// document D's groups before the boundary forwards at the output tail, so
-/// a multi-document run emits one set of grouped rows per document. The
-/// finalize half stays blocking: once the channel disconnects (every
-/// sender dropped at the producer arm's clean exit), any document still
-/// open (the synthetic doc id of a no-envelope pipeline, or a document
-/// never closed) flushes and the finalized rows return. Document-boundary
-/// punctuations are forwarded at the output tail unchanged.
+/// lets the upstream Source channel fill.
+///
+/// Group state is bucketed per [`DocumentId`] through the same
+/// [`RegisteredTables`] engine the materialized path uses: each record adds
+/// to the bucket for its raw document id, and a `DocumentClose(D)` flushes
+/// only document D's bucket. This is correct for both producer emit orders.
+/// A *fused* producer emits each close right after its document's records,
+/// so only one bucket is ever live — identical row output and peak footprint
+/// to a single-table flush. A *non-fused* producer
+/// ([`crate::executor::dispatch::stream_linear_producer_emit`]) tail-batches
+/// every close after all records, so several buckets populate during the
+/// record run and each close flushes its own — splitting the documents
+/// rather than folding them. The finalize half stays blocking: once the
+/// channel disconnects (every sender dropped at the producer arm's clean
+/// exit), every surviving bucket (the synthetic-doc-id sentinel of a
+/// no-envelope pipeline, plus any document whose close never arrived) flushes
+/// in ascending `DocumentId` order and the finalized rows return.
+/// Document-boundary punctuations are forwarded at the output tail unchanged.
+///
+/// Memory: this holds one open table per open-but-not-yet-closed document —
+/// the same envelope as the materialized path, which already buckets. For a
+/// fused producer that is one table at a time; for a non-fused producer it is
+/// bounded by the number of documents whose records have streamed but whose
+/// closes have not. Each table registers its own `AggregateConsumer` and
+/// spills independently under RSS pressure; flushing a table unregisters its
+/// consumer, so the arbitrator's live-usage reflects exactly the open
+/// documents. This is a deliberate, bounded change from the prior
+/// single-table model — the correct per-document memory shape.
 ///
 /// The scoped thread holds no `&mut ExecutorContext`; it accumulates cursor
 /// advances and `add_record` DLQ errors into [`StreamingIngestEffects`],
 /// replayed on the dispatch thread after the scope joins so rollback
 /// cursors, watermark liveness, and DLQ sequencing match the drain-to-`Vec`
-/// path exactly. Spill stays RSS-triggered inside `add_record` /
-/// `finalize`, never channel-depth-triggered.
+/// path exactly. A finalize error surfaces as a hard error (no DLQ on the
+/// streaming finalize path, matching the prior behavior). Spill stays
+/// RSS-triggered inside `add_record` / `finalize`, never
+/// channel-depth-triggered.
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_aggregate_ingest(
     ctx: &mut ExecutorContext<'_>,
@@ -1198,13 +1138,21 @@ fn run_streaming_aggregate_ingest(
     let mut out_rows: Vec<AggSortRow> = Vec::with_capacity(64);
     let mut puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut input_count: u64 = 0;
-    // Set once any `DocumentClose` flushes a table. The disconnect-time
+    // Set once any `DocumentClose` flushes a bucket. The disconnect-time
     // empty-input flush owes a global fold its single defaulted row only
     // when no close already paid that debt — an all-empty-documents run
     // flushes one defaulted row per close and must not gain an extra
     // phantom row at the tail.
     let mut flushed_close = false;
-    let mut agg = DocumentFlushAggregator::new(factory);
+    let is_global_fold = factory.compiled.group_by_fields.is_empty();
+    // Bucket group state per `DocumentId`, the same engine the materialized
+    // path uses. `tables` and `flushed` live in the OUTER (non-`move`) frame
+    // so the `RegisteredTables` RAII `Drop` runs when this function returns —
+    // including the `ingest_result?` early-return — releasing any bucket still
+    // open on an error exit. `flushed` makes a duplicate `DocumentClose` for
+    // an already-flushed document a no-op.
+    let mut tables = RegisteredTables::new(Arc::clone(&factory.arbitrator));
+    let mut flushed: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
 
     // Run the ingest recv loop and the producer concurrently. The scoped
     // thread owns the document-flush aggregator and drains the channel; the
@@ -1229,29 +1177,45 @@ fn run_streaming_aggregate_ingest(
                     let (record, rn) = match event {
                         StreamEvent::Record(r, rn) => (r, rn),
                         StreamEvent::Punctuation(p) => {
-                            // A `DocumentClose` arriving in stream order means
-                            // the open document is fully delivered: flush its
-                            // groups now (its records arrived contiguously
-                            // before this boundary), then forward the boundary
-                            // at the output tail. A global fold owes one
-                            // defaulted row per closing document even when that
-                            // document contributed zero records, so force a
-                            // table open before flushing an empty global-fold
-                            // document — matching what a standalone empty run
-                            // emits. A grouped fold owes nothing for an empty
-                            // document, and a closing document that DID see
-                            // records already holds an open table, so neither
-                            // path gains a phantom row. Opens only forward.
-                            // Punctuations carry zero charge, so no discharge
-                            // here.
+                            // On `DocumentClose(D)`, flush ONLY document D's
+                            // bucket — correct whether closes arrive in stream
+                            // order (fused producer: D's bucket is the only one
+                            // live) or tail-batched after every record
+                            // (non-fused producer: each close flushes its own
+                            // bucket, splitting the documents). A duplicate
+                            // close for an already-flushed document is a no-op.
+                            // A global fold owes one defaulted row per closing
+                            // document even when that document contributed zero
+                            // records, so build a fresh bucket for D before
+                            // finalizing the empty global-fold document; a
+                            // grouped fold owes nothing for an empty document.
+                            // Opens only forward. Punctuations carry zero
+                            // charge, so no discharge here. The finalize `?`
+                            // stays inside `drive`, so a finalize error funnels
+                            // through the single drain-then-return site below —
+                            // a finalize failure surfaces as a hard error,
+                            // matching the streaming arm's no-DLQ-on-finalize
+                            // behavior.
                             if p.kind()
                                 == crate::executor::stream_event::PunctuationKind::DocumentClose
                             {
-                                if agg.is_global_fold() {
-                                    agg.ensure_open()?;
+                                let doc_id = p.doc_id();
+                                if flushed.insert(doc_id) {
+                                    let bucket = match tables.remove(doc_id) {
+                                        Some(bucket) => Some(bucket),
+                                        None if is_global_fold => Some(factory.make()?),
+                                        None => None,
+                                    };
+                                    if let Some(bucket) = bucket {
+                                        finalize_bucket(
+                                            bucket,
+                                            &finalize_ctx,
+                                            &factory.arbitrator,
+                                            &mut out_rows,
+                                        )?;
+                                        flushed_close = true;
+                                    }
                                 }
-                                agg.flush_current(&finalize_ctx, &mut out_rows)?;
-                                flushed_close = true;
                             }
                             puncts.push(p);
                             continue;
@@ -1290,7 +1254,14 @@ fn run_streaming_aggregate_ingest(
                         source_name: &source_name_arc,
                         doc_ctx: record.doc_ctx(),
                     };
-                    let stream = agg.stream()?;
+                    // Bucket by the record's raw document id. The streaming
+                    // path cannot know which documents will close upfront
+                    // (closes arrive at the tail for a non-fused producer), so
+                    // unlike the materialized `flush_key` it keys on the raw id:
+                    // a no-envelope record carries `DocumentId::SYNTHETIC` and
+                    // buckets to the sentinel; a real document buckets to its
+                    // own id and flushes when its close arrives.
+                    let stream = tables.entry_or_make(record.doc_ctx().id(), &factory)?;
                     match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
                         Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
                         Err(e) => match strategy {
@@ -1307,19 +1278,24 @@ fn run_streaming_aggregate_ingest(
                 }
                 // Channel disconnected — every sender dropped at the producer
                 // arm's clean exit. A completely empty stream (no records, no
-                // forwarded close) opened no table; a global fold still owes
-                // one defaulted row, so force one open before the final flush.
-                // Gated on `!flushed_close` so an all-empty-documents run —
-                // whose per-document closes already each flushed a defaulted
-                // row — is not given an extra phantom row here. Then flush
-                // whatever is still open (the trailing document, the synthetic
-                // doc id of a no-envelope run, or the unreconciled-Merge
-                // remainder) and return.
-                if input_count == 0 && !flushed_close {
-                    agg.ensure_open()?;
+                // forwarded close) opened no bucket; a global fold still owes
+                // one defaulted row, so force the sentinel bucket open before
+                // the final flush. Gated on `!flushed_close` so an
+                // all-empty-documents run — whose per-document closes already
+                // each flushed a defaulted row — is not given an extra phantom
+                // row here. Then flush every surviving bucket in ascending
+                // `DocumentId` order (SYNTHETIC id 0 sorts first): the sentinel
+                // for no-document / unreconciled records, plus any document
+                // whose close never arrived. A finalize error propagates as a
+                // hard error through the drain-then-return site below.
+                if input_count == 0 && !flushed_close && is_global_fold {
+                    tables.entry_or_make(DocumentId::SYNTHETIC, &factory)?;
                 }
-                agg.flush_current(&finalize_ctx, &mut out_rows)
-                    .map_err(PipelineError::from)
+                for key in tables.sorted_keys() {
+                    let bucket = tables.remove(key).expect("key from this map");
+                    finalize_bucket(bucket, &finalize_ctx, &factory.arbitrator, &mut out_rows)?;
+                }
+                Ok(())
             };
             let result = drive();
             if result.is_err() {
@@ -1360,9 +1336,9 @@ fn run_streaming_aggregate_ingest(
     // heuristic mismatch between batch charge and per-record discharge must
     // not leave a stale positive for the arbitrator), then unregister the
     // per-edge charge consumer. The per-document aggregate consumers are
-    // released separately: a flushed document unregisters its own as it
-    // finalizes, and `DocumentFlushAggregator`'s `Drop` releases any table
-    // still open when `agg` falls out of scope below — including on the
+    // released separately: a flushed bucket unregisters its own via
+    // `finalize_bucket`, and `RegisteredTables`' `Drop` releases any bucket
+    // still open when `tables` falls out of scope below — including on the
     // error path, where `ingest_result?` returns before the success-path
     // replay. So no aggregate consumer survives this arm on any exit.
     charge_handle.set_bytes(0);

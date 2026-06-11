@@ -242,14 +242,17 @@ pub(crate) fn dispatch_combine(
     // Combine collects puncts from both inputs and forwards a
     // reconciled set downstream. Like Merge, it folds the two
     // inputs' boundary signals so a document spanning both sides
-    // emits one `DocumentOpen` and one `DocumentClose` — withholding
-    // the close until both inputs have closed the document prevents a
-    // downstream per-document Aggregate flush from double-firing.
+    // emits one `DocumentOpen` and one `DocumentClose`; a document
+    // carried by only one side forwards its single close. Reconciling
+    // before forwarding keeps a downstream per-document Aggregate flush
+    // from double-firing on a spanning document while still flushing
+    // per side-local document.
     //
     // Under streaming-probe the driver slot is empty (the driver has not
     // dispatched yet — it streams into the probe channel during the redispatch
-    // below), so this drains nothing and the driver records arrive on the
-    // channel instead.
+    // below), so this drains nothing and the driver records (and their
+    // punctuations) arrive on the channel instead, to be reconciled with the
+    // retained `build_puncts` after the probe joins.
     let (driver_buf, driver_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -268,13 +271,22 @@ pub(crate) fn dispatch_combine(
         Some(nb) => nb.drain_split()?,
         None => (Vec::new(), Vec::new()),
     };
-    // Binary Combine: fan-in degree is 2 (driver + build). The empty-
-    // punctuation common case folds to an empty vector, leaving the
-    // no-document path byte-identical to a bare union.
-    let combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
-        driver_puncts.into_iter().chain(build_puncts),
-        2,
-    );
+    // The empty-punctuation common case folds to an empty vector,
+    // leaving the no-document path byte-identical to a bare union. For
+    // the streaming-probe path the driver's punctuations have not arrived
+    // yet (they stream over the channel below), so defer the reconcile:
+    // retain `build_puncts` and rebuild `combined_puncts` once the probe
+    // returns its `driver_puncts`. For every other path both sides are
+    // already drained, so reconcile now.
+    let mut combined_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+    let mut build_puncts_retained: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
+    if streaming_probe_driver.is_some() {
+        build_puncts_retained = build_puncts;
+    } else {
+        combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
+            driver_puncts.into_iter().chain(build_puncts),
+        );
+    }
 
     // Operator-entry schema check per D4: every record
     // arriving on the probe and build channels is
@@ -870,6 +882,18 @@ pub(crate) fn dispatch_combine(
         // The driver streamed its records over the channel, so the input
         // count comes from the probe thread rather than a pre-drained Vec.
         probe_records_in = streamed.input_count;
+        // The driver's punctuations arrived over the channel during the
+        // probe and were collected by the probe thread. Reconcile them now
+        // with the retained build-side punctuations — same fold as the
+        // materialized path, so a document spanning both inputs collapses
+        // to one open + one close and a side-local document forwards its
+        // close.
+        combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
+            streamed
+                .driver_puncts
+                .into_iter()
+                .chain(std::mem::take(&mut build_puncts_retained)),
+        );
         streamed.output_records
     } else {
         let mut output_records = Vec::with_capacity(driver_buf.len());
@@ -959,11 +983,12 @@ pub(crate) fn dispatch_combine(
     // re-drain, and overlap the writer with the next topo node.
     // The eligibility predicate certified this combine roots no
     // window and tees to no deferred region, so the helper calls
-    // below are correctly skipped. Punctuations are dropped on the
-    // inline path (matching the materialized inline admit, which
-    // forwards no puncts), and the terminal writer drops them
-    // regardless. The per-fold snapshot and hash-table consumer
-    // are still released before the streaming return.
+    // below are correctly skipped. The reconciled document boundaries
+    // are forwarded on the inline path just like the materialized arms,
+    // so a per-document Aggregate reached through this streamed handoff
+    // flushes per document; a terminal writer downstream consumes them
+    // harmlessly. The per-fold snapshot and hash-table consumer are
+    // still released before the streaming return.
     if let Some(sender) = ctx.take_streaming_sender(node_idx) {
         let batch_size = ctx.batch_size;
         let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
@@ -975,7 +1000,7 @@ pub(crate) fn dispatch_combine(
             batch_size,
             name,
             output_records,
-            Vec::new(),
+            combined_puncts,
             &charge,
         )?;
         ctx.combine_input_snapshots.remove(&node_idx);
@@ -990,7 +1015,7 @@ pub(crate) fn dispatch_combine(
         name,
         node_idx,
         output_records,
-        Vec::new(),
+        combined_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
     ctx.node_buffers.insert(node_idx, nb);
@@ -1009,12 +1034,15 @@ pub(crate) fn dispatch_combine(
 }
 
 /// Result of a streaming-probe run handed back to [`dispatch_combine`]:
-/// the probe output rows and the count of driver records the producer fed
+/// the probe output rows, the count of driver records the producer fed
 /// over the channel (the streaming analogue of the materialized
-/// `driver_buf.len()` probe input).
+/// `driver_buf.len()` probe input), and the driver's document-boundary
+/// punctuations collected off the channel for post-join reconciliation
+/// with the build side.
 struct StreamingProbeOutput {
     output_records: Vec<(Record, u64)>,
     input_count: u64,
+    driver_puncts: Vec<crate::executor::stream_event::Punctuation>,
 }
 
 /// Per-record side effects the streaming-probe thread cannot apply directly
@@ -1099,6 +1127,7 @@ fn run_streaming_combine_probe(
         failures: Vec::new(),
     };
     let mut output_records: Vec<(Record, u64)> = Vec::new();
+    let mut driver_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut counters = ProbeCounters::default();
     let mut input_count: u64 = 0;
 
@@ -1116,12 +1145,15 @@ fn run_streaming_combine_probe(
             while let Ok(event) = rx.recv() {
                 let (record, rn) = match event {
                     StreamEvent::Record(r, rn) => (r, rn),
-                    // Punctuations carry zero charge and the inline path
-                    // forwards no puncts on the streaming-Output handoff, so
-                    // the probe drops them — byte-identical to the
-                    // materialized inline admit. Per-document combine flush
-                    // is a separate follow-up.
-                    StreamEvent::Punctuation(_) => continue,
+                    // Punctuations carry zero record charge (no `sub_bytes`
+                    // discharge, no `input_count` increment), so collect them
+                    // for post-join reconciliation with the build side rather
+                    // than dropping them. The driver's document boundaries
+                    // must reach a downstream per-document consumer.
+                    StreamEvent::Punctuation(p) => {
+                        driver_puncts.push(p);
+                        continue;
+                    }
                 };
                 // Discharge this record's per-row cost — the consume half of
                 // the driver's per-batch admit. The formula matches the
@@ -1304,6 +1336,7 @@ fn run_streaming_combine_probe(
     Ok(StreamingProbeOutput {
         output_records,
         input_count,
+        driver_puncts,
     })
 }
 

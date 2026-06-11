@@ -177,10 +177,14 @@ signals (one when a document opens, one when it closes). These signals
 let document-scoped operators fire at exactly the right point. Today the
 signals propagate through Source, Transform, Route, and Sort, and are
 reconciled at the multi-input operators — Merge and Combine. A document
-that fans in through several branches opens downstream once (on first
-sighting) and closes downstream once (only after every input has closed
-it), so a downstream document-scoped operator fires exactly once
-regardless of how many inputs the document spanned.
+opens downstream once (on first sighting) and closes downstream once —
+after **every input that opened the document has closed it** (its
+per-document close-count reaches its open-count). A document carried by
+one input closes after that input's single close; a document that
+genuinely spans several inputs closes only after the last of them, and
+emits one downstream close either way. So a downstream document-scoped
+operator fires exactly once regardless of how many inputs the document
+spanned.
 
 ### Per-document aggregation
 
@@ -196,12 +200,24 @@ others have already been emitted and freed, or have not yet started).
 This applies only when a document boundary actually reaches the
 Aggregate. A plain single-file source is one document, so it still emits
 one aggregate. A `Merge` that combines several distinct single-document
-sources does **not** forward a per-source close (it reconciles boundaries
-and emits a close only when *every* branch closed the same document), so
-those sources fold together into one cross-source aggregate — the same
-result you would get with no envelopes at all. To keep per-document
-roll-ups across files, feed the multi-file source straight into the
-Aggregate rather than merging distinct sources first.
+sources now forwards **each** source document's close (each document has
+open-count == close-count == 1 on its single branch), so those sources
+flush **independently** downstream — one roll-up per source document,
+exactly as feeding each source to its own Aggregate would. This holds for
+`mode: concat`, `mode: interleave` over non-Source inputs, and `mode:
+interleave` with an explicit `interleave_seed`. The roll-up split holds
+**regardless of whether the Aggregate's upstream streams or materializes**
+its output — both paths flush per document.
+
+The **one** exception is the fused all-Source `mode: interleave` fast
+path **without** a seed: it consumes punctuations inline and forwards no
+per-source close, so distinct single-document sources merged that way
+fold into one cross-source aggregate (the same result you would get with
+no envelopes at all). This is a known limitation; add an
+`interleave_seed` (or use `mode: concat`) to get per-document roll-ups. A
+`Combine` (join) carries reconciled boundaries on every strategy, so a
+per-document Aggregate downstream of a join also rolls up per driver
+document.
 
 ## Nested (multi-level) envelopes
 
@@ -243,8 +259,9 @@ keeps every level independently visible.
 Boundaries nest correctly through the pipeline: each level opens before
 the records inside it and closes after them, in strict innermost-first
 order. A level that fans in through several branches is still reconciled
-once at a multi-input operator (Merge or Combine), exactly like a
-single-level document.
+once at a multi-input operator (Merge or Combine) — it opens downstream on
+first sighting and closes downstream once every input that opened it has
+closed it — exactly like a single-level document.
 
 ## Header-only interchanges
 

@@ -11,10 +11,11 @@
 //! no-document / single-document control proves the dominant path is
 //! unchanged, a tiny memory budget exercises the spilling strategy across
 //! a document boundary, the streaming-ingest path is covered via a fused
-//! producer, and `concat` / `interleave` Merges of two single-document
-//! sources prove documents whose close never reaches the aggregate fold
-//! together into one cross-document result rather than splitting — even
-//! when an interleave Merge delivers their records non-contiguously.
+//! producer, and `concat` / seeded-`interleave` Merges of two
+//! single-document sources prove a non-fused Merge forwards each source's
+//! per-document close, so each source document flushes independently
+//! downstream — even when a seeded interleave delivers their records
+//! non-contiguously.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -341,14 +342,16 @@ fn streaming_ingest_path_flushes_per_document() {
 }
 
 /// A `concat` Merge of two distinct single-document sources feeds the
-/// Aggregate records carrying two different document ids — but the Merge
-/// reconciles boundaries and forwards a `DocumentClose` only when every
-/// branch closed the same document, which never happens for distinct
-/// per-source documents. With no close reaching the Aggregate, the two
-/// documents must fold together into ONE cross-document aggregate, exactly
-/// as a no-envelope stream would: per-document flush must NOT split an
-/// unreconciled merge into one aggregate per source file.
-const UNRECONCILED_MERGE_YAML: &str = r#"
+/// Aggregate records carrying two different document ids. The non-fused
+/// Merge reconciles boundaries by open-coverage: each source document has
+/// open count == close count == 1 on its single branch, so the Merge
+/// forwards each document's `DocumentClose`. A non-fused Merge is a
+/// certified streaming producer, so the downstream Aggregate runs the
+/// streaming ingest path and buckets group state per document — flushing
+/// each source document's bucket on its close even though the closes arrive
+/// tail-batched after every record. The per-document flush therefore splits
+/// into one group set per source file.
+const PER_SOURCE_MERGE_YAML: &str = r#"
 pipeline:
   name: unreconciled_merge_agg
 nodes:
@@ -393,16 +396,16 @@ nodes:
 "#;
 
 #[test]
-fn unreconciled_merge_folds_documents_together() {
-    let config = parse_config(UNRECONCILED_MERGE_YAML).expect("parse unreconciled-merge pipeline");
+fn concat_merge_forwards_per_source_document_close() {
+    let config = parse_config(PER_SOURCE_MERGE_YAML).expect("parse per-source-merge pipeline");
     let plan = config
         .compile(&CompileContext::default())
-        .expect("compile unreconciled-merge pipeline");
+        .expect("compile per-source-merge pipeline");
 
-    // sa contributes x×2, y×1; sb contributes x×1. With the two documents
-    // unreconciled (no forwarded close), the aggregate folds them together:
-    // x=3 (2 from sa + 1 from sb), y=1 — a single cross-document result,
-    // NOT a per-document split (which would yield x=2, y=1, x=1).
+    // sa contributes x×2, y×1; sb contributes x×1. The non-fused Merge
+    // forwards each source document's close (open == close == 1 per
+    // document), so the aggregate flushes per document: x=2, y=1 from sa's
+    // document and a SEPARATE x=1 from sb's document — not a folded x=3.
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([
         (
             "sa".to_string(),
@@ -432,7 +435,7 @@ fn unreconciled_merge_folds_documents_together() {
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run unreconciled-merge pipeline");
+        .expect("run per-source-merge pipeline");
     assert_eq!(report.counters.dlq_count, 0);
 
     let output = buf.as_string();
@@ -440,21 +443,27 @@ fn unreconciled_merge_folds_documents_together() {
     body.sort();
     assert_eq!(
         body,
-        vec!["x,3".to_string(), "y,1".to_string()],
-        "an unreconciled merge must fold its source documents into one \
-         aggregate (x=3, y=1), not split per source file",
+        vec!["x,1".to_string(), "x,2".to_string(), "y,1".to_string()],
+        "a non-fused concat merge forwards each source document's close, so \
+         the aggregate flushes per document (x=2,y=1 from sa; x=1 from sb), \
+         not a folded x=3",
     );
 }
 
-/// An `interleave` Merge round-robins records from two distinct-document
-/// sources, so the aggregate's input carries the two documents' records
-/// non-contiguously. Their closes are unreconciled (never forwarded), so
-/// the records must still fold into one aggregate regardless of arrival
-/// order — proving the per-document flush keys group state by document
-/// rather than by a running "current document" that interleaving would
-/// corrupt.
+/// A SEEDED `interleave` Merge round-robins records from two
+/// distinct-document sources, so the aggregate's input carries the two
+/// documents' records non-contiguously. A seeded interleave is non-fused
+/// (the seed excludes it from the all-Source fusion fast path so its
+/// schedule stays deterministic over a pre-buffered Vec), so it reconciles
+/// boundaries and forwards each source's per-document close, and — being a
+/// certified streaming producer — feeds the streaming Aggregate ingest path,
+/// which buckets group state per document even though the closes arrive
+/// tail-batched after all records. The aggregate therefore flushes per
+/// document regardless of round-robin arrival order — proving the
+/// per-document bucketing keys group state by document rather than by a
+/// running "current document" that interleaving would corrupt.
 #[test]
-fn interleaved_unreconciled_documents_fold_together() {
+fn seeded_interleave_merge_forwards_per_source_document_close() {
     let yaml = r#"
 pipeline:
   name: interleave_merge_agg
@@ -504,8 +513,10 @@ nodes:
         .compile(&CompileContext::default())
         .expect("compile interleave-merge pipeline");
 
-    // sa: x×3; sb: x×2, y×1. Interleaved and unreconciled → one aggregate:
-    // x=5, y=1.
+    // sa: x×3 (one document); sb: x×2, y×1 (another document). The seeded
+    // interleave is non-fused, so it reconciles boundaries and forwards
+    // each source's per-document close → per-document flush: x=3 from sa's
+    // document, and x=2, y=1 from sb's document.
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([
         (
             "sa".to_string(),
@@ -543,8 +554,9 @@ nodes:
     body.sort();
     assert_eq!(
         body,
-        vec!["x,5".to_string(), "y,1".to_string()],
-        "interleaved unreconciled documents must fold into one aggregate \
-         (x=5, y=1) regardless of round-robin arrival order",
+        vec!["x,2".to_string(), "x,3".to_string(), "y,1".to_string()],
+        "a seeded interleave is non-fused, so it forwards each source's \
+         per-document close → per-document flush (x=3 from sa; x=2,y=1 from \
+         sb), regardless of round-robin arrival order",
     );
 }
