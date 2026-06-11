@@ -1,8 +1,8 @@
 //! Regression coverage for the streaming-ingest aggregate arm.
 //!
-//! These tests pin three behaviors of the bounded-channel ingest path a
-//! strict Aggregate takes when its producer is a fused, streaming-certified
-//! `Source → Transform`:
+//! These tests pin behaviors of the bounded-channel ingest path a strict
+//! Aggregate takes when its producer streams (a fused, streaming-certified
+//! `Source → Transform`, or a non-fused Merge):
 //!
 //! 1. An ingest error must not deadlock. The producer streams into a bounded
 //!    channel on the dispatch thread while a scoped thread drives
@@ -27,9 +27,17 @@
 //!    — and the force-open ensures such a close still emits its global-fold
 //!    defaulted row.)
 //!
-//! All tests assert (via the `--explain` `buffer: streaming` classification)
-//! that the fused producer actually drives the streaming-ingest path rather
-//! than the materialized drain.
+//! 3. Per-document bucketing under tail-batched closes. The streaming ingest
+//!    aggregate keys group state per `DocumentId`. When the producer is
+//!    non-fused (a concat Merge of distinct single-document sources), it
+//!    emits every record first and every `DocumentClose` afterward, so the
+//!    closes arrive tail-batched rather than in stream order. The bucket
+//!    model still flushes each document's groups on its own close, splitting
+//!    the documents rather than folding them into one cross-document result.
+//!
+//! The fused tests assert (via the `--explain` `buffer: streaming`
+//! classification) that the fused producer actually drives the
+//! streaming-ingest path rather than the materialized drain.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -480,4 +488,194 @@ fn empty_input_grouped_aggregate_emits_nothing() {
         "an empty grouped aggregate emits no rows, got: {body:?}"
     );
     assert_eq!(ok, 0, "no rows for an empty grouped aggregate");
+}
+
+/// A `concat` Merge of two distinct single-document sources feeds a grouped
+/// Aggregate. A non-fused Merge is a certified streaming producer, so the
+/// Aggregate runs the streaming-ingest path — but the Merge tail-batches its
+/// forwarded `DocumentClose` punctuations after every record (records first,
+/// then both closes), so the closes do NOT arrive in stream order. The
+/// per-document bucket model must still flush each document's groups on its
+/// own close, splitting the two documents instead of folding them into one
+/// cross-document result.
+const NON_FUSED_MERGE_GROUPED_YAML: &str = r#"
+pipeline:
+  name: non_fused_streaming_buckets
+nodes:
+  - type: source
+    name: sa
+    config:
+      name: sa
+      type: csv
+      path: ./sa.csv
+      schema:
+        - { name: category, type: string }
+  - type: source
+    name: sb
+    config:
+      name: sb
+      type: csv
+      path: ./sb.csv
+      schema:
+        - { name: category, type: string }
+  - type: merge
+    name: m
+    inputs: [sa, sb]
+    config:
+      mode: concat
+  - type: aggregate
+    name: by_category
+    input: m
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+#[test]
+fn non_fused_streaming_multi_document_buckets_per_document() {
+    let config =
+        parse_config(NON_FUSED_MERGE_GROUPED_YAML).expect("parse non-fused-merge pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile non-fused-merge pipeline");
+
+    // doc A (sa): x×2, y×1. doc B (sb): x×3. The Merge forwards both
+    // documents' closes (open == close == 1 per document) but tail-batches
+    // them after every record. The streaming Aggregate buckets per document,
+    // so each close flushes only its own bucket: x=2,y=1 from doc A and a
+    // SEPARATE x=3 from doc B — NOT a folded x=5.
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "sa".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sa.csv",
+                Box::new(Cursor::new(b"category\nx\nx\ny\n".to_vec())),
+            ),
+        ),
+        (
+            "sb".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sb.csv",
+                Box::new(Cursor::new(b"category\nx\nx\nx\n".to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("run non-fused-merge pipeline");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    assert_eq!(
+        body,
+        vec!["x,2".to_string(), "x,3".to_string(), "y,1".to_string()],
+        "the streaming Aggregate must bucket per document under tail-batched \
+         closes (x=2,y=1 from doc A; x=3 from doc B), not fold to x=5"
+    );
+}
+
+/// A fused single no-envelope source into a global fold: every record
+/// carries the synthetic document id, so the bucket model keeps exactly one
+/// table (the sentinel) and finalizes it once at disconnect — byte-identical
+/// to the prior single-table flush for the dominant no-document case.
+const NO_DOCUMENT_GLOBAL_FOLD_YAML: &str = r#"
+pipeline:
+  name: streaming_no_document_global_fold
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: ./events.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: passthrough
+    input: events
+    config:
+      cxl: |
+        emit amount = amount
+  - type: aggregate
+    name: total
+    input: passthrough
+    config:
+      group_by: []
+      cxl: |
+        emit total = sum(amount)
+        emit n = count(*)
+  - type: output
+    name: out
+    input: total
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+#[test]
+fn streaming_no_document_single_table_byte_identical() {
+    assert_streaming_ingest(
+        NO_DOCUMENT_GLOBAL_FOLD_YAML,
+        "transform.passthrough",
+        "aggregation.total",
+    );
+
+    // A single populated no-envelope source: every record buckets to the
+    // synthetic sentinel, so exactly one table is built and finalized once at
+    // disconnect — one global-fold row (total=12, n=3), byte-identical to the
+    // old single-table flush.
+    let config = parse_config(NO_DOCUMENT_GLOBAL_FOLD_YAML).expect("parse no-document pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile no-document pipeline");
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "events".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "events.csv",
+            Box::new(Cursor::new(b"amount\n3\n4\n5\n".to_vec())),
+        ),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("run no-document global-fold pipeline");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    assert_eq!(
+        body,
+        vec!["12,3".to_string()],
+        "a no-document global fold buckets every record to the sentinel and \
+         emits exactly one row (total=12, n=3)"
+    );
+    assert_eq!(
+        report.counters.ok_count, 1,
+        "exactly one global-fold row for the single sentinel bucket"
+    );
 }

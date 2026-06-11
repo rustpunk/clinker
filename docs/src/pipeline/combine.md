@@ -253,6 +253,10 @@ Driver wins on a name collision: if both the driver and a build input declare `$
 
 Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly 1.5-2x the raw CSV size in heap. A 50 MB product catalog typically uses 75-100 MB of hash-table memory. Tune with `pipeline.memory.limit` at the pipeline level; see [Memory Tuning](../ops/memory.md) for spill thresholds, the backpressure knob, and strategy overrides.
 
+## Document boundaries
+
+A Combine forwards reconciled document boundaries to its output on **every** strategy -- the inline hash build-probe, IEJoin, grace-hash, sort-merge, and the streaming-probe path. So a per-document `Aggregate` downstream of a join flushes per document: a driver source that carries several documents (a `glob:` over monthly files, say) produces one roll-up per driver document after the join, not one fold spanning all of them. A document that spans both join inputs (the same document carried on the driver and the build side) opens and closes exactly once downstream -- the boundary is reconciled, never double-fired. See [Document Context & Envelopes](envelope-and-doc-context.md) for the per-document aggregation model.
+
 ## Complete example
 
 ```yaml

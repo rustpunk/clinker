@@ -123,7 +123,6 @@ pub(crate) fn dispatch_merge(
     // through merge_fused_interleave's recv loop); the else
     // branch's drain logic fills `all_puncts` from each input
     // NodeBuffer.
-    let fan_in_degree = sorted_preds.len();
     let mut all_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
 
     // Streaming-Output handoff: if a single Output downstream of
@@ -281,10 +280,12 @@ pub(crate) fn dispatch_merge(
     };
 
     // Reconcile boundaries across every Merge input: one `DocumentOpen`
-    // per document (first sighting wins) and one `DocumentClose` only
-    // after every input branch has closed the same document.
-    let deduped_puncts =
-        crate::executor::stream_event::reconcile_document_boundaries(all_puncts, fan_in_degree);
+    // per document (first sighting wins) and one `DocumentClose` once
+    // every input that opened a document has closed it. A document
+    // carried by a single input branch forwards its close after that
+    // branch's close, so a Merge of distinct single-document sources
+    // lets each document flush independently downstream.
+    let deduped_puncts = crate::executor::stream_event::reconcile_document_boundaries(all_puncts);
 
     // Non-fused streaming path: the predecessors' slots are
     // already drained into the full `merged` Vec, so this does not
