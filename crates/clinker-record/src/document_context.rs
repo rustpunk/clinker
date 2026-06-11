@@ -22,8 +22,10 @@ use std::sync::{Arc, OnceLock};
 /// Monotonic per-process. Sources allocate via [`DocumentId::next`] when
 /// constructing a new context per file. Used by `Merge` punctuation dedup
 /// (keys a per-document `HashMap` / `HashSet`) to fold a document's
-/// boundary down to one downstream emission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// boundary down to one downstream emission, and by the Aggregate's
+/// per-document group flush to walk its open documents in a stable order.
+/// `Ord` follows allocation order: a document opened earlier sorts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentId(u64);
 
 impl DocumentId {

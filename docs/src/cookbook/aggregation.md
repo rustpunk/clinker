@@ -108,6 +108,20 @@ Available aggregate functions in CXL:
 | `first(expr)` | First value encountered |
 | `last(expr)` | Last value encountered |
 
+### Per-document aggregation
+
+When the source is document-aware — a `glob:` / `paths:` source that
+treats each file as its own document, or an enveloped format like XML or
+EDI — the Aggregate produces **one set of grouped rows per document**
+rather than a single aggregate spanning every file. Each document's
+groups finalize and emit at that document's close boundary, so a glob
+over twelve monthly files yields twelve independent monthly roll-ups, and
+only one document's groups are live in memory at a time. A plain
+single-file source is one document and still emits a single aggregate.
+See [Envelopes & Document Context](../pipeline/envelope-and-doc-context.md#per-document-aggregation)
+for the boundary rules (including how a `Merge` of distinct sources folds
+them back into one aggregate).
+
 ### Strategy selection
 
 Clinker offers two aggregation strategies:

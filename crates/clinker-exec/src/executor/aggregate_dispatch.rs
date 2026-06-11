@@ -9,10 +9,11 @@
 //! dispatcher's `Aggregation` arm is a single delegating call into
 //! [`dispatch_aggregation`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
-use cxl::eval::ProgramEvaluator;
+use clinker_record::{DocumentId, GroupByKey, Record, Schema, SchemaBuilder, Value};
+use cxl::eval::{EvalContext, ProgramEvaluator};
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
@@ -232,26 +233,22 @@ pub(crate) fn dispatch_aggregation(
                 .expect("guarded by is_time_windowed"),
             config.allowed_lateness,
         )?
-    } else {
-        // Single ConsumerHandle shared between the
-        // AggregateConsumer wrapper that the arbitrator's
-        // policy registry holds and the HashAggregator that
-        // mirrors its value_heap_bytes total into the
-        // handle's counter on every admit / spill / reset.
+    } else if is_relaxed {
+        // Relaxed-CK retraction path: one retained `HashAggregator`
+        // spanning the whole input, parked on
+        // `relaxed_aggregator_states` so the correlation-commit
+        // orchestrator can `retract_row` + `finalize_in_place` against
+        // the same instance that produced these rows. The commit model
+        // requires every group live across the retract iterations, so
+        // per-document flush does not apply here — a document-aware
+        // relaxed-CK aggregate keeps its single cross-document table.
         //
-        // The returned `ConsumerId` is captured so the wrapper is
-        // unregistered the moment its aggregator's state stops
-        // being live. A strict aggregate's `finalize` consumes
-        // the stream and emits every group, so the arm exit
-        // unregisters it directly; without that the finalized
-        // group state keeps contributing to `sum_consumer_usage`
-        // for the rest of the run, inflating the reported peak
-        // even though the bytes are gone. A relaxed aggregate
-        // parks its aggregator on `relaxed_aggregator_states` and
-        // carries this id with it, because the commit phase keeps
-        // retracting and re-finalizing that instance — its bytes
-        // stay live until the aggregator is dropped, at which
-        // point the unregister fires from that state.
+        // The single `ConsumerHandle` is shared with the
+        // `AggregateConsumer` the arbitrator holds; its `ConsumerId` is
+        // captured so the wrapper is unregistered the moment the
+        // aggregator's state stops being live. Parking transfers
+        // ownership of the unregister to `RetainedAggregatorState`,
+        // which fires it when the aggregator drops.
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
@@ -291,229 +288,99 @@ pub(crate) fn dispatch_aggregation(
                     advance_cursor(ctx, &source_name_arc, *row_num);
                 }
                 if let Err(e) = add_result {
-                    match ctx.config.error_handling.strategy {
-                        ErrorStrategy::FailFast => return Err(e.into()),
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
-                            let routed = record_error_to_buffer_if_grouped(
-                                ctx,
-                                record,
-                                *row_num,
-                                clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                                format!("aggregate {name}: {e}"),
-                                stage.clone(),
-                                None,
-                            );
-                            if !routed {
-                                let source_name = source_name_arc_of(record);
-                                push_dlq(
-                                    ctx,
-                                    DlqEntry {
-                                        source_row: *row_num,
-                                        category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                                        error_message: format!("aggregate {name}: {e}"),
-                                        original_record: record.clone(),
-                                        stage,
-                                        route: None,
-                                        trigger: true,
-                                        source_name,
-                                        triggering_field: None,
-                                        triggering_value: None,
-                                    },
-                                )?;
-                            }
-                        }
-                    }
+                    handle_aggregate_add_error(ctx, name, record, *row_num, e)?;
                 }
             }
             Ok(())
         })()?;
 
-        // Finalize. Accumulator finalize errors get the
-        // typed `PipelineError::Accumulator` mapping; under
-        // `Continue` we route to the DLQ and emit zero rows
-        // for the failed group. All other engine errors
-        // propagate (Internal/Spill/Residual always abort).
-        //
-        // Relaxed-CK aggregates split the finalize path: instead
-        // of consuming the wrapper, the Hash-arm boxed aggregator
-        // is extracted and kept on `ExecutorContext.relaxed_aggregator_states`
-        // so the correlation-commit orchestrator can call
-        // `retract_row` + `finalize_in_place` against the same
-        // instance that produced these rows. Strict aggregates
-        // continue to consume-and-discard so non-relaxed
-        // pipelines pay zero overhead.
+        // Finalize into the retained boxed aggregator (rather than
+        // consuming it) so the commit phase can drive the same
+        // instance. Accumulator finalize errors route to the DLQ under
+        // `Continue` / `BestEffort`; all other engine errors propagate.
         let finalize_ctx = ctx.merged_eval_ctx();
-        let agg_out = if is_relaxed {
-            let mut hash_box = match stream.into_retained_hash() {
-                Some(b) => b,
-                None => {
-                    // Streaming + retraction-mode is rejected at
-                    // compile time (E15Y); reaching this branch is
-                    // a planner-pass bug.
-                    return Err(PipelineError::Internal {
-                        op: "aggregation",
-                        node: name.clone(),
-                        detail: "retraction-mode aggregate produced a non-Hash \
-                                 stream — E15Y should have rejected this at compile time"
-                            .to_string(),
-                    });
-                }
-            };
-            let emits_synthetic = hash_box.emits_synthetic_ck();
-            let pre_finalize_len = emitted_rows.len();
-            match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
-                Ok(()) => {
-                    if emits_synthetic {
-                        ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
-                            (emitted_rows.len() - pre_finalize_len) as u64;
-                    }
-                    ctx.relaxed_aggregator_states.insert(
-                        node_idx,
-                        RetainedAggregatorState {
-                            aggregator: hash_box,
-                            consumer_id: agg_consumer_id,
-                        },
-                    );
-                    emitted_rows
-                }
-                Err(HashAggError::Accumulator {
-                    transform,
-                    binding,
-                    source,
-                }) => match ctx.config.error_handling.strategy {
-                    ErrorStrategy::FailFast => {
-                        return Err(PipelineError::Accumulator {
-                            transform,
-                            binding,
-                            source,
-                        });
-                    }
-                    ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                        // Empty-input finalize failures have no real
-                        // record to attribute to a Source, so stamp
-                        // the aggregate node's own name as the
-                        // source label. The DLQ reader sees a
-                        // specific aggregate identifier instead of
-                        // the generic `<merged>` fallthrough
-                        // `source_name_arc_of` would yield for a
-                        // schema-only synthetic record.
-                        let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
-                            let sn = source_name_arc_of(rec);
-                            (rec.clone(), sn)
-                        } else {
-                            (
-                                Record::new(Arc::clone(output_schema), Vec::new()),
-                                Arc::from(name.as_str()),
-                            )
-                        };
-                        push_dlq(
-                            ctx,
-                            DlqEntry {
-                                source_row: 0,
-                                category:
-                                    clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                                error_message: format!(
-                                    "aggregate {transform}.{binding}: {source:?}"
-                                ),
-                                original_record: synthetic,
-                                stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
-                                route: None,
-                                trigger: true,
-                                source_name,
-                                triggering_field: None,
-                                triggering_value: None,
-                            },
-                        )?;
-                        Vec::new()
-                    }
-                },
-                Err(other) => return Err(other.into()),
-            }
-        } else {
-            match stream.finalize(&finalize_ctx, &mut emitted_rows) {
-                Ok(()) => emitted_rows,
-                Err(HashAggError::Accumulator {
-                    transform,
-                    binding,
-                    source,
-                }) => match ctx.config.error_handling.strategy {
-                    ErrorStrategy::FailFast => {
-                        return Err(PipelineError::Accumulator {
-                            transform,
-                            binding,
-                            source,
-                        });
-                    }
-                    ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                        // Empty-input finalize failures have no real
-                        // record to attribute to a Source, so stamp
-                        // the aggregate node's own name as the
-                        // source label. The DLQ reader sees a
-                        // specific aggregate identifier instead of
-                        // the generic `<merged>` fallthrough
-                        // `source_name_arc_of` would yield for a
-                        // schema-only synthetic record.
-                        let (synthetic, source_name) = if let Some((rec, _)) = input.first() {
-                            let sn = source_name_arc_of(rec);
-                            (rec.clone(), sn)
-                        } else {
-                            (
-                                Record::new(Arc::clone(output_schema), Vec::new()),
-                                Arc::from(name.as_str()),
-                            )
-                        };
-                        push_dlq(
-                            ctx,
-                            DlqEntry {
-                                source_row: 0,
-                                category:
-                                    clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                                error_message: format!(
-                                    "aggregate {transform}.{binding}: {source:?}"
-                                ),
-                                original_record: synthetic,
-                                stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
-                                route: None,
-                                trigger: true,
-                                source_name,
-                                triggering_field: None,
-                                triggering_value: None,
-                            },
-                        )?;
-                        Vec::new()
-                    }
-                },
-                Err(other) => return Err(other.into()),
+        let mut hash_box = match stream.into_retained_hash() {
+            Some(b) => b,
+            None => {
+                // Streaming + retraction-mode is rejected at
+                // compile time (E15Y); reaching this branch is
+                // a planner-pass bug.
+                return Err(PipelineError::Internal {
+                    op: "aggregation",
+                    node: name.clone(),
+                    detail: "retraction-mode aggregate produced a non-Hash \
+                             stream — E15Y should have rejected this at compile time"
+                        .to_string(),
+                });
             }
         };
-        // The aggregate's working set is live exactly as long as
-        // its aggregator is. A strict `finalize` above consumed
-        // the stream and emitted every group, so that state is
-        // now gone; unregister the wrapper here so the finalized
-        // bytes leave `sum_consumer_usage` immediately and the
-        // run peak reflects only concurrently-live state, making
-        // it sensitive to the order aggregates complete in.
-        //
-        // A relaxed aggregate that finalized successfully parked
-        // its boxed aggregator on `relaxed_aggregator_states`
-        // (the key is present): that state stays live across the
-        // commit phase's retract + re-finalize iterations, so its
-        // wrapper must stay registered. Ownership of the
-        // unregister transfers to `RetainedAggregatorState`,
-        // which fires it when the aggregator is dropped — at the
-        // commit-phase degrade `remove`, or at the top-scope
-        // teardown that drains the surviving states once the walk
-        // ends. A relaxed aggregate whose finalize failed and
-        // routed to the DLQ dropped its aggregator without
-        // parking it, so the key is absent and the wrapper is
-        // unregistered here alongside the strict case — the
-        // presence of the retained key, not `is_relaxed`, is the
-        // exact predicate for "the state outlives this arm".
+        let emits_synthetic = hash_box.emits_synthetic_ck();
+        let pre_finalize_len = emitted_rows.len();
+        let agg_out = match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
+            Ok(()) => {
+                if emits_synthetic {
+                    ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
+                        (emitted_rows.len() - pre_finalize_len) as u64;
+                }
+                ctx.relaxed_aggregator_states.insert(
+                    node_idx,
+                    RetainedAggregatorState {
+                        aggregator: hash_box,
+                        consumer_id: agg_consumer_id,
+                    },
+                );
+                emitted_rows
+            }
+            Err(HashAggError::Accumulator {
+                transform,
+                binding,
+                source,
+            }) => match ctx.config.error_handling.strategy {
+                ErrorStrategy::FailFast => {
+                    return Err(PipelineError::Accumulator {
+                        transform,
+                        binding,
+                        source,
+                    });
+                }
+                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                    emit_aggregate_finalize_dlq(
+                        ctx,
+                        name,
+                        &input,
+                        output_schema,
+                        &transform,
+                        &binding,
+                        &source,
+                    )?;
+                    Vec::new()
+                }
+            },
+            Err(other) => return Err(other.into()),
+        };
+        // A relaxed aggregate that finalized successfully parked its
+        // boxed aggregator on `relaxed_aggregator_states` (the key is
+        // present): that state stays live across the commit phase's
+        // retract + re-finalize iterations, so its wrapper must stay
+        // registered — `RetainedAggregatorState` owns the unregister and
+        // fires it when the aggregator drops. A finalize that failed and
+        // routed to the DLQ dropped its aggregator without parking it, so
+        // the key is absent and the wrapper is unregistered here.
         if !ctx.relaxed_aggregator_states.contains_key(&node_idx) {
             ctx.memory_budget.unregister_consumer(agg_consumer_id);
         }
         agg_out
+    } else {
+        // Strict path with per-document group flush. The single
+        // `evaluator` built above is unused — each document's table builds
+        // its own behind an `Arc<TypedProgram>`. Drop it (and the
+        // single-stream `spill_schema`, which the factory re-derives) so
+        // any throwaway state releases promptly.
+        drop(evaluator);
+        drop(spill_schema);
+        let factory =
+            DocAggregatorFactory::from_ctx(ctx, name, agg_strategy, compiled, output_schema)?;
+        run_strict_aggregate_per_document(ctx, factory, name, output_schema, &input, &input_puncts)?
     };
 
     finalize_aggregate_emit(
@@ -564,16 +431,11 @@ fn finalize_aggregate_emit(
         // without an extra commit-time materialization for the
         // no-retraction case. Retraction iterations overwrite
         // the slot in `recompute_aggregates::emit_post_recompute`.
-        // Aggregate forwards inbound punctuations to its
-        // output buffer (Preserving). Document-scoped flush
-        // semantics — "flush groups on `DocumentClose` before
-        // forwarding the punctuation" — land as a follow-up
-        // commit within this sprint; today the punctuation
-        // travels at the tail of the aggregated output, which
-        // matches the streaming contract for single-document
-        // pipelines but does not yet split per-document
-        // groups when multiple documents enter the same
-        // aggregate.
+        // `out_rows` already carries each closing document's groups
+        // flushed at its `DocumentClose` boundary (the ingest arm
+        // split them per document); the inbound punctuations forward
+        // unchanged at the output buffer tail (Preserving), trailing
+        // the document's flushed rows.
         let buffer_schema = region.buffer_schema.clone();
         let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
         finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
@@ -645,6 +507,375 @@ fn finalize_aggregate_emit(
     Ok(())
 }
 
+/// `ctx`-free factory for one document's [`crate::aggregation::AggregateStream`].
+///
+/// A document-aware source feeds an Aggregate one document per source
+/// file, each carrying its own [`DocumentId`] and a `DocumentClose`
+/// boundary at its tail. Per-document aggregation builds a fresh group
+/// table for each document and flushes it at the document's close, so a
+/// multi-document run produces one set of grouped rows per document rather
+/// than a single cross-document aggregate.
+///
+/// This factory captures everything [`crate::aggregation::AggregateStream::for_node`]
+/// needs without borrowing the [`ExecutorContext`], so it works on both
+/// the dispatch thread (materialized path) and the streaming-ingest scoped
+/// thread, which holds no `&mut ExecutorContext`. Each built table
+/// registers its own [`crate::aggregation::AggregateConsumer`] with the
+/// shared arbitrator, so the open document's group bytes count toward the
+/// run's RSS accounting and the existing per-aggregator spill triggers
+/// fire normally.
+struct DocAggregatorFactory {
+    strategy: AggregateStrategy,
+    compiled: Arc<cxl::plan::CompiledAggregate>,
+    typed: Arc<cxl::typecheck::TypedProgram>,
+    has_distinct: bool,
+    max_expansion: u64,
+    output_schema: Arc<Schema>,
+    spill_schema: Arc<Schema>,
+    mem_limit: usize,
+    spill_dir: std::path::PathBuf,
+    spill_compress: bool,
+    transform_name: String,
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+}
+
+impl DocAggregatorFactory {
+    /// Snapshot the build inputs out of `ctx` for an aggregate node.
+    /// Resolves the spill schema, memory limit, and spill-compression mode
+    /// from `ctx` itself — the same derivations the single-stream paths run
+    /// inline — so the caller passes only the node identity.
+    ///
+    /// Returns an error when no compiled transform backs the node — the
+    /// same hard-abort `PipelineError::Internal` the single-stream paths
+    /// raise, surfaced here once at construction so [`Self::make`] only
+    /// fails on the never-taken `for_node` arm.
+    fn from_ctx(
+        ctx: &ExecutorContext<'_>,
+        node_name: &str,
+        strategy: AggregateStrategy,
+        compiled: &Arc<cxl::plan::CompiledAggregate>,
+        output_schema: &Arc<Schema>,
+    ) -> Result<Self, PipelineError> {
+        let transform_idx = ctx
+            .transform_by_name
+            .get(node_name)
+            .copied()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "aggregation",
+                node: node_name.to_string(),
+                detail: "no compiled transform found for aggregate node".to_string(),
+            })?;
+        let compiled_transform = &ctx.compiled_transforms[transform_idx];
+        // Spill schema mirrors `HashAggregator::spill`: group-by columns ++
+        // `__acc_state` ++ `__meta_tracker`. The compression mode resolves
+        // against the output-schema width and batch size so a spilled
+        // table's on-disk format matches what `--explain` reports.
+        let spill_schema = compiled
+            .group_by_fields
+            .iter()
+            .map(|s| Box::<str>::from(s.as_str()))
+            .chain([
+                Box::<str>::from("__acc_state"),
+                Box::<str>::from("__meta_tracker"),
+            ])
+            .collect::<SchemaBuilder>()
+            .build();
+        let spill_compress = ctx
+            .spill_compress
+            .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
+        Ok(Self {
+            strategy,
+            compiled: Arc::clone(compiled),
+            typed: Arc::clone(&compiled_transform.typed),
+            has_distinct: compiled_transform.has_distinct(),
+            max_expansion: compiled_transform.max_expansion,
+            output_schema: Arc::clone(output_schema),
+            spill_schema,
+            mem_limit: parse_memory_limit(ctx.config),
+            spill_dir: ctx.spill_root_path.to_path_buf(),
+            spill_compress,
+            transform_name: node_name.to_string(),
+            arbitrator: Arc::clone(&ctx.memory_budget),
+        })
+    }
+
+    /// Build a fresh stream + register its arbitrator consumer. Building a
+    /// new `ProgramEvaluator` per document is cheap: the heavy CXL
+    /// pipeline lives behind `Arc<TypedProgram>`.
+    fn make(
+        &self,
+    ) -> Result<
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    > {
+        let evaluator = ProgramEvaluator::with_max_expansion(
+            Arc::clone(&self.typed),
+            self.has_distinct,
+            self.max_expansion,
+        );
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let consumer_id = self.arbitrator.register_consumer(Arc::new(
+            crate::aggregation::AggregateConsumer::new(handle.clone()),
+        ));
+        let stream = crate::aggregation::AggregateStream::for_node(
+            self.strategy,
+            crate::aggregation::AggregatorConfig {
+                compiled: Arc::clone(&self.compiled),
+                evaluator,
+                output_schema: Arc::clone(&self.output_schema),
+                spill_schema: Arc::clone(&self.spill_schema),
+                memory_budget: self.mem_limit,
+                spill_dir: Some(self.spill_dir.clone()),
+                spill_compress: self.spill_compress,
+                transform_name: self.transform_name.clone(),
+                consumer_handle: handle,
+            },
+        )?;
+        Ok((stream, consumer_id))
+    }
+}
+
+/// Single live group table that flushes on each document-close boundary,
+/// for the streaming-ingest path where boundaries arrive inline with
+/// records.
+///
+/// Holds at most one [`crate::aggregation::AggregateStream`] at a time —
+/// the open document's groups. On `DocumentClose` the current table
+/// finalizes, emits, and resets, so a fused single-source stream (whose
+/// boundaries arrive in document order) produces one set of grouped rows
+/// per document. A non-fused Merge instead delivers its forwarded
+/// punctuations after every record, so the lone table accumulates the
+/// whole stream and flushes once at the tail — folding unreconciled
+/// documents together exactly as a no-document run would.
+///
+/// Holding one table at a time keeps the peak footprint at a single
+/// document's group state (plus its arbitrator consumer), so per-document
+/// flush lowers peak memory rather than inflating it. The materialized
+/// drain-to-`Vec` path keys tables by document instead (see
+/// [`run_strict_aggregate_per_document`]) because its boundaries are split
+/// out of arrival order.
+struct DocumentFlushAggregator {
+    factory: DocAggregatorFactory,
+    current: Option<(
+        crate::aggregation::AggregateStream,
+        crate::pipeline::memory::ConsumerId,
+    )>,
+}
+
+impl DocumentFlushAggregator {
+    fn new(factory: DocAggregatorFactory) -> Self {
+        Self {
+            factory,
+            current: None,
+        }
+    }
+
+    /// Borrow the open table, building (and registering) a fresh one when
+    /// none is open.
+    fn stream(&mut self) -> Result<&mut crate::aggregation::AggregateStream, PipelineError> {
+        if self.current.is_none() {
+            self.current = Some(self.factory.make()?);
+        }
+        Ok(&mut self.current.as_mut().expect("just populated").0)
+    }
+
+    /// Finalize, emit, and reset the open table (if any). The next
+    /// `stream` call builds a fresh one for the following document. A
+    /// `DocumentClose` for a document that contributed no records finds no
+    /// open table and is a no-op.
+    fn flush_current(
+        &mut self,
+        finalize_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+    ) -> Result<(), crate::aggregation::HashAggError> {
+        let Some((stream, consumer_id)) = self.current.take() else {
+            return Ok(());
+        };
+        let result = stream.finalize(finalize_ctx, out);
+        // `finalize` consumed the stream — its group bytes are gone, so
+        // unregister regardless of whether finalize succeeded.
+        self.factory.arbitrator.unregister_consumer(consumer_id);
+        result
+    }
+
+    /// Force an empty table into existence so an empty input still runs
+    /// one finalize. A global fold (no group-by) over empty input emits its
+    /// single defaulted row; an empty grouped fold emits nothing —
+    /// reproducing the single-stream finalize this replaced. Idempotent.
+    fn ensure_open(&mut self) -> Result<(), PipelineError> {
+        if self.current.is_none() {
+            self.current = Some(self.factory.make()?);
+        }
+        Ok(())
+    }
+}
+
+/// Drive a strict (non-relaxed, non-time-windowed) Aggregate with
+/// per-document group flush over a fully-drained input batch.
+///
+/// `drain_split` separated the predecessor's records from its boundaries,
+/// so the closing-document set is read once from `input_puncts`, then each
+/// record routes to a live group table keyed by a *flush key*: its own doc
+/// id when that document's close was forwarded, or a shared sentinel
+/// otherwise. On `DocumentClose(D)` the table for D finalizes, emits, and
+/// drops; the sentinel table (every unreconciled / no-document record)
+/// flushes at end-of-input. Keying by flush key — rather than tracking a
+/// running document — is robust to arbitrary record interleaving (an
+/// upstream Merge in `interleave` mode): a closing document's groups stay
+/// isolated even when another document's records arrive between them, and
+/// unreconciled documents fold together exactly as a no-document run would.
+///
+/// A no-document or single-document run keys every record to one table
+/// (the file's single closing document, or the sentinel) flushed once —
+/// byte-identical to a plain finalize.
+///
+/// Punctuations are not consumed here — the caller forwards the full
+/// `input_puncts` at the output tail, preserving the boundary for
+/// downstream operators while this arm flushes the closing document's
+/// groups ahead of it. Peak footprint is the concurrently-open closing
+/// documents plus the sentinel; each closing document drops at its close,
+/// so per-document flush lowers peak rather than inflating it.
+fn run_strict_aggregate_per_document(
+    ctx: &mut ExecutorContext<'_>,
+    factory: DocAggregatorFactory,
+    name: &str,
+    output_schema: &Arc<Schema>,
+    input: &[(Record, u64)],
+    input_puncts: &[crate::executor::stream_event::Punctuation],
+) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
+    use crate::executor::stream_event::PunctuationKind;
+
+    // Documents whose close was forwarded to this Aggregate. Only these key
+    // their own table; every other record (unreconciled documents from a
+    // Merge that swallowed their closes, and the synthetic no-document id)
+    // shares the `SYNTHETIC` sentinel table and folds together. A real
+    // closing document never collides with the sentinel — sources allocate
+    // ids from a counter that starts past `DocumentId::SYNTHETIC`.
+    let closing_docs: std::collections::HashSet<DocumentId> = input_puncts
+        .iter()
+        .filter(|p| p.kind() == PunctuationKind::DocumentClose)
+        .map(|p| p.doc_id())
+        .collect();
+    let flush_key = |doc_id: DocumentId| -> DocumentId {
+        if closing_docs.contains(&doc_id) {
+            doc_id
+        } else {
+            DocumentId::SYNTHETIC
+        }
+    };
+
+    let mut tables: HashMap<
+        DocumentId,
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+    > = HashMap::new();
+    let mut out_rows: Vec<crate::aggregation::SortRow> = Vec::with_capacity(64);
+
+    for (record, row_num) in input {
+        let key = flush_key(record.doc_ctx().id());
+        let source_file_arc = source_file_arc_of(record);
+        let source_name_arc = source_name_arc_of(record);
+        let eval_ctx = ctx.eval_ctx_for_record(
+            &source_file_arc,
+            &source_name_arc,
+            *row_num,
+            record.doc_ctx(),
+        );
+        let entry = match tables.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(factory.make()?),
+        };
+        let add_result = entry
+            .0
+            .add_record(record, *row_num, &eval_ctx, &mut out_rows);
+        if add_result.is_ok() {
+            advance_cursor(ctx, &source_name_arc, *row_num);
+        }
+        if let Err(e) = add_result {
+            handle_aggregate_add_error(ctx, name, record, *row_num, e)?;
+        }
+    }
+
+    // Flush each closing document at its boundary (in `input_puncts`
+    // order), dropping its table. The merged-provenance finalize context
+    // borrows only `'a`-lifetime data, so it survives the `&mut ctx` DLQ
+    // routing between flushes.
+    let finalize_ctx = ctx.merged_eval_ctx();
+    for p in input_puncts {
+        if p.kind() == PunctuationKind::DocumentClose
+            && let Some((stream, consumer_id)) = tables.remove(&p.doc_id())
+        {
+            let result = stream.finalize(&finalize_ctx, &mut out_rows);
+            factory.arbitrator.unregister_consumer(consumer_id);
+            route_document_flush_result(ctx, name, input, output_schema, result)?;
+        }
+    }
+
+    // An empty input opened no table; a global fold still owes its single
+    // defaulted row, so force the sentinel table open before the final
+    // flush. Gated on truly-empty input so a run whose only document
+    // already flushed on its close is not given a phantom global-fold row.
+    if input.is_empty() {
+        tables.insert(DocumentId::SYNTHETIC, factory.make()?);
+    }
+    // Flush whatever is left in `DocumentId` order for deterministic emit
+    // ordering: the sentinel (unreconciled / no-document remainder) and any
+    // closing document whose close never arrived.
+    let finalize_ctx = ctx.merged_eval_ctx();
+    let mut remaining: Vec<DocumentId> = tables.keys().copied().collect();
+    remaining.sort_unstable();
+    for key in remaining {
+        let (stream, consumer_id) = tables.remove(&key).expect("key from this map");
+        let result = stream.finalize(&finalize_ctx, &mut out_rows);
+        factory.arbitrator.unregister_consumer(consumer_id);
+        route_document_flush_result(ctx, name, input, output_schema, result)?;
+    }
+
+    Ok(out_rows)
+}
+
+/// Route a document-flush finalize result: an `Accumulator` failure goes
+/// to the DLQ under `Continue` / `BestEffort` (mirroring the single-stream
+/// strict arm), `FailFast` and every other engine error propagate.
+fn route_document_flush_result(
+    ctx: &mut ExecutorContext<'_>,
+    name: &str,
+    input: &[(Record, u64)],
+    output_schema: &Arc<Schema>,
+    result: Result<(), crate::aggregation::HashAggError>,
+) -> Result<(), PipelineError> {
+    use crate::aggregation::HashAggError;
+    match result {
+        Ok(_) => Ok(()),
+        Err(HashAggError::Accumulator {
+            transform,
+            binding,
+            source,
+        }) => match ctx.config.error_handling.strategy {
+            ErrorStrategy::FailFast => Err(PipelineError::Accumulator {
+                transform,
+                binding,
+                source,
+            }),
+            ErrorStrategy::Continue | ErrorStrategy::BestEffort => emit_aggregate_finalize_dlq(
+                ctx,
+                name,
+                input,
+                output_schema,
+                &transform,
+                &binding,
+                &source,
+            ),
+        },
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// Per-record side effects a streaming-ingest scoped thread cannot apply
 /// directly (it holds no `&mut ExecutorContext`), replayed onto the
 /// dispatcher after the scope joins. Ordering within each vector is the
@@ -680,12 +911,15 @@ struct StreamingIngestOutput {
 /// batch into the channel, while a scoped thread drives `add_record` off
 /// the receiver. The bounded `send` is the back-pressure pivot — a slow
 /// `add_record` (e.g. a hash aggregate spilling) stalls the producer and
-/// lets the upstream Source channel fill. The finalize half stays blocking:
-/// the scoped thread runs `finalize` once the channel disconnects (every
-/// sender dropped at the producer arm's clean exit), then returns the
-/// finalized rows. Document-boundary punctuations are collected and
-/// forwarded at the output tail — byte-identical to the materialized hash
-/// path, whose per-document group flush is a separate follow-up.
+/// lets the upstream Source channel fill. Group state is bucketed per
+/// [`DocumentId`]: a `DocumentClose(D)` arriving in stream order flushes
+/// document D's groups before the boundary forwards at the output tail, so
+/// a multi-document run emits one set of grouped rows per document. The
+/// finalize half stays blocking: once the channel disconnects (every
+/// sender dropped at the producer arm's clean exit), any document still
+/// open (the synthetic doc id of a no-envelope pipeline, or a document
+/// never closed) flushes and the finalized rows return. Document-boundary
+/// punctuations are forwarded at the output tail unchanged.
 ///
 /// The scoped thread holds no `&mut ExecutorContext`; it accumulates cursor
 /// advances and `add_record` DLQ errors into [`StreamingIngestEffects`],
@@ -706,68 +940,21 @@ fn run_streaming_aggregate_ingest(
 ) -> Result<StreamingIngestOutput, PipelineError> {
     use crate::aggregation::SortRow as AggSortRow;
     use crate::executor::stream_event::StreamEvent;
-    use cxl::eval::EvalContext;
 
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
         .cloned();
     let upstream_name = current_dag.graph[producer_idx].name().to_string();
 
-    // Build the per-aggregation runtime artifacts (mirrors the materialized
-    // path): the executor owns the evaluator + spill metadata; the wrapper
-    // enum owns the engine. Register exactly one `AggregateConsumer` so the
-    // growing group state contributes to `sum_consumer_usage` while it is
-    // live, and unregister it after `finalize` consumes the stream.
-    let transform_idx = ctx.transform_by_name.get(name).copied();
-    let evaluator = match transform_idx {
-        Some(idx) => ProgramEvaluator::with_max_expansion(
-            Arc::clone(&ctx.compiled_transforms[idx].typed),
-            ctx.compiled_transforms[idx].has_distinct(),
-            ctx.compiled_transforms[idx].max_expansion,
-        ),
-        None => {
-            return Err(PipelineError::Internal {
-                op: "aggregation",
-                node: name.to_string(),
-                detail: "no compiled transform found for aggregate node".to_string(),
-            });
-        }
-    };
-    let spill_schema = compiled
-        .group_by_fields
-        .iter()
-        .map(|s| Box::<str>::from(s.as_str()))
-        .chain([
-            Box::<str>::from("__acc_state"),
-            Box::<str>::from("__meta_tracker"),
-        ])
-        .collect::<SchemaBuilder>()
-        .build();
-    let mem_limit = parse_memory_limit(ctx.config);
-    let spill_compress = ctx
-        .spill_compress
-        .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
-
-    let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-    let agg_consumer_id =
-        ctx.memory_budget
-            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(
-                agg_consumer_handle.clone(),
-            )));
-    let mut stream = crate::aggregation::AggregateStream::for_node(
-        agg_strategy,
-        crate::aggregation::AggregatorConfig {
-            compiled: Arc::clone(compiled),
-            evaluator,
-            output_schema: Arc::clone(output_schema),
-            spill_schema,
-            memory_budget: mem_limit,
-            spill_dir: Some(ctx.spill_root_path.to_path_buf()),
-            spill_compress,
-            transform_name: name.to_string(),
-            consumer_handle: agg_consumer_handle,
-        },
-    )?;
+    // Build the `ctx`-free document-aggregator factory (same one the
+    // materialized path uses). The scoped thread holds no
+    // `&mut ExecutorContext`, so it builds and registers each document's
+    // table through the factory's captured `Arc<MemoryArbitrator>`. Each
+    // table's `AggregateConsumer` contributes its growing group state to
+    // `sum_consumer_usage` while live, and is unregistered when that
+    // document flushes (on its `DocumentClose`, or at disconnect for the
+    // document left open).
+    let factory = DocAggregatorFactory::from_ctx(ctx, name, agg_strategy, compiled, output_schema)?;
 
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
@@ -792,11 +979,12 @@ fn run_streaming_aggregate_ingest(
     let mut out_rows: Vec<AggSortRow> = Vec::with_capacity(64);
     let mut puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut input_count: u64 = 0;
+    let mut agg = DocumentFlushAggregator::new(factory);
 
     // Run the ingest recv loop and the producer concurrently. The scoped
-    // thread owns the `AggregateStream` and drains the channel; the main
-    // thread redispatches the producer (which streams into the channel and
-    // drops its sender at clean exit, disconnecting the channel). The
+    // thread owns the document-flush aggregator and drains the channel; the
+    // main thread redispatches the producer (which streams into the channel
+    // and drops its sender at clean exit, disconnecting the channel). The
     // producer's `?` error and the ingest thread's error both surface; the
     // ingest thread always drains to disconnect first so a producer `send`
     // can never deadlock on a dead consumer.
@@ -807,10 +995,22 @@ fn run_streaming_aggregate_ingest(
                 let (record, rn) = match event {
                     StreamEvent::Record(r, rn) => (r, rn),
                     StreamEvent::Punctuation(p) => {
-                        // Collect for the output tail (byte-identical to the
-                        // materialized hash path; per-document flush is a
-                        // separate follow-up). Punctuations carry zero
+                        // A `DocumentClose` arriving in stream order means the
+                        // open document is fully delivered: flush its groups
+                        // now (its records arrived contiguously before this
+                        // boundary), then forward the boundary at the output
+                        // tail. Opens only forward. Punctuations carry zero
                         // charge, so no discharge here.
+                        if p.kind() == crate::executor::stream_event::PunctuationKind::DocumentClose
+                            && let Err(e) = agg.flush_current(&finalize_ctx, &mut out_rows)
+                        {
+                            // The streaming-ingest arm aborts on a finalize
+                            // failure (no DLQ fallback, matching the prior
+                            // single-stream behavior); drain first so the
+                            // producer's bounded `send` can't deadlock.
+                            while rx.recv().is_ok() {}
+                            return Err(e.into());
+                        }
                         puncts.push(p);
                         continue;
                     }
@@ -841,6 +1041,7 @@ fn run_streaming_aggregate_ingest(
                     source_name: &source_name_arc,
                     doc_ctx: record.doc_ctx(),
                 };
+                let stream = agg.stream()?;
                 match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
                     Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
                     Err(e) => match strategy {
@@ -859,9 +1060,15 @@ fn run_streaming_aggregate_ingest(
                 }
             }
             // Channel disconnected — every sender dropped at the producer
-            // arm's clean exit. Finalize the blocking half and return.
-            stream
-                .finalize(&finalize_ctx, &mut out_rows)
+            // arm's clean exit. An empty stream opened no table; a global
+            // fold still owes one defaulted row, so force one open before the
+            // final flush. Then flush whatever is still open (the trailing
+            // document, the synthetic doc id of a no-envelope run, or the
+            // unreconciled-Merge remainder) and return.
+            if input_count == 0 {
+                agg.ensure_open()?;
+            }
+            agg.flush_current(&finalize_ctx, &mut out_rows)
                 .map_err(PipelineError::from)
         });
 
@@ -890,13 +1097,13 @@ fn run_streaming_aggregate_ingest(
     // Charge bookkeeping is complete: the producer charged each batch and
     // the ingest thread discharged each record. Pin to zero defensively (a
     // heuristic mismatch between batch charge and per-record discharge must
-    // not leave a stale positive for the arbitrator), then unregister both
-    // the per-edge charge consumer and the aggregate consumer — `finalize`
-    // consumed the group state, so its bytes leave `sum_consumer_usage`.
+    // not leave a stale positive for the arbitrator), then unregister the
+    // per-edge charge consumer. Each per-document bucket's aggregate
+    // consumer already unregistered itself as that document flushed, so no
+    // aggregate consumer survives this arm.
     charge_handle.set_bytes(0);
     ctx.streaming_charge_consumers.remove(&producer_idx);
     ctx.memory_budget.unregister_consumer(charge_consumer_id);
-    ctx.memory_budget.unregister_consumer(agg_consumer_id);
 
     ingest_result?;
 
@@ -1061,7 +1268,6 @@ fn run_time_windowed_aggregate(
     };
     use clinker_plan::config::pipeline_node::TimeWindowSpec;
     use clinker_record::group_key::value_to_group_key;
-    use std::collections::HashMap;
 
     let upstream_sources = upstream_source_names(current_dag, node_idx);
     let allowed_lateness_nanos = allowed_lateness.map(duration_to_nanos).unwrap_or(0);
@@ -1471,9 +1677,10 @@ fn add_to_window(
     handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
 }
 
-/// Shared per-record `add_record` error handler for both
-/// tumbling/hopping and session arms. Mirrors the positional
-/// aggregate arm's error-strategy switch.
+/// Shared per-record `add_record` error handler for every materialized
+/// ingest arm — the strict per-document path, the relaxed-CK path, and
+/// the tumbling/hopping/session windowed arms. `FailFast` surfaces the
+/// error; `Continue` / `BestEffort` routes the failing record to the DLQ.
 fn handle_aggregate_add_error(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
@@ -1618,9 +1825,10 @@ fn push_late_record(
 }
 
 /// Emit an `AggregateFinalize` DLQ entry for an accumulator failure at
-/// finalize-time. Shared by tumbling/hopping `finalize_windows` and
-/// the session arm; mirrors the positional aggregate arm's
-/// synthetic-record fallback when input is empty.
+/// finalize-time. Shared by the strict per-document flush, the relaxed-CK
+/// arm, and the tumbling/hopping/session windowed finalizers. Falls back
+/// to a synthetic record stamped with the node name when the input was
+/// empty (the failure has no real record to attribute to a Source).
 fn emit_aggregate_finalize_dlq(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
