@@ -368,7 +368,8 @@ fn multiple_empty_files_global_fold_emit_one_defaulted_row() {
 
     // Several header-only files still deliver no records and no closes, so
     // the aggregate sees one empty stream and owes exactly one defaulted
-    // row at disconnect — the `!flushed_close` gate ensures the single
+    // row at disconnect — the disconnect force-open fires only when no
+    // document was flushed (the empty-`flushed` gate), so the single
     // disconnect-time finalize is not multiplied into a phantom row per
     // file.
     let (body, ok, dlq) = run_streaming(
