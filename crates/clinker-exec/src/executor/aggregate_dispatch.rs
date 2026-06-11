@@ -29,6 +29,25 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::types::AggregateStrategy;
 
+/// Build the on-disk spill schema for an aggregate's group state: the
+/// group-by columns ++ `__acc_state` ++ `__meta_tracker`. Mirrors the
+/// column layout `HashAggregator::spill` writes, so a spilled table round-
+/// trips through the same schema it was serialized against. Shared by every
+/// arm that builds an `AggregateStream` (the relaxed-CK and windowed
+/// preludes, and the per-document factory).
+fn aggregate_spill_schema(compiled: &cxl::plan::CompiledAggregate) -> Arc<Schema> {
+    compiled
+        .group_by_fields
+        .iter()
+        .map(|s| Box::<str>::from(s.as_str()))
+        .chain([
+            Box::<str>::from("__acc_state"),
+            Box::<str>::from("__meta_tracker"),
+        ])
+        .collect::<SchemaBuilder>()
+        .build()
+}
+
 /// Execute the `Aggregation` arm for `node_idx`: select hash or streaming
 /// strategy, ingest the predecessor's records (per-record for hash, sorted
 /// for streaming), trip soft/hard spill thresholds inside the RSS budget,
@@ -153,65 +172,18 @@ pub(crate) fn dispatch_aggregation(
         }
     }
 
-    // Build the per-aggregation runtime artifacts. The
-    // executor owns the evaluator + spill metadata; the
-    // wrapper enum owns the engine.
-    let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
-    let evaluator = match transform_idx {
-        Some(idx) => ProgramEvaluator::with_max_expansion(
-            Arc::clone(&ctx.compiled_transforms[idx].typed),
-            ctx.compiled_transforms[idx].has_distinct(),
-            ctx.compiled_transforms[idx].max_expansion,
-        ),
-        None => {
-            return Err(PipelineError::Internal {
-                op: "aggregation",
-                node: name.clone(),
-                detail: "no compiled transform found for aggregate node".to_string(),
-            });
-        }
-    };
-
-    // Spill schema follows the format used by
-    // `HashAggregator::spill`: group-by columns ++
-    // `__acc_state` ++ `__meta_tracker`.
-    let spill_schema = compiled
-        .group_by_fields
-        .iter()
-        .map(|s| Box::<str>::from(s.as_str()))
-        .chain([
-            Box::<str>::from("__acc_state"),
-            Box::<str>::from("__meta_tracker"),
-        ])
-        .collect::<SchemaBuilder>()
-        .build();
-
-    let mem_limit = parse_memory_limit(ctx.config);
-
-    // Resolve the spill compression mode against this aggregate's
-    // output-schema width and the run's batch size, so spilled group state
-    // matches what `--explain` projects for the operator. The explain line
-    // for an Aggregation node resolves the same way against
-    // `stored_output_schema().column_count()`, so resolving here against the
-    // output schema keeps the reported mode and the on-disk format in
-    // lockstep. `auto` skips LZ4 on narrow/short aggregates where the
-    // per-frame fixed cost outweighs the savings.
-    let spill_compress = ctx
-        .spill_compress
-        .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
-
     let input_count = input.len() as u64;
 
     let out_rows: Vec<AggSortRow> = if is_time_windowed {
-        // Time-windowed path: per-(window) AggregateStream
-        // instances dispatched in `run_time_windowed_aggregate`.
-        // The single positional `stream` built above is unused
-        // here — drop it so its spill files (if any) are cleaned
-        // up promptly. Building a fresh evaluator + spill setup
-        // per window keeps the time-windowed code self-
-        // contained at the cost of one extra evaluator clone per
-        // window (the heavy `TypedProgram` lives behind an Arc).
-        drop(evaluator);
+        // Time-windowed path: per-(window) AggregateStream instances
+        // dispatched in `run_time_windowed_aggregate`, each building its own
+        // evaluator from `transform_idx` (the heavy `TypedProgram` lives
+        // behind an Arc, so a per-window evaluator clone is cheap). The
+        // strict path below never reaches here, so the spill schema is built
+        // only on this windowed branch — never built-then-dropped.
+        let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
+        let spill_schema = aggregate_spill_schema(compiled);
+        let mem_limit = parse_memory_limit(ctx.config);
         let win_ctx = WindowedAggContext {
             name,
             compiled,
@@ -249,6 +221,38 @@ pub(crate) fn dispatch_aggregation(
         // aggregator's state stops being live. Parking transfers
         // ownership of the unregister to `RetainedAggregatorState`,
         // which fires it when the aggregator drops.
+        //
+        // Build the single retained-stream artifacts here, on the branch
+        // that consumes them — the strict path below re-derives its own per
+        // document, so nothing is built-then-dropped on the dominant arm.
+        let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
+        let evaluator = match transform_idx {
+            Some(idx) => ProgramEvaluator::with_max_expansion(
+                Arc::clone(&ctx.compiled_transforms[idx].typed),
+                ctx.compiled_transforms[idx].has_distinct(),
+                ctx.compiled_transforms[idx].max_expansion,
+            ),
+            None => {
+                return Err(PipelineError::Internal {
+                    op: "aggregation",
+                    node: name.clone(),
+                    detail: "no compiled transform found for aggregate node".to_string(),
+                });
+            }
+        };
+        let spill_schema = aggregate_spill_schema(compiled);
+        let mem_limit = parse_memory_limit(ctx.config);
+        // Resolve the spill compression mode against this aggregate's
+        // output-schema width and the run's batch size, so spilled group
+        // state matches what `--explain` projects for the operator: the
+        // explain line resolves the same way against
+        // `stored_output_schema().column_count()`, keeping the reported mode
+        // and the on-disk format in lockstep. `auto` skips LZ4 on
+        // narrow/short aggregates where the per-frame fixed cost outweighs
+        // the savings.
+        let spill_compress = ctx
+            .spill_compress
+            .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
@@ -371,13 +375,10 @@ pub(crate) fn dispatch_aggregation(
         }
         agg_out
     } else {
-        // Strict path with per-document group flush. The single
-        // `evaluator` built above is unused — each document's table builds
-        // its own behind an `Arc<TypedProgram>`. Drop it (and the
-        // single-stream `spill_schema`, which the factory re-derives) so
-        // any throwaway state releases promptly.
-        drop(evaluator);
-        drop(spill_schema);
+        // Strict path with per-document group flush — the dominant arm.
+        // Builds nothing in the prelude: each document's table derives its
+        // own evaluator + spill schema through the `ctx`-free factory, so a
+        // strict run allocates no throwaway evaluator or spill schema here.
         let factory =
             DocAggregatorFactory::from_ctx(ctx, name, agg_strategy, compiled, output_schema)?;
         run_strict_aggregate_per_document(ctx, factory, name, output_schema, &input, &input_puncts)?
@@ -566,20 +567,10 @@ impl DocAggregatorFactory {
                 detail: "no compiled transform found for aggregate node".to_string(),
             })?;
         let compiled_transform = &ctx.compiled_transforms[transform_idx];
-        // Spill schema mirrors `HashAggregator::spill`: group-by columns ++
-        // `__acc_state` ++ `__meta_tracker`. The compression mode resolves
-        // against the output-schema width and batch size so a spilled
-        // table's on-disk format matches what `--explain` reports.
-        let spill_schema = compiled
-            .group_by_fields
-            .iter()
-            .map(|s| Box::<str>::from(s.as_str()))
-            .chain([
-                Box::<str>::from("__acc_state"),
-                Box::<str>::from("__meta_tracker"),
-            ])
-            .collect::<SchemaBuilder>()
-            .build();
+        // The compression mode resolves against the output-schema width and
+        // batch size so a spilled table's on-disk format matches what
+        // `--explain` reports.
+        let spill_schema = aggregate_spill_schema(compiled);
         let spill_compress = ctx
             .spill_compress
             .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
@@ -628,6 +619,11 @@ impl DocAggregatorFactory {
                 output_schema: Arc::clone(&self.output_schema),
                 spill_schema: Arc::clone(&self.spill_schema),
                 memory_budget: self.mem_limit,
+                // `AggregatorConfig` owns its `spill_dir: Option<PathBuf>`
+                // and `transform_name: String`, so each table takes an owned
+                // copy — an `Arc<Path>` / `Arc<str>` here would still have to
+                // materialize an owned value at this boundary, not bump a
+                // refcount.
                 spill_dir: Some(self.spill_dir.clone()),
                 spill_compress: self.spill_compress,
                 transform_name: self.transform_name.clone(),
@@ -817,10 +813,14 @@ impl RegisteredTables {
     }
 
     /// Flush keys in ascending [`DocumentId`] order for deterministic emit
-    /// ordering across the leftover fold.
+    /// ordering across the leftover fold. The dominant no-/single-document
+    /// run leaves at most the one sentinel table here, where ordering is
+    /// already trivial — skip the sort in that case.
     fn sorted_keys(&self) -> Vec<DocumentId> {
         let mut keys: Vec<DocumentId> = self.tables.keys().copied().collect();
-        keys.sort_unstable();
+        if keys.len() > 1 {
+            keys.sort_unstable();
+        }
         keys
     }
 }
@@ -922,20 +922,39 @@ fn run_strict_aggregate_per_document(
         }
     }
 
-    // Flush each closing document at its boundary (in `input_puncts`
-    // order), dropping its table. The merged-provenance finalize context
-    // borrows only `'a`-lifetime data, so it survives the `&mut ctx` DLQ
-    // routing between flushes.
+    // The merged-provenance finalize context borrows only `'a`/`'static`
+    // data (the stable context and shared statics), not `ctx` itself, so one
+    // binding stays valid across the `&mut ctx` DLQ routing of both flush
+    // loops below — the merged `$source.count` is fixed by ingestion and does
+    // not move between the two loops.
     let finalize_ctx = ctx.merged_eval_ctx();
-    // Documents already flushed in this loop, so a duplicate `DocumentClose`
-    // for the same id does not synthesize a second global-fold row for a
-    // document that already emitted.
+    let flush = DocumentFlushCtx {
+        finalize_ctx: &finalize_ctx,
+        arbitrator: &factory.arbitrator,
+        name,
+        output_schema,
+    };
+
+    // Flush each closing document at its boundary (in `input_puncts` order),
+    // dropping its table. `flushed` records documents already flushed here so
+    // a duplicate `DocumentClose` for the same id does not synthesize a
+    // second global-fold row for a document that already emitted.
     let mut flushed: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
     for p in input_puncts {
         if p.kind() != PunctuationKind::DocumentClose {
             continue;
         }
         let doc_id = p.doc_id();
+        // A real closing document keys its own table; the flush-key model
+        // depends on its id never colliding with the sentinel. Sources
+        // allocate ids from a counter that starts past `DocumentId::SYNTHETIC`,
+        // so this holds by construction — assert it in debug builds.
+        debug_assert_ne!(
+            doc_id,
+            DocumentId::SYNTHETIC,
+            "a real closing document's id must never equal the sentinel id, \
+             or its groups would fold into the unreconciled-remainder table"
+        );
         if !flushed.insert(doc_id) {
             continue;
         }
@@ -948,14 +967,12 @@ fn run_strict_aggregate_per_document(
             None if is_global_fold => Some(factory.make()?),
             None => None,
         };
-        if let Some((stream, consumer_id)) = entry {
-            let result = stream.finalize(&finalize_ctx, &mut out_rows);
-            factory.arbitrator.unregister_consumer(consumer_id);
+        if let Some(table) = entry {
             // Attribute a finalize failure to a record from THIS document so
             // the DLQ entry points at the document's own source file, not the
             // batch's first document.
             let attribution = document_attribution_record(input, doc_id);
-            route_document_flush_result(ctx, name, attribution, output_schema, result)?;
+            finalize_and_route_table(ctx, &flush, attribution, table, &mut out_rows)?;
         }
     }
 
@@ -973,13 +990,11 @@ fn run_strict_aggregate_per_document(
     // ordering: the sentinel (unreconciled / no-document remainder) and any
     // closing document whose close never arrived. This leftover fold spans
     // no single document, so its DLQ attribution keeps the batch-first-record
-    // behavior.
-    let finalize_ctx = ctx.merged_eval_ctx();
+    // behavior. The dominant no-/single-document run leaves exactly one
+    // table here, so `sorted_keys` skips the Vec-collect + sort in that case.
     for key in tables.sorted_keys() {
-        let (stream, consumer_id) = tables.remove(key).expect("key from this map");
-        let result = stream.finalize(&finalize_ctx, &mut out_rows);
-        factory.arbitrator.unregister_consumer(consumer_id);
-        route_document_flush_result(ctx, name, input, output_schema, result)?;
+        let table = tables.remove(key).expect("key from this map");
+        finalize_and_route_table(ctx, &flush, input, table, &mut out_rows)?;
     }
 
     Ok(out_rows)
@@ -997,6 +1012,45 @@ fn document_attribution_record(input: &[(Record, u64)], doc_id: DocumentId) -> &
         Some(pos) => &input[pos..=pos],
         None => input,
     }
+}
+
+/// The invariant routing context shared by both per-document flush loops in
+/// [`run_strict_aggregate_per_document`]: the merged-provenance finalize
+/// context, the node name, the output schema, and the arbitrator. Built once
+/// and borrowed across both loops so the per-table flush step takes only its
+/// loop-varying inputs.
+struct DocumentFlushCtx<'f> {
+    finalize_ctx: &'f EvalContext<'f>,
+    arbitrator: &'f crate::pipeline::memory::MemoryArbitrator,
+    name: &'f str,
+    output_schema: &'f Arc<Schema>,
+}
+
+/// Finalize one already-removed group table, release its arbitrator
+/// consumer, and route the finalize result through
+/// [`route_document_flush_result`]. Shared by the punct-loop (each closing
+/// document) and the leftover-loop (the sentinel + any never-closed
+/// document) in [`run_strict_aggregate_per_document`].
+///
+/// The caller `remove`s the `(stream, consumer_id)` entry from
+/// [`RegisteredTables`] *before* calling this, so the guard no longer tracks
+/// it: unregistering here cannot double-unregister, and a `?` return from
+/// the routing cannot strand a consumer the guard already forgot. This keeps
+/// the guard's remove-before-unregister discipline intact across both loops.
+fn finalize_and_route_table(
+    ctx: &mut ExecutorContext<'_>,
+    flush: &DocumentFlushCtx<'_>,
+    attribution: &[(Record, u64)],
+    table: (
+        crate::aggregation::AggregateStream,
+        crate::pipeline::memory::ConsumerId,
+    ),
+    out_rows: &mut Vec<crate::aggregation::SortRow>,
+) -> Result<(), PipelineError> {
+    let (stream, consumer_id) = table;
+    let result = stream.finalize(flush.finalize_ctx, out_rows);
+    flush.arbitrator.unregister_consumer(consumer_id);
+    route_document_flush_result(ctx, flush.name, attribution, flush.output_schema, result)
 }
 
 /// Route a document-flush finalize result: an `Accumulator` failure goes

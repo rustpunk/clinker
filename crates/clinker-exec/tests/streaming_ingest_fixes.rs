@@ -20,9 +20,12 @@
 //!    disconnect-time empty-input flush is gated so a run whose closes
 //!    already paid that debt gains no phantom duplicate. (A plain multi-file
 //!    CSV glob delivers an empty trailing file as no document at all, so the
-//!    reachable empty case here is the empty stream; the per-document
-//!    force-open is the symmetric guard for envelope formats that do deliver
-//!    a zero-record close.)
+//!    empty case the tests here exercise is the empty stream. The per-document
+//!    zero-record close IS reachable, though: an envelope source emits a
+//!    balanced `DocumentOpen`/`DocumentClose` pair with no records between for
+//!    a header-only / body-less document — e.g. a header-only EDI interchange
+//!    — and the force-open ensures such a close still emits its global-fold
+//!    defaulted row.)
 //!
 //! All tests assert (via the `--explain` `buffer: streaming` classification)
 //! that the fused producer actually drives the streaming-ingest path rather
