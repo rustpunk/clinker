@@ -538,6 +538,11 @@ struct DocAggregatorFactory {
     spill_compress: bool,
     transform_name: String,
     arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+    /// A no-group-by fold owes one defaulted row per closing document even
+    /// when that document contributed zero records; a grouped fold owes
+    /// nothing for an empty document. Derived once here so the flush
+    /// lifecycle never re-walks `compiled.group_by_fields`.
+    is_global_fold: bool,
 }
 
 impl DocAggregatorFactory {
@@ -587,6 +592,7 @@ impl DocAggregatorFactory {
             spill_compress,
             transform_name: node_name.to_string(),
             arbitrator: Arc::clone(&ctx.memory_budget),
+            is_global_fold: compiled.group_by_fields.is_empty(),
         })
     }
 
@@ -702,42 +708,39 @@ impl RegisteredTables {
     }
 
     /// Flush the bucket for one closing document at its `DocumentClose`
-    /// boundary. Returns `None` when the document was already flushed (a
-    /// duplicate close), or when it contributed no records under a grouped
-    /// fold (which owes no row); otherwise finalizes the bucket into `out`
-    /// and returns the finalize `Result` for the caller to route — the
+    /// boundary, routing the finalize outcome through `route` — the
     /// materialized arm to the DLQ via [`route_document_flush_result`], the
-    /// streaming arm as a hard error. A global fold owes one defaulted row
-    /// per closing document even when it contributed zero records, so an
-    /// absent bucket is built fresh before finalizing in that case.
-    ///
-    /// The `factory.make()` failure for that fresh bucket is a hard
-    /// `PipelineError` in both arms, so it propagates through the outer
-    /// `Result`; only the finalize outcome is handed back for per-arm
-    /// routing.
+    /// streaming arm as a hard error. A duplicate close, or a grouped fold's
+    /// empty document (which owes no row), does nothing; a global fold owes
+    /// one defaulted row per closing document even with zero records, so an
+    /// absent bucket is built fresh before finalizing in that case. The
+    /// `factory.make()` failure for that fresh bucket is a hard
+    /// `PipelineError` in both arms and propagates via `?`.
     fn flush_closing_document(
         &mut self,
         doc_id: DocumentId,
-        is_global_fold: bool,
         factory: &DocAggregatorFactory,
         finalize_ctx: &EvalContext,
         out: &mut Vec<crate::aggregation::SortRow>,
-    ) -> Result<Option<Result<(), crate::aggregation::HashAggError>>, PipelineError> {
+        route: impl FnOnce(Result<(), crate::aggregation::HashAggError>) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
         if !self.flushed.insert(doc_id) {
-            return Ok(None);
+            return Ok(());
         }
         let bucket = match self.tables.remove(&doc_id) {
             Some(bucket) => Some(bucket),
-            None if is_global_fold => Some(factory.make()?),
+            None if factory.is_global_fold => Some(factory.make()?),
             None => None,
         };
-        Ok(bucket.map(|bucket| finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out)))
+        match bucket {
+            Some(bucket) => route(finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out)),
+            None => Ok(()),
+        }
     }
 
     /// Force a fresh global-fold sentinel bucket open so an otherwise-empty
     /// run still emits the fold's single defaulted row. Idempotent — a
-    /// sentinel already open is left as-is. Replaces the two arms' separate
-    /// force-open calls with one entry point.
+    /// sentinel already open is left as-is.
     fn force_open_global_fold_sentinel(
         &mut self,
         factory: &DocAggregatorFactory,
@@ -769,6 +772,28 @@ impl RegisteredTables {
             route(finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out))?;
         }
         Ok(())
+    }
+
+    /// End-of-input tail: a global fold over an `empty_input` run that
+    /// flushed no document still owes its single defaulted row, so force the
+    /// sentinel open first; then drain every surviving bucket. The
+    /// `flushed_is_empty` guard keeps a run whose closes already each paid
+    /// the global fold's row from gaining a phantom row here, and the
+    /// `is_global_fold` guard makes an empty grouped run a no-op (a fresh
+    /// grouped sentinel would finalize to zero rows anyway, so skipping it is
+    /// identical output).
+    fn drain_with_empty_sentinel(
+        &mut self,
+        empty_input: bool,
+        factory: &DocAggregatorFactory,
+        finalize_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+        route: impl FnMut(Result<(), crate::aggregation::HashAggError>) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        if empty_input && self.flushed_is_empty() && factory.is_global_fold {
+            self.force_open_global_fold_sentinel(factory)?;
+        }
+        self.drain_remaining(finalize_ctx, out, route)
     }
 }
 
@@ -843,12 +868,6 @@ fn run_strict_aggregate_per_document(
     let mut tables = RegisteredTables::new(Arc::clone(&factory.arbitrator));
     let mut out_rows: Vec<crate::aggregation::SortRow> = Vec::with_capacity(64);
 
-    // A global fold (no group-by) owes one defaulted row per closing
-    // document even when that document contributed zero records, matching a
-    // standalone empty single-file run; a grouped fold owes nothing for an
-    // empty document.
-    let is_global_fold = factory.compiled.group_by_fields.is_empty();
-
     for (record, row_num) in input {
         let key = flush_key(record.doc_ctx().id());
         let source_file_arc = source_file_arc_of(record);
@@ -898,36 +917,32 @@ fn run_strict_aggregate_per_document(
             "a real closing document's id must never equal the sentinel id, \
              or its groups would fold into the unreconciled-remainder table"
         );
-        if let Some(result) = tables.flush_closing_document(
+        tables.flush_closing_document(
             doc_id,
-            is_global_fold,
             &factory,
             &finalize_ctx,
             &mut out_rows,
-        )? {
-            let attribution = document_attribution_record(input, doc_id);
-            route_document_flush_result(ctx, name, attribution, output_schema, result)?;
-        }
+            |result| {
+                let attribution = document_attribution_record(input, doc_id);
+                route_document_flush_result(ctx, name, attribution, output_schema, result)
+            },
+        )?;
     }
 
-    // A wholly-empty input that flushed no closing document (the synthetic
-    // no-document case — a fused single-source run whose only document never
-    // forwarded a close) still owes its single defaulted row under a global
-    // fold, so force the sentinel table open before the final flush. The
-    // `flushed_is_empty` guard keeps this from double-emitting when a closing
-    // document already produced the global-fold row in the punct-loop above
-    // (e.g. a global fold whose lone closing document flushed empty).
-    if input.is_empty() && tables.flushed_is_empty() {
-        tables.force_open_global_fold_sentinel(&factory)?;
-    }
     // Flush whatever is left in `DocumentId` order for deterministic emit
     // ordering: the sentinel (unreconciled / no-document remainder) and any
-    // closing document whose close never arrived. This leftover fold spans
-    // no single document, so its DLQ attribution keeps the batch-first-record
-    // behavior.
-    tables.drain_remaining(&finalize_ctx, &mut out_rows, |result| {
-        route_document_flush_result(ctx, name, input, output_schema, result)
-    })?;
+    // closing document whose close never arrived. A wholly-empty input that
+    // flushed no closing document still owes its single defaulted row under a
+    // global fold, so the sentinel is force-opened first inside
+    // `drain_with_empty_sentinel`. This leftover fold spans no single
+    // document, so its DLQ attribution keeps the batch-first-record behavior.
+    tables.drain_with_empty_sentinel(
+        input.is_empty(),
+        &factory,
+        &finalize_ctx,
+        &mut out_rows,
+        |result| route_document_flush_result(ctx, name, input, output_schema, result),
+    )?;
 
     Ok(out_rows)
 }
@@ -1146,7 +1161,6 @@ fn run_streaming_aggregate_ingest(
     let mut out_rows: Vec<AggSortRow> = Vec::with_capacity(64);
     let mut puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut input_count: u64 = 0;
-    let is_global_fold = factory.compiled.group_by_fields.is_empty();
     // Bucket group state per `DocumentId`, the same engine the materialized
     // path uses. `tables` lives in the OUTER (non-`move`) frame so the
     // `RegisteredTables` RAII `Drop` runs when this function returns —
@@ -1193,15 +1207,14 @@ fn run_streaming_aggregate_ingest(
                             // charge, so there is no discharge here.
                             if p.kind()
                                 == crate::executor::stream_event::PunctuationKind::DocumentClose
-                                && let Some(result) = tables.flush_closing_document(
+                            {
+                                tables.flush_closing_document(
                                     p.doc_id(),
-                                    is_global_fold,
                                     &factory,
                                     &finalize_ctx,
                                     &mut out_rows,
-                                )?
-                            {
-                                result?;
+                                    |result| result.map_err(Into::into),
+                                )?;
                             }
                             puncts.push(p);
                             continue;
@@ -1265,21 +1278,20 @@ fn run_streaming_aggregate_ingest(
                 // Channel disconnected — every sender dropped at the producer
                 // arm's clean exit. A completely empty stream (no records, no
                 // forwarded close) opened no bucket; a global fold still owes
-                // one defaulted row, so force the sentinel bucket open before
-                // the final flush. The `flushed_is_empty` guard keeps an
-                // all-empty-documents run — whose per-document closes already
-                // each flushed a defaulted row — from gaining an extra phantom
-                // row here. Then flush every surviving bucket in ascending
-                // `DocumentId` order (SYNTHETIC id 0 sorts first): the sentinel
-                // for no-document / unreconciled records, plus any document
-                // whose close never arrived. A finalize error propagates as a
-                // hard error through the drain-then-return site below.
-                if input_count == 0 && tables.flushed_is_empty() && is_global_fold {
-                    tables.force_open_global_fold_sentinel(&factory)?;
-                }
-                tables.drain_remaining(&finalize_ctx, &mut out_rows, |result| {
-                    result.map_err(Into::into)
-                })?;
+                // one defaulted row, so `drain_with_empty_sentinel` forces the
+                // sentinel bucket open before draining every surviving bucket
+                // in ascending `DocumentId` order (SYNTHETIC id 0 sorts first):
+                // the sentinel for no-document / unreconciled records, plus any
+                // document whose close never arrived. A finalize error
+                // propagates as a hard error through the drain-then-return site
+                // below.
+                tables.drain_with_empty_sentinel(
+                    input_count == 0,
+                    &factory,
+                    &finalize_ctx,
+                    &mut out_rows,
+                    |result| result.map_err(Into::into),
+                )?;
                 Ok(())
             };
             let result = drive();
