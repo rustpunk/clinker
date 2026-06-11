@@ -22,6 +22,7 @@
 //! `SignalTo`, Logstash atomic boolean) are the FLINK-4329 failure
 //! mode and explicitly rejected.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use clinker_record::{DocumentContext, DocumentId, Record};
@@ -125,10 +126,66 @@ impl StreamEvent {
     }
 }
 
+/// Fold a fan-in's document-boundary punctuations down to one downstream
+/// signal per document, the way a multi-input operator must.
+///
+/// A document whose records arrive across several inputs (a forked
+/// document stream rejoining at a Merge, or a document spanning both
+/// sides of a binary Combine) contributes its `DocumentOpen` /
+/// `DocumentClose` boundary once per input. Forwarding that union
+/// unchanged would open the document several times and — worse — close
+/// it several times, double-firing any downstream consumer that flushes
+/// on close (per-document Aggregate finalize, Output finalize).
+///
+/// The reconciliation emits `DocumentOpen` on first sighting (later
+/// duplicates are dropped) and `DocumentClose` only once the close count
+/// for a document reaches `fan_in_degree` — i.e. every input has closed
+/// it. A document that traverses fewer than `fan_in_degree` inputs (e.g.
+/// distinct source files with distinct [`DocumentId`]s, each appearing on
+/// one input only) never reaches the threshold, so its close is withheld;
+/// this is the intended fan-in semantics, identical across every
+/// multi-input operator that calls this function. Input order is
+/// preserved for the events that survive.
+pub(crate) fn reconcile_document_boundaries(
+    puncts: impl IntoIterator<Item = Punctuation>,
+    fan_in_degree: usize,
+) -> Vec<Punctuation> {
+    let mut deduped: Vec<Punctuation> = Vec::new();
+    let mut open_seen: HashSet<DocumentId> = HashSet::new();
+    let mut close_counts: HashMap<DocumentId, usize> = HashMap::new();
+    for p in puncts {
+        let id = p.doc_id();
+        match p.kind() {
+            PunctuationKind::DocumentOpen => {
+                if open_seen.insert(id) {
+                    deduped.push(p);
+                }
+            }
+            PunctuationKind::DocumentClose => {
+                let count = close_counts.entry(id).or_insert(0);
+                *count += 1;
+                if *count == fan_in_degree {
+                    deduped.push(p);
+                }
+            }
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::{Schema, Value, synthetic_document_context};
+    use clinker_record::{DocumentContext, Schema, Value, synthetic_document_context};
+    use indexmap::IndexMap;
+
+    fn doc_ctx() -> Arc<DocumentContext> {
+        Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("doc.x12"),
+            IndexMap::new(),
+        ))
+    }
 
     fn rec(id: i64) -> Record {
         Record::new(
@@ -171,5 +228,87 @@ mod tests {
         let r_event = StreamEvent::record(rec(5), 7);
         let (_, rn) = r_event.into_record().unwrap();
         assert_eq!(rn, 7);
+    }
+
+    fn kinds_for(puncts: &[Punctuation], id: DocumentId) -> Vec<PunctuationKind> {
+        puncts
+            .iter()
+            .filter(|p| p.doc_id() == id)
+            .map(|p| p.kind())
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_collapses_duplicate_boundaries_for_spanning_document() {
+        // One document whose open+close arrives on each of two inputs
+        // collapses to a single open and a single close downstream — no
+        // double-close to double-fire a downstream per-document flush.
+        let ctx = doc_ctx();
+        let id = ctx.id();
+        let union = vec![
+            Punctuation::document_open(Arc::clone(&ctx)),
+            Punctuation::document_open(Arc::clone(&ctx)),
+            Punctuation::document_close(Arc::clone(&ctx)),
+            Punctuation::document_close(Arc::clone(&ctx)),
+        ];
+        let out = reconcile_document_boundaries(union, 2);
+        assert_eq!(
+            kinds_for(&out, id),
+            vec![
+                PunctuationKind::DocumentOpen,
+                PunctuationKind::DocumentClose
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_withholds_close_for_partial_coverage_document() {
+        // A document that opens+closes on only ONE input never reaches the
+        // fan-in degree, so its open is forwarded but its close is withheld
+        // — the shared fan-in semantics across every multi-input operator.
+        let ctx = doc_ctx();
+        let id = ctx.id();
+        let union = vec![
+            Punctuation::document_open(Arc::clone(&ctx)),
+            Punctuation::document_close(Arc::clone(&ctx)),
+        ];
+        let out = reconcile_document_boundaries(union, 2);
+        assert_eq!(kinds_for(&out, id), vec![PunctuationKind::DocumentOpen]);
+    }
+
+    #[test]
+    fn reconcile_is_per_document_independent() {
+        // Two distinct documents reconcile independently: a fully-covered
+        // one emits open+close, a partially-covered one emits open only.
+        let spanning = doc_ctx();
+        let partial = doc_ctx();
+        let union = vec![
+            Punctuation::document_open(Arc::clone(&spanning)),
+            Punctuation::document_open(Arc::clone(&partial)),
+            Punctuation::document_open(Arc::clone(&spanning)),
+            Punctuation::document_close(Arc::clone(&spanning)),
+            Punctuation::document_close(Arc::clone(&partial)),
+            Punctuation::document_close(Arc::clone(&spanning)),
+        ];
+        let out = reconcile_document_boundaries(union, 2);
+        assert_eq!(
+            kinds_for(&out, spanning.id()),
+            vec![
+                PunctuationKind::DocumentOpen,
+                PunctuationKind::DocumentClose
+            ]
+        );
+        assert_eq!(
+            kinds_for(&out, partial.id()),
+            vec![PunctuationKind::DocumentOpen]
+        );
+    }
+
+    #[test]
+    fn reconcile_empty_input_yields_empty_output() {
+        // The common case — no punctuations on either input — passes
+        // through byte-identically to an empty vector.
+        let out = reconcile_document_boundaries(Vec::new(), 2);
+        assert!(out.is_empty());
     }
 }

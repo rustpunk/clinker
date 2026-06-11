@@ -174,10 +174,13 @@ reflects the file that record came from.
 
 Document boundaries flow through the pipeline as inline punctuation
 signals (one when a document opens, one when it closes). These signals
-let document-scoped operators fire at exactly the right point. They
-propagate through Source, Transform, Route, Sort, and Combine, and are
-reconciled at Merge (a document that fans in through several branches
-closes downstream exactly once).
+let document-scoped operators fire at exactly the right point. Today the
+signals propagate through Source, Transform, Route, and Sort, and are
+reconciled at the multi-input operators — Merge and Combine. A document
+that fans in through several branches opens downstream once (on first
+sighting) and closes downstream once (only after every input has closed
+it), so a downstream document-scoped operator fires exactly once
+regardless of how many inputs the document spanned.
 
 ### Per-document aggregation
 
@@ -240,7 +243,8 @@ keeps every level independently visible.
 Boundaries nest correctly through the pipeline: each level opens before
 the records inside it and closes after them, in strict innermost-first
 order. A level that fans in through several branches is still reconciled
-once at Merge, exactly like a single-level document.
+once at a multi-input operator (Merge or Combine), exactly like a
+single-level document.
 
 ## Header-only interchanges
 

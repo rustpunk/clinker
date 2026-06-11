@@ -280,37 +280,11 @@ pub(crate) fn dispatch_merge(
         merged
     };
 
-    // Merge is rejected as a window root at compile time
-    // (E150d) because the multi-producer concatenation has no
-    // single producer identity for record_pos to anchor
-    // against. The call below is a defense-in-depth no-op:
-    // the helper iterates plan.indices_to_build and matches
-    // nothing because no spec roots at a Merge NodeIndex.
-    // Punctuation dedup pass: emit `DocumentOpen` once per
-    // document (first sighting wins) and `DocumentClose` only
+    // Reconcile boundaries across every Merge input: one `DocumentOpen`
+    // per document (first sighting wins) and one `DocumentClose` only
     // after every input branch has closed the same document.
-    let mut deduped_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
-    let mut open_seen: std::collections::HashSet<clinker_record::DocumentId> =
-        std::collections::HashSet::new();
-    let mut close_counts: std::collections::HashMap<clinker_record::DocumentId, usize> =
-        std::collections::HashMap::new();
-    for p in all_puncts {
-        let id = p.doc_id();
-        match p.kind() {
-            crate::executor::stream_event::PunctuationKind::DocumentOpen => {
-                if open_seen.insert(id) {
-                    deduped_puncts.push(p);
-                }
-            }
-            crate::executor::stream_event::PunctuationKind::DocumentClose => {
-                let count = close_counts.entry(id).or_insert(0);
-                *count += 1;
-                if *count == fan_in_degree {
-                    deduped_puncts.push(p);
-                }
-            }
-        }
-    }
+    let deduped_puncts =
+        crate::executor::stream_event::reconcile_document_boundaries(all_puncts, fan_in_degree);
 
     // Non-fused streaming path: the predecessors' slots are
     // already drained into the full `merged` Vec, so this does not
@@ -342,6 +316,12 @@ pub(crate) fn dispatch_merge(
         return Ok(());
     }
 
+    // Merge is rejected as a window root at compile time
+    // (E150d) because the multi-producer concatenation has no
+    // single producer identity for record_pos to anchor
+    // against. The call below is a defense-in-depth no-op:
+    // the helper iterates plan.indices_to_build and matches
+    // nothing because no spec roots at a Merge NodeIndex.
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
     let nb = admit_node_buffer(
