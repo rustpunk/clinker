@@ -239,13 +239,12 @@ pub(crate) fn dispatch_combine(
         None
     };
 
-    // Combine collects puncts from both inputs and forwards
-    // them to the output buffer. Per-document dedup
-    // (Merge-style barrier counter) for two-input Combine is
-    // out of scope for #91 (deferred to follow-up); the
-    // simple union here may emit `DocumentClose` twice
-    // downstream for documents that span both inputs, which
-    // any downstream Aggregate would handle idempotently.
+    // Combine collects puncts from both inputs and forwards a
+    // reconciled set downstream. Like Merge, it folds the two
+    // inputs' boundary signals so a document spanning both sides
+    // emits one `DocumentOpen` and one `DocumentClose` — withholding
+    // the close until both inputs have closed the document prevents a
+    // downstream per-document Aggregate flush from double-firing.
     //
     // Under streaming-probe the driver slot is empty (the driver has not
     // dispatched yet — it streams into the probe channel during the redispatch
@@ -269,8 +268,13 @@ pub(crate) fn dispatch_combine(
         Some(nb) => nb.drain_split()?,
         None => (Vec::new(), Vec::new()),
     };
-    let combined_puncts: Vec<crate::executor::stream_event::Punctuation> =
-        driver_puncts.into_iter().chain(build_puncts).collect();
+    // Binary Combine: fan-in degree is 2 (driver + build). The empty-
+    // punctuation common case folds to an empty vector, leaving the
+    // no-document path byte-identical to a bare union.
+    let combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
+        driver_puncts.into_iter().chain(build_puncts),
+        2,
+    );
 
     // Operator-entry schema check per D4: every record
     // arriving on the probe and build channels is
