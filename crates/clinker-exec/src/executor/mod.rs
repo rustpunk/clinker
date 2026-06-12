@@ -1416,6 +1416,11 @@ impl PipelineExecutor {
                 .batch_size
                 .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
             spill_compress: params.spill_compress,
+            // Seed the exec-time accumulator with the plan-time catalog's
+            // Plane A row counts so a downstream node reading it sees the
+            // metadata-derived estimates until an operator finalize
+            // supersedes one with an exec-measured figure.
+            runtime_statistics: Arc::new(std::sync::Mutex::new(artifacts.statistics.clone())),
         };
 
         // Resolve dispatch order through the memory arbitrator rather

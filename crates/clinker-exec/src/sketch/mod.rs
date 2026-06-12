@@ -25,7 +25,6 @@ pub use misra_gries::MisraGries;
 mod tests {
     use super::*;
     use ahash::RandomState;
-    use std::hash::BuildHasher;
 
     /// Mix a sequential index into a well-distributed 64-bit hash via the
     /// SplitMix64 finalizer. The sketches assume near-uniform input bits;

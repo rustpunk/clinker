@@ -926,6 +926,18 @@ pub(crate) struct ExecutorContext<'a> {
     /// can skip LZ4 on narrow/short batches where the per-frame fixed cost
     /// outweighs the savings. See [`clinker_plan::config::CompressMode`].
     pub(crate) spill_compress: clinker_plan::config::CompressMode,
+
+    /// Exec-time statistics accumulator (Plane B of the statistics
+    /// catalog). Operators fold finalized sketch results in at drain — the
+    /// grace-hash join routes its merged per-partition distinct-count
+    /// estimate here at completion, and a Source records its exact row
+    /// count when its stream disconnects. Seeded from the plan-time
+    /// catalog's Plane A row counts at executor entry so a downstream node
+    /// reading this map sees both the metadata-derived estimates and any
+    /// exec-measured figures that have superseded them. Behind a `Mutex`
+    /// so Rayon-parallel kernel work can record into one shared seat.
+    pub(crate) runtime_statistics:
+        Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -1134,6 +1146,13 @@ impl<'a> ExecutorContext<'a> {
     pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
         self.source_count_per_source
             .insert(Arc::clone(source_name), Some(count));
+        // Plane B: the exact post-read row count supersedes the Plane A
+        // byte-derived estimate for this source in the statistics catalog,
+        // so a downstream node sizing against it works off the measured
+        // figure once the source has drained.
+        if let Ok(mut catalog) = self.runtime_statistics.lock() {
+            catalog.record_row_count(Arc::clone(source_name), count);
+        }
         // Pre-seeded slots track every declared source. When none
         // remain `None` (excluding the MERGED slot itself, which we
         // are about to write), compute the cross-source total.

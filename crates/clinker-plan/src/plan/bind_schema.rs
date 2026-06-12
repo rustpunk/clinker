@@ -90,6 +90,13 @@ pub struct CompileArtifacts {
     /// (matches `CombineHeader.input` iteration order). Populated during
     /// schema propagation.
     pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
+    /// Planner-wide column-statistics catalog. The single facility every
+    /// node consults for row counts, distinct counts, heavy hitters, and
+    /// membership. Plane A row counts are seeded from source file metadata
+    /// before combine-strategy selection; Plane B sketch results fold back
+    /// in after a run. Combine strategy selection reads its row counts
+    /// instead of a per-input cardinality field.
+    pub statistics: crate::plan::statistics::StatisticsCatalog,
     /// Driving-input qualifier per combine node, chosen at `bind_combine`
     /// time by [`select_driving_input`] (explicit `drive:` → cardinality
     /// → first-in-IndexMap default). The `select_combine_strategies`

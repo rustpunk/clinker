@@ -1,8 +1,9 @@
-//! Unit tests for the grace hash join: partition assignment, the
-//! spill/reload lifecycle, the block-nested-loop fallback, and the
-//! HyperLogLog distinct-key sketch. Driven through both the public
-//! `execute_combine_grace_hash` entry point and a hand-built
-//! `ReloadContext` harness for the BNL-only paths.
+//! Unit tests for the grace hash join: partition assignment and the
+//! spill/reload lifecycle including the block-nested-loop fallback.
+//! Driven through both the public `execute_combine_grace_hash` entry
+//! point and a hand-built `ReloadContext` harness for the BNL-only paths.
+//! The distinct-key sketch's accuracy bounds are covered by the shared
+//! `crate::sketch` tests.
 
 use super::build::{GraceHll, MAX_HASH_BITS};
 use super::spill::{
@@ -24,6 +25,28 @@ fn schema_with(cols: &[&str]) -> Arc<Schema> {
         b = b.with_field(*c);
     }
     b.build()
+}
+
+/// Fresh exec-time statistics catalog for a grace-hash test to record its
+/// build-side distinct estimate into.
+fn fresh_stats_catalog()
+-> std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>> {
+    std::sync::Arc::new(std::sync::Mutex::new(
+        clinker_plan::plan::statistics::StatisticsCatalog::new(),
+    ))
+}
+
+/// Build a [`GraceStatsSink`] over a test catalog and key.
+fn test_stats_sink<'a>(
+    catalog: &std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
+    node: &'a str,
+    column: &'a str,
+) -> GraceStatsSink<'a> {
+    GraceStatsSink {
+        catalog: std::sync::Arc::clone(catalog),
+        node,
+        column,
+    }
 }
 
 fn record_for(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
@@ -470,6 +493,7 @@ fn execute_grace_hash_partition_pair_correct() {
         .prefix("gh-e2e-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_test",
         build_qualifier: "products",
@@ -489,6 +513,7 @@ fn execute_grace_hash_partition_pair_correct() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     })
     .expect("grace hash E2E")
     .records;
@@ -521,6 +546,20 @@ fn execute_grace_hash_partition_pair_correct() {
         .map(|i| (i, format!("d-{i}"), format!("b-{i}")))
         .collect();
     assert_eq!(seen, expected);
+
+    // Plane B lifecycle: the join routed its build-side distinct-count
+    // estimate into the catalog. 10 distinct build keys over a 1024-
+    // register HLL lands at or very near 10.
+    let catalog = stats_catalog.lock().unwrap();
+    let distinct = catalog
+        .column("products", "products")
+        .and_then(|c| c.distinct)
+        .expect("grace hash must record a build-side distinct estimate");
+    assert!(
+        (8..=12).contains(&distinct.0),
+        "10 distinct build keys should estimate near 10; got {}",
+        distinct.0
+    );
 }
 
 /// End-to-end: a tiny memory budget forces partition spill during
@@ -661,6 +700,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         .prefix("gh-spill-e2e-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_spill_test",
         build_qualifier: "products",
@@ -680,6 +720,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     })
     .expect("grace hash spill E2E")
     .records;
@@ -847,6 +888,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         .prefix("gh-quota-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_quota_test",
         build_qualifier: "products",
@@ -866,6 +908,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     });
 
     let err = result.expect_err("disk quota must abort the combine");

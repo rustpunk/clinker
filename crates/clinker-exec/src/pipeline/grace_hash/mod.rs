@@ -203,6 +203,23 @@ pub(crate) struct GraceHashExec<'a> {
     /// under `Continue` / `BestEffort` the failing row is deferred to the
     /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
+    /// Exec-time statistics accumulator (Plane B) and the `(node, column)`
+    /// the join's build-side distinct-count estimate is recorded under at
+    /// completion. The kernel builds a planner-grade HyperLogLog over the
+    /// build-key hashes it already computes, then folds the finalized
+    /// distinct estimate into the catalog so a downstream node — or the
+    /// run's own reporting — sees a measured figure that supersedes the
+    /// plan-time row-count guess.
+    pub stats_sink: GraceStatsSink<'a>,
+}
+
+/// Where the grace-hash join records its build-side distinct-count
+/// estimate: the shared exec-time catalog plus the `(node, column)` key
+/// identifying the build join key.
+pub(crate) struct GraceStatsSink<'a> {
+    pub catalog: std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
+    pub node: &'a str,
+    pub column: &'a str,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -644,6 +661,7 @@ pub(crate) fn execute_combine_grace_hash(
         spill_compress,
         consumer_handle,
         strategy,
+        stats_sink,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -744,10 +762,25 @@ pub(crate) fn execute_combine_grace_hash(
             Ok::<_, PipelineError>((record, hash))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Planner-grade distinct-count over the build-side join keys. Reuses
+    // the composite-key hashes already computed for partition placement,
+    // so the only added cost is one register max-update per build record
+    // — negligible against the build itself, and outside the
+    // order-sensitive `add_build_record` loop so partition timing is
+    // unchanged. 1024 registers give ≈±3.25% standard error, the planner
+    // grade the catalog wants; the partition sketches stay at 64.
+    let mut build_distinct = crate::sketch::Hll::<1024>::new();
     for (record, hash) in hashed_build {
+        build_distinct.add(hash);
         executor
             .add_build_record(record, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
+    }
+    if let Ok(mut catalog) = stats_sink.catalog.lock() {
+        catalog.record_distinct(
+            clinker_plan::plan::statistics::StatKey::new(stats_sink.node, stats_sink.column),
+            build_distinct.estimate(),
+        );
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
     let build_spilled = executor.take_spilled_bytes();
