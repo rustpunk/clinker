@@ -352,7 +352,6 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "merge",
                             "combine",
                             "output",
-                            "state",
                             "composition",
                         ],
                     )),

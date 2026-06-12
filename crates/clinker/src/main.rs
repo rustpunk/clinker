@@ -125,7 +125,7 @@ pub struct RunArgs {
     /// Path to the pipeline YAML configuration file
     pub config: PathBuf,
 
-    /// Memory budget (supports K/M/G suffixes), default 256M
+    /// Memory budget (supports K/M/G suffixes), default 512M
     #[arg(long = "memory-limit", help_heading = "Execution")]
     pub mem_limit: Option<String>,
 
@@ -206,9 +206,9 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    /// Resolve memory limit from CLI flag or default (256MB).
+    /// Resolve memory limit from CLI flag or default (512MB).
     pub fn memory_limit_bytes(&self) -> u64 {
-        parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("256M")))
+        parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("512M")))
     }
 
     /// Resolve batch_id from CLI flag or generate UUID v7.
@@ -2180,7 +2180,7 @@ mod tests {
     fn test_cli_run_default_memory_limit() {
         let cli = Cli::try_parse_from(["clinker", "run", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 256 * 1024 * 1024),
+            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 512 * 1024 * 1024),
             _ => panic!("expected Run command"),
         }
     }

@@ -20,7 +20,7 @@ clinker run [OPTIONS] <CONFIG>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--memory-limit <SIZE>` | `256M` | Memory budget for the execution. Accepts binary (1024-based) `K`/`M`/`G` suffixes (`K` = 1024 bytes, `M` = 1024², `G` = 1024³); a bare integer is bytes. When the limit is approached, aggregation operators spill to disk rather than crashing. CLI value overrides any `memory.limit` set in the YAML. |
+| `--memory-limit <SIZE>` | `512M` | Memory budget for the execution. Accepts binary (1024-based) `K`/`M`/`G` suffixes (`K` = 1024 bytes, `M` = 1024², `G` = 1024³); a bare integer is bytes. When the limit is approached, aggregation operators spill to disk rather than crashing. CLI value overrides any `memory.limit` set in the YAML. |
 | `--threads <N>` | number of CPUs | Size of the thread pool used for parallel node execution. |
 | `--error-threshold <N>` | `0` (unlimited) | Maximum number of records routed to the dead-letter queue before the pipeline aborts. `0` means no limit -- the pipeline will run to completion regardless of DLQ volume. |
 | `--batch-id <ID>` | UUID v7 | Custom execution identifier. Appears in metrics output and log lines. Use a meaningful value (e.g. `daily-2026-04-11`) for correlation across retries. |

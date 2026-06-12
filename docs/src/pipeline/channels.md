@@ -79,7 +79,7 @@ Source overrides are keyed by source-node name (`vars.source.<src>.<var>`). Adds
 
 ### Reserved-system fields
 
-Each scope has a small set of reserved field names that the engine populates (e.g. `$pipeline.execution_id`, `$source.path`, `$source.row`, `$pipeline.start_time`). Channels cannot shadow these — attempting it produces **E110**, naming the offending scope and field. The full lists live in `crates/clinker-core/src/config/mod.rs` (`RESERVED_PIPELINE_NAMES`, `RESERVED_SOURCE_NAMES`, `RESERVED_RECORD_NAMES`); `$vars.*` has no reserved subset.
+Each scope has a small set of reserved field names that the engine populates (e.g. `$pipeline.execution_id`, `$source.path`, `$source.row`, `$pipeline.start_time`). Channels cannot shadow these — attempting it produces **E110**, naming the offending scope and field. The full lists live in `crates/clinker-plan/src/config/pipeline.rs` (`RESERVED_PIPELINE_NAMES`, `RESERVED_SOURCE_NAMES`, `RESERVED_RECORD_NAMES`); `$vars.*` has no reserved subset.
 
 ### Composition-target channels
 

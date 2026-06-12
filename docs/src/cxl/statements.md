@@ -96,19 +96,21 @@ distinct by field_name
 
 In a pipeline, `distinct` tracks values seen so far and drops records that have already been emitted with the same key.
 
-## emit meta
+## emit to a scoped namespace
 
-The `emit meta` statement writes a value to the `$meta.*` namespace -- per-record metadata that is not part of the output columns. Metadata can be read by downstream nodes via `$meta.field`.
-
-```
-emit meta quality_flag = if amount < 0 then "suspect" else "ok"
-```
-
-Access metadata downstream:
+An `emit` whose target is a `$pipeline.*`, `$source.*`, or `$record.*` name writes a producer-declared scoped variable instead of an output column. The variable must be listed in the writing Transform's `config.declares:` block. `$record.*` is the per-record store that travels with the record but never serializes as an output column.
 
 ```
-filter $meta.quality_flag == "ok"
+emit $record.quality_flag = if amount < 0 then "suspect" else "ok"
 ```
+
+Read it downstream via the same namespace:
+
+```
+filter $record.quality_flag == "ok"
+```
+
+See [Scoped Variables](../pipeline/variables.md) for the declaration model and the three scopes' lifetimes.
 
 ## trace
 

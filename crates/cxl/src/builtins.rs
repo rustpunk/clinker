@@ -335,10 +335,11 @@ impl BuiltinRegistry {
             },
         );
 
-        // ── Map (5) ── — `.keys`, `.values`, `.merge(map)`,
-        // `.set(key: string, value: any)`, `.remove_field(key: string)`.
-        // `keys` and `values` are zero-arg; `merge` / `set` /
-        // `remove_field` take a single argument plus an optional value.
+        // ── Map (6) ── — `.keys`, `.values`, `.merge(map)`,
+        // `.set(key: string, value: any)`, `.remove_field(key: string)`,
+        // `.unset(key: string)`. `keys` and `values` are zero-arg;
+        // `merge` / `set` / `remove_field` / `unset` take a single
+        // argument plus an optional value.
         methods.insert(
             "keys",
             BuiltinDef {
