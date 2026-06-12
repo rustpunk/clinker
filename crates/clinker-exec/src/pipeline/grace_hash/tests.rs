@@ -4,7 +4,7 @@
 //! `execute_combine_grace_hash` entry point and a hand-built
 //! `ReloadContext` harness for the BNL-only paths.
 
-use super::build::MAX_HASH_BITS;
+use super::build::{GraceHll, MAX_HASH_BITS};
 use super::spill::{
     BnlStats, PROBE_BUFFER_RESERVATION, RESULT_BATCH_SIZE, SKEW_REDUCTION_THRESHOLD, bnl_fallback,
 };
@@ -1165,7 +1165,7 @@ fn spill_for_bnl(
     hash_bits: u8,
 ) -> SpilledPartition {
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
-    let mut sketch = Hll::new();
+    let mut sketch = GraceHll::new();
     for r in build_records {
         bw.write_record(r).unwrap();
         // Feed the HLL via the build-side hash of the join key.
@@ -1646,23 +1646,4 @@ fn test_e310_hard_limit_abort() {
             panic!("BNL hard-limit abort must surface MemoryBudgetExceeded; got {other:?}")
         }
     }
-}
-
-/// HLL sanity: 200 distinct hashes give an estimate within 50% of
-/// the true cardinality. The 64-register sketch's nominal error is
-/// ±13%; the loose 50% bound here only guards against gross
-/// regressions in the bias-correction or harmonic-mean formula.
-#[test]
-fn hll_estimate_in_band() {
-    let mut sketch = Hll::new();
-    for i in 0..200u64 {
-        sketch.add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    }
-    let est = sketch.estimate();
-    let lower = 100;
-    let upper = 400;
-    assert!(
-        (lower..=upper).contains(&est),
-        "HLL estimate {est} for 200 distinct hashes should land in [{lower}, {upper}]",
-    );
 }

@@ -12,7 +12,7 @@ use ahash::RandomState;
 use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
-use super::build::{BuildChunkIter, Hll, PartitionAssigner};
+use super::build::{BuildChunkIter, GraceHll, PartitionAssigner};
 use super::probe::{EmitArgs, GraceEmitSink, emit_for_probe};
 use crate::executor::combine::CombineResolver;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
@@ -57,7 +57,7 @@ pub(crate) struct SpilledPartition {
     pub probe_files: Vec<SpillFilePath>,
     pub build_count: u64,
     pub hash_bits: u8,
-    pub distinct_sketch: Hll,
+    pub distinct_sketch: GraceHll,
 }
 
 /// Bundle of reload-phase context shared across recursive
@@ -182,8 +182,8 @@ pub(super) fn process_spilled_partition(
         let parent_id = sp.partition_id as u64;
         let mut child_a: Vec<Record> = Vec::new();
         let mut child_b: Vec<Record> = Vec::new();
-        let mut child_a_sketch = Hll::new();
-        let mut child_b_sketch = Hll::new();
+        let mut child_a_sketch = GraceHll::new();
+        let mut child_b_sketch = GraceHll::new();
         for r in build_records {
             let keys =
                 build_extractor

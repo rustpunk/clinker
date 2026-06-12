@@ -13,6 +13,7 @@ pub mod partial;
 pub mod pipeline;
 pub mod progress;
 pub mod projection;
+pub mod sketch;
 pub mod source;
 
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};

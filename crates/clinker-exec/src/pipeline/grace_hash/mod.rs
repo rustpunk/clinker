@@ -86,7 +86,7 @@ use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
 
-use build::{Hll, PartitionAssigner, estimated_record_bytes};
+use build::{GraceHll, PartitionAssigner, estimated_record_bytes};
 use probe::{EmitArgs, GraceEmitSink, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
@@ -113,7 +113,7 @@ enum PartitionState {
     Building {
         records: Vec<Record>,
         bytes_estimated: usize,
-        distinct_sketch: Hll,
+        distinct_sketch: GraceHll,
     },
     /// Build side spilled. `build_files` carries one file per
     /// spill flush of this partition (the initial bulk spill plus
@@ -138,7 +138,7 @@ enum PartitionState {
         build_count: u64,
         probe_count: u64,
         hash_bits: u8,
-        distinct_sketch: Hll,
+        distinct_sketch: GraceHll,
     },
     /// In-memory hash table built; ready for probe.
     Ready { hash_table: CombineHashTable },
@@ -258,7 +258,7 @@ impl GraceHashExecutor {
             partitions.push(PartitionState::Building {
                 records: Vec::new(),
                 bytes_estimated: 0,
-                distinct_sketch: Hll::new(),
+                distinct_sketch: GraceHll::new(),
             });
         }
         Ok(Self {
