@@ -1,6 +1,6 @@
 # Map Methods
 
-CXL provides five built-in methods for working with map values (key-value pairs). Maps arise naturally from JSON object inputs, from the [`set`](#setkey-string-value-any---map) builder below, and from upstream emits that produce nested structures.
+CXL provides six built-in methods for working with map values (key-value pairs). Maps arise naturally from JSON object inputs, from the [`set`](#setkey-string-value-any---map) builder below, and from upstream emits that produce nested structures.
 
 All map methods return new values -- they never mutate the receiver. This is copy-on-write semantics: chaining `.set` then `.remove_field` produces a fresh map at each step, leaving the upstream binding untouched.
 
@@ -87,6 +87,22 @@ Returns a new map without `key`. If the key was absent, the receiver is returned
 ```
 
 `slim` is `{"name":"Alice","tier":"gold"}`.
+
+### unset(key: String) -> Map
+
+Returns a new map with the entry addressed by `key` removed. `unset` is the deletion counterpart to [`set`](#setkey-string-value-any---map) and reuses the **same** dotted/indexed path grammar: dots separate map keys, a `[n]` suffix indexes an array. A bare key (no `.` or `[n]`) drops a top-level entry, exactly like `remove_field`.
+
+```yaml
+    cxl: |
+      emit pruned = profile.unset("address.city")
+      emit dropped = order.unset("items[0]")
+```
+
+- **Array element removes and shifts.** `unset("items[0]")` deletes element 0 and shifts the remaining elements down, so the array shrinks by one (matching jq `del`). This is deliberately distinct from `set("items[0]", null)`, which leaves a `null` hole — `unset` means *delete*.
+- **Missing or conflicting path is a no-op.** A path that does not resolve — a missing intermediate, a missing final key, an array index past the end, or a type conflict (a field segment against an array, an index segment against a map) — returns the receiver **unchanged**. This mirrors `remove_field` on an absent key, and is the opposite of `set`, which returns `null` on a conflicting path.
+- **Copy-on-write.** Like every map method, `unset` never mutates the receiver; the upstream binding is untouched.
+
+For `profile = {"name":"Alice","address":{"city":"LA","zip":"90001"}}`, `profile.unset("address.city")` is `{"name":"Alice","address":{"zip":"90001"}}` -- the sibling `zip` and the top-level `name` are preserved.
 
 ## Worked example: chained set + remove_field
 

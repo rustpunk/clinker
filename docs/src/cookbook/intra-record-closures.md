@@ -157,7 +157,7 @@ The first `set` overwrites the SKU of the first item; the second writes `ship.re
 
 - [Closures](../cxl/closures.md) -- the `it => body` form.
 - [Array Methods](../cxl/builtins-array.md) -- `filter`, `map`, `find`, `any`, `flat_map`, `remove`, `length`, `join`.
-- [Map Methods](../cxl/builtins-map.md) -- `keys`, `values`, `merge`, `set`, `remove_field`.
+- [Map Methods](../cxl/builtins-map.md) -- `keys`, `values`, `merge`, `set`, `remove_field`, `unset`.
 - [Nested Paths](../cxl/nested-paths.md) -- bracket-index and dotted-path navigation.
 - [Emit Each](../cxl/emit-each.md) -- the fan-out statement.
 - [Transform Nodes](../pipeline/transform.md) -- `max_expansion` and DLQ routing.

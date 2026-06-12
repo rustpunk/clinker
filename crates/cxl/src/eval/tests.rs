@@ -1853,6 +1853,301 @@ mod intra_record {
     }
 
     #[test]
+    fn nested_unset_removes_leaf_preserving_siblings() {
+        let out = run(
+            "emit pruned = doc.unset(\"a.b\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "a",
+                    map(vec![("b", Value::Integer(1)), ("c", Value::Integer(2))]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("pruned"),
+                    Some(&map(vec![("a", map(vec![("c", Value::Integer(2))]))])),
+                    "unset must drop only the addressed leaf, keeping every sibling",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_array_element_removes_and_shifts() {
+        // `unset("items[0]")` deletes element 0 and shifts the tail down, so the
+        // array shrinks by one (jq `del` semantics). This is deliberately
+        // distinct from `set("items[0]", null)`, which would leave a null hole.
+        let out = run(
+            "emit shifted = doc.unset(\"items[0]\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "items",
+                    arr(vec![
+                        Value::Integer(10),
+                        Value::Integer(20),
+                        Value::Integer(30),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("shifted"),
+                    Some(&map(vec![(
+                        "items",
+                        arr(vec![Value::Integer(20), Value::Integer(30)]),
+                    )])),
+                    "array unset must remove-and-shift: length shrinks, order preserved, no null hole",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_leaf_reached_through_array_index() {
+        let out = run(
+            "emit r = doc.unset(\"items[1].sku\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "items",
+                    arr(vec![
+                        map(vec![("sku", Value::String("a".into()))]),
+                        map(vec![
+                            ("sku", Value::String("b".into())),
+                            ("qty", Value::Integer(3)),
+                        ]),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![(
+                        "items",
+                        arr(vec![
+                            map(vec![("sku", Value::String("a".into()))]),
+                            map(vec![("qty", Value::Integer(3))]),
+                        ]),
+                    )])),
+                    "unset descends through an array index to delete a nested map leaf",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_missing_final_key_is_noop_not_null() {
+        // The intermediate `a` exists but has no `z`. Unlike `.set` on a
+        // conflicting path (which returns null), `.unset` returns the receiver
+        // unchanged.
+        let out = run(
+            "emit r = doc.unset(\"a.z\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("a", map(vec![("b", Value::Integer(1))]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("a", map(vec![("b", Value::Integer(1))]))])),
+                    "missing final key is a no-op returning the receiver unchanged, not null",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_missing_intermediate_is_noop_not_null() {
+        // `a` is absent entirely, so the path cannot resolve; the receiver comes
+        // back unchanged rather than null.
+        let out = run(
+            "emit r = doc.unset(\"a.b\")",
+            &["doc"],
+            HashMap::from([("doc".into(), map(vec![("k", Value::Integer(1))]))]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("k", Value::Integer(1))])),
+                    "missing intermediate is a no-op returning the receiver unchanged, not null",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_array_index_past_end_is_noop_not_null() {
+        // The contrast with `nested_set_array_index_past_end_returns_null`:
+        // `.set` past the end is null, but `.unset` past the end is a no-op that
+        // returns the receiver unchanged.
+        let out = run(
+            "emit r = doc.unset(\"items[5]\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "items",
+                    arr(vec![Value::Integer(10), Value::Integer(20)]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![(
+                        "items",
+                        arr(vec![Value::Integer(10), Value::Integer(20)]),
+                    )])),
+                    "array index past the end is a no-op for unset (returns receiver), unlike set which returns null",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_field_into_array_is_noop_not_null() {
+        // `items` is an array; a field segment against it is a type conflict.
+        // `.set` returns null here; `.unset` returns the receiver unchanged.
+        let out = run(
+            "emit r = doc.unset(\"items.name\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("items", arr(vec![Value::Integer(1)]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("items", arr(vec![Value::Integer(1)]))])),
+                    "field-into-array type conflict is a no-op for unset (returns receiver), unlike set which returns null",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_index_into_map_is_noop_not_null() {
+        // `a` is a map; an index segment against it is a type conflict. `.set`
+        // returns null here; `.unset` returns the receiver unchanged.
+        let out = run(
+            "emit r = doc.unset(\"a[0]\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("a", map(vec![("b", Value::Integer(1))]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("a", map(vec![("b", Value::Integer(1))]))])),
+                    "index-into-map type conflict is a no-op for unset (returns receiver), unlike set which returns null",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_does_not_mutate_receiver() {
+        // `.unset` is copy-on-write: emitting both the original and the pruned
+        // path must show the original untouched.
+        let out = run(
+            "emit before = doc\nemit after = doc.unset(\"a.b\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![(
+                    "a",
+                    map(vec![("b", Value::Integer(1)), ("c", Value::Integer(2))]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("before"),
+                    Some(&map(vec![(
+                        "a",
+                        map(vec![("b", Value::Integer(1)), ("c", Value::Integer(2))]),
+                    )])),
+                    "receiver must be untouched after unset (copy-on-write)",
+                );
+                assert_eq!(
+                    fields.get("after"),
+                    Some(&map(vec![("a", map(vec![("c", Value::Integer(2))]))])),
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_key_unset_behaves_like_remove_field() {
+        // A bare key reaches the top-level entry through the path grammar,
+        // matching `remove_field("region")` exactly.
+        let out = run(
+            "emit via_unset = doc.unset(\"region\")\nemit via_remove = doc.remove_field(\"region\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![
+                    ("region", Value::String("us-east".into())),
+                    ("tier", Value::String("gold".into())),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                let expected = map(vec![("tier", Value::String("gold".into()))]);
+                assert_eq!(fields.get("via_unset"), Some(&expected));
+                assert_eq!(
+                    fields.get("via_unset"),
+                    fields.get("via_remove"),
+                    "single-segment unset must match remove_field for the same key",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn array_remove_returns_new_array_without_index() {
         let out = run(
             "emit val = nums.remove(1)",
