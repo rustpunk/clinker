@@ -1983,6 +1983,16 @@ fn resolve_all_input_references(
 /// attributor unions these source sets across a path's referencing nodes
 /// to stamp each source with only the paths it actually delivers.
 ///
+/// This is a parallel walk to `bind_schema`'s `upstream_sources` map
+/// (which feeds the E156 time-window watermark guard). The two
+/// intentionally diverge: that walk unions every input unconditionally,
+/// whereas this one narrows a `Combine` to its driving input and resolves
+/// a `Composition` through its full `inputs:` port set. The semantics here
+/// model where a record's document context actually flows; the watermark
+/// walk models which sources can deliver records at all. Keep them in sync
+/// on the shared shape (Source-seeds-self, declaration-order topo walk,
+/// composition-body recursion) when either changes.
+///
 /// The top-level walk runs in declaration order, which Stage-3 validation
 /// proved topologically sound, so each node's source set is the union of
 /// its direct inputs' sets (Sources seed themselves).
@@ -1998,10 +2008,15 @@ fn resolve_all_input_references(
 /// program are keyed by the combine node's own name, so they share this
 /// driving-input source set with no extra handling.
 ///
-/// Composition bodies are isolated mini-DAGs whose nodes draw their
-/// records from the call-site `inputs:` port bindings; every body node
-/// (recursively, through nested compositions) inherits the union of the
-/// source sets feeding those ports. A body `$doc` access carries no port
+/// A `Composition` forwards the union of EVERY bound `inputs:` port's
+/// source set, not just its primary port. `direct_input_names` reports
+/// only `header.input` (the single primary port) for a composition, so a
+/// multi-port call (`inputs: { primary: a, reference: b }`) would drop the
+/// non-primary ports' sources — a downstream `$doc` read off the
+/// composition output must still see them. Composition bodies are isolated
+/// mini-DAGs whose nodes draw their records from the same call-site port
+/// bindings; every body node (recursively, through nested compositions)
+/// inherits the same port-union set. A body `$doc` access carries no port
 /// qualifier, so it could read any incoming port's source envelope — the
 /// union is the correct attribution.
 fn build_node_source_sets(
@@ -2056,6 +2071,23 @@ fn build_node_source_sets(
             .collect()
     };
 
+    // Union of the source sets feeding a composition's `inputs:` port
+    // bindings — the authoritative call-site connectivity. `header.input`
+    // (what `direct_input_names` reports for a Composition) names only the
+    // single primary port, so it must NOT be used for a multi-port
+    // composition: a downstream `$doc` read off the composition output, or
+    // a body `$doc` access, can resolve against any bound port's source.
+    let composition_call_site_sources =
+        |inputs: &IndexMap<String, String>,
+         sources: &HashMap<String, std::collections::BTreeSet<String>>|
+         -> std::collections::BTreeSet<String> {
+            let producers: Vec<&str> = inputs
+                .values()
+                .map(|upstream| upstream.split('.').next().unwrap_or(upstream))
+                .collect();
+            union_of(&producers, sources)
+        };
+
     for spanned in nodes {
         let name = spanned.value.name().to_string();
         let sources: std::collections::BTreeSet<String> = match &spanned.value {
@@ -2068,6 +2100,14 @@ fn build_node_source_sets(
             PipelineNode::Combine { .. } => combine_driver_upstream(&name)
                 .and_then(|driver| node_sources.get(&driver).cloned())
                 .unwrap_or_else(|| union_of(&spanned.value.direct_input_names(), &node_sources)),
+            // A composition forwards the union of EVERY bound input port's
+            // source set, not just its primary port — a downstream node
+            // reading `$doc` off the composition output can see any port's
+            // document context. This matches the body-node attribution
+            // below, which unions the same port sources.
+            PipelineNode::Composition { inputs, .. } => {
+                composition_call_site_sources(inputs, &node_sources)
+            }
             // Every other non-Source variant inherits the union of its
             // direct inputs' source sets.
             other => union_of(&other.direct_input_names(), &node_sources),
@@ -2076,18 +2116,12 @@ fn build_node_source_sets(
         // A composition's body nodes feed from the call-site `inputs:`
         // port bindings — union every bound port's source set so a body
         // `$doc` access is attributed to whichever input could supply its
-        // envelope. The port bindings are the authoritative call-site
-        // connectivity (`header.input` adds nothing beyond them).
-        if let PipelineNode::Composition { inputs, .. } = &spanned.value {
-            let call_site_sources: std::collections::BTreeSet<String> = inputs
-                .values()
-                .map(|upstream| upstream.split('.').next().unwrap_or(upstream))
-                .filter_map(|producer| node_sources.get(producer))
-                .flat_map(|s| s.iter().cloned())
-                .collect();
-            if let Some(&body_id) = artifacts.composition_body_assignments.get(&name) {
-                attribute_body(body_id, &call_site_sources, artifacts, &mut node_sources);
-            }
+        // envelope. That union is exactly the source set the Composition
+        // arm above computed into `sources`, so reuse it.
+        if let PipelineNode::Composition { .. } = &spanned.value
+            && let Some(&body_id) = artifacts.composition_body_assignments.get(&name)
+        {
+            attribute_body(body_id, &sources, artifacts, &mut node_sources);
         }
 
         node_sources.insert(name, sources);

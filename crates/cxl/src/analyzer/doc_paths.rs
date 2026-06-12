@@ -87,11 +87,15 @@ pub struct DocPathSet {
     pub unresolvable: Vec<(String, TypeDiagnostic)>,
 }
 
+#[cfg(test)]
 impl DocPathSet {
     /// The deduplicated, sorted set of every resolved path across all
-    /// nodes, discarding per-node attribution. Useful for callers that
-    /// only need the pipeline-wide path list (diagnostics, display).
-    pub fn all_paths(&self) -> Vec<DocPath> {
+    /// nodes, discarding per-node attribution — a test convenience for
+    /// asserting against the flat path list. Production callers consume
+    /// the per-node attribution in `by_node` directly; a pipeline-wide
+    /// flat-list consumer (diagnostics / display) can promote this out of
+    /// the test gate when one lands.
+    fn all_paths(&self) -> Vec<DocPath> {
         self.by_node.keys().cloned().collect()
     }
 }

@@ -470,3 +470,136 @@ nodes:
         source.source.declared_doc_paths
     );
 }
+
+#[test]
+fn test_multi_port_composition_forwards_all_port_sources() {
+    // A composition with TWO bound input ports merges them and surfaces one
+    // output. A downstream node reading `$doc` off the composition output
+    // could see a record from EITHER port's source, so the path must be
+    // attributed to BOTH port sources — not just the primary `input:` port.
+    // The composition node forwards only `header.input` (the primary port)
+    // through the generic DAG-edge view, so this pins that the source
+    // attribution unions every `inputs:` port instead.
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+    std::fs::write(
+        comp_dir.join("two_port.comp.yaml"),
+        r#"_compose:
+  name: two_port
+  inputs:
+    primary:
+      schema:
+        - { name: amount, type: int }
+    reference:
+      schema:
+        - { name: amount, type: int }
+  outputs:
+    out: merged
+  config_schema: {}
+
+nodes:
+  - type: merge
+    name: merged
+    inputs: [primary, reference]
+"#,
+    )
+    .expect("write comp");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    // Both sources declare the SAME envelope section so a `$doc.Shared.tag`
+    // read downstream of the merge typechecks regardless of which port's
+    // record is in hand.
+    let yaml = r#"
+pipeline:
+  name: multi_port_doc
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: xml
+      glob: ./c/*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          Shared:
+            extract: { xml_path: "/doc/Shared" }
+            fields:
+              tag: string
+      schema:
+        - { name: amount, type: int }
+  - type: source
+    name: zip_lookup
+    config:
+      name: zip_lookup
+      type: xml
+      glob: ./z/*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          Shared:
+            extract: { xml_path: "/doc/Shared" }
+            fields:
+              tag: string
+      schema:
+        - { name: amount, type: int }
+  - type: composition
+    name: combined
+    input: customers
+    use: ../compositions/two_port.comp.yaml
+    inputs:
+      primary: customers
+      reference: zip_lookup
+  - type: transform
+    name: tag
+    input: combined
+    config:
+      cxl: |
+        emit amount = amount
+        emit tag = $doc.Shared.tag
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-port pipeline");
+    let ctx = crate::config::CompileContext::with_pipeline_dir(
+        workspace.path(),
+        std::path::PathBuf::from("pipelines"),
+    );
+    let compiled = config.compile(&ctx).expect("compile multi-port pipeline");
+    let dag = compiled.dag();
+    let paths_for = |source_name: &str| -> Vec<DocPath> {
+        dag.graph
+            .node_indices()
+            .find_map(|idx| match &dag.graph[idx] {
+                PlanNode::Source {
+                    name,
+                    resolved: Some(r),
+                    ..
+                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let shared_tag = path("Shared", "tag", vec![]);
+    // The downstream `$doc` read must reach BOTH the primary (`customers`)
+    // and the non-primary (`zip_lookup`) port sources.
+    assert!(
+        paths_for("customers").contains(&shared_tag),
+        "primary port source `customers` must carry the downstream `$doc` path"
+    );
+    assert!(
+        paths_for("zip_lookup").contains(&shared_tag),
+        "non-primary port source `zip_lookup` must carry the downstream `$doc` path, got {:?}",
+        paths_for("zip_lookup")
+    );
+}
