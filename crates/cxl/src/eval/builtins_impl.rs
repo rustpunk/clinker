@@ -867,7 +867,12 @@ fn map_unset_path(m: &indexmap::IndexMap<Box<str>, Value>, key: &str) -> Value {
 /// `.unset` is a no-op.
 fn unset_in(target: &mut Value, segs: &[PathSeg<'_>]) -> bool {
     let Some((head, rest)) = segs.split_first() else {
-        // An empty path addresses no leaf to delete.
+        // Unreachable in practice: `parse_set_path` always yields at least one
+        // segment, and the recursion below only descends with a non-empty
+        // `rest`, so `unset_in` never sees an empty path. Kept as a defensive
+        // no-op (no leaf to delete → receiver unchanged) rather than a panic.
+        // Deletion acts on the parent container, so — unlike `set_in` — there
+        // is no recurse-into-empty-base write step that would make this live.
         return false;
     };
     match (head, target) {

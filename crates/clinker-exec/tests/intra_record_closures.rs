@@ -370,10 +370,13 @@ nodes:
 }
 
 /// Map builtins running inside a closure: `.keys()`, `.values()`,
-/// `.set()`, `.remove_field()`. The closure binding `it` is each
-/// element of the items array (a `Value::Map`); the builtins return
-/// new `Value::Map`/`Value::Array` per element, surfaced through the
-/// outer `.map` that wraps them.
+/// `.set()`, `.remove_field()`, and the nested-path `.unset()`. The
+/// closure binding `it` is each element of the items array (a
+/// `Value::Map`); the builtins return new `Value::Map`/`Value::Array`
+/// per element, surfaced through the outer `.map` that wraps them. The
+/// `.unset("meta.flag")` case proves the nested-path deletion parses,
+/// typechecks, compiles, and evaluates through a real pipeline — not
+/// just in the `cxl`-crate eval unit tests.
 #[test]
 fn ndjson_map_builtins_run_inside_array_closures() {
     let yaml = r#"
@@ -401,6 +404,7 @@ nodes:
         emit value_sets = items.map(it => it.values())
         emit enriched = items.map(it => it.set("region", "us-east"))
         emit slim = items.map(it => it.remove_field("internal_id"))
+        emit pruned = items.map(it => it.unset("meta.flag"))
   - type: output
     name: out
     input: derive
@@ -413,7 +417,7 @@ nodes:
       include_unmapped: false
       exclude: [items]
 "#;
-    let payload = br#"{"items":[{"sku":"a","price":10,"internal_id":"ix-1"},{"sku":"b","price":20,"internal_id":"ix-2"}]}
+    let payload = br#"{"items":[{"sku":"a","price":10,"internal_id":"ix-1","meta":{"flag":true,"keep":1}},{"sku":"b","price":20,"internal_id":"ix-2","meta":{"flag":true,"keep":1}}]}
 "#;
     let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
     let line = output.lines().next().expect("at least one record");
@@ -457,6 +461,24 @@ nodes:
     assert!(
         first_slim.contains_key("sku"),
         ".remove_field preserved sku"
+    );
+    let pruned = parsed
+        .get("pruned")
+        .and_then(|v| v.as_array())
+        .expect("pruned array");
+    let first_meta = pruned[0]
+        .as_object()
+        .expect("pruned[0] is object")
+        .get("meta")
+        .and_then(|v| v.as_object())
+        .expect("pruned[0].meta is object");
+    assert!(
+        !first_meta.contains_key("flag"),
+        ".unset dropped the nested meta.flag end-to-end: {parsed}"
+    );
+    assert!(
+        first_meta.contains_key("keep"),
+        ".unset preserved the sibling meta.keep"
     );
 }
 

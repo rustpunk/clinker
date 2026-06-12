@@ -1915,6 +1915,61 @@ mod intra_record {
     }
 
     #[test]
+    fn nested_unset_last_array_element_yields_empty_array() {
+        // Deleting the only element shrinks the array to empty — the
+        // remove-and-shift boundary where a hole-leaving impl or an off-by-one
+        // bound would surface.
+        let out = run(
+            "emit r = doc.unset(\"items[0]\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![("items", arr(vec![Value::Integer(10)]))]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("items", arr(vec![]))])),
+                    "deleting the only array element yields an empty array, not a null hole",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_unset_removes_whole_submap_by_bare_key() {
+        // A bare key naming a container deletes the entire substructure, exactly
+        // like `remove_field` — the documented "prune a nested field" use case,
+        // through the same top-level `shift_remove` path a scalar key takes.
+        let out = run(
+            "emit r = doc.unset(\"a\")",
+            &["doc"],
+            HashMap::from([(
+                "doc".into(),
+                map(vec![
+                    ("a", map(vec![("b", Value::Integer(1))])),
+                    ("k", Value::Integer(2)),
+                ]),
+            )]),
+        )
+        .unwrap();
+        match out {
+            EvalResult::Emit { fields, .. } => {
+                assert_eq!(
+                    fields.get("r"),
+                    Some(&map(vec![("k", Value::Integer(2))])),
+                    "a bare key deletes the whole sub-map, not just scalar leaves",
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn nested_unset_leaf_reached_through_array_index() {
         let out = run(
             "emit r = doc.unset(\"items[1].sku\")",
