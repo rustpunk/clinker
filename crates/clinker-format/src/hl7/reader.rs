@@ -199,9 +199,17 @@ impl<R: Read> Hl7Reader<R> {
             let raw = match self.next_raw()? {
                 Some(s) => s,
                 None => {
-                    // End of input: close any still-open message, then the
-                    // batch if the file used a bare batch with no BTS.
+                    // End of input. Close every still-open level so the
+                    // queued envelope events balance: first any open message
+                    // (which has no trailer — EOF is its natural boundary),
+                    // then an open batch whose `BTS` the file omitted. HL7
+                    // batch/file trailers are advisory and real files
+                    // frequently drop them, so a missing `BTS`/`FTS` at EOF
+                    // is a clean close, not a truncation error; the optional
+                    // count check only runs when a trailer is actually
+                    // present.
                     self.close_message_if_open();
+                    self.close_batch_if_open();
                     self.done = true;
                     return Ok(None);
                 }
@@ -357,6 +365,18 @@ impl<R: Read> Hl7Reader<R> {
     /// and at end-of-input.
     fn close_message_if_open(&mut self) {
         if self.open_message.take().is_some() {
+            self.pending_events.push(EnvelopeEvent::CloseLevel);
+        }
+    }
+
+    /// Close the open batch (if any) without a `BTS` count check, queuing
+    /// its `CloseLevel`. A no-op when no batch is open. Used at end-of-input
+    /// for a batch whose `BTS` trailer the file omitted, so the queued
+    /// `OpenLevel`/`CloseLevel` events stay balanced. An explicit `BTS`
+    /// trailer goes through [`Self::close_batch`] instead, which also
+    /// validates the optional message count.
+    fn close_batch_if_open(&mut self) {
+        if self.open_batch.take().is_some() {
             self.pending_events.push(EnvelopeEvent::CloseLevel);
         }
     }
@@ -709,6 +729,65 @@ mod tests {
         assert!(matches!(events[1], EnvelopeEvent::OpenLevel { .. }));
     }
 
+    /// Drain every envelope event a reader produces across the whole stream,
+    /// including the terminal end-of-input `next_record`.
+    fn drain_all_events(data: &str) -> Vec<EnvelopeEvent> {
+        let mut r = reader(data);
+        let mut events = Vec::new();
+        loop {
+            match r.next_record().unwrap() {
+                Some(_) => events.extend(r.take_envelope_events()),
+                None => {
+                    events.extend(r.take_envelope_events());
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    fn count_open_close(events: &[EnvelopeEvent]) -> (usize, usize) {
+        let opens = events
+            .iter()
+            .filter(|e| matches!(e, EnvelopeEvent::OpenLevel { .. }))
+            .count();
+        let closes = events
+            .iter()
+            .filter(|e| matches!(e, EnvelopeEvent::CloseLevel))
+            .count();
+        (opens, closes)
+    }
+
+    #[test]
+    fn unterminated_batch_at_eof_still_balances_events() {
+        // A BHS-opened batch (and its MSH message) with no BTS/FTS at EOF —
+        // a common shape for HL7 batch files that drop the advisory trailers.
+        // The reader must close both the message and the batch at EOF so the
+        // OpenLevel/CloseLevel events stay balanced; an unbalanced batch
+        // OpenLevel would leave the driver's document stack open forever.
+        let data = format!("BHS|^~\\&|S\r{MSH}\rPID|1");
+        let events = drain_all_events(&data);
+        let (opens, closes) = count_open_close(&events);
+        assert_eq!(opens, 2, "BHS + MSH each open one level");
+        assert_eq!(
+            closes, opens,
+            "every opened level must close by EOF; events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_batch_with_trailer_still_balances_events() {
+        // The same batch with its BTS/FTS present must balance identically.
+        let data = format!("FHS|^~\\&|S\rBHS|^~\\&|S\r{MSH}\rPID|1\rBTS|1\rFTS|1");
+        let events = drain_all_events(&data);
+        let (opens, closes) = count_open_close(&events);
+        assert_eq!(
+            opens, 2,
+            "BHS + MSH each open one level (FHS is file-level)"
+        );
+        assert_eq!(closes, opens, "events: {events:?}");
+    }
+
     #[test]
     fn bts_message_count_mismatch_errors() {
         let data = format!("BHS|^~\\&|S\r{MSH}\rPID|1\rBTS|9");
@@ -872,12 +951,21 @@ mod tests {
         use crate::traits::FormatWriter;
         use clinker_record::{DocumentContext, DocumentId};
 
-        // An OBX field carries a literal '|' that arrives escaped as \F\.
-        let input = format!("{MSH}\rPID|1||PATID\rOBX|1|TX|note||a\\F\\b");
+        // PID-3 is a real composite CX field with four components and a
+        // repetition (`~`); the OBX field carries a literal '|' that arrives
+        // escaped as \F\. The composite/repetition structure must round-trip
+        // byte-identically (kept verbatim), while the escaped '|' decodes and
+        // re-escapes.
+        let input = format!("{MSH}\rPID|1||PATID^^^MRN~ALT^^^MR\rOBX|1|TX|note||a\\F\\b");
 
         let mut r = reader(&input);
         let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
         assert_eq!(body_recs.len(), 3); // MSH, PID, OBX
+        // PID-3 is kept verbatim (components and repetition intact).
+        assert_eq!(
+            body_recs[1].get("f03"),
+            Some(&Value::String("PATID^^^MRN~ALT^^^MR".into()))
+        );
         // The decoded OBX value is clean (no wire escape).
         assert_eq!(body_recs[2].get("f05"), Some(&Value::String("a|b".into())));
 
@@ -905,13 +993,21 @@ mod tests {
             String::from_utf8(buf).unwrap()
         };
 
-        // The MSH header is re-emitted and the literal '|' is re-escaped.
+        // The MSH header is re-emitted, the composite PID-3 is byte-identical
+        // (its component '^' and repetition '~' separators are NOT escaped),
+        // and the literal '|' is re-escaped.
         assert!(out.starts_with("MSH|^~\\&|"), "{out}");
+        assert!(out.contains("PID|1||PATID^^^MRN~ALT^^^MR\r"), "{out}");
         assert!(out.contains("OBX|1|TX|note||a\\F\\b"), "{out}");
 
-        // Re-read the emitted file: the decoded value matches.
+        // Re-read the emitted file: the composite survives and the decoded
+        // value matches.
         let recs2 = collect(&out);
         assert_eq!(recs2.len(), 3);
+        assert_eq!(
+            recs2[1].get("f03"),
+            Some(&Value::String("PATID^^^MRN~ALT^^^MR".into()))
+        );
         assert_eq!(recs2[2].get("f05"), Some(&Value::String("a|b".into())));
     }
 }

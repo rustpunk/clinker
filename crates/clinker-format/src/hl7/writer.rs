@@ -174,13 +174,22 @@ impl<W: Write> Hl7Writer<W> {
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(Some(fields));
             }
-            // Fallback: walk the declared positional `f01, f02, …` keys.
+            // Fallback: collect the declared positional `f01, f02, …` keys
+            // into wire order. A gapped section (e.g. `f01` and `f03`
+            // present, `f02` absent) must not truncate at the gap — pad the
+            // missing slot with an empty field and keep the later values at
+            // the positions their keys declare, mirroring how `record_fields`
+            // maps body records. `DocumentContext` exposes only point
+            // lookups, so the scan runs to a fixed ceiling that comfortably
+            // exceeds any real FHS/BHS header width.
+            const HEADER_FIELD_SCAN_LIMIT: usize = 99;
             let mut fields: Vec<String> = Vec::new();
-            for i in 0.. {
+            for i in 0..HEADER_FIELD_SCAN_LIMIT {
                 let key = format!("f{:02}", i + 1);
-                match ctx.get_section_field(section, &key) {
-                    Some(v) => fields.push(value_to_field(&v, &format!("{section}.{key}"))?),
-                    None => break,
+                if let Some(v) = ctx.get_section_field(section, &key) {
+                    // Pad any skipped lower positions before placing this one.
+                    fields.resize(i, String::new());
+                    fields.push(value_to_field(&v, &format!("{section}.{key}"))?);
                 }
             }
             if fields.is_empty() {
@@ -309,24 +318,39 @@ impl<W: Write> Hl7Writer<W> {
         Ok(())
     }
 
-    /// Write a field, escaping each structural delimiter byte as its HL7
-    /// escape sequence (`|`→`\F\`, `^`→`\S\`, `&`→`\T\`, `~`→`\R\`,
-    /// `\`→`\E\`). The component, repetition, and sub-component separators
-    /// are escaped too, mirroring the reader's decode: the reader keeps them
-    /// verbatim inside a field only when they arrived verbatim, so a value
-    /// that decoded *from* an escape must be re-escaped to round-trip.
+    /// Write a field, escaping only the bytes the reader would otherwise
+    /// misread as structure: the field separator (`|` → `\F\`), the escape
+    /// character itself (`\` → `\E\`), and the segment terminator (carriage
+    /// return → `\X0D\`).
+    ///
+    /// The component (`^`), repetition (`~`), and sub-component (`&`)
+    /// separators are written **verbatim**, mirroring the reader, which keeps
+    /// them as a field's internal composite/repetition structure rather than
+    /// decoding them. Escaping them here would collapse a composite field
+    /// like `PATID^^^MRN` into a single component of escaped literals,
+    /// destroying the structure; leaving them verbatim makes the
+    /// reader → writer → reader round-trip byte-faithful, exactly as the X12
+    /// writer leaves its sub-element separator verbatim.
     fn write_escaped(&mut self, field: &str) -> Result<(), FormatError> {
         for &b in field.as_bytes() {
+            // The carriage return is the segment terminator; a scalar field
+            // value normally cannot contain it, but escape it defensively as
+            // the numeric `\X0D\` form so an embedded CR cannot split a
+            // segment.
+            if b == b'\r' {
+                self.writer
+                    .write_all(&[self.delims.escape])
+                    .map_err(FormatError::Io)?;
+                self.writer.write_all(b"X0D").map_err(FormatError::Io)?;
+                self.writer
+                    .write_all(&[self.delims.escape])
+                    .map_err(FormatError::Io)?;
+                continue;
+            }
             let escape: Option<&[u8]> = if b == self.delims.escape {
                 Some(b"E")
             } else if b == self.delims.field {
                 Some(b"F")
-            } else if b == self.delims.component {
-                Some(b"S")
-            } else if b == self.delims.subcomponent {
-                Some(b"T")
-            } else if b == self.delims.repetition {
-                Some(b"R")
             } else {
                 None
             };
@@ -472,14 +496,49 @@ mod tests {
     }
 
     #[test]
-    fn field_data_is_escaped_on_output() {
+    fn only_field_and_escape_chars_are_escaped() {
         let s = schema();
-        // An OBX value carries literal '|', '^', and '\' bytes.
+        // An OBX value carries a literal field separator '|', a component
+        // separator '^', and a literal escape char '\'. Only the field
+        // separator and the escape char are escaped; the component separator
+        // is part of the field's composite structure and is left verbatim,
+        // mirroring the reader (which keeps it verbatim) and the X12 writer.
         let msh = record(&s, "MSH", &["^~\\&", "S"]);
         let obx = record(&s, "OBX", &["1", "TX", "note", "", "a|b^c\\d"]);
         let out = write_all(Hl7WriterConfig::default(), &[msh, obx], &s);
-        // '|' -> \F\, '^' -> \S\, '\' -> \E\.
-        assert!(out.contains("a\\F\\b\\S\\c\\E\\d"), "{out}");
+        assert!(out.contains("a\\F\\b^c\\E\\d"), "{out}");
+        // The component separator must not be escaped to \S\.
+        assert!(
+            !out.contains("\\S\\"),
+            "component separator wrongly escaped: {out}"
+        );
+    }
+
+    #[test]
+    fn composite_field_round_trips_verbatim() {
+        // A composite CX field (`PATID^^^^MRN`) read verbatim by the reader
+        // must re-emit byte-identically — escaping the component separators
+        // would collapse it into one component of escaped literals.
+        let s = schema();
+        let msh = record(&s, "MSH", &["^~\\&", "S"]);
+        let pid = record(&s, "PID", &["1", "", "PATID^^^^MRN"]);
+        let out = write_all(Hl7WriterConfig::default(), &[msh, pid], &s);
+        assert!(out.contains("PID|1||PATID^^^^MRN\r"), "{out}");
+    }
+
+    #[test]
+    fn embedded_carriage_return_is_hex_escaped() {
+        // A scalar value carrying a carriage return cannot be written raw —
+        // it would split the segment. It is escaped as the numeric \X0D\
+        // form, which the reader decodes back to a literal CR.
+        let s = schema();
+        let msh = record(&s, "MSH", &["^~\\&", "S"]);
+        let nte = record(&s, "NTE", &["1", "", "a\rb"]);
+        let out = write_all(Hl7WriterConfig::default(), &[msh, nte], &s);
+        assert!(out.contains("a\\X0D\\b"), "{out}");
+        // The raw CR must not appear inside the field (only as the segment
+        // terminator after the field).
+        assert!(!out.contains("a\rb"), "raw CR leaked into field: {out}");
     }
 
     #[test]
@@ -559,6 +618,42 @@ mod tests {
         assert!(out.starts_with("FHS|^~\\&|SENDAPP|FILE9\r"), "{out}");
         // One message, zero batches -> FTS|0.
         assert!(out.contains("FTS|0\r"), "{out}");
+    }
+
+    #[test]
+    fn gapped_doc_header_fallback_pads_missing_positions() {
+        // The positional-key fallback (no `$raw` array present) must not stop
+        // at the first missing `fNN` key: with `f01` and `f03` declared but
+        // `f02` absent, the FHS header must carry an empty field at position 2
+        // rather than truncating at the gap.
+        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use indexmap::IndexMap;
+
+        let s = schema();
+        let mut file_doc: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        file_doc.insert("f01".into(), RecVal::String("^~\\&".into()));
+        // f02 deliberately absent — the gap.
+        file_doc.insert("f03".into(), RecVal::String("FILE9".into()));
+        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        sections.insert("file".into(), RecVal::Map(Box::new(file_doc)));
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("a.hl7"),
+            sections,
+        ));
+
+        let mut msh = record(&s, "MSH", &["^~\\&", "S"]);
+        msh.set_doc_ctx(ctx);
+
+        let cfg = Hl7WriterConfig {
+            file_header_from_doc: Some("file".into()),
+            segment_newline: false,
+            ..Default::default()
+        };
+        let out = write_all(cfg, &[msh], &s);
+        // FHS-2 encoding chars, then an empty FHS-3, then FILE9 at FHS-4 —
+        // the gap is preserved as an empty field, not collapsed.
+        assert!(out.starts_with("FHS|^~\\&||FILE9\r"), "{out}");
     }
 
     #[test]

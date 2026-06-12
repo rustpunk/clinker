@@ -181,6 +181,23 @@ nodes:
     assert!(output.contains("OBX|1|NM|"), "OBX1 missing: {output}");
     assert!(output.contains("OBX|2|NM|"), "OBX2 missing: {output}");
 
+    // Composite fields must survive byte-identically — their component '^'
+    // separators are part of the field structure and are NOT escaped on
+    // write. The PID-3 CX field and the OBX-3 CE field round-trip verbatim.
+    assert!(
+        output.contains("PID|1||PATID123^^^HOSP^MR"),
+        "composite PID-3 not byte-identical: {output}"
+    );
+    assert!(
+        output.contains("OBX|1|NM|WBC^White Blood Cell"),
+        "composite OBX-3 not byte-identical: {output}"
+    );
+    // No component separator may have been turned into an \S\ escape.
+    assert!(
+        !output.contains("\\S\\"),
+        "component separator wrongly escaped on output: {output}"
+    );
+
     // Feed the HL7 output back through a second pipeline (HL7 → CSV) to
     // prove it re-parses identically: the segment tags must round-trip.
     let reparse_yaml = r#"

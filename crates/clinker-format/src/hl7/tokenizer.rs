@@ -185,6 +185,42 @@ impl<R: BufRead> SegmentTokenizer<R> {
         }
         let field = raw[3];
         let encoding = &raw[4..8];
+        // The five service delimiters must be mutually distinct. A short
+        // MSH-2 (e.g. `MSH|^~\|...`, which omits the sub-component char)
+        // leaves `raw[7]` pointing at the next field separator, so a naive
+        // read would set `subcomponent == field` and silently corrupt every
+        // split. The byte after the four encoding characters (`raw[8]`, when
+        // present) must be the field separator that ends MSH-2; reject a
+        // header where it is not, or where any two delimiters collide.
+        let delims = [field, encoding[0], encoding[1], encoding[2], encoding[3]];
+        for (a, &da) in delims.iter().enumerate() {
+            for &db in &delims[a + 1..] {
+                if da == db {
+                    return Err(FormatError::Hl7(format!(
+                        "HL7 header declares colliding delimiters: the field separator and the \
+                         four encoding characters (component, repetition, escape, sub-component) \
+                         must be five distinct bytes, found {:?}. A short MSH-2 that omits an \
+                         encoding character is the usual cause.",
+                        String::from_utf8_lossy(&raw[3..8])
+                    )));
+                }
+            }
+        }
+        // A conformant MSH-2 ends at the next field separator. If the byte
+        // after the four encoding characters is present and is not the field
+        // separator, the encoding-characters field is longer than four bytes
+        // (an unsupported extended encoding set), which would misalign every
+        // later field.
+        if let Some(&after) = raw.get(8)
+            && after != field
+        {
+            return Err(FormatError::Hl7(format!(
+                "HL7 header MSH-2 encoding-characters field is not the expected four bytes \
+                 terminated by the field separator; found {:?} after the four encoding \
+                 characters. Extended encoding sets are not supported.",
+                after as char
+            )));
+        }
         self.delimiters = Delimiters {
             field,
             component: encoding[0],
@@ -390,6 +426,15 @@ fn decode_escapes(bytes: &[u8], delims: &Delimiters) -> String {
                 i = i + 1 + end_rel + 1;
                 continue;
             }
+            // A `\Xhh..\` hexadecimal escape encodes raw data bytes (the
+            // form the writer uses to escape an embedded carriage return so
+            // it cannot split a segment). Decode it back to those bytes so
+            // the round-trip is faithful.
+            if let Some(mut decoded) = decode_hex_escape(inner) {
+                out.append(&mut decoded);
+                i = i + 1 + end_rel + 1;
+                continue;
+            }
             // Recognized escape framing but an application sequence we do
             // not decode (e.g. `\.br\`): keep the whole run verbatim.
             out.push(escape);
@@ -415,6 +460,25 @@ fn escape_to_delimiter(inner: &[u8], delims: &Delimiters) -> Option<u8> {
         b"E" => Some(delims.escape),
         _ => None,
     }
+}
+
+/// Decode an HL7 `\Xhh..\` hexadecimal escape body (the bytes between the
+/// two escape characters, beginning with `X`) to the raw bytes it encodes.
+/// Returns `None` when the body is not an `X` followed by an even-length run
+/// of ASCII hex digits, so a non-hex application escape keeps its
+/// verbatim-passthrough behavior.
+fn decode_hex_escape(inner: &[u8]) -> Option<Vec<u8>> {
+    let hex = inner.strip_prefix(b"X")?;
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -568,5 +632,63 @@ mod tests {
         let header = t.read_first_segment().unwrap();
         assert!(header.starts_with("MSH"));
         assert_eq!(t.delimiters().field, b'|');
+    }
+
+    #[test]
+    fn short_msh2_collides_with_field_separator_and_is_rejected() {
+        // `MSH|^~\|...` has a three-character MSH-2 (`^~\`, no sub-component)
+        // followed by the field separator. A naive `raw[4..8]` read would set
+        // the sub-component separator to the field separator `|`, silently
+        // corrupting every split. The collision must be rejected.
+        let mut t = tok(b"MSH|^~\\|SENDAPP|SENDFAC|RCVAPP|RCVFAC|202401||ADT^A01|M1|P|2.5\r");
+        let err = t.read_first_segment().unwrap_err();
+        assert!(
+            matches!(err, FormatError::Hl7(m) if m.contains("colliding delimiters")),
+            "expected a colliding-delimiter rejection"
+        );
+    }
+
+    #[test]
+    fn duplicate_encoding_chars_rejected() {
+        // Two encoding characters equal to each other (`^` repeated) is also
+        // a collision the parser must reject.
+        let mut t = tok(b"MSH|^^\\&|SENDAPP|SENDFAC|R|R|202401||ADT^A01|M1|P|2.5\r");
+        let err = t.read_first_segment().unwrap_err();
+        assert!(matches!(err, FormatError::Hl7(m) if m.contains("colliding delimiters")));
+    }
+
+    #[test]
+    fn extended_msh2_beyond_four_chars_rejected() {
+        // A MSH-2 wider than four bytes before the field separator is an
+        // unsupported extended encoding set; rejecting it avoids silently
+        // misaligning every later field.
+        let mut t = tok(b"MSH|^~\\&#|SENDAPP|SENDFAC|R|R|202401||ADT^A01|M1|P|2.5\r");
+        let err = t.read_first_segment().unwrap_err();
+        assert!(matches!(err, FormatError::Hl7(m) if m.contains("not the expected four bytes")));
+    }
+
+    #[test]
+    fn hex_escape_decodes_to_raw_byte() {
+        // A `\X0D\` hex escape decodes back to a literal carriage return —
+        // the form the writer uses to escape an embedded CR so it cannot
+        // split a segment.
+        let data = format!("{MSH}\rNTE|1||a\\X0D\\b");
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_first_segment().unwrap();
+        let nte = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&nte, &t.delimiters());
+        assert_eq!(parsed.fields[2], "a\rb");
+    }
+
+    #[test]
+    fn malformed_hex_escape_kept_verbatim() {
+        // A non-hex `\X..\` body is not a valid hex escape and is preserved
+        // verbatim rather than dropped.
+        let data = format!("{MSH}\rNTE|1||a\\XZZ\\b");
+        let mut t = tok(data.as_bytes());
+        let _ = t.read_first_segment().unwrap();
+        let nte = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&nte, &t.delimiters());
+        assert_eq!(parsed.fields[2], "a\\XZZ\\b");
     }
 }
