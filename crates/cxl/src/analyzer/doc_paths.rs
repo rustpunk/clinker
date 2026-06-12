@@ -21,7 +21,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{Expr, LiteralValue, MatchArm, Statement, UnaryOp};
+use crate::analyzer::visitor::{Visitor, walk_expr};
+use crate::ast::{Expr, LiteralValue, UnaryOp};
 use crate::lexer::Span;
 use crate::typecheck::pass::{TypeDiagnostic, TypedProgram};
 
@@ -77,154 +78,69 @@ pub struct DocPathSet {
 /// deduplicated across all programs and returned in sorted order;
 /// unresolvable-index diagnostics are accumulated in walk order.
 pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
-    let mut paths: BTreeSet<DocPath> = BTreeSet::new();
-    let mut unresolvable: Vec<(String, TypeDiagnostic)> = Vec::new();
+    let mut collector = DocPathCollector::default();
     for (name, typed) in programs {
+        collector.node_name = name;
         for stmt in &typed.program.statements {
-            walk_statement(name, stmt, &mut paths, &mut unresolvable);
+            collector.visit_statement(stmt);
         }
     }
     DocPathSet {
-        paths: paths.into_iter().collect(),
-        unresolvable,
+        paths: collector.paths.into_iter().collect(),
+        unresolvable: collector.unresolvable,
     }
 }
 
-fn walk_statement(
-    node_name: &str,
-    stmt: &Statement,
-    paths: &mut BTreeSet<DocPath>,
-    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
-) {
-    match stmt {
-        Statement::Let { expr, .. }
-        | Statement::Emit { expr, .. }
-        | Statement::ExprStmt { expr, .. } => walk_expr(node_name, expr, paths, unresolvable),
-        Statement::Filter { predicate, .. } => walk_expr(node_name, predicate, paths, unresolvable),
-        Statement::Trace { guard, message, .. } => {
-            if let Some(g) = guard {
-                walk_expr(node_name, g, paths, unresolvable);
-            }
-            walk_expr(node_name, message, paths, unresolvable);
-        }
-        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
-            walk_expr(node_name, source, paths, unresolvable);
-            for inner in body {
-                walk_statement(node_name, inner, paths, unresolvable);
-            }
-        }
-        Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
-    }
-}
-
-/// Walk an expression, recording any `$doc` access it contains.
+/// Collects the `$doc` envelope paths a single program references, driving
+/// the shared typed-AST [`Visitor`] walk.
 ///
-/// A `$doc` access is the `DocAccess` node optionally wrapped in one or
-/// more `IndexAccess` layers (`$doc.s.f[0][1]`). When the whole stack of
-/// indices is literal, the path is recorded; the first non-literal index
-/// makes the access unresolvable. The walker recurses through every
-/// control-flow branch (`if`, `match`, `coalesce`, `emit_each` bodies),
-/// so a `$doc` access used only inside a conditional is still collected.
-fn walk_expr(
-    node_name: &str,
-    expr: &Expr,
-    paths: &mut BTreeSet<DocPath>,
-    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
-) {
-    // An IndexAccess whose receiver chain bottoms out at a DocAccess is a
-    // `$doc` path with trailing indices — classify it as a unit rather
-    // than walking the DocAccess receiver as a bare access. Other
-    // IndexAccess shapes (`record_field[0]`) fall through to the generic
-    // recursion below.
-    if let Expr::IndexAccess { .. } = expr
-        && let Some(classified) = classify_doc_index_chain(expr)
-    {
-        match classified {
-            Ok(path) => {
-                paths.insert(path);
-            }
-            Err(diag) => unresolvable.push((node_name.to_string(), diag)),
-        }
-        return;
-    }
+/// Only `DocAccess` and `IndexAccess` carry `$doc` meaning, so those are
+/// the sole overrides — a `DocAccess` records a plain two-level path, and
+/// an `IndexAccess` whose receiver chain bottoms out at a `DocAccess`
+/// records a path with trailing index segments (or a diagnostic for a
+/// non-literal index). Every other node, including index chains that do
+/// not root at a `$doc` access, falls through to the default descent, so a
+/// `$doc` access nested in any control-flow branch or index expression is
+/// still collected.
+#[derive(Default)]
+struct DocPathCollector<'a> {
+    /// Name of the program currently being walked, so an unresolvable-index
+    /// diagnostic can be attributed to its node.
+    node_name: &'a str,
+    paths: BTreeSet<DocPath>,
+    unresolvable: Vec<(String, TypeDiagnostic)>,
+}
 
-    match expr {
-        Expr::DocAccess { section, field, .. } => {
-            paths.insert(DocPath {
+impl Visitor for DocPathCollector<'_> {
+    fn visit_expr(&mut self, expr: &Expr) {
+        // An IndexAccess whose receiver chain bottoms out at a DocAccess is
+        // a `$doc` path with trailing indices — classify it as a unit
+        // rather than descending into the DocAccess as a bare access. Other
+        // IndexAccess shapes (`record_field[0]`) fall through to the
+        // default descent below.
+        if let Expr::IndexAccess { .. } = expr
+            && let Some(classified) = classify_doc_index_chain(expr)
+        {
+            match classified {
+                Ok(path) => {
+                    self.paths.insert(path);
+                }
+                Err(diag) => self.unresolvable.push((self.node_name.to_string(), diag)),
+            }
+            return;
+        }
+
+        if let Expr::DocAccess { section, field, .. } = expr {
+            self.paths.insert(DocPath {
                 section: section.clone(),
                 field: field.clone(),
                 indices: Vec::new(),
             });
+            return;
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
-            walk_expr(node_name, lhs, paths, unresolvable);
-            walk_expr(node_name, rhs, paths, unresolvable);
-        }
-        Expr::Unary { operand, .. } => walk_expr(node_name, operand, paths, unresolvable),
-        Expr::MethodCall { receiver, args, .. } => {
-            walk_expr(node_name, receiver, paths, unresolvable);
-            for a in args {
-                walk_expr(node_name, a, paths, unresolvable);
-            }
-        }
-        Expr::Match { subject, arms, .. } => {
-            if let Some(s) = subject {
-                walk_expr(node_name, s, paths, unresolvable);
-            }
-            for arm in arms {
-                walk_match_arm(node_name, arm, paths, unresolvable);
-            }
-        }
-        Expr::IfThenElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            walk_expr(node_name, condition, paths, unresolvable);
-            walk_expr(node_name, then_branch, paths, unresolvable);
-            if let Some(e) = else_branch {
-                walk_expr(node_name, e, paths, unresolvable);
-            }
-        }
-        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
-            for a in args {
-                walk_expr(node_name, a, paths, unresolvable);
-            }
-        }
-        Expr::IndexAccess {
-            receiver, index, ..
-        } => {
-            // Reached only for non-`$doc` index chains; recurse into both
-            // sides so a `$doc` access buried in the index expression
-            // (`arr[$doc.s.f]`) is still collected.
-            walk_expr(node_name, receiver, paths, unresolvable);
-            walk_expr(node_name, index, paths, unresolvable);
-        }
-        Expr::Closure { body, .. } => walk_expr(node_name, body, paths, unresolvable),
-        Expr::Literal { .. }
-        | Expr::FieldRef { .. }
-        | Expr::QualifiedFieldRef { .. }
-        | Expr::PipelineAccess { .. }
-        | Expr::VarsAccess { .. }
-        | Expr::SourceAccess { .. }
-        | Expr::QualifiedSourceAccess { .. }
-        | Expr::RecordAccess { .. }
-        | Expr::Now { .. }
-        | Expr::Wildcard { .. }
-        | Expr::AggSlot { .. }
-        | Expr::GroupKey { .. } => {}
-    }
-}
 
-fn walk_match_arm(
-    node_name: &str,
-    arm: &MatchArm,
-    paths: &mut BTreeSet<DocPath>,
-    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
-) {
-    walk_expr(node_name, &arm.pattern, paths, unresolvable);
-    walk_expr(node_name, &arm.body, paths, unresolvable);
+        walk_expr(self, expr);
+    }
 }
 
 /// Classify an `IndexAccess` whose receiver chain bottoms out at a

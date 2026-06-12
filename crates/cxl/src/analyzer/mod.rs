@@ -6,10 +6,13 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{Expr, MatchArm, Statement};
+use crate::ast::{Expr, Statement};
 use crate::typecheck::pass::TypedProgram;
 
 pub mod doc_paths;
+pub mod visitor;
+
+use visitor::{Visitor, walk_expr};
 
 /// Which category of window function was called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,30 +77,28 @@ pub struct AnalysisReport {
 /// `name`: the transform's name from config.
 /// `typed`: the compiled (parsed → resolved → type-checked) CXL program.
 pub fn analyze_transform(name: &str, typed: &TypedProgram) -> TransformAnalysis {
-    let mut window_calls = Vec::new();
-    let mut accessed_fields = HashSet::new();
-
     let has_distinct = typed
         .program
         .statements
         .iter()
         .any(|s| matches!(s, Statement::Distinct { .. }));
 
+    let mut collector = WindowCollector::default();
     for stmt in &typed.program.statements {
-        walk_statement(stmt, &mut window_calls, &mut accessed_fields);
+        collector.visit_statement(stmt);
     }
 
     // Distinct forces Sequential — mutable HashSet state cannot be parallelized.
     let parallelism_hint = if has_distinct {
         ParallelismHint::Sequential
     } else {
-        classify_parallelism(&window_calls)
+        classify_parallelism(&collector.window_calls)
     };
 
     TransformAnalysis {
         name: name.to_string(),
-        window_calls,
-        accessed_fields,
+        window_calls: collector.window_calls,
+        accessed_fields: collector.accessed_fields,
         parallelism_hint,
     }
 }
@@ -130,201 +131,126 @@ fn classify_parallelism(calls: &[WindowCallInfo]) -> ParallelismHint {
     ParallelismHint::IndexReading
 }
 
-// --- AST walkers ---
-
-fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mut HashSet<String>) {
-    match stmt {
-        Statement::Let { expr, .. } => walk_expr(expr, calls, fields, None),
-        Statement::Emit { expr, .. } => walk_expr(expr, calls, fields, None),
-        Statement::Trace { guard, message, .. } => {
-            if let Some(g) = guard {
-                walk_expr(g, calls, fields, None);
-            }
-            walk_expr(message, calls, fields, None);
-        }
-        Statement::ExprStmt { expr, .. } => walk_expr(expr, calls, fields, None),
-        Statement::UseStmt { .. } => {}
-        Statement::Filter { predicate, .. } => walk_expr(predicate, calls, fields, None),
-        Statement::Distinct { .. } => {}
-        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
-            walk_expr(source, calls, fields, None);
-            for inner in body {
-                walk_statement(inner, calls, fields);
-            }
-        }
-    }
-}
-
-/// Walk an expression tree, collecting window calls and accessed fields.
+/// Collects every `window.*` call site and every field reference a
+/// transform's CXL reads, driving the shared typed-AST [`Visitor`] walk.
 ///
-/// `postfix_target`: when we're walking a postfix chain on a WindowCall result,
-/// this collects the field names accessed (e.g., `window.first().name` → "name").
-fn walk_expr(
-    expr: &Expr,
-    calls: &mut Vec<WindowCallInfo>,
-    fields: &mut HashSet<String>,
-    postfix_target: Option<&mut Vec<String>>,
-) {
-    match expr {
-        Expr::WindowCall { function, args, .. } => {
-            let category = match function.as_ref() {
-                "first" | "last" | "lag" | "lead" => WindowFunction::Positional,
-                "count" | "sum" | "avg" | "min" | "max" => WindowFunction::Aggregate,
-                "any" | "all" => WindowFunction::Iterable,
-                "collect" | "distinct" => WindowFunction::Collector,
-                _ => WindowFunction::Aggregate, // fallback
-            };
+/// Only the nodes that carry analysis meaning are overridden — `WindowCall`
+/// (records the call and its argument fields), `MethodCall` (detects a
+/// postfix field access on a window result, e.g. `window.first().name`),
+/// and `FieldRef` (every bare column the transform needs from the upstream
+/// record). Every other node falls through to the default descent.
+#[derive(Default)]
+struct WindowCollector {
+    window_calls: Vec<WindowCallInfo>,
+    accessed_fields: HashSet<String>,
+    /// Set while walking the receiver of a window-result method chain so a
+    /// field access in that chain attaches to the originating
+    /// `WindowCall`'s `postfix_fields`. `None` outside such a walk.
+    postfix_target: Option<Vec<String>>,
+}
 
-            // Extract field name arguments
-            let field_args: Vec<String> = args
-                .iter()
-                .filter_map(|arg| {
-                    if let Expr::FieldRef { name, .. } = arg {
-                        Some(name.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+impl Visitor for WindowCollector {
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::WindowCall { function, args, .. } => {
+                let category = match function.as_ref() {
+                    "first" | "last" | "lag" | "lead" => WindowFunction::Positional,
+                    "count" | "sum" | "avg" | "min" | "max" => WindowFunction::Aggregate,
+                    "any" | "all" => WindowFunction::Iterable,
+                    "collect" | "distinct" => WindowFunction::Collector,
+                    _ => WindowFunction::Aggregate, // fallback
+                };
 
-            // Add field args to the accessed set
-            for f in &field_args {
-                fields.insert(f.clone());
-            }
+                let field_args: Vec<String> = args
+                    .iter()
+                    .filter_map(|arg| {
+                        if let Expr::FieldRef { name, .. } = arg {
+                            Some(name.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
-            // Walk args for nested expressions
-            for arg in args {
-                walk_expr(arg, calls, fields, None);
-            }
-
-            let call_info = WindowCallInfo {
-                function_name: function.clone(),
-                category,
-                field_args,
-                postfix_fields: Vec::new(), // filled by parent MethodCall if any
-            };
-            calls.push(call_info);
-        }
-
-        // MethodCall on a WindowCall result: `window.first().name` appears as
-        // MethodCall { receiver: WindowCall("first"), method: "name", args: [] }
-        // We need to detect when the receiver is a WindowCall and collect the method
-        // as a postfix field.
-        Expr::MethodCall {
-            receiver,
-            method,
-            args,
-            ..
-        } => {
-            // Check if receiver is a WindowCall (or chain leading to one)
-            if is_window_call_chain(receiver) {
-                // This method name is a field access on the window result
-                let field_name = method.to_string();
-                fields.insert(field_name.clone());
-
-                // Walk the receiver to collect the WindowCall itself
-                let mut postfix_fields = vec![field_name];
-                walk_expr(receiver, calls, fields, Some(&mut postfix_fields));
-
-                // Attach postfix fields to the last WindowCall we found
-                if let Some(last_call) = calls.last_mut() {
-                    last_call.postfix_fields.extend(postfix_fields);
+                for f in &field_args {
+                    self.accessed_fields.insert(f.clone());
                 }
-            } else {
-                // Normal method call — walk receiver and args
-                walk_expr(receiver, calls, fields, None);
+
+                // Argument sub-expressions never belong to the enclosing
+                // window-result postfix chain, so suspend any active target
+                // while descending into them.
+                let saved = self.postfix_target.take();
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+                self.postfix_target = saved;
+
+                self.window_calls.push(WindowCallInfo {
+                    function_name: function.clone(),
+                    category,
+                    field_args,
+                    postfix_fields: Vec::new(), // filled by parent MethodCall if any
+                });
             }
 
-            for arg in args {
-                walk_expr(arg, calls, fields, None);
-            }
-        }
+            // `window.first().name` parses as
+            // MethodCall { receiver: WindowCall("first"), method: "name" }.
+            // When the receiver bottoms out at a window call, the method
+            // name is a field access on the window result — collect it and
+            // attach it to that call's postfix fields.
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                if is_window_call_chain(receiver) {
+                    let field_name = method.to_string();
+                    self.accessed_fields.insert(field_name.clone());
 
-        // Field access. Any bare `FieldRef` means this transform needs
-        // the field from the upstream record at runtime — Option W's
-        // arena projection must include it, or the evaluator will read
-        // Null from a missing slot. This was a latent bug before the
-        // arena/DAG unification: the analyzer tracked only
-        // window-argument fields, so plain `emit f1 = f1` inside a
-        // window-using transform silently dropped f1.
-        //
-        // `postfix_target` is additionally collected for
-        // `window.first().name`-style access (so we can attach the
-        // postfix to the preceding WindowCall for aggregate-op dispatch).
-        Expr::FieldRef { name, .. } => {
-            fields.insert(name.to_string());
-            if let Some(postfix) = postfix_target {
-                postfix.push(name.to_string());
-            }
-        }
+                    let saved = self.postfix_target.replace(vec![field_name]);
+                    self.visit_expr(receiver);
+                    let postfix_fields = self.postfix_target.take().unwrap_or_default();
+                    self.postfix_target = saved;
 
-        // Recurse into all other expression types
-        Expr::Binary { lhs, rhs, .. } => {
-            walk_expr(lhs, calls, fields, None);
-            walk_expr(rhs, calls, fields, None);
-        }
-        Expr::Unary { operand, .. } => {
-            walk_expr(operand, calls, fields, None);
-        }
-        Expr::IfThenElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            walk_expr(condition, calls, fields, None);
-            walk_expr(then_branch, calls, fields, None);
-            if let Some(e) = else_branch {
-                walk_expr(e, calls, fields, None);
+                    if let Some(last_call) = self.window_calls.last_mut() {
+                        last_call.postfix_fields.extend(postfix_fields);
+                    }
+                } else {
+                    self.visit_expr(receiver);
+                }
+
+                let saved = self.postfix_target.take();
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+                self.postfix_target = saved;
             }
-        }
-        Expr::Coalesce { lhs, rhs, .. } => {
-            walk_expr(lhs, calls, fields, None);
-            walk_expr(rhs, calls, fields, None);
-        }
-        Expr::Match { subject, arms, .. } => {
-            if let Some(s) = subject {
-                walk_expr(s, calls, fields, None);
+
+            // Any bare `FieldRef` means this transform needs the field from
+            // the upstream record at runtime — the arena projection must
+            // include it, or the evaluator reads Null from a missing slot.
+            // The analyzer therefore tracks every FieldRef, not just
+            // window-argument fields, so plain `emit f1 = f1` inside a
+            // window-using transform does not silently drop f1.
+            //
+            // While walking a window-result method chain, the field also
+            // attaches to that call's postfix fields for aggregate-op
+            // dispatch (`window.first().name`).
+            Expr::FieldRef { name, .. } => {
+                self.accessed_fields.insert(name.to_string());
+                if let Some(postfix) = self.postfix_target.as_mut() {
+                    postfix.push(name.to_string());
+                }
             }
-            for arm in arms {
-                walk_match_arm(arm, calls, fields);
-            }
+
+            _ => walk_expr(self, expr),
         }
-        Expr::AggCall { args, .. } => {
-            for arg in args {
-                walk_expr(arg, calls, fields, None);
-            }
-        }
-        Expr::IndexAccess {
-            receiver, index, ..
-        } => {
-            walk_expr(receiver, calls, fields, None);
-            walk_expr(index, calls, fields, None);
-        }
-        Expr::Closure { body, .. } => {
-            walk_expr(body, calls, fields, None);
-        }
-        Expr::Literal { .. }
-        | Expr::QualifiedFieldRef { .. }
-        | Expr::PipelineAccess { .. }
-        | Expr::VarsAccess { .. }
-        | Expr::SourceAccess { .. }
-        | Expr::QualifiedSourceAccess { .. }
-        | Expr::RecordAccess { .. }
-        | Expr::DocAccess { .. }
-        | Expr::Now { .. }
-        | Expr::Wildcard { .. }
-        | Expr::AggSlot { .. }
-        | Expr::GroupKey { .. } => {}
     }
 }
 
-fn walk_match_arm(arm: &MatchArm, calls: &mut Vec<WindowCallInfo>, fields: &mut HashSet<String>) {
-    walk_expr(&arm.pattern, calls, fields, None);
-    walk_expr(&arm.body, calls, fields, None);
-}
-
-/// Check if an expression is a WindowCall or a chain of method calls ending at a WindowCall.
+/// True when `expr` is a window call or a method-call chain bottoming out
+/// at one.
 fn is_window_call_chain(expr: &Expr) -> bool {
     match expr {
         Expr::WindowCall { .. } => true,
