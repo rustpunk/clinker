@@ -456,6 +456,7 @@ mod tests {
             files: None,
             watermark: None,
             envelope: None,
+            declared_doc_paths: Vec::new(),
             schema: None,
             schema_overrides: None,
             array_paths: None,

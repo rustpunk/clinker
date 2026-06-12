@@ -23,6 +23,11 @@ pub enum FormatError {
     /// control-number echo mismatch, truncation, a delimiter byte in data
     /// that X12 cannot escape).
     X12(String),
+    /// An HL7 v2 parse, batch/file-count, or malformed-segment failure.
+    /// Carries a precise message naming the offending segment or
+    /// constraint (missing/truncated MSH header, BTS/FTS count mismatch,
+    /// unbalanced batch/file envelope, truncation, non-UTF-8 charset).
+    Hl7(String),
     InvalidRecord {
         row: u64,
         message: String,
@@ -68,6 +73,7 @@ impl fmt::Display for FormatError {
             Self::FixedWidth(msg) => write!(f, "fixed-width error: {msg}"),
             Self::Edifact(msg) => write!(f, "EDIFACT error: {msg}"),
             Self::X12(msg) => write!(f, "X12 error: {msg}"),
+            Self::Hl7(msg) => write!(f, "HL7 error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }

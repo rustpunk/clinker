@@ -11,6 +11,7 @@ use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCo
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
 use clinker_format::edifact::writer::{EdifactWriter, EdifactWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
+use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::traits::FormatWriter;
@@ -137,6 +138,18 @@ fn build_x12_writer_config(
         interchange_from_doc: opts.and_then(|o| o.interchange_from_doc.clone()),
         group_header: opts.and_then(|o| o.group_header.clone()),
         set_type: opts.and_then(|o| o.set_type.clone()),
+        segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
+    }
+}
+
+fn build_hl7_writer_config(
+    opts: Option<&clinker_plan::config::Hl7OutputOptions>,
+) -> Hl7WriterConfig {
+    // `segment_newline` defaults to `true` (readable per-segment lines).
+    Hl7WriterConfig {
+        file_header: opts.and_then(|o| o.file_header.clone()),
+        file_header_from_doc: opts.and_then(|o| o.file_header_from_doc.clone()),
+        batch_header: opts.and_then(|o| o.batch_header.clone()),
         segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
     }
 }
@@ -273,6 +286,16 @@ fn build_writer_factory(
                     counting_writer,
                     schema,
                     x12_config.clone(),
+                )))
+            })
+        }
+        OutputFormat::Hl7(opts) => {
+            let hl7_config = build_hl7_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(Hl7Writer::new(
+                    counting_writer,
+                    schema,
+                    hl7_config.clone(),
                 )))
             })
         }

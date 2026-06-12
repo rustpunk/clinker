@@ -8,6 +8,7 @@ use std::sync::Arc;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
@@ -53,6 +54,10 @@ fn build_format_reader(
         clinker_plan::config::InputFormat::X12(opts) => {
             let config = build_x12_reader_config(opts.as_ref());
             Ok(Box::new(X12Reader::new(reader, config)))
+        }
+        clinker_plan::config::InputFormat::Hl7(opts) => {
+            let config = build_hl7_reader_config(opts.as_ref());
+            Ok(Box::new(Hl7Reader::new(reader, config)))
         }
     }
 }
@@ -810,6 +815,18 @@ fn build_x12_reader_config(
         && let Some(max) = opts.max_elements
     {
         config.max_elements = max;
+    }
+    config
+}
+
+fn build_hl7_reader_config(
+    opts: Option<&clinker_plan::config::Hl7InputOptions>,
+) -> Hl7ReaderConfig {
+    let mut config = Hl7ReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(max) = opts.max_fields
+    {
+        config.max_fields = max;
     }
     config
 }

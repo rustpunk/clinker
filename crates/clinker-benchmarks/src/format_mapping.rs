@@ -9,6 +9,7 @@ pub enum FormatMappingError {
     UnsupportedJsonObject,
     UnsupportedEdifact,
     UnsupportedX12,
+    UnsupportedHl7,
 }
 
 impl std::fmt::Display for FormatMappingError {
@@ -22,6 +23,9 @@ impl std::fmt::Display for FormatMappingError {
             }
             Self::UnsupportedX12 => {
                 f.write_str("X12 format has no benchmark DataFormat equivalent")
+            }
+            Self::UnsupportedHl7 => {
+                f.write_str("HL7 format has no benchmark DataFormat equivalent")
             }
         }
     }
@@ -39,6 +43,7 @@ pub fn input_format_to_data_format(input: &InputFormat) -> Result<DataFormat, Fo
         InputFormat::FixedWidth(_) => Ok(DataFormat::FixedWidth),
         InputFormat::Edifact(_) => Err(FormatMappingError::UnsupportedEdifact),
         InputFormat::X12(_) => Err(FormatMappingError::UnsupportedX12),
+        InputFormat::Hl7(_) => Err(FormatMappingError::UnsupportedHl7),
         InputFormat::Json(opts) => {
             let json_fmt = opts.as_ref().and_then(|o| o.format.as_ref());
             match json_fmt {

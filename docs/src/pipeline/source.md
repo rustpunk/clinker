@@ -80,7 +80,7 @@ shares repeated values instead of storing each copy independently.
 A source declaration has two independent layers:
 
 - **Transport** (`transport:`) selects *where* the records come from. The only transport today is `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
-- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`.
+- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`.
 
 ```yaml
 - type: source
@@ -98,7 +98,7 @@ A `file` transport requires **exactly one** file matcher (`path`, `glob`, `regex
 
 ## Format types
 
-The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`.
+The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`.
 
 The `edifact` format reads UN/EDIFACT interchanges; it has its own
 reference page covering the segment-record schema, delimiter discovery,
@@ -112,6 +112,12 @@ The `x12` format reads ANSI ASC X12 interchanges with their three-tier
 `ISA..IEA` → `GS..GE` → `ST..SE` envelope, surfacing all three tiers as
 nested `$doc` sections. It shares the same `max_elements` input option and
 has its own reference page. See [X12 Format](x12.md).
+
+The `hl7` format reads HL7 v2.x pipe-and-hat messages with MSH-driven
+delimiter discovery and optional batch/file (`BHS..BTS`, `FHS..FTS`)
+envelopes that surface as nested `$doc` levels. Its input option is
+`max_fields` (default 64) — the number of positional `fNN` field columns on
+the record schema. See [HL7 v2 Format](hl7.md).
 
 ### CSV
 

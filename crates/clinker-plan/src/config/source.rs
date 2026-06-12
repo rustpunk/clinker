@@ -70,6 +70,16 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<clinker_format::EnvelopeConfig>,
 
+    /// `$doc.<section>.<field>` envelope paths the pipeline's CXL
+    /// programs actually reference, collected at compile time by
+    /// `cxl::analyzer::doc_paths`. Empty for sources whose downstream
+    /// programs read no `$doc` paths. Document readers consult this set
+    /// to skip extracting declared sections no program consumes. Derived
+    /// by the planner — never author-written — so it is excluded from
+    /// serialized config.
+    #[serde(skip)]
+    pub declared_doc_paths: Vec<cxl::analyzer::doc_paths::DocPath>,
+
     /// Format-layer schema pointer (e.g. fixed-width field layouts).
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk
@@ -558,4 +568,15 @@ pub struct X12InputOptions {
     /// with guidance rather than silently truncated. Defaults to 32.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_elements: Option<usize>,
+}
+
+/// HL7 v2 input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Hl7InputOptions {
+    /// Number of positional `fNN` field columns on the record schema. A
+    /// segment carrying more data fields than this is rejected with
+    /// guidance rather than silently truncated. Defaults to 64.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fields: Option<usize>,
 }
