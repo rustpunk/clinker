@@ -104,15 +104,13 @@ fn unb_control_candidates(elements: &[String]) -> impl Iterator<Item = &str> {
     let s004_padded = elements.get(UNB_S004_INDEX).is_some_and(|e| e.is_empty());
     elements
         .iter()
-        .enumerate()
         .skip(UNB_LEADING_COMPOSITES)
-        .filter(|(_, e)| !e.is_empty())
-        .map(|(i, e)| (i, e.as_str()))
+        .map(String::as_str)
+        .filter(|e| !e.is_empty())
         // The primary candidate is the first non-empty element after the
         // leading composites; the shifted candidate is the next one, and
         // only when the empty S004 slot marks the doubly-degenerate shape.
         .take(if s004_padded { 2 } else { 1 })
-        .map(|(_, e)| e)
 }
 
 /// Whether a `UNZ` control-reference echo matches the control reference
