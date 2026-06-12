@@ -597,6 +597,32 @@ impl PlanNode {
         format!("{}.{}", self.type_tag(), self.name())
     }
 
+    /// The named output ports this node emits to, or `None` when the node
+    /// has a single unnamed output.
+    ///
+    /// Producer-side counterpart to a node's named inputs. A `Route` emits
+    /// one output per branch plus its `default`; the dispatcher tags each
+    /// outgoing edge with the [`PlanEdge::producer_port`] it carries, so a
+    /// record assigned to branch `b` flows down exactly the edges tagged
+    /// `b`. The returned set is deduplicated and preserves branch
+    /// declaration order, appending `default` last when it is not already a
+    /// branch name. Every other variant returns `None` (single output).
+    /// Future multi-output operators add their own arm here.
+    pub fn output_ports(&self) -> Option<Vec<&str>> {
+        match self {
+            PlanNode::Route {
+                branches, default, ..
+            } => {
+                let mut ports: Vec<&str> = branches.iter().map(String::as_str).collect();
+                if !ports.contains(&default.as_str()) {
+                    ports.push(default.as_str());
+                }
+                Some(ports)
+            }
+            _ => None,
+        }
+    }
+
     /// Human-readable label for DOT node annotations and text display.
     pub fn display_name(&self) -> String {
         match self {
@@ -698,14 +724,25 @@ impl DependencyType {
 
 /// Edge in the execution plan DAG.
 ///
-/// `port` carries the consumer-side port name when the edge feeds a
-/// node whose inputs are named (currently `PlanNode::Composition`). The
-/// dispatcher uses the live edge graph + port tag as the single source
-/// of truth for runtime port resolution: planner-injected nodes (e.g.,
-/// `inject_correlation_sort`'s synthetic Sort) reroute edges and carry
-/// the tag forward, so a downstream composition arm always reads its
-/// producer through the live graph rather than a frozen name snapshot.
-/// `None` for unnamed-input edges (every other consumer arm).
+/// An edge connects a producer output to a consumer input. Two
+/// independent port tags name the endpoints when either side carries
+/// more than one labelled stream:
+///
+/// - `producer_port` names which output of the producer this edge draws
+///   from. A node that emits multiple named output streams (today:
+///   `PlanNode::Route`, one output per branch plus the default) tags each
+///   outgoing edge with the output it carries. `None` means the producer
+///   has a single unnamed output (every other operator).
+/// - `port` (consumer-side) names which input of the consumer this edge
+///   feeds when the consumer takes named inputs (today:
+///   `PlanNode::Composition`). `None` otherwise.
+///
+/// The dispatcher uses the live edge graph + these tags as the single
+/// source of truth for runtime port resolution: planner-injected nodes
+/// (e.g., `inject_correlation_sort`'s synthetic Sort) reroute edges and
+/// carry both tags forward, so a downstream arm always reads its
+/// producer/consumer port through the live graph rather than a frozen
+/// name snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanEdge {
     pub dependency_type: DependencyType,
@@ -713,6 +750,14 @@ pub struct PlanEdge {
     /// `None` otherwise. Preserved across edge reroutes by every
     /// planner pass that splices intermediate nodes.
     pub port: Option<String>,
+    /// Producer-side output port this edge draws from when the producer
+    /// emits multiple named outputs (Route branches / default); `None`
+    /// for single-output producers. Preserved across edge reroutes by
+    /// every planner pass that splices an intermediate node: the spliced
+    /// node is a single-output passthrough, so the tag stays on the hop
+    /// leaving the original multi-output producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_port: Option<String>,
 }
 
 /// Plan-time projection of an operator's runtime arbitration parameters.

@@ -580,15 +580,18 @@ impl ExecutionPlanDag {
             out.push('\n');
         }
 
-        // Show route info from graph nodes
-        for node in self.graph.node_weights() {
+        // Show route info from graph nodes. Each branch (and the default)
+        // is an output port; the consumers it feeds are resolved from the
+        // producer-port-tagged outgoing edges, so the rendering reflects
+        // the live topology rather than assuming one consumer per port.
+        for idx in self.graph.node_indices() {
             if let PlanNode::Route {
                 name,
                 mode,
                 branches,
                 default,
                 ..
-            } = node
+            } = &self.graph[idx]
             {
                 out.push_str(&format!(
                     "Route '{}' (mode: {}):\n",
@@ -600,13 +603,15 @@ impl ExecutionPlanDag {
                 ));
                 for branch_name in branches {
                     out.push_str(&format!(
-                        "  Branch '{}' → output '{}'\n",
-                        branch_name, branch_name
+                        "  Branch '{}' → {}\n",
+                        branch_name,
+                        self.render_route_port_targets(idx, branch_name),
                     ));
                 }
                 out.push_str(&format!(
-                    "  Default: '{}' → output '{}'\n\n",
-                    default, default
+                    "  Default: '{}' → {}\n\n",
+                    default,
+                    self.render_route_port_targets(idx, default),
                 ));
             }
         }
@@ -623,6 +628,28 @@ impl ExecutionPlanDag {
         self.render_retraction_section(&mut out, None);
 
         out
+    }
+
+    /// Render the `--explain` target list for one Route output port.
+    ///
+    /// Walks the route node's outgoing edges, selecting those whose
+    /// [`PlanEdge::producer_port`] equals `port`, and lists each target
+    /// node's id slug. A port with no consumer renders `(unconsumed)` so
+    /// an author who wired a branch to nothing sees it. Multiple consumers
+    /// of one port render comma-separated in graph-edge order.
+    fn render_route_port_targets(&self, route_idx: NodeIndex, port: &str) -> String {
+        use petgraph::visit::EdgeRef;
+        let targets: Vec<String> = self
+            .graph
+            .edges_directed(route_idx, petgraph::Direction::Outgoing)
+            .filter(|e| e.weight().producer_port.as_deref() == Some(port))
+            .map(|e| self.graph[e.target()].id_slug())
+            .collect();
+        if targets.is_empty() {
+            "(unconsumed)".to_string()
+        } else {
+            targets.join(", ")
+        }
     }
 
     /// Render the retraction-cost block for content-relaxed aggregates
@@ -1493,7 +1520,16 @@ impl ExecutionPlanDag {
                     petgraph::dot::Config::EdgeNoLabel,
                     petgraph::dot::Config::NodeNoLabel,
                 ],
-                &|_, edge| { format!(r#"label="{}""#, edge.weight().dependency_type.as_str()) },
+                &|_, edge| {
+                    // Append the producer output port (Route branch /
+                    // default) to the dependency-type label so the graph
+                    // shows which branch each edge carries.
+                    let dep = edge.weight().dependency_type.as_str();
+                    match edge.weight().producer_port.as_deref() {
+                        Some(port) => format!(r#"label="{}:{}""#, dep, dot_escape(port)),
+                        None => format!(r#"label="{}""#, dep),
+                    }
+                },
                 &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
             )
         )
@@ -2292,6 +2328,7 @@ mod spill_projection_tests {
             PlanEdge {
                 dependency_type: DependencyType::Data,
                 port: None,
+                producer_port: None,
             },
         );
         dag.topo_order = vec![src_idx, sort_idx];

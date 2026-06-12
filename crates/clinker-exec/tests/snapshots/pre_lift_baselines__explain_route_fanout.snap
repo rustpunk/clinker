@@ -76,8 +76,8 @@ edge route.classify_route -> output.high:
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 Route 'classify_route' (mode: exclusive):
-  Branch 'high' → output 'high'
-  Default: 'low' → output 'low'
+  Branch 'high' → output.high
+  Default: 'low' → output.low
 
 === CXL Expressions ===
 

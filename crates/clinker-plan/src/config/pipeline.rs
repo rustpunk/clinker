@@ -937,19 +937,29 @@ impl PipelineConfig {
         }
         for spanned in &self.nodes {
             let node = &spanned.value;
-            let consumer_name = node.name();
-            let Some(&consumer_idx) = name_to_idx.get(consumer_name) else {
+            let consumer_name = node.name().to_string();
+            let Some(&consumer_idx) = name_to_idx.get(consumer_name.as_str()) else {
                 continue;
             };
             let mut wire = |producer_full: &str, port: Option<String>| {
                 let producer_key = strip_port_for_edge(producer_full);
                 if let Some(&producer_idx) = name_to_idx.get(producer_key) {
+                    // Tag the edge with the producer output port it draws
+                    // from so the dispatcher routes Route branches off the
+                    // live graph; `None` for single-output producers.
+                    let producer_port = resolve_producer_port(
+                        &graph[producer_idx],
+                        producer_full,
+                        producer_key,
+                        &consumer_name,
+                    );
                     graph.add_edge(
                         producer_idx,
                         consumer_idx,
                         PlanEdge {
                             dependency_type: DependencyType::Data,
                             port,
+                            producer_port,
                         },
                     );
                 }
@@ -1867,6 +1877,41 @@ fn input_full_reference(input: &node_header::NodeInput) -> String {
         node_header::NodeInput::Single(s) => s.clone(),
         node_header::NodeInput::Port { node, port } => format!("{node}.{port}"),
     }
+}
+
+/// Resolve the producer output port a consumer's edge draws from, given
+/// the producer node, the consumer's full input reference, the bare
+/// producer name, and the consumer's own name.
+///
+/// Two reference shapes select a port on a multi-output producer (today
+/// only `PlanNode::Route`, whose ports are its branches plus the default):
+///
+/// - Port form: `input: <route>.<branch>` — the suffix names the port.
+/// - Bare form: `input: <route>` on a consumer whose own *name* equals a
+///   branch (or the default). This shorthand reads as "this node IS the
+///   `<name>` branch": each branch has one consumer named for it.
+///
+/// Returns `None` for single-output producers, and for references that
+/// match neither shape (a suffix or consumer name that is not a declared
+/// port). Shared by the top-level and composition-body edge wiring so
+/// both scopes route Route branches off the live edge graph identically.
+pub(crate) fn resolve_producer_port(
+    producer: &crate::plan::execution::PlanNode,
+    producer_full: &str,
+    producer_key: &str,
+    consumer_name: &str,
+) -> Option<String> {
+    let ports = producer.output_ports()?;
+    if let Some(suffix) = producer_full
+        .strip_prefix(producer_key)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        return ports.contains(&suffix).then(|| suffix.to_string());
+    }
+    // Bare reference: the consumer's name selects the port.
+    ports
+        .contains(&consumer_name)
+        .then(|| consumer_name.to_string())
 }
 
 /// Unified input-reference resolution pass. Walks every node's

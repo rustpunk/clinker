@@ -1889,8 +1889,8 @@ fn bind_composition(
     }
     for spanned in &body_file.nodes {
         let n = &spanned.value;
-        let consumer_name = n.name();
-        let Some(&consumer_idx) = body_name_to_idx.get(consumer_name) else {
+        let consumer_name = n.name().to_string();
+        let Some(&consumer_idx) = body_name_to_idx.get(consumer_name.as_str()) else {
             continue;
         };
         let mut wire = |producer_full: &str, port: Option<String>| {
@@ -1900,12 +1900,23 @@ fn bind_composition(
             // graph edge — port seeding is handled at composition
             // entry by the executor through the live edge graph.
             if let Some(&producer_idx) = body_name_to_idx.get(producer_key) {
+                // Tag the producer output port a `<route>.<branch>` (or
+                // bare-name) reference draws from, mirroring the top-level
+                // wiring so the body executor routes Route branches off the
+                // live edge graph too.
+                let producer_port = crate::config::resolve_producer_port(
+                    &body_graph[producer_idx],
+                    producer_full,
+                    producer_key,
+                    &consumer_name,
+                );
                 body_graph.add_edge(
                     producer_idx,
                     consumer_idx,
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port,
+                        producer_port,
                     },
                 );
             }
