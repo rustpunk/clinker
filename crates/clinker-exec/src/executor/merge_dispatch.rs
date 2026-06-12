@@ -150,10 +150,10 @@ pub(crate) fn dispatch_merge(
     let mut nonfused_sender: Option<
         crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     > = None;
-    let (merged, fused_deduped_puncts): (
-        Vec<(Record, u64)>,
-        Vec<crate::executor::stream_event::Punctuation>,
-    ) = if fused_mode {
+    let FusedMergeOutput {
+        records: merged,
+        puncts: fused_deduped_puncts,
+    } = if fused_mode {
         let handoff = match (streaming_sender, merge_charge.as_ref()) {
             (Some(sender), Some(charge)) => Some(MergeStreamHandoff {
                 sender,
@@ -162,15 +162,14 @@ pub(crate) fn dispatch_merge(
             }),
             _ => None,
         };
-        let FusedMergeOutput { records, puncts } = merge_fused_interleave(
+        merge_fused_interleave(
             ctx,
             current_dag,
             name,
             &sorted_preds,
             merge_output_schema.as_ref(),
             handoff,
-        )?;
-        (records, puncts)
+        )?
     } else {
         nonfused_sender = streaming_sender;
         let total: usize = sorted_preds
@@ -279,7 +278,10 @@ pub(crate) fn dispatch_merge(
                 }
             }
         }
-        (merged, Vec::new())
+        FusedMergeOutput {
+            records: merged,
+            puncts: Vec::new(),
+        }
     };
 
     // Reconcile boundaries across every Merge input: one `DocumentOpen`

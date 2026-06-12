@@ -2204,12 +2204,23 @@ pub(crate) fn merge_fused_interleave(
     let deduped_puncts =
         crate::executor::stream_event::reconcile_document_boundaries(collected_puncts);
     if streaming.is_some() {
-        if !deduped_puncts.is_empty() {
-            let mut batch =
-                crate::executor::batch_handoff::EventBatch::with_capacity(deduped_puncts.len());
-            for p in deduped_puncts {
-                batch.push_punctuation(p);
+        // Emit the reconciled boundaries through the same bounded channel,
+        // chunked at `batch_size` exactly like the record stream above and
+        // the non-fused arm's `stream_linear_producer_emit`, so a run
+        // spanning very many documents never builds one unbounded tail
+        // batch. The sender then drops with this frame, disconnecting the
+        // writer thread's `recv` loop and triggering its flush.
+        let mut batch = crate::executor::batch_handoff::EventBatch::with_capacity(batch_size);
+        for p in deduped_puncts {
+            batch.push_punctuation(p);
+            if batch.len() >= batch_size {
+                flush_stream_batch(std::mem::replace(
+                    &mut batch,
+                    crate::executor::batch_handoff::EventBatch::with_capacity(batch_size),
+                ))?;
             }
+        }
+        if !batch.is_empty() {
             flush_stream_batch(batch)?;
         }
         return Ok(FusedMergeOutput {
