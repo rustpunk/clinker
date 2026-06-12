@@ -653,6 +653,40 @@ mod tests {
     }
 
     #[test]
+    fn split_date_time_unb_locates_control_ref_past_the_time_part() {
+        // The UNB transmits S004 date/time as two separate elements
+        // (date "240101" at index 3, time "1200" at index 4) instead of
+        // the conformant single composite "240101:1200". That split pushes
+        // the true control reference "REF1" to index 5. Without
+        // recombining the date/time the locator would take the time "1200"
+        // as the reference and spuriously reject this internally consistent
+        // interchange (UNZ correctly echoes "REF1").
+        let data = "UNB+UNOA:1+SENDER+RECEIVER+240101+1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'";
+        let recs = collect(data);
+        assert_eq!(recs.len(), 2); // UNH, BGM — no spurious rejection
+        assert_eq!(recs[1].get("seg_id"), Some(&Value::String("BGM".into())));
+    }
+
+    #[test]
+    fn split_date_time_unb_still_rejects_genuine_unz_mismatch() {
+        // The split-date/time recombination must not become a wildcard: a
+        // UNZ that echoes the time part "1200" instead of the true
+        // reference "REF1" is still a genuine mismatch.
+        let data = "UNB+UNOA:1+SENDER+RECEIVER+240101+1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+1200'";
+        let mut r = reader(data);
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected control ref mismatch for split date/time header"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::Edifact(m) if m.contains("does not echo the UNB")));
+    }
+
+    #[test]
     fn doubly_degenerate_unb_still_rejects_genuine_unz_mismatch() {
         // The doubly-degenerate shape must not become a wildcard: a UNZ
         // that echoes neither the canonical-slot date "240101" nor the

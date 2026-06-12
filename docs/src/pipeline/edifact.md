@@ -149,6 +149,18 @@ the fifth position) therefore validates and round-trips correctly: the
 reader reads the real reference and the writer echoes the same one into
 `UNZ`, so the trailer never contradicts its own header.
 
+The S004 date/time of preparation is conformantly a single element with
+a date component and a time component joined by the component separator
+(`240101:1200`). Some producers transmit it as two element-separated
+parts instead — a bare date `240101`, then a bare time `1200` — which
+pushes the control reference one position later. The reader recombines
+that split into its logical S004 slot before locating data element 0020,
+recognising it deterministically: a bare date token (all digits, six or
+eight wide) carrying no component separator in the S004 position,
+followed by a bare time token (all digits, four or six wide). It then
+skips both as the single date/time slot, so the control reference is
+read from the correct position and the round-trip echoes it into `UNZ`.
+
 A header that is degenerate in two ways at once — an empty date/time
 slot *and* a date-only date/time element placed where the control
 reference would normally sit — leaves two equally-plausible positions
@@ -230,3 +242,16 @@ have no source `UNB` section to echo.
   cannot be divided across files. An `edifact` output combined with a
   `split:` block is rejected at config-validation time (diagnostic
   `E323`) rather than emitting a structurally corrupt interchange.
+- **Doubly-degenerate header on re-emit.** The reader resolves the
+  doubly-degenerate shape (an empty date/time slot plus a date-only
+  date/time at the canonical control-reference position) against the
+  `UNZ` echo, which is available only on read. The writer reconstructs
+  the header before the trailer is computed and has no echo to consult,
+  so it cannot tell the date-only date/time apart from the control
+  reference and echoes the first candidate (the date). A read → write
+  round-trip of such a header still validates on re-read — the emitted
+  `UNZ` matches one of the same plausible positions — but names the date
+  rather than the true reference in the trailer. The split date/time and
+  single empty-padding shapes re-emit with the correct reference; only
+  this simultaneous double degeneracy carries the limitation, and it is
+  rare in practice.
