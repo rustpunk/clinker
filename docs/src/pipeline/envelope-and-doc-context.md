@@ -204,18 +204,13 @@ sources now forwards **each** source document's close (each document has
 open-count == close-count == 1 on its single branch), so those sources
 flush **independently** downstream — one roll-up per source document,
 exactly as feeding each source to its own Aggregate would. This holds for
-`mode: concat`, `mode: interleave` over non-Source inputs, and `mode:
-interleave` with an explicit `interleave_seed`. The roll-up split holds
-**regardless of whether the Aggregate's upstream streams or materializes**
-its output — both paths flush per document.
+**every** `Merge` mode: `mode: concat`, `mode: interleave` over
+non-Source inputs, `mode: interleave` with an explicit `interleave_seed`,
+and the fused all-Source `mode: interleave` fast path with no seed. The
+roll-up split holds **regardless of whether the Aggregate's upstream
+streams or materializes** its output — both paths flush per document.
 
-The **one** exception is the fused all-Source `mode: interleave` fast
-path **without** a seed: it consumes punctuations inline and forwards no
-per-source close, so distinct single-document sources merged that way
-fold into one cross-source aggregate (the same result you would get with
-no envelopes at all). This is a known limitation; add an
-`interleave_seed` (or use `mode: concat`) to get per-document roll-ups. A
-`Combine` (join) carries reconciled boundaries on every strategy, so a
+A `Combine` (join) carries reconciled boundaries on every strategy, so a
 per-document Aggregate downstream of a join also rolls up per driver
 document.
 

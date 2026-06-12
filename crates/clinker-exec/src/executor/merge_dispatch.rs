@@ -15,9 +15,9 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, MergeStreamHandoff, admit_node_buffer, drain_node_buffer_slot,
-    finalize_node_rooted_windows, merge_fused_interleave, node_buffer_spill_allowed,
-    stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    ExecutorContext, FusedMergeOutput, MergeStreamHandoff, admit_node_buffer,
+    drain_node_buffer_slot, finalize_node_rooted_windows, merge_fused_interleave,
+    node_buffer_spill_allowed, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
@@ -116,13 +116,12 @@ pub(crate) fn dispatch_merge(
             _ => false,
         });
 
-    // Punctuation collection state hoisted above the if-else so
-    // the dedup pass below the merge body can read it. The
-    // fused-mode merge_fused_interleave path does not yet
-    // forward punctuations (a follow-up will route them
-    // through merge_fused_interleave's recv loop); the else
-    // branch's drain logic fills `all_puncts` from each input
-    // NodeBuffer.
+    // Raw document-boundary punctuations drained from each non-fused input
+    // NodeBuffer; the cross-input fold below the merge body reconciles them.
+    // The fused path's inputs are live Source channels rather than
+    // NodeBuffers, so it collects and reconciles its own boundaries inside
+    // `merge_fused_interleave`, leaves `all_puncts` empty, and returns the
+    // already-reconciled set.
     let mut all_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
 
     // Streaming-Output handoff: if a single Output downstream of
@@ -151,7 +150,10 @@ pub(crate) fn dispatch_merge(
     let mut nonfused_sender: Option<
         crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     > = None;
-    let merged: Vec<(Record, u64)> = if fused_mode {
+    let FusedMergeOutput {
+        records: merged,
+        puncts: fused_deduped_puncts,
+    } = if fused_mode {
         let handoff = match (streaming_sender, merge_charge.as_ref()) {
             (Some(sender), Some(charge)) => Some(MergeStreamHandoff {
                 sender,
@@ -276,7 +278,10 @@ pub(crate) fn dispatch_merge(
                 }
             }
         }
-        merged
+        FusedMergeOutput {
+            records: merged,
+            puncts: Vec::new(),
+        }
     };
 
     // Reconcile boundaries across every Merge input: one `DocumentOpen`
@@ -284,8 +289,14 @@ pub(crate) fn dispatch_merge(
     // every input that opened a document has closed it. A document
     // carried by a single input branch forwards its close after that
     // branch's close, so a Merge of distinct single-document sources
-    // lets each document flush independently downstream.
-    let deduped_puncts = crate::executor::stream_event::reconcile_document_boundaries(all_puncts);
+    // lets each document flush independently downstream. The fused arm
+    // already ran this fold inside `merge_fused_interleave`, so reuse its
+    // reconciled set; the non-fused arm folds the raw `all_puncts` here.
+    let deduped_puncts = if fused_mode {
+        fused_deduped_puncts
+    } else {
+        crate::executor::stream_event::reconcile_document_boundaries(all_puncts)
+    };
 
     // Non-fused streaming path: the predecessors' slots are
     // already drained into the full `merged` Vec, so this does not

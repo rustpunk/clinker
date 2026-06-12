@@ -1861,6 +1861,30 @@ pub(crate) fn finalize_node_rooted_windows(
     Ok(())
 }
 
+/// Streaming handoff bundle for the fused `Merge.interleave` arm: the
+/// bounded-channel sender to the writer thread, the slot's per-batch
+/// charge handle, and the flush batch size. Present only when a single
+/// streaming-eligible Output downstream of the Merge installed its sender;
+/// absent on the materialized path (the arm accumulates a full `merged`
+/// Vec instead). Bundled into one struct so the arm's signature stays
+/// under the argument-count lint.
+pub(crate) struct MergeStreamHandoff<'a> {
+    pub(crate) sender: crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    pub(crate) charge: &'a crate::executor::batch_handoff::StreamingChargeHandle,
+    pub(crate) batch_size: usize,
+}
+
+/// Materialized result of the fused `Merge.interleave` arm: the merged
+/// records on the Merge's output schema and the document boundaries the
+/// arm reconciled across its Source inputs. Both empty on the streaming
+/// path (records and boundaries went out the bounded channel instead);
+/// on the materialized path the caller admits both into the node buffer,
+/// boundaries trailing the records.
+pub(crate) struct FusedMergeOutput {
+    pub(crate) records: Vec<(Record, u64)>,
+    pub(crate) puncts: Vec<crate::executor::stream_event::Punctuation>,
+}
+
 /// Drive the fused `Merge.mode: interleave` arm when every direct
 /// predecessor is a `PlanNode::Source` whose receiver is parked in
 /// `ctx.source_records`. Takes ownership of each predecessor's
@@ -1887,29 +1911,32 @@ pub(crate) fn finalize_node_rooted_windows(
 /// crossbeam's randomized ready-pick matches; no snapshot/baseline test
 /// asserts a specific order on this path.
 ///
-/// `streaming_sender` is `Some` iff the executor matched a fused
+/// Document-boundary punctuations arriving on the per-Source channels are
+/// collected as records stream through, then reconciled once at close via
+/// [`crate::executor::stream_event::reconcile_document_boundaries`] — the
+/// same cross-input fold the non-fused Merge arm runs: one `DocumentOpen`
+/// per document on first sighting, one `DocumentClose` once every input
+/// that opened a document has closed it. A fused Merge's predecessors are
+/// all Sources with independently minted `DocumentId`s, so in practice
+/// each document is carried by one input and the fold is a pass-through
+/// dedup; running it anyway keeps the fused and non-fused arms on one
+/// boundary contract. The reconciled boundaries trail the records,
+/// matching the non-fused arm's tail emission — a downstream
+/// document-scoped operator (per-document Aggregate flush, Output
+/// finalize) then observes each boundary exactly once.
+///
+/// `streaming` is `Some` iff the executor matched a fused
 /// `Merge.interleave → single Output` chain against the streaming
 /// eligibility predicate (issue #72). In streaming mode this function
 /// pushes each canonicalized record through the bounded channel instead
 /// of accumulating into a Vec, applies live back-pressure end-to-end
 /// (writer slow → Merge `send` blocks → Sources' channels fill →
-/// ingest threads block), and returns an empty Vec at close. In
-/// non-streaming mode (`None`) it returns the accumulated
-/// `Vec<(Record, u64)>` that the Merge arm then teed into
-/// `node_buffers` for downstream consumers.
-/// Streaming handoff bundle for the fused `Merge.interleave` arm: the
-/// bounded-channel sender to the writer thread, the slot's per-batch
-/// charge handle, and the flush batch size. Present only when a single
-/// streaming-eligible Output downstream of the Merge installed its sender;
-/// absent on the materialized path (the arm accumulates a full `merged`
-/// Vec instead). Bundled into one struct so the arm's signature stays
-/// under the argument-count lint.
-pub(crate) struct MergeStreamHandoff<'a> {
-    pub(crate) sender: crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
-    pub(crate) charge: &'a crate::executor::batch_handoff::StreamingChargeHandle,
-    pub(crate) batch_size: usize,
-}
-
+/// ingest threads block), emits the reconciled boundaries through the
+/// same channel at the tail, and returns an empty [`FusedMergeOutput`]
+/// at close. In materialized mode (`None`) the returned
+/// [`FusedMergeOutput`] carries the accumulated records and the
+/// reconciled boundaries, which the Merge arm admits into `node_buffers`
+/// for downstream consumers.
 pub(crate) fn merge_fused_interleave(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -1917,7 +1944,7 @@ pub(crate) fn merge_fused_interleave(
     sorted_preds: &[NodeIndex],
     merge_output_schema: Option<&Arc<Schema>>,
     streaming: Option<MergeStreamHandoff<'_>>,
-) -> Result<Vec<(Record, u64)>, PipelineError> {
+) -> Result<FusedMergeOutput, PipelineError> {
     // Per-predecessor state: the source's plan-time schema, its
     // engine-stamped tail mapping, its `Arc<str>` name (used for
     // the per-source running counter and the
@@ -1973,6 +2000,11 @@ pub(crate) fn merge_fused_interleave(
     let merge_schema_arc = merge_output_schema.cloned();
     let has_record_seed = !ctx.record_var_seed.is_empty();
     let mut merged: Vec<(Record, u64)> = Vec::new();
+    // Document-boundary punctuations arriving on the Source channels collect
+    // here and reconcile once at close, mirroring the non-fused Merge arm's
+    // collect-then-dedup pass. Punctuations are O(1) per document, so this
+    // stays tiny next to the record stream.
+    let mut collected_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     // Streaming-mode batch accumulator: records collect into one
     // `EventBatch` and flush through the slot's charge handle once the
     // batch fills, so the fused Merge participates in per-batch arbitrator
@@ -2070,16 +2102,15 @@ pub(crate) fn merge_fused_interleave(
                     .expect("select op_index maps to an active receiver"),
             )
             .ok();
-        // Fused merge path: punctuations from the per-Source live
-        // channels are currently consumed here. Forwarding them
-        // through the streaming-output channel with multi-input dedup
-        // (Merge-style barrier counter) requires per-source state on
-        // this select loop and lands as a follow-up — file under #91
-        // backlog. The non-fused Merge arm already deduplicates
-        // punctuations via the `all_puncts` collect-then-dedup pass.
+        // A document-boundary punctuation off a Source channel is collected
+        // for the close-time reconcile rather than forwarded inline; only
+        // records flow into the per-record pipeline below.
         let item: Option<(Record, u64)> = match item {
             Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => Some((r, rn)),
-            Some(crate::executor::stream_event::StreamEvent::Punctuation(_)) => continue,
+            Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                collected_puncts.push(p);
+                continue;
+            }
             None => None,
         };
         match item {
@@ -2100,8 +2131,13 @@ pub(crate) fn merge_fused_interleave(
                 }
                 per_source_counts[i] += 1;
                 // Re-canonicalize onto the Merge's output schema so
-                // downstream operators hit `Arc::ptr_eq` regardless
-                // of which Source produced the record.
+                // downstream operators hit `Arc::ptr_eq` regardless of which
+                // Source produced the record. The rebuild carries the
+                // record's document context across, so a downstream
+                // per-document operator still buckets each row by the
+                // document its Source opened — otherwise the rebuilt row
+                // would carry the synthetic sentinel id and every document's
+                // `DocumentClose` would flush an empty bucket.
                 if let Some(merge_schema) = merge_schema_arc.as_ref() {
                     check_input_schema(
                         merge_schema,
@@ -2110,8 +2146,10 @@ pub(crate) fn merge_fused_interleave(
                         "merge",
                         &state.source_name_string,
                     )?;
+                    let doc_ctx = Arc::clone(rec.doc_ctx());
                     let values = rec.values().to_vec();
                     rec = Record::new(Arc::clone(merge_schema), values);
+                    rec.set_doc_ctx(doc_ctx);
                 }
                 match stream_batch.as_mut() {
                     // Streaming: accumulate into the current batch and flush
@@ -2147,16 +2185,54 @@ pub(crate) fn merge_fused_interleave(
         }
     }
 
-    // Flush the trailing partial batch (streaming mode only). The
-    // streaming sender then drops with this function's frame, disconnecting
-    // the writer thread's `recv` loop and triggering its flush.
+    // Flush the trailing partial record batch (streaming mode only) before
+    // the boundary punctuations, so the reconciled closes trail every record.
     if let Some(batch) = stream_batch.take()
         && !batch.is_empty()
     {
         flush_stream_batch(batch)?;
     }
 
-    Ok(merged)
+    // Reconcile the collected boundaries down to one open + one close per
+    // document (the non-fused Merge arm's cross-input fold). In streaming
+    // mode emit them through the same bounded channel at the tail and
+    // return an empty result; the sender then drops with this frame,
+    // disconnecting the writer thread's `recv` loop and triggering its
+    // flush. In materialized mode hand the records and the reconciled
+    // boundaries back to the Merge arm, which admits both into the node
+    // buffer.
+    let deduped_puncts =
+        crate::executor::stream_event::reconcile_document_boundaries(collected_puncts);
+    if streaming.is_some() {
+        // Emit the reconciled boundaries through the same bounded channel,
+        // chunked at `batch_size` exactly like the record stream above and
+        // the non-fused arm's `stream_linear_producer_emit`, so a run
+        // spanning very many documents never builds one unbounded tail
+        // batch. The sender then drops with this frame, disconnecting the
+        // writer thread's `recv` loop and triggering its flush.
+        let mut batch = crate::executor::batch_handoff::EventBatch::with_capacity(batch_size);
+        for p in deduped_puncts {
+            batch.push_punctuation(p);
+            if batch.len() >= batch_size {
+                flush_stream_batch(std::mem::replace(
+                    &mut batch,
+                    crate::executor::batch_handoff::EventBatch::with_capacity(batch_size),
+                ))?;
+            }
+        }
+        if !batch.is_empty() {
+            flush_stream_batch(batch)?;
+        }
+        return Ok(FusedMergeOutput {
+            records: Vec::new(),
+            puncts: Vec::new(),
+        });
+    }
+
+    Ok(FusedMergeOutput {
+        records: merged,
+        puncts: deduped_puncts,
+    })
 }
 
 /// Drive a `PlanNode::Transform` whose sole upstream is a

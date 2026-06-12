@@ -11,11 +11,27 @@
 //! no-document / single-document control proves the dominant path is
 //! unchanged, a tiny memory budget exercises the spilling strategy across
 //! a document boundary, the streaming-ingest path is covered via a fused
-//! producer, and `concat` / seeded-`interleave` Merges of two
-//! single-document sources prove a non-fused Merge forwards each source's
-//! per-document close, so each source document flushes independently
-//! downstream — even when a seeded interleave delivers their records
-//! non-contiguously.
+//! producer, and `concat` / seeded-`interleave` / unseeded-`interleave`
+//! Merges of two single-document sources prove every Merge mode forwards
+//! each source's per-document close, so each source document flushes
+//! independently downstream, even when a seeded interleave delivers their
+//! records non-contiguously.
+//!
+//! The unseeded interleave is the FUSED all-Source path: with no
+//! `interleave_seed`, the Merge takes ownership of its Source receivers and
+//! runs a `crossbeam_channel::Select` over them, whereas the seeded sibling
+//! stays non-fused so its deterministic schedule survives over a
+//! pre-buffered Vec. The fused arm collects the per-Source document
+//! boundaries off the live channels and reconciles them at close, the same
+//! cross-input fold the non-fused arm runs over pre-buffered input
+//! punctuations, so a fused Merge forwards per-document closes too.
+//!
+//! No streaming fused `Merge.interleave -> single Output` boundary test
+//! lives here: an Output consumes document punctuations at finalize and
+//! never writes them into the CSV body, so a fused-streaming boundary is
+//! not observable in the writer's output. The materialized fused case
+//! below (an Aggregate downstream of the Merge) is where forwarding the
+//! boundary changes observable output, so that is the regression guard.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -558,5 +574,137 @@ nodes:
         "a seeded interleave is non-fused, so it forwards each source's \
          per-document close → per-document flush (x=3 from sa; x=2,y=1 from \
          sb), regardless of round-robin arrival order",
+    );
+}
+
+/// An UNSEEDED `interleave` Merge of two distinct-document Sources takes the
+/// fused all-Source path: the Merge owns the Source receivers and runs a
+/// `crossbeam_channel::Select` over the live channels rather than draining
+/// pre-buffered input slots. The fused arm collects each Source's document
+/// boundaries off its channel and reconciles them at close — the same
+/// cross-input fold the non-fused arm runs — then admits the reconciled
+/// closes into its node buffer trailing the records, so the downstream
+/// per-document Aggregate flushes each Source's document independently.
+///
+/// This is the regression guard for the fused path. With boundaries dropped
+/// on the fused arm (the historical behavior), no `DocumentClose` reaches
+/// the Aggregate until end-of-input, so it folds both documents into a
+/// single `x,5` + `y,1`. Forwarding the reconciled boundaries splits the
+/// fold per document: `x,3` from sa's document and `x,2` + `y,1` from sb's.
+/// The split is impossible without forwarding, so the body assertion alone
+/// pins the fix; the explicit fused-path assertion below removes any doubt
+/// that the run actually took the fused arm rather than an accidental
+/// non-fused one.
+#[test]
+fn fused_interleave_merge_forwards_per_source_document_close() {
+    let yaml = r#"
+pipeline:
+  name: fused_interleave_merge_agg
+nodes:
+  - type: source
+    name: sa
+    config:
+      name: sa
+      type: csv
+      path: ./sa.csv
+      schema:
+        - { name: category, type: string }
+  - type: source
+    name: sb
+    config:
+      name: sb
+      type: csv
+      path: ./sb.csv
+      schema:
+        - { name: category, type: string }
+  - type: merge
+    name: m
+    inputs: [sa, sb]
+    config:
+      mode: interleave
+  - type: aggregate
+    name: by_category
+    input: m
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let config = parse_config(yaml).expect("parse fused-interleave-merge pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile fused-interleave-merge pipeline");
+
+    // Prove this run takes the fused all-Source interleave arm: an unseeded
+    // interleave Merge whose every predecessor is a Source claims both
+    // Source receivers, so both names land in the fused set. The seeded
+    // sibling test, by contrast, has `interleave_seed` set and so produces
+    // an empty fused set. This is the same predicate the dispatcher consults
+    // at executor entry, so it can never drift from the runtime decision.
+    let (dag, _) =
+        clinker_exec::executor::PipelineExecutor::explain_plan_dag(&plan).expect("explain dag");
+    let fused =
+        clinker_plan::plan::execution::compute_merge_interleave_fused_sources(&dag, plan.config());
+    assert!(
+        fused.contains("sa") && fused.contains("sb"),
+        "an unseeded all-Source interleave Merge must fuse both Sources \
+         (so the fused merge_fused_interleave arm runs), got fused set: {fused:?}",
+    );
+
+    // sa: x×3 (one document); sb: x×2, y×1 (another document). The fused
+    // Merge reconciles each Source's per-document close and forwards it, so
+    // the Aggregate flushes per document: x=3 from sa's document, and x=2,
+    // y=1 from sb's document — never a folded x=5.
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "sa".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sa.csv",
+                Box::new(Cursor::new(b"category\nx\nx\nx\n".to_vec())),
+            ),
+        ),
+        (
+            "sb".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sb.csv",
+                Box::new(Cursor::new(b"category\nx\nx\ny\n".to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "e".to_string(),
+        batch_id: "b".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("run fused-interleave-merge pipeline");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    assert_eq!(
+        body,
+        vec!["x,2".to_string(), "x,3".to_string(), "y,1".to_string()],
+        "the fused interleave Merge forwards each Source's per-document close, \
+         so the Aggregate flushes per document (x=3 from sa; x=2,y=1 from sb), \
+         not a folded x=5",
     );
 }
