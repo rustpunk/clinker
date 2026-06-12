@@ -122,9 +122,11 @@ document and still emits a single aggregate. This holds **whether the
 Aggregate's upstream streams or materializes** its output — both flush
 per document.
 
-A `Merge` of distinct single-document sources now forwards each source's
-per-document close, so each source flushes its own roll-up. And
-per-document aggregation also works **after a `Combine`** on any join
+A `Merge` of distinct single-document sources forwards each source's
+per-document close on **every** mode — `concat`, seeded `interleave`, and
+the fused unseeded all-Source `interleave` fast path — so each source
+flushes its own roll-up. And per-document aggregation also works **after a
+`Combine`** on any join
 strategy — for example a driver `glob:` source joined to a lookup table,
 then a group-by Aggregate, yields one roll-up per driver document:
 
@@ -147,8 +149,7 @@ nodes:
 ```
 
 See [Envelopes & Document Context](../pipeline/envelope-and-doc-context.md#per-document-aggregation)
-for the boundary rules (including the one fused-interleave Merge exception
-that still folds distinct sources together).
+for the boundary rules across every `Merge` mode and `Combine` strategy.
 
 ### Strategy selection
 
