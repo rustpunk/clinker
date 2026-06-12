@@ -16,6 +16,9 @@
 use std::io::{BufRead, Read};
 
 use crate::error::FormatError;
+use crate::segment_tokenizer::{
+    SegmentFraming, TrailingSegment, read_raw_segment, skip_inter_segment_whitespace,
+};
 
 /// Hard ceiling on a single segment's raw byte length. A real EDIFACT
 /// segment is well under a kilobyte; this cap exists only so a stream
@@ -119,32 +122,21 @@ impl<R: BufRead> SegmentTokenizer<R> {
             };
             self.delimiters = delimiters;
             self.reader.consume(9);
-            self.skip_inter_segment_whitespace()?;
+            skip_inter_segment_whitespace(&mut self.reader)?;
         }
         Ok(())
     }
 
-    /// Consume CR/LF (and surrounding spaces/tabs) that some producers
-    /// insert between segments for readability. Stops at the first byte
-    /// that could begin a segment tag.
-    fn skip_inter_segment_whitespace(&mut self) -> Result<(), FormatError> {
-        loop {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                return Ok(());
-            }
-            let mut consumed = 0;
-            for &b in buf {
-                if b == b'\r' || b == b'\n' {
-                    consumed += 1;
-                } else {
-                    break;
-                }
-            }
-            if consumed == 0 {
-                return Ok(());
-            }
-            self.reader.consume(consumed);
+    /// EDIFACT segment framing: the terminator discovered from `UNA` (or the
+    /// Level-A default), the release character that escapes an embedded
+    /// terminator, and a terminator-less final segment rejected as a
+    /// truncated interchange.
+    fn framing(&self) -> SegmentFraming {
+        SegmentFraming {
+            terminator: self.delimiters.terminator,
+            release: Some(self.delimiters.release),
+            max_segment_bytes: MAX_SEGMENT_BYTES,
+            trailing: TrailingSegment::RejectUnterminated,
         }
     }
 
@@ -157,92 +149,37 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// dropped; CR/LF inside an element is preserved.
     pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
         self.initialize()?;
-        self.skip_inter_segment_whitespace()?;
+        skip_inter_segment_whitespace(&mut self.reader)?;
 
-        let terminator = self.delimiters.terminator;
-        let release = self.delimiters.release;
-
-        let mut raw: Vec<u8> = Vec::new();
-        let mut pending_release = false;
-
-        loop {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                // EOF. A non-empty pending buffer means a final segment
-                // with no terminator — truncation, not a clean end.
-                if raw.is_empty() {
-                    return Ok(None);
-                }
-                return Err(FormatError::Edifact(format!(
-                    "unterminated final segment ({} bytes read with no segment terminator); \
-                     the interchange is truncated",
-                    raw.len()
-                )));
-            }
-
-            let mut consumed = 0;
-            let mut finished = false;
-            for &b in buf {
-                consumed += 1;
-                if pending_release {
-                    // The previous byte was an unescaped release char;
-                    // this byte is literal regardless of its role.
-                    raw.push(release);
-                    raw.push(b);
-                    pending_release = false;
-                    continue;
-                }
-                if b == release {
-                    pending_release = true;
-                    continue;
-                }
-                if b == terminator {
-                    finished = true;
-                    break;
-                }
-                raw.push(b);
-            }
-            self.reader.consume(consumed);
-
-            if raw.len() > MAX_SEGMENT_BYTES {
-                return Err(FormatError::Edifact(format!(
+        let framing = self.framing();
+        let raw = match read_raw_segment(
+            &mut self.reader,
+            &framing,
+            || {
+                FormatError::Edifact(format!(
                     "segment exceeded the {MAX_SEGMENT_BYTES}-byte cap without a terminator; \
                      the interchange is malformed or the segment terminator is misconfigured"
-                )));
-            }
+                ))
+            },
+            |read| {
+                FormatError::Edifact(format!(
+                    "unterminated final segment ({read} bytes read with no segment terminator); \
+                     the interchange is truncated"
+                ))
+            },
+        )? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
 
-            if finished {
-                if pending_release {
-                    // Dangling release char with nothing to escape.
-                    raw.push(release);
-                }
-                let segment = strip_edge_whitespace(&raw);
-                let text = String::from_utf8(segment).map_err(|e| {
-                    FormatError::Edifact(format!(
-                        "segment is not valid UTF-8: {e}. Non-UTF-8 charsets \
-                         (UNOA/UNOB/Latin-1 high bytes) are not supported"
-                    ))
-                })?;
-                return Ok(Some(text));
-            }
-        }
+        let text = String::from_utf8(raw).map_err(|e| {
+            FormatError::Edifact(format!(
+                "segment is not valid UTF-8: {e}. Non-UTF-8 charsets \
+                 (UNOA/UNOB/Latin-1 high bytes) are not supported"
+            ))
+        })?;
+        Ok(Some(text))
     }
-}
-
-/// Drop CR/LF that bracket a raw segment body. Interior CR/LF is left
-/// intact — only the readability newlines a producer wraps around the
-/// terminator are insignificant.
-fn strip_edge_whitespace(raw: &[u8]) -> Vec<u8> {
-    let start = raw
-        .iter()
-        .position(|&b| b != b'\r' && b != b'\n')
-        .unwrap_or(raw.len());
-    let end = raw
-        .iter()
-        .rposition(|&b| b != b'\r' && b != b'\n')
-        .map(|p| p + 1)
-        .unwrap_or(start);
-    raw[start..end].to_vec()
 }
 
 /// A parsed segment: its tag plus its decoded data elements.

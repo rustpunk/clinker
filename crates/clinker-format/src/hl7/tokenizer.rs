@@ -29,6 +29,9 @@
 use std::io::{BufRead, Read};
 
 use crate::error::FormatError;
+use crate::segment_tokenizer::{
+    SegmentFraming, TrailingSegment, read_raw_segment, skip_inter_segment_whitespace,
+};
 
 /// Hard ceiling on a single segment's raw byte length. A real HL7 segment
 /// is well under a few kilobytes; this cap exists only so a stream with no
@@ -39,6 +42,17 @@ pub(crate) const MAX_SEGMENT_BYTES: usize = 256 * 1024;
 /// The HL7 segment terminator. Always a carriage return — never
 /// producer-chosen, unlike the field/encoding delimiters.
 const SEGMENT_TERMINATOR: u8 = b'\r';
+
+/// HL7 segment framing: the fixed carriage-return terminator, no release
+/// character (escape decoding happens later in [`split_segment`], not at the
+/// framing layer), and a terminator-less final segment accepted because HL7
+/// producers commonly drop the last carriage return.
+const FRAMING: SegmentFraming = SegmentFraming {
+    terminator: SEGMENT_TERMINATOR,
+    release: None,
+    max_segment_bytes: MAX_SEGMENT_BYTES,
+    trailing: TrailingSegment::AcceptUnterminated,
+};
 
 /// The four HL7 service delimiters discovered from the `MSH` header (the
 /// field separator plus the four encoding characters).
@@ -108,30 +122,6 @@ impl<R: BufRead> SegmentTokenizer<R> {
         self.delimiters
     }
 
-    /// Consume any inter-segment newline whitespace (`\r`/`\n`) that some
-    /// producers add between segments for readability. Stops at the first
-    /// byte that could begin a segment tag.
-    fn skip_inter_segment_whitespace(&mut self) -> Result<(), FormatError> {
-        loop {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                return Ok(());
-            }
-            let mut consumed = 0;
-            for &b in buf {
-                if b == b'\r' || b == b'\n' {
-                    consumed += 1;
-                } else {
-                    break;
-                }
-            }
-            if consumed == 0 {
-                return Ok(());
-            }
-            self.reader.consume(consumed);
-        }
-    }
-
     /// Read the first segment — an `MSH` message header, or an `FHS` file
     /// header or `BHS` batch header that wraps it — resolving the delimiter
     /// set from it and returning the raw segment text.
@@ -152,7 +142,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// four encoding characters (a non-HL7 or truncated stream leaves the
     /// delimiter set undefined, so nothing downstream can be tokenized).
     pub(crate) fn read_first_segment(&mut self) -> Result<String, FormatError> {
-        self.skip_inter_segment_whitespace()?;
+        skip_inter_segment_whitespace(&mut self.reader)?;
 
         // The header's delimiters are not yet known, so the first segment is
         // read up to the fixed carriage-return terminator without any escape
@@ -251,7 +241,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
             self.initialized,
             "read_first_segment must run before next_segment"
         );
-        self.skip_inter_segment_whitespace()?;
+        skip_inter_segment_whitespace(&mut self.reader)?;
         let raw = match self.read_raw_until_terminator()? {
             Some(bytes) => bytes,
             None => return Ok(None),
@@ -274,59 +264,25 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// passes through verbatim because the terminator is the fixed carriage
     /// return, and HL7 escape decoding happens later in [`split_segment`].
     fn read_raw_until_terminator(&mut self) -> Result<Option<Vec<u8>>, FormatError> {
-        let mut raw: Vec<u8> = Vec::new();
-        loop {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                if raw.is_empty() {
-                    return Ok(None);
-                }
-                // A final segment with no trailing CR is the common HL7
-                // shape; strip surrounding newlines and accept it.
-                return Ok(Some(strip_edge_whitespace(&raw)));
-            }
-
-            let mut consumed = 0;
-            let mut finished = false;
-            for &b in buf {
-                consumed += 1;
-                if b == SEGMENT_TERMINATOR {
-                    finished = true;
-                    break;
-                }
-                raw.push(b);
-            }
-            self.reader.consume(consumed);
-
-            if raw.len() > MAX_SEGMENT_BYTES {
-                return Err(FormatError::Hl7(format!(
+        // HL7 accepts a terminator-less final segment, so the truncation
+        // constructor is unreachable under this framing policy.
+        read_raw_segment(
+            &mut self.reader,
+            &FRAMING,
+            || {
+                FormatError::Hl7(format!(
                     "segment exceeded the {MAX_SEGMENT_BYTES}-byte cap without a carriage-return \
                      terminator; the file is malformed or not HL7 v2"
-                )));
-            }
-
-            if finished {
-                return Ok(Some(strip_edge_whitespace(&raw)));
-            }
-        }
+                ))
+            },
+            |read| {
+                FormatError::Hl7(format!(
+                    "unterminated final HL7 segment ({read} bytes read with no carriage-return \
+                     terminator)"
+                ))
+            },
+        )
     }
-}
-
-/// Drop a line-feed that brackets a raw segment body. HL7 segments end in
-/// a bare carriage return, but producers (and CRLF-normalizing transports)
-/// often add a line feed; that whitespace is insignificant, so it is
-/// trimmed from the segment edges. Interior bytes are left intact.
-fn strip_edge_whitespace(raw: &[u8]) -> Vec<u8> {
-    let start = raw
-        .iter()
-        .position(|&b| b != b'\r' && b != b'\n')
-        .unwrap_or(raw.len());
-    let end = raw
-        .iter()
-        .rposition(|&b| b != b'\r' && b != b'\n')
-        .map(|p| p + 1)
-        .unwrap_or(start);
-    raw[start..end].to_vec()
 }
 
 /// A parsed segment: its tag plus its decoded data fields.
