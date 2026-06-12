@@ -399,6 +399,18 @@ impl BuiltinRegistry {
                 category: Category::Array,
             },
         );
+        methods.insert(
+            "unset",
+            BuiltinDef {
+                name: "unset",
+                receiver: TypeTag::Map,
+                args: vec![TypeTag::String],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::Map,
+                category: Category::Array,
+            },
+        );
 
         // ── Conversion strict (6) ──
         let cs = |name: &'static str,

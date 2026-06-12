@@ -681,6 +681,16 @@ pub fn dispatch_method(
             }
             _ => Value::Null,
         })),
+        "unset" => Ok(Some(match (receiver, args.first()) {
+            (Value::Map(m), Some(Value::String(key))) => {
+                // A bare key (no `.` / `[n]`) drops a top-level entry, mirroring
+                // `remove_field`. A dotted/indexed path descends to the addressed
+                // leaf and deletes it; see `map_unset_path` for the
+                // shift-on-array-remove and missing-path-is-a-no-op rules.
+                map_unset_path(m, key.as_str())
+            }
+            _ => Value::Null,
+        })),
 
         _ => Ok(None), // Unknown method
     }
@@ -811,6 +821,92 @@ fn set_in(target: &mut Value, segs: &[PathSeg<'_>], val: &Value) -> bool {
         },
         // Field-into-array, index-into-map, or any scalar where a container is
         // required: a hard type conflict.
+        _ => false,
+    }
+}
+
+// ── `.unset` path deletion ──────────────────────────────────
+//
+// `.unset` is the deletion counterpart to `.set`: it reuses the very same path
+// grammar (`parse_set_path`) to address one leaf and remove it. The contrasts
+// with `.set` are deliberate:
+//   * An array element is removed **and the tail shifts down** (jq `del`
+//     semantics) — the array shrinks by one. This is distinct from
+//     `set(path, null)`, which leaves a null hole.
+//   * A path that does not resolve — missing intermediate, missing final key,
+//     array index past the end, or a type conflict (a field segment into a
+//     non-map, an index segment into a non-array) — is a **no-op returning the
+//     receiver unchanged**, never `Null`. This mirrors `remove_field` returning
+//     the receiver unchanged when the key is absent, and is the opposite of
+//     `.set`, which yields `Null` on a conflicting path.
+// Like every map method it is copy-on-write: the receiver is never mutated.
+
+/// Deletes the leaf addressed by `key` within map `m`, returning a fresh
+/// `Value::Map`.
+///
+/// A malformed path string, or any path that does not resolve to an existing
+/// leaf, is a no-op: the receiver is returned unchanged (contrast `map_set_path`,
+/// which yields `Null` on a conflicting path). Array elements are removed with a
+/// down-shift so the array shrinks by one. The receiver is cloned before any
+/// edit, so the caller's binding is untouched.
+fn map_unset_path(m: &indexmap::IndexMap<Box<str>, Value>, key: &str) -> Value {
+    let Some(segs) = parse_set_path(key) else {
+        return Value::Map(Box::new(m.clone()));
+    };
+    let mut root = Value::Map(Box::new(m.clone()));
+    // The cloned `root` is the unchanged receiver whether or not `unset_in`
+    // deletes anything, so a no-op simply returns it as-is.
+    unset_in(&mut root, &segs);
+    root
+}
+
+/// Removes the leaf at path `segs` inside `target`, descending in place into the
+/// caller's already-cloned copy. Returns `true` when a leaf was actually deleted
+/// and `false` for any unresolved path (missing key, index past the end, or a
+/// type conflict), leaving `target` untouched in the `false` case so the whole
+/// `.unset` is a no-op.
+fn unset_in(target: &mut Value, segs: &[PathSeg<'_>]) -> bool {
+    let Some((head, rest)) = segs.split_first() else {
+        // Unreachable in practice: `parse_set_path` always yields at least one
+        // segment, and the recursion below only descends with a non-empty
+        // `rest`, so `unset_in` never sees an empty path. Kept as a defensive
+        // no-op (no leaf to delete → receiver unchanged) rather than a panic.
+        // Deletion acts on the parent container, so — unlike `set_in` — there
+        // is no recurse-into-empty-base write step that would make this live.
+        return false;
+    };
+    match (head, target) {
+        (PathSeg::Field(name), Value::Map(map)) => {
+            if rest.is_empty() {
+                // `shift_remove` deletes the entry and preserves the order of the
+                // surviving keys; absence is a no-op.
+                map.shift_remove(*name).is_some()
+            } else {
+                match map.get_mut(*name) {
+                    Some(child) => unset_in(child, rest),
+                    None => false, // missing intermediate → no-op
+                }
+            }
+        }
+        (PathSeg::Index(idx), Value::Array(items)) => {
+            if rest.is_empty() {
+                if *idx < items.len() {
+                    // Remove-and-shift: the array shrinks by one (jq `del`),
+                    // distinct from `set(path, null)` leaving a hole.
+                    items.remove(*idx);
+                    true
+                } else {
+                    false // index past the end → no-op
+                }
+            } else {
+                match items.get_mut(*idx) {
+                    Some(child) => unset_in(child, rest),
+                    None => false, // index past the end → no-op
+                }
+            }
+        }
+        // Field-into-array, index-into-map, or a scalar where a container is
+        // required: a type conflict, so a no-op.
         _ => false,
     }
 }
