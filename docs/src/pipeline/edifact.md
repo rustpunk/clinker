@@ -149,6 +149,17 @@ the fifth position) therefore validates and round-trips correctly: the
 reader reads the real reference and the writer echoes the same one into
 `UNZ`, so the trailer never contradicts its own header.
 
+A header that is degenerate in two ways at once — an empty date/time
+slot *and* a date-only date/time element placed where the control
+reference would normally sit — leaves two equally-plausible positions
+for data element 0020 that the header alone cannot tell apart (the shape
+is byte-identical to a conformant header whose optional recipient
+reference is present). The reader resolves this against the `UNZ`
+control-reference echo: 0020 is the candidate position the trailer
+echoes, so a self-consistent interchange of this shape validates and the
+intended control reference is identified, while a trailer that echoes
+neither plausible position is still rejected as a mismatch.
+
 A missing `UNZ` at end of input is a truncation error; content after the
 `UNZ` trailer is rejected.
 
