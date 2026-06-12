@@ -1,10 +1,12 @@
 //! End-to-end surfacing of the compile-time `$doc` path set.
 //!
 //! `cxl::analyzer::doc_paths` collects every `$doc.<section>.<field>` the
-//! pipeline's programs reference; `PipelineConfig::compile` stamps that
-//! set onto each lowered `Source` node's `SourceConfig`. These tests pin
-//! the plan-build wiring: the path set reaches the Source, and a `$doc`
-//! access indexed by a non-literal aborts the compile with E340.
+//! pipeline's programs reference, attributed to the referencing node;
+//! `PipelineConfig::compile` traces each path back through the DAG to its
+//! source(s) and stamps only those sources' `SourceConfig`. These tests
+//! pin the plan-build wiring: each path reaches exactly the source(s)
+//! feeding it (never the pipeline-wide union), and a `$doc` access
+//! indexed by a non-literal aborts the compile with E340.
 
 use cxl::analyzer::doc_paths::{DocIndex, DocPath};
 
@@ -249,16 +251,124 @@ nodes:
         .compile(&CompileContext::default())
         .expect("compile combine-doc pipeline");
     let dag = plan.dag();
-    // Both sources carry the pipeline-wide set (the known
-    // over-attachment); assert the Combine-predicate path reached it.
-    let any_source_has_path = dag.graph.node_indices().any(|idx| {
-        matches!(&dag.graph[idx], PlanNode::Source { resolved: Some(r), .. }
-            if r.source.declared_doc_paths.contains(&path("Head", "cutoff", vec![])))
-    });
+    let head_cutoff = path("Head", "cutoff", vec![]);
+    // A joined record carries the DRIVING input's document context, so a
+    // `$doc` access in the Combine predicate is attributed to the driver
+    // source only. `left` is declared first (the planner's declaration-
+    // order driver default) and is the source whose envelope declares
+    // `Head`. The probe-side `right` source — which has no envelope —
+    // must NOT be told to extract it.
+    let paths_for = |source_name: &str| -> Vec<DocPath> {
+        dag.graph
+            .node_indices()
+            .find_map(|idx| match &dag.graph[idx] {
+                PlanNode::Source {
+                    name,
+                    resolved: Some(r),
+                    ..
+                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
     assert!(
-        any_source_has_path,
-        "`$doc.Head.cutoff` used in the Combine predicate must reach the declared set"
+        paths_for("left").contains(&head_cutoff),
+        "the driving source `left` must carry the Combine-predicate `$doc` path"
     );
+    assert!(
+        !paths_for("right").contains(&head_cutoff),
+        "the probe source `right` must NOT carry the driver's `$doc` path"
+    );
+}
+
+#[test]
+fn test_multi_source_paths_are_attributed_per_source() {
+    // Two independent single-source chains read disjoint `$doc` paths.
+    // Each source must carry ONLY the path its own downstream program
+    // reads — never the pipeline-wide union — so a multi-source run does
+    // not tell a source to extract another source's envelope section.
+    let yaml = r#"
+pipeline:
+  name: multi_source_doc
+nodes:
+  - type: source
+    name: alpha
+    config:
+      name: alpha
+      type: xml
+      glob: ./a/*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          AHead:
+            extract: { xml_path: "/doc/AHead" }
+            fields:
+              a_batch: string
+      schema:
+        - { name: amount, type: int }
+  - type: source
+    name: beta
+    config:
+      name: beta
+      type: xml
+      glob: ./b/*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          BHead:
+            extract: { xml_path: "/doc/BHead" }
+            fields:
+              b_batch: string
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: tag_alpha
+    input: alpha
+    config:
+      cxl: |
+        emit amount = amount
+        emit a = $doc.AHead.a_batch
+  - type: transform
+    name: tag_beta
+    input: beta
+    config:
+      cxl: |
+        emit amount = amount
+        emit b = $doc.BHead.b_batch
+  - type: merge
+    name: merged
+    inputs: [tag_alpha, tag_beta]
+  - type: output
+    name: out
+    input: merged
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-source pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile multi-source pipeline");
+    let dag = plan.dag();
+    let paths_for = |source_name: &str| -> Vec<DocPath> {
+        dag.graph
+            .node_indices()
+            .find_map(|idx| match &dag.graph[idx] {
+                PlanNode::Source {
+                    name,
+                    resolved: Some(r),
+                    ..
+                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    // `alpha` carries only its own section; `beta` only its own.
+    assert_eq!(paths_for("alpha"), vec![path("AHead", "a_batch", vec![])]);
+    assert_eq!(paths_for("beta"), vec![path("BHead", "b_batch", vec![])]);
 }
 
 #[test]
