@@ -13,11 +13,12 @@
 //!
 //! * **Plane B — exec-time, sketch-maintained.** Distinct counts
 //!   (HyperLogLog), heavy hitters (Misra-Gries), and membership (Bloom)
-//!   accumulated by [`RuntimeStatistics`] as records flow during a run.
-//!   These are read back by the same run's reporting and by downstream
-//!   in-DAG nodes that execute *after* the producer. They never re-decide
-//!   an upstream plan node: a record-derived statistic cannot exist when
-//!   that upstream node was already planned.
+//!   accumulated into a shared, interior-mutable catalog the executor
+//!   carries as records flow during a run. These are read back by the
+//!   same run's reporting and by downstream in-DAG nodes that execute
+//!   *after* the producer. They never re-decide an upstream plan node: a
+//!   record-derived statistic cannot exist when that upstream node was
+//!   already planned.
 //!
 //! Every column-level field is `Option`, so a stat that was never
 //! gathered renders as an honest absence rather than a fabricated zero —
@@ -123,9 +124,10 @@ pub struct ColumnStats {
 /// Holds already-finalized summaries: per-node row counts (Plane A seed,
 /// optionally overwritten by an exec-time finalize) and per-column
 /// [`ColumnStats`]. Plain owned data with no locks, so it clones with
-/// `CompileArtifacts` and is read freely across the planner. Exec-time
-/// accumulation happens in [`RuntimeStatistics`], whose finalized results
-/// fold back in via [`StatisticsCatalog::record_distinct`] and friends.
+/// `CompileArtifacts` and is read freely across the planner. At execution
+/// time the executor wraps a clone of this catalog in a shared lock and
+/// folds in finalized sketch results via [`StatisticsCatalog::record_distinct`]
+/// and friends as operators drain.
 #[derive(Debug, Default, Clone)]
 pub struct StatisticsCatalog {
     row_counts: HashMap<Arc<str>, RowCount>,
