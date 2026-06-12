@@ -426,3 +426,61 @@ fn explain_cites_metadata_driven_grace_hash() {
     );
     insta::assert_snapshot!("explain_metadata_driven_grace_hash", text);
 }
+
+/// Pin the artifacts-aware explain text for a plan whose statistics catalog
+/// carries exec-time sketch results, so the `Statistics` block's distinct,
+/// heavy-hitter, and membership lines are reviewed line-by-line. A real run
+/// populates these as the grace-hash join drains; the test injects the same
+/// finalized summaries the join would record so the plan-only explain
+/// surface can render them deterministically.
+#[test]
+fn explain_renders_exec_sketches_in_statistics_block() {
+    use clinker_plan::plan::statistics::{BloomSummary, StatKey};
+    use clinker_record::Value;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_padded_csv(tmp.path(), "products.csv", "product_id,name", 60 * 1024);
+    write_padded_csv(tmp.path(), "orders.csv", "product_id,amount", 90 * 1024);
+
+    let config: PipelineConfig = parse_config(grace_from_metadata_yaml()).expect("parse_config");
+    let ctx = CompileContext::with_pipeline_dir(tmp.path(), "");
+    let plan = config.compile(&ctx).expect("compile");
+
+    // Clone the artifacts and fold in the build-side sketches the grace-hash
+    // join records at completion, keyed under the build upstream node.
+    let mut artifacts = plan.artifacts().clone();
+    let key = StatKey::new("products", "product_id");
+    artifacts.statistics.record_distinct(key.clone(), 58);
+    artifacts.statistics.record_heavy_hitters(
+        key.clone(),
+        vec![
+            (Value::from("p0"), 12),
+            (Value::from("p1"), 9),
+            (Value::from("p2"), 4),
+        ],
+    );
+    artifacts.statistics.record_bloom(
+        key,
+        BloomSummary {
+            bit_count: 560,
+            hash_count: 7,
+            sized_from_estimate: true,
+        },
+    );
+
+    let text = plan.dag().explain_text_with_artifacts(&config, &artifacts);
+
+    assert!(
+        text.contains("58 distinct [exec sketch]"),
+        "distinct count must render with exec-sketch provenance; got:\n{text}"
+    );
+    assert!(
+        text.contains("heavy hitters [exec sketch, lower bound]: p0=12"),
+        "heavy hitters must render top-k values with counts; got:\n{text}"
+    );
+    assert!(
+        text.contains("membership filter, 560 bits / 7 probes [exec sketch, sized from estimate]"),
+        "membership filter must render with exec-sketch provenance; got:\n{text}"
+    );
+    insta::assert_snapshot!("explain_exec_sketches_statistics", text);
+}

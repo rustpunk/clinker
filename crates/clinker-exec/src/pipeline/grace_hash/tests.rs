@@ -545,19 +545,62 @@ fn execute_grace_hash_partition_pair_correct() {
         .collect();
     assert_eq!(seen, expected);
 
-    // Plane B lifecycle: the join routed its build-side distinct-count
-    // estimate into the catalog. 10 distinct build keys over a 1024-
-    // register HLL lands at or very near 10.
+    // Plane B lifecycle: the join routed all three build-side sketches
+    // into the catalog under (products, products).
     let catalog = stats_catalog.lock().unwrap();
-    let distinct = catalog
+    let stats = catalog
         .column("products", "products")
-        .and_then(|c| c.distinct)
+        .expect("grace hash must record build-side column statistics");
+
+    // Distinct: 10 distinct build keys over a 1024-register HLL lands at or
+    // very near 10.
+    let distinct = stats
+        .distinct
         .expect("grace hash must record a build-side distinct estimate");
     assert!(
         (8..=12).contains(&distinct.0),
         "10 distinct build keys should estimate near 10; got {}",
         distinct.0
     );
+
+    // Heavy hitters: each of the 10 keys appears once, so all survive the
+    // 256-counter sketch; the report caps at the top 16, so all 10 list.
+    let hitters = stats
+        .heavy_hitters
+        .as_ref()
+        .expect("grace hash must record build-side heavy hitters");
+    assert_eq!(
+        hitters.len(),
+        10,
+        "all 10 single-occurrence keys survive the Misra-Gries sketch; got {hitters:?}"
+    );
+    for (_, count) in hitters {
+        assert_eq!(
+            *count, 1,
+            "each key appears once, so its lower-bound count is 1"
+        );
+    }
+    // The representative values are the actual single-component build join
+    // keys (`bk` = "0".."9"), not opaque hashes.
+    let hitter_values: std::collections::HashSet<String> =
+        hitters.iter().map(|(v, _)| v.to_string()).collect();
+    for i in 0..10 {
+        assert!(
+            hitter_values.contains(&i.to_string()),
+            "heavy-hitter list must carry the real join-key value {i}; got {hitter_values:?}"
+        );
+    }
+
+    // Membership: a Bloom filter sized from the distinct estimate, recorded
+    // as estimate-sized with a positive bit/probe budget.
+    let bloom = stats
+        .bloom
+        .expect("grace hash must record a build-side membership filter");
+    assert!(
+        bloom.sized_from_estimate,
+        "Bloom was sized from the HLL estimate"
+    );
+    assert!(bloom.bit_count > 0 && bloom.hash_count > 0);
 }
 
 /// End-to-end: a tiny memory budget forces partition spill during

@@ -163,12 +163,26 @@ fn render_statistics_section(
                     source.label()
                 ));
             }
-            if let Some(hitters) = &stats.heavy_hitters {
+            if let Some(hitters) = &stats.heavy_hitters
+                && !hitters.is_empty()
+            {
+                // Show the top few `value=count` pairs inline; the counts
+                // are Misra-Gries lower bounds, so the line is the floor on
+                // each listed key's frequency, never an exclusion of others.
+                let preview = hitters
+                    .iter()
+                    .take(3)
+                    .map(|(v, c)| format!("{v}={}", format_thousands(*c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if hitters.len() > 3 {
+                    format!(", +{} more", hitters.len() - 3)
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
-                    "  {}.{}: {} heavy hitter(s) [exec sketch, lower bound]\n",
-                    key.node,
-                    key.column,
-                    hitters.len()
+                    "  {}.{}: heavy hitters [exec sketch, lower bound]: {preview}{more}\n",
+                    key.node, key.column,
                 ));
             }
             if let Some(bloom) = &stats.bloom {
@@ -2302,6 +2316,69 @@ mod spill_projection_tests {
             dag.spill_decision_column_count(sort_idx),
             runtime_input_width,
             "the --explain Sort column count must equal the runtime spilled-batch width"
+        );
+    }
+
+    /// The Statistics section renders all three exec-sketch results — a
+    /// distinct count, a top-k heavy-hitter list with counts, and a
+    /// membership-filter summary — each tagged with its `exec sketch`
+    /// provenance, exactly as a catalog populated during a grace-hash run
+    /// would surface them.
+    #[test]
+    fn statistics_section_renders_all_three_sketch_classes() {
+        use crate::plan::statistics::{BloomSummary, StatKey, StatisticsCatalog};
+        use clinker_record::Value;
+
+        let mut catalog = StatisticsCatalog::new();
+        catalog.seed_row_count_from_bytes("orders", Some(1024 * 1200));
+        let key = StatKey::new("orders", "product_id");
+        catalog.record_distinct(key.clone(), 12_431);
+        catalog.record_heavy_hitters(
+            key.clone(),
+            vec![
+                (Value::from("widget"), 9_000),
+                (Value::from("gadget"), 3_200),
+                (Value::from("gizmo"), 1_100),
+                (Value::from("sprocket"), 800),
+            ],
+        );
+        catalog.record_bloom(
+            key,
+            BloomSummary {
+                bit_count: 119_048,
+                hash_count: 7,
+                sized_from_estimate: true,
+            },
+        );
+
+        let mut out = String::new();
+        render_statistics_section(&mut out, &catalog);
+
+        let expected = "\
+=== Statistics ===
+
+Row counts:
+  orders: ≈1,200 rows [file metadata] (informs combine build/probe + partition bits)
+
+Column sketches:
+  orders.product_id: 12,431 distinct [exec sketch]
+  orders.product_id: heavy hitters [exec sketch, lower bound]: widget=9,000, gadget=3,200, gizmo=1,100, +1 more
+  orders.product_id: membership filter, 119048 bits / 7 probes [exec sketch, sized from estimate]
+
+";
+        assert_eq!(out, expected, "rendered:\n{out}");
+    }
+
+    /// An empty catalog adds no Statistics section, preserving the
+    /// honest-null floor for a plan with no sized sources or sketches.
+    #[test]
+    fn statistics_section_omitted_when_catalog_empty() {
+        use crate::plan::statistics::StatisticsCatalog;
+        let mut out = String::new();
+        render_statistics_section(&mut out, &StatisticsCatalog::new());
+        assert!(
+            out.is_empty(),
+            "empty catalog must add nothing; got {out:?}"
         );
     }
 }
