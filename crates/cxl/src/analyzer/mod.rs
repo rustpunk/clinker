@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use crate::ast::{Expr, MatchArm, Statement};
 use crate::typecheck::pass::TypedProgram;
 
+pub mod doc_paths;
+
 /// Which category of window function was called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFunction {

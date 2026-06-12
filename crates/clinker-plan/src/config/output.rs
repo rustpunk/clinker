@@ -248,3 +248,34 @@ pub struct X12OutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_newline: Option<bool>,
 }
+
+/// HL7 v2 output options.
+///
+/// The writer re-emits the `MSH` and body segments from the record stream
+/// and optionally wraps them in batch/file envelopes. An `FHS` file header
+/// comes from `file_header` (literal fields) or, when that is unset, is
+/// echoed from the `$doc` section named by `file_header_from_doc` for
+/// round-trip reconstruction; a `BHS` batch header comes from
+/// `batch_header`. When either envelope is configured the writer recomputes
+/// the closing `BTS`/`FTS` counts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Hl7OutputOptions {
+    /// Literal `FHS` file-header fields written verbatim. Takes precedence
+    /// over `file_header_from_doc` when both are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_header: Option<Vec<String>>,
+    /// Name of a `$doc` section to echo the `FHS` fields from (the reader's
+    /// positional `FHS` envelope section), enabling round-trip file-header
+    /// reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_header_from_doc: Option<String>,
+    /// Literal `BHS` batch-header fields written verbatim. When set, the
+    /// writer wraps the messages in a `BHS..BTS` batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_header: Option<Vec<String>>,
+    /// Write a newline after each segment's carriage-return terminator for
+    /// readability. Defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_newline: Option<bool>,
+}

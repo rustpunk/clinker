@@ -17,6 +17,7 @@ pub enum InputFormat {
     FixedWidth(Option<FixedWidthInputOptions>),
     Edifact(Option<EdifactInputOptions>),
     X12(Option<X12InputOptions>),
+    Hl7(Option<Hl7InputOptions>),
 }
 
 impl InputFormat {
@@ -29,6 +30,7 @@ impl InputFormat {
             InputFormat::FixedWidth(_) => "fixed_width",
             InputFormat::Edifact(_) => "edifact",
             InputFormat::X12(_) => "x12",
+            InputFormat::Hl7(_) => "hl7",
         }
     }
 
@@ -51,6 +53,7 @@ impl OutputFormat {
             OutputFormat::FixedWidth(_) => "fixed_width",
             OutputFormat::Edifact(_) => "edifact",
             OutputFormat::X12(_) => "x12",
+            OutputFormat::Hl7(_) => "hl7",
         }
     }
 }
@@ -65,6 +68,7 @@ pub enum OutputFormat {
     FixedWidth(Option<FixedWidthOutputOptions>),
     Edifact(Option<EdifactOutputOptions>),
     X12(Option<X12OutputOptions>),
+    Hl7(Option<Hl7OutputOptions>),
 }
 
 /// Supported format types.

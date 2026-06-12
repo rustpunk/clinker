@@ -14,7 +14,7 @@ Output nodes write processed records to files. They are the terminal nodes of a 
     path: "./output/result.csv"
 ```
 
-The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, or `x12`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; see [EDIFACT Format](edifact.md) and [X12 Format](x12.md).
+The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, or `hl7`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; the `hl7` writer re-emits HL7 v2 segments and optionally wraps them in batch/file envelopes. See [EDIFACT Format](edifact.md), [X12 Format](x12.md), and [HL7 v2 Format](hl7.md).
 
 ## Field control
 
@@ -65,7 +65,7 @@ Set `include_correlation_keys: true` to surface the shadow columns in the writer
 
 ### Writer rejection of `Value::Map` payloads
 
-CSV, XML, fixed-width, EDIFACT, and X12 writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
+CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
 
 The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
 
@@ -217,6 +217,33 @@ interchange is a single envelope, so an `edifact` output cannot be
 combined with a `split:` block — the combination is rejected at
 config-validation time (`E323`). See [EDIFACT Format](edifact.md) for the
 full option reference, the record schema, and the round-trip semantics.
+
+### HL7 v2
+
+```yaml
+- type: output
+  name: hl7_out
+  input: messages
+  config:
+    name: hl7_out
+    type: hl7
+    path: "./out/result.hl7"
+    options:
+      file_header: ["^~\\&", "LAB", "HOSP", "EHR", "HOSP", "20240102", "FILE7"]
+      batch_header: ["^~\\&", "LAB", "HOSP", "EHR", "HOSP", "20240102", "BATCH3"]
+      segment_newline: true
+```
+
+The HL7 writer re-emits the `MSH` and body segments from the record
+stream, escaping any field data that carries a delimiter character (`|` →
+`\F\`, `^` → `\S\`, and so on). When a `file_header` (or
+`file_header_from_doc`) or `batch_header` is configured the writer wraps the
+messages in an `FHS..FTS` file or `BHS..BTS` batch and recomputes the
+closing `BTS`/`FTS` counts. A batch/file envelope is a single structure, so
+an `hl7` output cannot be combined with a `split:` block — the combination
+is rejected at config-validation time (`E339`). See
+[HL7 v2 Format](hl7.md) for the full option reference, the record schema,
+the MSH off-by-one, and the round-trip semantics.
 
 ## Sort order
 

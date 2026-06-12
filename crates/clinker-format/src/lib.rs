@@ -5,6 +5,7 @@ pub mod edifact;
 pub mod envelope;
 pub mod error;
 pub mod fixed_width;
+pub mod hl7;
 pub mod json;
 pub mod splitting;
 pub mod traits;

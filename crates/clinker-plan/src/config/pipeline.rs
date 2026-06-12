@@ -755,6 +755,64 @@ impl PipelineConfig {
             })
             .collect();
         let report = cxl::analyzer::analyze_all(&compiled_refs);
+
+        // Collect the `$doc` envelope paths every program references, so
+        // each lowered Source carries its declared document-path set for
+        // the reader. The walk covers EVERY typed program in the compile
+        // artifacts — not just the `entries` subset that feeds the
+        // analyzer — because `$doc` is valid in Combine predicates /
+        // residual filters / emit bodies and in composition-body
+        // programs, all of which land in `artifacts.typed` under their
+        // node name (body programs are inserted there by the recursive
+        // bind_schema pass). Missing any of them would drop a referenced
+        // path from the declared set.
+        let doc_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = artifacts
+            .typed
+            .iter()
+            .map(|(name, tp)| (name.as_str(), tp.as_ref()))
+            // A Combine's node-keyed `typed` entry holds only its `cxl:`
+            // body; its `where:` predicate program lives in a separate
+            // side-table, so include those too — a `$doc` access used only
+            // in a predicate would otherwise be dropped.
+            .chain(
+                artifacts
+                    .combine_where_typed
+                    .iter()
+                    .map(|(name, tp)| (name.as_str(), tp.as_ref())),
+            )
+            .collect();
+        let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&doc_refs);
+        if !doc_path_set.unresolvable.is_empty() {
+            // Anchor each diagnostic at the offending node's source line.
+            // Top-level node lines come from the saphyr-captured YAML
+            // position; a composition-body node (not present in
+            // `self.nodes`) falls back to a synthetic span.
+            let node_line: HashMap<&str, u32> = self
+                .nodes
+                .iter()
+                .filter_map(|sp| {
+                    let line = sp.referenced.line();
+                    (line > 0).then(|| (sp.value.name(), line as u32))
+                })
+                .collect();
+            for (node_name, d) in &doc_path_set.unresolvable {
+                let primary = match node_line.get(node_name.as_str()) {
+                    Some(&line) => Span::line_only(line),
+                    None => Span::SYNTHETIC,
+                };
+                let mut diag = Diagnostic::error(
+                    "E340",
+                    d.message.clone(),
+                    LabeledSpan::primary(primary, String::new()),
+                );
+                if let Some(help) = &d.help {
+                    diag = diag.with_help(help.clone());
+                }
+                diags.push(diag);
+            }
+            return Err(diags);
+        }
+        let declared_doc_paths = doc_path_set.paths;
         // Keep an analysis-by-name index so we can surface the analysis
         // alongside its matching entry regardless of filter order.
         let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
@@ -859,6 +917,7 @@ impl PipelineConfig {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 primary_source: primary_source.as_str(),
+                declared_doc_paths: &declared_doc_paths,
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1904,6 +1963,11 @@ pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
     pub window_config: Option<&'a AnalyticWindowSpec>,
     pub primary_source: &'a str,
+    /// `$doc` envelope paths collected across the pipeline's programs,
+    /// surfaced onto each lowered `Source` node's `SourceConfig`. Empty
+    /// for the body-node lowering path (`LoweringCtx::default()`) — only
+    /// the top-level compile path collects and threads these.
+    pub declared_doc_paths: &'a [cxl::analyzer::doc_paths::DocPath],
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -1985,15 +2049,25 @@ pub(crate) fn lower_node_to_plan_node(
     };
 
     match node {
-        PipelineNode::Source { config, .. } => Some(PlanNode::Source {
-            name: name.to_string(),
-            span,
-            resolved: Some(Box::new(PlanSourcePayload {
-                source: config.source.clone(),
-                validated_path: None,
-            })),
-            output_schema: schema_from_bound(name),
-        }),
+        PipelineNode::Source { config, .. } => {
+            let mut source = config.source.clone();
+            // Stamp the pipeline-wide `$doc` path set onto this source so
+            // a document reader can learn the declared path set before
+            // reading input. A `$doc` access carries no source qualifier,
+            // so the whole set is attached to every source; single-source
+            // document pipelines (the common case) thus see exactly their
+            // own paths.
+            source.declared_doc_paths = ctx.declared_doc_paths.to_vec();
+            Some(PlanNode::Source {
+                name: name.to_string(),
+                span,
+                resolved: Some(Box::new(PlanSourcePayload {
+                    source,
+                    validated_path: None,
+                })),
+                output_schema: schema_from_bound(name),
+            })
+        }
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
             // (E108, E200, etc.) on this node — skip lowering.
@@ -2537,6 +2611,26 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                  an X12 interchange is a single ISA..IEA envelope and cannot be \
                  divided across files; remove the `split` block or choose a splittable \
                  format",
+                output.name
+            )));
+        }
+    }
+
+    // An HL7 v2 file with a batch/file envelope is likewise a single
+    // FHS..FTS / BHS..BTS structure whose trailer counts are recomputed and
+    // written only at end of stream. Byte-limit file splitting flushes (and
+    // therefore finalizes) the writer mid-stream, sealing the file after the
+    // first split and emitting later messages after the FTS trailer. There
+    // is no meaningful way to split one HL7 file envelope across files, so
+    // reject the combination up front rather than emit a structurally
+    // corrupt file that still reports run success.
+    for output in config.output_configs() {
+        if matches!(output.format, OutputFormat::Hl7(_)) && output.split.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "[E339] output '{}': `hl7` output cannot be combined with `split` — \
+                 an HL7 v2 batch/file envelope is a single FHS..FTS structure and \
+                 cannot be divided across files; remove the `split` block or choose a \
+                 splittable format",
                 output.name
             )));
         }

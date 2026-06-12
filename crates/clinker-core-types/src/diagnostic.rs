@@ -80,6 +80,8 @@
 //! | `E322`      | error    | Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file |
 //! | `E323`      | error    | `edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope) |
 //! | `E338`      | error    | `x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope) |
+//! | `E339`      | error    | `hl7` output combined with byte-limit `split` (a batch/file envelope is one indivisible FHS..FTS structure) |
+//! | `E340`      | error    | A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time |
 
 use crate::span::{FileId, Span};
 

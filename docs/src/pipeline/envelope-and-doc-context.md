@@ -89,6 +89,7 @@ Each section declares how the reader locates its payload:
 | JSON    | `json_pointer`   | RFC 6901 pointer, e.g. `/Head`                   |
 | EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
 | X12     | `segment`        | A service-segment tag — only `ISA` (GS/ST surface as nested levels) |
+| HL7 v2  | `segment`        | A header-segment tag — only `FHS` (BHS/MSH surface as nested levels) |
 
 Declaring an `xml_path` section against a JSON source (or vice versa),
 or a `segment` extract against XML/JSON, is a configuration error and
@@ -223,6 +224,15 @@ implements this: an **interchange** (ISA/IEA) contains one or more
 sets** (ST/SE), each containing the records. A single file can carry
 multiple interchanges back to back. See [X12 Format](x12.md) for the full
 reference.
+
+HL7 v2 is the second multi-level format: an optional **file** (`FHS`/`FTS`)
+contains optional **batches** (`BHS`/`BTS`), each containing one or more
+**messages** (`MSH..`), each containing the segment records. The tiers map
+onto the same nested levels — the `FHS` file header is a declared
+`segment: "FHS"` section, while the `BHS` batch and the `MSH` message
+surface automatically as the reader-supplied sections `batch` and
+`transaction_set`. Every tier is optional, so a bare `MSH`-led file simply
+opens one message level. See [HL7 v2 Format](hl7.md) for the full reference.
 
 A reader for such a format opens and closes each nested level as it
 crosses the corresponding envelope boundary mid-file. Each level
