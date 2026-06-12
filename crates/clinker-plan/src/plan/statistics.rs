@@ -159,7 +159,11 @@ impl StatisticsCatalog {
     /// Seed a node's Plane A row count from its file-metadata byte seed.
     /// A `None` or zero seed records nothing, preserving the honest-null
     /// floor.
-    pub fn seed_row_count_from_bytes(&mut self, node: impl Into<Arc<str>>, seed_bytes: Option<u64>) {
+    pub fn seed_row_count_from_bytes(
+        &mut self,
+        node: impl Into<Arc<str>>,
+        seed_bytes: Option<u64>,
+    ) {
         if let Some(rows) = rows_from_bytes(seed_bytes) {
             self.row_counts.insert(
                 node.into(),

@@ -1744,7 +1744,6 @@ mod tests {
             CombineInput {
                 upstream_name: Arc::from(left_qual),
                 row: left_row,
-                estimated_cardinality: None,
             },
         );
         combine_inputs.insert(
@@ -1752,7 +1751,6 @@ mod tests {
             CombineInput {
                 upstream_name: Arc::from(right_qual),
                 row: right_row,
-                estimated_cardinality: None,
             },
         );
         // Pre-resolved column map: maps every qualifier.field to its

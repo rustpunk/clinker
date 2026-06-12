@@ -114,7 +114,10 @@ mod tests {
         let bound = mg.error_bound();
         for (key, est) in mg.top_k(k) {
             let actual = truth[&key];
-            assert!(est <= actual, "MisraGries must never over-count: {est} > {actual}");
+            assert!(
+                est <= actual,
+                "MisraGries must never over-count: {est} > {actual}"
+            );
             assert!(
                 actual - est <= bound,
                 "MisraGries under-count {actual}-{est} exceeds N/k bound {bound}"
@@ -125,7 +128,10 @@ mod tests {
         let survivors: std::collections::HashSet<u64> =
             mg.top_k(k).into_iter().map(|(k, _)| k).collect();
         for hot in 0..4u64 {
-            assert!(survivors.contains(&hot), "hot key {hot} must survive in the sketch");
+            assert!(
+                survivors.contains(&hot),
+                "hot key {hot} must survive in the sketch"
+            );
         }
     }
 
@@ -137,7 +143,11 @@ mod tests {
         let mut truth: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for i in 0..10_000u64 {
             let key = if i % 3 == 0 { 7 } else { 100 + (i % 900) };
-            if i % 2 == 0 { left.add(key) } else { right.add(key) }
+            if i % 2 == 0 {
+                left.add(key)
+            } else {
+                right.add(key)
+            }
             *truth.entry(key).or_default() += 1;
         }
         left.merge(&right);
@@ -145,7 +155,10 @@ mod tests {
         for (key, est) in left.top_k(k) {
             let actual = truth[&key];
             assert!(est <= actual, "merged estimate over-counts");
-            assert!(actual - est <= bound, "merged under-count exceeds bound {bound}");
+            assert!(
+                actual - est <= bound,
+                "merged under-count exceeds bound {bound}"
+            );
         }
     }
 

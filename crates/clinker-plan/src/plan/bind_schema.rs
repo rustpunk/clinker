@@ -3036,7 +3036,6 @@ fn bind_combine(
             CombineInput {
                 upstream_name: Arc::from(upstream_target),
                 row: upstream_row.clone(),
-                estimated_cardinality: None,
             },
         );
     }
@@ -3052,6 +3051,7 @@ fn bind_combine(
     // stays empty for this combine and the post-pass skips it.
     if let Some(driver) = select_driving_input(
         &combine_inputs_entries,
+        &artifacts.statistics,
         config.drive.as_deref(),
         name,
         span,

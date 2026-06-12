@@ -459,7 +459,6 @@ fn execute_grace_hash_partition_pair_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -467,7 +466,6 @@ fn execute_grace_hash_partition_pair_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -664,7 +662,6 @@ fn execute_grace_hash_spill_then_reload_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -672,7 +669,6 @@ fn execute_grace_hash_spill_then_reload_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -852,7 +848,6 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -860,7 +855,6 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -1117,7 +1111,6 @@ fn build_bnl_harness() -> BnlHarness {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -1125,7 +1118,6 @@ fn build_bnl_harness() -> BnlHarness {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =

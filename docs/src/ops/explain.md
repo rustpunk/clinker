@@ -122,6 +122,15 @@ Per buffer-mode window index the block reports:
 
 Group cardinality is honestly surfaced as "unknown at plan time" -- the planner has no group-cardinality side-table to consult before the run. Use the [operator-by-operator retraction cost reference](../pipeline/correlation-keys.md#operator-by-operator-retraction-cost-reference) and the per-row figures the explain block prints for capacity planning, then confirm the live shape via `clinker metrics collect` after the first production run.
 
+## Statistics
+
+When the plan carries any column statistics, the explain output ends with a `=== Statistics ===` section listing the planner-wide statistics catalog. Every figure is tagged with its provenance so you can tell a metadata-derived estimate from a record-exact measurement:
+
+- **Row counts** -- one line per source node, e.g. `orders: ≈90 rows [file metadata] (informs combine build/probe + partition bits)`. A `[file metadata]` figure is derived at plan time by dividing the input file's on-disk byte length by an average-record-bytes constant, before any record is read. This is the same row count that drives a combine's build-side selection and its grace-hash partition-bit choice -- a build side large enough to risk overrunning the memory limit is what tips a pure-equality combine from the in-memory hash strategy to the disk-spilling grace-hash strategy. A `[exec sketch]` figure is the exact count a source measured during a run, superseding the estimate.
+- **Column sketches** -- distinct counts (`[exec sketch]`), heavy hitters, and membership filters that operators populate while records flow. The heavy-hitter list is a lower bound on frequency: a value absent from it may still be frequent, so it is only ever used to promote a key, never to exclude one.
+
+Row counts also appear inline on each combine's driving and build inputs (`est. 90 [file metadata] rows`). A statistic that was never gathered renders honestly as `null` rather than a fabricated zero -- a plan over sources whose sizes cannot be read (a `glob`/`regex` multi-file source, a network source, or a missing/unreadable file) adds no Statistics section at all. As with group cardinality above, confirm the live shape via `clinker metrics collect` after the first production run.
+
 ## Looking up diagnostic codes
 
 `clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:

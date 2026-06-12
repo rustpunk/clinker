@@ -217,7 +217,8 @@ pub(crate) struct GraceHashExec<'a> {
 /// estimate: the shared exec-time catalog plus the `(node, column)` key
 /// identifying the build join key.
 pub(crate) struct GraceStatsSink<'a> {
-    pub catalog: std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
+    pub catalog:
+        std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
     pub node: &'a str,
     pub column: &'a str,
 }
