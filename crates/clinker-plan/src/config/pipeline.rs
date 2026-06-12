@@ -758,17 +758,57 @@ impl PipelineConfig {
 
         // Collect the `$doc` envelope paths every program references, so
         // each lowered Source carries its declared document-path set for
-        // the reader. An access indexed by a non-literal cannot be
-        // resolved to a static path — surface E340 against the node and
-        // abort, since the declared set would otherwise be incomplete.
-        let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&compiled_refs);
+        // the reader. The walk covers EVERY typed program in the compile
+        // artifacts — not just the `entries` subset that feeds the
+        // analyzer — because `$doc` is valid in Combine predicates /
+        // residual filters / emit bodies and in composition-body
+        // programs, all of which land in `artifacts.typed` under their
+        // node name (body programs are inserted there by the recursive
+        // bind_schema pass). Missing any of them would drop a referenced
+        // path from the declared set.
+        let doc_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = artifacts
+            .typed
+            .iter()
+            .map(|(name, tp)| (name.as_str(), tp.as_ref()))
+            // A Combine's node-keyed `typed` entry holds only its `cxl:`
+            // body; its `where:` predicate program lives in a separate
+            // side-table, so include those too — a `$doc` access used only
+            // in a predicate would otherwise be dropped.
+            .chain(
+                artifacts
+                    .combine_where_typed
+                    .iter()
+                    .map(|(name, tp)| (name.as_str(), tp.as_ref())),
+            )
+            .collect();
+        let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&doc_refs);
         if !doc_path_set.unresolvable.is_empty() {
-            for d in &doc_path_set.unresolvable {
-                diags.push(Diagnostic::error(
+            // Anchor each diagnostic at the offending node's source line.
+            // Top-level node lines come from the saphyr-captured YAML
+            // position; a composition-body node (not present in
+            // `self.nodes`) falls back to a synthetic span.
+            let node_line: HashMap<&str, u32> = self
+                .nodes
+                .iter()
+                .filter_map(|sp| {
+                    let line = sp.referenced.line();
+                    (line > 0).then(|| (sp.value.name(), line as u32))
+                })
+                .collect();
+            for (node_name, d) in &doc_path_set.unresolvable {
+                let primary = match node_line.get(node_name.as_str()) {
+                    Some(&line) => Span::line_only(line),
+                    None => Span::SYNTHETIC,
+                };
+                let mut diag = Diagnostic::error(
                     "E340",
                     d.message.clone(),
-                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-                ));
+                    LabeledSpan::primary(primary, String::new()),
+                );
+                if let Some(help) = &d.help {
+                    diag = diag.with_help(help.clone());
+                }
+                diags.push(diag);
             }
             return Err(diags);
         }

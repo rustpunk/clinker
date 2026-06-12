@@ -57,6 +57,14 @@ pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
     pub typed: HashMap<String, Arc<TypedProgram>>,
+    /// Per-Combine `where:` predicate typed programs, keyed by combine
+    /// node name. The node-keyed `typed` map stores only a Combine's
+    /// `cxl:` body; the `where:` predicate is decomposed into
+    /// `combine_predicates` and otherwise discarded as a standalone
+    /// program. This side-table retains it so a `$doc` access used ONLY
+    /// in a predicate (e.g. `l.amount > $doc.Head.cutoff`) is still
+    /// reachable by the compile-time `$doc` path walk.
+    pub combine_where_typed: HashMap<String, Arc<TypedProgram>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -3069,6 +3077,10 @@ fn bind_combine(
             return;
         }
     };
+
+    artifacts
+        .combine_where_typed
+        .insert(name.to_string(), Arc::clone(&typed_where));
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
     let e304_before = diags.iter().filter(|d| d.code == "E304").count();

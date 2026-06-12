@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{Expr, LiteralValue, MatchArm, Statement};
+use crate::ast::{Expr, LiteralValue, MatchArm, Statement, UnaryOp};
 use crate::lexer::Span;
 use crate::typecheck::pass::{TypeDiagnostic, TypedProgram};
 
@@ -62,8 +62,11 @@ pub struct DocPath {
 pub struct DocPathSet {
     /// Deduplicated, sorted declared paths.
     pub paths: Vec<DocPath>,
-    /// One diagnostic per `$doc` access whose index is not a literal.
-    pub unresolvable: Vec<TypeDiagnostic>,
+    /// One entry per `$doc` access whose index is not a literal. The
+    /// `String` is the name of the program's node so the caller can anchor
+    /// a plan-level diagnostic at that node; the [`TypeDiagnostic`] carries
+    /// the precise offending-index span and help.
+    pub unresolvable: Vec<(String, TypeDiagnostic)>,
 }
 
 /// Collect the `$doc` path set referenced across a set of typed programs.
@@ -75,10 +78,10 @@ pub struct DocPathSet {
 /// unresolvable-index diagnostics are accumulated in walk order.
 pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
     let mut paths: BTreeSet<DocPath> = BTreeSet::new();
-    let mut unresolvable: Vec<TypeDiagnostic> = Vec::new();
-    for (_name, typed) in programs {
+    let mut unresolvable: Vec<(String, TypeDiagnostic)> = Vec::new();
+    for (name, typed) in programs {
         for stmt in &typed.program.statements {
-            walk_statement(stmt, &mut paths, &mut unresolvable);
+            walk_statement(name, stmt, &mut paths, &mut unresolvable);
         }
     }
     DocPathSet {
@@ -88,25 +91,26 @@ pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
 }
 
 fn walk_statement(
+    node_name: &str,
     stmt: &Statement,
     paths: &mut BTreeSet<DocPath>,
-    unresolvable: &mut Vec<TypeDiagnostic>,
+    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
 ) {
     match stmt {
         Statement::Let { expr, .. }
         | Statement::Emit { expr, .. }
-        | Statement::ExprStmt { expr, .. } => walk_expr(expr, paths, unresolvable),
-        Statement::Filter { predicate, .. } => walk_expr(predicate, paths, unresolvable),
+        | Statement::ExprStmt { expr, .. } => walk_expr(node_name, expr, paths, unresolvable),
+        Statement::Filter { predicate, .. } => walk_expr(node_name, predicate, paths, unresolvable),
         Statement::Trace { guard, message, .. } => {
             if let Some(g) = guard {
-                walk_expr(g, paths, unresolvable);
+                walk_expr(node_name, g, paths, unresolvable);
             }
-            walk_expr(message, paths, unresolvable);
+            walk_expr(node_name, message, paths, unresolvable);
         }
         Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
-            walk_expr(source, paths, unresolvable);
+            walk_expr(node_name, source, paths, unresolvable);
             for inner in body {
-                walk_statement(inner, paths, unresolvable);
+                walk_statement(node_name, inner, paths, unresolvable);
             }
         }
         Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
@@ -121,7 +125,12 @@ fn walk_statement(
 /// makes the access unresolvable. The walker recurses through every
 /// control-flow branch (`if`, `match`, `coalesce`, `emit_each` bodies),
 /// so a `$doc` access used only inside a conditional is still collected.
-fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<TypeDiagnostic>) {
+fn walk_expr(
+    node_name: &str,
+    expr: &Expr,
+    paths: &mut BTreeSet<DocPath>,
+    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
+) {
     // An IndexAccess whose receiver chain bottoms out at a DocAccess is a
     // `$doc` path with trailing indices — classify it as a unit rather
     // than walking the DocAccess receiver as a bare access. Other
@@ -134,7 +143,7 @@ fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<
             Ok(path) => {
                 paths.insert(path);
             }
-            Err(diag) => unresolvable.push(diag),
+            Err(diag) => unresolvable.push((node_name.to_string(), diag)),
         }
         return;
     }
@@ -148,22 +157,22 @@ fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<
             });
         }
         Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
-            walk_expr(lhs, paths, unresolvable);
-            walk_expr(rhs, paths, unresolvable);
+            walk_expr(node_name, lhs, paths, unresolvable);
+            walk_expr(node_name, rhs, paths, unresolvable);
         }
-        Expr::Unary { operand, .. } => walk_expr(operand, paths, unresolvable),
+        Expr::Unary { operand, .. } => walk_expr(node_name, operand, paths, unresolvable),
         Expr::MethodCall { receiver, args, .. } => {
-            walk_expr(receiver, paths, unresolvable);
+            walk_expr(node_name, receiver, paths, unresolvable);
             for a in args {
-                walk_expr(a, paths, unresolvable);
+                walk_expr(node_name, a, paths, unresolvable);
             }
         }
         Expr::Match { subject, arms, .. } => {
             if let Some(s) = subject {
-                walk_expr(s, paths, unresolvable);
+                walk_expr(node_name, s, paths, unresolvable);
             }
             for arm in arms {
-                walk_match_arm(arm, paths, unresolvable);
+                walk_match_arm(node_name, arm, paths, unresolvable);
             }
         }
         Expr::IfThenElse {
@@ -172,15 +181,15 @@ fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<
             else_branch,
             ..
         } => {
-            walk_expr(condition, paths, unresolvable);
-            walk_expr(then_branch, paths, unresolvable);
+            walk_expr(node_name, condition, paths, unresolvable);
+            walk_expr(node_name, then_branch, paths, unresolvable);
             if let Some(e) = else_branch {
-                walk_expr(e, paths, unresolvable);
+                walk_expr(node_name, e, paths, unresolvable);
             }
         }
         Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
             for a in args {
-                walk_expr(a, paths, unresolvable);
+                walk_expr(node_name, a, paths, unresolvable);
             }
         }
         Expr::IndexAccess {
@@ -189,10 +198,10 @@ fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<
             // Reached only for non-`$doc` index chains; recurse into both
             // sides so a `$doc` access buried in the index expression
             // (`arr[$doc.s.f]`) is still collected.
-            walk_expr(receiver, paths, unresolvable);
-            walk_expr(index, paths, unresolvable);
+            walk_expr(node_name, receiver, paths, unresolvable);
+            walk_expr(node_name, index, paths, unresolvable);
         }
-        Expr::Closure { body, .. } => walk_expr(body, paths, unresolvable),
+        Expr::Closure { body, .. } => walk_expr(node_name, body, paths, unresolvable),
         Expr::Literal { .. }
         | Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
@@ -209,12 +218,13 @@ fn walk_expr(expr: &Expr, paths: &mut BTreeSet<DocPath>, unresolvable: &mut Vec<
 }
 
 fn walk_match_arm(
+    node_name: &str,
     arm: &MatchArm,
     paths: &mut BTreeSet<DocPath>,
-    unresolvable: &mut Vec<TypeDiagnostic>,
+    unresolvable: &mut Vec<(String, TypeDiagnostic)>,
 ) {
-    walk_expr(&arm.pattern, paths, unresolvable);
-    walk_expr(&arm.body, paths, unresolvable);
+    walk_expr(node_name, &arm.pattern, paths, unresolvable);
+    walk_expr(node_name, &arm.body, paths, unresolvable);
 }
 
 /// Classify an `IndexAccess` whose receiver chain bottoms out at a
@@ -269,10 +279,11 @@ fn classify_doc_index_chain(expr: &Expr) -> Option<Result<DocPath, TypeDiagnosti
 
 /// Extract a literal index segment, or `None` if the index is computed.
 ///
-/// Only integer and string literals are valid `$doc` index segments;
-/// every other literal kind (float, bool, date, null) is rejected as
-/// non-indexable so it surfaces the same fail-fast diagnostic as a
-/// computed index.
+/// Accepts an integer literal, a unary-negated integer literal
+/// (`items[-1]` — a static from-end index), or a string-key literal.
+/// Every other shape (a field reference, an arithmetic expression, a
+/// float/bool/date/null literal) is non-literal and makes the path
+/// unresolvable.
 fn literal_index(index: &Expr) -> Option<DocIndex> {
     match index {
         Expr::Literal {
@@ -283,6 +294,20 @@ fn literal_index(index: &Expr) -> Option<DocIndex> {
             value: LiteralValue::String(s),
             ..
         } => Some(DocIndex::Key(s.clone())),
+        // `items[-1]` parses as `Unary{Neg, Literal(Int)}` — still a
+        // static index, so resolve it rather than rejecting it as
+        // "computed".
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => match operand.as_ref() {
+            Expr::Literal {
+                value: LiteralValue::Int(n),
+                ..
+            } => Some(DocIndex::Int(-*n)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -290,11 +315,13 @@ fn literal_index(index: &Expr) -> Option<DocIndex> {
 fn diag_dynamic_doc_index(span: Span) -> TypeDiagnostic {
     TypeDiagnostic {
         span,
-        message: "a `$doc` access must index by a literal — this index is computed at \
-                  runtime, so the declared document path cannot be resolved at compile time"
+        message: "a `$doc` access must be indexed by a literal, but this index is a \
+                  non-literal expression, so the declared document path cannot be \
+                  resolved at compile time"
             .to_string(),
         help: Some(
-            "index the envelope path with an integer or string literal \
+            "index the envelope path with an integer literal (including a \
+             negative such as `[-1]`) or a string-key literal \
              (`$doc.section.items[0]` / `$doc.section.meta[\"run_date\"]`)"
                 .to_string(),
         ),
@@ -452,12 +479,50 @@ mod tests {
             "no path is recorded for an unresolvable access"
         );
         assert_eq!(set.unresolvable.len(), 1);
-        let diag = &set.unresolvable[0];
+        let (node, diag) = &set.unresolvable[0];
+        // The diagnostic is tagged with the program's node name so a
+        // plan-level caller can anchor a node-level span.
+        assert_eq!(node, "t");
         // The span must point at the offending index expression `idx`,
         // not the whole access.
         let snippet = &src[diag.span.start as usize..diag.span.end as usize];
         assert_eq!(snippet, "idx");
         assert!(!diag.is_warning);
+    }
+
+    #[test]
+    fn test_negative_literal_index_is_resolved() {
+        // `items[-1]` parses as a unary-negated integer literal — a
+        // static from-end index, so the path resolves rather than being
+        // flagged unresolvable.
+        let set = collect("emit last = $doc.summary.items[-1]");
+        assert!(
+            set.unresolvable.is_empty(),
+            "a negated integer literal is a static index"
+        );
+        assert_eq!(
+            set.paths,
+            vec![path("summary", "items", vec![DocIndex::Int(-1)])]
+        );
+    }
+
+    #[test]
+    fn test_unresolvable_message_does_not_claim_runtime_for_static_forms() {
+        // A field-reference index is genuinely non-literal; the message
+        // must describe it as a non-literal expression, never as a
+        // specific runtime claim that would be false for a static `-1`.
+        let set = collect("emit v = $doc.summary.items[region]");
+        assert_eq!(set.unresolvable.len(), 1);
+        let (_node, diag) = &set.unresolvable[0];
+        assert!(
+            diag.message.contains("non-literal expression"),
+            "message should describe the index as a non-literal expression: {}",
+            diag.message
+        );
+        assert!(
+            diag.help.as_deref().unwrap_or("").contains("[-1]"),
+            "help should mention that a negative literal is accepted"
+        );
     }
 
     #[test]
