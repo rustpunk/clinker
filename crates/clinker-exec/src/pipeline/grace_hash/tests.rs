@@ -492,6 +492,14 @@ fn execute_grace_hash_partition_pair_correct() {
         .tempdir()
         .unwrap();
     let stats_catalog = fresh_stats_catalog();
+    // Seed the build node's plan-time row count from file metadata so the
+    // membership filter is sized up front and recorded as estimate-sized
+    // (the Bloom is skipped when no plan estimate exists). 12 KiB at the
+    // shared ~1 KiB/row divisor seeds ~12 rows.
+    stats_catalog
+        .lock()
+        .unwrap()
+        .seed_row_count_from_bytes("products", Some(12 * 1024));
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_test",
         build_qualifier: "products",

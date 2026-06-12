@@ -14,30 +14,38 @@
 //! pass would have produced.
 
 mod bloom;
+mod build_sketches;
 mod hll;
 mod misra_gries;
 
 pub use bloom::Bloom;
+pub use build_sketches::{
+    BLOOM_FALSE_POSITIVE_RATE, BuildKeySketchSummary, BuildKeySketches, HEAVY_HITTER_COUNTERS,
+    HEAVY_HITTER_REPORT,
+};
 pub use hll::Hll;
 pub use misra_gries::MisraGries;
+
+/// Mix a sequential index into a well-distributed 64-bit hash via the
+/// SplitMix64 finalizer. The sketches assume near-uniform input bits;
+/// SplitMix64 passes BigCrush, so feeding it `0..n` gives the HLL
+/// register-index and leading-zero distributions their accuracy bounds are
+/// derived under — a weaker mixer leaves residual structure in the high
+/// bits and inflates the apparent error. Shared by the sketch test modules.
+#[cfg(test)]
+pub(crate) fn splitmix64(i: u64) -> u64 {
+    let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ahash::RandomState;
 
-    /// Mix a sequential index into a well-distributed 64-bit hash via the
-    /// SplitMix64 finalizer. The sketches assume near-uniform input bits;
-    /// SplitMix64 passes BigCrush, so feeding it `0..n` gives the HLL
-    /// register-index and leading-zero distributions their accuracy bounds
-    /// are derived under — a weaker mixer leaves residual structure in the
-    /// high bits and inflates the apparent error.
-    fn mix(i: u64) -> u64 {
-        let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
+    use super::splitmix64 as mix;
 
     /// Assert an HLL of register width `M` estimates `n` distinct hashes
     /// within three standard errors (`3 * 1.04/sqrt(M)`). Three sigma
@@ -99,16 +107,17 @@ mod tests {
         let k = 16;
         let mut mg = MisraGries::new(k);
         let mut truth: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        // Hot keys 0..4 each appear 2000 times.
+        // Hot keys 0..4 each appear 2000 times. The label is the key hash
+        // itself, so `top_k` reports `(hash, count)` for these tests.
         for hot in 0..4u64 {
             for _ in 0..2000 {
-                mg.add(hot);
+                mg.add(hot, || hot);
                 *truth.entry(hot).or_default() += 1;
             }
         }
         // Cold tail: 5000 distinct keys once each.
         for cold in 100..5100u64 {
-            mg.add(cold);
+            mg.add(cold, || cold);
             *truth.entry(cold).or_default() += 1;
         }
         let bound = mg.error_bound();
@@ -144,9 +153,9 @@ mod tests {
         for i in 0..10_000u64 {
             let key = if i % 3 == 0 { 7 } else { 100 + (i % 900) };
             if i % 2 == 0 {
-                left.add(key)
+                left.add(key, || key)
             } else {
-                right.add(key)
+                right.add(key, || key)
             }
             *truth.entry(key).or_default() += 1;
         }
@@ -160,6 +169,36 @@ mod tests {
                 "merged under-count exceeds bound {bound}"
             );
         }
+    }
+
+    #[test]
+    fn misra_gries_reports_label_for_a_late_hot_key() {
+        // Many distinct singleton keys first, then one key repeated far more
+        // than the rest. Because the label is bound to counter membership —
+        // captured the moment the hot key's counter opens and never evicted
+        // while it stays hot — the survivor carries its real label, not an
+        // empty placeholder, even though it was not among the first keys seen.
+        let k = 8;
+        let mut mg: MisraGries<String> = MisraGries::new(k);
+        // 1000 distinct singleton keys, each labeled with its own string.
+        for i in 0..1000u64 {
+            mg.add(mix(i), || format!("cold-{i}"));
+        }
+        // Then a single key, hashed distinctly, repeated 5000 times.
+        let hot_hash = mix(9_999_999);
+        for _ in 0..5000 {
+            mg.add(hot_hash, || "hot-key".to_string());
+        }
+        let top = mg.top_k(k);
+        let (label, count) = top.first().expect("a survivor exists");
+        assert_eq!(
+            label, "hot-key",
+            "the late hot key must report its real label"
+        );
+        assert!(
+            *count > 1000,
+            "the hot key's count must dominate; got {count}"
+        );
     }
 
     #[test]

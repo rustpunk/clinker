@@ -94,22 +94,6 @@ use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
-/// Misra-Gries counter budget for the build-side heavy-hitter sketch. With
-/// `k` counters the per-key under-count bound is `N/k`, so 256 keeps that
-/// bound tight (≤0.4% of `N`) at a fixed ~4 KiB of counters — bounded
-/// regardless of build size.
-const HEAVY_HITTER_COUNTERS: usize = 256;
-
-/// Number of heavy hitters surfaced into the catalog. The full counter set
-/// is a lower-bound frequency map; the top slice is what a downstream skew
-/// decision or `--explain` reader actually consults.
-const HEAVY_HITTER_REPORT: usize = 16;
-
-/// Target false-positive rate for the build-side membership filter, sized
-/// from the distinct-count estimate. 1% trades a modest bit budget for a
-/// filter precise enough to skip most absent-key probes.
-const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
-
 /// Render a composite join key into a single representative [`Value`] for
 /// heavy-hitter reporting. A single-component key keeps its own value so a
 /// string or integer key reports unchanged; a multi-component key renders
@@ -785,7 +769,7 @@ pub(crate) fn execute_combine_grace_hash(
     // hash seed is cloned out of the executor first; `RandomState::clone`
     // preserves the seed, so every worker hashes identically.
     let build_hash_state = executor.hash_state().clone();
-    let hashed_build: Vec<(Record, u64, Value)> = build_records
+    let hashed_build: Vec<(Record, u64)> = build_records
         .into_par_iter()
         .map(|record| {
             let keys =
@@ -796,81 +780,78 @@ pub(crate) fn execute_combine_grace_hash(
                         messages: vec![format!("grace hash build key eval error: {e}")],
                     })?;
             let hash = hash_composite_key(&keys, &build_hash_state);
-            // A representative value for the composite key, kept so a
-            // heavy-hitter reported by hash can be rendered back to the key
-            // an author would recognize.
-            let key_value = representative_key_value(&keys);
-            Ok::<_, PipelineError>((record, hash, key_value))
+            Ok::<_, PipelineError>((record, hash))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // Maintain three planner-grade sketches over the build-side join keys,
-    // reusing the composite-key hashes already computed for partition
-    // placement: a HyperLogLog distinct-count, a Misra-Gries heavy-hitter
-    // tracker, and a Bloom membership filter. The HLL and Misra-Gries feeds
-    // are one bounded update per build record; both run outside the
-    // order-sensitive `add_build_record` loop so partition timing is
-    // unchanged. 1024 registers give ≈±3.25% standard error, the planner
-    // grade the catalog wants; the partition sketches stay at 64.
-    let mut build_distinct = crate::sketch::Hll::<1024>::new();
-    let mut build_hitters = crate::sketch::MisraGries::new(HEAVY_HITTER_COUNTERS);
-    // The Bloom filter is sized from the distinct estimate, which is only
-    // final after the full pass, so its hashes are buffered here and
-    // inserted once `n` is known. One `u64` per build record is negligible
-    // beside the build `Record`s already resident in `hashed_build`.
-    let mut build_hashes: Vec<u64> = Vec::with_capacity(hashed_build.len());
-    // First-seen representative value per heavy-hitter hash, so a top-k
-    // entry can be rendered back to the key an author would recognize.
-    // Capped at the counter budget: a genuine heavy hitter is frequent, so
-    // it is seen early and captured before the cap fills — bounding this map
-    // to ~HEAVY_HITTER_COUNTERS values regardless of build cardinality,
-    // rather than retaining one value per distinct key.
-    let mut key_values: std::collections::HashMap<u64, Value> =
-        std::collections::HashMap::with_capacity(HEAVY_HITTER_COUNTERS);
-    for (record, hash, key_value) in hashed_build {
-        build_distinct.add(hash);
-        build_hitters.add(hash);
-        build_hashes.push(hash);
-        if key_values.len() < HEAVY_HITTER_COUNTERS {
-            key_values.entry(hash).or_insert(key_value);
-        }
+
+    // Maintain three planner-grade sketches over the build-side join keys
+    // in the single build pass, reusing the composite-key hashes already
+    // computed for partition placement. [`BuildKeySketches`] is
+    // allocation-bounded by a fixed constant — never by build size — so it
+    // is invisible to the arbitrator: the HyperLogLog is fixed-register, the
+    // Misra-Gries holds at most its counter budget (and one representative
+    // value per live counter, materialized only when a counter opens), and
+    // the Bloom is sized UP FRONT from the build node's plan-time row-count
+    // estimate (an upper bound on distinct keys, so the filter is
+    // conservatively sized — FP rate ≤ target, just possibly more bits).
+    // When no plan-time estimate exists the filter is skipped rather than
+    // buffered. The feed runs outside the order-sensitive `add_build_record`
+    // loop, so the partition table and spill timing are unchanged; the
+    // per-partition diagnostic sketches stay at 64 registers.
+    //
+    // The build node's row count is normally the plan-time file-metadata
+    // estimate; if the build source already drained and recorded its exact
+    // count, that supersedes the estimate and the membership summary records
+    // the sizing as exact rather than estimated.
+    let build_row_count = stats_sink
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.row_count_with_source(stats_sink.node));
+    let bloom_sized_from_estimate = !matches!(
+        build_row_count.map(|rc| rc.source),
+        Some(clinker_plan::plan::statistics::StatSource::ExecSketch)
+    );
+    let mut build_sketches =
+        crate::sketch::BuildKeySketches::new(build_row_count.map(|rc| rc.rows));
+    for (record, hash) in hashed_build {
+        // Re-derive the representative key value only when Misra-Gries opens
+        // a counter (a bounded number of times across the whole build), so
+        // the per-row cost stays a single hash and no value is retained per
+        // record. The extract here repeats work the parallel hash pass did,
+        // but only for the handful of keys that become tracked counters.
+        build_sketches.observe(hash, || {
+            build_extractor
+                .extract(ctx, &record)
+                .map(|keys| representative_key_value(&keys))
+                .unwrap_or(Value::Null)
+        });
         executor
             .add_build_record(record, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
 
-    let distinct_estimate = build_distinct.estimate();
-    // Size the membership filter from the distinct estimate (an estimate,
-    // not an exact count — recorded as such) at the catalog's default
-    // false-positive target, then insert every build-key hash.
-    let mut build_bloom = crate::sketch::Bloom::new(distinct_estimate, BLOOM_FALSE_POSITIVE_RATE);
-    for &hash in &build_hashes {
-        build_bloom.insert(hash);
-    }
+    let crate::sketch::BuildKeySketchSummary {
+        distinct,
+        heavy_hitters,
+        bloom,
+    } = build_sketches.finalize();
 
     if let Ok(mut catalog) = stats_sink.catalog.lock() {
         use clinker_plan::plan::statistics::{BloomSummary, StatKey};
         let key = StatKey::new(stats_sink.node, stats_sink.column);
-        catalog.record_distinct(key.clone(), distinct_estimate);
-        let hitters: Vec<(Value, u64)> = build_hitters
-            .top_k(HEAVY_HITTER_REPORT)
-            .into_iter()
-            .map(|(hash, count)| {
-                let value = key_values
-                    .get(&hash)
-                    .cloned()
-                    .unwrap_or_else(|| Value::from(""));
-                (value, count)
-            })
-            .collect();
-        catalog.record_heavy_hitters(key.clone(), hitters);
-        catalog.record_bloom(
-            key,
-            BloomSummary {
-                bit_count: build_bloom.bit_count(),
-                hash_count: build_bloom.hash_count(),
-                sized_from_estimate: true,
-            },
-        );
+        catalog.record_distinct(key.clone(), distinct);
+        catalog.record_heavy_hitters(key.clone(), heavy_hitters);
+        if let Some((bit_count, hash_count)) = bloom {
+            catalog.record_bloom(
+                key,
+                BloomSummary {
+                    bit_count,
+                    hash_count,
+                    sized_from_estimate: bloom_sized_from_estimate,
+                },
+            );
+        }
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
     let build_spilled = executor.take_spilled_bytes();

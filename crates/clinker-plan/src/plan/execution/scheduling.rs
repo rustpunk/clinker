@@ -58,6 +58,39 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
+    /// Seed the statistics catalog's Plane A row counts from source file
+    /// metadata.
+    ///
+    /// Reads each Source node's on-disk byte length through the same
+    /// [`source_seed_bytes`] metadata read that drives the byte-volume
+    /// estimates — never a second data-reading pass — and divides it by the
+    /// shared average-record-bytes divisor to land a row-count estimate
+    /// keyed by the Source node's name. A source whose size cannot be read
+    /// (multi-file `glob`/`regex`/`paths`, a network source, an unreadable
+    /// file) records nothing, so the catalog keeps an honest absence rather
+    /// than a fabricated zero.
+    ///
+    /// Runs before combine-strategy selection so the strategy heuristics can
+    /// read a build side's row count from the catalog. The byte seed and the
+    /// catalog row count are deliberately separate surfaces keyed the same
+    /// way: bytes drive the memory arbitrator's peak-volume model, rows
+    /// drive the join planner's build-side sizing.
+    pub fn seed_statistics_row_counts(
+        &self,
+        ctx: &crate::config::CompileContext,
+        catalog: &mut crate::plan::statistics::StatisticsCatalog,
+    ) {
+        let anchor = ctx.workspace_root.join(&ctx.pipeline_dir);
+        for idx in self.graph.node_indices() {
+            if let PlanNode::Source { resolved, .. } = &self.graph[idx] {
+                let seed = resolved
+                    .as_deref()
+                    .and_then(|payload| source_seed_bytes(&payload.source, &anchor));
+                catalog.seed_row_count_from_bytes(self.graph[idx].name(), seed);
+            }
+        }
+    }
+
     /// Attach a coarse per-node input-volume byte prediction to every node
     /// in `node_properties`, derived from the on-disk size of file-backed
     /// Sources and propagated forward in topological order.
@@ -113,39 +146,6 @@ impl ExecutionPlanDag {
     /// `node_properties` row contribute `0`, matching how `--explain`
     /// already skips them.
     ///
-    /// Seed the statistics catalog's Plane A row counts from source file
-    /// metadata.
-    ///
-    /// Reads each Source node's on-disk byte length through the same
-    /// [`source_seed_bytes`] metadata read that drives the byte-volume
-    /// estimates — never a second data-reading pass — and divides it by the
-    /// shared average-record-bytes divisor to land a row-count estimate
-    /// keyed by the Source node's name. A source whose size cannot be read
-    /// (multi-file `glob`/`regex`/`paths`, a network source, an unreadable
-    /// file) records nothing, so the catalog keeps an honest absence rather
-    /// than a fabricated zero.
-    ///
-    /// Runs before combine-strategy selection so the strategy heuristics can
-    /// read a build side's row count from the catalog. The byte seed and the
-    /// catalog row count are deliberately separate surfaces keyed the same
-    /// way: bytes drive the memory arbitrator's peak-volume model, rows
-    /// drive the join planner's build-side sizing.
-    pub fn seed_statistics_row_counts(
-        &self,
-        ctx: &crate::config::CompileContext,
-        catalog: &mut crate::plan::statistics::StatisticsCatalog,
-    ) {
-        let anchor = ctx.workspace_root.join(&ctx.pipeline_dir);
-        for idx in self.graph.node_indices() {
-            if let PlanNode::Source { resolved, .. } = &self.graph[idx] {
-                let seed = resolved
-                    .as_deref()
-                    .and_then(|payload| source_seed_bytes(&payload.source, &anchor));
-                catalog.seed_row_count_from_bytes(self.graph[idx].name(), seed);
-            }
-        }
-    }
-
     /// Runs after aggregation- and combine-strategy selection so the resolved
     /// strategy is visible to [`arbitration_class`] and no later property
     /// overwrite clobbers the volume fields.
