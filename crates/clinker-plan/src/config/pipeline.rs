@@ -2574,64 +2574,51 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
-    // An EDIFACT interchange is a single envelope: every record sits
-    // inside one UNB..UNZ frame whose trailer counts are recomputed and
-    // written only at end of stream. Byte-limit file splitting flushes
-    // (and therefore finalizes) the writer mid-stream, which would seal
-    // the interchange after the first record and emit later records — and
-    // their fresh UNH headers — after the UNZ trailer. There is no
-    // meaningful way to split one interchange across files, so reject the
-    // combination up front rather than emit a structurally corrupt
-    // interchange that still reports run success.
+    // Single-envelope output formats wrap every record in one frame whose
+    // trailer counts are recomputed and written only at end of stream:
+    // EDIFACT's UNB..UNZ interchange, X12's ISA..IEA interchange, and HL7
+    // v2's FHS..FTS batch/file structure. Byte-limit file splitting flushes
+    // (and therefore finalizes) the writer mid-stream, which seals the
+    // envelope after the first split and emits later records — with their
+    // fresh headers — after the trailer. There is no meaningful way to
+    // split one envelope across files, so reject the combination up front
+    // rather than emit a structurally corrupt envelope that still reports
+    // run success. One pass over the outputs keeps these per-format
+    // rejections in lockstep; a fourth single-envelope format is one match
+    // arm, not a fourth copied loop.
     for output in config.output_configs() {
-        if matches!(output.format, OutputFormat::Edifact(_)) && output.split.is_some() {
+        // Each indivisible-envelope format maps to its diagnostic code, the
+        // `format:` token a user wrote, and the structural-envelope phrase
+        // naming why it can't be split; splittable formats yield `None`.
+        let envelope = match output.format {
+            OutputFormat::Edifact(_) => Some((
+                "E323",
+                "edifact",
+                "an EDIFACT interchange is a single UNB..UNZ envelope",
+            )),
+            OutputFormat::X12(_) => Some((
+                "E338",
+                "x12",
+                "an X12 interchange is a single ISA..IEA envelope",
+            )),
+            OutputFormat::Hl7(_) => Some((
+                "E339",
+                "hl7",
+                "an HL7 v2 batch/file envelope is a single FHS..FTS structure",
+            )),
+            OutputFormat::Csv(_)
+            | OutputFormat::Json(_)
+            | OutputFormat::Xml(_)
+            | OutputFormat::FixedWidth(_) => None,
+        };
+        if let Some((code, format_token, envelope_phrase)) = envelope
+            && output.split.is_some()
+        {
             return Err(ConfigError::Validation(format!(
-                "[E323] output '{}': `edifact` output cannot be combined with `split` — \
-                 an EDIFACT interchange is a single UNB..UNZ envelope and cannot be \
-                 divided across files; remove the `split` block or choose a splittable \
-                 format",
-                output.name
-            )));
-        }
-    }
-
-    // An X12 interchange is likewise a single three-tier envelope:
-    // ISA..IEA wraps GS..GE groups wrapping ST..SE sets, and every trailer
-    // count (SE/GE/IEA) is recomputed and written only at end of stream.
-    // Byte-limit file splitting flushes (and therefore finalizes) the
-    // writer mid-stream, sealing the interchange after the first file and
-    // emitting later records — and their fresh ST/GS headers — after the
-    // IEA trailer. There is no meaningful way to split one interchange
-    // across files, so reject the combination up front rather than emit a
-    // structurally corrupt interchange that still reports run success.
-    for output in config.output_configs() {
-        if matches!(output.format, OutputFormat::X12(_)) && output.split.is_some() {
-            return Err(ConfigError::Validation(format!(
-                "[E338] output '{}': `x12` output cannot be combined with `split` — \
-                 an X12 interchange is a single ISA..IEA envelope and cannot be \
-                 divided across files; remove the `split` block or choose a splittable \
-                 format",
-                output.name
-            )));
-        }
-    }
-
-    // An HL7 v2 file with a batch/file envelope is likewise a single
-    // FHS..FTS / BHS..BTS structure whose trailer counts are recomputed and
-    // written only at end of stream. Byte-limit file splitting flushes (and
-    // therefore finalizes) the writer mid-stream, sealing the file after the
-    // first split and emitting later messages after the FTS trailer. There
-    // is no meaningful way to split one HL7 file envelope across files, so
-    // reject the combination up front rather than emit a structurally
-    // corrupt file that still reports run success.
-    for output in config.output_configs() {
-        if matches!(output.format, OutputFormat::Hl7(_)) && output.split.is_some() {
-            return Err(ConfigError::Validation(format!(
-                "[E339] output '{}': `hl7` output cannot be combined with `split` — \
-                 an HL7 v2 batch/file envelope is a single FHS..FTS structure and \
-                 cannot be divided across files; remove the `split` block or choose a \
-                 splittable format",
-                output.name
+                "[{code}] output '{name}': `{format_token}` output cannot be combined \
+                 with `split` — {envelope_phrase} and cannot be divided across files; \
+                 remove the `split` block or choose a splittable format",
+                name = output.name,
             )));
         }
     }
