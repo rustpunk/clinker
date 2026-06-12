@@ -87,77 +87,23 @@ pub(crate) fn dispatch_route(
         .neighbors_directed(node_idx, Direction::Outgoing)
         .collect();
 
-    // Build branch_name -> successor NodeIndex mapping.
+    // Map each branch output port to the successor(s) that draw from it.
     //
-    // Under the unified taxonomy, a
-    // `PlanNode::Route` is a first-class node named as the
-    // user wrote it in YAML (e.g. `classify_route`). Successors
-    // may be Transforms, Aggregates, Outputs, or Compositions —
-    // any node whose `input:` is declared as
-    // `<route_name>.<branch>` (NodeInput::Port form). We
-    // can't use `build_transform_specs` alone because it
-    // excludes Outputs and Compositions.
-    //
-    // Walk `config.nodes` once, read each node's
-    // `header.input`, match against `<route_parent>.<branch>`,
-    // and map the branch to the successor's NodeIndex.
-    let route_parent = name.strip_prefix("route_").unwrap_or(name);
-    let mut succ_by_name: HashMap<String, NodeIndex> = HashMap::new();
-    for &succ in &successors {
-        succ_by_name.insert(current_dag.graph[succ].name().to_string(), succ);
-    }
-    let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
-    // Iterate either the body's input-ref table (when set
-    // by the body executor for the current walk) or the
-    // top-level config nodes. The shape is the same:
-    // `(consumer_name, input_ref)` pairs.
-    let mut name_input_pairs: Vec<(String, String)> = Vec::new();
-    if let Some(body_refs) = ctx.current_body_node_input_refs.as_ref() {
-        for (consumer, refs) in body_refs {
-            for r in refs {
-                name_input_pairs.push((consumer.clone(), r.clone()));
-            }
-        }
-    } else {
-        use clinker_plan::config::PipelineNode;
-        use clinker_plan::config::node_header::NodeInput;
-        for spanned in &ctx.config.nodes {
-            let (node_name, input_ref) = match &spanned.value {
-                PipelineNode::Transform { header, .. }
-                | PipelineNode::Aggregate { header, .. }
-                | PipelineNode::Route { header, .. }
-                | PipelineNode::Output { header, .. } => {
-                    let ir = match &header.input.value {
-                        NodeInput::Single(s) => s.clone(),
-                        NodeInput::Port { node, port } => format!("{node}.{port}"),
-                    };
-                    (header.name.clone(), ir)
-                }
-                _ => continue,
-            };
-            name_input_pairs.push((node_name, input_ref));
-        }
-    }
-    for (node_name, input_ref) in name_input_pairs {
-        // Port form: "<route>.<branch>" — branch name comes
-        // from the port suffix. Standard for named branches
-        // on routes with multiple downstream consumers per
-        // branch.
-        if let Some(branch) = input_ref.strip_prefix(&format!("{}.", route_parent))
-            && let Some(&succ) = succ_by_name.get(&node_name)
-        {
-            branch_to_succ.insert(branch.to_string(), succ);
-            continue;
-        }
-        // Bare form: `input: <route>` on an Output whose
-        // *name* matches a Route branch (or the Route
-        // `default:`). Conventional shorthand when each
-        // branch has exactly one downstream consumer and
-        // the consumer's name is the branch name.
-        if input_ref == route_parent
-            && let Some(&succ) = succ_by_name.get(&node_name)
-        {
-            branch_to_succ.insert(node_name.clone(), succ);
+    // The producer-port tag on each outgoing edge is the single source
+    // of truth: the planner stamps `PlanEdge.producer_port` with the
+    // branch (or `default`) name the consumer referenced as
+    // `<route>.<branch>`, so resolution is a direct walk of the live
+    // edge graph — no re-parsing of `config.nodes` input refs and no
+    // dependence on the route-name spelling. A branch may fan to more
+    // than one consumer, so each port maps to a `Vec` of successors.
+    use petgraph::visit::EdgeRef;
+    let mut branch_to_succ: HashMap<&str, Vec<NodeIndex>> = HashMap::new();
+    for edge in current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Outgoing)
+    {
+        if let Some(port) = edge.weight().producer_port.as_deref() {
+            branch_to_succ.entry(port).or_default().push(edge.target());
         }
     }
 
@@ -209,11 +155,13 @@ pub(crate) fn dispatch_route(
             match route_result {
                 Ok(targets) => {
                     for target in &targets {
-                        if let Some(&succ) = branch_to_succ.get(target.as_str()) {
-                            branch_buffers
-                                .entry(succ)
-                                .or_default()
-                                .push((record.clone(), rn));
+                        if let Some(succs) = branch_to_succ.get(target.as_str()) {
+                            for &succ in succs {
+                                branch_buffers
+                                    .entry(succ)
+                                    .or_default()
+                                    .push((record.clone(), rn));
+                            }
                         }
                         // Exclusive mode: stop after first match
                         if mode == clinker_plan::config::RouteMode::Exclusive {
