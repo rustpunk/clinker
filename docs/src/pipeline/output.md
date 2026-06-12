@@ -105,26 +105,6 @@ Set to `false` to omit the CSV header row.
 
 When `false`, null values are written as empty strings. When `true`, nulls are preserved in the output format's native null representation (e.g., `null` in JSON).
 
-## Metadata inclusion
-
-Control whether per-record `$meta.*` metadata fields appear in output:
-
-```yaml
-    include_metadata: all       # Include all metadata fields
-```
-
-```yaml
-    include_metadata: none      # Default -- strip all metadata
-```
-
-```yaml
-    include_metadata:
-      - source_file             # Include only listed metadata keys
-      - source_row
-```
-
-Metadata fields are prefixed with `meta.` in the output.
-
 ## Output format options
 
 ### CSV

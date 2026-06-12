@@ -2,10 +2,11 @@
 
 Clinker's scoped-variable system lets a pipeline read and write
 named values at three lifetimes: the pipeline run, the source, and
-the record. Variables are **declared statically** at pipeline top
-with their type and scope, **read inline** from CXL via the `$pipeline.*`,
-`$source.*`, and `$record.*` namespaces, and **written exclusively**
-by a dedicated `state` node.
+the record. Each variable is **declared on the Transform that writes
+it** via that Transform's `declares:` block (type, scope, optional
+default), **written** by the same Transform's CXL with
+`emit $<scope>.<name> = ...`, and **read inline** from any downstream
+node via the `$pipeline.*`, `$source.*`, and `$record.*` namespaces.
 
 ## The three scopes
 
@@ -15,40 +16,51 @@ by a dedicated `state` node.
 | `source`   | One per source file (`Arc<str>`-keyed)    | Per source-file   | `$source.<key>`         |
 | `record`   | A single record as it flows through nodes | Per record        | `$record.<key>`         |
 
-`$record.<key>` is a separate namespace from `$meta.<key>`. Metadata
-is written via `emit $meta.x = ...` from a transform and survives only
-to the immediate downstream operator. Record-scope vars survive the
-whole row pipeline (every transform along the row's path can read
-them) but never serialize as output columns unless explicitly emitted
-as a regular column.
+Record-scope variables are the per-record private store: every transform
+along the row's path can read them, but they never serialize as output
+columns unless explicitly re-emitted as a regular column. They are written
+with `emit $record.<key> = ...` from a transform that declares them.
 
 ## Declaring variables
 
-Every scoped variable must be declared in the pipeline's top-level
-`vars:` block, named, scoped, typed, and optionally given a default:
+A scoped variable is declared on the Transform that writes it, in that
+Transform's `config.declares:` list. Each entry is named, scoped, typed,
+and optionally given a default that satisfies reads firing before the
+writer has run:
+
+```yaml
+- type: transform
+  name: enrich
+  input: orders
+  config:
+    declares:
+      - { name: cutoff_date,  scope: pipeline, type: date,   default: "2024-01-01" }
+      - { name: ingest_label, scope: source,   type: string, default: "prod" }
+      - { name: fuzzy_score,  scope: record,   type: float }
+    cxl: |
+      emit id = id
+      emit $pipeline.cutoff_date = "2024-01-01"
+      emit $source.ingest_label = $source.file.file_stem()
+      emit $record.fuzzy_score = fuzzy_match(name, $pipeline.canonical_name)
+```
+
+Allowed types: `int`, `float`, `string`, `bool`, `date`, `date_time`.
+
+Each `(scope, name)` pair must be declared on exactly one Transform —
+the same pair declared on two Transforms is rejected at config-validation
+time, ahead of compilation. `$pipeline`, `$source`, and `$record` are flat
+shared namespaces; declare each name once and read it from every consumer.
+
+The pipeline's top-level `vars:` block is a **separate, flat** registry
+for static configuration read via `$vars.<key>` — it does not carry the
+nested `pipeline:` / `source:` / `record:` scopes:
 
 ```yaml
 pipeline:
   name: order_processing
   vars:
-    pipeline:
-      cutoff_date:
-        type: date
-        default: "2024-01-01"
-      fuzzy_threshold:
-        type: float
-        default: 0.85
-    source:
-      batch_id:
-        type: string
-      ingestion_label:
-        type: string
-    record:
-      fuzzy_score:
-        type: float
+    fuzzy_threshold: { type: float, default: 0.85 }   # read as $vars.fuzzy_threshold
 ```
-
-Allowed types: `int`, `float`, `string`, `bool`, `date`, `date_time`.
 
 Built-in members of each scope (`$source.file`, `$source.row`,
 `$source.path`, `$source.count`, `$source.batch`,
@@ -78,9 +90,9 @@ that Source's input stream closes:
 Pipelines that previously used `$source.count` as a streaming
 denominator (e.g. `value / $source.count`) will now see `Null` from
 that division on mid-stream records. If you need a streaming row
-counter, declare a `scope: source` variable and increment it from a
-`state` writer — that gives you a running count instead of waiting
-for the final.
+counter, declare a `scope: source` variable on a Transform and increment
+it from that Transform's CXL — that gives you a running count instead of
+waiting for the final.
 
 ## Reading variables
 
@@ -102,44 +114,47 @@ Reads of undeclared keys are rejected with **E200** (CXL name
 resolution failed) at compile time, with a "did you mean" suggestion
 that scans the declared registry.
 
-## Writing variables: the `state` node
+## Writing variables
 
-The only way to mutate a scoped variable is a dedicated `state`
-node. The node is a **pass-through** for records — its input record
-forwards unchanged on the output edge — but evaluates its `set:`
-assignments and writes the results into the appropriate scope-keyed
-runtime registry.
+A scoped variable is written by the Transform that declares it: list the
+variable in the Transform's `declares:` block and assign it from the same
+Transform's CXL with `emit $<scope>.<name> = <expr>`. The Transform still
+processes records normally — declaring and writing a scoped var is
+additive to its ordinary `emit`/`filter` logic.
 
 ```yaml
-- type: state
+- type: transform
   name: capture_header
   input: salesforce_in
   config:
-    scope: source
-    set:
-      - var: batch_id
-        cxl: "first(this.batch)"
-      - var: ingestion_label
-        cxl: "$source.file.file_stem()"
+    declares:
+      - { name: batch_id,        scope: source, type: string }
+      - { name: ingestion_label, scope: source, type: string }
+    cxl: |
+      emit id = id
+      emit $source.batch_id = batch
+      emit $source.ingestion_label = $source.file.file_stem()
 
-- type: state
+- type: transform
   name: row_score
   input: enrich
   config:
-    scope: record
-    set:
-      - var: fuzzy_score
-        cxl: "fuzzy_match(this.name, $pipeline.canonical_name)"
+    declares:
+      - { name: fuzzy_score, scope: record, type: float }
+    cxl: |
+      emit id = id
+      emit $record.fuzzy_score = fuzzy_match(name, $pipeline.canonical_name)
 ```
 
-Inline mutation from a regular transform (`emit $pipeline.x = ...`)
-is a parse error. The dedicated-node design keeps the dependency
-between writers and readers visible at plan time.
+An `emit $<scope>.<name>` write to a variable the Transform does **not**
+declare is rejected at compile time. Requiring the `declares:` entry keeps
+the dependency between writers and readers visible at plan time.
 
 ## Init phase: pre-runtime population
 
-A state node may declare `phase: init` to run **to completion**
-before any runtime-phase node sees a record:
+A Transform may set `phase: init` to run **to completion** before any
+runtime-phase node sees a record — useful for populating a `$pipeline.*`
+or `$source.*` value from a config source:
 
 ```yaml
 - type: source
@@ -159,22 +174,23 @@ before any runtime-phase node sees a record:
     cxl: |
       emit cap = max(cutoff)
 
-- type: state
+- type: transform
   name: precompute_cutoff
   input: max_agg
   config:
-    scope: pipeline
     phase: init
-    set:
-      - var: cutoff_date
-        cxl: "cap"
+    declares:
+      - { name: cutoff_date, scope: pipeline, type: int }
+    cxl: |
+      emit cap = cap
+      emit $pipeline.cutoff_date = cap
 ```
 
 Init-phase nodes **must be terminal** — no runtime-phase node may
-consume from an init-phase state node. (Init-phase state nodes can
-chain through init-only descendants for compositions.) Use disjoint
-Sources for init vs runtime when you need both, since a Source shared
-between an init and a runtime branch only feeds the init pass.
+consume from an init-phase Transform. (Init-phase nodes can chain
+through init-only descendants for compositions.) Use disjoint Sources
+for init vs runtime when you need both, since a Source shared between
+an init and a runtime branch only feeds the init pass.
 
 ## Compile-time validation
 
@@ -188,7 +204,7 @@ registry, and every cross-DAG flow is verified against the topology.
 | E109 | Channel targets a composition but carries `vars:` overrides.           |
 | E110 | Channel var name shadows a reserved system field for that scope.       |
 | E111 | Channel `vars.source.<src>` references an unknown source-node name.    |
-| E164 | An init-phase state node has a runtime descendant.                     |
+| E164 | An init-phase Transform has a runtime descendant.                      |
 | E171 | A reader is not a transitive DAG descendant of its writer.             |
 | E172 | Bare `$source.<custom>` read downstream of a Merge or Combine.         |
 | E173 | Composition body reads a parent scoped var without opting in.          |
@@ -269,10 +285,11 @@ These are intentional non-features:
 - **No persistence across runs.** State is in-memory only. A pipeline
   run starts with declaration defaults; the writes don't survive
   the process.
-- **No inline `emit $pipeline.x` writes.** Convenience-style
-  mutation from a transform body is forbidden — empirical evidence
-  from comparable engines shows it leads to race conditions and
-  hidden DAG dependencies.
+- **No undeclared writes.** A Transform may only write a scoped
+  variable it lists in `declares:`; an `emit $pipeline.x` to an
+  undeclared name is a compile error. Requiring the declaration keeps
+  every writer visible at plan time and the writer→reader dependency
+  explicit in the DAG.
 - **No dynamic var creation.** The set of variables is closed at
   plan time, by design. This bounds memory and makes the validation
   matrix above tractable.

@@ -59,7 +59,9 @@ memory ceiling.
 ## Why Clinker?
 
 **Single binary, zero dependencies.** Download it, run it. No JVM, no Python,
-no package manager. Works on any Linux server out of the box.
+no package manager. Runs on Linux, macOS, and Windows out of the box — CI
+builds and tests on all three, and the spill, staging, and RSS-sampling
+layers have platform-specific paths so behavior is consistent across them.
 
 **Good neighbor on busy servers.** Clinker enforces a strict memory ceiling
 (default 512 MB) so it can run alongside JVM applications, databases, and other

@@ -35,10 +35,11 @@ The operators `&&`, `||`, and `!` are **syntax errors** in CXL. Always use `and`
 
 CXL provides built-in namespaces for accessing pipeline state, metadata, and window functions. All system namespaces are prefixed with `$`:
 
-- `$pipeline.*` -- pipeline execution context (name, counters, provenance)
-- `$meta.*` -- per-record metadata
+- `$pipeline.*` -- pipeline execution context (name, counters, provenance) and pipeline-scope declared state
+- `$source.*` -- per-source context and source-scope declared state
+- `$record.*` -- per-record scoped state (travels with the record, never an output column)
 - `$window.*` -- window function calls
-- `$vars.*` -- user-defined pipeline variables
+- `$vars.*` -- static, channel-overridable configuration
 
 ```bash
 $ cxl eval -e 'emit name = $pipeline.name'

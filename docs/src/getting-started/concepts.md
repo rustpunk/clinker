@@ -96,17 +96,29 @@ CXL uses `and`, `or`, and `not` for boolean logic -- not `&&` or `||`. String
 concatenation uses `+`. Conditional expressions use
 `if ... then ... else ...` syntax.
 
-System namespaces use a `$` prefix: `$pipeline.*`, `$window.*`, `$meta.*`.
-These provide access to pipeline metadata, window function state, and record
-metadata respectively.
+System namespaces use a `$` prefix: `$pipeline.*`, `$source.*`, `$record.*`,
+`$window.*`, and `$vars.*`. These provide access to pipeline and source
+context, per-record scoped state, window function state, and static
+configuration respectively.
 
 ## Per-record evaluation and the memory budget
 
-Within a run, records flow through the pipeline **one at a time**. Clinker
-does not load an entire file into memory before processing it. A source reads
-one record, pushes it through the downstream nodes, and then reads the next.
-This is what "streaming" means in Clinker -- row-by-row evaluation inside a
-finite batch job, not Flink-style unbounded stream processing.
+Within a run, stateless operators evaluate records **one at a time**:
+a CXL block sees exactly one record, with no table-level context and no
+per-record state carried across records. Clinker does not load an entire
+file into memory before processing it. This is what "streaming" means in
+Clinker -- row-by-row evaluation inside a finite batch job, not Flink-style
+unbounded stream processing.
+
+"One at a time" describes the *evaluation* model, not the transport. For
+efficiency, records move between stages in bounded batches (default 2048
+events, tunable per stage or pipeline-wide via
+[`batch_size`](../ops/memory.md#streaming-batch-size-batch_size)) rather
+than as individual messages -- but each record is still evaluated
+independently against the CXL block. The batch is a handoff unit, not a
+window: an operator never needs the whole batch to process any single
+record. (Blocking operators -- Aggregate, sort, grace-hash Combine -- are
+the exception that *do* accumulate across records; see below.)
 
 Per-record evaluation keeps **per-row** memory usage bounded for the
 stateless parts of the graph (Transform, Route, Merge, most Combine

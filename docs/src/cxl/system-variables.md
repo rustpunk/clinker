@@ -96,27 +96,36 @@ emit currency = $vars.output_currency
 
 Variables provide a clean way to externalize configuration from CXL logic. Combined with [channels](../pipeline/channels.md), different variable sets can parameterize the same pipeline for different environments or clients.
 
-## $meta.* -- Per-record metadata
+## $record.* -- Per-record scoped state
 
-Metadata is a per-record key-value store that travels with the record through the pipeline but is not part of the output columns. Write to it with `emit meta`; read from it with `$meta.field`.
+`$record.*` is a per-record key-value store that travels with the record through the pipeline but never serializes as an output column. It is the mechanism for tagging records with quality flags, routing hints, or audit information that should not appear in the final output unless explicitly re-emitted as a regular column.
 
-### Writing metadata
+Each `$record` variable is declared in the writing Transform's `config.declares:` block (`scope: record`) and written from that Transform's CXL:
+
+### Writing record state
+
+```yaml
+- type: transform
+  name: classify
+  input: orders
+  config:
+    declares:
+      - { name: quality, scope: record, type: string }
+    cxl: |
+      emit order_id = order_id
+      emit $record.quality = if amount < 0 then "suspect" else "ok"
+```
+
+### Reading record state
+
+Any downstream node reads it via `$record.<key>`:
 
 ```
-emit meta quality = if amount < 0 then "suspect" else "ok"
-emit meta source_system = "legacy_erp"
+filter $record.quality == "ok"
+emit audit_quality = $record.quality
 ```
 
-### Reading metadata
-
-Downstream nodes can read metadata:
-
-```
-filter $meta.quality == "ok"
-emit audit_system = $meta.source_system
-```
-
-Metadata is useful for tagging records with quality flags, routing hints, or audit information that should not appear in the final output unless explicitly emitted.
+See [Scoped Variables](../pipeline/variables.md) for the full declaration model and the pipeline / source / record lifetimes.
 
 ## now -- Current time
 
@@ -166,7 +175,7 @@ pipeline:
         emit tax = amount * $vars.tax_rate
         emit total = amount * (1 - discount) + tax
         emit processed_at = now
-        emit meta source_file = $source.file
+        emit source_file = $source.file
         emit pipeline_run = $pipeline.execution_id
 
     - name: output
