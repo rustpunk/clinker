@@ -7,6 +7,7 @@ pub mod error;
 pub mod fixed_width;
 pub mod hl7;
 pub mod json;
+pub(crate) mod segment_tokenizer;
 pub mod splitting;
 pub mod traits;
 pub mod x12;
