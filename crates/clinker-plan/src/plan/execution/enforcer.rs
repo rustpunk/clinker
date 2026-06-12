@@ -115,17 +115,19 @@ impl ExecutionPlanDag {
             }
 
             // Locate and remove the direct Source→consumer edge, capturing
-            // its dependency type and consumer-side port for re-use on
-            // the rewritten edges. The port tag belongs to the
-            // sort→consumer hop (the consumer is unchanged); the
-            // source→sort hop has no port (Sort takes a single unnamed
-            // input).
+            // its dependency type and both port tags for re-use on the
+            // rewritten edges. Both tags belong to the sort→consumer hop:
+            // the consumer is unchanged, and the original producer is
+            // preserved upstream of the spliced Sort. The source→sort hop
+            // carries no port (Sort takes a single unnamed input and the
+            // Source emits a single unnamed output).
             let edge_id = self
                 .graph
                 .find_edge(source_idx, consumer_idx)
                 .expect("source parent must have outgoing edge to consumer");
             let dep_type = self.graph[edge_id].dependency_type;
             let consumer_port = self.graph[edge_id].port.clone();
+            let producer_port = self.graph[edge_id].producer_port.clone();
             self.graph.remove_edge(edge_id);
 
             // Planner-synthesized sort enforcer. No YAML node exists
@@ -146,6 +148,7 @@ impl ExecutionPlanDag {
                 PlanEdge {
                     dependency_type: dep_type,
                     port: None,
+                    producer_port: None,
                 },
             );
             self.graph.add_edge(
@@ -154,6 +157,7 @@ impl ExecutionPlanDag {
                 PlanEdge {
                     dependency_type: dep_type,
                     port: consumer_port,
+                    producer_port,
                 },
             );
         }
@@ -230,11 +234,11 @@ impl ExecutionPlanDag {
                 }
             }
 
-            // Capture (target, dep_type, port) for every outgoing edge — the
-            // port tag must survive the splice so a downstream
-            // composition's named-input edge keeps its tag on the new
-            // sort→target hop.
-            let outgoing: Vec<(NodeIndex, DependencyType, Option<String>)> = self
+            // Capture (target, dep_type, consumer_port, producer_port) for
+            // every outgoing edge — both port tags must survive the splice
+            // so a downstream composition's named-input edge keeps its tag
+            // and any producer output port stays on the new sort→target hop.
+            let outgoing: Vec<(NodeIndex, DependencyType, Option<String>, Option<String>)> = self
                 .graph
                 .edges_directed(source_idx, petgraph::Direction::Outgoing)
                 .map(|e| {
@@ -242,6 +246,7 @@ impl ExecutionPlanDag {
                         e.target(),
                         e.weight().dependency_type,
                         e.weight().port.clone(),
+                        e.weight().producer_port.clone(),
                     )
                 })
                 .collect();
@@ -251,7 +256,7 @@ impl ExecutionPlanDag {
 
             // Idempotent insertion guard: every outgoing edge already
             // lands on a CORRELATION_SORT_PREFIX Sort node — nothing to do.
-            if outgoing.iter().all(|(t, _, _)| {
+            if outgoing.iter().all(|(t, _, _, _)| {
                 matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
             }) {
                 continue;
@@ -263,7 +268,7 @@ impl ExecutionPlanDag {
                 sort_fields,
             };
             let sort_idx = self.graph.add_node(sort_node);
-            for (target, dep_type, port) in outgoing {
+            for (target, dep_type, port, producer_port) in outgoing {
                 if target == sort_idx {
                     continue;
                 }
@@ -276,6 +281,7 @@ impl ExecutionPlanDag {
                     PlanEdge {
                         dependency_type: dep_type,
                         port,
+                        producer_port,
                     },
                 );
             }
@@ -285,6 +291,7 @@ impl ExecutionPlanDag {
                 PlanEdge {
                     dependency_type: DependencyType::Data,
                     port: None,
+                    producer_port: None,
                 },
             );
         }
@@ -361,6 +368,7 @@ impl ExecutionPlanDag {
                 PlanEdge {
                     dependency_type: DependencyType::Data,
                     port: None,
+                    producer_port: None,
                 },
             );
         }

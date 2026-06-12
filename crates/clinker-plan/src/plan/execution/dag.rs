@@ -716,6 +716,7 @@ mod port_tag_guard_tests {
             PlanEdge {
                 dependency_type: DependencyType::Data,
                 port: Some("p".to_string()),
+                producer_port: None,
             },
         );
         let artifacts = CompileArtifacts::default();
@@ -738,6 +739,7 @@ mod port_tag_guard_tests {
             PlanEdge {
                 dependency_type: DependencyType::Data,
                 port: None,
+                producer_port: None,
             },
         );
         let artifacts = CompileArtifacts::default();
@@ -775,6 +777,7 @@ mod port_tag_guard_tests {
             PlanEdge {
                 dependency_type: DependencyType::Data,
                 port: None,
+                producer_port: None,
             },
         );
         let body = crate::plan::composition_body::BoundBody {

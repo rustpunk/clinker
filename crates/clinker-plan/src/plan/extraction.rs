@@ -456,6 +456,7 @@ mod tests {
         PlanEdge {
             dependency_type: DependencyType::Data,
             port: None,
+            producer_port: None,
         }
     }
 

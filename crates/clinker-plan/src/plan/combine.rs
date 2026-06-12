@@ -2052,6 +2052,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
+                        producer_port: None,
                     },
                 );
             }
@@ -2062,6 +2063,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
+                        producer_port: None,
                     },
                 );
             }
