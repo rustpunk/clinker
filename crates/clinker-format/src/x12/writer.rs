@@ -31,6 +31,7 @@ use clinker_record::{Record, Schema, Value};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 use crate::x12::RAW_ELEMENTS_KEY;
+use crate::x12::charset::Charset;
 use crate::x12::tokenizer::Delimiters;
 
 /// Default X12 service delimiters used when no `ISA` header dictates
@@ -70,6 +71,11 @@ pub struct X12WriterConfig {
     /// plain `Default` for this struct leaves it `false`, so a caller
     /// constructing the config directly sets it explicitly.
     pub segment_newline: bool,
+    /// Character set element text is encoded through. Defaults to UTF-8; set
+    /// to match the reader's charset so a non-UTF-8 interchange round-trips
+    /// byte-faithfully. A character the charset cannot represent is rejected
+    /// rather than emitted truncated.
+    pub charset: Charset,
 }
 
 /// Streaming X12 interchange writer.
@@ -428,9 +434,11 @@ impl<W: Write> X12Writer<W> {
             self.writer
                 .write_all(&[self.delims.element])
                 .map_err(FormatError::Io)?;
-            self.writer
-                .write_all(element.as_bytes())
-                .map_err(FormatError::Io)?;
+            // Encode element text through the configured charset so a
+            // non-UTF-8 interchange round-trips byte-faithfully; a character
+            // the charset cannot represent is rejected, not truncated.
+            let encoded = self.config.charset.encode(element)?;
+            self.writer.write_all(&encoded).map_err(FormatError::Io)?;
         }
         self.writer
             .write_all(&[self.delims.terminator])

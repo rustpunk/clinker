@@ -15,6 +15,7 @@ use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::traits::FormatWriter;
+use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use clinker_plan::config::{OutputConfig, OutputFormat};
@@ -129,17 +130,24 @@ fn build_edifact_writer_config(
 
 fn build_x12_writer_config(
     opts: Option<&clinker_plan::config::X12OutputOptions>,
-) -> X12WriterConfig {
+) -> Result<X12WriterConfig, clinker_format::FormatError> {
     // `segment_newline` defaults to `true` (readable per-segment lines).
     // The struct literal expresses it up front so an unset option falls
-    // through to the documented default.
-    X12WriterConfig {
+    // through to the documented default. An unset `encoding` defaults to
+    // UTF-8; a declared one is resolved here so a bad name fails at writer
+    // construction rather than mid-stream.
+    let charset = match opts.and_then(|o| o.encoding.as_deref()) {
+        Some(name) => Charset::from_name(name)?,
+        None => Charset::default(),
+    };
+    Ok(X12WriterConfig {
         interchange: opts.and_then(|o| o.interchange.clone()),
         interchange_from_doc: opts.and_then(|o| o.interchange_from_doc.clone()),
         group_header: opts.and_then(|o| o.group_header.clone()),
         set_type: opts.and_then(|o| o.set_type.clone()),
         segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
-    }
+        charset,
+    })
 }
 
 fn build_hl7_writer_config(
@@ -280,12 +288,23 @@ fn build_writer_factory(
             })
         }
         OutputFormat::X12(opts) => {
+            // Resolve the writer config (including charset) once here so the
+            // factory only clones an already-validated config and a bad
+            // `encoding` name surfaces deterministically, before any output
+            // bytes. For a non-split sink the factory runs at executor setup,
+            // so the error is a startup failure; for a split sink the
+            // SplittingWriter lazy-opens the factory, so it surfaces when the
+            // first per-split writer is built (at the first record) — still
+            // pre-output and never a corrupt interchange, just not at setup.
             let x12_config = build_x12_writer_config(opts.as_ref());
             Box::new(move |counting_writer, schema| {
+                let config = x12_config
+                    .as_ref()
+                    .map_err(|e| clinker_format::FormatError::X12(e.to_string()))?;
                 Ok(Box::new(X12Writer::new(
                     counting_writer,
                     schema,
-                    x12_config.clone(),
+                    config.clone(),
                 )))
             })
         }

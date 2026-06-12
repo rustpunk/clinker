@@ -568,6 +568,13 @@ pub struct X12InputOptions {
     /// with guidance rather than silently truncated. Defaults to 32.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_elements: Option<usize>,
+    /// Character set the interchange body is decoded through. X12 carries
+    /// no in-band element naming the body repertoire, so it is declared
+    /// here and defaults to UTF-8. Supported values are `utf-8` and
+    /// `iso-8859-1` (Latin-1); an unsupported value is rejected with a
+    /// precise error naming it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// HL7 v2 input options.

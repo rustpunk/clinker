@@ -31,6 +31,7 @@ use crate::error::FormatError;
 use crate::segment_tokenizer::{
     SegmentFraming, TrailingSegment, read_raw_segment, skip_inter_segment_whitespace,
 };
+use crate::x12::charset::Charset;
 
 /// Hard ceiling on a single segment's raw byte length. A real X12 segment
 /// is well under a kilobyte; this cap exists only so a stream with no
@@ -75,21 +76,25 @@ pub(crate) struct Delimiters {
 
 /// Streaming X12 segment reader.
 ///
-/// Wraps a buffered source and yields one raw segment string at a time
+/// Wraps a buffered source and yields one decoded segment string at a time
 /// (terminator stripped, inter-segment CR/LF whitespace stripped). The
 /// delimiters are discovered once from the fixed 106-byte `ISA` header on
-/// the first read.
+/// the first read; element text is decoded through the configured
+/// [`Charset`] (the shared framing layer never inspects bytes, so the
+/// charset policy stays X12-local here).
 pub(crate) struct SegmentTokenizer<R: Read> {
     reader: R,
     delimiters: Delimiters,
+    charset: Charset,
     initialized: bool,
 }
 
 impl<R: BufRead> SegmentTokenizer<R> {
-    /// Build a tokenizer over a buffered source. Delimiter discovery is
-    /// deferred to the first [`Self::next_segment`] call so the `ISA`
-    /// header scan and the first segment read share one pass.
-    pub(crate) fn new(reader: R) -> Self {
+    /// Build a tokenizer over a buffered source decoding element text
+    /// through `charset`. Delimiter discovery is deferred to the first
+    /// [`Self::next_segment`] call so the `ISA` header scan and the first
+    /// segment read share one pass.
+    pub(crate) fn new(reader: R, charset: Charset) -> Self {
         Self {
             reader,
             // A placeholder until the ISA is read; never used because the
@@ -99,6 +104,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
                 subelement: b':',
                 terminator: b'~',
             },
+            charset,
             initialized: false,
         }
     }
@@ -107,6 +113,11 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// resolved the `ISA` header.
     pub(crate) fn delimiters(&self) -> Delimiters {
         self.delimiters
+    }
+
+    /// The charset element text is decoded through.
+    pub(crate) fn charset(&self) -> Charset {
+        self.charset
     }
 
     /// Read and consume the fixed 106-byte `ISA` header, returning its raw
@@ -176,13 +187,20 @@ impl<R: BufRead> SegmentTokenizer<R> {
         }
     }
 
-    /// Read the next raw segment (terminator-delimited), or `None` at
-    /// clean end of stream.
+    /// Read the next segment (terminator-delimited) and decode it through
+    /// the configured [`Charset`], or `None` at clean end of stream.
     ///
     /// The terminator byte is consumed but not returned. X12 has no
     /// release/escape mechanism, so every terminator byte is a segment
     /// boundary. CR/LF between segments is dropped; CR/LF inside an
-    /// element is preserved.
+    /// element is preserved. The raw segment bytes are decoded once here
+    /// (the shared framing layer that read them never interprets bytes), so
+    /// a non-UTF-8 charset is honored without touching segment framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::X12`] when the segment bytes are not valid in
+    /// the configured charset (only possible under [`Charset::Utf8`]).
     pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
         debug_assert!(
             self.initialized,
@@ -211,11 +229,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
             None => return Ok(None),
         };
 
-        let text = String::from_utf8(raw).map_err(|e| {
-            FormatError::X12(format!(
-                "segment is not valid UTF-8: {e}. Non-UTF-8 charsets are not supported"
-            ))
-        })?;
+        let text = self.charset.decode(raw)?;
         Ok(Some(text))
     }
 }
@@ -264,14 +278,24 @@ pub(crate) fn split_segment(raw: &str, delims: &Delimiters) -> ParsedSegment {
 }
 
 /// Split the fixed `ISA` header bytes into the `ISA` tag plus its 16 data
-/// elements on the discovered element separator.
+/// elements on the discovered element separator, decoding the header text
+/// through `charset`.
 ///
 /// The header is split structurally (on the element separator), not by
 /// absolute byte offset, so a consumer reads `ISA13` (the interchange
 /// control number) as element index 12 regardless of any producer
 /// padding quirk — mirroring the rest of the parser's
 /// locate-by-structure discipline.
-pub(crate) fn split_isa(header: &[u8], delims: &Delimiters) -> ParsedSegment {
+///
+/// # Errors
+///
+/// Returns [`FormatError::X12`] when the header bytes are not valid in
+/// `charset` (only possible under [`Charset::Utf8`]).
+pub(crate) fn split_isa(
+    header: &[u8],
+    delims: &Delimiters,
+    charset: Charset,
+) -> Result<ParsedSegment, FormatError> {
     // The header's final byte is the segment terminator; trim it so the
     // last element (ISA16) is not contaminated by it.
     let body = if header.last() == Some(&delims.terminator) {
@@ -279,12 +303,13 @@ pub(crate) fn split_isa(header: &[u8], delims: &Delimiters) -> ParsedSegment {
     } else {
         header
     };
-    let text = String::from_utf8_lossy(body).into_owned();
-    split_segment(&text, delims)
+    let text = charset.decode(body.to_vec())?;
+    Ok(split_segment(&text, delims))
 }
 
 /// Reassemble interior `current` bytes into a `String`. The input is a
-/// UTF-8-validated segment slice, so this is lossless.
+/// slice of an already-decoded (valid UTF-8) segment string, split on the
+/// single-byte element separator, so this reconstruction is lossless.
 fn bytes_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -306,7 +331,7 @@ mod tests {
     }
 
     fn tok(data: &[u8]) -> SegmentTokenizer<Cursor<Vec<u8>>> {
-        SegmentTokenizer::new(Cursor::new(data.to_vec()))
+        SegmentTokenizer::new(Cursor::new(data.to_vec()), Charset::Utf8)
     }
 
     #[test]
@@ -318,7 +343,7 @@ mod tests {
         assert_eq!(d.element, b'*');
         assert_eq!(d.subelement, b':');
         assert_eq!(d.terminator, b'~');
-        let parsed = split_isa(&header, &d);
+        let parsed = split_isa(&header, &d, t.charset()).unwrap();
         assert_eq!(parsed.tag, "ISA");
         assert_eq!(parsed.elements.len(), 16, "ISA carries 16 elements");
         // ISA13 (interchange control number) is element index 12.
@@ -362,6 +387,54 @@ mod tests {
         let parsed = split_segment(&seg, &t.delimiters());
         assert_eq!(parsed.tag, "REF");
         assert_eq!(parsed.elements, vec!["ZZ".to_string(), "A:B:C".to_string()]);
+    }
+
+    #[test]
+    fn latin1_high_byte_element_decoded() {
+        // A REF segment whose element carries the Latin-1 byte 0xE9 (é)
+        // decodes under the Latin-1 charset but would be rejected as
+        // invalid UTF-8 under the default.
+        let mut data = isa_header().into_bytes();
+        data.extend_from_slice(b"REF*ZZ*Caf");
+        data.push(0xE9);
+        data.push(b'~');
+        let mut t = SegmentTokenizer::new(Cursor::new(data), Charset::Latin1);
+        let _ = t.read_isa_header().unwrap();
+        let seg = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&seg, &t.delimiters());
+        assert_eq!(parsed.tag, "REF");
+        assert_eq!(parsed.elements, vec!["ZZ".to_string(), "Café".to_string()]);
+    }
+
+    #[test]
+    fn latin1_isa_decode_consistent_with_segments() {
+        // A Latin-1 tokenizer decodes both the ISA header and the body
+        // through the same repertoire; the ASCII control header is
+        // unaffected and the high-byte body element decodes.
+        let mut data = isa_header().into_bytes();
+        data.extend_from_slice(b"REF*N1*A");
+        data.push(0xF1);
+        data.push(b'o');
+        data.push(b'~');
+        let mut t = SegmentTokenizer::new(Cursor::new(data), Charset::Latin1);
+        let header = t.read_isa_header().unwrap();
+        let isa = split_isa(&header, &t.delimiters(), t.charset()).unwrap();
+        assert_eq!(isa.elements[12], "000000001");
+        let seg = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&seg, &t.delimiters());
+        assert_eq!(parsed.elements, vec!["N1".to_string(), "Año".to_string()]);
+    }
+
+    #[test]
+    fn high_byte_element_rejected_under_utf8() {
+        let mut data = isa_header().into_bytes();
+        data.extend_from_slice(b"REF*ZZ*Caf");
+        data.push(0xE9);
+        data.push(b'~');
+        let mut t = SegmentTokenizer::new(Cursor::new(data), Charset::Utf8);
+        let _ = t.read_isa_header().unwrap();
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::X12(m) if m.contains("not valid UTF-8")));
     }
 
     #[test]
@@ -422,7 +495,7 @@ mod tests {
         let data = format!("{}GS*PO*S*R*20240101*1200*1*X*004010~", isa_header());
         let inner = Cursor::new(data.into_bytes());
         let buffered = BufReader::with_capacity(16, inner);
-        let mut t = SegmentTokenizer::new(buffered);
+        let mut t = SegmentTokenizer::new(buffered, Charset::Utf8);
         let header = t.read_isa_header().unwrap();
         assert_eq!(header.len(), ISA_LEN);
         assert_eq!(t.delimiters().element, b'*');
