@@ -22,7 +22,7 @@ use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
 use crate::edifact::tokenizer::{ParsedSegment, SegmentTokenizer, split_segment};
-use crate::edifact::{RAW_ELEMENTS_KEY, unb_control_reference};
+use crate::edifact::{RAW_ELEMENTS_KEY, unz_echo_matches_unb};
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -59,12 +59,10 @@ pub struct EdifactReader<R: Read> {
     schema: Arc<Schema>,
     max_elements: usize,
     initialized: bool,
-    /// Raw `UNB` data elements, stashed at init for envelope serving.
+    /// Raw `UNB` data elements, stashed at init for envelope serving and
+    /// for structurally validating the `UNZ` control-reference echo once
+    /// the trailer arrives.
     unb_elements: Vec<String>,
-    /// `UNB` interchange control reference (data element 0020), located
-    /// structurally after the mandatory leading composites and echoed by
-    /// `UNZ` for round-trip integrity validation.
-    unb_control_ref: Option<String>,
     /// State of the message currently being streamed, if any.
     open_message: Option<OpenMessage>,
     /// Count of `UNH` messages seen, checked against `UNZ`.
@@ -96,7 +94,6 @@ impl<R: Read> EdifactReader<R> {
             max_elements: config.max_elements,
             initialized: false,
             unb_elements: Vec::new(),
-            unb_control_ref: None,
             open_message: None,
             message_count: 0,
             interchange_closed: false,
@@ -105,8 +102,8 @@ impl<R: Read> EdifactReader<R> {
     }
 
     /// Consume the optional `UNA` and the mandatory `UNB`, stashing the
-    /// interchange control reference and the `UNB` data elements for
-    /// envelope serving. Idempotent.
+    /// `UNB` data elements for envelope serving and for the deferred
+    /// control-reference validation against the `UNZ` trailer. Idempotent.
     fn ensure_initialized(&mut self) -> Result<(), FormatError> {
         if self.initialized {
             return Ok(());
@@ -124,12 +121,11 @@ impl<R: Read> EdifactReader<R> {
                 parsed.tag
             )));
         }
-        // Locate the interchange control reference structurally — after
-        // the four mandatory leading composites — rather than at a fixed
-        // index, so an empty optional element ahead of it does not cause
-        // the wrong element to be read. Absence in a degenerate header
-        // disables the UNZ-echo check rather than failing the parse.
-        self.unb_control_ref = unb_control_reference(&parsed.elements).map(str::to_owned);
+        // Stash the full element list; the control reference is resolved
+        // structurally against the UNZ echo at interchange close, not from
+        // the header alone — a doubly-degenerate UNB (empty date/time slot
+        // plus a date-only date/time) leaves two plausible control-reference
+        // positions that only the trailer can disambiguate.
         self.unb_elements = parsed.elements;
         Ok(())
     }
@@ -289,14 +285,19 @@ impl<R: Read> EdifactReader<R> {
                 self.message_count
             )));
         }
-        if let Some(expected) = &self.unb_control_ref {
-            let echoed = unz.elements.get(1).map(|s| s.as_str()).unwrap_or("");
-            if echoed != expected {
-                return Err(FormatError::Edifact(format!(
-                    "UNZ control reference {echoed:?} does not echo the UNB reference \
-                     {expected:?}"
-                )));
-            }
+        // Validate the control-reference echo against the UNB structure
+        // rather than a single pre-chosen index: the echo confirms which
+        // of the plausible control-reference slots holds 0020, so a
+        // doubly-degenerate header (empty date/time slot plus a date-only
+        // date/time, which shifts the reference one slot) is accepted when
+        // the trailer echoes the true reference, while a genuinely
+        // out-of-sync trailer still fails.
+        let echoed = unz.elements.get(1).map(|s| s.as_str()).unwrap_or("");
+        if !unz_echo_matches_unb(&self.unb_elements, echoed) {
+            return Err(FormatError::Edifact(format!(
+                "UNZ control reference {echoed:?} does not echo the UNB interchange \
+                 control reference"
+            )));
         }
         self.interchange_closed = true;
         Ok(())
@@ -628,6 +629,41 @@ mod tests {
             match r.next_record() {
                 Ok(Some(_)) => continue,
                 Ok(None) => panic!("expected control ref mismatch for shifted reference"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::Edifact(m) if m.contains("does not echo the UNB")));
+    }
+
+    #[test]
+    fn doubly_degenerate_unb_resolves_control_ref_to_intended_element() {
+        // A header degenerate in two ways at once: the S004 date/time slot
+        // (index 3) is an empty pad AND a date-only S004 "240101" sits at
+        // the canonical control-reference slot (index 4), shifting the true
+        // reference "REF9" to index 5. Locating the reference by the first
+        // non-empty element after the leading composites would pick the
+        // date "240101"; the structural check accepts the UNZ echo of the
+        // real reference at the shifted slot, so this internally consistent
+        // interchange validates instead of being spuriously rejected.
+        let data = "UNB+UNOA:1+SENDER+RECEIVER++240101+REF9'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF9'";
+        let recs = collect(data);
+        assert_eq!(recs.len(), 2); // UNH, BGM — no spurious rejection
+        assert_eq!(recs[1].get("seg_id"), Some(&Value::String("BGM".into())));
+    }
+
+    #[test]
+    fn doubly_degenerate_unb_still_rejects_genuine_unz_mismatch() {
+        // The doubly-degenerate shape must not become a wildcard: a UNZ
+        // that echoes neither the canonical-slot date "240101" nor the
+        // shifted true reference "REF9" is still a genuine mismatch.
+        let data = "UNB+UNOA:1+SENDER+RECEIVER++240101+REF9'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+WRONGREF'";
+        let mut r = reader(data);
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected control ref mismatch for doubly-degenerate header"),
                 Err(e) => break e,
             }
         };
