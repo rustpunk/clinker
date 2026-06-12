@@ -266,9 +266,6 @@ pub struct CombineInput {
     /// C.2+ execution strategies without having to re-traverse
     /// `schema_by_name`.
     pub row: Row,
-    /// Optional cardinality estimate. Populated by later phases (e.g.
-    /// statistics) when available; `None` at bind_schema time.
-    pub estimated_cardinality: Option<u64>,
 }
 
 // ─── Predicate decomposition (Phase Combine C.1.2) ──────────────────
@@ -704,6 +701,10 @@ pub(crate) struct CombineSelectionTables<'a> {
     pub combine_predicates: &'a std::collections::HashMap<String, DecomposedPredicate>,
     /// Per-combine driving qualifier, keyed by combine node name.
     pub combine_driving: &'a std::collections::HashMap<String, String>,
+    /// Statistics catalog. Combine strategy selection reads each input's
+    /// row count from here, keyed by the input's upstream node name, in
+    /// place of a per-input cardinality field.
+    pub statistics: &'a crate::plan::statistics::StatisticsCatalog,
     /// Per-combine user-supplied strategy hint, keyed by combine node name.
     pub combine_strategy_hints:
         &'a std::collections::HashMap<String, crate::config::CombineStrategyHint>,
@@ -724,6 +725,7 @@ pub fn select_combine_strategies(
         combine_inputs: &artifacts.combine_inputs,
         combine_predicates: &artifacts.combine_predicates,
         combine_driving: &artifacts.combine_driving,
+        statistics: &artifacts.statistics,
         combine_strategy_hints: &artifacts.combine_strategy_hints,
     };
     select_combine_strategies_in_graph(
@@ -757,6 +759,7 @@ pub fn select_combine_strategies_in_bodies(
         combine_inputs,
         combine_predicates,
         combine_driving,
+        statistics,
         combine_strategy_hints,
         ..
     } = artifacts;
@@ -765,6 +768,7 @@ pub fn select_combine_strategies_in_bodies(
         combine_inputs,
         combine_predicates,
         combine_driving,
+        statistics,
         combine_strategy_hints,
     };
     for body in composition_bodies.values_mut() {
@@ -834,9 +838,12 @@ pub(crate) fn select_combine_strategies_in_graph(
             continue;
         }
         if decomposed.ranges.is_empty()
-            && inputs
-                .values()
-                .all(|ci| matches!(ci.estimated_cardinality, Some(c) if c <= SMALL_INPUT_THRESHOLD))
+            && inputs.values().all(|ci| {
+                matches!(
+                    tables.statistics.row_count(&ci.upstream_name),
+                    Some(c) if c <= SMALL_INPUT_THRESHOLD
+                )
+            })
         {
             diags.push(combine_w302_small_both(&name, span));
         }
@@ -857,7 +864,7 @@ pub(crate) fn select_combine_strategies_in_graph(
 
         let chosen_strategy: CombineStrategy = if has_equi && has_range {
             CombineStrategy::HashPartitionIEJoin {
-                partition_bits: compute_partition_bits(inputs),
+                partition_bits: compute_partition_bits(inputs, tables.statistics),
             }
         } else if !has_equi && has_range {
             // Pure-range predicate. SortMerge is preferred when both
@@ -881,7 +888,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             } else {
                 CombineStrategy::IEJoin
             }
-        } else if grace_hash_should_fire(inputs, mem_limit_str)
+        } else if grace_hash_should_fire(inputs, tables.statistics, mem_limit_str)
             || matches!(
                 tables.combine_strategy_hints.get(&name),
                 Some(crate::config::CombineStrategyHint::GraceHash)
@@ -897,7 +904,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             // its `MIN_BITS` floor — the executor still partitions the
             // build correctly, it just splits into fewer buckets.
             CombineStrategy::GraceHash {
-                partition_bits: compute_grace_partition_bits(inputs),
+                partition_bits: compute_grace_partition_bits(inputs, tables.statistics),
             }
         } else {
             CombineStrategy::HashBuildProbe
@@ -959,52 +966,53 @@ pub(crate) fn select_combine_strategies_in_graph(
 /// grace dispatch.
 fn grace_hash_should_fire(
     inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
     mem_limit_str: Option<&str>,
 ) -> bool {
     use crate::config::utils::parse_memory_limit_bytes;
 
-    // Conservative per-record byte estimate when computing whether to fire
-    // GraceHash strategy. Underestimating biases toward HashBuildProbe;
-    // overestimating biases toward GraceHash. 1 KiB matches the
-    // production-record size observed on enrich pipelines.
-    const GRACE_RECORD_BYTES_ESTIMATE: u64 = 1024;
-
-    let estimates: Vec<u64> = inputs
-        .values()
-        .filter_map(|ci| ci.estimated_cardinality)
-        .collect();
-    if estimates.len() < inputs.len() {
+    let Some(build_estimate) = build_side_row_count(inputs, statistics) else {
         return false;
-    }
-    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
-    if build_estimate == 0 {
-        return false;
-    }
+    };
     let limit = parse_memory_limit_bytes(mem_limit_str);
     let soft_limit = limit / 100 * 80;
-    let estimated_bytes = build_estimate.saturating_mul(GRACE_RECORD_BYTES_ESTIMATE);
+    let estimated_bytes =
+        build_estimate.saturating_mul(crate::plan::statistics::RECORD_BYTES_ESTIMATE);
     estimated_bytes >= soft_limit
+}
+
+/// The build-side row count for a combine: the smallest known row count
+/// across its inputs, read from the statistics catalog keyed by each
+/// input's upstream node name. Returns `None` when any input has no row
+/// count (no signal to size against) or when the smallest is zero — the
+/// same "no estimate" floor that keeps an unsized join on the default
+/// in-memory strategy rather than over-spilling it.
+fn build_side_row_count(
+    inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
+) -> Option<u64> {
+    let mut smallest: Option<u64> = None;
+    for ci in inputs.values() {
+        let rows = statistics.row_count(&ci.upstream_name)?;
+        smallest = Some(smallest.map_or(rows, |s: u64| s.min(rows)));
+    }
+    smallest.filter(|&r| r > 0)
 }
 
 /// Compute `partition_bits` for `GraceHash`. Targets ~256 records per
 /// partition under an unspilled build to keep per-partition hash table
 /// overhead amortized. Capped at 12 bits (4096 partitions) per the
 /// per-partition file overhead breakeven.
-fn compute_grace_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
+fn compute_grace_partition_bits(
+    inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
+) -> u8 {
     const TARGET_PER_PARTITION: u64 = 256;
     const MIN_BITS: u8 = 4; // 16 partitions floor
     const MAX_BITS: u8 = 12; // 4096 partitions cap
-    let estimates: Vec<u64> = inputs
-        .values()
-        .filter_map(|ci| ci.estimated_cardinality)
-        .collect();
-    if estimates.len() < inputs.len() {
+    let Some(build_estimate) = build_side_row_count(inputs, statistics) else {
         return MIN_BITS;
-    }
-    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
-    if build_estimate == 0 {
-        return MIN_BITS;
-    }
+    };
     let max_partitions = build_estimate / TARGET_PER_PARTITION;
     if max_partitions <= 1 {
         return MIN_BITS;
@@ -1020,24 +1028,19 @@ fn compute_grace_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
 /// count is reduced. The minimum returned value is 1 (two partitions);
 /// pure-range combines bypass partitioning entirely and use
 /// [`CombineStrategy::IEJoin`] instead.
-fn compute_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
+fn compute_partition_bits(
+    inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
+) -> u8 {
     const DEFAULT_BITS: u8 = 8;
     const MIN_BITS: u8 = 1;
     const TARGET_PER_PARTITION: u64 = 64;
     // Use the smaller side as the "build" estimate — same heuristic
-    // the grace-hash partitioner uses. When estimates are missing on
+    // the grace-hash partitioner uses. When a row count is missing on
     // either input, fall back to the default.
-    let estimates: Vec<u64> = inputs
-        .values()
-        .filter_map(|ci| ci.estimated_cardinality)
-        .collect();
-    if estimates.len() < inputs.len() {
+    let Some(build_estimate) = build_side_row_count(inputs, statistics) else {
         return DEFAULT_BITS;
-    }
-    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
-    if build_estimate == 0 {
-        return DEFAULT_BITS;
-    }
+    };
     // Find the largest `bits` such that build_estimate / 2^bits >= 64.
     // i.e. 2^bits <= build_estimate / 64.
     let max_partitions = build_estimate / TARGET_PER_PARTITION;
@@ -1208,18 +1211,24 @@ fn combine_w302_small_both(combine_name: &str, span: Span) -> Diagnostic {
 ///   1. **Explicit `drive:` hint** — author override. Validated against
 ///      `inputs`; an unknown hint emits **E306** and returns `Err(())`
 ///      so downstream sub-passes can skip the broken combine cleanly.
-///   2. **Cardinality** — pick the input with the highest
-///      `estimated_cardinality` when every input has a `Some(_)` value.
-///      Build the smaller side; probe the larger one. Matches
-///      DataFusion's "build the small side" rule and Spark's
-///      `chooseBuildSide` policy.
+///   2. **Row count** — pick the input with the highest catalog row
+///      count when every input carries one. Build the smaller side; probe
+///      the larger one. Matches DataFusion's "build the small side" rule
+///      and Spark's `chooseBuildSide` policy. Row counts come from the
+///      statistics catalog keyed by each input's upstream node name.
 ///   3. **Declaration order fallback** — first qualifier in the
 ///      `IndexMap`. For `inputs.len() >= 3` this also emits **W306**
 ///      (planner cannot determine optimal driver) so authors notice
-///      missing cardinality estimates on the original N-ary combine
-///      before [`decompose_nary_combines`] runs.
+///      missing row counts on the original N-ary combine before
+///      [`decompose_nary_combines`] runs.
+///
+/// At `bind_combine` time the catalog is not yet seeded — Plane A row
+/// counts land after the DAG is built — so this resolves to declaration
+/// order during binding and the combine post-pass re-derives the driver
+/// once row counts exist.
 pub(crate) fn select_driving_input(
     inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
     explicit_drive: Option<&str>,
     combine_name: &str,
     span: Span,
@@ -1233,13 +1242,14 @@ pub(crate) fn select_driving_input(
         return None;
     }
 
-    if inputs.values().all(|ci| ci.estimated_cardinality.is_some()) {
+    let row_count = |ci: &CombineInput| statistics.row_count(&ci.upstream_name);
+    if inputs.values().all(|ci| row_count(ci).is_some()) {
         // Iterate via `IndexMap::iter` so ties resolve to the earliest
         // declared qualifier (deterministic; `max_by_key` keeps the
         // first max under stable ordering).
         let (qualifier, _) = inputs
             .iter()
-            .max_by_key(|(_, ci)| ci.estimated_cardinality.unwrap())
+            .max_by_key(|(_, ci)| row_count(ci).unwrap_or(0))
             .expect("inputs non-empty (E300 guard upstream)");
         return Some(qualifier.clone());
     }
@@ -1416,9 +1426,10 @@ fn connected_conjuncts(
 /// predicate conjuncts that connect it to the already-joined frontier.
 /// Inputs with zero connecting conjuncts are skipped — selecting one
 /// would force a Cartesian product. From the connected candidates the
-/// planner picks the one with the smallest `estimated_cardinality`,
-/// breaking ties by `IndexMap` declaration order so the result is
-/// deterministic across runs.
+/// planner picks the one with the smallest catalog row count, breaking
+/// ties by `IndexMap` declaration order so the result is deterministic
+/// across runs. Row counts come from the statistics catalog keyed by each
+/// input's upstream node name.
 ///
 /// Returns E305 (disconnected join graph) when no unjoined input is
 /// connected to the joined frontier — equivalent to a missing
@@ -1426,6 +1437,7 @@ fn connected_conjuncts(
 pub(crate) fn decompose_nary_combine(
     original_name: &str,
     inputs: &IndexMap<String, CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
     predicate: &DecomposedPredicate,
     full_merged_row: &Row,
     driving: &str,
@@ -1457,7 +1469,7 @@ pub(crate) fn decompose_nary_combine(
             if connected == 0 {
                 continue;
             }
-            let card = ci.estimated_cardinality;
+            let card = statistics.row_count(&ci.upstream_name);
             let candidate = (qual.as_str(), decl_pos, card, connected);
             best = Some(match best {
                 None => candidate,
@@ -1775,6 +1787,7 @@ pub(crate) fn decompose_nary_combines(
         let steps = match decompose_nary_combine(
             &original_name,
             &inputs,
+            &artifacts.statistics,
             &predicate,
             &merged_row,
             &driving,
@@ -2087,7 +2100,6 @@ pub(crate) fn decompose_nary_combines(
                 CombineInput {
                     upstream_name: driver_upstream,
                     row: driver_row,
-                    estimated_cardinality: None,
                 },
             );
             step_inputs.insert(
@@ -2095,7 +2107,6 @@ pub(crate) fn decompose_nary_combines(
                 CombineInput {
                     upstream_name: Arc::clone(&build_meta.upstream_name),
                     row: build_meta.row.clone(),
-                    estimated_cardinality: build_meta.estimated_cardinality,
                 },
             );
 
@@ -2190,46 +2201,70 @@ mod tests {
         assert!(json.contains("\"partition_bits\":8"));
     }
 
-    fn synthetic_input(qualifier: &str, cardinality: Option<u64>) -> (String, CombineInput) {
+    /// Build a single combine input plus, when a row count is supplied,
+    /// seed it into `catalog` keyed by the input's upstream name (which
+    /// equals the qualifier for synthetic inputs). Row counts live in the
+    /// statistics catalog now, not on `CombineInput`.
+    fn synthetic_input(
+        qualifier: &str,
+        cardinality: Option<u64>,
+        catalog: &mut crate::plan::statistics::StatisticsCatalog,
+    ) -> (String, CombineInput) {
         use indexmap::IndexMap;
         let row = Row::closed(IndexMap::new(), cxl::lexer::Span::new(0, 0));
+        if let Some(rows) = cardinality {
+            catalog.record_row_count(qualifier, rows);
+        }
         (
             qualifier.to_string(),
             CombineInput {
                 upstream_name: Arc::from(qualifier),
                 row,
-                estimated_cardinality: cardinality,
             },
         )
     }
 
     #[test]
     fn test_select_driving_input_explicit_drive() {
+        let mut catalog = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs = IndexMap::new();
-        let (k, v) = synthetic_input("orders", None);
+        let (k, v) = synthetic_input("orders", None, &mut catalog);
         inputs.insert(k, v);
-        let (k, v) = synthetic_input("products", None);
+        let (k, v) = synthetic_input("products", None, &mut catalog);
         inputs.insert(k, v);
 
         let mut diags = Vec::new();
-        let chosen =
-            select_driving_input(&inputs, Some("products"), "c1", Span::SYNTHETIC, &mut diags)
-                .expect("explicit drive must succeed");
+        let chosen = select_driving_input(
+            &inputs,
+            &catalog,
+            Some("products"),
+            "c1",
+            Span::SYNTHETIC,
+            &mut diags,
+        )
+        .expect("explicit drive must succeed");
         assert_eq!(chosen, "products");
         assert!(diags.is_empty(), "no diagnostics for valid drive");
     }
 
     #[test]
     fn test_select_driving_input_invalid_drive_e306() {
+        let mut catalog = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs = IndexMap::new();
-        let (k, v) = synthetic_input("orders", None);
+        let (k, v) = synthetic_input("orders", None, &mut catalog);
         inputs.insert(k, v);
-        let (k, v) = synthetic_input("products", None);
+        let (k, v) = synthetic_input("products", None, &mut catalog);
         inputs.insert(k, v);
 
         let mut diags = Vec::new();
-        let result =
-            select_driving_input(&inputs, Some("ghost"), "c1", Span::SYNTHETIC, &mut diags);
+        let result = select_driving_input(
+            &inputs,
+            &catalog,
+            Some("ghost"),
+            "c1",
+            Span::SYNTHETIC,
+            &mut diags,
+        );
         assert!(result.is_none(), "invalid drive must return None");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "E306");
@@ -2237,45 +2272,51 @@ mod tests {
 
     #[test]
     fn test_select_driving_input_by_cardinality() {
+        let mut catalog = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs = IndexMap::new();
-        let (k, v) = synthetic_input("orders", Some(100));
+        let (k, v) = synthetic_input("orders", Some(100), &mut catalog);
         inputs.insert(k, v);
-        let (k, v) = synthetic_input("products", Some(10_000));
+        let (k, v) = synthetic_input("products", Some(10_000), &mut catalog);
         inputs.insert(k, v);
 
         let mut diags = Vec::new();
-        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
-            .expect("cardinality path must succeed");
-        assert_eq!(chosen, "products", "highest cardinality drives");
+        let chosen =
+            select_driving_input(&inputs, &catalog, None, "c1", Span::SYNTHETIC, &mut diags)
+                .expect("row-count path must succeed");
+        assert_eq!(chosen, "products", "highest row count drives");
         assert!(diags.is_empty());
     }
 
     #[test]
     fn test_select_driving_input_default_first_in_indexmap() {
+        let mut catalog = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs = IndexMap::new();
-        let (k, v) = synthetic_input("orders", None);
+        let (k, v) = synthetic_input("orders", None, &mut catalog);
         inputs.insert(k, v);
-        let (k, v) = synthetic_input("products", None);
+        let (k, v) = synthetic_input("products", None, &mut catalog);
         inputs.insert(k, v);
 
         let mut diags = Vec::new();
-        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
-            .expect("default path must succeed");
+        let chosen =
+            select_driving_input(&inputs, &catalog, None, "c1", Span::SYNTHETIC, &mut diags)
+                .expect("default path must succeed");
         assert_eq!(chosen, "orders", "first in declaration order wins");
         assert!(diags.is_empty(), "no W306 below 3 inputs");
     }
 
     #[test]
     fn test_select_driving_input_w306_three_inputs_no_cardinality() {
+        let mut catalog = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs = IndexMap::new();
         for q in ["a", "b", "c"] {
-            let (k, v) = synthetic_input(q, None);
+            let (k, v) = synthetic_input(q, None, &mut catalog);
             inputs.insert(k, v);
         }
 
         let mut diags = Vec::new();
-        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
-            .expect("3-input fallback must succeed");
+        let chosen =
+            select_driving_input(&inputs, &catalog, None, "c1", Span::SYNTHETIC, &mut diags)
+                .expect("3-input fallback must succeed");
         assert_eq!(chosen, "a");
         assert_eq!(diags.len(), 1, "W306 fired");
         assert_eq!(diags[0].code, "W306");
@@ -2303,12 +2344,14 @@ mod tests {
 
         let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
         for (qual, card) in &inputs {
+            if let Some(rows) = *card {
+                artifacts.statistics.record_row_count(*qual, rows);
+            }
             inputs_map.insert(
                 (*qual).to_string(),
                 CombineInput {
                     upstream_name: Arc::from(*qual),
                     row: Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
-                    estimated_cardinality: *card,
                 },
             );
         }
@@ -2618,12 +2661,14 @@ mod tests {
         for (qual, card) in &inputs {
             let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
             row_fields.insert(QualifiedField::bare("id"), Type::String);
+            if let Some(rows) = *card {
+                artifacts.statistics.record_row_count(*qual, rows);
+            }
             inputs_map.insert(
                 (*qual).to_string(),
                 CombineInput {
                     upstream_name: Arc::from(*qual),
                     row: Row::closed(row_fields, CxlSpan::new(0, 0)),
-                    estimated_cardinality: *card,
                 },
             );
         }
@@ -2905,16 +2950,19 @@ mod tests {
             vec![("a", "b"), ("b", "d")],
             "a",
         );
+        let mut stats = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
         for (q, card) in [("a", Some(100u64)), ("b", Some(200)), ("d", Some(300))] {
             let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
             row_fields.insert(QualifiedField::bare("id"), Type::String);
+            if let Some(rows) = card {
+                stats.record_row_count(q, rows);
+            }
             inputs_map.insert(
                 q.to_string(),
                 CombineInput {
                     upstream_name: Arc::from(q),
                     row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
-                    estimated_cardinality: card,
                 },
             );
         }
@@ -2964,6 +3012,7 @@ mod tests {
         let steps = decompose_nary_combine(
             "c",
             &inputs_map,
+            &stats,
             &predicate,
             &merged_row,
             "a",
@@ -3003,6 +3052,7 @@ mod tests {
             vec![("a", "b"), ("b", "d")],
             "a",
         );
+        let stats = crate::plan::statistics::StatisticsCatalog::new();
         let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
         for q in ["a", "b", "d"] {
             let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
@@ -3012,7 +3062,6 @@ mod tests {
                 CombineInput {
                     upstream_name: Arc::from(q),
                     row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
-                    estimated_cardinality: None,
                 },
             );
         }
@@ -3062,6 +3111,7 @@ mod tests {
         let steps = decompose_nary_combine(
             "c",
             &inputs_map,
+            &stats,
             &predicate,
             &merged_row,
             "a",

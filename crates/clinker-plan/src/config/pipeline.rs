@@ -1660,6 +1660,15 @@ impl PipelineConfig {
             }
         };
 
+        // Seed the statistics catalog's Plane A row counts from source
+        // file metadata before the combine post-pass reads them. Uses the
+        // same on-disk byte read the byte-volume estimates derive from,
+        // divided by the shared average-record-bytes divisor — no second
+        // data-reading pass. A build side's metadata-derived row count is
+        // what lets the planner choose grace-hash over an in-memory hash
+        // before a single record is read.
+        dag.seed_statistics_row_counts(ctx, &mut artifacts.statistics);
+
         // Combine strategy + driving-input post-pass. Runs after the
         // DAG is fully enriched (so every PlanNode::Combine is present
         // and property derivation has stamped ordering provenance) and

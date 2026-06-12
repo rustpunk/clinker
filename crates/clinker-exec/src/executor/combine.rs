@@ -253,7 +253,6 @@ mod tests {
         CombineInput {
             upstream_name: Arc::from(name),
             row: clinker_plan::plan::row_type::Row::closed(declared, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         }
     }
 

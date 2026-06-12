@@ -594,6 +594,11 @@ pub(crate) fn dispatch_combine(
                     spill_compress: grace_spill_compress,
                     consumer_handle: grace_consumer_handle,
                     strategy: ctx.strategy,
+                    stats_sink: crate::pipeline::grace_hash::GraceStatsSink {
+                        catalog: std::sync::Arc::clone(&ctx.runtime_statistics),
+                        node: build_upstream,
+                        column: &build_qualifier,
+                    },
                 })
             })?;
             let crate::pipeline::combine::CombineKernelOutput {

@@ -86,13 +86,32 @@ use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
 
-use build::{Hll, PartitionAssigner, estimated_record_bytes};
+use build::{GraceHll, PartitionAssigner, estimated_record_bytes};
 use probe::{EmitArgs, GraceEmitSink, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
 /// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
+
+/// Render a composite join key into a single representative [`Value`] for
+/// heavy-hitter reporting. A single-component key keeps its own value so a
+/// string or integer key reports unchanged; a multi-component key renders
+/// its components joined by `|` into a string, since the catalog records
+/// one value per heavy hitter.
+fn representative_key_value(keys: &[Value]) -> Value {
+    match keys {
+        [single] => single.clone(),
+        _ => {
+            let joined = keys
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("|");
+            Value::from(joined.as_str())
+        }
+    }
+}
 
 /// Order-tracking sidecar carried alongside every record in the
 /// executor's `node_buffers`. Mirrors the alias in `iejoin`; the grace
@@ -113,7 +132,7 @@ enum PartitionState {
     Building {
         records: Vec<Record>,
         bytes_estimated: usize,
-        distinct_sketch: Hll,
+        distinct_sketch: GraceHll,
     },
     /// Build side spilled. `build_files` carries one file per
     /// spill flush of this partition (the initial bulk spill plus
@@ -138,7 +157,7 @@ enum PartitionState {
         build_count: u64,
         probe_count: u64,
         hash_bits: u8,
-        distinct_sketch: Hll,
+        distinct_sketch: GraceHll,
     },
     /// In-memory hash table built; ready for probe.
     Ready { hash_table: CombineHashTable },
@@ -203,6 +222,25 @@ pub(crate) struct GraceHashExec<'a> {
     /// under `Continue` / `BestEffort` the failing row is deferred to the
     /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
+    /// Exec-time statistics accumulator (Plane B) and the `(node, column)`
+    /// the join's build-side sketches are recorded under at completion. The
+    /// kernel maintains three sketches over the build-key hashes it already
+    /// computes — a planner-grade HyperLogLog (distinct count), a
+    /// Misra-Gries tracker (heavy hitters), and a Bloom filter (membership)
+    /// — then folds the finalized results into the catalog so a downstream
+    /// node, or the run's own reporting, sees measured figures that
+    /// supersede the plan-time row-count guess.
+    pub stats_sink: GraceStatsSink<'a>,
+}
+
+/// Where the grace-hash join records its build-side sketch results: the
+/// shared exec-time catalog plus the `(node, column)` key identifying the
+/// build join key.
+pub(crate) struct GraceStatsSink<'a> {
+    pub catalog:
+        std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
+    pub node: &'a str,
+    pub column: &'a str,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -258,7 +296,7 @@ impl GraceHashExecutor {
             partitions.push(PartitionState::Building {
                 records: Vec::new(),
                 bytes_estimated: 0,
-                distinct_sketch: Hll::new(),
+                distinct_sketch: GraceHll::new(),
             });
         }
         Ok(Self {
@@ -644,6 +682,7 @@ pub(crate) fn execute_combine_grace_hash(
         spill_compress,
         consumer_handle,
         strategy,
+        stats_sink,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -744,10 +783,75 @@ pub(crate) fn execute_combine_grace_hash(
             Ok::<_, PipelineError>((record, hash))
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Maintain three planner-grade sketches over the build-side join keys
+    // in the single build pass, reusing the composite-key hashes already
+    // computed for partition placement. [`BuildKeySketches`] is
+    // allocation-bounded by a fixed constant — never by build size — so it
+    // is invisible to the arbitrator: the HyperLogLog is fixed-register, the
+    // Misra-Gries holds at most its counter budget (and one representative
+    // value per live counter, materialized only when a counter opens), and
+    // the Bloom is sized UP FRONT from the build node's plan-time row-count
+    // estimate (an upper bound on distinct keys, so the filter is
+    // conservatively sized — FP rate ≤ target, just possibly more bits).
+    // When no plan-time estimate exists the filter is skipped rather than
+    // buffered. The feed runs outside the order-sensitive `add_build_record`
+    // loop, so the partition table and spill timing are unchanged; the
+    // per-partition diagnostic sketches stay at 64 registers.
+    //
+    // The build node's row count is normally the plan-time file-metadata
+    // estimate; if the build source already drained and recorded its exact
+    // count, that supersedes the estimate and the membership summary records
+    // the sizing as exact rather than estimated.
+    let build_row_count = stats_sink
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.row_count_with_source(stats_sink.node));
+    let bloom_sized_from_estimate = !matches!(
+        build_row_count.map(|rc| rc.source),
+        Some(clinker_plan::plan::statistics::StatSource::ExecSketch)
+    );
+    let mut build_sketches =
+        crate::sketch::BuildKeySketches::new(build_row_count.map(|rc| rc.rows));
     for (record, hash) in hashed_build {
+        // Re-derive the representative key value only when Misra-Gries opens
+        // a counter (a bounded number of times across the whole build), so
+        // the per-row cost stays a single hash and no value is retained per
+        // record. The extract here repeats work the parallel hash pass did,
+        // but only for the handful of keys that become tracked counters.
+        build_sketches.observe(hash, || {
+            build_extractor
+                .extract(ctx, &record)
+                .map(|keys| representative_key_value(&keys))
+                .unwrap_or(Value::Null)
+        });
         executor
             .add_build_record(record, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
+    }
+
+    let crate::sketch::BuildKeySketchSummary {
+        distinct,
+        heavy_hitters,
+        bloom,
+    } = build_sketches.finalize();
+
+    if let Ok(mut catalog) = stats_sink.catalog.lock() {
+        use clinker_plan::plan::statistics::{BloomSummary, StatKey};
+        let key = StatKey::new(stats_sink.node, stats_sink.column);
+        catalog.record_distinct(key.clone(), distinct);
+        catalog.record_heavy_hitters(key.clone(), heavy_hitters);
+        if let Some((bit_count, hash_count)) = bloom {
+            catalog.record_bloom(
+                key,
+                BloomSummary {
+                    bit_count,
+                    hash_count,
+                    sized_from_estimate: bloom_sized_from_estimate,
+                },
+            );
+        }
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
     let build_spilled = executor.take_spilled_bytes();

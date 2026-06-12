@@ -90,6 +90,13 @@ pub struct CompileArtifacts {
     /// (matches `CombineHeader.input` iteration order). Populated during
     /// schema propagation.
     pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
+    /// Planner-wide column-statistics catalog. The single facility every
+    /// node consults for row counts, distinct counts, heavy hitters, and
+    /// membership. Plane A row counts are seeded from source file metadata
+    /// before combine-strategy selection; Plane B sketch results fold back
+    /// in after a run. Combine strategy selection reads its row counts
+    /// instead of a per-input cardinality field.
+    pub statistics: crate::plan::statistics::StatisticsCatalog,
     /// Driving-input qualifier per combine node, chosen at `bind_combine`
     /// time by [`select_driving_input`] (explicit `drive:` → cardinality
     /// → first-in-IndexMap default). The `select_combine_strategies`
@@ -3029,7 +3036,6 @@ fn bind_combine(
             CombineInput {
                 upstream_name: Arc::from(upstream_target),
                 row: upstream_row.clone(),
-                estimated_cardinality: None,
             },
         );
     }
@@ -3045,6 +3051,7 @@ fn bind_combine(
     // stays empty for this combine and the post-pass skips it.
     if let Some(driver) = select_driving_input(
         &combine_inputs_entries,
+        &artifacts.statistics,
         config.drive.as_deref(),
         name,
         span,

@@ -105,28 +105,132 @@ fn format_on_miss(o: crate::config::pipeline_node::OnMiss) -> &'static str {
     }
 }
 
-/// Format a row count with comma thousands separators (e.g. `1,000,000`),
-/// returning the literal string `"null"` when the cardinality is unknown.
-/// Honest output (V-8-2): the planner only fills `estimated_cardinality`
-/// at sources that carry an explicit hint, so most inputs render `null` —
-/// matching DataFusion / Spark / DuckDB behavior when statistics are
-/// absent.
-fn format_estimated_rows(input: Option<&crate::plan::combine::CombineInput>) -> String {
-    match input.and_then(|ci| ci.estimated_cardinality) {
-        Some(n) => {
-            // Comma thousands separator, manually formatted (no
-            // dependency on `num-format` for one call site).
-            let s = n.to_string();
-            let mut out = String::with_capacity(s.len() + s.len() / 3);
-            let bytes = s.as_bytes();
-            for (i, &b) in bytes.iter().enumerate() {
-                if i > 0 && (bytes.len() - i) % 3 == 0 {
-                    out.push(',');
+/// Render the `=== Statistics ===` section: the planner-wide statistics
+/// catalog's contents and the decision each figure informs.
+///
+/// Emits one line per node row count (with provenance) and one per column
+/// that carries an exec-time sketch result (distinct count, heavy hitters,
+/// membership). A row count tagged `file metadata` is the metadata-derived
+/// estimate that drives the combine build/probe and partition-bit choices;
+/// an `exec sketch` figure was measured during a run and supersedes it.
+/// The section is omitted entirely when the catalog is empty, preserving
+/// the honest-null floor — a plan with no sized sources adds no section.
+fn render_statistics_section(
+    out: &mut String,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
+) {
+    if statistics.is_empty() {
+        return;
+    }
+    out.push_str("=== Statistics ===\n\n");
+
+    let row_counts = statistics.row_counts_sorted();
+    if !row_counts.is_empty() {
+        out.push_str("Row counts:\n");
+        for (node, rc) in row_counts {
+            // A file-metadata row count is what the combine planner sizes
+            // its build/probe and partition-bit choices against; an exec
+            // sketch figure is the measured count that supersedes it.
+            let informs = match rc.source {
+                crate::plan::statistics::StatSource::FileMetadata
+                | crate::plan::statistics::StatSource::SchemaHint => {
+                    "informs combine build/probe + partition bits"
                 }
-                out.push(b as char);
-            }
-            out
+                crate::plan::statistics::StatSource::ExecSketch => "measured during run",
+            };
+            out.push_str(&format!(
+                "  {node}: ≈{} rows [{}] ({informs})\n",
+                format_thousands(rc.rows),
+                rc.source.label()
+            ));
         }
+    }
+
+    let columns = statistics.columns_sorted();
+    let has_column_stats = columns
+        .iter()
+        .any(|(_, s)| s.distinct.is_some() || s.heavy_hitters.is_some() || s.bloom.is_some());
+    if has_column_stats {
+        out.push('\n');
+        out.push_str("Column sketches:\n");
+        for (key, stats) in columns {
+            if let Some((distinct, source)) = stats.distinct {
+                out.push_str(&format!(
+                    "  {}.{}: {} distinct [{}]\n",
+                    key.node,
+                    key.column,
+                    format_thousands(distinct),
+                    source.label()
+                ));
+            }
+            if let Some(hitters) = &stats.heavy_hitters
+                && !hitters.is_empty()
+            {
+                // Show the top few `value=count` pairs inline; the counts
+                // are Misra-Gries lower bounds, so the line is the floor on
+                // each listed key's frequency, never an exclusion of others.
+                let preview = hitters
+                    .iter()
+                    .take(3)
+                    .map(|(v, c)| format!("{v}={}", format_thousands(*c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if hitters.len() > 3 {
+                    format!(", +{} more", hitters.len() - 3)
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "  {}.{}: heavy hitters [exec sketch, lower bound]: {preview}{more}\n",
+                    key.node, key.column,
+                ));
+            }
+            if let Some(bloom) = &stats.bloom {
+                let sizing = if bloom.sized_from_estimate {
+                    "sized from estimate"
+                } else {
+                    "sized from exact count"
+                };
+                out.push_str(&format!(
+                    "  {}.{}: membership filter, {} bits / {} probes [exec sketch, {sizing}]\n",
+                    key.node, key.column, bloom.bit_count, bloom.hash_count
+                ));
+            }
+        }
+    }
+    out.push('\n');
+}
+
+/// Render a `u64` with comma thousands separators (e.g. `1,000,000`),
+/// manually formatted to avoid a dependency on `num-format` for one
+/// call site.
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// Format a combine input's row count for `--explain`, tagging it with
+/// the statistic's provenance — e.g. `1,000,000 [file metadata]`.
+///
+/// Returns the literal string `"null"` when no row count is known. Honest
+/// output: a row count exists only for a source whose on-disk size could
+/// be read (or one an exec sketch has measured), so most inputs render
+/// `null` — matching DataFusion / Spark / DuckDB behavior when statistics
+/// are absent.
+fn format_estimated_rows(
+    input: Option<&crate::plan::combine::CombineInput>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
+) -> String {
+    match input.and_then(|ci| statistics.row_count_with_source(&ci.upstream_name)) {
+        Some(rc) => format!("{} [{}]", format_thousands(rc.rows), rc.source.label()),
         None => "null".to_string(),
     }
 }
@@ -711,6 +815,7 @@ impl ExecutionPlanDag {
         let policy_name = config.pipeline.memory.backpressure.policy_name();
         let mut out = self.explain(&classes, policy_name);
         self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
+        render_statistics_section(&mut out, &artifacts.statistics);
         out
     }
 
@@ -809,15 +914,20 @@ impl ExecutionPlanDag {
         } else {
             driving_input.as_str()
         };
-        let drive_rows = format_estimated_rows(inputs_for_node.and_then(|m| m.get(drive_label)));
+        let drive_rows = format_estimated_rows(
+            inputs_for_node.and_then(|m| m.get(drive_label)),
+            &artifacts.statistics,
+        );
         out.push_str(&format!(
             "  Driving input: {drive_label} (probe, est. {drive_rows} rows)\n",
         ));
 
         for build_name in build_inputs {
             let role = describe_build_role(strategy, build_name);
-            let rows =
-                format_estimated_rows(inputs_for_node.and_then(|m| m.get(build_name.as_str())));
+            let rows = format_estimated_rows(
+                inputs_for_node.and_then(|m| m.get(build_name.as_str())),
+                &artifacts.statistics,
+            );
             out.push_str(&format!(
                 "  Build input: {build_name} ({role}, est. {rows} rows)\n",
             ));
@@ -1830,6 +1940,7 @@ impl<'a> Serialize for CombineNodeEntry<'a> {
             // Per-input role + estimated rows.
             let inputs_value = build_inputs_json(
                 self.artifacts.combine_inputs.get(name),
+                &self.artifacts.statistics,
                 driving_input,
                 build_inputs,
                 strategy,
@@ -1905,13 +2016,15 @@ fn build_predicate_json(
 }
 
 /// Build the `inputs` JSON map for a combine node:
-/// `{ <qualifier>: { role, estimated_rows } }`. `role` is `"probe"`
-/// for the driver, `"build"` (or `"build (sorted scan)"` for sort-merge)
-/// for the rest. `estimated_rows` is JSON `null` when the planner has
-/// no cardinality estimate — V-8-2 honest output, matching every
-/// surveyed engine's behavior in absence of statistics.
+/// `{ <qualifier>: { role, estimated_rows, estimated_rows_source } }`.
+/// `role` is `"probe"` for the driver, `"build"` (or `"build (sorted
+/// scan)"` for sort-merge) for the rest. `estimated_rows` is JSON `null`
+/// when no row count is known, with `estimated_rows_source` carrying the
+/// statistic's provenance label when present — honest output matching
+/// every surveyed engine's behavior in the absence of statistics.
 fn build_inputs_json(
     inputs_for_node: Option<&IndexMap<String, crate::plan::combine::CombineInput>>,
+    statistics: &crate::plan::statistics::StatisticsCatalog,
     driving_input: &str,
     build_inputs: &[String],
     strategy: &crate::plan::combine::CombineStrategy,
@@ -1920,16 +2033,20 @@ fn build_inputs_json(
     let mut obj = Map::new();
 
     let mut emit_one = |name: &str, role: &str| {
-        let est = inputs_for_node
+        let rc = inputs_for_node
             .and_then(|m| m.get(name))
-            .and_then(|ci| ci.estimated_cardinality);
-        let est_value = match est {
-            Some(n) => Value::Number(n.into()),
-            None => Value::Null,
+            .and_then(|ci| statistics.row_count_with_source(&ci.upstream_name));
+        let (est_value, source_value) = match rc {
+            Some(rc) => (
+                Value::Number(rc.rows.into()),
+                Value::String(rc.source.label().to_string()),
+            ),
+            None => (Value::Null, Value::Null),
         };
         let mut entry = Map::new();
         entry.insert("role".to_string(), Value::String(role.to_string()));
         entry.insert("estimated_rows".to_string(), est_value);
+        entry.insert("estimated_rows_source".to_string(), source_value);
         obj.insert(name.to_string(), Value::Object(entry));
     };
 
@@ -2199,6 +2316,69 @@ mod spill_projection_tests {
             dag.spill_decision_column_count(sort_idx),
             runtime_input_width,
             "the --explain Sort column count must equal the runtime spilled-batch width"
+        );
+    }
+
+    /// The Statistics section renders all three exec-sketch results — a
+    /// distinct count, a top-k heavy-hitter list with counts, and a
+    /// membership-filter summary — each tagged with its `exec sketch`
+    /// provenance, exactly as a catalog populated during a grace-hash run
+    /// would surface them.
+    #[test]
+    fn statistics_section_renders_all_three_sketch_classes() {
+        use crate::plan::statistics::{BloomSummary, StatKey, StatisticsCatalog};
+        use clinker_record::Value;
+
+        let mut catalog = StatisticsCatalog::new();
+        catalog.seed_row_count_from_bytes("orders", Some(1024 * 1200));
+        let key = StatKey::new("orders", "product_id");
+        catalog.record_distinct(key.clone(), 12_431);
+        catalog.record_heavy_hitters(
+            key.clone(),
+            vec![
+                (Value::from("widget"), 9_000),
+                (Value::from("gadget"), 3_200),
+                (Value::from("gizmo"), 1_100),
+                (Value::from("sprocket"), 800),
+            ],
+        );
+        catalog.record_bloom(
+            key,
+            BloomSummary {
+                bit_count: 119_048,
+                hash_count: 7,
+                sized_from_estimate: true,
+            },
+        );
+
+        let mut out = String::new();
+        render_statistics_section(&mut out, &catalog);
+
+        let expected = "\
+=== Statistics ===
+
+Row counts:
+  orders: ≈1,200 rows [file metadata] (informs combine build/probe + partition bits)
+
+Column sketches:
+  orders.product_id: 12,431 distinct [exec sketch]
+  orders.product_id: heavy hitters [exec sketch, lower bound]: widget=9,000, gadget=3,200, gizmo=1,100, +1 more
+  orders.product_id: membership filter, 119048 bits / 7 probes [exec sketch, sized from estimate]
+
+";
+        assert_eq!(out, expected, "rendered:\n{out}");
+    }
+
+    /// An empty catalog adds no Statistics section, preserving the
+    /// honest-null floor for a plan with no sized sources or sketches.
+    #[test]
+    fn statistics_section_omitted_when_catalog_empty() {
+        use crate::plan::statistics::StatisticsCatalog;
+        let mut out = String::new();
+        render_statistics_section(&mut out, &StatisticsCatalog::new());
+        assert!(
+            out.is_empty(),
+            "empty catalog must add nothing; got {out:?}"
         );
     }
 }

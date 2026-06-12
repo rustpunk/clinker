@@ -1,10 +1,11 @@
-//! Unit tests for the grace hash join: partition assignment, the
-//! spill/reload lifecycle, the block-nested-loop fallback, and the
-//! HyperLogLog distinct-key sketch. Driven through both the public
-//! `execute_combine_grace_hash` entry point and a hand-built
-//! `ReloadContext` harness for the BNL-only paths.
+//! Unit tests for the grace hash join: partition assignment and the
+//! spill/reload lifecycle including the block-nested-loop fallback.
+//! Driven through both the public `execute_combine_grace_hash` entry
+//! point and a hand-built `ReloadContext` harness for the BNL-only paths.
+//! The distinct-key sketch's accuracy bounds are covered by the shared
+//! `crate::sketch` tests.
 
-use super::build::MAX_HASH_BITS;
+use super::build::{GraceHll, MAX_HASH_BITS};
 use super::spill::{
     BnlStats, PROBE_BUFFER_RESERVATION, RESULT_BATCH_SIZE, SKEW_REDUCTION_THRESHOLD, bnl_fallback,
 };
@@ -24,6 +25,28 @@ fn schema_with(cols: &[&str]) -> Arc<Schema> {
         b = b.with_field(*c);
     }
     b.build()
+}
+
+/// Fresh exec-time statistics catalog for a grace-hash test to record its
+/// build-side distinct estimate into.
+fn fresh_stats_catalog()
+-> std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>> {
+    std::sync::Arc::new(std::sync::Mutex::new(
+        clinker_plan::plan::statistics::StatisticsCatalog::new(),
+    ))
+}
+
+/// Build a [`GraceStatsSink`] over a test catalog and key.
+fn test_stats_sink<'a>(
+    catalog: &std::sync::Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
+    node: &'a str,
+    column: &'a str,
+) -> GraceStatsSink<'a> {
+    GraceStatsSink {
+        catalog: std::sync::Arc::clone(catalog),
+        node,
+        column,
+    }
 }
 
 fn record_for(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
@@ -436,7 +459,6 @@ fn execute_grace_hash_partition_pair_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -444,7 +466,6 @@ fn execute_grace_hash_partition_pair_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -470,6 +491,15 @@ fn execute_grace_hash_partition_pair_correct() {
         .prefix("gh-e2e-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
+    // Seed the build node's plan-time row count from file metadata so the
+    // membership filter is sized up front and recorded as estimate-sized
+    // (the Bloom is skipped when no plan estimate exists). 12 KiB at the
+    // shared ~1 KiB/row divisor seeds ~12 rows.
+    stats_catalog
+        .lock()
+        .unwrap()
+        .seed_row_count_from_bytes("products", Some(12 * 1024));
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_test",
         build_qualifier: "products",
@@ -489,6 +519,7 @@ fn execute_grace_hash_partition_pair_correct() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     })
     .expect("grace hash E2E")
     .records;
@@ -521,6 +552,63 @@ fn execute_grace_hash_partition_pair_correct() {
         .map(|i| (i, format!("d-{i}"), format!("b-{i}")))
         .collect();
     assert_eq!(seen, expected);
+
+    // Plane B lifecycle: the join routed all three build-side sketches
+    // into the catalog under (products, products).
+    let catalog = stats_catalog.lock().unwrap();
+    let stats = catalog
+        .column("products", "products")
+        .expect("grace hash must record build-side column statistics");
+
+    // Distinct: 10 distinct build keys over a 1024-register HLL lands at or
+    // very near 10.
+    let distinct = stats
+        .distinct
+        .expect("grace hash must record a build-side distinct estimate");
+    assert!(
+        (8..=12).contains(&distinct.0),
+        "10 distinct build keys should estimate near 10; got {}",
+        distinct.0
+    );
+
+    // Heavy hitters: each of the 10 keys appears once, so all survive the
+    // 256-counter sketch; the report caps at the top 16, so all 10 list.
+    let hitters = stats
+        .heavy_hitters
+        .as_ref()
+        .expect("grace hash must record build-side heavy hitters");
+    assert_eq!(
+        hitters.len(),
+        10,
+        "all 10 single-occurrence keys survive the Misra-Gries sketch; got {hitters:?}"
+    );
+    for (_, count) in hitters {
+        assert_eq!(
+            *count, 1,
+            "each key appears once, so its lower-bound count is 1"
+        );
+    }
+    // The representative values are the actual single-component build join
+    // keys (`bk` = "0".."9"), not opaque hashes.
+    let hitter_values: std::collections::HashSet<String> =
+        hitters.iter().map(|(v, _)| v.to_string()).collect();
+    for i in 0..10 {
+        assert!(
+            hitter_values.contains(&i.to_string()),
+            "heavy-hitter list must carry the real join-key value {i}; got {hitter_values:?}"
+        );
+    }
+
+    // Membership: a Bloom filter sized from the distinct estimate, recorded
+    // as estimate-sized with a positive bit/probe budget.
+    let bloom = stats
+        .bloom
+        .expect("grace hash must record a build-side membership filter");
+    assert!(
+        bloom.sized_from_estimate,
+        "Bloom was sized from the HLL estimate"
+    );
+    assert!(bloom.bit_count > 0 && bloom.hash_count > 0);
 }
 
 /// End-to-end: a tiny memory budget forces partition spill during
@@ -625,7 +713,6 @@ fn execute_grace_hash_spill_then_reload_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -633,7 +720,6 @@ fn execute_grace_hash_spill_then_reload_correct() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -661,6 +747,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         .prefix("gh-spill-e2e-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_spill_test",
         build_qualifier: "products",
@@ -680,6 +767,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     })
     .expect("grace hash spill E2E")
     .records;
@@ -811,7 +899,6 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -819,7 +906,6 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -847,6 +933,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         .prefix("gh-quota-")
         .tempdir()
         .unwrap();
+    let stats_catalog = fresh_stats_catalog();
     let result = execute_combine_grace_hash(GraceHashExec {
         name: "grace_quota_test",
         build_qualifier: "products",
@@ -866,6 +953,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         spill_compress: true,
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
     });
 
     let err = result.expect_err("disk quota must abort the combine");
@@ -1074,7 +1162,6 @@ fn build_bnl_harness() -> BnlHarness {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     combine_inputs.insert(
@@ -1082,7 +1169,6 @@ fn build_bnl_harness() -> BnlHarness {
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
-            estimated_cardinality: None,
         },
     );
     let resolver_mapping =
@@ -1165,7 +1251,7 @@ fn spill_for_bnl(
     hash_bits: u8,
 ) -> SpilledPartition {
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
-    let mut sketch = Hll::new();
+    let mut sketch = GraceHll::new();
     for r in build_records {
         bw.write_record(r).unwrap();
         // Feed the HLL via the build-side hash of the join key.
@@ -1646,23 +1732,4 @@ fn test_e310_hard_limit_abort() {
             panic!("BNL hard-limit abort must surface MemoryBudgetExceeded; got {other:?}")
         }
     }
-}
-
-/// HLL sanity: 200 distinct hashes give an estimate within 50% of
-/// the true cardinality. The 64-register sketch's nominal error is
-/// ±13%; the loose 50% bound here only guards against gross
-/// regressions in the bias-correction or harmonic-mean formula.
-#[test]
-fn hll_estimate_in_band() {
-    let mut sketch = Hll::new();
-    for i in 0..200u64 {
-        sketch.add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    }
-    let est = sketch.estimate();
-    let lower = 100;
-    let upper = 400;
-    assert!(
-        (lower..=upper).contains(&est),
-        "HLL estimate {est} for 200 distinct hashes should land in [{lower}, {upper}]",
-    );
 }

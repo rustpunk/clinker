@@ -10,6 +10,7 @@ pub mod index;
 pub mod properties;
 pub mod row_type;
 pub mod scheduling_hint;
+pub mod statistics;
 pub mod streaming_eligibility;
 pub mod types;
 

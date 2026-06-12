@@ -33,6 +33,17 @@ fn render_explain_anchored(yaml: &str, anchor: &Path) -> String {
     plan.dag().explain_text(&config)
 }
 
+/// Render the artifacts-aware `--explain` text (the surface the CLI emits):
+/// the combine block plus the `=== Statistics ===` section. Anchored so
+/// the statistics catalog's file-metadata row counts are deterministic.
+fn render_explain_with_artifacts_anchored(yaml: &str, anchor: &Path) -> String {
+    let config: PipelineConfig = parse_config(yaml).expect("parse_config");
+    let ctx = CompileContext::with_pipeline_dir(anchor, "");
+    let plan = config.compile(&ctx).expect("compile");
+    plan.dag()
+        .explain_text_with_artifacts(&config, plan.artifacts())
+}
+
 /// Write `contents` to `<dir>/<name>` and assert its on-disk length so a
 /// snapshot's predicted-byte values are pinned to a known, fixed size.
 fn write_sized(dir: &Path, name: &str, contents: &str, expected_len: u64) {
@@ -295,4 +306,181 @@ nodes:
         "a streaming-only pipeline has no spilling stage, so the estimate section must be omitted, \
          got:\n{text}"
     );
+}
+
+/// A pure-equi combine over two CSV sources whose on-disk sizes seed
+/// metadata-derived row counts. With a tight `memory.limit`, the smaller
+/// (build) side's row count × the per-record byte estimate breaches the
+/// soft limit, so the planner picks `GraceHash` over the default in-memory
+/// hash — a plan-time decision driven entirely by file metadata, before
+/// any record is read. The two-source CSV bodies are padded to exact byte
+/// lengths so the seeded row counts (bytes ÷ 1024) are deterministic.
+fn grace_from_metadata_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: grace_from_metadata
+  memory:
+    limit: 64K
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: amount, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit product_id = orders.product_id
+        emit amount = orders.amount
+        emit name = products.name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+}
+
+/// Write a CSV with `header` and rows padded so the file is exactly
+/// `target_len` bytes — the seed `--explain` divides by 1024 to land a
+/// deterministic row count.
+fn write_padded_csv(dir: &Path, name: &str, header: &str, target_len: u64) {
+    let mut body = String::new();
+    body.push_str(header);
+    body.push('\n');
+    // Each data row is `p<n>,<pad>` — grow until the file reaches the
+    // target length, padding the final row so the byte count is exact.
+    let mut row = 0u64;
+    while (body.len() as u64) < target_len {
+        let remaining = target_len - body.len() as u64;
+        let line = format!("p{row},{}", "x".repeat(8));
+        if (line.len() as u64 + 1) <= remaining {
+            body.push_str(&line);
+            body.push('\n');
+        } else {
+            // Final padding to hit the exact length with a comment-free tail.
+            body.push_str(&"y".repeat(remaining as usize));
+        }
+        row += 1;
+    }
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create csv");
+    f.write_all(body.as_bytes()).expect("write csv");
+    f.flush().expect("flush csv");
+    assert_eq!(
+        body.len() as u64,
+        target_len,
+        "fixture `{name}` must be exactly {target_len} bytes for a stable row-count seed"
+    );
+}
+
+/// Pin the full artifacts-aware explain text for a plan whose GraceHash
+/// choice is driven by file-metadata row counts, so the `Statistics`
+/// section and the strategy citation are reviewed line-by-line on change.
+#[test]
+fn explain_cites_metadata_driven_grace_hash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // products = 60 KiB → ≈58 rows (build side); orders = 90 KiB → ≈87
+    // rows. min(58, 87) = 58; 58 * 1024 ≈ 59 KB ≥ 80% of the 64 KiB limit,
+    // so GraceHash fires.
+    write_padded_csv(tmp.path(), "products.csv", "product_id,name", 60 * 1024);
+    write_padded_csv(tmp.path(), "orders.csv", "product_id,amount", 90 * 1024);
+
+    let text = render_explain_with_artifacts_anchored(grace_from_metadata_yaml(), tmp.path());
+
+    assert!(
+        text.contains("Strategy: GraceHash"),
+        "metadata-derived build row count must drive GraceHash; got:\n{text}"
+    );
+    assert!(
+        text.contains("=== Statistics ==="),
+        "explain must carry the Statistics section when sources are sized; got:\n{text}"
+    );
+    assert!(
+        text.contains("[file metadata] (informs combine build/probe + partition bits)"),
+        "row counts must cite their file-metadata provenance and the decision they inform; \
+         got:\n{text}"
+    );
+    insta::assert_snapshot!("explain_metadata_driven_grace_hash", text);
+}
+
+/// Pin the artifacts-aware explain text for a plan whose statistics catalog
+/// carries exec-time sketch results, so the `Statistics` block's distinct,
+/// heavy-hitter, and membership lines are reviewed line-by-line. A real run
+/// populates these as the grace-hash join drains; the test injects the same
+/// finalized summaries the join would record so the plan-only explain
+/// surface can render them deterministically.
+#[test]
+fn explain_renders_exec_sketches_in_statistics_block() {
+    use clinker_plan::plan::statistics::{BloomSummary, StatKey};
+    use clinker_record::Value;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_padded_csv(tmp.path(), "products.csv", "product_id,name", 60 * 1024);
+    write_padded_csv(tmp.path(), "orders.csv", "product_id,amount", 90 * 1024);
+
+    let config: PipelineConfig = parse_config(grace_from_metadata_yaml()).expect("parse_config");
+    let ctx = CompileContext::with_pipeline_dir(tmp.path(), "");
+    let plan = config.compile(&ctx).expect("compile");
+
+    // Clone the artifacts and fold in the build-side sketches the grace-hash
+    // join records at completion, keyed under the build upstream node.
+    let mut artifacts = plan.artifacts().clone();
+    let key = StatKey::new("products", "product_id");
+    artifacts.statistics.record_distinct(key.clone(), 58);
+    artifacts.statistics.record_heavy_hitters(
+        key.clone(),
+        vec![
+            (Value::from("p0"), 12),
+            (Value::from("p1"), 9),
+            (Value::from("p2"), 4),
+        ],
+    );
+    artifacts.statistics.record_bloom(
+        key,
+        BloomSummary {
+            bit_count: 560,
+            hash_count: 7,
+            sized_from_estimate: true,
+        },
+    );
+
+    let text = plan.dag().explain_text_with_artifacts(&config, &artifacts);
+
+    assert!(
+        text.contains("58 distinct [exec sketch]"),
+        "distinct count must render with exec-sketch provenance; got:\n{text}"
+    );
+    assert!(
+        text.contains("heavy hitters [exec sketch, lower bound]: p0=12"),
+        "heavy hitters must render top-k values with counts; got:\n{text}"
+    );
+    assert!(
+        text.contains("membership filter, 560 bits / 7 probes [exec sketch, sized from estimate]"),
+        "membership filter must render with exec-sketch provenance; got:\n{text}"
+    );
+    insta::assert_snapshot!("explain_exec_sketches_statistics", text);
 }

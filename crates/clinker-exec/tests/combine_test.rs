@@ -4435,12 +4435,14 @@ nodes:
         for (q, card) in [("orders", 1_000_000u64), ("products", 600_000u64)] {
             let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
             row_fields.insert(QualifiedField::bare("id"), Type::String);
+            // Row counts that drive the strategy choice live in the
+            // statistics catalog now, keyed by upstream node name.
+            artifacts.statistics.record_row_count(q, card);
             inputs_map.insert(
                 q.to_string(),
                 CombineInput {
                     upstream_name: Arc::from(q),
                     row: Row::closed(row_fields, CxlSpan::new(0, 0)),
-                    estimated_cardinality: Some(card),
                 },
             );
         }

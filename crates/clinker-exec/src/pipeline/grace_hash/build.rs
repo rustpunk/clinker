@@ -6,102 +6,23 @@
 
 use clinker_record::Record;
 
+use crate::sketch::Hll;
+
 /// Maximum partition bit width. 12 bits = 4096 partitions; beyond this,
 /// per-partition overhead (file handles, postcard headers, hashbrown
 /// allocations) outweighs further skew reduction. AsterixDB and DuckDB
 /// converge on the same cap.
 pub(super) const MAX_HASH_BITS: u8 = 12;
 
-// ──────────────────────────────────────────────────────────────────────────
-// HyperLogLog distinct-key sketch
-// ──────────────────────────────────────────────────────────────────────────
-
-/// Number of HyperLogLog registers. 64 registers ≈ ±13% nominal error;
-/// pairs with the bias-correction constant `HLL_ALPHA_64` to give a
-/// usable cardinality estimate at 64 bytes per partition (one byte per
-/// register, leading-zero count fits comfortably in a `u8` for any
-/// 64-bit hash). Sized for diagnostic-quality reporting in E310, not
-/// for query-plan cost estimation.
-const HLL_REGISTERS: usize = 64;
-
-/// Number of register-index bits derived from a 64-bit hash. `64 = 2^6`,
-/// so the top 6 bits select the register and the remaining 58 bits feed
-/// the leading-zero count.
-const HLL_INDEX_BITS: u32 = 6;
-
-/// Bias-correction constant for `m = 64`. Flajolet et al. (2007) give a
-/// closed form for `m >= 128`; for `m = 64` we use the empirically
-/// validated `0.709`, which matches Apache DataSketches and Redis
-/// HyperLogLog at the same register count.
-const HLL_ALPHA_64: f64 = 0.709;
-
-/// Tiny per-partition HyperLogLog sketch.
+/// Per-partition distinct-key sketch carried by the grace hash join.
 ///
-/// Memory: 64 bytes (one register per slot). Approximates the count of
-/// distinct hash values fed in via [`Hll::add`]; consulted by
-/// `bnl_fallback` when an E310 abort fires so the operator-facing
-/// diagnostic carries an actionable cardinality estimate ("partition 7,
-/// ~3.2M distinct keys") instead of a bare OOM.
-///
-/// The estimate uses the harmonic-mean form with bias correction at
-/// small range (`E < 2.5m`); large-range correction is unnecessary
-/// because the input domain is bounded by `u32::MAX - 1` records per
-/// partition (the build-side cap enforced in `CombineHashTable::build`).
-#[derive(Debug, Clone)]
-pub(crate) struct Hll {
-    registers: [u8; HLL_REGISTERS],
-}
-
-impl Hll {
-    /// Construct a fresh sketch with all registers zeroed.
-    pub(crate) fn new() -> Self {
-        Self {
-            registers: [0; HLL_REGISTERS],
-        }
-    }
-
-    /// Feed one 64-bit hash value into the sketch. Cost is one branch
-    /// plus a max-update on a single register.
-    pub(crate) fn add(&mut self, hash: u64) {
-        // Top HLL_INDEX_BITS bits pick the register; leading-zero count
-        // of the remaining bits + 1 is the contribution. The +1
-        // convention (rho = position of leftmost 1-bit, 1-indexed)
-        // matches the Flajolet 2007 paper.
-        let idx = (hash >> (64 - HLL_INDEX_BITS)) as usize;
-        let w = (hash << HLL_INDEX_BITS) | (1u64 << (HLL_INDEX_BITS - 1));
-        let rho = (w.leading_zeros() + 1) as u8;
-        if rho > self.registers[idx] {
-            self.registers[idx] = rho;
-        }
-    }
-
-    /// Return the approximate distinct-value count.
-    ///
-    /// Uses the harmonic-mean estimator `E = alpha_m * m^2 / sum(2^-M[j])`,
-    /// with the small-range linear-counting correction when more than
-    /// half the registers are still zero.
-    pub(crate) fn estimate(&self) -> u64 {
-        let m = HLL_REGISTERS as f64;
-        let mut sum_inv = 0.0f64;
-        let mut zeros = 0usize;
-        for &r in &self.registers {
-            sum_inv += 2f64.powi(-(r as i32));
-            if r == 0 {
-                zeros += 1;
-            }
-        }
-        let raw = HLL_ALPHA_64 * m * m / sum_inv;
-        // Linear-counting branch: when register vector is sparse, the
-        // harmonic-mean estimator is biased high. Switch to the
-        // closed-form `m * ln(m / V)` correction (Flajolet 2007 §4),
-        // which is unbiased in this regime.
-        if raw <= 2.5 * m && zeros > 0 {
-            (m * (m / zeros as f64).ln()).round() as u64
-        } else {
-            raw.round() as u64
-        }
-    }
-}
+/// Fixed at 64 registers (≈±13% nominal error, 64 bytes per partition):
+/// this is a diagnostic-quality estimate consulted only when an E310
+/// abort fires, so the BNL fallback can report "partition 7, ~3.2M
+/// distinct keys" instead of a bare OOM. The planner-grade statistics
+/// catalog instantiates the same [`Hll`] at ≥1024 registers; the
+/// hot-path partition sketch deliberately stays small.
+pub(crate) type GraceHll = Hll<64>;
 
 // ──────────────────────────────────────────────────────────────────────────
 // PartitionAssigner
