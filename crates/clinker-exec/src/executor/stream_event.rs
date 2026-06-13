@@ -274,13 +274,12 @@ pub(crate) fn reconcile_document_boundaries(
 mod tests {
     use super::*;
     use clinker_record::{DocumentContext, Schema, Value, synthetic_document_context};
-    use indexmap::IndexMap;
 
     fn doc_ctx() -> Arc<DocumentContext> {
         Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("doc.x12"),
-            IndexMap::new(),
+            clinker_record::EnvelopeRecord::empty(),
         ))
     }
 

@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn file_header_echoed_from_doc_section() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         let s = schema();
@@ -658,7 +658,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.hl7"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
 
         let mut msh = record(
@@ -685,7 +685,7 @@ mod tests {
         // at the first missing `fNN` key: with `f01` and `f03` declared but
         // `f02` absent, the FHS header must carry an empty field at position 2
         // rather than truncating at the gap.
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         let s = schema();
@@ -698,7 +698,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.hl7"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
 
         let mut msh = record(&s, "MSH", &["^~\\&", "S"]);

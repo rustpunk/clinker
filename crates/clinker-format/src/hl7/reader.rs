@@ -1168,7 +1168,7 @@ mod tests {
     fn reader_doc_writer_round_trip_preserves_msh_and_escapes() {
         use crate::hl7::writer::{Hl7Writer, Hl7WriterConfig};
         use crate::traits::FormatWriter;
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         // PID-3 is a real composite CX field with four components and a
         // repetition (`~`); the OBX field carries a literal '|' that arrives
@@ -1193,7 +1193,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("adt.hl7"),
-            IndexMap::new(),
+            EnvelopeRecord::empty(),
         ));
         let schema = r.schema().unwrap();
         let out = {

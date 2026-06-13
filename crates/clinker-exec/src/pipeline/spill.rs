@@ -541,7 +541,7 @@ mod tests {
         Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
-            sections,
+            clinker_record::EnvelopeRecord::from_sections(sections),
         ))
     }
 

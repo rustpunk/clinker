@@ -86,6 +86,7 @@ pub(crate) fn extract_sections(
     let mut parser = XmlParser::from_reader(reader);
     parser.config_mut().trim_text(true);
 
+    let parse_ctx = SectionParseCtx { ns, attr_prefix };
     let mut path_stack: Vec<String> = Vec::new();
     let mut captured: Vec<MatchedSection> = Vec::new();
     let mut charge = ByteCharge {
@@ -107,14 +108,25 @@ pub(crate) fn extract_sections(
                     .iter()
                     .find(|t| path_matches(&path_stack, &t.segments))
                 {
+                    // The matched section element's OWN attributes belong to
+                    // the section, addressable as bare `@attr` (no element
+                    // prefix) — exactly as the body reader seeds a record's
+                    // start-tag attributes. Seed them before the children so
+                    // `<Summary id="5">` exposes `$doc.Summary.@id`; the
+                    // children's nested fields follow.
+                    let mut seed: Vec<(String, String)> = Vec::new();
+                    for (key, val) in extract_attributes_static(attr_prefix, e)? {
+                        charge.charge(key.len() + val.len(), &target.name)?;
+                        seed.push((key, val));
+                    }
                     let payload = read_section_payload(
                         &mut parser,
                         &mut buf,
-                        ns,
-                        attr_prefix,
+                        &parse_ctx,
                         path_stack.len(),
                         &target.name,
                         &mut charge,
+                        seed,
                     )?;
                     captured.push((target.name.clone(), payload));
                     // `read_section_payload` consumed the matched subtree up
@@ -148,6 +160,14 @@ pub(crate) fn extract_sections(
     }
 
     Ok(captured)
+}
+
+/// The two static per-parse settings the section walk threads unchanged
+/// through every element: namespace handling and the attribute-key prefix.
+/// Grouped so the subtree reader carries them as one borrow.
+struct SectionParseCtx<'a> {
+    ns: &'a NamespaceMode,
+    attr_prefix: &'a str,
 }
 
 /// Running retained-byte total for the streaming pass, charged against the
@@ -189,6 +209,11 @@ fn path_matches(stack: &[String], segs: &[String]) -> bool {
 /// pairs, charging each retained pair against `charge` and aborting
 /// mid-subtree the instant the running total crosses the cap.
 ///
+/// `seed` carries the matched element's own start-tag attributes (already
+/// charged by the caller), which lead the payload as bare `@attr` keys before
+/// the children's nested fields — matching the body reader's start-attribute
+/// seeding.
+///
 /// Produces the same flat payload the body record extractor does — same
 /// `.`-joined nested-element prefixes, attribute prefixing, and CData /
 /// text handling — so a declared section's output is byte-identical to the
@@ -202,13 +227,13 @@ fn path_matches(stack: &[String], segs: &[String]) -> bool {
 fn read_section_payload(
     parser: &mut BodyParser,
     buf: &mut Vec<u8>,
-    ns: &NamespaceMode,
-    attr_prefix: &str,
+    ctx: &SectionParseCtx,
     section_depth: usize,
     section: &str,
     charge: &mut ByteCharge,
+    seed: Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>, FormatError> {
-    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut fields: Vec<(String, String)> = seed;
     let mut element_stack: Vec<String> = Vec::new();
     let mut depth_here = section_depth;
     loop {
@@ -219,9 +244,9 @@ fn read_section_payload(
         match event {
             Event::Start(ref e) => {
                 depth_here += 1;
-                let name = elem_name_static(ns, &e.name());
+                let name = elem_name_static(ctx.ns, &e.name());
                 element_stack.push(name);
-                let attrs = extract_attributes_static(attr_prefix, e)?;
+                let attrs = extract_attributes_static(ctx.attr_prefix, e)?;
                 let prefix = element_stack.join(".");
                 for (k, v) in attrs {
                     let key = format!("{prefix}.{k}");
@@ -237,7 +262,7 @@ fn read_section_payload(
                 element_stack.pop();
             }
             Event::Empty(ref e) => {
-                let name = elem_name_static(ns, &e.name());
+                let name = elem_name_static(ctx.ns, &e.name());
                 let prefix = if element_stack.is_empty() {
                     name.clone()
                 } else {
@@ -245,7 +270,7 @@ fn read_section_payload(
                 };
                 charge.charge(prefix.len(), section)?;
                 fields.push((prefix.clone(), String::new()));
-                let attrs = extract_attributes_static(attr_prefix, e)?;
+                let attrs = extract_attributes_static(ctx.attr_prefix, e)?;
                 for (k, v) in attrs {
                     let key = format!("{prefix}.{k}");
                     charge.charge(key.len() + v.len(), section)?;

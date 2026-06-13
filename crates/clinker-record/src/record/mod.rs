@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_record_set_doc_ctx_attaches_real_context() {
-        use crate::document_context::{DocumentContext, DocumentId};
+        use crate::document_context::{DocumentContext, DocumentId, EnvelopeRecord};
         let schema = test_schema();
         let mut record = Record::new(schema, vec![Value::Null; 5]);
         let id = DocumentId::next();
@@ -568,7 +568,11 @@ mod tests {
                 m
             })),
         );
-        let ctx = Arc::new(DocumentContext::new(id, Arc::from("doc.xml"), sections));
+        let ctx = Arc::new(DocumentContext::new(
+            id,
+            Arc::from("doc.xml"),
+            EnvelopeRecord::from_sections(sections),
+        ));
         record.set_doc_ctx(Arc::clone(&ctx));
         assert!(Arc::ptr_eq(record.doc_ctx(), &ctx));
         assert_eq!(record.doc_ctx().id(), id);

@@ -383,6 +383,37 @@ fn prescan_preserves_namespaces_attributes_and_cdata() {
     assert_eq!(meta.get("note"), Some(&Value::String("a & b".into())));
 }
 
+#[test]
+fn prescan_retains_the_matched_section_elements_own_attributes() {
+    // The matched section element carries its own attributes
+    // (`<Summary id="5" run="R-1">…`). The streaming pre-scan must seed those
+    // as bare `@attr` fields of the section — exactly as the body reader seeds
+    // a record's start-tag attributes — so `$doc.Summary.@id` resolves. Child
+    // element attributes are still captured under their `.`-joined prefix.
+    let xml = r#"<doc><Summary id="5" run="R-1"><line tag="net"></line><record_count>3</record_count></Summary><records><record><x>1</x></record></records></doc>"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[
+            ("@id", EnvelopeFieldType::Int),
+            ("@run", EnvelopeFieldType::String),
+            ("line.@tag", EnvelopeFieldType::String),
+            ("record_count", EnvelopeFieldType::Int),
+        ],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+    let summary = unwrap_map(sections.get("Summary").expect("Summary retained"));
+    // The matched element's OWN attributes — the #505 regression.
+    assert_eq!(summary.get("@id"), Some(&Value::Integer(5)));
+    assert_eq!(summary.get("@run"), Some(&Value::String("R-1".into())));
+    // Child-element attributes and child text still captured alongside.
+    assert_eq!(summary.get("line.@tag"), Some(&Value::String("net".into())));
+    assert_eq!(summary.get("record_count"), Some(&Value::Integer(3)));
+}
+
 /// A multi-MB body streams element-at-a-time from a path-backed source: the
 /// body walks one `<record>` at a time and re-opening by path means no
 /// whole-document byte buffer is held either.

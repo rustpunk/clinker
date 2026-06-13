@@ -21,7 +21,7 @@ pub use coercion::{
 };
 pub use counters::{PipelineCounters, RetractionCounters};
 pub use document_context::{
-    DocumentContext, DocumentGrain, DocumentId, synthetic_document_context,
+    DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord, synthetic_document_context,
     synthetic_document_context_ref,
 };
 pub use field_str::FieldStr;

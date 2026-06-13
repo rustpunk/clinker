@@ -515,7 +515,7 @@ mod tests {
         let doc = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::clone(&file),
-            sections,
+            clinker_record::EnvelopeRecord::from_sections(sections),
         ));
         let mut ctx = make_ctx(&stable, &file, &batch, 1);
         ctx.doc_ctx = &doc;

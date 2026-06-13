@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn isa_echoed_from_doc_section() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         let s = schema();
@@ -769,7 +769,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
 
         let mut record = body(&s, "BEG", "0001", "850", &["00"]);

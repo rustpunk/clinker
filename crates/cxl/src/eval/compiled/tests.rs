@@ -305,7 +305,7 @@ fn eval_project_with_doc(
 /// `(field, Value)` payload as a `Value::Map`. Field values may themselves
 /// be `Value::Array` / `Value::Map` to exercise indexed `$doc` chains.
 fn doc_with_section(name: &str, fields: &[(&str, Value)]) -> Arc<clinker_record::DocumentContext> {
-    use clinker_record::{DocumentContext, DocumentId};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
     let mut payload = indexmap::IndexMap::new();
     for (k, v) in fields {
         payload.insert(Box::from(*k), v.clone());
@@ -315,7 +315,7 @@ fn doc_with_section(name: &str, fields: &[(&str, Value)]) -> Arc<clinker_record:
     Arc::new(DocumentContext::new(
         DocumentId::next(),
         Arc::from("proof.json"),
-        sections,
+        EnvelopeRecord::from_sections(sections),
     ))
 }
 

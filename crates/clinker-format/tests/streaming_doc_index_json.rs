@@ -407,6 +407,114 @@ fn prescan_prunes_the_unread_section_in_a_mixed_envelope() {
     );
 }
 
+#[test]
+fn prescan_coerces_only_the_read_fields_of_a_wide_section() {
+    // A wide-schema section whose program reads exactly ONE field must coerce
+    // only that field. The unread fields are not parsed or type-checked — so a
+    // declared-but-unread field carrying a value that would FAIL its declared
+    // coercion is skipped silently rather than aborting the run (the #496
+    // regression: eager coercion of every declared field).
+    let json = r#"{"Summary":{"record_count":7,"checksum":"not-an-int","ratio":"not-a-float"},"records":[{"x":1}]}"#;
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/Summary",
+        &[
+            ("record_count", EnvelopeFieldType::Int),
+            // Declared Int / Float, but the document carries non-numeric
+            // strings — these would error if eagerly coerced.
+            ("checksum", EnvelopeFieldType::Int),
+            ("ratio", EnvelopeFieldType::Float),
+        ],
+    )];
+    let cfg = envelope_config(specs);
+
+    // Only `record_count` is referenced by a `$doc` path.
+    let declared = vec![DocPath {
+        section: "Summary".into(),
+        field: "record_count".into(),
+        indices: Vec::new(),
+    }];
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(json.as_bytes().to_vec()),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared,
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let sections = reader
+        .prepare_document(&cfg)
+        .expect("unread malformed fields must not abort the pre-scan");
+    let summary = match sections.get("Summary").expect("Summary retained") {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    };
+    // The read field coerced and survives.
+    assert_eq!(summary.get("record_count"), Some(&Value::Integer(7)));
+    // The unread fields were never coerced — absent from the retained payload.
+    assert!(
+        summary.get("checksum").is_none(),
+        "an unread declared field must not be coerced or retained"
+    );
+    assert!(summary.get("ratio").is_none());
+}
+
+#[test]
+fn prescan_retains_all_fields_when_section_referenced_whole_or_indexed() {
+    // A whole-section reference (empty field) or an indexed reference retains
+    // every declared field — the complement of the field-pruned case. Here a
+    // single indexed path into `Summary` promotes the whole section, so every
+    // declared field is coerced and retained.
+    let json =
+        r#"{"Summary":{"record_count":7,"checksum":42,"items":[10,20]},"records":[{"x":1}]}"#;
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/Summary",
+        &[
+            ("record_count", EnvelopeFieldType::Int),
+            ("checksum", EnvelopeFieldType::Int),
+            ("items", EnvelopeFieldType::String),
+        ],
+    )];
+    let cfg = envelope_config(specs);
+
+    // An indexed reference into `Summary.items[0]` promotes the section to
+    // retain-all — even fields no concrete path names.
+    let declared = vec![DocPath {
+        section: "Summary".into(),
+        field: "items".into(),
+        indices: vec![cxl::analyzer::doc_paths::DocIndex::Int(0)],
+    }];
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(json.as_bytes().to_vec()),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared,
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+    let summary = match sections.get("Summary").expect("Summary retained") {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    };
+    // Every declared field retained — indexed reference promotes retain-all.
+    assert_eq!(summary.get("record_count"), Some(&Value::Integer(7)));
+    assert_eq!(summary.get("checksum"), Some(&Value::Integer(42)));
+    assert!(
+        summary.get("items").is_some(),
+        "the indexed field is retained alongside its section's other fields"
+    );
+}
+
 /// A multi-MB top-level array streams element-at-a-time: the whole array is
 /// never collected into a `Vec`, and re-opening by path means no whole-file
 /// byte buffer is held either. Body consumption tracks records yielded, not the

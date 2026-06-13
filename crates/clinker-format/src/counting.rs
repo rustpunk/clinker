@@ -243,8 +243,7 @@ mod tests {
     fn counted_format_writer_forwards_document_hooks_to_inner() {
         use std::sync::{Arc, Mutex};
 
-        use clinker_record::DocumentId;
-        use indexmap::IndexMap;
+        use clinker_record::{DocumentId, EnvelopeRecord};
 
         let log = Arc::new(Mutex::new(Vec::new()));
         let probe = HookProbe {
@@ -252,7 +251,11 @@ mod tests {
         };
         let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
 
-        let doc = DocumentContext::new(DocumentId::next(), Arc::from("file.x12"), IndexMap::new());
+        let doc = DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("file.x12"),
+            EnvelopeRecord::empty(),
+        );
         counted.begin_document(&doc).unwrap();
         counted.end_document(&doc).unwrap();
 

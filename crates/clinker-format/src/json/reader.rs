@@ -468,7 +468,7 @@ impl FormatReader for JsonReader {
                     )));
                 }
             };
-            let typed = coerce_json_section_fields(name, payload_obj, &section.fields)?;
+            let typed = coerce_json_section_fields(name, payload_obj, &section.fields, &index)?;
             let path = doc_path_for_section(name);
             index.insert(&path, Value::Map(Box::new(typed)))?;
         }
@@ -597,13 +597,23 @@ fn json_value_kind(v: &serde_json::Value) -> &'static str {
 /// missing fields drop out (CXL eval maps to `Value::Null`); type
 /// mismatch raises a format error citing the section + field +
 /// observed JSON value.
+///
+/// A declared field no program reads is skipped before coercion: a
+/// wide-schema section referenced by a single field coerces only that field,
+/// so an unread (and possibly malformed) sibling field is never parsed or
+/// type-checked. `index` is the retention authority that knows the read set
+/// (see [`DocArenaIndex::wants_field`]).
 fn coerce_json_section_fields(
     section_name: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
     schema: &IndexMap<String, EnvelopeFieldType>,
+    index: &DocArenaIndex,
 ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
     let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
     for (field, ty) in schema {
+        if !index.wants_field(section_name, field) {
+            continue;
+        }
         let json_val = match obj.get(field.as_str()) {
             Some(v) if !v.is_null() => v,
             _ => continue,

@@ -577,7 +577,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            clinker_record::EnvelopeRecord::from_sections(sections),
         ));
         input.set_doc_ctx(Arc::clone(&ctx));
 
