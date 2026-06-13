@@ -205,6 +205,17 @@ pub(crate) fn phys_footprint_bytes() -> Option<u64> {
     rusage_info_v4().map(|info| info.ri_phys_footprint)
 }
 
+/// Returns the lifetime high-water mark of the process's physical memory
+/// footprint in bytes (`ri_lifetime_max_phys_footprint`), the peak of the
+/// same `phys_footprint` figure [`phys_footprint_bytes`] samples live, or
+/// `None` when `proc_pid_rusage` fails. macOS-only; the peak-RSS gate reads
+/// this so a transient spike is captured even after the footprint falls back.
+/// Monotonic non-decreasing for the life of the process.
+#[cfg(target_os = "macos")]
+pub(crate) fn lifetime_max_phys_footprint_bytes() -> Option<u64> {
+    rusage_info_v4().map(|info| info.ri_lifetime_max_phys_footprint)
+}
+
 #[cfg(target_os = "macos")]
 fn io_counters_impl() -> Option<IoCounters> {
     rusage_info_v4().map(|info| IoCounters {

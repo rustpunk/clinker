@@ -245,6 +245,48 @@ config declares — an X12 reader exposes `$doc.functional_group.*` and
 `$doc.transaction_set.*` the config never names — so their `$doc` paths
 are not checked this way.
 
+## Indexed `$doc` access
+
+A section field that holds an array or a map can be indexed inline, the
+same way any record value is — see [Nested paths](../cxl/nested-paths.md)
+for the full bracket-index reference. Integer indices select array
+elements; string keys select map entries; the two compose into a chain:
+
+```yaml
+project:
+  - first_line:   $doc.Header.line_items[0]      # array element
+  - run_date:     $doc.Header.meta["run_date"]   # map entry
+  - first_sku:    $doc.Header.line_items[0]["sku"]  # array-of-maps chain
+```
+
+An out-of-range array index or a missing map key resolves to `null` — it
+never errors or panics, and a `null` mid-chain short-circuits the rest of
+the chain to `null` rather than failing. This is the same missing-value
+convention `$doc.<missing_field>` and `$source.*` follow.
+
+### Only literal paths are readable
+
+Every index segment must be a **literal** — a constant integer or string
+written in the program text. The section and field are always literal
+identifiers (the grammar requires it), so a literal index is the last
+piece a reader needs to know, before reading any input, exactly which
+envelope paths a run will consume. The pre-scan extracts precisely those
+statically-resolvable paths and nothing else.
+
+A **computed** index — one derived from runtime data, such as
+`$doc.Header.line_items[row_index]` — is not statically resolvable: the
+reader cannot pre-scan a row-dependent element. clinker rejects it at
+compile time with a diagnostic pointing at the offending index, rather
+than reading it at run time. Use a literal index, or pull the value into
+a record field upstream and index that instead.
+
+This compiles together with the declared-path rule above: a `$doc` read
+of a section or field the source does not declare is a **compile-time
+error** (`E341`), and a `$doc` read with a computed index is a
+**compile-time diagnostic** — neither reaches run time as a silent
+`null`. Only a literal path over a *declared* section is pre-scanned and
+readable.
+
 ## One document per file
 
 Each source file is its own document with its own envelope context.

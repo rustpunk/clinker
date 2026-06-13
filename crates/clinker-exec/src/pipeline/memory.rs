@@ -111,6 +111,93 @@ fn rss_bytes_impl() -> Option<u64> {
     None
 }
 
+/// Peak resident memory the process has ever held — the lifetime
+/// high-water mark of [`rss_bytes`], not the live figure. Returns `None`
+/// on unsupported platforms.
+///
+/// Unlike [`rss_bytes`] (a *current* reading that a `free()` can lower),
+/// this is a monotonic non-decreasing watermark the OS maintains: it only
+/// rises. That makes a `peak_after >= peak_before` comparison immune to a
+/// sibling thread's churn between the two samples — the property a
+/// bounded-memory proof needs.
+///
+/// **Unit invariant — every arm returns BYTES.** Linux `VmHWM` from
+/// `/proc/self/status` is reported in **kB**, so this multiplies by 1024;
+/// macOS `ri_lifetime_max_phys_footprint` and Windows `PeakWorkingSetSize`
+/// are already in bytes and pass through unconverted. A future editor must
+/// not "normalize" the Linux ×1024 away — the kB→bytes conversion is the
+/// one place the three arms differ.
+pub fn peak_rss_bytes() -> Option<u64> {
+    peak_rss_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn peak_rss_bytes_impl() -> Option<u64> {
+    // `VmHWM:` is the peak resident set size — the high-water mark of the
+    // `VmRSS` figure `rss_bytes` reads. It is reported in kB, so multiply
+    // by 1024 to return BYTES (the unit invariant the other arms already
+    // satisfy without conversion).
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn peak_rss_bytes_impl() -> Option<u64> {
+    // `ri_lifetime_max_phys_footprint` is the peak of the same
+    // `phys_footprint` figure `rss_bytes` samples live — already in BYTES,
+    // no conversion. Mirrors `rss_bytes_impl`'s delegation to
+    // `phys_footprint_bytes`.
+    super::sysstats::lifetime_max_phys_footprint_bytes()
+}
+
+#[cfg(target_os = "windows")]
+fn peak_rss_bytes_impl() -> Option<u64> {
+    use std::mem;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // `PeakWorkingSetSize` is the high-water mark of the process's working
+    // set — already in BYTES, no conversion. It lives in the leading base
+    // `PROCESS_MEMORY_COUNTERS` fields, so the same EX-struct-cast-to-base
+    // idiom `rss_bytes_impl` uses to read `PrivateUsage` reads it here with
+    // no extra `windows-sys` feature.
+    //
+    // SAFETY: identical to `rss_bytes_impl`. `GetCurrentProcess()` returns
+    // the always-valid pseudo-handle (-1) needing no `CloseHandle`; the
+    // pointer cast is sound because `PROCESS_MEMORY_COUNTERS_EX` is
+    // `#[repr(C)]` and layout-compatible with `PROCESS_MEMORY_COUNTERS` for
+    // the leading fields, and `cb` is the EX size so the kernel writes the
+    // full struct.
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
+        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        let ok = K32GetProcessMemoryInfo(
+            handle,
+            &mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        );
+        if ok != 0 {
+            Some(pmc.PeakWorkingSetSize as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn peak_rss_bytes_impl() -> Option<u64> {
+    None
+}
+
 /// Reject an unsatisfiable memory budget at startup, before any
 /// source-ingest thread spawns.
 ///
@@ -1294,10 +1381,57 @@ mod tests {
         );
     }
 
+    /// `peak_rss_bytes()` reports a monotonic high-water mark that never
+    /// decreases, so a touched 64 MiB allocation can only raise it.
+    ///
+    /// Unlike the `phys_footprint` / `PrivateUsage` probes — which read a
+    /// *current* figure a sibling thread's `free()` can lower between two
+    /// samples, forcing the `run_isolated` subprocess harness (issue #394) —
+    /// `VmHWM` / `PeakWorkingSetSize` / `ri_lifetime_max_phys_footprint` are
+    /// lifetime watermarks: they only rise. A `peak_after >= peak_before`
+    /// assertion is therefore inherently immune to sibling churn and needs
+    /// no process isolation. Gated to the first-class targets where
+    /// `peak_rss_bytes()` is defined.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn peak_rss_bytes_is_a_monotonic_high_water_mark() {
+        let before =
+            peak_rss_bytes().expect("peak_rss_bytes() must be readable on a first-class target");
+        assert!(before > 0, "peak RSS must be positive for a live process");
+
+        // On Linux the high-water mark must be on the same order as the
+        // current RSS — a cheap catch for a dropped `* 1024`, which would
+        // make `peak_rss_bytes` ~1024x smaller than `rss_bytes`. The exact
+        // `>= current` relation does NOT hold instant-to-instant: `VmHWM`
+        // here comes from `/proc/self/status` while `rss_bytes` reads
+        // `/proc/self/statm` (resident pages x page size), and the two
+        // kernel sources can disagree by a few pages at a sample boundary.
+        // Asserting `peak >= current / 2` tolerates that skew while still
+        // failing a 1024x unit error by a wide margin.
+        #[cfg(target_os = "linux")]
+        {
+            let current = rss_bytes().expect("rss_bytes() must be readable on Linux");
+            assert!(
+                before >= current / 2,
+                "peak RSS ({before}) must be on the order of current RSS ({current}); \
+                 a peak ~1024x smaller signals a missing kB->bytes conversion"
+            );
+        }
+
+        let buf = touch_pages(64 * 1024 * 1024);
+        let after =
+            peak_rss_bytes().expect("peak_rss_bytes() must be readable on a first-class target");
+        assert!(
+            after >= before,
+            "a high-water mark can only rise; before={before} after={after}"
+        );
+        drop(buf);
+    }
+
     /// Touch every page of a heap buffer so the pages are committed and
     /// resident, then keep the buffer alive across the read. Returns the
     /// buffer so the caller controls its drop point.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn touch_pages(bytes: usize) -> Vec<u8> {
         let mut v: Vec<u8> = vec![0u8; bytes];
         let page = 4096;
@@ -1314,7 +1448,7 @@ mod tests {
     /// parent: absent in the parent (which re-execs), set in the child
     /// (which runs the probe body). Its presence also breaks the otherwise
     /// infinite re-exec loop.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     const MEMPROBE_ISOLATED_ENV: &str = "CLINKER_MEMPROBE_ISOLATED";
 
     /// Marker the child prints to stdout after the probe's assertions pass.
@@ -1325,20 +1459,23 @@ mod tests {
     /// a filter quirk) and the probe never executed. A dedicated sentinel is
     /// robust to libtest output-format drift in a way that scraping for
     /// "1 passed" is not.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     const MEMPROBE_RAN_SENTINEL: &str = "__clinker_memprobe_ran__";
 
     /// Runs `probe` in a child process where it is the sole test, so its
-    /// before/after memory samples bracket only its own allocation.
+    /// memory samples bracket only its own allocation and the process-global
+    /// RSS readings cannot be moved by a sibling test thread.
     ///
-    /// The probes read a process-global counter (Windows `PrivateUsage`,
-    /// macOS `phys_footprint`) and assert a direction of change. Under
-    /// `cargo test`'s default multi-threaded harness, sibling test threads
-    /// in the same binary commit and free large buffers between the two
-    /// samples, moving the global figure independently of this probe's own
-    /// allocation and tripping the assertion at random (issue #394).
-    /// `#[serial]` is insufficient: it only orders `#[serial]`-tagged tests,
-    /// leaving every other test in the binary concurrent.
+    /// The probes read a process-global counter (Linux `/proc/self/statm`
+    /// RSS, Windows `PrivateUsage`, macOS `phys_footprint`) and assert a
+    /// relation between two or more samples. Under `cargo test`'s default
+    /// multi-threaded harness, sibling test threads in the same binary
+    /// commit and free large buffers between the samples, moving the global
+    /// figure independently of this probe's own allocation and tripping the
+    /// assertion at random (issue #394). `#[serial]` is insufficient: it
+    /// only orders `#[serial]`-tagged tests, leaving every other test in the
+    /// binary concurrent. The mechanism is platform-agnostic, so it runs on
+    /// every first-class target rather than only macOS/Windows.
     ///
     /// On first entry (parent, env flag absent) this re-execs the test
     /// binary filtered to `test_path` alone, with the flag set, then
@@ -1348,7 +1485,7 @@ mod tests {
     /// failure surfaces the child's stderr (the real assertion text). On the
     /// recursive entry (child, env flag present) it runs `probe`, prints the
     /// sentinel, and returns, letting libtest report the result.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn run_isolated(test_path: &str, probe: impl FnOnce()) {
         if std::env::var_os(MEMPROBE_ISOLATED_ENV).is_some() {
             probe();
@@ -1459,52 +1596,72 @@ mod tests {
         );
     }
 
+    /// This test samples `rss_bytes()` as `baseline`, then
+    /// `reject_unsatisfiable_budget` internally samples current RSS again as
+    /// `baseline_rss` and the test asserts `baseline_rss >= baseline`. Both
+    /// reads are of the process-global *current* RSS, so a sibling test
+    /// thread freeing memory between them lowers RSS and trips the
+    /// assertion under the multi-threaded harness — the same churn that
+    /// flakes the `phys_footprint` / `PrivateUsage` probes (issue #394).
+    /// Running it as the sole test in a child process via [`run_isolated`]
+    /// removes the sibling churn, so the two reads are stable and the
+    /// assertion holds without weakening it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn reject_unsatisfiable_budget_pins_both_policies() {
-        use clinker_plan::config::BackpressureKnob;
-        use clinker_plan::error::PipelineError;
+        run_isolated(
+            "pipeline::memory::tests::reject_unsatisfiable_budget_pins_both_policies",
+            || {
+                use clinker_plan::config::BackpressureKnob;
+                use clinker_plan::error::PipelineError;
 
-        // No baseline to compare against → cannot judge; never rejects.
-        let Some(baseline) = rss_bytes() else {
-            assert!(reject_unsatisfiable_budget(1, BackpressureKnob::Pause).is_ok());
-            return;
-        };
+                // No baseline to compare against → cannot judge; never rejects.
+                let Some(baseline) = rss_bytes() else {
+                    assert!(reject_unsatisfiable_budget(1, BackpressureKnob::Pause).is_ok());
+                    return;
+                };
 
-        // A 1-byte budget is below baseline RSS. Under the producer-pausing
-        // policies (pause/both) it would deadlock, so it is rejected at
-        // startup with the configured limit and the measured baseline.
-        for knob in [BackpressureKnob::Pause, BackpressureKnob::Both] {
-            match reject_unsatisfiable_budget(1, knob) {
-                Err(PipelineError::UnsatisfiableMemoryBudget {
-                    limit,
-                    baseline_rss,
-                }) => {
-                    assert_eq!(limit, 1);
-                    assert!(baseline_rss >= baseline, "baseline must be the live RSS");
+                // A 1-byte budget is below baseline RSS. Under the producer-pausing
+                // policies (pause/both) it would deadlock, so it is rejected at
+                // startup with the configured limit and the measured baseline.
+                for knob in [BackpressureKnob::Pause, BackpressureKnob::Both] {
+                    match reject_unsatisfiable_budget(1, knob) {
+                        Err(PipelineError::UnsatisfiableMemoryBudget {
+                            limit,
+                            baseline_rss,
+                        }) => {
+                            assert_eq!(limit, 1);
+                            assert!(baseline_rss >= baseline, "baseline must be the live RSS");
+                        }
+                        other => {
+                            panic!(
+                                "pausing policy must reject a sub-baseline budget; got {other:?}"
+                            )
+                        }
+                    }
                 }
-                other => panic!("pausing policy must reject a sub-baseline budget; got {other:?}"),
-            }
-        }
 
-        // Under spill the same sub-baseline budget never pauses, so it is
-        // NOT rejected — it spills/aborts via the runtime admission path.
-        assert!(
-            reject_unsatisfiable_budget(1, BackpressureKnob::Spill).is_ok(),
-            "spill policy must not reject a sub-baseline budget at startup"
+                // Under spill the same sub-baseline budget never pauses, so it is
+                // NOT rejected — it spills/aborts via the runtime admission path.
+                assert!(
+                    reject_unsatisfiable_budget(1, BackpressureKnob::Spill).is_ok(),
+                    "spill policy must not reject a sub-baseline budget at startup"
+                );
+
+                // A budget well above baseline is satisfiable under every policy.
+                let generous = baseline.saturating_mul(4).max(512 * 1024 * 1024);
+                for knob in [
+                    BackpressureKnob::Pause,
+                    BackpressureKnob::Both,
+                    BackpressureKnob::Spill,
+                ] {
+                    assert!(
+                        reject_unsatisfiable_budget(generous, knob).is_ok(),
+                        "a budget above baseline must be satisfiable under {knob:?}"
+                    );
+                }
+            },
         );
-
-        // A budget well above baseline is satisfiable under every policy.
-        let generous = baseline.saturating_mul(4).max(512 * 1024 * 1024);
-        for knob in [
-            BackpressureKnob::Pause,
-            BackpressureKnob::Both,
-            BackpressureKnob::Spill,
-        ] {
-            assert!(
-                reject_unsatisfiable_budget(generous, knob).is_ok(),
-                "a budget above baseline must be satisfiable under {knob:?}"
-            );
-        }
     }
 
     #[test]
