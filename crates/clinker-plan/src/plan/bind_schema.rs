@@ -1158,6 +1158,19 @@ fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     }
 }
 
+/// Borrowed inputs for binding one `PipelineNode::Reshape`.
+///
+/// Bundles the read-only node identity (name/config/upstream/span/vars)
+/// so `bind_reshape` keeps only the mutable sinks (diags/artifacts/schema
+/// map) as loose parameters, mirroring `CombineNodeBinding`.
+struct ReshapeNodeBinding<'a> {
+    name: &'a str,
+    config: &'a ReshapeBody,
+    upstream: &'a Row,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
 /// Bind a `PipelineNode::Reshape`: validate `partition_by` against the
 /// upstream schema, typecheck each rule's `when` / `set` / `overrides`
 /// CXL against that schema, enforce the group-identity and synthesis
@@ -1173,17 +1186,19 @@ fn synthetic_typed_program(output_row: Row) -> TypedProgram {
 ///   survive Reshape;
 /// - `copy_from: none` requires every upstream column to appear in
 ///   `overrides`, so a synthesized row is never silently all-null.
-#[allow(clippy::too_many_arguments)]
 fn bind_reshape(
-    name: &str,
-    config: &ReshapeBody,
-    upstream: &Row,
-    span: Span,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+    node: &ReshapeNodeBinding<'_>,
     diags: &mut Vec<Diagnostic>,
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
 ) {
+    let &ReshapeNodeBinding {
+        name,
+        config,
+        upstream,
+        span,
+        scoped_vars,
+    } = node;
     let mut ok = true;
 
     // `partition_by` fields must exist upstream.
@@ -1771,11 +1786,13 @@ fn bind_schema_inner(
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let upstream = upstream.clone();
                     bind_reshape(
-                        &name,
-                        config,
-                        &upstream,
-                        span,
-                        &bind_ctx.scoped_vars,
+                        &ReshapeNodeBinding {
+                            name: &name,
+                            config,
+                            upstream: &upstream,
+                            span,
+                            scoped_vars: &bind_ctx.scoped_vars,
+                        },
                         diags,
                         artifacts,
                         schema_by_name,

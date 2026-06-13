@@ -112,4 +112,4 @@ Like the `$ck.*` correlation columns, these `$meta.*` columns stay out of the de
 
 ## Memory model
 
-Reshape accumulates per-group state in memory: a group must be fully buffered before its rules run. Group buffering is bounded by the correlation group cap (`error_handling.max_group_buffer`). Disk-spill governance for these buffers is part of Reshape's ongoing memory-management work.
+The whole input materializes in memory before any output row is emitted: Reshape groups every record, then runs each group's rules. There is no group-size cap and no disk spill yet — bounded-memory governance (spill, group caps, and hysteresis around the spill thresholds) is tracked as follow-on work.

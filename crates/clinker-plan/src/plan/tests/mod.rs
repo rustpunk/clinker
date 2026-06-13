@@ -7,5 +7,6 @@ mod doc_paths;
 mod explain_buffer_class;
 mod explain_polish;
 mod plan_time_window_root;
+mod reshape_validation;
 mod route_ports;
 mod watermark_validation;

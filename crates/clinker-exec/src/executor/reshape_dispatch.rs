@@ -261,9 +261,7 @@ fn process_group(
     // Conflict: the whole correlation group rolls back. No output row from
     // this group reaches the buffer.
     if let Some(c) = conflict {
-        return dlq_group_conflict(
-            ctx, node_name, &c.rule_a, &c.rule_b, &c.field, &c.record, c.row_num,
-        );
+        return dlq_group_conflict(ctx, node_name, &c);
     }
 
     // No conflict: emit originals (with staged mutations + audit stamps)
@@ -283,22 +281,24 @@ fn process_group(
 /// Push a `MutationConflict` DLQ entry for the colliding row and roll the
 /// whole group back. Returns `Ok(())` so the caller skips emitting this
 /// group's rows.
-#[allow(clippy::too_many_arguments)]
 fn dlq_group_conflict(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
-    rule_a: &str,
-    rule_b: &str,
-    field: &str,
-    record: &Record,
-    row_num: u64,
+    conflict: &MutationConflict,
 ) -> Result<(), PipelineError> {
+    let MutationConflict {
+        rule_a,
+        rule_b,
+        field,
+        record,
+        row_num,
+    } = conflict;
     let stage = stage_reshape_mutation_conflict(node_name, rule_a, rule_b);
     let source_name = source_name_arc_of(record);
     push_dlq(
         ctx,
         DlqEntry {
-            source_row: row_num,
+            source_row: *row_num,
             category: DlqErrorCategory::MutationConflict,
             error_message: format!(
                 "reshape {node_name:?}: rules {rule_a:?} and {rule_b:?} both write field \
@@ -309,7 +309,7 @@ fn dlq_group_conflict(
             route: None,
             trigger: true,
             source_name,
-            triggering_field: Some(Arc::from(field)),
+            triggering_field: Some(Arc::from(field.as_str())),
             triggering_value: None,
         },
     )
