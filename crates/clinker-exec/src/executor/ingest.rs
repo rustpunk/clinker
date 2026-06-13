@@ -5,6 +5,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use clinker_format::ReopenableSource;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
@@ -23,19 +24,25 @@ use clinker_format::xml::reader::{
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
-/// Build a format-specific reader from input config and raw reader.
+/// Build a format-specific reader from input config and a re-openable source.
 ///
-/// Dispatches on `InputFormat` to construct the correct reader type.
-/// Returns `Box<dyn FormatReader>` — all downstream code uses trait methods
-/// (`schema()`, `next_record()`).
+/// Dispatches on `InputFormat` to construct the correct reader type. The JSON
+/// arm threads the [`ReopenableSource`] straight through so its envelope
+/// pre-scan and body stream each open a fresh `Read` without buffering the
+/// whole file; every other (one-pass) format opens the source once and streams
+/// that single `Read`. Returns `Box<dyn FormatReader>` — all downstream code
+/// uses trait methods (`schema()`, `next_record()`).
 fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
-    reader: Box<dyn Read + Send>,
+    source: ReopenableSource,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     match &input.format {
         clinker_plan::config::InputFormat::Csv(opts) => {
             let config = build_csv_reader_config(opts.as_ref());
-            Ok(Box::new(CsvReader::from_reader(reader, config)))
+            Ok(Box::new(CsvReader::from_reader(
+                open_one_shot(&source)?,
+                config,
+            )))
         }
         clinker_plan::config::InputFormat::Json(opts) => {
             let config = build_json_reader_config(
@@ -43,7 +50,7 @@ fn build_format_reader(
                 input.array_paths.as_deref(),
                 &input.declared_doc_paths,
             );
-            Ok(Box::new(JsonReader::from_reader(reader, config)?))
+            Ok(Box::new(JsonReader::from_source(source, config)?))
         }
         clinker_plan::config::InputFormat::Xml(opts) => {
             let config = build_xml_reader_config(
@@ -51,30 +58,47 @@ fn build_format_reader(
                 input.array_paths.as_deref(),
                 &input.declared_doc_paths,
             );
-            Ok(Box::new(XmlReader::new(reader, config)?))
+            Ok(Box::new(XmlReader::new(open_one_shot(&source)?, config)?))
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => {
             let fields = extract_field_defs(input)?;
             let config = build_fw_reader_config(opts.as_ref());
-            Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
+            Ok(Box::new(FixedWidthReader::new(
+                open_one_shot(&source)?,
+                fields,
+                config,
+            )?))
         }
         clinker_plan::config::InputFormat::Edifact(opts) => {
             let config = build_edifact_reader_config(opts.as_ref());
-            Ok(Box::new(EdifactReader::new(reader, config)))
+            Ok(Box::new(EdifactReader::new(
+                open_one_shot(&source)?,
+                config,
+            )))
         }
         clinker_plan::config::InputFormat::X12(opts) => {
             let config = build_x12_reader_config(opts.as_ref())?;
-            Ok(Box::new(X12Reader::new(reader, config)))
+            Ok(Box::new(X12Reader::new(open_one_shot(&source)?, config)))
         }
         clinker_plan::config::InputFormat::Hl7(opts) => {
             let config = build_hl7_reader_config(opts.as_ref());
-            Ok(Box::new(Hl7Reader::new(reader, config)))
+            Ok(Box::new(Hl7Reader::new(open_one_shot(&source)?, config)))
         }
         clinker_plan::config::InputFormat::Swift(opts) => {
             let config = build_swift_reader_config(opts.as_ref());
-            Ok(Box::new(SwiftReader::new(reader, config)))
+            Ok(Box::new(SwiftReader::new(open_one_shot(&source)?, config)))
         }
     }
+}
+
+/// Open a single `Read` from a re-openable source for a one-pass format reader,
+/// mapping an open failure to a pipeline config-validation error.
+fn open_one_shot(source: &ReopenableSource) -> Result<Box<dyn Read + Send>, PipelineError> {
+    source.open().map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "failed to open source bytes: {e}"
+        )))
+    })
 }
 
 /// Build a [`MultiFileFormatReader`] wrapping every file the discovery
@@ -94,10 +118,10 @@ fn build_multi_file_reader(
     // boundary intact.
     let owned_config = input.clone();
     let factory: Box<FactoryFn> = Box::new(
-        move |reader: Box<dyn Read + Send>,
+        move |source: ReopenableSource,
               _idx: usize|
               -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
-            build_format_reader(&owned_config, reader).map_err(|e| {
+            build_format_reader(&owned_config, source).map_err(|e| {
                 clinker_format::FormatError::SchemaInference(format!(
                     "format reader construction failed: {e}"
                 ))

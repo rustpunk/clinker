@@ -9,6 +9,7 @@ pub mod fixed_width;
 pub mod hl7;
 pub mod json;
 pub(crate) mod segment_tokenizer;
+pub mod source;
 pub mod splitting;
 pub mod swift;
 pub mod traits;
@@ -22,4 +23,5 @@ pub use envelope::{
     NestedEnvelopeSection,
 };
 pub use error::FormatError;
+pub use source::ReopenableSource;
 pub use traits::{FormatReader, FormatWriter};

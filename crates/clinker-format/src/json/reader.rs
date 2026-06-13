@@ -1,29 +1,26 @@
 //! Streaming JSON reader with auto-detect (array/NDJSON/object), schema inference,
 //! nested flattening, and array_paths explode/join.
 //!
-//! **All modes stream with O(1 record) memory:**
-//! - NDJSON: line-by-line from BufReader.
-//! - Array: `visit_seq` via DeserializeSeed — one element at a time.
-//! - record_path: `DeserializeSeed` + `IgnoredAny` navigates to the target
-//!   path, skipping non-matching keys without allocation, then streams the
-//!   array. Total memory: ~10KB buffer + one record.
+//! **All modes stream with O(1 record) memory, with no whole-file buffer held
+//! for a re-openable (file) source:**
+//! - NDJSON: line-by-line from a freshly re-opened `BufReader`.
+//! - Array / record_path: a [`JsonArrayStream`] navigates to the target array
+//!   over a second freshly re-opened reader and yields one element at a time —
+//!   never collecting the array into a `Vec`.
 //!
-//! Envelope-aware sources run a streaming pre-scan over the document
-//! before any body record emits: it walks the JSON once, deserializing
-//! ONLY the subtrees the declared `$doc.*` paths name (every other key is
-//! parsed-and-skipped via `IgnoredAny`) into a path-pruned arena index
-//! capped by `max_index_bytes`, rather than materializing the whole
-//! document tree. The pre-scan reads from a fresh cursor over the shared
-//! source buffer, so it does not consume body iteration.
-//!
-//! The source buffer itself is still a full `read_to_end` at construction
-//! — it backs both the body parser's cursor and the pre-scan's cursor, so
-//! there is one read from disk regardless of envelope declarations. Only
-//! the pre-scan's parsed-tree materialization is removed here; shrinking
-//! the raw byte buffer for purely-streamable bodies is a separate
-//! follow-up.
+//! Envelope-aware sources run a streaming pre-scan over the document before any
+//! body record emits: it walks the JSON once over its own freshly re-opened
+//! reader, deserializing ONLY the subtrees the declared `$doc.*` paths name
+//! (every other key is parsed-and-skipped via `IgnoredAny`) into a path-pruned
+//! arena index capped by `max_index_bytes`, rather than materializing the whole
+//! document tree. The pre-scan and the body each open their own [`Read`] from
+//! the [`ReopenableSource`], so neither consumes the other and no shared
+//! whole-file byte buffer is retained for file-backed inputs. A pathless input
+//! (a test cursor, the `<inline>`/`<empty>` slot, a REST body) is held as a
+//! small `ReopenableSource::Buffered` — the honest one-shot fallback, bounded
+//! because such inputs are small by construction.
 
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use clinker_record::{
@@ -39,7 +36,9 @@ use crate::bom::UTF8_BOM;
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::FormatError;
+use crate::json::body_stream::{JsonArrayStream, is_json_ws};
 use crate::json::streaming::{SectionTarget, extract_sections};
+use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 
 // ── Public config types ──────────────────────────────────────────────
@@ -89,82 +88,134 @@ pub struct JsonReader {
     schema: Option<Arc<Schema>>,
     config: JsonReaderConfig,
     pending: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Buffered source bytes shared with the envelope pre-scan. The body
-    /// parser drains a cursor over these bytes; `prepare_document` opens a
-    /// fresh cursor over the same bytes and streams a single
-    /// `DeserializeSeed` pass that retains only declared `$doc.*` subtrees,
-    /// rather than re-parsing the whole document tree.
-    raw_bytes: Arc<[u8]>,
+    /// The re-openable byte source. Body iteration and the envelope pre-scan
+    /// each open their own fresh [`Read`] from it, so no whole-file buffer is
+    /// held for a file-backed (`ReopenableSource::Path`) source.
+    source: ReopenableSource,
+    /// Content identity of the bytes the body open read, captured at
+    /// construction. The envelope pre-scan re-opens the source and confirms it
+    /// sees the same content, so a path-backed input rewritten between the two
+    /// passes fails loud instead of splicing a stale envelope onto a new body.
+    body_identity: SourceIdentity,
 }
 
 enum InnerReader {
-    /// NDJSON: line-by-line. O(1 record) memory.
+    /// NDJSON: line-by-line from a re-opened `BufReader`. O(1 record) memory.
     Ndjson {
         reader: BufReader<Box<dyn Read + Send>>,
         line_buf: String,
     },
-    /// Array or record_path: records collected via streaming DeserializeSeed.
-    /// Elements are deserialized one at a time and pushed to a Vec during the
-    /// single-pass `deserialize` call, then yielded lazily via `pos`.
-    Collected {
-        records: Vec<serde_json::Value>,
-        pos: usize,
-    },
-    /// Exhausted.
+    /// Array or record_path: one element at a time from a lazy
+    /// [`JsonArrayStream`] over a re-opened reader. Never collects the array.
+    Array(JsonArrayStream),
+    /// Exhausted (empty document).
     Done,
 }
 
 impl JsonReader {
-    pub fn from_reader<R: Read + Send + 'static>(
-        mut reader: R,
+    /// Build a reader over a re-openable byte source.
+    ///
+    /// Streaming, O(1 record): the body opens one fresh [`Read`] from `source`
+    /// (and the envelope pre-scan opens a second), so a file-backed source is
+    /// never buffered whole. Auto-detect peeks the first non-whitespace byte
+    /// from a fresh open to choose array vs. NDJSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError`] if the source cannot be opened, the first byte
+    /// is not a valid JSON start, or `format: object` is set without a
+    /// `record_path`.
+    pub fn from_source(
+        source: ReopenableSource,
         config: JsonReaderConfig,
     ) -> Result<Self, FormatError> {
-        let mut bytes_vec = Vec::new();
-        reader.read_to_end(&mut bytes_vec)?;
-        // Strip a single leading UTF-8 BOM once at the source. `raw_bytes`
-        // feeds every JSON path — array/object auto-detect, the NDJSON
-        // line scan, and the envelope pre-scan's `serde_json::from_slice`
-        // — so one strip here clears the marker from all of them.
-        if bytes_vec.starts_with(&UTF8_BOM) {
-            bytes_vec.drain(..UTF8_BOM.len());
-        }
-        let raw_bytes: Arc<[u8]> = Arc::from(bytes_vec);
-        let body_cursor: Box<dyn Read + Send> = Box::new(Cursor::new(Arc::clone(&raw_bytes)));
-        let mut buf = BufReader::new(body_cursor);
-        let inner = Self::init(&mut buf, &config)?;
+        // JSON runs two passes (envelope pre-scan + body stream), so the source
+        // must be re-openable. A `Path`/`Buffered` source passes through; a
+        // pathless `OneShot` is buffered here, on the reader-building thread —
+        // bounded because such inputs are small.
+        let source = source.into_reopenable().map_err(FormatError::Io)?;
+        let (inner, body_identity) = Self::init(&source, &config)?;
         Ok(JsonReader {
             inner,
             schema: None,
             config,
             pending: Vec::new(),
-            raw_bytes,
+            source,
+            body_identity,
         })
     }
 
+    /// Build a reader by buffering a one-shot `Read` into a re-openable source.
+    ///
+    /// For pathless inputs (test cursors, the `<inline>`/`<empty>` slots, REST
+    /// bodies) that have no on-disk path to re-open: the bytes are captured
+    /// once into a small `ReopenableSource::Buffered`. Bounded because such
+    /// inputs are small by construction; file-backed sources use
+    /// [`from_source`](Self::from_source) with `ReopenableSource::Path` instead
+    /// and are never buffered whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError`] on a read failure or the same parse errors as
+    /// [`from_source`](Self::from_source).
+    pub fn from_reader<R: Read + Send + 'static>(
+        reader: R,
+        config: JsonReaderConfig,
+    ) -> Result<Self, FormatError> {
+        let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
+        Self::from_source(source, config)
+    }
+
+    /// Open a fresh `BufReader` from the source with a leading UTF-8 BOM
+    /// stripped, returning the content-identity snapshot of the bytes it reads.
+    /// Each pass (body, pre-scan) re-opens, so the strip happens per open rather
+    /// than once over a shared buffer; the identity lets a later pass detect the
+    /// input changing between passes.
+    fn open_buf(
+        source: &ReopenableSource,
+    ) -> Result<(BufReader<Box<dyn Read + Send>>, SourceIdentity), FormatError> {
+        let (reader, identity) = source.open_with_identity().map_err(FormatError::Io)?;
+        let mut buf = BufReader::new(reader);
+        strip_leading_bom(&mut buf)?;
+        Ok((buf, identity))
+    }
+
+    /// Build the body reader and return it alongside the content-identity of
+    /// the bytes it opened, so the envelope pre-scan can verify it re-opens the
+    /// same content.
     fn init(
-        buf: &mut BufReader<Box<dyn Read + Send>>,
+        source: &ReopenableSource,
         config: &JsonReaderConfig,
-    ) -> Result<InnerReader, FormatError> {
-        // record_path → streaming DeserializeSeed navigation
+    ) -> Result<(InnerReader, SourceIdentity), FormatError> {
+        // record_path → navigate then stream the named array lazily.
         if let Some(ref rp) = config.record_path {
             let path_segments: Vec<String> = rp.split('.').map(String::from).collect();
-            let records = stream_path_array(buf, &path_segments)?;
-            return Ok(InnerReader::Collected { records, pos: 0 });
+            let (buf, identity) = Self::open_buf(source)?;
+            return Ok((
+                InnerReader::Array(JsonArrayStream::at_path(buf, &path_segments)?),
+                identity,
+            ));
         }
 
-        // Explicit format
+        // Explicit format.
         if let Some(mode) = config.format {
             return match mode {
                 JsonMode::Array => {
-                    let records = stream_top_level_array(buf)?;
-                    Ok(InnerReader::Collected { records, pos: 0 })
+                    let (buf, identity) = Self::open_buf(source)?;
+                    Ok((
+                        InnerReader::Array(JsonArrayStream::top_level(buf)?),
+                        identity,
+                    ))
                 }
                 JsonMode::Ndjson => {
-                    let owned = std::mem::replace(buf, BufReader::new(Box::new(std::io::empty())));
-                    Ok(InnerReader::Ndjson {
-                        reader: owned,
-                        line_buf: String::new(),
-                    })
+                    let (reader, identity) = Self::open_buf(source)?;
+                    Ok((
+                        InnerReader::Ndjson {
+                            reader,
+                            line_buf: String::new(),
+                        },
+                        identity,
+                    ))
                 }
                 JsonMode::Object => Err(FormatError::Json(
                     "format: object requires record_path".into(),
@@ -172,39 +223,28 @@ impl JsonReader {
             };
         }
 
-        // Auto-detect
-        let first = peek_first_byte(buf)?;
-        match first {
-            Some(b'[') => {
-                let records = stream_top_level_array(buf)?;
-                Ok(InnerReader::Collected { records, pos: 0 })
+        // Auto-detect from the first non-whitespace byte.
+        let (mut buf, identity) = Self::open_buf(source)?;
+        let inner = match peek_first_byte(&mut buf)? {
+            Some(b'[') => InnerReader::Array(JsonArrayStream::top_level(buf)?),
+            Some(b'{') => InnerReader::Ndjson {
+                reader: buf,
+                line_buf: String::new(),
+            },
+            Some(b) => {
+                return Err(FormatError::Json(format!(
+                    "cannot auto-detect: unexpected byte '{}' (0x{b:02x})",
+                    b as char
+                )));
             }
-            Some(b'{') => {
-                let owned = std::mem::replace(buf, BufReader::new(Box::new(std::io::empty())));
-                Ok(InnerReader::Ndjson {
-                    reader: owned,
-                    line_buf: String::new(),
-                })
-            }
-            Some(b) => Err(FormatError::Json(format!(
-                "cannot auto-detect: unexpected byte '{}' (0x{b:02x})",
-                b as char
-            ))),
-            None => Ok(InnerReader::Done),
-        }
+            None => InnerReader::Done,
+        };
+        Ok((inner, identity))
     }
 
     fn next_raw(&mut self) -> Result<Option<serde_json::Value>, FormatError> {
         match &mut self.inner {
-            InnerReader::Collected { records, pos } => {
-                if *pos < records.len() {
-                    let v = records[*pos].clone();
-                    *pos += 1;
-                    Ok(Some(v))
-                } else {
-                    Ok(None)
-                }
-            }
+            InnerReader::Array(stream) => stream.next(),
             InnerReader::Ndjson { reader, line_buf } => loop {
                 line_buf.clear();
                 let n = reader.read_line(line_buf).map_err(FormatError::Io)?;
@@ -382,13 +422,30 @@ impl FormatReader for JsonReader {
             targets.push(SectionTarget::new(name.clone(), pointer));
         }
 
-        // Single streaming pass over a fresh cursor: only the matched
-        // subtrees are built; every other key is parsed-and-skipped. The cap
-        // is charged *as each declared section is constructed*, so an
+        // Single streaming pass over a freshly re-opened reader: only the
+        // matched subtrees are built; every other key is parsed-and-skipped.
+        // The cap is charged *as each declared section is constructed*, so an
         // oversized declared section aborts the parse mid-build rather than
-        // after the whole subtree materializes. Body iteration keeps its own
-        // independent cursor over `raw_bytes`.
-        let mut prescan = BufReader::new(Cursor::new(Arc::clone(&self.raw_bytes)));
+        // after the whole subtree materializes. Body iteration opens its own
+        // independent reader, so this pass does not consume it and no shared
+        // whole-file buffer is held.
+        //
+        // Confirm the pre-scan re-opens the same content the body opened. A
+        // path-backed input replaced or truncated between the two opens (an
+        // external producer re-emitting mid-run) would otherwise splice this
+        // envelope onto a body parsed from different bytes; the `(len, mtime)`
+        // identity check fails loud instead.
+        //
+        // This is a cheap courtesy guard under the finite-batch input-stability
+        // contract, not a fingerprint: it does not detect a same-length,
+        // same-mtime-tick in-place rewrite, nor a rewrite landing after this
+        // point while the body streams lazily through `next_record` (the check
+        // runs once, here). Closing those would require hashing the whole file,
+        // reintroducing the buffer this reader removes. See `SourceIdentity`.
+        let (mut prescan, prescan_identity) = Self::open_buf(&self.source)?;
+        prescan_identity
+            .ensure_matches(&self.body_identity)
+            .map_err(FormatError::Io)?;
         let matched = extract_sections(&mut prescan, &targets, self.config.max_index_bytes)?;
 
         // Coerce each matched subtree to its declared field schema and retain
@@ -475,132 +532,6 @@ impl FormatReader for JsonReader {
             return Ok(Some(record));
         }
     }
-}
-
-// ── Streaming DeserializeSeed for path navigation ────────────────────
-//
-// These types use serde's Deserializer API to navigate through a JSON
-// object tree without buffering. Non-matching keys are skipped via
-// `IgnoredAny` which parses but discards values (zero allocation).
-// At the target path, array elements are deserialized one at a time
-// as `serde_json::Value` and collected into a Vec.
-
-use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-
-/// Navigate to a nested path, then collect array elements.
-/// Memory: O(N elements) for the collected results, but each element is
-/// deserialized individually (not buffered as a raw tree of the whole file).
-struct PathNavigator<'a> {
-    path: &'a [String],
-    results: &'a mut Vec<serde_json::Value>,
-}
-
-impl<'de, 'a> DeserializeSeed<'de> for PathNavigator<'a> {
-    type Value = ();
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        if self.path.is_empty() {
-            // Arrived at target — stream the array
-            deserializer.deserialize_seq(ArrayCollector {
-                results: self.results,
-            })
-        } else {
-            // Navigate one level deeper
-            deserializer.deserialize_map(ObjectNavigator {
-                target_key: &self.path[0],
-                remaining: &self.path[1..],
-                results: self.results,
-            })
-        }
-    }
-}
-
-struct ObjectNavigator<'a> {
-    target_key: &'a str,
-    remaining: &'a [String],
-    results: &'a mut Vec<serde_json::Value>,
-}
-
-impl<'de, 'a> Visitor<'de> for ObjectNavigator<'a> {
-    type Value = ();
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "an object containing key '{}'", self.target_key)
-    }
-
-    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
-        while let Some(key) = map.next_key::<String>()? {
-            if key == self.target_key {
-                // Found target key — descend into its value
-                map.next_value_seed(PathNavigator {
-                    path: self.remaining,
-                    results: self.results,
-                })?;
-                // Skip remaining keys in this object
-                while (map.next_key::<IgnoredAny>()?).is_some() {
-                    map.next_value::<IgnoredAny>()?;
-                }
-                return Ok(());
-            } else {
-                // Skip this key's value entirely — zero allocation
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        Err(de::Error::custom(format!(
-            "key '{}' not found",
-            self.target_key
-        )))
-    }
-}
-
-struct ArrayCollector<'a> {
-    results: &'a mut Vec<serde_json::Value>,
-}
-
-impl<'de, 'a> Visitor<'de> for ArrayCollector<'a> {
-    type Value = ();
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("an array of records")
-    }
-
-    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
-        while let Some(element) = seq.next_element::<serde_json::Value>()? {
-            self.results.push(element);
-        }
-        Ok(())
-    }
-}
-
-/// Stream array elements from a nested path using DeserializeSeed.
-/// Navigates to the path via `IgnoredAny` (zero-alloc skip), then
-/// deserializes each array element individually.
-fn stream_path_array(
-    reader: &mut BufReader<Box<dyn Read + Send>>,
-    path: &[String],
-) -> Result<Vec<serde_json::Value>, FormatError> {
-    let mut results = Vec::new();
-    let mut de = serde_json::Deserializer::from_reader(reader);
-    PathNavigator {
-        path,
-        results: &mut results,
-    }
-    .deserialize(&mut de)
-    .map_err(|e| FormatError::Json(e.to_string()))?;
-    Ok(results)
-}
-
-/// Stream elements from a top-level JSON array using DeserializeSeed.
-fn stream_top_level_array(
-    reader: &mut BufReader<Box<dyn Read + Send>>,
-) -> Result<Vec<serde_json::Value>, FormatError> {
-    let mut results = Vec::new();
-    let mut de = serde_json::Deserializer::from_reader(reader);
-    de.deserialize_seq(ArrayCollector {
-        results: &mut results,
-    })
-    .map_err(|e| FormatError::Json(e.to_string()))?;
-    Ok(results)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -706,12 +637,30 @@ fn peek_first_byte(
         if buf.is_empty() {
             return Ok(None);
         }
-        if let Some(pos) = buf.iter().position(|b| !b.is_ascii_whitespace()) {
+        // RFC 8259 whitespace only, so a leading form-feed before the value is
+        // a structural byte the auto-detect rejects, not silently skipped —
+        // matching `serde_json` and the body scanner.
+        if let Some(pos) = buf.iter().position(|b| !is_json_ws(*b)) {
             return Ok(Some(buf[pos]));
         }
         let len = buf.len();
         reader.consume(len);
     }
+}
+
+/// Consume a single leading UTF-8 BOM from a freshly opened reader, if present.
+///
+/// Each pass re-opens its own `Read`, so a Windows-authored file (Excel /
+/// PowerShell utf8 export) carries the BOM on every open; stripping it here
+/// clears the marker for body iteration, the NDJSON line scan, and the
+/// envelope pre-scan alike. The `BufReader`'s default capacity exceeds the
+/// 3-byte BOM, so the marker is always wholly inside the first fill.
+fn strip_leading_bom(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<(), FormatError> {
+    let buf = reader.fill_buf().map_err(FormatError::Io)?;
+    if buf.starts_with(&UTF8_BOM) {
+        reader.consume(UTF8_BOM.len());
+    }
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1031,9 +980,9 @@ mod tests {
 
     #[test]
     fn test_json_envelope_prescan_strips_leading_bom() {
-        // The envelope pre-scan streams `raw_bytes` from a fresh cursor;
-        // the source-level strip must clear the BOM for that path too, not
-        // just body iteration.
+        // The envelope pre-scan re-opens its own reader from the source; the
+        // per-open BOM strip must clear the marker for that path too, not just
+        // body iteration.
         let json = r#"{
             "BatchInfo": {"batch_id": "RUN-001", "count": 42},
             "records": [{"x": 1}, {"x": 2}]

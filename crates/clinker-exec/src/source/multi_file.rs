@@ -1,9 +1,10 @@
 //! Multi-file streaming reader.
 //!
-//! [`MultiFileFormatReader`] sequences a list of `(PathBuf, Box<dyn Read>)`
-//! files through a per-file format reader factory, presenting them as a
-//! single [`FormatReader`] stream to the executor. Each inner reader is
-//! built fresh per file via the supplied factory closure.
+//! [`MultiFileFormatReader`] sequences a list of [`FileSlot`]s (each a
+//! provenance path plus a re-openable byte source) through a per-file format
+//! reader factory, presenting them as a single [`FormatReader`] stream to the
+//! executor. Each inner reader is built fresh per file via the supplied factory
+//! closure.
 //!
 //! Per-format concat-safety:
 //! - **CSV** with `has_header: true` — every inner CsvReader independently
@@ -26,43 +27,60 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clinker_format::{FormatError, FormatReader};
+use clinker_format::{FormatError, FormatReader, ReopenableSource};
 use clinker_record::{Record, Schema};
 
-/// Closure that builds a [`FormatReader`] from a single file's bytes.
+/// Closure that builds a [`FormatReader`] from a single file's re-openable
+/// byte source.
+///
+/// The factory receives a [`ReopenableSource`] rather than a one-shot
+/// `Box<dyn Read>` so a reader needing multiple passes (JSON's envelope
+/// pre-scan plus its body stream) can open the source twice without buffering
+/// the whole file. One-pass formats (CSV, fixed-width, XML, EDI) open it once
+/// and ignore the re-open capability.
 ///
 /// `file_index` lets the factory differentiate the first file from
 /// subsequent files when format-specific bookkeeping requires it
 /// (currently unused — every format builds the same way per file).
 pub type FactoryFn =
-    dyn FnMut(Box<dyn Read + Send>, usize) -> Result<Box<dyn FormatReader>, FormatError> + Send;
+    dyn FnMut(ReopenableSource, usize) -> Result<Box<dyn FormatReader>, FormatError> + Send;
 
 /// One file slot in the multi-file stream.
+///
+/// `path` is the record-stamping provenance identity (`$source.file`), which
+/// for a staged source is the *original* matched path. `source` is the
+/// re-openable handle on the actual bytes the reader streams — for a staged
+/// source, the content-addressed staged copy, distinct from `path`.
 pub struct FileSlot {
     pub path: PathBuf,
-    pub reader: Box<dyn Read + Send>,
+    pub source: ReopenableSource,
 }
 
 impl FileSlot {
-    /// Convenience: wrap an open `Read` handle plus its path into a slot.
+    /// Wrap a one-shot `Read` handle plus its path into a slot.
+    ///
+    /// For in-memory inputs (test/bench cursors, the `<empty>` slot) that have
+    /// no on-disk path to re-open: the reader is held lazily as a
+    /// `ReopenableSource::OneShot` and streamed directly by a one-pass format,
+    /// so a paced/slow reader keeps its per-row timing and nothing is read at
+    /// slot construction. A multi-pass reader (JSON) buffers it on demand.
+    /// File-backed production sources use [`from_path`](Self::from_path)
+    /// instead, which re-opens by path and never buffers the file whole.
     pub fn new(path: impl Into<PathBuf>, reader: Box<dyn Read + Send>) -> Self {
         Self {
             path: path.into(),
-            reader,
+            source: ReopenableSource::one_shot(reader),
         }
     }
-}
 
-/// Wrap a single `Read` handle as a one-element file list. The path is
-/// `"<inline>"` — used by tests and benchmarks that hand the executor
-/// in-memory cursors with no real on-disk path. Production callers
-/// should construct `FileSlot` directly with the real path so
-/// `$source.file` carries it through to records.
-impl From<Box<dyn Read + Send>> for FileSlot {
-    fn from(reader: Box<dyn Read + Send>) -> Self {
+    /// Build a slot for a file-backed source: `provenance` is the originating
+    /// path stamped on records (`$source.file`), `read_path` is the stable
+    /// (staged) path the reader re-opens. The reader opens `read_path` fresh
+    /// per pass — no whole-file buffer is held.
+    pub fn from_path(provenance: impl Into<PathBuf>, read_path: impl Into<PathBuf>) -> Self {
         Self {
-            path: PathBuf::from("<inline>"),
-            reader,
+            path: provenance.into(),
+            source: ReopenableSource::path(read_path),
         }
     }
 }
@@ -137,12 +155,12 @@ impl MultiFileFormatReader {
             &mut self.files[idx],
             FileSlot {
                 path: PathBuf::new(),
-                reader: Box::new(std::io::empty()),
+                source: ReopenableSource::one_shot(Box::new(std::io::empty())),
             },
         );
         self.current_file = Arc::from(slot.path.to_string_lossy().into_owned());
         self.cursor += 1;
-        let reader = (self.factory)(slot.reader, idx)?;
+        let reader = (self.factory)(slot.source, idx)?;
         self.active = Some(reader);
         Ok(true)
     }
@@ -258,17 +276,18 @@ mod tests {
     use super::*;
     use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 
-    fn cursor(s: &str) -> Box<dyn Read + Send> {
-        Box::new(std::io::Cursor::new(s.to_string().into_bytes()))
+    fn slot(path: &str, s: &str) -> FileSlot {
+        FileSlot::new(
+            PathBuf::from(path),
+            Box::new(std::io::Cursor::new(s.to_string().into_bytes())),
+        )
     }
 
     fn csv_factory() -> Box<FactoryFn> {
         Box::new(
-            |reader: Box<dyn Read + Send>,
-             _idx: usize|
-             -> Result<Box<dyn FormatReader>, FormatError> {
+            |source: ReopenableSource, _idx: usize| -> Result<Box<dyn FormatReader>, FormatError> {
                 Ok(Box::new(CsvReader::from_reader(
-                    reader,
+                    source.open()?,
                     CsvReaderConfig::default(),
                 )))
             },
@@ -278,14 +297,8 @@ mod tests {
     #[test]
     fn streams_records_across_two_csv_files() {
         let files = vec![
-            FileSlot {
-                path: PathBuf::from("a.csv"),
-                reader: cursor("id,name\n1,alice\n2,bob\n"),
-            },
-            FileSlot {
-                path: PathBuf::from("b.csv"),
-                reader: cursor("id,name\n3,carol\n"),
-            },
+            slot("a.csv", "id,name\n1,alice\n2,bob\n"),
+            slot("b.csv", "id,name\n3,carol\n"),
         ];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let _ = r.schema().unwrap();
@@ -299,14 +312,8 @@ mod tests {
     #[test]
     fn current_file_updates_across_boundary() {
         let files = vec![
-            FileSlot {
-                path: PathBuf::from("a.csv"),
-                reader: cursor("id,name\n1,alice\n"),
-            },
-            FileSlot {
-                path: PathBuf::from("b.csv"),
-                reader: cursor("id,name\n2,bob\n"),
-            },
+            slot("a.csv", "id,name\n1,alice\n"),
+            slot("b.csv", "id,name\n2,bob\n"),
         ];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         r.next_record().unwrap();
@@ -320,14 +327,8 @@ mod tests {
     #[test]
     fn schema_mismatch_across_files_is_rejected() {
         let files = vec![
-            FileSlot {
-                path: PathBuf::from("a.csv"),
-                reader: cursor("id,name\n1,alice\n"),
-            },
-            FileSlot {
-                path: PathBuf::from("b.csv"),
-                reader: cursor("id,price\n2,9.99\n"),
-            },
+            slot("a.csv", "id,name\n1,alice\n"),
+            slot("b.csv", "id,price\n2,9.99\n"),
         ];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let _ = r.schema().unwrap();
@@ -344,10 +345,7 @@ mod tests {
 
     #[test]
     fn single_file_streams_unchanged() {
-        let files = vec![FileSlot {
-            path: PathBuf::from("only.csv"),
-            reader: cursor("id\n1\n2\n3\n"),
-        }];
+        let files = vec![slot("only.csv", "id\n1\n2\n3\n")];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let _ = r.schema().unwrap();
         let mut count = 0;
@@ -360,14 +358,8 @@ mod tests {
     #[test]
     fn schema_is_cached_from_first_file() {
         let files = vec![
-            FileSlot {
-                path: PathBuf::from("a.csv"),
-                reader: cursor("id,name\n1,alice\n"),
-            },
-            FileSlot {
-                path: PathBuf::from("b.csv"),
-                reader: cursor("id,name\n2,bob\n"),
-            },
+            slot("a.csv", "id,name\n1,alice\n"),
+            slot("b.csv", "id,name\n2,bob\n"),
         ];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let s1 = r.schema().unwrap();
