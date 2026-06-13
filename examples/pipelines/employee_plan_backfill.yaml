@@ -1,0 +1,94 @@
+# Employee plan backfill, then cull the groups that need manual review.
+#
+# Stage 1 (Reshape): per employee (`employee_id` is the correlation group), a
+# plan row whose coverage window runs longer than one fiscal year
+# (`plan_start - plan_end > 365`) is an un-split SCD record. Reshape MUTATES
+# that trigger row to close its window at the start boundary and SYNTHESIZES a
+# continuation row marked `status=synthesized`.
+#
+# Stage 2 (Cull): after backfill, employees with a large plan history are
+# flagged for manual review. Cull groups the backfilled rows by `employee_id`
+# again and routes the WHOLE group of any employee with more than three plan
+# rows to the `review` side-output port; every other employee flows to the
+# main output. `removed_to` is a first-class producer-side output port (not the
+# dead-letter queue): the removed rows are valid records deliberately
+# partitioned onto a second audit stream.
+#
+# Both Reshape and Cull are blocking, grouped operators governed by the engine
+# memory budget — they spill their per-group buffers to disk under pressure and
+# re-run on reload, so the result is identical whether a group stayed resident
+# or round-tripped through disk.
+pipeline:
+  name: employee_plan_backfill
+
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: ./data/employee_plans.csv
+      options:
+        has_header: true
+      schema:
+        - { name: employee_id, type: string }
+        - { name: plan_start, type: int }
+        - { name: plan_end, type: int }
+        - { name: status, type: string }
+
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      order_by:
+        - { field: plan_start, order: asc }
+      rules:
+        - name: split_long_plan
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              # Close the over-long window at its start boundary.
+              plan_end: "plan_start"
+          synthesize:
+            copy_from: trigger
+            overrides:
+              status: "'synthesized'"
+
+  - type: cull
+    name: flag_large_histories
+    input: backfill
+    config:
+      partition_by: [employee_id]
+      # The side-output port name. Downstream nodes draw removed rows by
+      # referencing `flag_large_histories.review`.
+      removed_to: review
+      rules:
+        # An employee with more than three plan rows after backfill is routed
+        # to manual review. CXL's bare aggregates are sum/count/min/max/avg/
+        # collect, so the group-level predicate is `count(*) > 3` (there is no
+        # bare `any()` aggregate — express "any row matches" as
+        # `sum(if <cond> then 1 else 0) > 0`).
+        - name: too_many_plans
+          drop_group_when: "count(*) > 3"
+
+  # Main output: employees with a manageable plan history.
+  - type: output
+    name: out
+    input: flag_large_histories
+    config:
+      name: out
+      type: csv
+      path: ./output/employee_plans_clean.csv
+
+  # Side output: employees flagged for manual review.
+  - type: output
+    name: review
+    input: flag_large_histories.review
+    config:
+      name: review
+      type: csv
+      path: ./output/employee_plans_review.csv
+
+error_handling:
+  strategy: continue

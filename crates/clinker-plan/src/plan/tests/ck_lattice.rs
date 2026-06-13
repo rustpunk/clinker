@@ -966,6 +966,7 @@ fn assert_every_node_has_properties(plan: &crate::plan::execution::ExecutionPlan
                 PlanNode::Combine { .. } => "combine",
                 PlanNode::Output { .. } => "output",
                 PlanNode::Reshape { .. } => "reshape",
+                PlanNode::Cull { .. } => "cull",
                 PlanNode::Composition { .. } => "composition",
                 PlanNode::CorrelationCommit { .. } => "correlation_commit",
             }

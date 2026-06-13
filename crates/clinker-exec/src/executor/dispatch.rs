@@ -2708,6 +2708,10 @@ pub(crate) fn dispatch_plan_node(
             crate::executor::reshape_dispatch::dispatch_reshape(ctx, current_dag, node_idx, &node)?;
         }
 
+        PlanNode::Cull { .. } => {
+            crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)?;
+        }
+
         PlanNode::Composition { .. } => {
             crate::executor::composition_dispatch::dispatch_composition(
                 ctx,

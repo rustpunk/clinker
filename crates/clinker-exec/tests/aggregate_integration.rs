@@ -883,3 +883,61 @@ nodes:
         "expected aggregate-rejects-scope-emit diagnostic, got:\n{combined}",
     );
 }
+
+#[test]
+fn test_e2e_aggregate_emit_comparison_residual() {
+    // An aggregate `emit` whose value is an ordered comparison over an
+    // aggregate — `count(*) > 1` (numeric) and `max(name) > 'M'` (string).
+    // These exercise the aggregate emit-residual evaluator's ordered
+    // comparison, the same code path a Cull `drop_group_when` uses, so the
+    // result means the same thing here as `>` does in a Transform.
+    let yaml = r#"
+pipeline:
+  name: agg_compare_residual
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: team, type: string }
+      - { name: name, type: string }
+- type: aggregate
+  name: by_team
+  input: src
+  config:
+    group_by:
+    - team
+    cxl: 'emit team = team
+
+      emit multiple = count(*) > 1
+
+      emit late_name = max(name) > ''M''
+
+      '
+- type: output
+  name: out
+  input: by_team
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+    // team alpha: Alice, Bob → count 2 (>1 true), max 'Bob' (< 'M', false).
+    // team zeta: Zoe → count 1 (>1 false), max 'Zoe' (> 'M', true).
+    let csv = "team,name\nalpha,Alice\nalpha,Bob\nzeta,Zoe\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.dlq_entries.len(), 0, "no DLQ on comparison residual");
+    let lines = sorted_body_lines(&output);
+    // alpha,true,false  and  zeta,false,true
+    assert!(
+        lines.iter().any(|l| l == "alpha,true,false"),
+        "alpha: count(*)>1 true, max(name)>'M' false: {output}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "zeta,false,true"),
+        "zeta: count(*)>1 false, max(name)>'M' true: {output}"
+    );
+}

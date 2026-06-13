@@ -1787,7 +1787,16 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+/// Order two [`Value`]s with the row evaluator's comparison semantics, the
+/// single source of truth for `<` / `>` / `<=` / `>=` in CXL.
+///
+/// Orders `Int`/`Float` (mixed, via `f64`), `String` (lexicographic), `Date`,
+/// and `DateTime`. Returns `None` for any other pairing — a null operand, a
+/// bool, or a type mismatch — which every comparison call site maps to a
+/// false / null three-valued result. Shared by the row evaluator and the
+/// aggregate emit-residual evaluator so `max(name) > 'M'` means the same
+/// thing in a Transform, an Aggregate `emit`, and a Cull predicate.
+pub fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),

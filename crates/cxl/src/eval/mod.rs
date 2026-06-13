@@ -23,7 +23,7 @@ use crate::typecheck::pass::TypedProgram;
 
 use compiled::{CompiledProgram, EvalState};
 
-pub use compiled::{CompiledScalar, compile_scalar};
+pub use compiled::{CompiledScalar, compare_values, compile_scalar};
 pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
 pub use error::{EvalError, EvalErrorKind, extract_triggering_value};
 

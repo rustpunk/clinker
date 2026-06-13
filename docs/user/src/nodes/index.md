@@ -22,6 +22,7 @@ nodes, and leaves at an Output:
 | [Combine](combine.md) | N-ary record combining with mixed predicates (equi + range + arbitrary CXL). | N → 1 | Blocking (build side) |
 | [Aggregate](aggregate.md) | Grouped or windowed reduction. | 1 → 1 | Blocking (or streaming when sorted) |
 | [Reshape](reshape.md) | Pivot / unpivot between wide and long record shapes. | 1 → 1 | Blocking |
+| [Cull](cull.md) | Per-correlation-group removal on a group-level predicate, with a `removed_to` side-output port. | 1 → 2 | Blocking |
 | [Output](output.md) | Writes records to a sink; the exit point. | 1 → 0 | Streaming |
 
 ## Streaming vs blocking

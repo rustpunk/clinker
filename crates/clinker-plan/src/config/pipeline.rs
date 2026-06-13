@@ -738,6 +738,7 @@ impl PipelineConfig {
                 | PipelineNode::Output { .. }
                 | PipelineNode::Merge { .. }
                 | PipelineNode::Reshape { .. }
+                | PipelineNode::Cull { .. }
                 | PipelineNode::Composition { .. }
                 | PipelineNode::Combine { .. } => None,
             })
@@ -1068,6 +1069,7 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Reshape { header, .. }
+                | PipelineNode::Cull { header, .. }
                 | PipelineNode::Output { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
@@ -2079,6 +2081,7 @@ fn resolve_all_input_references(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Output { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
@@ -2741,6 +2744,22 @@ pub(crate) fn lower_node_to_plan_node(
             // (E200 on a rule predicate / assignment) — skip lowering.
             artifacts.typed.get(name)?;
             Some(crate::plan::execution::PlanNode::Reshape {
+                name: name.to_string(),
+                span,
+                config: config.clone(),
+                output_schema: schema_from_bound(name),
+            })
+        }
+        // Cull lowers to PlanNode::Cull carrying the parsed config and the
+        // (unchanged) upstream output schema. The executor recompiles each
+        // rule's `drop_group_when` predicate against the live input schema
+        // at dispatch time, so no per-rule typed program is threaded
+        // through CompileArtifacts.
+        PipelineNode::Cull { config, .. } => {
+            // A missing typed entry means bind_schema rejected the node
+            // (E200 on a rule predicate / removed_to) — skip lowering.
+            artifacts.typed.get(name)?;
+            Some(crate::plan::execution::PlanNode::Cull {
                 name: name.to_string(),
                 span,
                 config: config.clone(),

@@ -51,7 +51,7 @@ use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, Value};
 use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
-use cxl::eval::{CompiledScalar, EvalContext, EvalError, ProgramEvaluator};
+use cxl::eval::{CompiledScalar, EvalContext, EvalError, ProgramEvaluator, compare_values};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
 use clinker_plan::error::PipelineError;
@@ -220,6 +220,24 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, AggregateEvalErro
         (BinOp::Div, Float(a), Integer(b)) => Float(a / b as f64),
         (BinOp::Eq, a, b) => Bool(a == b),
         (BinOp::Neq, a, b) => Bool(a != b),
+        // Ordered comparisons delegate to the same `compare_values` the row
+        // evaluator uses, so an aggregate boolean residual means exactly what
+        // it would in a Transform: `count(*) > 100`, `max(name) > 'M'`, and
+        // `min(event_date) >= '2020-01-01'` all order Int/Float/String/Date/
+        // DateTime identically. A null (or otherwise-incomparable) operand
+        // yields `None`, which maps to `false` here, matching the row
+        // evaluator's three-valued comparison (whose `matches!`-based
+        // `>=`/`<=` likewise treat an incomparable pair as false).
+        (BinOp::Gt, a, b) => Bool(compare_values(&a, &b) == Some(std::cmp::Ordering::Greater)),
+        (BinOp::Lt, a, b) => Bool(compare_values(&a, &b) == Some(std::cmp::Ordering::Less)),
+        (BinOp::Gte, a, b) => Bool(matches!(
+            compare_values(&a, &b),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        )),
+        (BinOp::Lte, a, b) => Bool(matches!(
+            compare_values(&a, &b),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )),
         (BinOp::And, Bool(a), Bool(b)) => Bool(a && b),
         (BinOp::Or, Bool(a), Bool(b)) => Bool(a || b),
         (_, Null, _) | (_, _, Null) => Null,

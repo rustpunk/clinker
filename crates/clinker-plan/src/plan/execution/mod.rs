@@ -194,6 +194,31 @@ pub enum PlanNode {
         #[serde(skip)]
         output_schema: Arc<Schema>,
     },
+    /// Per-correlation-group record removal with a side-output port.
+    ///
+    /// Blocking grouping operator: buffers each `partition_by` group,
+    /// evaluates each rule's group-level `drop_group_when` predicate over
+    /// the whole group, and routes every record of a dropped group to the
+    /// `removed_to` producer-side output port while untriggered groups flow
+    /// to the main output port. Cull does not widen — both ports carry the
+    /// unchanged upstream schema. The executor compiles each rule's
+    /// predicate against the live input schema at dispatch time (the Route
+    /// condition-compile seam), so the plan node carries only the parsed
+    /// `config` and the unchanged output schema.
+    Cull {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Parsed Cull configuration (`partition_by` / `order_by` /
+        /// `rules` / `removed_to`). Consumed by the executor's cull
+        /// dispatch arm.
+        config: crate::config::pipeline_node::CullBody,
+        /// Output schema, equal to the upstream schema (Cull does not
+        /// widen). Both the main and `removed_to` ports carry it.
+        /// Populated by `bind_schema`.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
+    },
     /// Planner-synthesized sort enforcer.
     ///
     /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
@@ -429,6 +454,7 @@ impl PlanNode {
             | PlanNode::Merge { name, .. }
             | PlanNode::Output { name, .. }
             | PlanNode::Reshape { name, .. }
+            | PlanNode::Cull { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
             | PlanNode::Composition { name, .. }
@@ -447,6 +473,7 @@ impl PlanNode {
             | PlanNode::Merge { span, .. }
             | PlanNode::Output { span, .. }
             | PlanNode::Reshape { span, .. }
+            | PlanNode::Cull { span, .. }
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
             | PlanNode::Composition { span, .. }
@@ -492,6 +519,7 @@ impl PlanNode {
             | PlanNode::Combine { output_schema, .. }
             | PlanNode::Composition { output_schema, .. }
             | PlanNode::Reshape { output_schema, .. }
+            | PlanNode::Cull { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => output_schema
                 .columns()
                 .iter()
@@ -527,6 +555,7 @@ impl PlanNode {
             | PlanNode::Combine { output_schema, .. }
             | PlanNode::Composition { output_schema, .. }
             | PlanNode::Reshape { output_schema, .. }
+            | PlanNode::Cull { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
             PlanNode::Route { .. }
             | PlanNode::Output { .. }
@@ -616,6 +645,7 @@ impl PlanNode {
             PlanNode::Combine { .. } => "combine",
             PlanNode::CorrelationCommit { .. } => "correlation_commit",
             PlanNode::Reshape { .. } => "reshape",
+            PlanNode::Cull { .. } => "cull",
         }
     }
 
@@ -627,14 +657,15 @@ impl PlanNode {
     /// The named output ports this node emits to, or `None` when the node
     /// has a single unnamed output.
     ///
-    /// Producer-side counterpart to a node's named inputs. A `Route` emits
-    /// one output per branch plus its `default`; the dispatcher tags each
-    /// outgoing edge with the [`PlanEdge::producer_port`] it carries, so a
-    /// record assigned to branch `b` flows down exactly the edges tagged
-    /// `b`. The returned set is deduplicated and preserves branch
-    /// declaration order, appending `default` last when it is not already a
-    /// branch name. Every other variant returns `None` (single output).
-    /// Future multi-output operators add their own arm here.
+    /// Producer-side counterpart to a node's named inputs. Two variants emit
+    /// named ports: a `Route` emits one output per branch plus its `default`,
+    /// and a `Cull` emits `main` (kept groups) plus its `removed_to` port
+    /// (removed groups). The dispatcher tags each outgoing edge with the
+    /// [`PlanEdge::producer_port`] it carries, so a record assigned to port
+    /// `p` flows down exactly the edges tagged `p`. The Route set is
+    /// deduplicated and preserves branch declaration order, appending
+    /// `default` last when it is not already a branch name. Every other
+    /// variant returns `None` (single output).
     pub fn output_ports(&self) -> Option<Vec<&str>> {
         match self {
             PlanNode::Route {
@@ -646,6 +677,12 @@ impl PlanNode {
                 }
                 Some(ports)
             }
+            // Cull is the second producer-side multi-output operator: the
+            // main port carries kept groups, the `removed_to` port carries
+            // removed groups. A downstream node draws kept rows by
+            // referencing the node name (bare) and removed rows by
+            // referencing `<cull>.<removed_to>`.
+            PlanNode::Cull { config, .. } => Some(vec!["main", config.removed_to.as_str()]),
             _ => None,
         }
     }
@@ -669,6 +706,14 @@ impl PlanNode {
                     "[reshape] {name} partition_by=[{}] rules={}",
                     config.partition_by.join(", "),
                     config.rules.len()
+                )
+            }
+            PlanNode::Cull { name, config, .. } => {
+                format!(
+                    "[cull] {name} partition_by=[{}] rules={} removed_to={}",
+                    config.partition_by.join(", "),
+                    config.rules.len(),
+                    config.removed_to
                 )
             }
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
@@ -901,6 +946,18 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
             spill_priority: Some(15),
             can_back_pressure: false,
         },
+        // Cull buffers every input record per correlation group before any
+        // group-level `drop_group_when` predicate can decide keep-vs-remove
+        // (an aggregate property of the whole group cannot be folded
+        // incrementally into a keep/remove decision), then spills the raw
+        // input records via the same whole-record round-trip Reshape uses.
+        // Priority `15` matches Reshape — a grouped record buffer costlier
+        // to evict than grace partitions but cheaper than an external-sort
+        // merge. No upstream channel to gate, so it cannot back-pressure.
+        PlanNode::Cull { .. } => ArbitrationClass {
+            spill_priority: Some(15),
+            can_back_pressure: false,
+        },
         // Stateless or sink stages register no spillable consumer:
         // Transform / Route / Merge stream record-at-a-time, Output is a
         // sink, Composition is a structural wrapper whose body nodes
@@ -970,6 +1027,10 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
         // the budget and re-runs synthesis on reload, so it writes real spill
         // files and must appear in the disk-spill projection surfaces.
         PlanNode::Reshape { .. } => true,
+        // Cull spills its raw per-group input records when the buffer trips
+        // the budget and re-splits on reload, so it writes real spill files
+        // and must appear in the disk-spill projection surfaces.
+        PlanNode::Cull { .. } => true,
         PlanNode::Source { .. }
         | PlanNode::Transform { .. }
         | PlanNode::Route { .. }

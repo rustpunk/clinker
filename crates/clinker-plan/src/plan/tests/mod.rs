@@ -1,5 +1,6 @@
 mod ck_aligned_partition;
 mod ck_lattice;
+mod cull_validation;
 mod dag;
 mod dedup_node_rooted;
 mod deferred_region;

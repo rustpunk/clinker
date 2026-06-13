@@ -33,8 +33,8 @@ use crate::config::composition::{
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
-    CombineBody, CopyFrom, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, ReshapeBody,
-    SchemaDecl,
+    CombineBody, CopyFrom, CullBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec,
+    ReshapeBody, SchemaDecl,
 };
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
@@ -1456,6 +1456,173 @@ fn bind_reshape(
         .insert(name.to_string(), Arc::new(synthetic_typed_program(out)));
 }
 
+/// Borrowed inputs for binding one `PipelineNode::Cull`.
+///
+/// Bundles the read-only node identity (name/config/upstream/span/vars)
+/// so `bind_cull` keeps only the mutable sinks (diags/artifacts/schema
+/// map) as loose parameters, mirroring `ReshapeNodeBinding`.
+struct CullNodeBinding<'a> {
+    name: &'a str,
+    config: &'a CullBody,
+    upstream: &'a Row,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
+/// Bind a `PipelineNode::Cull`: validate `partition_by` / `order_by`
+/// against the upstream schema, typecheck each rule's `drop_group_when`
+/// predicate in aggregate context, validate the `removed_to` port name,
+/// and publish the (unchanged) upstream row as the node's output.
+///
+/// Validation enforced here (compile errors, code E200):
+/// - every `partition_by` and `order_by` field exists upstream;
+/// - at least one removal rule is declared;
+/// - each rule's `drop_group_when` predicate typechecks against the
+///   upstream row in aggregate context (group-by = `partition_by`), so a
+///   group-level predicate like `count(*) > 100` is well-formed;
+/// - `removed_to` is non-empty and is not the node's own name (the main
+///   output port), so the two output ports are distinguishable.
+///
+/// Cull does not widen: both the main and `removed_to` output ports carry
+/// the unchanged upstream row, so the bound output schema equals upstream.
+fn bind_cull(
+    node: &CullNodeBinding<'_>,
+    diags: &mut Vec<Diagnostic>,
+    artifacts: &mut CompileArtifacts,
+    schema_by_name: &mut HashMap<String, Row>,
+) {
+    let &CullNodeBinding {
+        name,
+        config,
+        upstream,
+        span,
+        scoped_vars,
+    } = node;
+    let mut ok = true;
+
+    // `partition_by` fields must exist upstream.
+    for pk in &config.partition_by {
+        if !upstream.has_field(pk) {
+            diags.push(
+                Diagnostic::error(
+                    "E200",
+                    format!(
+                        "cull {name:?}: partition_by field {pk:?} is not present in the \
+                         upstream schema"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "declare the column in the source's `schema:` block or emit it from an \
+                     upstream transform",
+                ),
+            );
+            ok = false;
+        }
+    }
+
+    // `order_by` fields must exist upstream.
+    for sf in &config.order_by {
+        if !upstream.has_field(&sf.field) {
+            diags.push(Diagnostic::error(
+                "E200",
+                format!(
+                    "cull {name:?}: order_by field {:?} is not present in the upstream schema",
+                    sf.field
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            ok = false;
+        }
+    }
+
+    // `removed_to` names a distinct side-output port. An empty name has
+    // no resolvable edge, and reusing the node's own name would collide
+    // the side-output port with the main output, so both are rejected.
+    if config.removed_to.trim().is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E200",
+                format!("cull {name:?}: removed_to must name a non-empty side-output port"),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(
+                "set `removed_to:` to the port name downstream nodes draw removed rows from",
+            ),
+        );
+        ok = false;
+    } else if config.removed_to == name {
+        diags.push(
+            Diagnostic::error(
+                "E200",
+                format!(
+                    "cull {name:?}: removed_to {:?} collides with the node's own name (the main \
+                     output port) — the two output ports must be distinguishable",
+                    config.removed_to
+                ),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help("rename `removed_to:` to a distinct port name"),
+        );
+        ok = false;
+    }
+
+    // A Cull with no removal rule never removes anything — it is a no-op
+    // operator with two ports, almost certainly an authoring mistake. Reject
+    // it rather than silently route every record to the main port.
+    if config.rules.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E200",
+                format!("cull {name:?}: rules must contain at least one removal rule"),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(
+                "add a rule with a `drop_group_when:` predicate, or remove the Cull node entirely",
+            ),
+        );
+        ok = false;
+    }
+
+    // Each rule's `drop_group_when` typechecks in aggregate context over the
+    // whole group (group-by = `partition_by`), so an aggregate predicate such
+    // as `count(*) > 100` or `sum(if status == 'error' then 1 else 0) > 0` is
+    // well-formed. The predicate is wrapped in a single `emit` so it
+    // typechecks through the same aggregate-mode path the Aggregate node uses;
+    // the bound result is discarded here (the executor recompiles per node at
+    // dispatch time, the Route condition-compile seam).
+    let agg_mode = AggregateMode::GroupBy {
+        group_by_fields: config.partition_by.iter().cloned().collect(),
+    };
+    for rule in &config.rules {
+        let drop_src = format!("emit __drop = {}", rule.drop_group_when.source);
+        if let Err(d) = typecheck_cxl(
+            &format!("{name}:{}:drop_group_when", rule.name),
+            &drop_src,
+            upstream,
+            agg_mode.clone(),
+            span,
+            scoped_vars,
+        ) {
+            diags.push(d);
+            ok = false;
+        }
+    }
+
+    if !ok {
+        return;
+    }
+
+    // Cull does not widen: both output ports carry the unchanged upstream
+    // row. Publish it as the node's output so downstream binding sees the
+    // identical schema on the main and `removed_to` ports.
+    let out = upstream.clone();
+    schema_by_name.insert(name.to_string(), out.clone());
+    artifacts
+        .typed
+        .insert(name.to_string(), Arc::new(synthetic_typed_program(out)));
+}
+
 // ─── Internal recursive bind_schema ─────────────────────────────────
 
 /// Internal recursive bind_schema. Walks nodes in topological order,
@@ -1857,6 +2024,23 @@ fn bind_schema_inner(
                     let upstream = upstream.clone();
                     bind_reshape(
                         &ReshapeNodeBinding {
+                            name: &name,
+                            config,
+                            upstream: &upstream,
+                            span,
+                            scoped_vars: &bind_ctx.scoped_vars,
+                        },
+                        diags,
+                        artifacts,
+                        schema_by_name,
+                    );
+                }
+            }
+            PipelineNode::Cull { header, config } => {
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let upstream = upstream.clone();
+                    bind_cull(
+                        &CullNodeBinding {
                             name: &name,
                             config,
                             upstream: &upstream,
@@ -2296,6 +2480,7 @@ fn bind_composition(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Output { header, .. } => {
                 let r = match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
@@ -2408,6 +2593,7 @@ fn bind_composition(
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Output { header, .. } => {
                 vec![match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
