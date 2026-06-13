@@ -93,7 +93,10 @@ whose lead `record_type` column carries the matched type's `id`. A
 downstream [Route](../nodes/route.md) discriminates on that column.
 Rows of different record types may carry different column counts (ragged
 rows) — the reader validates the column count per record type, not
-file-wide.
+file-wide. A textual column-header row is skipped when `has_header` is
+`true` (the default), so a leading `record_type,name,amount` line is not
+mistaken for a record of an unknown type. Each declared field honors its
+own `type` / `trim` / `pad`, the same as a single-record CSV field.
 
 - **Header rows** declared as an `envelope:` section via the
   `record_type` extract surface as `$doc.<section>.*` and are excluded
@@ -102,6 +105,12 @@ file-wide.
 - **Trailer rows** named by a `structure:` constraint are validated as
   they stream — the declared `count` field is checked against the actual
   body-record count at document close — and excluded from the body
-  stream.
+  stream. A declared trailer that never appears is an incomplete-document
+  error; a body row after the trailer is rejected as content past the
+  document close.
+- **Blank lines** (empty or whitespace-only, common after concatenation)
+  are skipped rather than parsed.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
-  fails the run with [E345](../../explain/E345.md).
+  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
+  by default, or under `dlq_granularity: document` condemns the whole
+  file to the dead-letter sink and the run continues.

@@ -45,7 +45,7 @@ fn build_format_reader(
             match multi_record_schema(input, "csv")? {
                 Some(def) => build_multi_record_reader(
                     input,
-                    &def,
+                    def,
                     MultiRecordKind::Csv(opts.as_ref()),
                     open_one_shot(&source)?,
                 ),
@@ -81,7 +81,7 @@ fn build_format_reader(
             match multi_record_schema(input, "fixed-width")? {
                 Some(def) => build_multi_record_reader(
                     input,
-                    &def,
+                    def,
                     MultiRecordKind::FixedWidth(opts.as_ref()),
                     open_one_shot(&source)?,
                 ),
@@ -931,21 +931,29 @@ fn multi_record_schema(
     Ok(def.records.is_some().then_some(def))
 }
 
-/// Extract the single-record `Vec<FieldDef>` a fixed-width source declares.
+/// Extract the single-record `Vec<FieldDef>` a fixed-width source declares,
+/// with `inherits:` merged and field constraints validated.
+///
+/// Routes through [`clinker_plan::schema::resolve_schema`] so a fixed-width
+/// field declaring `inherits:` resolves against the schema's `defs:` templates
+/// (positions, types, padding) instead of reaching the reader unresolved — the
+/// same resolution the multi-record path gets.
 ///
 /// # Errors
 ///
 /// Returns a config validation error when the fixed-width source declares no
-/// `format_schema` or its definition carries no `fields:` list.
+/// `format_schema`, its definition carries no `fields:` list, or an
+/// inherits / field-constraint check fails.
 fn extract_field_defs(
     input: &clinker_plan::config::SourceConfig,
 ) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
     let def = load_format_schema(input, "fixed-width")?;
-    def.fields.ok_or_else(|| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            "fixed-width schema must have 'fields' defined".into(),
-        ))
-    })
+    let resolved = clinker_plan::schema::resolve_schema(def).map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "fixed-width schema: {e}"
+        )))
+    })?;
+    Ok(resolved.fields)
 }
 
 /// Build a multi-record flat-file reader (CSV or fixed-width) from a
@@ -962,39 +970,33 @@ fn extract_field_defs(
 /// rejects the discriminator / record-type declarations.
 fn build_multi_record_reader(
     input: &clinker_plan::config::SourceConfig,
-    def: &clinker_record::schema_def::SchemaDefinition,
+    def: clinker_record::schema_def::SchemaDefinition,
     kind: MultiRecordKind,
     reader: Box<dyn Read + Send>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    let discriminator = def.discriminator.as_ref().ok_or_else(|| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            "multi-record `format_schema` requires a `discriminator` block".into(),
-        ))
+    // Resolve the record types — merging each type's `inherits:` and validating
+    // its field constraints — so a multi-record schema gets the same resolution
+    // a single-record one does, instead of reaching the reader raw.
+    let resolved = clinker_plan::schema::resolve_records(def).map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "multi-record schema: {e}"
+        )))
     })?;
-    let record_types = def.records.as_deref().unwrap_or_default();
-    let structure = def.structure.clone().unwrap_or_default();
     // The header record-type tags are the `record_type` extracts the source's
     // `envelope:` config declares. The reader learns them at construction so
     // its bounded header pre-scan runs before any body record, and a header
     // row is never misclassified as a body record (the driver calls
     // `next_record` before `prepare_document`).
     let header_tags = header_record_type_tags(input);
-    // A multi-record source with no DLQ strategy fails fast on an unknown
-    // discriminator value (E345). The document-DLQ seam routes the row to the
-    // dead-letter sink under a non-fail-fast strategy; that wiring lands with
-    // the per-record DLQ granularity work, so the reader defaults to fail-fast
-    // here, the strictest and safest posture for an undeclared tag.
-    let fail_fast = true;
     let to_pipeline_err = |e: clinker_format::FormatError| PipelineError::Compilation {
         transform_name: input.name.clone(),
         messages: vec![format!("multi-record reader init error: {e}")],
     };
     let spec = clinker_format::multi_record::MultiRecordSpec {
-        discriminator,
-        record_types,
-        structure,
+        discriminator: resolved.discriminator,
+        record_types: resolved.record_types,
+        structure: resolved.structure,
         header_tags,
-        fail_fast,
     };
     let built: Box<dyn FormatReader> = match kind {
         MultiRecordKind::FixedWidth(opts) => {
@@ -1014,8 +1016,15 @@ fn build_multi_record_reader(
                 clinker_format::multi_record::MultiRecordReader::new_csv(
                     reader,
                     spec,
-                    cfg.delimiter,
-                    cfg.quote_char,
+                    clinker_format::multi_record::CsvDialect {
+                        delimiter: cfg.delimiter,
+                        quote_char: cfg.quote_char,
+                        // A multi-record CSV exported with a column-header line
+                        // (the default `has_header: true`) skips that first
+                        // physical row, so a textual header is not mistaken for
+                        // an unknown discriminator value.
+                        has_header: cfg.has_header,
+                    },
                 )
                 .map_err(to_pipeline_err)?,
             )
@@ -1028,6 +1037,7 @@ fn build_multi_record_reader(
 /// via `record_type` extracts. These name the header rows the multi-record
 /// reader captures in its bounded pre-scan and excludes from the body stream.
 fn header_record_type_tags(input: &clinker_plan::config::SourceConfig) -> Vec<String> {
+    use clinker_format::EnvelopeExtract;
     let Some(envelope) = input.envelope.as_ref() else {
         return Vec::new();
     };
@@ -1035,8 +1045,12 @@ fn header_record_type_tags(input: &clinker_plan::config::SourceConfig) -> Vec<St
         .sections
         .values()
         .filter_map(|section| match &section.extract {
-            clinker_format::EnvelopeExtract::RecordType(tag) => Some(tag.clone()),
-            _ => None,
+            EnvelopeExtract::RecordType(tag) => Some(tag.clone()),
+            // Exhaustive on purpose: a new extract variant must force a decision
+            // here rather than silently dropping a header tag.
+            EnvelopeExtract::XmlPath(_)
+            | EnvelopeExtract::JsonPointer(_)
+            | EnvelopeExtract::Segment(_) => None,
         })
         .collect()
 }

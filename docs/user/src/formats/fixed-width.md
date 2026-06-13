@@ -96,6 +96,16 @@ file is never buffered.
 - **Trailer lines** named by a `structure:` constraint are validated as
   they stream — the declared `count` field is checked against the actual
   body-record count at document close — and excluded from the body
-  stream.
+  stream. A declared trailer that never appears is an incomplete-document
+  error; a body line after the trailer is rejected as content past the
+  document close.
+- **Blank lines** (empty or whitespace-only, common after concatenation)
+  are skipped rather than rejected; a line whose declared field range is
+  cut off mid-value is a truncation error, not a silently-partial read.
+  Field parsing — type coercion, padding strip, justification — is shared
+  with the single-record fixed-width reader, so a declared `type` parses
+  identically on both paths.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
-  fails the run with [E345](../../explain/E345.md).
+  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
+  by default, or under `dlq_granularity: document` condemns the whole
+  file to the dead-letter sink and the run continues.

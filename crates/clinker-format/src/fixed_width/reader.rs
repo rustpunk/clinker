@@ -17,14 +17,13 @@
 //! switch to `on_unmapped: drop` / `reject` for explicit scalar
 //! semantics.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::sync::Arc;
 
-use chrono::NaiveDate;
-
 use crate::bom::SkipBom;
-use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator};
-use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use crate::fixed_width::field::{self, ResolvedField};
+use clinker_record::schema_def::{FieldDef, LineSeparator};
+use clinker_record::{Record, Schema, SchemaBuilder};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -58,68 +57,6 @@ pub struct FixedWidthReader<R: Read> {
     row_number: u64,
 }
 
-/// Pre-resolved field with computed width (from width or end-start).
-struct ResolvedField {
-    name: String,
-    start: usize,
-    width: usize,
-    field_type: Option<FieldType>,
-    format: Option<String>,
-    justify: Option<Justify>,
-    pad: String,
-    trim: bool,
-}
-
-impl ResolvedField {
-    fn from_field_def(f: &FieldDef) -> Result<Self, FormatError> {
-        let start = f.start.ok_or_else(|| FormatError::InvalidRecord {
-            row: 0,
-            message: format!("field '{}': fixed-width field must have 'start'", f.name),
-        })?;
-
-        let width = if let Some(w) = f.width {
-            w
-        } else if let Some(end) = f.end {
-            if end < start {
-                return Err(FormatError::InvalidRecord {
-                    row: 0,
-                    message: format!(
-                        "field '{}': 'end' ({}) must be >= 'start' ({})",
-                        f.name, end, start
-                    ),
-                });
-            }
-            end - start
-        } else {
-            return Err(FormatError::InvalidRecord {
-                row: 0,
-                message: format!(
-                    "field '{}': fixed-width field must have 'width' or 'end'",
-                    f.name
-                ),
-            });
-        };
-
-        if width == 0 {
-            return Err(FormatError::InvalidRecord {
-                row: 0,
-                message: format!("field '{}': width must be > 0", f.name),
-            });
-        }
-
-        Ok(ResolvedField {
-            name: f.name.clone(),
-            start,
-            width,
-            field_type: f.field_type.clone(),
-            format: f.format.clone(),
-            justify: f.justify.clone(),
-            pad: f.pad.clone().unwrap_or_else(|| " ".into()),
-            trim: f.trim.unwrap_or(true),
-        })
-    }
-}
-
 impl<R: Read> FixedWidthReader<R> {
     pub fn new(
         reader: R,
@@ -136,11 +73,7 @@ impl<R: Read> FixedWidthReader<R> {
             .map(|f| Box::<str>::from(f.name.as_str()))
             .collect::<SchemaBuilder>()
             .build();
-        let record_length = resolved
-            .iter()
-            .map(|f| f.start + f.width)
-            .max()
-            .unwrap_or(0);
+        let record_length = resolved.iter().map(ResolvedField::end).max().unwrap_or(0);
 
         Ok(Self {
             reader: BufReader::new(SkipBom::new(reader)),
@@ -152,178 +85,6 @@ impl<R: Read> FixedWidthReader<R> {
             row_number: 0,
         })
     }
-
-    fn read_line(&mut self) -> Result<bool, FormatError> {
-        self.line_buf.clear();
-        match self.config.line_separator {
-            LineSeparator::Lf => {
-                let n = self.reader.read_until(b'\n', &mut self.line_buf)?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                // Strip trailing \n
-                if self.line_buf.last() == Some(&b'\n') {
-                    self.line_buf.pop();
-                }
-            }
-            LineSeparator::CrLf => {
-                let n = self.reader.read_until(b'\n', &mut self.line_buf)?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                // Strip trailing \r\n
-                if self.line_buf.ends_with(b"\r\n") {
-                    self.line_buf.truncate(self.line_buf.len() - 2);
-                } else if self.line_buf.last() == Some(&b'\n') {
-                    self.line_buf.pop();
-                }
-            }
-            LineSeparator::None => {
-                self.line_buf.resize(self.record_length, 0);
-                let mut total = 0;
-                while total < self.record_length {
-                    let n = self.reader.read(&mut self.line_buf[total..])?;
-                    if n == 0 {
-                        if total == 0 {
-                            return Ok(false);
-                        }
-                        return Err(FormatError::InvalidRecord {
-                            row: self.row_number + 1,
-                            message: format!(
-                                "incomplete record: expected {} bytes, got {}",
-                                self.record_length, total
-                            ),
-                        });
-                    }
-                    total += n;
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn extract_field(&self, field: &ResolvedField) -> Result<Value, FormatError> {
-        let end = field.start + field.width;
-        if end > self.line_buf.len() {
-            // Line shorter than field extent — pad conceptually with spaces
-            let available = if field.start < self.line_buf.len() {
-                &self.line_buf[field.start..]
-            } else {
-                b"" as &[u8]
-            };
-            let s = std::str::from_utf8(available).map_err(|e| FormatError::InvalidRecord {
-                row: self.row_number,
-                message: format!("field '{}': invalid UTF-8: {e}", field.name),
-            })?;
-            return self.parse_field_value(field, s);
-        }
-
-        let raw = &self.line_buf[field.start..end];
-        let s = std::str::from_utf8(raw).map_err(|e| FormatError::InvalidRecord {
-            row: self.row_number,
-            message: format!("field '{}': invalid UTF-8: {e}", field.name),
-        })?;
-
-        self.parse_field_value(field, s)
-    }
-
-    fn parse_field_value(&self, field: &ResolvedField, raw: &str) -> Result<Value, FormatError> {
-        if !field.trim {
-            // No trimming — return raw value as-is
-            if raw.is_empty() {
-                return Ok(Value::Null);
-            }
-            return match &field.field_type {
-                Some(FieldType::String) | None => Ok(Value::String(raw.into())),
-                _ => {
-                    // Even for no-trim, typed fields need parsing from the raw string
-                    self.parse_typed_value(field, raw)
-                }
-            };
-        }
-
-        // Strip padding based on justification
-        let stripped = match field.justify {
-            Some(Justify::Right) => {
-                // Right-justified: strip leading pad chars
-                let pad_char = field.pad.chars().next().unwrap_or(' ');
-                raw.trim_start_matches(pad_char)
-            }
-            Some(Justify::Left) | None => {
-                // Left-justified (default): strip trailing pad chars
-                let pad_char = field.pad.chars().next().unwrap_or(' ');
-                raw.trim_end_matches(pad_char)
-            }
-        };
-
-        let value_str = stripped.trim();
-
-        if value_str.is_empty() {
-            return Ok(Value::Null);
-        }
-
-        self.parse_typed_value(field, value_str)
-    }
-
-    fn parse_typed_value(
-        &self,
-        field: &ResolvedField,
-        value_str: &str,
-    ) -> Result<Value, FormatError> {
-        match &field.field_type {
-            Some(FieldType::Integer) => {
-                let v: i64 = value_str.parse().map_err(|e| FormatError::InvalidRecord {
-                    row: self.row_number,
-                    message: format!(
-                        "field '{}': cannot parse '{}' as integer: {e}",
-                        field.name, value_str
-                    ),
-                })?;
-                Ok(Value::Integer(v))
-            }
-            Some(FieldType::Float) => {
-                let v: f64 = value_str.parse().map_err(|e| FormatError::InvalidRecord {
-                    row: self.row_number,
-                    message: format!(
-                        "field '{}': cannot parse '{}' as float: {e}",
-                        field.name, value_str
-                    ),
-                })?;
-                Ok(Value::Float(v))
-            }
-            Some(FieldType::Date) => {
-                let fmt = field.format.as_deref().unwrap_or("%Y-%m-%d");
-                let d = NaiveDate::parse_from_str(value_str, fmt).map_err(|e| {
-                    FormatError::InvalidRecord {
-                        row: self.row_number,
-                        message: format!(
-                            "field '{}': cannot parse '{}' as date with format '{}': {e}",
-                            field.name, value_str, fmt
-                        ),
-                    }
-                })?;
-                Ok(Value::Date(d))
-            }
-            Some(FieldType::Boolean) => {
-                let b = match value_str.to_lowercase().as_str() {
-                    "true" | "1" | "yes" | "y" => true,
-                    "false" | "0" | "no" | "n" => false,
-                    _ => {
-                        return Err(FormatError::InvalidRecord {
-                            row: self.row_number,
-                            message: format!(
-                                "field '{}': cannot parse '{}' as boolean",
-                                field.name, value_str
-                            ),
-                        });
-                    }
-                };
-                Ok(Value::Bool(b))
-            }
-            Some(FieldType::String) | None => Ok(Value::String(value_str.into())),
-            _ => Ok(Value::String(value_str.into())),
-        }
-    }
 }
 
 impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
@@ -332,14 +93,20 @@ impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
-        if !self.read_line()? {
+        if !field::read_physical_line(
+            &mut self.reader,
+            &self.config.line_separator,
+            self.record_length,
+            self.row_number,
+            &mut self.line_buf,
+        )? {
             return Ok(None);
         }
         self.row_number += 1;
 
         let mut values = Vec::with_capacity(self.fields.len());
-        for field in &self.fields {
-            values.push(self.extract_field(field)?);
+        for f in &self.fields {
+            values.push(field::extract_value(f, &self.line_buf, self.row_number)?);
         }
 
         Ok(Some(Record::new(Arc::clone(&self.schema), values)))
@@ -349,7 +116,9 @@ impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::schema_def::FieldDef;
+    use chrono::NaiveDate;
+    use clinker_record::Value;
+    use clinker_record::schema_def::{FieldDef, FieldType, Justify};
 
     fn field(name: &str) -> FieldDef {
         FieldDef {

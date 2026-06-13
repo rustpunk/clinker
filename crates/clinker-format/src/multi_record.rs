@@ -12,17 +12,20 @@
 //!
 //! Memory model: strictly record-at-a-time. The only retained state beyond
 //! one line is the optional header pre-scan ([`FormatReader::prepare_document`]
-//! stashes the first header-tag row, O(one row)), the running body count, and
-//! the most recent trailer row's raw fields used to validate a trailer's
-//! declared count at document close. Trailer rows arrive after the body they
-//! close, so a trailer record type is validated as it streams rather than
-//! surfaced as a `$doc` pre-scan section.
+//! captures the first header-tag row, O(one row per header section)), the
+//! running body count, and the most recent trailer row's fields used to
+//! validate a trailer's declared count at document close. Trailer rows arrive
+//! after the body they close, so a trailer record type is validated as it
+//! streams rather than surfaced as a `$doc` pre-scan section.
+//!
+//! Field parsing is delegated to [`crate::fixed_width::field`] so a declared
+//! `type:` parses byte-for-byte identically to the single-record fixed-width
+//! reader; CSV fields share the same scalar coercion.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::sync::Arc;
 
-use chrono::NaiveDate;
 use indexmap::IndexMap;
 
 use clinker_record::schema_def::{
@@ -33,12 +36,25 @@ use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use crate::bom::SkipBom;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
+use crate::fixed_width::field::{self, ResolvedField};
 use crate::traits::FormatReader;
 
 /// The lead column of the superset schema, carrying the matched record type's
 /// declared `id` so a downstream `Route` discriminates on a stable name
 /// independent of the discriminator's physical location.
+///
+/// Reserved: a record type may not declare a field of this name, or its raw
+/// value would overwrite the stamped type id and silently misroute every row.
 pub const RECORD_TYPE_COLUMN: &str = "record_type";
+
+/// CSV dialect for the multi-record reader.
+pub struct CsvDialect {
+    pub delimiter: u8,
+    pub quote_char: u8,
+    /// When `true`, the first physical row is a textual column header and is
+    /// skipped rather than classified as a record type.
+    pub has_header: bool,
+}
 
 /// How the discriminator value is located in a physical line.
 enum Discrimination {
@@ -56,29 +72,33 @@ struct ResolvedType {
     id: Arc<str>,
     /// The fields this type contributes, in declaration order. Each maps to a
     /// superset-schema column index plus its extraction plan.
-    fields: Vec<ResolvedField>,
+    fields: Vec<TypeField>,
 }
 
-/// A field's extraction plan against a physical line, plus the superset
-/// column slot it fills.
-struct ResolvedField {
-    /// The declared field name, used to key header pre-scan pairs against an
-    /// envelope section's declared field schema.
-    name: String,
+/// One declared field of a record type, mapping to a superset column slot.
+///
+/// A fixed-width field carries a byte-positioned [`ResolvedField`]; a CSV field
+/// carries a column index plus the same field-level parse policy (type, format,
+/// trim, justify, pad) so a user's `trim`/`pad`/`type` on a CSV field is
+/// honored, not silently dropped.
+struct TypeField {
     /// Index into the superset schema's column vector.
     column: usize,
+    /// The field's name (keys header pre-scan and trailer pairs).
+    name: String,
     field_type: Option<FieldType>,
     format: Option<String>,
-    /// Fixed-width byte range; `None` for CSV (positional column extraction).
-    byte_range: Option<(usize, usize)>,
-    /// CSV column index for this field; `None` for fixed-width.
+    /// Fixed-width byte-positioned field, or `None` for a CSV field.
+    fixed: Option<ResolvedField>,
+    /// CSV column index, or `None` for a fixed-width field.
     csv_column: Option<usize>,
+    /// CSV-only parse policy (fixed-width carries these on `fixed`).
+    trim: bool,
     justify: Option<Justify>,
     pad: String,
-    trim: bool,
 }
 
-/// The line scanner backing the reader — fixed-width fixed-length reads or a
+/// The line scanner backing the reader — fixed-width physical reads or a
 /// `csv::Reader` configured `flexible(true)` for ragged per-type rows.
 enum LineScanner<R: Read> {
     FixedWidth {
@@ -90,6 +110,9 @@ enum LineScanner<R: Read> {
     Csv {
         reader: csv::Reader<SkipBom<R>>,
         record_buf: csv::StringRecord,
+        /// `true` until the column-header row has been consumed (when the
+        /// dialect declares one).
+        pending_header: bool,
     },
 }
 
@@ -101,15 +124,18 @@ enum ScannedLine {
 }
 
 /// The resolved building blocks both backends produce from a `records:` list:
-/// the static superset schema, the tag → record-type map, and a trailing
-/// usize (the fixed-width record length, or the CSV discriminator column).
-type ResolvedTypes = (Arc<Schema>, HashMap<String, ResolvedType>, usize);
+/// the static superset schema and the tag → record-type map.
+type ResolvedParts = (Arc<Schema>, HashMap<String, ResolvedType>);
+
+/// A backend resolver's output: the [`ResolvedParts`] plus a trailing usize —
+/// the fixed-width record length, or the CSV discriminator column index.
+type ResolvedBackend = (Arc<Schema>, HashMap<String, ResolvedType>, usize);
 
 /// Streaming multi-record flat-file reader.
 ///
 /// Holds the line scanner, the static superset schema, a `tag → ResolvedType`
-/// map, the running body count, and the optional trailer structural
-/// constraint. Stamps each matched line as one record on the superset schema.
+/// map, the running counts, and the trailer structural constraints. Stamps
+/// each matched line as one record on the superset schema.
 pub struct MultiRecordReader<R: Read> {
     scanner: LineScanner<R>,
     schema: Arc<Schema>,
@@ -117,79 +143,68 @@ pub struct MultiRecordReader<R: Read> {
     /// Tag (trimmed) → resolved record type. A row whose tag is absent here is
     /// an unknown discriminator value.
     by_tag: HashMap<String, ResolvedType>,
-    /// Whether an unknown discriminator value aborts the read (fail-fast) or
-    /// dead-letters the row. Dead-lettering rides the document-DLQ seam: the
-    /// driver's per-record error handling skips the row.
-    fail_fast: bool,
     /// Trailer structural constraints: a record-type id whose declared count
     /// column must equal the actual body count at document close.
     structure: Vec<StructureConstraint>,
-    /// Running count of body rows (every matched row that is neither a header
-    /// nor a trailer type), checked against a trailer's declared count.
+    /// Count of physical lines read (every line, including header/trailer and
+    /// skipped blanks), so a diagnostic names the offending physical line.
+    physical_row: u64,
+    /// Count of body rows (every matched row that is neither a header nor a
+    /// trailer type), checked against a trailer's declared count.
     body_count: u64,
-    /// Header-type tags whose first row is captured by the bounded pre-scan and
-    /// excluded from the body count. Known at construction from the source's
-    /// `envelope:` config, so the pre-scan runs before any body record and a
-    /// header row is never misclassified as a body record.
+    /// Header-type tags captured by the bounded pre-scan and excluded from the
+    /// body count. Known at construction from the source's `envelope:` config.
     header_tags: Vec<String>,
-    /// Header-type ids matched to `header_tags`, kept for the body-skip
-    /// pointer check.
+    /// Header-type ids matched to `header_tags`, for the body-skip pointer check.
     header_ids: Vec<Arc<str>>,
-    /// Trailer-type ids (the `record` side of a `StructureConstraint`). A row
-    /// of one of these types is the trailer and is excluded from the body
-    /// count; its raw fields are stashed in `last_trailer`.
+    /// Trailer-type ids (the `record` side of a `StructureConstraint`).
     trailer_ids: Vec<Arc<str>>,
     /// Captured header rows, keyed by record-type tag: the first row of each
-    /// header type, as declared field-name → raw text pairs. Filled by the
-    /// one-time pre-scan and read by `prepare_document` for section coercion.
+    /// header type, as declared field-name → raw text pairs. The envelope
+    /// section schema coerces them when `prepare_document` runs.
     captured_headers: HashMap<String, Vec<(String, String)>>,
-    /// Whether the one-time header pre-scan has run. It runs lazily on the
-    /// first `next_record` or `prepare_document`, whichever the driver calls
-    /// first, so the header region is consumed exactly once.
+    /// Whether the one-time header pre-scan has run.
     prescanned: bool,
     /// The non-header row that terminated the pre-scan, held so the body stream
-    /// consumes it as its first row rather than dropping it.
+    /// consumes it rather than dropping it.
     pending_line: Option<ScannedLine>,
-    /// The most recent trailer row: its type id and raw field-name → text map,
-    /// resolved into a declared count at end-of-input structural validation.
+    /// The most recent trailer row: its type id and field-name → declared count
+    /// text, resolved at end-of-input structural validation.
     last_trailer: Option<(Arc<str>, HashMap<String, String>)>,
+    /// `true` once the trailer of a constrained type has streamed; a body row
+    /// after it is a structural error (content past the document's trailer).
+    trailer_seen: bool,
     done: bool,
 }
 
-/// The format-agnostic construction inputs for a [`MultiRecordReader`],
-/// shared by the CSV and fixed-width entry points.
-///
-/// Bundled into one struct so the constructors stay below the argument-count
-/// limit and so the executor factory builds the spec once and reuses it for
-/// either backend.
-pub struct MultiRecordSpec<'a> {
-    /// How each line's record type is identified (a byte range for
-    /// fixed-width, a named column for CSV).
-    pub discriminator: &'a Discriminator,
-    /// The declared record types — each with its tag and per-field layout.
-    pub record_types: &'a [RecordTypeDef],
+/// The format-agnostic construction inputs for a [`MultiRecordReader`], shared
+/// by the CSV and fixed-width entry points. Carries the already-resolved
+/// record types (inherits merged, constraints validated).
+pub struct MultiRecordSpec {
+    /// How each line's record type is identified.
+    pub discriminator: Discriminator,
+    /// The resolved record types — each with its tag and per-field layout.
+    pub record_types: Vec<RecordTypeDef>,
     /// Trailer structural-count constraints validated at document close.
     pub structure: Vec<StructureConstraint>,
-    /// Header record-type tags captured by the bounded pre-scan and excluded
-    /// from the body stream (the `record_type` envelope extracts).
+    /// Header record-type tags captured by the pre-scan (the `record_type`
+    /// envelope extracts) and excluded from the body stream.
     pub header_tags: Vec<String>,
-    /// Whether an unknown discriminator value aborts the run (fail-fast) or
-    /// dead-letters the row.
-    pub fail_fast: bool,
 }
 
 impl<R: Read> MultiRecordReader<R> {
-    /// Build a fixed-width multi-record reader from the discriminator, record
-    /// types, and structural constraints of a `records:` schema.
+    /// Build a fixed-width multi-record reader.
     ///
     /// # Errors
     ///
     /// Returns [`FormatError::FixedWidth`] when the discriminator lacks a byte
-    /// `start`, a record type declares no `tag`, or a field omits its
-    /// `start`/`width`.
+    /// `start`; or a construction error when a record type declares no `tag`,
+    /// duplicates a tag/id, declares a `record_type` field, a same-named field
+    /// with an incompatible type across types, a structural constraint names an
+    /// undeclared record type, or a field omits its `start`/`width`.
     pub fn new_fixed_width(
         reader: R,
-        spec: MultiRecordSpec<'_>,
+        spec: MultiRecordSpec,
         separator: LineSeparator,
     ) -> Result<Self, FormatError> {
         let start = spec.discriminator.start.ok_or_else(|| {
@@ -200,7 +215,8 @@ impl<R: Read> MultiRecordReader<R> {
         let width = spec.discriminator.width.unwrap_or(1);
         let discrimination = Discrimination::ByteRange { start, width };
 
-        let (schema, by_tag, record_length) = resolve_fixed_width(spec.record_types, start, width)?;
+        let (schema, by_tag, record_length) =
+            resolve_fixed_width(&spec.record_types, start, width)?;
         let scanner = LineScanner::FixedWidth {
             reader: BufReader::new(SkipBom::new(reader)),
             separator,
@@ -210,8 +226,7 @@ impl<R: Read> MultiRecordReader<R> {
         Self::assemble(scanner, schema, discrimination, by_tag, spec)
     }
 
-    /// Build a CSV multi-record reader from the discriminator, record types,
-    /// and structural constraints of a `records:` schema.
+    /// Build a CSV multi-record reader.
     ///
     /// The discriminator names a field; its column index is the position of
     /// that field in each record type's declared field list and must be
@@ -220,34 +235,37 @@ impl<R: Read> MultiRecordReader<R> {
     /// # Errors
     ///
     /// Returns [`FormatError::Csv`] when the discriminator omits its `field`
-    /// name, a record type declares no `tag`, or the discriminator field is
-    /// absent from a type's field list or sits at a different column index
-    /// across types.
+    /// name, the field is absent from a type or sits at a different column
+    /// across types; or a construction error for a duplicate tag/id, a
+    /// `record_type` field, an incompatible same-named field, or a structural
+    /// constraint naming an undeclared record type.
     pub fn new_csv(
         reader: R,
-        spec: MultiRecordSpec<'_>,
-        delimiter: u8,
-        quote_char: u8,
+        spec: MultiRecordSpec,
+        dialect: CsvDialect,
     ) -> Result<Self, FormatError> {
         let field = spec.discriminator.field.as_deref().ok_or_else(|| {
             FormatError::Csv(csv_error(
                 "multi-record CSV discriminator requires a `field` name",
             ))
         })?;
-        let (schema, by_tag, column) = resolve_csv(spec.record_types, field)?;
+        let (schema, by_tag, column) = resolve_csv(&spec.record_types, field)?;
         let discrimination = Discrimination::Column(column);
         let csv_reader = csv::ReaderBuilder::new()
-            .delimiter(delimiter)
-            .quote(quote_char)
+            .delimiter(dialect.delimiter)
+            .quote(dialect.quote_char)
             // Heterogeneous record types have different column counts; per-type
             // column-count validation happens at extraction, so the underlying
             // parser must accept ragged rows rather than erroring file-wide.
             .flexible(true)
+            // The reader handles the column-header row itself (skipping it as a
+            // pending header), so the csv crate never treats a row as headers.
             .has_headers(false)
             .from_reader(SkipBom::new(reader));
         let scanner = LineScanner::Csv {
             reader: csv_reader,
             record_buf: csv::StringRecord::new(),
+            pending_header: dialect.has_header,
         };
         Self::assemble(scanner, schema, discrimination, by_tag, spec)
     }
@@ -257,23 +275,31 @@ impl<R: Read> MultiRecordReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::SchemaInference`] when a declared `header_tags`
-    /// entry matches no record type.
+    /// Returns [`FormatError::SchemaInference`] when a `header_tags` entry or a
+    /// structural constraint names a record type that does not exist.
     fn assemble(
         scanner: LineScanner<R>,
         schema: Arc<Schema>,
         discrimination: Discrimination,
         by_tag: HashMap<String, ResolvedType>,
-        spec: MultiRecordSpec<'_>,
+        spec: MultiRecordSpec,
     ) -> Result<Self, FormatError> {
         let MultiRecordSpec {
             structure,
             header_tags,
-            fail_fast,
             ..
         } = spec;
-        // A trailer type is the `record` side of a structural constraint: its
-        // row carries the declared count and must not be tallied as body.
+        // Every structural constraint must name a declared record type; an id
+        // that matches none is a config error, not a silently-skipped check.
+        for c in &structure {
+            if !by_tag.values().any(|rt| rt.id.as_ref() == c.record) {
+                return Err(FormatError::SchemaInference(format!(
+                    "structure constraint names record type '{}', which no `records:` entry \
+                     declares (id mismatch)",
+                    c.record
+                )));
+            }
+        }
         let trailer_ids: Vec<Arc<str>> = by_tag
             .values()
             .filter(|rt| {
@@ -283,9 +309,6 @@ impl<R: Read> MultiRecordReader<R> {
             })
             .map(|rt| Arc::clone(&rt.id))
             .collect();
-        // Resolve each header tag to its record-type id up front so the body
-        // stream can skip header rows by pointer check without re-reading the
-        // envelope config.
         let mut header_ids = Vec::with_capacity(header_tags.len());
         for tag in &header_tags {
             let id = by_tag
@@ -303,8 +326,8 @@ impl<R: Read> MultiRecordReader<R> {
             schema,
             discrimination,
             by_tag,
-            fail_fast,
             structure,
+            physical_row: 0,
             body_count: 0,
             header_tags,
             header_ids,
@@ -313,29 +336,58 @@ impl<R: Read> MultiRecordReader<R> {
             prescanned: false,
             pending_line: None,
             last_trailer: None,
+            trailer_seen: false,
             done: false,
         })
     }
 
-    /// Read one physical line from the scanner, or `None` at end of input.
+    /// Read one non-blank physical line from the scanner, or `None` at end of
+    /// input. Blank lines (empty, or whitespace-only — common after file
+    /// concatenation) are skipped rather than rejected.
     fn scan_line(&mut self) -> Result<Option<ScannedLine>, FormatError> {
-        match &mut self.scanner {
-            LineScanner::FixedWidth {
-                reader,
-                separator,
-                record_length,
-                line_buf,
-            } => {
-                if !read_fixed_line(reader, separator, *record_length, line_buf)? {
-                    return Ok(None);
+        loop {
+            match &mut self.scanner {
+                LineScanner::FixedWidth {
+                    reader,
+                    separator,
+                    record_length,
+                    line_buf,
+                } => {
+                    if !field::read_physical_line(
+                        reader,
+                        separator,
+                        *record_length,
+                        self.physical_row,
+                        line_buf,
+                    )? {
+                        return Ok(None);
+                    }
+                    self.physical_row += 1;
+                    if field::is_blank_line(line_buf) {
+                        continue;
+                    }
+                    return Ok(Some(ScannedLine::FixedWidth(line_buf.clone())));
                 }
-                Ok(Some(ScannedLine::FixedWidth(line_buf.clone())))
-            }
-            LineScanner::Csv { reader, record_buf } => {
-                if !reader.read_record(record_buf)? {
-                    return Ok(None);
+                LineScanner::Csv {
+                    reader,
+                    record_buf,
+                    pending_header,
+                } => {
+                    if !reader.read_record(record_buf)? {
+                        return Ok(None);
+                    }
+                    self.physical_row += 1;
+                    // The first physical row is the textual column header when
+                    // the dialect declares one — skip it once.
+                    if *pending_header {
+                        *pending_header = false;
+                        continue;
+                    }
+                    if csv_row_is_blank(record_buf) {
+                        continue;
+                    }
+                    return Ok(Some(ScannedLine::Csv(record_buf.clone())));
                 }
-                Ok(Some(ScannedLine::Csv(record_buf.clone())))
             }
         }
     }
@@ -347,12 +399,16 @@ impl<R: Read> MultiRecordReader<R> {
                 let end = start + width;
                 let slice = bytes.get(*start..end).ok_or_else(|| {
                     FormatError::FixedWidth(format!(
-                        "line too short for discriminator: need {end} bytes, got {}",
+                        "line {} too short for discriminator: need {end} bytes, got {}",
+                        self.physical_row,
                         bytes.len()
                     ))
                 })?;
                 let tag = std::str::from_utf8(slice).map_err(|_| {
-                    FormatError::FixedWidth("invalid UTF-8 in discriminator byte range".into())
+                    FormatError::FixedWidth(format!(
+                        "line {}: invalid UTF-8 in discriminator byte range",
+                        self.physical_row
+                    ))
                 })?;
                 Ok(tag.trim().to_string())
             }
@@ -368,25 +424,20 @@ impl<R: Read> MultiRecordReader<R> {
     }
 
     /// Build the body [`Record`] for a matched line: the `record_type` lead
-    /// column plus every declared field of the matched type coerced into its
-    /// superset slot; unfilled slots stay `Value::Null`.
+    /// column plus every declared field coerced into its superset slot;
+    /// unfilled slots stay `Value::Null`.
     fn build_record(&self, rt: &ResolvedType, line: &ScannedLine) -> Result<Record, FormatError> {
         let mut values: Vec<Value> = vec![Value::Null; self.schema.column_count()];
         values[0] = Value::String(rt.id.as_ref().into());
-        for field in &rt.fields {
-            values[field.column] = extract_field_value(field, line)?;
+        for tf in &rt.fields {
+            values[tf.column] = extract_field_value(tf, line, self.physical_row)?;
         }
         Ok(Record::new(Arc::clone(&self.schema), values))
     }
 
     /// Run the one-time header pre-scan: forward-scan the contiguous header
     /// region at the file head, capturing the first row of each declared header
-    /// tag, and stop at the first non-header row. Idempotent — the first
-    /// `next_record` or `prepare_document` triggers it; later calls are no-ops.
-    ///
-    /// The pending non-header row that terminates the scan is stashed in
-    /// `pending_line` so `pull_next` consumes it as the first body row rather
-    /// than dropping it. The scan retains O(one header row per section).
+    /// tag, and stop at the first non-header row. Idempotent.
     fn ensure_prescanned(&mut self) -> Result<(), FormatError> {
         if self.prescanned {
             return Ok(());
@@ -409,21 +460,20 @@ impl<R: Read> MultiRecordReader<R> {
                 return Ok(());
             }
             if self.captured_headers.contains_key(&tag) {
-                // A repeated header of an already-captured tag: first wins.
-                continue;
+                continue; // first occurrence wins
             }
             let rt = self
                 .by_tag
                 .get(&tag)
                 .expect("header tag resolved to a record type at construction");
-            let pairs = named_pairs(rt, &line)?;
+            let pairs = collect_named_pairs(rt, &line, self.physical_row)?;
             self.captured_headers.insert(tag, pairs);
         }
     }
 
     /// Pull the next matched body record, consuming header rows (captured by
-    /// the pre-scan) and trailer rows (they feed structural validation)
-    /// transparently, or `None` at clean end of input.
+    /// the pre-scan) and trailer rows (they feed structural validation), or
+    /// `None` at clean end of input.
     fn pull_next(&mut self) -> Result<Option<Record>, FormatError> {
         self.ensure_prescanned()?;
         loop {
@@ -439,20 +489,29 @@ impl<R: Read> MultiRecordReader<R> {
                 },
             };
             let tag = self.extract_tag(&line)?;
-            if !self.by_tag.contains_key(&tag) {
-                self.reject_unknown_tag(&tag)?;
-            }
-            let id = Arc::clone(&self.by_tag[&tag].id);
+            let Some(rt) = self.by_tag.get(&tag) else {
+                return Err(self.unknown_tag_error(&tag));
+            };
+            let id = Arc::clone(&rt.id);
             if self.header_ids.iter().any(|h| Arc::ptr_eq(h, &id)) {
-                // A header type's row outside the contiguous head region (the
-                // pre-scan already captured the first occurrence): never a body
-                // record.
+                // A header type's row outside the contiguous head region: the
+                // pre-scan already captured the first occurrence.
                 continue;
             }
             if self.trailer_ids.iter().any(|t| Arc::ptr_eq(t, &id)) {
-                let raw = named_pairs(&self.by_tag[&tag], &line)?;
+                let raw = collect_named_pairs(rt, &line, self.physical_row)?;
                 self.last_trailer = Some((id, raw.into_iter().collect()));
+                self.trailer_seen = true;
                 continue;
+            }
+            // A body row after a constrained trailer is content past the
+            // document's close — a structural error, not a silently-counted row.
+            if self.trailer_seen {
+                return Err(FormatError::multi_record_structural_count(format!(
+                    "line {}: body record of type '{}' appears after the trailer that closes \
+                     the document",
+                    self.physical_row, id
+                )));
             }
             self.body_count += 1;
             let rt = &self.by_tag[&tag];
@@ -460,44 +519,44 @@ impl<R: Read> MultiRecordReader<R> {
         }
     }
 
-    /// Surface an unknown discriminator value: fail-fast aborts with the E345
-    /// diagnostic; otherwise the row dead-letters through the document-DLQ
-    /// seam (the driver skips a record-level error).
-    fn reject_unknown_tag(&self, tag: &str) -> Result<(), FormatError> {
-        if self.fail_fast {
-            return Err(FormatError::FixedWidth(format!(
-                "E345 unknown record-type discriminator {tag:?}: no `records:` entry declares \
-                 this tag. Declare a record type with `tag: {tag}`, or set a non-fail-fast DLQ \
-                 strategy to dead-letter unmatched rows. See: clinker explain --code E345"
-            )));
-        }
-        Err(FormatError::InvalidRecord {
-            row: self.body_count + 1,
-            message: format!(
-                "E345 unknown record-type discriminator {tag:?}: no `records:` entry declares \
-                 this tag. See: clinker explain --code E345"
-            ),
-        })
+    /// Build the E345 error for an unknown discriminator value.
+    ///
+    /// Classed as a structural-count error so the source ingest driver routes
+    /// it through the document-level dead-letter seam under
+    /// `dlq_granularity: document` (condemning the file) instead of always
+    /// aborting the run. Per-record dead-lettering of a single unknown-tag row
+    /// is tracked separately.
+    fn unknown_tag_error(&self, tag: &str) -> FormatError {
+        FormatError::multi_record_structural_count(format!(
+            "E345 line {}: unknown record-type discriminator {tag:?} — no `records:` entry \
+             declares this tag. Declare a record type with `tag: {tag}`, or set \
+             `dlq_granularity: document` to dead-letter the file. \
+             See: clinker explain --code E345",
+            self.physical_row
+        ))
     }
 
     /// Validate every trailer structural constraint against the streamed body
     /// count at end of input.
     ///
+    /// A declared constraint whose trailer never appeared is an incomplete
+    /// document, not a silently-skipped check.
+    ///
     /// # Errors
     ///
-    /// Returns [`FormatError::InvalidRecord`] when a trailer's declared count
-    /// disagrees with the actual body count it closes.
+    /// Returns a [`FormatError::StructuralCount`] when a trailer's declared
+    /// count disagrees with the body count, or its trailer is absent.
     fn validate_structure(&self) -> Result<(), FormatError> {
         for constraint in &self.structure {
-            let Some(declared) = self.last_trailer_count(&constraint.record, &constraint.count)?
-            else {
-                continue;
+            let declared = self.last_trailer_count(&constraint.record, &constraint.count)?;
+            let Some(declared) = declared else {
+                return Err(FormatError::multi_record_structural_count(format!(
+                    "trailer record '{}' is declared in `structure` but no such row appeared; \
+                     the document is incomplete (expected a trailer carrying field '{}')",
+                    constraint.record, constraint.count
+                )));
             };
             if declared != self.body_count {
-                // A trailer-count disagreement is an envelope structural-count
-                // failure, the same class as X12 `SE` / EDIFACT `UNT` / HL7
-                // `BTS`: under `dlq_granularity: document` it condemns the file
-                // rather than aborting the run.
                 return Err(FormatError::multi_record_structural_count(format!(
                     "trailer record '{}' declares count {} (field '{}'), but the file streamed \
                      {} body records",
@@ -508,9 +567,14 @@ impl<R: Read> MultiRecordReader<R> {
         Ok(())
     }
 
-    /// The declared count carried by the most recent trailer row of the named
-    /// record type, parsed from its `count` field. `None` when no trailer of
-    /// that type was seen.
+    /// The declared count from the most recent trailer row of the named type,
+    /// parsed from its `count` field. `None` when no trailer was seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FormatError::StructuralCount`] when the trailer declares no
+    /// such field (a truncated trailer line whose count column was cut off, or
+    /// a misconfigured field name) or its value is not a non-negative integer.
     fn last_trailer_count(
         &self,
         record_id: &str,
@@ -520,19 +584,18 @@ impl<R: Read> MultiRecordReader<R> {
             Some((id, fields)) if id.as_ref() == record_id => {
                 let raw = fields
                     .get(count_field)
-                    .ok_or_else(|| FormatError::InvalidRecord {
-                        row: self.body_count,
-                        message: format!(
-                            "trailer record '{record_id}' declares no field '{count_field}' to \
-                         validate the body count against"
-                        ),
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        FormatError::multi_record_structural_count(format!(
+                            "trailer record '{record_id}' carries no value for count field \
+                         '{count_field}' — the trailer line is truncated or misconfigured"
+                        ))
                     })?;
-                let parsed: u64 = raw.trim().parse().map_err(|_| FormatError::InvalidRecord {
-                    row: self.body_count,
-                    message: format!(
+                let parsed: u64 = raw.trim().parse().map_err(|_| {
+                    FormatError::multi_record_structural_count(format!(
                         "trailer record '{record_id}' field '{count_field}' value {raw:?} is not \
                          a non-negative integer count"
-                    ),
+                    ))
                 })?;
                 Ok(Some(parsed))
             }
@@ -560,10 +623,6 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
-        // The header tags were resolved at construction (from the same
-        // `envelope:` config), so the pre-scan has already captured each
-        // declared header row by the time the driver calls this — whether it
-        // ran here or on the first `next_record`.
         self.ensure_prescanned()?;
         let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
@@ -579,13 +638,15 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
                     )));
                 }
             };
-            // A header tag with no captured row means the file carried no row
-            // of that type; its `$doc` fields resolve to `Value::Null` per the
-            // absent-section convention, so it is simply omitted here.
-            let Some(pairs) = self.captured_headers.get(tag) else {
+            // The captured row's fields are keyed by the record type's declared
+            // field names; the section schema selects and coerces the ones it
+            // declares to their `$doc` types.
+            let Some(captured) = self.captured_headers.get(tag) else {
+                // No row of that header type appeared; its `$doc` fields resolve
+                // to Null via the absent-section convention.
                 continue;
             };
-            let typed = coerce_section_fields(pairs.clone(), &section.fields)
+            let typed = coerce_section_fields(captured.clone(), &section.fields)
                 .map_err(FormatError::SchemaInference)?;
             out.insert(name.as_str().into(), Value::Map(Box::new(typed)));
         }
@@ -594,66 +655,56 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
 }
 
 /// Resolve the fixed-width superset schema, tag map, and record length.
-///
-/// The superset schema is `[record_type, <union of every type's field names in
-/// declaration order>]`. Returns the tag → resolved type map and the maximum
-/// line length any field reaches (drives the `LineSeparator::None` fixed read).
 fn resolve_fixed_width(
     record_types: &[RecordTypeDef],
     disc_start: usize,
     disc_width: usize,
-) -> Result<ResolvedTypes, FormatError> {
-    let mut columns: Vec<String> = vec![RECORD_TYPE_COLUMN.to_string()];
-    let mut column_index: HashMap<String, usize> = HashMap::new();
-    column_index.insert(RECORD_TYPE_COLUMN.to_string(), 0);
-    let mut by_tag: HashMap<String, ResolvedType> = HashMap::new();
+) -> Result<ResolvedBackend, FormatError> {
+    let mut builder = SupersetBuilder::new();
     let mut record_length = disc_start + disc_width;
-
     for rt in record_types {
         let tag = require_tag(&rt.tag, &rt.id).map_err(FormatError::FixedWidth)?;
         let id: Arc<str> = Arc::from(rt.id.as_str());
         let mut fields = Vec::with_capacity(rt.fields.len());
         for f in &rt.fields {
-            let col = intern_column(&mut columns, &mut column_index, &f.name);
-            let (start, width) = fixed_width_range(f)?;
-            record_length = record_length.max(start + width);
-            fields.push(ResolvedField {
+            reject_record_type_field(&f.name).map_err(FormatError::FixedWidth)?;
+            let resolved = ResolvedField::from_field_def(f)?;
+            record_length = record_length.max(resolved.end());
+            let column = builder.intern(f).map_err(FormatError::FixedWidth)?;
+            fields.push(TypeField {
+                column,
                 name: f.name.clone(),
-                column: col,
                 field_type: f.field_type.clone(),
                 format: f.format.clone(),
-                byte_range: Some((start, width)),
+                fixed: Some(resolved),
                 csv_column: None,
+                trim: f.trim.unwrap_or(true),
                 justify: f.justify.clone(),
                 pad: f.pad.clone().unwrap_or_else(|| " ".into()),
-                trim: f.trim.unwrap_or(true),
             });
         }
-        by_tag.insert(tag, ResolvedType { id, fields });
+        insert_type(
+            &mut builder.by_tag,
+            tag,
+            &rt.id,
+            ResolvedType { id, fields },
+        )
+        .map_err(FormatError::FixedWidth)?;
     }
-
-    let schema = build_superset_schema(columns);
+    let (schema, by_tag) = builder.finish();
     Ok((schema, by_tag, record_length))
 }
 
-/// Resolve the CSV superset schema, tag map, and the discriminator column
-/// index (consistent across every record type).
+/// Resolve the CSV superset schema, tag map, and the discriminator column index.
 fn resolve_csv(
     record_types: &[RecordTypeDef],
     disc_field: &str,
-) -> Result<ResolvedTypes, FormatError> {
-    let mut columns: Vec<String> = vec![RECORD_TYPE_COLUMN.to_string()];
-    let mut column_index: HashMap<String, usize> = HashMap::new();
-    column_index.insert(RECORD_TYPE_COLUMN.to_string(), 0);
-    let mut by_tag: HashMap<String, ResolvedType> = HashMap::new();
+) -> Result<ResolvedBackend, FormatError> {
+    let mut builder = SupersetBuilder::new();
     let mut disc_column: Option<usize> = None;
-
     for rt in record_types {
         let tag = require_tag(&rt.tag, &rt.id).map_err(|m| FormatError::Csv(csv_error(&m)))?;
         let id: Arc<str> = Arc::from(rt.id.as_str());
-        // The discriminator's column position is its index in this type's
-        // field list; it must be present and consistent across every type so
-        // the tag can be read before the type is known.
         let local = rt
             .fields
             .iter()
@@ -679,60 +730,138 @@ fn resolve_csv(
         }
         let mut fields = Vec::with_capacity(rt.fields.len());
         for (csv_idx, f) in rt.fields.iter().enumerate() {
-            let col = intern_column(&mut columns, &mut column_index, &f.name);
-            fields.push(ResolvedField {
+            reject_record_type_field(&f.name).map_err(|m| FormatError::Csv(csv_error(&m)))?;
+            let column = builder
+                .intern(f)
+                .map_err(|m| FormatError::Csv(csv_error(&m)))?;
+            fields.push(TypeField {
+                column,
                 name: f.name.clone(),
-                column: col,
                 field_type: f.field_type.clone(),
                 format: f.format.clone(),
-                byte_range: None,
+                fixed: None,
                 csv_column: Some(csv_idx),
-                justify: None,
-                pad: " ".into(),
-                trim: true,
+                trim: f.trim.unwrap_or(true),
+                justify: f.justify.clone(),
+                pad: f.pad.clone().unwrap_or_else(|| " ".into()),
             });
         }
-        by_tag.insert(tag, ResolvedType { id, fields });
+        insert_type(
+            &mut builder.by_tag,
+            tag,
+            &rt.id,
+            ResolvedType { id, fields },
+        )
+        .map_err(|m| FormatError::Csv(csv_error(&m)))?;
     }
-
     let column = disc_column.ok_or_else(|| {
         FormatError::Csv(csv_error(
             "multi-record CSV schema declares no record types",
         ))
     })?;
-    let schema = build_superset_schema(columns);
+    let (schema, by_tag) = builder.finish();
     Ok((schema, by_tag, column))
 }
 
-/// Build the superset [`Schema`] from the ordered column-name list.
-fn build_superset_schema(columns: Vec<String>) -> Arc<Schema> {
-    columns
-        .into_iter()
-        .map(Box::<str>::from)
-        .collect::<SchemaBuilder>()
-        .build()
+/// Accumulates the superset column list and the tag map while resolving record
+/// types, enforcing the cross-type field-name/type compatibility invariant.
+struct SupersetBuilder {
+    columns: Vec<String>,
+    column_index: HashMap<String, usize>,
+    /// Declared type of each named column, to reject an incompatible re-use.
+    column_type: HashMap<String, Option<FieldType>>,
+    by_tag: HashMap<String, ResolvedType>,
 }
 
-/// Intern a field name into the shared superset column list, returning its
-/// index. A name shared across record types maps to one column slot, so a
-/// union field declared by two types is not duplicated.
-fn intern_column(
-    columns: &mut Vec<String>,
-    column_index: &mut HashMap<String, usize>,
-    name: &str,
-) -> usize {
-    if let Some(&idx) = column_index.get(name) {
-        return idx;
+impl SupersetBuilder {
+    fn new() -> Self {
+        let mut column_index = HashMap::new();
+        column_index.insert(RECORD_TYPE_COLUMN.to_string(), 0);
+        Self {
+            columns: vec![RECORD_TYPE_COLUMN.to_string()],
+            column_index,
+            column_type: HashMap::new(),
+            by_tag: HashMap::new(),
+        }
     }
-    let idx = columns.len();
-    columns.push(name.to_string());
-    column_index.insert(name.to_string(), idx);
-    idx
+
+    /// Intern a field name into the shared superset column list, returning its
+    /// index. A name shared across record types maps to one column — but only
+    /// when the declared types match; two types declaring the same field name
+    /// with incompatible types would corrupt one shared slot, so that is an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a same-named field is re-declared with a
+    /// different type.
+    fn intern(&mut self, f: &FieldDef) -> Result<usize, String> {
+        if let Some(&idx) = self.column_index.get(&f.name) {
+            let prior = self.column_type.get(&f.name).cloned().flatten();
+            if prior != f.field_type {
+                return Err(format!(
+                    "field '{}' is declared by more than one record type with incompatible \
+                     types ({prior:?} vs {:?}); a shared superset column must have one type",
+                    f.name, f.field_type
+                ));
+            }
+            return Ok(idx);
+        }
+        let idx = self.columns.len();
+        self.columns.push(f.name.clone());
+        self.column_index.insert(f.name.clone(), idx);
+        self.column_type
+            .insert(f.name.clone(), f.field_type.clone());
+        Ok(idx)
+    }
+
+    fn finish(self) -> ResolvedParts {
+        let schema = self
+            .columns
+            .into_iter()
+            .map(Box::<str>::from)
+            .collect::<SchemaBuilder>()
+            .build();
+        (schema, self.by_tag)
+    }
+}
+
+/// Insert a resolved type under its tag, rejecting a duplicate tag or id.
+fn insert_type(
+    by_tag: &mut HashMap<String, ResolvedType>,
+    tag: String,
+    id: &str,
+    rt: ResolvedType,
+) -> Result<(), String> {
+    if by_tag.contains_key(&tag) {
+        return Err(format!(
+            "discriminator tag '{tag}' is declared by more than one record type; tags must be \
+             unique"
+        ));
+    }
+    if by_tag.values().any(|t| t.id.as_ref() == id) {
+        return Err(format!(
+            "record type id '{id}' is declared more than once; ids must be unique"
+        ));
+    }
+    by_tag.insert(tag, rt);
+    Ok(())
+}
+
+/// Reject a field named `record_type`, which would collide with the reserved
+/// lead column.
+fn reject_record_type_field(name: &str) -> Result<(), String> {
+    if name == RECORD_TYPE_COLUMN {
+        return Err(format!(
+            "a record type declares a field named '{RECORD_TYPE_COLUMN}', which is reserved for \
+             the lead discriminator column; rename the field"
+        ));
+    }
+    Ok(())
 }
 
 /// Require a non-empty record-type tag, returning the trimmed tag or a
-/// format-neutral error message naming the offending type id. Each caller
-/// wraps the message in its own format-specific [`FormatError`] variant.
+/// format-neutral error message naming the offending type id.
 fn require_tag(tag: &str, id: &str) -> Result<String, String> {
     if tag.is_empty() {
         return Err(format!(
@@ -742,200 +871,82 @@ fn require_tag(tag: &str, id: &str) -> Result<String, String> {
     Ok(tag.trim().to_string())
 }
 
-/// Resolve a fixed-width field's `(start, width)` byte range from its
-/// `start` + `width`/`end`.
-fn fixed_width_range(f: &FieldDef) -> Result<(usize, usize), FormatError> {
-    let start = f.start.ok_or_else(|| {
-        FormatError::FixedWidth(format!(
-            "field '{}': multi-record fixed-width field must declare `start`",
-            f.name
-        ))
-    })?;
-    let width = if let Some(w) = f.width {
-        w
-    } else if let Some(end) = f.end {
-        end.checked_sub(start).ok_or_else(|| {
-            FormatError::FixedWidth(format!(
-                "field '{}': `end` ({end}) must be >= `start` ({start})",
-                f.name
-            ))
-        })?
-    } else {
-        return Err(FormatError::FixedWidth(format!(
-            "field '{}': multi-record fixed-width field must declare `width` or `end`",
-            f.name
-        )));
-    };
-    if width == 0 {
-        return Err(FormatError::FixedWidth(format!(
-            "field '{}': width must be > 0",
-            f.name
-        )));
-    }
-    Ok((start, width))
-}
-
-/// Extract one field's typed value from a scanned line.
-fn extract_field_value(field: &ResolvedField, line: &ScannedLine) -> Result<Value, FormatError> {
-    let raw = raw_field_text(field, line)?;
+/// Extract one field's typed value from a scanned line: pull the raw text
+/// (shared with pair collection), then coerce to the declared type.
+fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<Value, FormatError> {
+    let raw = field_raw_text(tf, line, row)?;
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    parse_typed_value(&raw, field)
+    match &tf.field_type {
+        None | Some(FieldType::String) => Ok(Value::String(raw.as_str().into())),
+        Some(ty) => field::coerce_scalar(ty, tf.format.as_deref(), &raw).map_err(|m| {
+            FormatError::InvalidRecord {
+                row,
+                message: format!("field '{}': {m}", tf.name),
+            }
+        }),
+    }
 }
 
-/// Extract a field's raw (un-typed) text from a scanned line, stripping
-/// fixed-width padding / CSV whitespace.
-fn raw_field_text(field: &ResolvedField, line: &ScannedLine) -> Result<String, FormatError> {
-    match (line, field.byte_range, field.csv_column) {
-        (ScannedLine::FixedWidth(bytes), Some((start, width)), _) => {
-            let end = start + width;
-            let slice = if end <= bytes.len() {
-                &bytes[start..end]
-            } else if start < bytes.len() {
-                &bytes[start..]
-            } else {
-                b""
-            };
-            let s = std::str::from_utf8(slice).map_err(|e| {
-                FormatError::FixedWidth(format!("field '{}': invalid UTF-8: {e}", field.name))
-            })?;
-            Ok(strip_fixed_padding(s, field).to_string())
+/// A field's raw (un-coerced) text from a scanned line, stripped of padding
+/// per its policy. Fixed-width delegates to the shared `field::field_text`
+/// (which errors on a truncated value); a CSV field honors its own
+/// `trim`/`justify`/`pad` so a user's `trim: false` or custom pad is respected.
+///
+/// # Errors
+///
+/// Returns [`FormatError::InvalidRecord`] when a fixed-width field is truncated
+/// or not valid UTF-8.
+fn field_raw_text(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<String, FormatError> {
+    match (line, tf.fixed.as_ref(), tf.csv_column) {
+        (ScannedLine::FixedWidth(bytes), Some(resolved), _) => {
+            field::field_text(resolved, bytes, row)
         }
-        (ScannedLine::Csv(rec), _, Some(idx)) => Ok(rec.get(idx).unwrap_or("").trim().to_string()),
-        // The extraction plan is bound to the line format at construction.
+        (ScannedLine::Csv(rec), _, Some(idx)) => Ok(csv_field_text(rec, idx, tf)),
         _ => Err(FormatError::SchemaInference(
             "field/line-format mismatch in multi-record extraction".into(),
         )),
     }
 }
 
-/// Strip fixed-width padding from a raw slice per the field's justification.
-fn strip_fixed_padding<'a>(raw: &'a str, field: &ResolvedField) -> &'a str {
-    if !field.trim {
-        return raw;
+/// A CSV field's raw text, honoring the field's `trim` / `justify` / `pad`
+/// policy (not a hardcoded trim), so a user's `trim: false` or custom pad on a
+/// CSV field is respected.
+fn csv_field_text(rec: &csv::StringRecord, idx: usize, tf: &TypeField) -> String {
+    let raw = rec.get(idx).unwrap_or("");
+    if !tf.trim {
+        return raw.to_string();
     }
-    let pad_char = field.pad.chars().next().unwrap_or(' ');
-    let stripped = match field.justify {
-        Some(Justify::Right) => raw.trim_start_matches(pad_char),
-        Some(Justify::Left) | None => raw.trim_end_matches(pad_char),
+    if tf.pad.is_empty() {
+        return raw.trim().to_string();
+    }
+    let stripped = match tf.justify {
+        Some(Justify::Right) => raw.trim_start_matches(tf.pad.as_str()),
+        Some(Justify::Left) | None => raw.trim_end_matches(tf.pad.as_str()),
     };
-    stripped.trim()
+    stripped.trim().to_string()
 }
 
-/// Parse a non-empty raw field string into its declared type, defaulting to a
-/// string when no type is declared.
-fn parse_typed_value(raw: &str, field: &ResolvedField) -> Result<Value, FormatError> {
-    match &field.field_type {
-        Some(FieldType::Integer) => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .map_err(|e| typed_err(field, raw, "integer", &e.to_string())),
-        Some(FieldType::Float | FieldType::Decimal) => raw
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|e| typed_err(field, raw, "float", &e.to_string())),
-        Some(FieldType::Boolean) => match raw.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
-            "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
-            _ => Err(typed_err(
-                field,
-                raw,
-                "boolean",
-                "unrecognized boolean literal",
-            )),
-        },
-        Some(FieldType::Date) => {
-            let fmt = field.format.as_deref().unwrap_or("%Y-%m-%d");
-            NaiveDate::parse_from_str(raw, fmt)
-                .map(Value::Date)
-                .map_err(|e| typed_err(field, raw, "date", &e.to_string()))
-        }
-        // String / DateTime / Object / Array carry the raw text; CXL coercion
-        // and downstream schema binding refine them. This mirrors the
-        // all-string posture of the CSV and EDI readers.
-        _ => Ok(Value::String(raw.into())),
-    }
-}
-
-/// Build a typed-parse [`FormatError`] naming the field, value, and declared
-/// type.
-fn typed_err(field: &ResolvedField, raw: &str, ty: &str, detail: &str) -> FormatError {
-    FormatError::InvalidRecord {
-        row: 0,
-        message: format!(
-            "multi-record field '{}': cannot parse {raw:?} as {ty}: {detail}",
-            field.name
-        ),
-    }
-}
-
-/// Pair each declared field of a matched type with its raw string value,
-/// keyed by the declared field name. Drives header-section coercion (the
-/// pre-scan) and trailer-field capture.
-fn named_pairs(
+/// Collect each declared field of a matched type with its raw string value,
+/// keyed by the declared field name (drives trailer-field capture and the
+/// header pre-scan).
+fn collect_named_pairs(
     rt: &ResolvedType,
     line: &ScannedLine,
+    row: u64,
 ) -> Result<Vec<(String, String)>, FormatError> {
     let mut pairs = Vec::with_capacity(rt.fields.len());
-    for field in &rt.fields {
-        pairs.push((field.name.clone(), raw_field_text(field, line)?));
+    for tf in &rt.fields {
+        pairs.push((tf.name.clone(), field_raw_text(tf, line, row)?));
     }
     Ok(pairs)
 }
 
-/// Read one fixed-width physical line (delimited or fixed-length) into
-/// `line_buf`, returning `false` at end of input.
-fn read_fixed_line<R: Read>(
-    reader: &mut BufReader<SkipBom<R>>,
-    separator: &LineSeparator,
-    record_length: usize,
-    line_buf: &mut Vec<u8>,
-) -> Result<bool, FormatError> {
-    line_buf.clear();
-    match separator {
-        LineSeparator::Lf => {
-            let n = reader.read_until(b'\n', line_buf)?;
-            if n == 0 {
-                return Ok(false);
-            }
-            if line_buf.last() == Some(&b'\n') {
-                line_buf.pop();
-            }
-        }
-        LineSeparator::CrLf => {
-            let n = reader.read_until(b'\n', line_buf)?;
-            if n == 0 {
-                return Ok(false);
-            }
-            if line_buf.ends_with(b"\r\n") {
-                line_buf.truncate(line_buf.len() - 2);
-            } else if line_buf.last() == Some(&b'\n') {
-                line_buf.pop();
-            }
-        }
-        LineSeparator::None => {
-            line_buf.resize(record_length, 0);
-            let mut total = 0;
-            while total < record_length {
-                let n = reader.read(&mut line_buf[total..])?;
-                if n == 0 {
-                    if total == 0 {
-                        return Ok(false);
-                    }
-                    return Err(FormatError::InvalidRecord {
-                        row: 0,
-                        message: format!(
-                            "incomplete fixed-width record: expected {record_length} bytes, got \
-                             {total}"
-                        ),
-                    });
-                }
-                total += n;
-            }
-        }
-    }
-    Ok(true)
+/// `true` when a CSV row carries no field content (no fields, or every field
+/// empty after trimming).
+fn csv_row_is_blank(rec: &csv::StringRecord) -> bool {
+    rec.iter().all(|f| f.trim().is_empty())
 }
 
 /// Build a `csv::Error` carrying a custom message.
@@ -976,29 +987,10 @@ mod tests {
     }
 
     fn csv_field(name: &str, ty: Option<FieldType>) -> FieldDef {
-        FieldDef {
-            name: name.into(),
-            field_type: ty,
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            start: None,
-            width: None,
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-            drop: None,
-            record: None,
-        }
+        let mut f = fw_field(name, 0, 1, ty);
+        f.start = None;
+        f.width = None;
+        f
     }
 
     fn rtype(id: &str, tag: &str, fields: Vec<FieldDef>) -> RecordTypeDef {
@@ -1017,6 +1009,14 @@ mod tests {
             start: Some(start),
             width: Some(width),
             field: None,
+        }
+    }
+
+    fn csv_disc(field: &str) -> Discriminator {
+        Discriminator {
+            start: None,
+            width: None,
+            field: Some(field.into()),
         }
     }
 
@@ -1039,6 +1039,31 @@ mod tests {
         ]
     }
 
+    fn fw_reader<R: Read>(
+        reader: R,
+        types: Vec<RecordTypeDef>,
+        structure: Vec<StructureConstraint>,
+        header_tags: Vec<String>,
+    ) -> Result<MultiRecordReader<R>, FormatError> {
+        MultiRecordReader::new_fixed_width(
+            reader,
+            MultiRecordSpec {
+                discriminator: fw_disc(0, 1),
+                record_types: types,
+                structure,
+                header_tags,
+            },
+            LineSeparator::Lf,
+        )
+    }
+
+    fn trailer_constraint() -> Vec<StructureConstraint> {
+        vec![StructureConstraint {
+            record: "trailer".into(),
+            count: "count".into(),
+        }]
+    }
+
     fn collect<R: Read + Send>(mut reader: MultiRecordReader<R>) -> Vec<Record> {
         let mut out = Vec::new();
         while let Some(r) = reader.next_record().unwrap() {
@@ -1047,24 +1072,20 @@ mod tests {
         out
     }
 
+    fn drain_err<R: Read + Send>(mut reader: MultiRecordReader<R>) -> FormatError {
+        loop {
+            match reader.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected an error, got clean end"),
+                Err(e) => return e,
+            }
+        }
+    }
+
     #[test]
     fn fixed_width_discriminates_body_records_on_superset_schema() {
-        // H header, two D bodies, T trailer. Without an envelope the header is
-        // an ordinary record type, so the H row streams as a body record too;
-        // the discriminator column tells them apart.
         let data = b"HREPORT   \nD00001 100\nD00002 200\nT00002    \n";
-        let reader = MultiRecordReader::new_fixed_width(
-            &data[..],
-            MultiRecordSpec {
-                discriminator: &fw_disc(0, 1),
-                record_types: &fw_types(),
-                structure: Vec::new(),
-                header_tags: Vec::new(),
-                fail_fast: true,
-            },
-            LineSeparator::Lf,
-        )
-        .unwrap();
+        let reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
         let recs = collect(reader);
         // 1 header + 2 detail + 1 trailer = 4 records (no envelope, no
         // structural constraint, so every type is a body record).
@@ -1073,14 +1094,8 @@ mod tests {
             recs[0].get(RECORD_TYPE_COLUMN),
             Some(&Value::String("header".into()))
         );
-        assert_eq!(
-            recs[1].get(RECORD_TYPE_COLUMN),
-            Some(&Value::String("detail".into()))
-        );
         assert_eq!(recs[1].get("id"), Some(&Value::Integer(1)));
         assert_eq!(recs[1].get("amount"), Some(&Value::Integer(100)));
-        // A detail row leaves the header/trailer-only `batch`/`count` columns
-        // null — the superset slots it does not fill.
         assert_eq!(recs[1].get("batch"), Some(&Value::Null));
         assert_eq!(recs[1].get("count"), Some(&Value::Null));
         assert_eq!(
@@ -1090,74 +1105,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_fail_fast_errors_with_e345() {
+    fn unknown_tag_is_a_structural_count_error_with_e345() {
         let data = b"D00001 100\nX99999 999\n";
-        let mut reader = MultiRecordReader::new_fixed_width(
-            &data[..],
-            MultiRecordSpec {
-                discriminator: &fw_disc(0, 1),
-                record_types: &fw_types(),
-                structure: Vec::new(),
-                header_tags: Vec::new(),
-                fail_fast: true,
-            },
-            LineSeparator::Lf,
-        )
-        .unwrap();
-        // First row is a valid detail.
+        let mut reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
         assert!(reader.next_record().unwrap().is_some());
         let err = reader.next_record().unwrap_err();
+        assert!(
+            err.is_structural_count(),
+            "must route through the document DLQ seam"
+        );
         let msg = err.to_string();
         assert!(msg.contains("E345"), "expected E345 in: {msg}");
         assert!(msg.contains("\"X\""), "should name the unknown tag: {msg}");
+        assert!(
+            msg.contains("line 2"),
+            "should name the physical line: {msg}"
+        );
     }
 
     #[test]
-    fn unknown_tag_non_fail_fast_dead_letters_record() {
-        let data = b"D00001 100\nX99999 999\nD00002 200\n";
-        let mut reader = MultiRecordReader::new_fixed_width(
-            &data[..],
-            MultiRecordSpec {
-                discriminator: &fw_disc(0, 1),
-                record_types: &fw_types(),
-                structure: Vec::new(),
-                header_tags: Vec::new(),
-                fail_fast: false,
-            },
-            LineSeparator::Lf,
-        )
-        .unwrap();
-        // First detail streams.
-        assert!(reader.next_record().unwrap().is_some());
-        // The unknown row surfaces a record-level (DLQ-able) error, not a
-        // fail-fast abort.
-        let err = reader.next_record().unwrap_err();
-        assert!(matches!(err, FormatError::InvalidRecord { .. }));
-        assert!(err.to_string().contains("E345"));
-    }
-
-    #[test]
-    fn trailer_count_matches_body_count() {
-        // Envelope declares H as a header section and the trailer T's count is
-        // structurally validated; two D body rows; T claims 2.
+    fn trailer_count_matches_body_count_with_header_doc() {
         let data = b"HREPORT   \nD00001 100\nD00002 200\nT00002    \n";
-        let structure = vec![StructureConstraint {
-            record: "trailer".into(),
-            count: "count".into(),
-        }];
-        let mut reader = MultiRecordReader::new_fixed_width(
+        let mut reader = fw_reader(
             &data[..],
-            MultiRecordSpec {
-                discriminator: &fw_disc(0, 1),
-                record_types: &fw_types(),
-                structure,
-                header_tags: vec!["H".to_string()],
-                fail_fast: true,
-            },
-            LineSeparator::Lf,
+            fw_types(),
+            trailer_constraint(),
+            vec!["H".to_string()],
         )
         .unwrap();
-        // Pre-scan the H header so the H row is captured (not a body record).
         let mut cfg = EnvelopeConfig::default();
         let mut fields = IndexMap::new();
         fields.insert(
@@ -1177,8 +1152,6 @@ mod tests {
             other => panic!("expected map: {other:?}"),
         };
         assert_eq!(head.get("batch"), Some(&Value::String("REPORT".into())));
-        // Body streams: two D rows; the T trailer feeds structural validation,
-        // which passes at end of input (count 2 == 2 body rows).
         let recs = collect(reader);
         assert_eq!(recs.len(), 2);
         assert!(
@@ -1189,40 +1162,152 @@ mod tests {
 
     #[test]
     fn trailer_count_mismatch_errors() {
-        // T claims 5 but only two D rows stream.
         let data = b"D00001 100\nD00002 200\nT00005    \n";
-        let structure = vec![StructureConstraint {
-            record: "trailer".into(),
-            count: "count".into(),
-        }];
-        let mut reader = MultiRecordReader::new_fixed_width(
-            &data[..],
-            MultiRecordSpec {
-                discriminator: &fw_disc(0, 1),
-                record_types: &fw_types(),
-                structure,
-                header_tags: Vec::new(),
-                fail_fast: true,
-            },
-            LineSeparator::Lf,
-        )
-        .unwrap();
-        let err = loop {
-            match reader.next_record() {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("expected a trailer-count mismatch"),
-                Err(e) => break e,
-            }
-        };
+        let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
+        let err = drain_err(reader);
+        assert!(err.is_structural_count());
         let msg = err.to_string();
         assert!(msg.contains("declares count 5"), "msg: {msg}");
         assert!(msg.contains("2 body records"), "msg: {msg}");
     }
 
     #[test]
-    fn csv_discriminates_on_named_column() {
-        // rec_type is column 0 in every type; ragged rows (different column
-        // counts per type) parse under flexible(true).
+    fn missing_trailer_errors_as_incomplete_document() {
+        // Two detail rows, no trailer at all, but a trailer is declared.
+        let data = b"D00001 100\nD00002 200\n";
+        let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
+        let err = drain_err(reader);
+        assert!(err.is_structural_count());
+        assert!(err.to_string().contains("incomplete"), "{err}");
+    }
+
+    #[test]
+    fn post_trailer_body_row_is_a_structural_error() {
+        // A detail row after the trailer that closes the document.
+        let data = b"D00001 100\nT00001    \nD00002 200\n";
+        let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
+        let err = drain_err(reader);
+        assert!(err.is_structural_count());
+        assert!(err.to_string().contains("after the trailer"), "{err}");
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_not_aborting() {
+        // A blank line between body rows (common after concatenation) is
+        // skipped, not treated as a too-short discriminator error.
+        let data = b"D00001 100\n\n   \nD00002 200\n";
+        let reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
+        let recs = collect(reader);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].get("id"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn truncated_body_field_errors_not_silent_partial() {
+        // The amount field (bytes 6..10) is cut off: "D00002 20" stops at 9
+        // bytes, so amount would slice "20" — must error, not return 20.
+        let data = b"D00002 20";
+        let reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
+        let err = drain_err(reader);
+        assert!(
+            err.to_string().contains("truncated"),
+            "truncated field must error: {err}"
+        );
+    }
+
+    #[test]
+    fn truncated_trailer_count_errors() {
+        // The trailer line is cut before the count field's value: "T" with no
+        // digits → the count column is absent/empty.
+        let data = b"D00001 100\nT\n";
+        let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
+        let err = drain_err(reader);
+        assert!(err.is_structural_count());
+        assert!(
+            err.to_string().contains("truncated") || err.to_string().contains("no value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn record_type_field_name_is_rejected() {
+        // A field literally named `record_type` would overwrite the stamped id.
+        let types = vec![rtype(
+            "detail",
+            "D",
+            vec![fw_field("record_type", 1, 1, None)],
+        )];
+        let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
+            Ok(_) => panic!("expected a reserved-name error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_tag_is_rejected() {
+        let types = vec![
+            rtype("a", "D", vec![fw_field("x", 1, 3, None)]),
+            rtype("b", "D", vec![fw_field("y", 1, 3, None)]),
+        ];
+        let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
+            Ok(_) => panic!("expected a duplicate-tag error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unique"), "{err}");
+    }
+
+    #[test]
+    fn incompatible_same_named_field_across_types_is_rejected() {
+        // `ref` is string in one type, integer in another — one shared column
+        // cannot carry both.
+        let types = vec![
+            rtype(
+                "a",
+                "A",
+                vec![fw_field("ref", 1, 4, Some(FieldType::String))],
+            ),
+            rtype(
+                "b",
+                "B",
+                vec![fw_field("ref", 1, 4, Some(FieldType::Integer))],
+            ),
+        ];
+        let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
+            Ok(_) => panic!("expected an incompatible-type error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("incompatible"), "{err}");
+    }
+
+    #[test]
+    fn structure_naming_unknown_record_is_rejected() {
+        let bad = vec![StructureConstraint {
+            record: "nonexistent".into(),
+            count: "count".into(),
+        }];
+        let err = match fw_reader(&b""[..], fw_types(), bad, Vec::new()) {
+            Ok(_) => panic!("expected an unknown-record error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no `records:`"), "{err}");
+    }
+
+    #[test]
+    fn multi_char_pad_is_stripped_as_a_unit() {
+        // A left-justified field padded with the multi-char string "ab":
+        // "42abab" strips trailing "ab" runs as a unit → "42". The old reader
+        // honored only the first pad char, so a multi-char pad leaked.
+        let mut field = fw_field("v", 0, 6, Some(FieldType::Integer));
+        field.justify = Some(Justify::Left);
+        field.pad = Some("ab".into());
+        let resolved = ResolvedField::from_field_def(&field).unwrap();
+        let v = field::extract_value(&resolved, b"42abab", 1).unwrap();
+        assert_eq!(v, Value::Integer(42));
+    }
+
+    #[test]
+    fn csv_discriminates_and_honors_field_types() {
         let data = "H,2024-01-01\nD,1,100\nD,2,200\nT,2\n";
         let types = vec![
             rtype(
@@ -1248,61 +1333,106 @@ mod tests {
                 ],
             ),
         ];
-        let disc = Discriminator {
-            start: None,
-            width: None,
-            field: Some("rec_type".into()),
-        };
         let reader = MultiRecordReader::new_csv(
             Cursor::new(data.as_bytes().to_vec()),
             MultiRecordSpec {
-                discriminator: &disc,
-                record_types: &types,
+                discriminator: csv_disc("rec_type"),
+                record_types: types,
                 structure: Vec::new(),
                 header_tags: Vec::new(),
-                fail_fast: true,
             },
-            b',',
-            b'"',
+            CsvDialect {
+                delimiter: b',',
+                quote_char: b'"',
+                has_header: false,
+            },
         )
         .unwrap();
         let recs = collect(reader);
-        // 1 H + 2 D + 1 T = 4 (no envelope/structure).
         assert_eq!(recs.len(), 4);
         assert_eq!(recs[1].get("id"), Some(&Value::Integer(1)));
         assert_eq!(recs[1].get("amount"), Some(&Value::Integer(100)));
-        // A ragged D row does not fill the H-only run_date column.
         assert_eq!(recs[1].get("run_date"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn csv_header_row_is_skipped() {
+        // A textual column-header row precedes the data; has_header skips it.
+        let data = "rec_type,id,amount\nD,1,100\nT,1\n";
+        let types = vec![
+            rtype(
+                "detail",
+                "D",
+                vec![
+                    csv_field("rec_type", None),
+                    csv_field("id", Some(FieldType::Integer)),
+                    csv_field("amount", Some(FieldType::Integer)),
+                ],
+            ),
+            rtype(
+                "trailer",
+                "T",
+                vec![
+                    csv_field("rec_type", None),
+                    csv_field("count", Some(FieldType::Integer)),
+                ],
+            ),
+        ];
+        let reader = MultiRecordReader::new_csv(
+            Cursor::new(data.as_bytes().to_vec()),
+            MultiRecordSpec {
+                discriminator: csv_disc("rec_type"),
+                record_types: types,
+                structure: vec![StructureConstraint {
+                    record: "trailer".into(),
+                    count: "count".into(),
+                }],
+                header_tags: Vec::new(),
+            },
+            CsvDialect {
+                delimiter: b',',
+                quote_char: b'"',
+                has_header: true,
+            },
+        )
+        .unwrap();
+        let recs = collect(reader);
+        // The "rec_type,id,amount" header row is skipped → only one D body row,
+        // and the trailer count of 1 validates against it.
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].get("id"), Some(&Value::Integer(1)));
     }
 
     #[test]
     fn csv_discriminator_absent_from_a_type_errors() {
         let types = vec![
             rtype("header", "H", vec![csv_field("rec_type", None)]),
-            // detail omits rec_type — construction must reject it.
             rtype("detail", "D", vec![csv_field("id", None)]),
         ];
-        let disc = Discriminator {
-            start: None,
-            width: None,
-            field: Some("rec_type".into()),
-        };
         let result = MultiRecordReader::new_csv(
             Cursor::new(Vec::new()),
             MultiRecordSpec {
-                discriminator: &disc,
-                record_types: &types,
+                discriminator: csv_disc("rec_type"),
+                record_types: types,
                 structure: Vec::new(),
                 header_tags: Vec::new(),
-                fail_fast: true,
             },
-            b',',
-            b'"',
+            CsvDialect {
+                delimiter: b',',
+                quote_char: b'"',
+                has_header: false,
+            },
         );
         let err = match result {
             Ok(_) => panic!("expected discriminator-absent error"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("absent from record type"));
+    }
+
+    #[test]
+    fn empty_file_yields_no_records() {
+        let reader = fw_reader(&b""[..], fw_types(), Vec::new(), Vec::new()).unwrap();
+        assert!(collect(reader).is_empty());
     }
 }
