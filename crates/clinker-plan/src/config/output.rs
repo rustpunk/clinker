@@ -65,6 +65,19 @@ pub struct OutputConfig {
     /// output stream is flushed. Opt-in.
     #[serde(default, skip_serializing_if = "is_false_bool")]
     pub write_meta: bool,
+    /// Reconstruct the per-document output envelope around each document's
+    /// body records: the writer's `begin_document` fires on a document's
+    /// opening boundary, its records stream straight through, and
+    /// `end_document` fires on the closing boundary. When set, the executor
+    /// routes this Output's input through the punctuation-aware arm (reading
+    /// the interleaved record/boundary stream) instead of the records-only
+    /// fast path, and excludes the Output from the fused streaming-writer
+    /// thread so the materialized `DocumentClose` reaches the writer in band.
+    /// Records still stream one at a time across the boundary — no document
+    /// is buffered. Opt-in; writers render no framing until a format
+    /// implements `begin_document` / `end_document`.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub reconstruct_envelope: bool,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.

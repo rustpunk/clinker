@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{DocumentContext, Record, Schema, Value};
 use indexmap::IndexMap;
 
 use crate::envelope::{EnvelopeConfig, EnvelopeEvent};
@@ -98,6 +98,40 @@ pub trait FormatReader: Send {
 pub trait FormatWriter: Send {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError>;
     fn flush(&mut self) -> Result<(), FormatError>;
+
+    /// Emit any per-document opening framing (an envelope header) before the
+    /// document's first body record streams. Called by the Output dispatch
+    /// arm on a document's OUTERMOST `DocumentOpen`, passing the same
+    /// [`DocumentContext`] the body records carry so the writer can read its
+    /// envelope sections. The body records then flow through
+    /// [`Self::write_record`] one at a time, and [`Self::end_document`] closes
+    /// the framing — no document is ever buffered, so a writer that renders an
+    /// envelope still streams at O(1-record).
+    ///
+    /// Default impl is a no-op: a writer that does not reconstruct envelopes
+    /// (every writer today) ignores document boundaries entirely, leaving its
+    /// output byte-identical to the boundary-unaware path.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any I/O error emitting the opening framing.
+    fn begin_document(&mut self, _doc: &DocumentContext) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    /// Emit any per-document closing framing (an envelope footer / trailer)
+    /// after the document's last body record has been written. Called by the
+    /// Output dispatch arm on a document's OUTERMOST `DocumentClose`, paired
+    /// with the [`Self::begin_document`] that opened it.
+    ///
+    /// Default impl is a no-op, mirroring [`Self::begin_document`].
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any I/O error emitting the closing framing.
+    fn end_document(&mut self, _doc: &DocumentContext) -> Result<(), FormatError> {
+        Ok(())
+    }
 
     /// Bytes written to the underlying I/O sink since this writer was created.
     /// Returns `None` if byte counting is not enabled for this writer.

@@ -67,7 +67,15 @@ pub(super) fn compute_streaming_output_specs(
     // per-document Output buffer flushes or rejects each document at its
     // materialized `DocumentClose`, which a streaming-Output thread would
     // consume out of band before the buffer could decide the document.
-    if config.any_source_has_correlation_key() || config.any_source_has_document_dlq() {
+    // Envelope reconstruction disables it on the same axis: the
+    // punctuation-aware Output arm fires the writer's `begin_document` /
+    // `end_document` at the materialized boundaries, so a streaming-Output
+    // thread consuming the `DocumentClose` out of band would strand the
+    // footer.
+    if config.any_source_has_correlation_key()
+        || config.any_source_has_document_dlq()
+        || config.any_output_reconstructs_envelope()
+    {
         return Vec::new();
     }
 
@@ -414,12 +422,14 @@ impl StreamingConsumer for OutputStreamConsumer {
     }
 
     fn on_punctuation(&mut self, _punct: Punctuation) {
-        // Streaming output is terminal — it writes records straight to
-        // disk, so a document boundary needs no writer action here.
-        // Per-document writer finalization (envelope header/footer
-        // streaming reconstruction on `DocumentClose`) is a separate piece
-        // of work; until then punctuations are discarded, byte-for-byte
-        // matching the buffered Output path.
+        // Streaming output is terminal — it writes records straight to disk,
+        // so a document boundary needs no writer action here. An Output that
+        // declares `reconstruct_envelope: true` (where the boundary DOES drive
+        // a writer's `begin_document` / `end_document`) is excluded from this
+        // fused path at spec-build time, so no envelope-reconstructing Output
+        // ever reaches this consumer; the boundaries it would discard belong
+        // only to plain writers that render no framing, leaving the streamed
+        // output byte-identical to the boundary-unaware buffered path.
     }
 
     fn on_close(&mut self) {

@@ -248,6 +248,16 @@ impl PipelineConfig {
             .any(|s| s.dlq_granularity == DlqGranularity::Document)
     }
 
+    /// Whether any Output declares `reconstruct_envelope: true`. Gates the
+    /// fused streaming-writer fast path off pipeline-wide, mirroring
+    /// `any_source_has_document_dlq`: an envelope-reconstructing Output reads
+    /// the materialized `DocumentClose` punctuation in band to fire its
+    /// writer's `end_document`, which a streaming-Output thread would consume
+    /// out of band before the boundary could reach the writer.
+    pub fn any_output_reconstructs_envelope(&self) -> bool {
+        self.output_configs().any(|o| o.reconstruct_envelope)
+    }
+
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
