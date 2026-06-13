@@ -274,6 +274,51 @@ fn eval_project_capturing(
     (project(&result), snapshot_side_effects(&stable))
 }
 
+/// Evaluate `src` through the compiled evaluator with an explicit
+/// `Arc<DocumentContext>` bound as the per-record envelope context, so the
+/// compiled `Expr::DocAccess` lowering resolves `$doc.*` against real
+/// sections rather than the empty synthetic context.
+///
+/// Runs through the live `ProgramEvaluator::eval_record` entry, so the
+/// `DocAccess` (and any wrapping `IndexAccess`) closure under test is the
+/// exact one production lowers — not a test-local re-implementation.
+fn eval_project_with_doc(
+    src: &str,
+    fields: &[&str],
+    record: HashMap<String, Value>,
+    doc_ctx: &Arc<clinker_record::DocumentContext>,
+) -> ResultProjection {
+    let typed = type_program(src, fields);
+    let has_distinct = program_has_distinct(&typed);
+
+    let stable = StableEvalContext::test_default();
+    let resolver = HashMapResolver::new(record);
+
+    let mut ctx = EvalContext::test_default_borrowed(&stable);
+    ctx.doc_ctx = doc_ctx;
+    let mut eval = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+    let result = eval.eval_record::<NullStorage>(&ctx, &resolver, None);
+    project(&result)
+}
+
+/// Build a `DocumentContext` whose single section `name` holds the given
+/// `(field, Value)` payload as a `Value::Map`. Field values may themselves
+/// be `Value::Array` / `Value::Map` to exercise indexed `$doc` chains.
+fn doc_with_section(name: &str, fields: &[(&str, Value)]) -> Arc<clinker_record::DocumentContext> {
+    use clinker_record::{DocumentContext, DocumentId};
+    let mut payload = indexmap::IndexMap::new();
+    for (k, v) in fields {
+        payload.insert(Box::from(*k), v.clone());
+    }
+    let mut sections = indexmap::IndexMap::new();
+    sections.insert(Box::from(name), Value::Map(Box::new(payload)));
+    Arc::new(DocumentContext::new(
+        DocumentId::next(),
+        Arc::from("proof.json"),
+        sections,
+    ))
+}
+
 // ── Corpus: the scalar core ───────────────────────────────
 
 /// The full three-valued Kleene truth table for `and` / `or`, every cell
@@ -887,6 +932,167 @@ fn index_access() {
             "emit out = nums[0 - 1]",
             &["nums"],
             HashMap::from([("nums".to_string(), nums())]),
+        ),
+        emit(Value::Null),
+    );
+}
+
+/// `$doc.<section>.<field>` through the compiled `Expr::DocAccess`
+/// lowering: a present field resolves to its value; an undeclared section
+/// or a missing field resolves to `Null` (never an error).
+#[test]
+fn doc_access_scalar_present_and_missing() {
+    let doc = doc_with_section(
+        "Head",
+        &[
+            ("batch_id", Value::String("RUN-001".into())),
+            ("count", Value::Integer(7)),
+        ],
+    );
+    let emit = |v: Value| ResultProjection::Emit {
+        fields: vec![("out".to_string(), v)],
+        record_vars: vec![],
+    };
+
+    // Present field → its value.
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.Head.batch_id", &[], HashMap::new(), &doc),
+        emit(Value::String("RUN-001".into())),
+    );
+    // Undeclared section → Null.
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.Foot.batch_id", &[], HashMap::new(), &doc),
+        emit(Value::Null),
+    );
+    // Declared section, missing field → Null.
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.Head.missing", &[], HashMap::new(), &doc),
+        emit(Value::Null),
+    );
+}
+
+/// `$doc` against a synthetic/empty document context resolves every path to
+/// `Null` — the record-free / undeclared-source default.
+#[test]
+fn doc_access_against_empty_context_is_null() {
+    use clinker_record::synthetic_document_context;
+    let doc = synthetic_document_context();
+    let emit = |v: Value| ResultProjection::Emit {
+        fields: vec![("out".to_string(), v)],
+        record_vars: vec![],
+    };
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.any.field", &[], HashMap::new(), &doc),
+        emit(Value::Null),
+    );
+}
+
+/// Indexed `$doc` access: a `$doc.<section>.<field>` whose field is a
+/// `Value::Array` indexes by integer — in-range yields the element,
+/// out-of-range yields `Null` with no panic. This is the compiled
+/// `IndexAccess` lowering wrapping the `DocAccess` leaf.
+#[test]
+fn doc_access_array_index_in_and_out_of_range() {
+    let doc = doc_with_section(
+        "Head",
+        &[(
+            "items",
+            Value::Array(vec![
+                Value::Integer(10),
+                Value::Integer(20),
+                Value::Integer(30),
+            ]),
+        )],
+    );
+    let emit = |v: Value| ResultProjection::Emit {
+        fields: vec![("out".to_string(), v)],
+        record_vars: vec![],
+    };
+    // In-range: items[0] → 10.
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.Head.items[0]", &[], HashMap::new(), &doc),
+        emit(Value::Integer(10)),
+    );
+    // Out-of-range → Null (no panic).
+    assert_eq!(
+        eval_project_with_doc("emit out = $doc.Head.items[9]", &[], HashMap::new(), &doc),
+        emit(Value::Null),
+    );
+}
+
+/// Keyed `$doc` access: a `$doc.<section>.<field>` whose field is a
+/// `Value::Map` indexes by string key — present yields the value, missing
+/// yields `Null`.
+#[test]
+fn doc_access_map_key_present_and_missing() {
+    let mut meta = indexmap::IndexMap::new();
+    meta.insert(Box::from("region"), Value::String("us-east".into()));
+    let doc = doc_with_section("Head", &[("meta", Value::Map(Box::new(meta)))]);
+    let emit = |v: Value| ResultProjection::Emit {
+        fields: vec![("out".to_string(), v)],
+        record_vars: vec![],
+    };
+    // Present key.
+    assert_eq!(
+        eval_project_with_doc(
+            "emit out = $doc.Head.meta[\"region\"]",
+            &[],
+            HashMap::new(),
+            &doc
+        ),
+        emit(Value::String("us-east".into())),
+    );
+    // Missing key → Null.
+    assert_eq!(
+        eval_project_with_doc(
+            "emit out = $doc.Head.meta[\"absent\"]",
+            &[],
+            HashMap::new(),
+            &doc
+        ),
+        emit(Value::Null),
+    );
+}
+
+/// Nested `$doc` chain: `$doc.<section>.<field>[i]["k"]` resolves through an
+/// array-of-maps. An out-of-range link short-circuits the whole chain to
+/// `Null` — the `IndexAccess` null-receiver gate means the trailing key
+/// access never runs against a non-map.
+#[test]
+fn doc_access_nested_chain_short_circuits_on_out_of_range() {
+    let mut row0 = indexmap::IndexMap::new();
+    row0.insert(Box::from("k"), Value::String("v0".into()));
+    let mut row1 = indexmap::IndexMap::new();
+    row1.insert(Box::from("k"), Value::String("v1".into()));
+    let doc = doc_with_section(
+        "Head",
+        &[(
+            "items",
+            Value::Array(vec![Value::Map(Box::new(row0)), Value::Map(Box::new(row1))]),
+        )],
+    );
+    let emit = |v: Value| ResultProjection::Emit {
+        fields: vec![("out".to_string(), v)],
+        record_vars: vec![],
+    };
+    // In-range chain: items[1]["k"] → "v1".
+    assert_eq!(
+        eval_project_with_doc(
+            "emit out = $doc.Head.items[1][\"k\"]",
+            &[],
+            HashMap::new(),
+            &doc
+        ),
+        emit(Value::String("v1".into())),
+    );
+    // Out-of-range first link short-circuits: items[9] is Null, so the
+    // trailing ["k"] resolves to Null instead of panicking.
+    assert_eq!(
+        eval_project_with_doc(
+            "emit out = $doc.Head.items[9][\"k\"]",
+            &[],
+            HashMap::new(),
+            &doc
         ),
         emit(Value::Null),
     );

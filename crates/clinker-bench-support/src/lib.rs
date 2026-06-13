@@ -97,6 +97,7 @@ pub use generators::fixed_width::{
     BenchFieldSpec, BenchFieldType, BenchJustify, field_specs_for, generate_fixed_width,
 };
 pub use generators::json::{generate_json_array, generate_ndjson};
+pub use generators::nested_envelope::{write_nested_envelope_json, write_nested_envelope_xml};
 pub use generators::xml::generate_xml;
 
 // ── Scale constants ────────────────────────────────────────────────
