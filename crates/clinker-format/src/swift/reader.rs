@@ -99,15 +99,9 @@ pub struct SwiftReader<R: Read> {
     /// The block-4 field lines, framed at first body pull and drained one
     /// record per `next_record`.
     body_lines: std::collections::VecDeque<ParsedBlock4Line>,
-    /// `true` once the message-level `OpenLevel` has been queued.
+    /// `true` once the message-level `OpenLevel` has been queued, so the
+    /// matching `CloseLevel` is queued exactly once at end-of-message.
     level_open: bool,
-    /// `true` once the matching `CloseLevel` has been queued, so it is queued
-    /// exactly once — on the final record-bearing pull (the moment the body
-    /// is known drained), not the trailing `Ok(None)` pull. Queuing it with
-    /// the last record means a multi-file wrapper forwards the precise close
-    /// before it advances to the next file, rather than relying on the
-    /// driver's file-boundary stack sweep.
-    level_closed: bool,
     /// Nested-envelope events queued during the most recent `next_record`,
     /// drained by the driver via [`FormatReader::take_envelope_events`].
     pending_events: Vec<EnvelopeEvent>,
@@ -129,7 +123,6 @@ impl<R: Read> SwiftReader<R> {
             trailer: None,
             body_lines: std::collections::VecDeque::new(),
             level_open: false,
-            level_closed: false,
             pending_events: Vec::new(),
             done: false,
         }
@@ -197,8 +190,17 @@ impl<R: Read> SwiftReader<R> {
     }
 
     /// Pull the next body record, queuing the message-level `OpenLevel`
-    /// before the first record and the matching `CloseLevel` the moment the
-    /// body is known drained. Returns `None` at clean end of message.
+    /// before the first record and the matching `CloseLevel` once the body is
+    /// drained. Returns `None` at clean end of message.
+    ///
+    /// The `CloseLevel` rides the terminal `Ok(None)` pull, not the final
+    /// record-bearing one: the source ingest driver drains
+    /// [`FormatReader::take_envelope_events`] and applies each boundary
+    /// *before* it pushes the record that pull returned, so a close queued
+    /// alongside the last record would be applied ahead of that record and
+    /// strand it outside its own document level. Queuing on the `None` pull
+    /// keeps every body record inside the message level and the close after
+    /// the message's last record.
     fn pull_next(&mut self) -> Result<Option<Record>, FormatError> {
         if !self.level_open {
             // One message = one nested document level wrapping the block-4
@@ -210,24 +212,14 @@ impl<R: Read> SwiftReader<R> {
             });
             self.level_open = true;
         }
-        let record = self
-            .body_lines
-            .pop_front()
-            .map(|line| self.body_record(&line));
-        // Close the level the instant the body is drained — on the final
-        // record-bearing pull (`body_lines` now empty) for a message with a
-        // body, or immediately for a header-only message. Queuing the
-        // `CloseLevel` with the last record (rather than on the trailing
-        // `Ok(None)` pull) means a multi-file source forwards the precise
-        // close before the wrapper advances to the next file.
-        if !self.level_closed && self.body_lines.is_empty() {
-            self.pending_events.push(EnvelopeEvent::CloseLevel);
-            self.level_closed = true;
+        match self.body_lines.pop_front() {
+            Some(line) => Ok(Some(self.body_record(&line))),
+            None => {
+                self.pending_events.push(EnvelopeEvent::CloseLevel);
+                self.done = true;
+                Ok(None)
+            }
         }
-        if record.is_none() {
-            self.done = true;
-        }
-        Ok(record)
     }
 
     /// Map one block-4 field line to a `[block, tag, value]` record. `block`
