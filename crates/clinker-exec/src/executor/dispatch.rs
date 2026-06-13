@@ -285,6 +285,7 @@ pub(crate) fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupB
             | Some(FieldMetadata::SourceFile)
             | Some(FieldMetadata::SourceName)
             | Some(FieldMetadata::SourceEventTime)
+            | Some(FieldMetadata::ReshapeAudit)
             | None => {}
         }
     }
@@ -1618,6 +1619,7 @@ pub(crate) fn build_engine_stamped_tail(target: &Arc<Schema>) -> Vec<(usize, Box
             | Some(clinker_record::FieldMetadata::SourceFile)
             | Some(clinker_record::FieldMetadata::SourceName)
             | Some(clinker_record::FieldMetadata::SourceEventTime)
+            | Some(clinker_record::FieldMetadata::ReshapeAudit)
             | None => None,
         })
         .collect()
@@ -2700,6 +2702,10 @@ pub(crate) fn dispatch_plan_node(
 
         PlanNode::Output { .. } => {
             crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)?;
+        }
+
+        PlanNode::Reshape { .. } => {
+            crate::executor::reshape_dispatch::dispatch_reshape(ctx, current_dag, node_idx, &node)?;
         }
 
         PlanNode::Composition { .. } => {

@@ -17,6 +17,7 @@ pub(crate) mod node_buffer_spill;
 pub(crate) mod output_dispatch;
 mod params;
 mod registry;
+pub(crate) mod reshape_dispatch;
 mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;

@@ -172,6 +172,28 @@ pub enum PlanNode {
         #[serde(skip)]
         resolved: Option<Box<PlanOutputPayload>>,
     },
+    /// Per-correlation-group synthesis and trigger-row mutation.
+    ///
+    /// Blocking grouping operator: buffers each `partition_by` group,
+    /// observes it, then applies each rule's trigger-row mutation and
+    /// row synthesis. Single output. The executor compiles each rule's
+    /// `when` / `set` / `overrides` CXL against the live input schema at
+    /// dispatch time (mirroring the Route condition-compile seam), so the
+    /// plan node carries only the parsed `config` and the widened output
+    /// schema.
+    Reshape {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Parsed Reshape configuration (`partition_by` / `order_by` /
+        /// `rules`). Consumed by the executor's reshape dispatch arm.
+        config: crate::config::pipeline_node::ReshapeBody,
+        /// Widened output schema: the upstream columns plus the three
+        /// `$meta.*` audit columns Reshape stamps. Populated by
+        /// `bind_schema`.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
+    },
     /// Planner-synthesized sort enforcer.
     ///
     /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
@@ -406,6 +428,7 @@ impl PlanNode {
             | PlanNode::Route { name, .. }
             | PlanNode::Merge { name, .. }
             | PlanNode::Output { name, .. }
+            | PlanNode::Reshape { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
             | PlanNode::Composition { name, .. }
@@ -423,6 +446,7 @@ impl PlanNode {
             | PlanNode::Route { span, .. }
             | PlanNode::Merge { span, .. }
             | PlanNode::Output { span, .. }
+            | PlanNode::Reshape { span, .. }
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
             | PlanNode::Composition { span, .. }
@@ -467,6 +491,7 @@ impl PlanNode {
             PlanNode::Aggregation { output_schema, .. }
             | PlanNode::Combine { output_schema, .. }
             | PlanNode::Composition { output_schema, .. }
+            | PlanNode::Reshape { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => output_schema
                 .columns()
                 .iter()
@@ -501,6 +526,7 @@ impl PlanNode {
             | PlanNode::Aggregation { output_schema, .. }
             | PlanNode::Combine { output_schema, .. }
             | PlanNode::Composition { output_schema, .. }
+            | PlanNode::Reshape { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
             PlanNode::Route { .. }
             | PlanNode::Output { .. }
@@ -589,6 +615,7 @@ impl PlanNode {
             PlanNode::Composition { .. } => "composition",
             PlanNode::Combine { .. } => "combine",
             PlanNode::CorrelationCommit { .. } => "correlation_commit",
+            PlanNode::Reshape { .. } => "reshape",
         }
     }
 
@@ -637,6 +664,13 @@ impl PlanNode {
             }
             PlanNode::Merge { name, .. } => format!("[merge] {name}"),
             PlanNode::Output { name, .. } => format!("[output] {name}"),
+            PlanNode::Reshape { name, config, .. } => {
+                format!(
+                    "[reshape] {name} partition_by=[{}] rules={}",
+                    config.partition_by.join(", "),
+                    config.rules.len()
+                )
+            }
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
             PlanNode::Aggregation { name, strategy, .. } => {
                 let s = match strategy {
@@ -859,10 +893,14 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
         // sink, Composition is a structural wrapper whose body nodes
         // carry their own classes, and CorrelationCommit's group buffer
         // is bounded by `max_group_buffer` rather than the arbitrator.
+        // Reshape buffers per-group state entirely in memory with no
+        // group-size cap; its disk-spill governance lands with the follow-on
+        // memory work, so it registers no spillable consumer yet.
         PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Output { .. }
+        | PlanNode::Reshape { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => ArbitrationClass {
             spill_priority: None,
@@ -922,6 +960,7 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Output { .. }
+        | PlanNode::Reshape { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => false,
     }

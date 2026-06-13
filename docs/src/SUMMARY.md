@@ -23,6 +23,7 @@
 - [Route Nodes](pipeline/route.md)
 - [Merge Nodes](pipeline/merge.md)
 - [Combine Nodes](pipeline/combine.md)
+- [Reshape Nodes](pipeline/reshape.md)
 - [Output Nodes](pipeline/output.md)
 - [Error Handling & DLQ](pipeline/error-handling.md)
 - [Correlation Keys](pipeline/correlation-keys.md)

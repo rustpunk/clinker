@@ -115,6 +115,20 @@ pub enum PipelineNode {
         header: NodeHeader,
         config: OutputBody,
     },
+    /// Per-correlation-group record synthesis and trigger-row mutation.
+    ///
+    /// Groups records by `partition_by`, observes each group, and per
+    /// declarative rule mutates the rows whose state caused the rule to
+    /// fire and/or synthesizes new rows derived from those trigger rows.
+    /// Distinct from Aggregate (which reduces a group to one row),
+    /// Transform (0-or-1 record per input), and Combine (joins across
+    /// sources): Reshape produces new records derived from a group's
+    /// observed state while preserving the originals. Single output.
+    Reshape {
+        #[serde(flatten)]
+        header: NodeHeader,
+        config: ReshapeBody,
+    },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
     /// keyed by the `body` handle.
@@ -336,6 +350,13 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         let (header, config) = payload.into_variant_parts();
                         Ok(PipelineNode::Output { header, config })
                     }
+                    "reshape" => {
+                        let payload = ReshapePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Reshape { header, config })
+                    }
                     "composition" => {
                         let payload = CompositionPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
@@ -352,6 +373,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "merge",
                             "combine",
                             "output",
+                            "reshape",
                             "composition",
                         ],
                     )),
@@ -510,6 +532,34 @@ impl OutputPayload {
     }
 }
 
+// ---- Reshape ---------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReshapePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: ReshapeBody,
+}
+
+impl ReshapePayload {
+    fn into_variant_parts(self) -> (NodeHeader, ReshapeBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
 // ---- Merge -----------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -622,6 +672,7 @@ impl PipelineNode {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
             PipelineNode::Merge { header, .. } => &header.name,
             PipelineNode::Combine { header, .. } => &header.name,
@@ -638,6 +689,7 @@ impl PipelineNode {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
             PipelineNode::Source { .. }
             | PipelineNode::Merge { .. }
@@ -668,6 +720,7 @@ impl PipelineNode {
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Composition { header, .. } => vec![header.input.value.name()],
             PipelineNode::Merge { header, .. } => {
                 header.inputs.iter().map(|i| i.value.name()).collect()
@@ -707,6 +760,7 @@ impl PipelineNode {
             PipelineNode::Merge { .. } => "merge",
             PipelineNode::Combine { .. } => "combine",
             PipelineNode::Output { .. } => "output",
+            PipelineNode::Reshape { .. } => "reshape",
             PipelineNode::Composition { .. } => "composition",
         }
     }
@@ -1238,6 +1292,100 @@ pub struct CombineBody {
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
+}
+
+/// Engine-stamped audit column set `true` on every record a Reshape
+/// rule synthesizes. Originals (including mutated trigger rows) carry
+/// `false`. Reserved `$meta.` prefix guarantees no collision with a
+/// user-declared column.
+pub const RESHAPE_SYNTHETIC_COLUMN: &str = "$meta.synthetic";
+
+/// Engine-stamped audit column naming the `<node>:<rule>` that
+/// synthesized a record. Empty string on non-synthetic records.
+pub const RESHAPE_SYNTHESIZED_BY_COLUMN: &str = "$meta.synthesized_by";
+
+/// Engine-stamped audit column accumulating the `<node>:<rule>` labels
+/// of every rule that mutated a record, comma-separated. Empty string
+/// on records no rule mutated.
+pub const RESHAPE_MUTATED_BY_COLUMN: &str = "$meta.mutated_by";
+
+/// Reshape variant body. A blocking grouping operator: it buffers each
+/// correlation group (keyed by `partition_by`), observes the whole
+/// group, then applies each rule's mutation and synthesis actions.
+///
+/// Rules see the **original** group state — later rules never observe
+/// earlier rules' effects (the no-cascade contract). To sequence
+/// dependent transformations, chain two Reshape nodes in the DAG.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReshapeBody {
+    /// Correlation-key fields. Records are grouped by the tuple of these
+    /// column values; every rule observes and acts within one group.
+    pub partition_by: Vec<String>,
+    /// Optional within-group ordering. When set, each group's rows are
+    /// sorted by these keys before rules run, so `order_by`-dependent
+    /// synthesis (e.g. copy-from-first) is deterministic.
+    #[serde(default)]
+    pub order_by: Vec<crate::config::SortField>,
+    /// Declarative rules applied per group. Evaluated in declaration
+    /// order, but all against the same original group snapshot.
+    pub rules: Vec<ReshapeRule>,
+}
+
+/// One declarative Reshape rule: a row-trigger predicate plus optional
+/// mutation and synthesis actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReshapeRule {
+    /// Rule name, used in `$meta.*` audit stamps and mutation-conflict
+    /// DLQ stage labels.
+    pub name: String,
+    /// CXL boolean predicate. A group row for which `when` evaluates
+    /// truthy is a **trigger row**: the rule's `mutate` rewrites it and
+    /// its `synthesize` derives new rows from it.
+    pub when: CxlSource,
+    /// Optional in-place mutation of trigger rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutate: Option<MutateAction>,
+    /// Optional synthesis of new rows derived from trigger rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesize: Option<SynthesizeAction>,
+}
+
+/// In-place mutation of trigger rows: assign each field its CXL-evaluated
+/// new value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutateAction {
+    /// Field → CXL scalar expression. Each expression evaluates against
+    /// the original trigger row; the result overwrites that field on the
+    /// row. Assigning a `partition_by` field is a compile error — group
+    /// identity must survive Reshape.
+    pub set: IndexMap<String, CxlSource>,
+}
+
+/// Synthesis of new rows derived from trigger rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynthesizeAction {
+    /// Where the synthesized row's base column values come from.
+    pub copy_from: CopyFrom,
+    /// Field → CXL scalar expression applied on top of the copied base.
+    /// Evaluated against the trigger row. When `copy_from: none`, every
+    /// output column must appear here (enforced at compile time).
+    #[serde(default)]
+    pub overrides: IndexMap<String, CxlSource>,
+}
+
+/// Base-value source for a synthesized row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyFrom {
+    /// Copy every column value from the trigger row, then apply
+    /// `overrides`.
+    Trigger,
+    /// Start from an all-null row; `overrides` supplies every value.
+    None,
 }
 
 /// The scope a Transform's `declares:` entry writes to. Each scope is

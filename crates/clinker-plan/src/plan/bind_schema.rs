@@ -33,7 +33,8 @@ use crate::config::composition::{
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
-    CombineBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, SchemaDecl,
+    CombineBody, CopyFrom, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec, ReshapeBody,
+    SchemaDecl,
 };
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
@@ -1157,6 +1158,234 @@ fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     }
 }
 
+/// Borrowed inputs for binding one `PipelineNode::Reshape`.
+///
+/// Bundles the read-only node identity (name/config/upstream/span/vars)
+/// so `bind_reshape` keeps only the mutable sinks (diags/artifacts/schema
+/// map) as loose parameters, mirroring `CombineNodeBinding`.
+struct ReshapeNodeBinding<'a> {
+    name: &'a str,
+    config: &'a ReshapeBody,
+    upstream: &'a Row,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
+/// Bind a `PipelineNode::Reshape`: validate `partition_by` against the
+/// upstream schema, typecheck each rule's `when` / `set` / `overrides`
+/// CXL against that schema, enforce the group-identity and synthesis
+/// invariants, and publish the audit-widened output row.
+///
+/// Validation enforced here (compile errors, code E200):
+/// - every `partition_by` field exists upstream;
+/// - each rule's `when` predicate and every `set` / `overrides` value
+///   expression typechecks against the upstream row;
+/// - `set` targets must already exist upstream (Reshape mutates, it does
+///   not widen the user schema) and must not be a `partition_by` field or
+///   an engine-stamped `$`-namespaced column — group identity must
+///   survive Reshape;
+/// - `copy_from: none` requires every upstream column to appear in
+///   `overrides`, so a synthesized row is never silently all-null.
+fn bind_reshape(
+    node: &ReshapeNodeBinding<'_>,
+    diags: &mut Vec<Diagnostic>,
+    artifacts: &mut CompileArtifacts,
+    schema_by_name: &mut HashMap<String, Row>,
+) {
+    let &ReshapeNodeBinding {
+        name,
+        config,
+        upstream,
+        span,
+        scoped_vars,
+    } = node;
+    let mut ok = true;
+
+    // `partition_by` fields must exist upstream.
+    for pk in &config.partition_by {
+        if !upstream.has_field(pk) {
+            diags.push(
+                Diagnostic::error(
+                    "E200",
+                    format!(
+                        "reshape {name:?}: partition_by field {pk:?} is not present in the \
+                         upstream schema"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "declare the column in the source's `schema:` block or emit it from an \
+                     upstream transform",
+                ),
+            );
+            ok = false;
+        }
+    }
+
+    // `order_by` fields must exist upstream.
+    for sf in &config.order_by {
+        if !upstream.has_field(&sf.field) {
+            diags.push(Diagnostic::error(
+                "E200",
+                format!(
+                    "reshape {name:?}: order_by field {:?} is not present in the upstream schema",
+                    sf.field
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            ok = false;
+        }
+    }
+
+    // Per-rule predicate + assignment typechecks and invariants.
+    for rule in &config.rules {
+        // `when` predicate compiles as a row filter.
+        let when_src = format!("filter {}", rule.when.source);
+        if let Err(d) = typecheck_cxl(
+            &format!("{name}:{}:when", rule.name),
+            &when_src,
+            upstream,
+            AggregateMode::Row,
+            span,
+            scoped_vars,
+        ) {
+            diags.push(d);
+            ok = false;
+        }
+
+        if let Some(mutate) = &rule.mutate {
+            for (field, value) in &mutate.set {
+                // Group identity must survive Reshape: a `set` cannot
+                // target a partition key or an engine-stamped column.
+                if config.partition_by.iter().any(|p| p == field) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E200",
+                            format!(
+                                "reshape {name:?} rule {:?}: mutate.set may not write \
+                                 partition_by field {field:?} — group identity must survive \
+                                 Reshape",
+                                rule.name
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help("drop this assignment, or partition on a different field"),
+                    );
+                    ok = false;
+                } else if field.starts_with('$') {
+                    diags.push(Diagnostic::error(
+                        "E200",
+                        format!(
+                            "reshape {name:?} rule {:?}: mutate.set may not write the \
+                             engine-stamped column {field:?}",
+                            rule.name
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    ok = false;
+                } else if !upstream.has_field(field) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E200",
+                            format!(
+                                "reshape {name:?} rule {:?}: mutate.set target {field:?} is not \
+                                 present in the upstream schema — Reshape mutates existing \
+                                 columns, it does not add new ones",
+                                rule.name
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help("emit the column from an upstream transform first"),
+                    );
+                    ok = false;
+                }
+                if let Err(d) = typecheck_cxl(
+                    &format!("{name}:{}:set.{field}", rule.name),
+                    &format!("emit {field} = {}", value.source),
+                    upstream,
+                    AggregateMode::Row,
+                    span,
+                    scoped_vars,
+                ) {
+                    diags.push(d);
+                    ok = false;
+                }
+            }
+        }
+
+        if let Some(synth) = &rule.synthesize {
+            // `copy_from: none` requires every upstream user column to be
+            // supplied by `overrides`, so a synthesized row is never
+            // silently all-null.
+            if synth.copy_from == CopyFrom::None {
+                for (qf, _) in upstream.fields() {
+                    let col = qf.name.as_ref();
+                    if col.starts_with('$') {
+                        continue;
+                    }
+                    if !synth.overrides.keys().any(|k| k == col) {
+                        diags.push(
+                            Diagnostic::error(
+                                "E200",
+                                format!(
+                                    "reshape {name:?} rule {:?}: synthesize with \
+                                     `copy_from: none` must override every column, but {col:?} \
+                                     is missing from `overrides`",
+                                    rule.name
+                                ),
+                                LabeledSpan::primary(span, String::new()),
+                            )
+                            .with_help(
+                                "add the column to `overrides`, or use `copy_from: trigger` to \
+                                 inherit the trigger row's values",
+                            ),
+                        );
+                        ok = false;
+                    }
+                }
+            }
+            for (field, value) in &synth.overrides {
+                if let Err(d) = typecheck_cxl(
+                    &format!("{name}:{}:override.{field}", rule.name),
+                    &format!("emit {field} = {}", value.source),
+                    upstream,
+                    AggregateMode::Row,
+                    span,
+                    scoped_vars,
+                ) {
+                    diags.push(d);
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    if !ok {
+        return;
+    }
+
+    // Output row = upstream columns ++ the three `$meta.*` audit columns
+    // Reshape stamps on every output record.
+    let mut declared = upstream.declared_map().clone();
+    use crate::config::pipeline_node::{
+        RESHAPE_MUTATED_BY_COLUMN, RESHAPE_SYNTHESIZED_BY_COLUMN, RESHAPE_SYNTHETIC_COLUMN,
+    };
+    declared.insert(QualifiedField::bare(RESHAPE_SYNTHETIC_COLUMN), Type::Bool);
+    declared.insert(
+        QualifiedField::bare(RESHAPE_SYNTHESIZED_BY_COLUMN),
+        Type::String,
+    );
+    declared.insert(
+        QualifiedField::bare(RESHAPE_MUTATED_BY_COLUMN),
+        Type::String,
+    );
+    let out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
+    schema_by_name.insert(name.to_string(), out.clone());
+    artifacts
+        .typed
+        .insert(name.to_string(), Arc::new(synthetic_typed_program(out)));
+}
+
 // ─── Internal recursive bind_schema ─────────────────────────────────
 
 /// Internal recursive bind_schema. Walks nodes in topological order,
@@ -1551,6 +1780,23 @@ fn bind_schema_inner(
                     artifacts
                         .typed
                         .insert(name, Arc::new(synthetic_typed_program(row)));
+                }
+            }
+            PipelineNode::Reshape { header, config } => {
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let upstream = upstream.clone();
+                    bind_reshape(
+                        &ReshapeNodeBinding {
+                            name: &name,
+                            config,
+                            upstream: &upstream,
+                            span,
+                            scoped_vars: &bind_ctx.scoped_vars,
+                        },
+                        diags,
+                        artifacts,
+                        schema_by_name,
+                    );
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
@@ -1979,6 +2225,7 @@ fn bind_composition(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Output { header, .. } => {
                 let r = match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
@@ -2090,6 +2337,7 @@ fn bind_composition(
             | PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Output { header, .. } => {
                 vec![match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),

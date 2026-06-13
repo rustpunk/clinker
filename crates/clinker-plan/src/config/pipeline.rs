@@ -737,6 +737,7 @@ impl PipelineConfig {
                 PipelineNode::Source { .. }
                 | PipelineNode::Output { .. }
                 | PipelineNode::Merge { .. }
+                | PipelineNode::Reshape { .. }
                 | PipelineNode::Composition { .. }
                 | PipelineNode::Combine { .. } => None,
             })
@@ -1066,6 +1067,7 @@ impl PipelineConfig {
                 PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
+                | PipelineNode::Reshape { header, .. }
                 | PipelineNode::Output { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
@@ -2076,6 +2078,7 @@ fn resolve_all_input_references(
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
+            | PipelineNode::Reshape { header, .. }
             | PipelineNode::Output { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
@@ -2431,6 +2434,11 @@ pub(crate) fn lower_node_to_plan_node(
                         builder.with_field_meta(col, FieldMetadata::source_name())
                     } else if col == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN {
                         builder.with_field_meta(col, FieldMetadata::source_event_time())
+                    } else if col == crate::config::pipeline_node::RESHAPE_SYNTHETIC_COLUMN
+                        || col == crate::config::pipeline_node::RESHAPE_SYNTHESIZED_BY_COLUMN
+                        || col == crate::config::pipeline_node::RESHAPE_MUTATED_BY_COLUMN
+                    {
+                        builder.with_field_meta(col, FieldMetadata::reshape_audit())
                     } else {
                         builder.with_field(col)
                     };
@@ -2721,6 +2729,22 @@ pub(crate) fn lower_node_to_plan_node(
                 decomposed_from: None,
                 output_schema: schema_from_bound(name),
                 resolved_column_map,
+            })
+        }
+        // Reshape lowers to PlanNode::Reshape carrying the parsed config
+        // and the audit-widened output schema. The executor compiles each
+        // rule's `when` / `set` / `overrides` CXL against the live input
+        // schema at dispatch time (the Route condition-compile seam), so no
+        // per-rule typed program is threaded through CompileArtifacts.
+        PipelineNode::Reshape { config, .. } => {
+            // A missing typed entry means bind_schema rejected the node
+            // (E200 on a rule predicate / assignment) — skip lowering.
+            artifacts.typed.get(name)?;
+            Some(crate::plan::execution::PlanNode::Reshape {
+                name: name.to_string(),
+                span,
+                config: config.clone(),
+                output_schema: schema_from_bound(name),
             })
         }
     }
