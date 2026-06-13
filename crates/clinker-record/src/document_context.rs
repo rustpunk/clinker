@@ -14,6 +14,10 @@
 
 use crate::value::Value;
 use indexmap::IndexMap;
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -25,7 +29,13 @@ use std::sync::{Arc, OnceLock};
 /// boundary down to one downstream emission, and by the Aggregate's
 /// per-document group flush to walk its open documents in a stable order.
 /// `Ord` follows allocation order: a document opened earlier sorts first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// The `Serialize`/`Deserialize` impls are transparent over the inner
+/// `u64`, so a spilled record's `doc_id` keys the per-file interning
+/// table by the original numeric identity — never re-minted on read.
+/// [`DocumentId::SYNTHETIC`] (`0`) round-trips as `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DocumentId(u64);
 
 impl DocumentId {
@@ -128,6 +138,82 @@ impl DocumentContext {
             // means the reader emitted a non-Map payload.
             _ => None,
         }
+    }
+}
+
+// ── Spill codec ─────────────────────────────────────────────────────────────
+//
+// A `DocumentContext` is interned once per spill file (one frame per distinct
+// `DocumentId`), so its codec is hand-written rather than derived for two
+// reasons: `IndexMap` has no insertion-order-preserving serde impl, and the
+// `Arc<str>` source file must collapse to its bytes on the wire and rebuild as
+// a fresh `Arc<str>` on read (the in-memory `Arc` identity does not — and need
+// not — survive the spill boundary; see the module-level note on per-document
+// re-hydration). The shape is a 3-tuple mirroring `Value::Map`'s pair-vec
+// encoding so section insertion order is preserved exactly:
+//   (DocumentId, source_file: &str, sections: Vec<(&str, &Value)>)
+// On read each `(String, Value)` pair re-inserts in order into a fresh
+// `IndexMap`, and the source file rebuilds via `Arc::from`.
+
+impl Serialize for DocumentContext {
+    /// Serializes this context as `(id, source_file, ordered section pairs)`.
+    ///
+    /// Used only by the spill interning path, which writes one context frame
+    /// per distinct document per file (`O(distinct documents)`, never
+    /// `O(records)`). Section order is preserved by emitting the `IndexMap`
+    /// as an ordered pair vector, matching the `Value::Map` codec.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let pairs: Vec<(&str, &Value)> =
+            self.sections.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+        let mut tup = serializer.serialize_tuple(3)?;
+        tup.serialize_element(&self.id)?;
+        tup.serialize_element(self.source_file.as_ref())?;
+        tup.serialize_element(&pairs)?;
+        tup.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentContext {
+    /// Reconstructs a context from `(id, source_file, ordered section pairs)`.
+    ///
+    /// Rebuilds the `source_file` as a fresh `Arc<str>` and re-inserts the
+    /// section pairs into a new `IndexMap` in wire order, so a document's
+    /// section ordering survives a spill round-trip. The rebuilt `Arc<str>`
+    /// is a distinct allocation from the live ingest stream's — equality is
+    /// by content, not pointer identity.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContextVisitor;
+
+        impl<'de> Visitor<'de> for ContextVisitor {
+            type Value = DocumentContext;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a (DocumentId, source_file, sections) tuple")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<DocumentContext, A::Error> {
+                let id: DocumentId = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let source_file: std::string::String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let pairs: Vec<(std::string::String, Value)> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let mut sections = IndexMap::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    sections.insert(k.into_boxed_str(), v);
+                }
+                Ok(DocumentContext {
+                    id,
+                    source_file: Arc::from(source_file.as_str()),
+                    sections,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(3, ContextVisitor)
     }
 }
 
@@ -302,5 +388,78 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DocumentContext>();
         assert_send_sync::<Arc<DocumentContext>>();
+    }
+
+    #[test]
+    fn document_id_serde_is_transparent_over_u64() {
+        // The id is the interning-table key on a spill round-trip; it must
+        // encode as the bare inner u64 so a record's doc_id reloads to the
+        // same numeric identity it spilled with.
+        let id = DocumentId::next();
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let raw = postcard::to_stdvec(&id.0).unwrap();
+        assert_eq!(bytes, raw, "DocumentId must encode identically to its u64");
+        let back: DocumentId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, id);
+
+        // SYNTHETIC (0) round-trips as 0, never re-minted.
+        let syn = postcard::to_stdvec(&DocumentId::SYNTHETIC).unwrap();
+        let syn_back: DocumentId = postcard::from_bytes(&syn).unwrap();
+        assert_eq!(syn_back, DocumentId::SYNTHETIC);
+    }
+
+    #[test]
+    fn document_context_serde_preserves_id_file_and_section_order() {
+        // Sections inserted z, a, m — insertion order must survive the wire,
+        // mirroring the Value::Map pair-vec codec. A nested Value::Map inside
+        // a section exercises the recursive Value path through the frame.
+        let mut sections = IndexMap::new();
+        sections.insert(
+            Box::from("z_section"),
+            make_section(&[("k", Value::String("zv".into()))]),
+        );
+        sections.insert(
+            Box::from("a_section"),
+            make_section(&[
+                ("count", Value::Integer(7)),
+                (
+                    "nested",
+                    Value::Map(Box::new({
+                        let mut inner = IndexMap::new();
+                        inner.insert(Box::from("deep"), Value::Bool(true));
+                        inner
+                    })),
+                ),
+            ]),
+        );
+        sections.insert(Box::from("m_section"), make_section(&[]));
+        let id = DocumentId::next();
+        let ctx = DocumentContext::new(id, Arc::from("payments/run-001.xml"), sections);
+
+        let bytes = postcard::to_stdvec(&ctx).unwrap();
+        let back: DocumentContext = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(back.id(), id);
+        assert_eq!(back.source_file().as_ref(), "payments/run-001.xml");
+        // Section names survive in insertion order, not sorted order.
+        let names: Vec<&str> = back.sections.keys().map(|k| k.as_ref()).collect();
+        assert_eq!(names, vec!["z_section", "a_section", "m_section"]);
+        // Field values, including a nested Value::Map, survive intact.
+        assert_eq!(
+            back.get_section_field("z_section", "k"),
+            Some(Value::String("zv".into()))
+        );
+        assert_eq!(
+            back.get_section_field("a_section", "count"),
+            Some(Value::Integer(7))
+        );
+        assert_eq!(
+            back.get_section_field("a_section", "nested"),
+            Some(Value::Map(Box::new({
+                let mut inner = IndexMap::new();
+                inner.insert(Box::from("deep"), Value::Bool(true));
+                inner
+            })))
+        );
     }
 }

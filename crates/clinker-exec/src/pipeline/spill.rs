@@ -18,8 +18,26 @@
 //!   Then a record stream (raw when uncompressed, inside an LZ4 frame when
 //!   compressed):
 //!     Line 0: JSON array of column names (schema header)
-//!     Line 1..N: postcard-encoded `(RecordPayload, P)` pairs, length-prefixed
-//!                as a 4-byte little-endian u32 before each record.
+//!     Line 1..N: a sequence of length-prefixed frames. Each frame is a
+//!                4-byte little-endian u32 byte length, then a 1-byte frame
+//!                discriminator, then the frame body:
+//!                  `0x00` record pair — postcard `(RecordPayload, P)`.
+//!                  `0x01` context intern — postcard `DocumentContext`.
+//!
+//! Document envelope context is interned per file, not inlined per record.
+//! The first time a record carrying a non-synthetic [`DocumentId`] is
+//! written, the writer emits that document's context frame **before** the
+//! record's pair frame; every later record of the same document carries
+//! only its `doc_id` (a `u64`) in the `RecordPayload`. On read the context
+//! frames build a `HashMap<DocumentId, Arc<DocumentContext>>` incrementally
+//! and each record clones the shared `Arc` keyed by its `doc_id`. This is
+//! bounded-memory: `O(distinct documents in file)` context frames, never
+//! `O(records)`, and exactly one `Arc<DocumentContext>` per document on
+//! reload. [`DocumentId::SYNTHETIC`] is never interned — a synthetic
+//! `doc_id` resolves on read to the process-wide
+//! [`synthetic_document_context`] singleton; a non-synthetic `doc_id`
+//! absent from the table is a corrupt-file decode error, not a silent
+//! synthetic fallback.
 //!
 //! The leading tag lets the reader dispatch on the on-disk format without
 //! the writer's compression choice having to travel out-of-band. The choice
@@ -31,6 +49,7 @@
 //! manifest written once per file. Record bodies use postcard for compact
 //! binary encoding of `Value`s and the per-record metadata map.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -40,7 +59,9 @@ use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 
-use clinker_record::{Record, RecordPayload, Schema};
+use clinker_record::{
+    DocumentContext, DocumentId, Record, RecordPayload, Schema, synthetic_document_context,
+};
 
 use clinker_plan::SpillError;
 
@@ -49,6 +70,14 @@ use clinker_plan::SpillError;
 const FORMAT_TAG_UNCOMPRESSED: u8 = 0x00;
 /// On-disk format tag for an LZ4-frame-compressed spill file.
 const FORMAT_TAG_LZ4: u8 = 0x01;
+
+/// Frame discriminator for a record pair: the body is a postcard
+/// `(RecordPayload, P)` tuple.
+const FRAME_RECORD_PAIR: u8 = 0x00;
+/// Frame discriminator for a document-context intern: the body is a postcard
+/// [`DocumentContext`], emitted on the first sight of a non-synthetic
+/// [`DocumentId`] in the stream.
+const FRAME_CONTEXT_INTERN: u8 = 0x01;
 
 /// Record-stream sink for a spill file: either a raw buffered writer
 /// (uncompressed) or an LZ4 frame encoder wrapping one. Both expose
@@ -104,13 +133,25 @@ impl SpillSink {
 /// Writes (record, payload) pairs to a spill file, optionally LZ4-compressed.
 ///
 /// A 1-byte format tag is written first, then the schema as a JSON header
-/// line, then each record as a 4-byte little-endian length prefix followed by
-/// a postcard-encoded `(RecordPayload, P)` tuple. The `compress` flag at
-/// construction selects the LZ4 or raw record stream and is recorded in the
-/// tag so [`SpillReader`] dispatches without out-of-band state.
+/// line, then a sequence of length-prefixed, discriminator-tagged frames:
+/// each record becomes a record-pair frame holding a postcard
+/// `(RecordPayload, P)` tuple, and the first record of each non-synthetic
+/// document is preceded by a one-time context-intern frame holding that
+/// document's [`DocumentContext`]. The `compress` flag at construction
+/// selects the LZ4 or raw record stream and is recorded in the tag so
+/// [`SpillReader`] dispatches without out-of-band state.
+///
+/// Memory model: streaming — records are encoded and flushed one at a time.
+/// The only retained state is `seen_docs`, an `O(distinct documents)` set
+/// that bounds context interning to one frame per document.
 pub struct SpillWriter<P> {
     sink: SpillSink,
     schema: Arc<Schema>,
+    /// Documents whose context frame has already been emitted, so each
+    /// non-synthetic [`DocumentId`] is interned exactly once per file. Holds
+    /// at most one entry per distinct document in the stream
+    /// (`O(distinct documents)`), never one per record.
+    seen_docs: HashSet<DocumentId>,
     /// Directory the spill file lives in, retained so a mid-stream write or
     /// finalize fault can be classified against it: an `ENOSPC` becomes
     /// `SpillError::DiskFull` and a directory-level fault becomes
@@ -183,32 +224,51 @@ impl<P: Serialize> SpillWriter<P> {
         Ok(SpillWriter {
             sink,
             schema,
+            seen_docs: HashSet::new(),
             spill_dir: resolved_dir,
             _payload: PhantomData,
         })
     }
 
-    /// Serialize one (record, payload) pair.
-    ///
-    /// Each pair is written as a 4-byte little-endian length prefix
-    /// followed by a postcard-encoded `(RecordPayload, P)` tuple.
-    pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
-        let rv = record.record_var_pairs();
-        let rec_payload = RecordPayload {
-            values: record.values().to_vec(),
-            record_vars: if rv.is_empty() { None } else { Some(rv) },
-        };
-        let bytes = postcard::to_stdvec(&(&rec_payload, payload))?;
-        let len = bytes.len() as u32;
-        // Classify a write fault against the spill directory so an `ENOSPC`
-        // mid-stream surfaces as `DiskFull` (E321), not a generic `Io`.
+    /// Write one length-prefixed, discriminator-tagged frame: a 4-byte
+    /// little-endian length covering the 1-byte `discriminator` plus
+    /// `body`, then the discriminator, then the body. Classifies a write
+    /// fault against the spill directory so an `ENOSPC` mid-stream surfaces
+    /// as `DiskFull` (E321), not a generic `Io`.
+    fn write_frame(&mut self, discriminator: u8, body: &[u8]) -> Result<(), SpillError> {
+        let len = (body.len() + 1) as u32;
         self.sink
             .write_all(&len.to_le_bytes())
             .map_err(|e| SpillError::from_spill_dir_io(&self.spill_dir, e))?;
         self.sink
-            .write_all(&bytes)
+            .write_all(&[discriminator])
+            .map_err(|e| SpillError::from_spill_dir_io(&self.spill_dir, e))?;
+        self.sink
+            .write_all(body)
             .map_err(|e| SpillError::from_spill_dir_io(&self.spill_dir, e))?;
         Ok(())
+    }
+
+    /// Serialize one (record, payload) pair.
+    ///
+    /// On the first sight of a record's non-synthetic [`DocumentId`], a
+    /// one-time context-intern frame carrying its [`DocumentContext`] is
+    /// emitted *before* the record-pair frame, so the reader's interning
+    /// table is populated before any record references it. The record's
+    /// `RecordPayload` then carries only the `doc_id`, never the full
+    /// context. The synthetic document is never interned — it resolves on
+    /// read to the shared synthetic singleton.
+    pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
+        let doc_ctx = record.doc_ctx();
+        let doc_id = doc_ctx.id();
+        if doc_id != DocumentId::SYNTHETIC && self.seen_docs.insert(doc_id) {
+            let ctx_bytes = postcard::to_stdvec(doc_ctx.as_ref())?;
+            self.write_frame(FRAME_CONTEXT_INTERN, &ctx_bytes)?;
+        }
+
+        let rec_payload = RecordPayload::from_record(record);
+        let bytes = postcard::to_stdvec(&(&rec_payload, payload))?;
+        self.write_frame(FRAME_RECORD_PAIR, &bytes)
     }
 
     /// Convenience: write a record with the unit payload `()`.
@@ -264,6 +324,7 @@ impl<P: DeserializeOwned> SpillFile<P> {
         let mut reader = SpillReader {
             source,
             schema: Arc::clone(&self.schema),
+            doc_table: HashMap::new(),
             len_buf: [0u8; 4],
             _payload: PhantomData,
         };
@@ -335,9 +396,19 @@ impl BufRead for SpillSource {
 
 /// Reads (record, payload) pairs from a spill file, dispatching on the file's
 /// format tag for the compressed or uncompressed record stream.
+///
+/// Memory model: streaming — one frame is decoded per `next` call. The only
+/// retained state is `doc_table`, the per-file `DocumentId → Arc` interning
+/// table built incrementally from context frames; it holds one `Arc` per
+/// distinct document (`O(distinct documents)`), and every record of a
+/// document clones that shared `Arc` rather than decoding the context again.
 pub struct SpillReader<P> {
     source: SpillSource,
     schema: Arc<Schema>,
+    /// Per-file envelope-context interning table. A context-intern frame
+    /// decodes its [`DocumentContext`] into exactly one `Arc` here; every
+    /// later record carrying that `DocumentId` clones the shared `Arc`.
+    doc_table: HashMap<DocumentId, Arc<DocumentContext>>,
     len_buf: [u8; 4],
     _payload: PhantomData<P>,
 }
@@ -346,25 +417,78 @@ impl<P: DeserializeOwned> Iterator for SpillReader<P> {
     type Item = Result<(Record, P), SpillError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Read 4-byte length prefix
-        match self.source.read_exact(&mut self.len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => return Some(Err(SpillError::Io(e))),
+        // Drive past any context-intern frames — they populate the doc
+        // table but yield no record — until a record-pair frame produces a
+        // `(Record, P)`, or the stream ends.
+        loop {
+            // Read 4-byte length prefix.
+            match self.source.read_exact(&mut self.len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                Err(e) => return Some(Err(SpillError::Io(e))),
+            }
+            let len = u32::from_le_bytes(self.len_buf) as usize;
+            if len == 0 {
+                // A frame is at minimum its 1-byte discriminator; a zero
+                // length is structurally impossible from `write_frame`.
+                return Some(Err(SpillError::InvalidSchema(
+                    "spill frame length 0 (missing discriminator); file is corrupt".to_string(),
+                )));
+            }
+            let mut buf = vec![0u8; len];
+            if let Err(e) = self.source.read_exact(&mut buf) {
+                return Some(Err(SpillError::Io(e)));
+            }
+            let (discriminator, body) = (buf[0], &buf[1..]);
+            match discriminator {
+                FRAME_CONTEXT_INTERN => {
+                    if let Err(e) = self.intern_context(body) {
+                        return Some(Err(e));
+                    }
+                    // Loop to the next frame.
+                }
+                FRAME_RECORD_PAIR => return Some(self.parse_pair(body)),
+                other => {
+                    return Some(Err(SpillError::InvalidSchema(format!(
+                        "unknown spill frame discriminator {other:#04x}; file is corrupt"
+                    ))));
+                }
+            }
         }
-        let len = u32::from_le_bytes(self.len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        if let Err(e) = self.source.read_exact(&mut buf) {
-            return Some(Err(SpillError::Io(e)));
-        }
-        Some(self.parse_pair(&buf))
     }
 }
 
 impl<P: DeserializeOwned> SpillReader<P> {
+    /// Decode a context-intern frame into one shared `Arc<DocumentContext>`
+    /// and insert it into the per-file table keyed by the document's id.
+    fn intern_context(&mut self, body: &[u8]) -> Result<(), SpillError> {
+        let ctx: DocumentContext = postcard::from_bytes(body)?;
+        self.doc_table.insert(ctx.id(), Arc::new(ctx));
+        Ok(())
+    }
+
+    /// Decode a record-pair frame and reattach the document's shared
+    /// context. A synthetic `doc_id` resolves to the process-wide synthetic
+    /// singleton; a non-synthetic `doc_id` absent from the interning table
+    /// is a corrupt-file error (a record frame must always be preceded by
+    /// its document's context frame), never a silent synthetic fallback.
     fn parse_pair(&self, buf: &[u8]) -> Result<(Record, P), SpillError> {
         let (rec_payload, payload): (RecordPayload, P) = postcard::from_bytes(buf)?;
-        let record = rec_payload.into_record(Arc::clone(&self.schema));
+        let doc_ctx = if rec_payload.doc_id == DocumentId::SYNTHETIC {
+            synthetic_document_context()
+        } else {
+            match self.doc_table.get(&rec_payload.doc_id) {
+                Some(ctx) => Arc::clone(ctx),
+                None => {
+                    return Err(SpillError::InvalidSchema(format!(
+                        "spill record references document {:?} with no interned context frame; \
+                         file is corrupt",
+                        rec_payload.doc_id
+                    )));
+                }
+            }
+        };
+        let record = rec_payload.into_record(Arc::clone(&self.schema), doc_ctx);
         Ok((record, payload))
     }
 }
@@ -373,6 +497,7 @@ impl<P: DeserializeOwned> SpillReader<P> {
 mod tests {
     use super::*;
     use clinker_record::Value;
+    use indexmap::IndexMap;
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -380,6 +505,26 @@ mod tests {
             "amount".into(),
             "active".into(),
         ]))
+    }
+
+    /// Build a `DocumentContext` with the given id, file, and a single
+    /// `Head` section carrying `(batch_id, total)` — a typical envelope
+    /// shape with a nested `Value::Map` payload exercising the recursive
+    /// `Value` path through the context frame.
+    fn make_doc_ctx(id_seed: i64, file: &str) -> Arc<DocumentContext> {
+        let mut head = IndexMap::new();
+        head.insert(
+            Box::from("batch_id"),
+            Value::String(format!("RUN-{id_seed:03}").into()),
+        );
+        head.insert("total".into(), Value::Integer(id_seed * 10));
+        let mut sections = IndexMap::new();
+        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
+        Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from(file),
+            sections,
+        ))
     }
 
     fn make_record(schema: &Arc<Schema>, name: &str, amount: i64, active: bool) -> Record {
@@ -714,5 +859,265 @@ mod tests {
             rendered.contains("became unavailable mid-run"),
             "{rendered}"
         );
+    }
+
+    // A document's envelope context (id, sections including a nested
+    // Value::Map, and a non-empty source_file) must survive the spill
+    // round-trip identically under both the compressed and uncompressed
+    // body format.
+    #[test]
+    fn spill_roundtrip_preserves_doc_ctx() {
+        for compress in [true, false] {
+            let schema = test_schema();
+            let doc = make_doc_ctx(1, "payments/run-001.xml");
+            let mut writer: SpillWriter<()> =
+                SpillWriter::new(Arc::clone(&schema), None, compress).unwrap();
+            let mut rec = make_record(&schema, "Alice", 100, true);
+            rec.set_doc_ctx(Arc::clone(&doc));
+            writer.write_record(&rec).unwrap();
+
+            let spill_file = writer.finish().unwrap();
+            let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
+            assert_eq!(records.len(), 1, "compress={compress}");
+            let ctx = records[0].doc_ctx();
+            assert_eq!(ctx.id(), doc.id(), "compress={compress}");
+            assert_eq!(
+                ctx.source_file().as_ref(),
+                "payments/run-001.xml",
+                "source_file must survive (compress={compress})"
+            );
+            assert_eq!(
+                ctx.get_section_field("Head", "batch_id"),
+                Some(Value::String("RUN-001".into())),
+                "section field must survive (compress={compress})"
+            );
+            assert_eq!(
+                ctx.get_section_field("Head", "total"),
+                Some(Value::Integer(10)),
+                "compress={compress}"
+            );
+        }
+    }
+
+    // Every record of one document re-hydrates the SAME shared
+    // `Arc<DocumentContext>` — one allocation per document on reload, not
+    // per record. `Arc::ptr_eq` across all three records of the document
+    // proves the interning table hands back a single shared Arc.
+    #[test]
+    fn spill_shares_one_arc_per_document() {
+        let schema = test_schema();
+        let doc = make_doc_ctx(2, "claims/batch.xml");
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        for i in 0..3 {
+            let mut rec = make_record(&schema, &format!("row{i}"), i, true);
+            rec.set_doc_ctx(Arc::clone(&doc));
+            writer.write_record(&rec).unwrap();
+        }
+        let spill_file = writer.finish().unwrap();
+        let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
+        assert_eq!(records.len(), 3);
+        let first = records[0].doc_ctx();
+        for rec in &records[1..] {
+            assert!(
+                Arc::ptr_eq(first, rec.doc_ctx()),
+                "all records of one document must share one re-hydrated Arc",
+            );
+        }
+    }
+
+    // A synthetic-context record interns no context frame and re-hydrates
+    // to the process-wide synthetic singleton (ptr_eq to the live
+    // singleton), so in-pipeline-synthesized records cost zero context
+    // frames on spill.
+    #[test]
+    fn spill_synthetic_doc_ctx_roundtrips_as_synthetic() {
+        let schema = test_schema();
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        // make_record leaves the default synthetic context attached.
+        writer
+            .write_record(&make_record(&schema, "syn", 1, false))
+            .unwrap();
+        let spill_file = writer.finish().unwrap();
+
+        // No context-intern frame is emitted for the synthetic document:
+        // exactly one frame (the record pair) lands in the body.
+        assert_eq!(
+            count_body_frames(&spill_file),
+            1,
+            "synthetic document must intern no context frame",
+        );
+
+        let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
+        assert_eq!(records.len(), 1);
+        assert!(
+            Arc::ptr_eq(records[0].doc_ctx(), &synthetic_document_context()),
+            "synthetic doc_id must re-hydrate to the shared singleton",
+        );
+        assert_eq!(records[0].doc_ctx().id(), DocumentId::SYNTHETIC);
+    }
+
+    // The interning table is `O(distinct documents)`, not `O(records)`: N
+    // records spread over K distinct documents emit exactly K context
+    // frames (plus N record frames), regardless of how many records each
+    // document carries.
+    #[test]
+    fn spill_interning_table_is_o_distinct_docs() {
+        let schema = test_schema();
+        const DOCS: usize = 3;
+        const RECS_PER_DOC: usize = 20;
+        let docs: Vec<Arc<DocumentContext>> = (0..DOCS)
+            .map(|d| make_doc_ctx(d as i64 + 1, &format!("doc-{d}.xml")))
+            .collect();
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        for doc in &docs {
+            for i in 0..RECS_PER_DOC {
+                let mut rec = make_record(&schema, "r", i as i64, true);
+                rec.set_doc_ctx(Arc::clone(doc));
+                writer.write_record(&rec).unwrap();
+            }
+        }
+        let spill_file = writer.finish().unwrap();
+
+        let (ctx_frames, rec_frames) = count_frames_by_kind(&spill_file);
+        assert_eq!(ctx_frames, DOCS, "exactly one context frame per document");
+        assert_eq!(
+            rec_frames,
+            DOCS * RECS_PER_DOC,
+            "one record frame per record",
+        );
+
+        // Each document's records share that document's single Arc, and the
+        // three documents' Arcs are mutually distinct.
+        let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
+        assert_eq!(records.len(), DOCS * RECS_PER_DOC);
+        let doc_a = records[0].doc_ctx();
+        let doc_b = records[RECS_PER_DOC].doc_ctx();
+        assert!(
+            !Arc::ptr_eq(doc_a, doc_b),
+            "distinct docs get distinct Arcs"
+        );
+        assert!(Arc::ptr_eq(doc_a, records[RECS_PER_DOC - 1].doc_ctx()));
+    }
+
+    // A non-synthetic record whose context frame never landed is a
+    // corrupt-file decode error, never a silent synthetic fallback. Build a
+    // valid spill, then strip its leading context-intern frame so the
+    // record references an absent document.
+    #[test]
+    fn spill_missing_context_frame_is_decode_error() {
+        let schema = test_schema();
+        let doc = make_doc_ctx(9, "lone.xml");
+        // Uncompressed so the body frames are byte-addressable for surgery.
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut rec = make_record(&schema, "z", 1, true);
+        rec.set_doc_ctx(Arc::clone(&doc));
+        writer.write_record(&rec).unwrap();
+        let spill_file = writer.finish().unwrap();
+
+        // The on-disk layout is: [tag][schema line\n][ctx frame][record frame].
+        // Drop the context frame, keeping tag + schema + record frame, so the
+        // record's doc_id has no interned context.
+        let raw = std::fs::read(spill_file.path()).unwrap();
+        let nl = raw.iter().position(|&b| b == b'\n').unwrap();
+        let header = &raw[..=nl];
+        let mut rest = &raw[nl + 1..];
+        // First frame is the context intern: skip its 4-byte length + body.
+        let ctx_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        assert_eq!(rest[4], FRAME_CONTEXT_INTERN, "first body frame is context");
+        rest = &rest[4 + ctx_len..];
+        let mut surgical = Vec::with_capacity(header.len() + rest.len());
+        surgical.extend_from_slice(header);
+        surgical.extend_from_slice(rest);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &surgical).unwrap();
+        // Re-open through a hand-built SpillFile pointing at the surgical file.
+        let file = std::fs::File::open(tmp.path()).unwrap();
+        drop(file);
+        // Decode via a fresh reader over the surgical bytes.
+        let err = decode_surgical(tmp.path(), &schema)
+            .expect_err("a record with no interned context must be a decode error");
+        match err {
+            SpillError::InvalidSchema(msg) => assert!(
+                msg.contains("no interned context frame"),
+                "expected corrupt-context message, got: {msg}"
+            ),
+            other => panic!("expected InvalidSchema, got {other:?}"),
+        }
+    }
+
+    /// Count every length-prefixed frame in a finished spill file's body,
+    /// transparently handling the LZ4 / raw body. Used by the interning
+    /// tests to assert the frame budget without depending on reader logic.
+    fn count_body_frames(spill_file: &SpillFile<()>) -> usize {
+        let (ctx, rec) = count_frames_by_kind(spill_file);
+        ctx + rec
+    }
+
+    /// Decode a spill file's body frames and tally `(context_frames,
+    /// record_frames)`. Reads the leading format tag and schema line the
+    /// same way `SpillFile::reader` does, then walks the frame stream.
+    fn count_frames_by_kind(spill_file: &SpillFile<()>) -> (usize, usize) {
+        let mut file = std::fs::File::open(spill_file.path()).unwrap();
+        let mut tag = [0u8; 1];
+        file.read_exact(&mut tag).unwrap();
+        let mut source: Box<dyn BufRead> = match tag[0] {
+            FORMAT_TAG_LZ4 => Box::new(BufReader::new(FrameDecoder::new(file))),
+            FORMAT_TAG_UNCOMPRESSED => Box::new(BufReader::new(file)),
+            other => panic!("unknown tag {other:#04x}"),
+        };
+        let mut schema_line = String::new();
+        source.read_line(&mut schema_line).unwrap();
+        let (mut ctx, mut rec) = (0usize, 0usize);
+        let mut len_buf = [0u8; 4];
+        loop {
+            match source.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            source.read_exact(&mut buf).unwrap();
+            match buf[0] {
+                FRAME_CONTEXT_INTERN => ctx += 1,
+                FRAME_RECORD_PAIR => rec += 1,
+                other => panic!("unknown frame discriminator {other:#04x}"),
+            }
+        }
+        (ctx, rec)
+    }
+
+    /// Open a raw spill file at `path` (uncompressed) and decode it through
+    /// the production `SpillReader` frame loop, returning the first decode
+    /// error encountered. Mirrors `SpillFile::reader` without needing a
+    /// `SpillFile` handle (the surgical file isn't one).
+    fn decode_surgical(path: &Path, schema: &Arc<Schema>) -> Result<Vec<Record>, SpillError> {
+        let mut file = std::fs::File::open(path)?;
+        let mut tag = [0u8; 1];
+        file.read_exact(&mut tag)?;
+        let source = match tag[0] {
+            FORMAT_TAG_UNCOMPRESSED => SpillSource::Uncompressed(BufReader::new(file)),
+            FORMAT_TAG_LZ4 => SpillSource::Lz4(BufReader::new(FrameDecoder::new(file))),
+            other => {
+                return Err(SpillError::InvalidSchema(format!(
+                    "unknown tag {other:#04x}"
+                )));
+            }
+        };
+        let mut reader: SpillReader<()> = SpillReader {
+            source,
+            schema: Arc::clone(schema),
+            doc_table: HashMap::new(),
+            len_buf: [0u8; 4],
+            _payload: PhantomData,
+        };
+        let mut schema_line = String::new();
+        reader.source.read_line(&mut schema_line)?;
+        reader.map(|r| r.map(|(rec, ())| rec)).collect()
     }
 }
