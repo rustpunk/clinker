@@ -64,10 +64,16 @@ impl Delimiters {
 /// Wraps a buffered source and yields one decoded segment string at a time
 /// (terminator stripped, inter-segment CR/LF whitespace stripped). The
 /// delimiters are discovered once from the optional `UNA` prefix on the
-/// first read. Element text is decoded through the active [`Charset`], which
-/// starts on the byte-total bootstrap repertoire so the `UNB` decodes before
-/// its in-band syntax identifier is known; the reader re-arms it via
-/// [`Self::set_charset`] once that identifier is parsed.
+/// first read.
+///
+/// The body repertoire is named in-band by the `UNB` syntax identifier, so
+/// the reader frames the first segment raw via [`Self::next_raw_segment`],
+/// sniffs that identifier (always ASCII) from the raw bytes, arms the
+/// charset with [`Self::set_charset`], and only then decodes — including the
+/// `UNB` itself — through [`Self::decode`]. Every subsequent segment decodes
+/// through the negotiated repertoire via [`Self::next_segment`]. The charset
+/// is therefore set before any byte is interpreted, so no element is ever
+/// decoded under a wrong repertoire.
 pub(crate) struct SegmentTokenizer<R: Read> {
     reader: R,
     delimiters: Delimiters,
@@ -77,15 +83,19 @@ pub(crate) struct SegmentTokenizer<R: Read> {
 
 impl<R: BufRead> SegmentTokenizer<R> {
     /// Build a tokenizer over a buffered source. Delimiter discovery is
-    /// deferred to the first [`Self::next_segment`] call so the `UNA`
-    /// scan and the first segment read share one pass. Decoding starts on
-    /// the bootstrap charset so the `UNB` — which names the body repertoire
-    /// in-band — can itself be decoded before that repertoire is known.
+    /// deferred to the first read so the `UNA` scan and the first segment
+    /// read share one pass.
+    ///
+    /// The charset starts at [`Charset::default`] purely as a placeholder:
+    /// the reader frames the first (`UNB`) segment raw, sniffs the in-band
+    /// syntax identifier, and arms the real repertoire via
+    /// [`Self::set_charset`] before any segment — the `UNB` included — is
+    /// decoded, so the placeholder is never used to interpret bytes.
     pub(crate) fn new(reader: R) -> Self {
         Self {
             reader,
             delimiters: Delimiters::level_a(),
-            charset: Charset::Bootstrap,
+            charset: Charset::default(),
             initialized: false,
         }
     }
@@ -96,11 +106,26 @@ impl<R: BufRead> SegmentTokenizer<R> {
         self.delimiters
     }
 
-    /// Re-arm the decoding charset, called by the reader once it has parsed
-    /// the `UNB` syntax identifier so every subsequent segment decodes
-    /// through the negotiated repertoire.
+    /// Arm the decoding charset from the `UNB` syntax identifier, called by
+    /// the reader before it decodes the first segment so every segment —
+    /// the `UNB` included — decodes through the negotiated repertoire.
     pub(crate) fn set_charset(&mut self, charset: Charset) {
         self.charset = charset;
+    }
+
+    /// Decode raw segment bytes through the armed charset.
+    ///
+    /// Paired with [`Self::next_raw_segment`] so the reader can frame the
+    /// first segment, sniff its in-band syntax identifier, arm the charset,
+    /// and then decode the same bytes correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Edifact`] when the bytes are not valid in the
+    /// armed charset (a high byte under an ASCII repertoire, or invalid
+    /// UTF-8 under UNOY).
+    pub(crate) fn decode(&self, raw: Vec<u8>) -> Result<String, FormatError> {
+        self.charset.decode(raw)
     }
 
     /// Resolve the optional `UNA` prefix. Peeks the first bytes of the
@@ -155,28 +180,22 @@ impl<R: BufRead> SegmentTokenizer<R> {
         }
     }
 
-    /// Read the next segment (terminator-delimited) and decode it through
-    /// the active [`Charset`], or `None` at clean end of stream.
+    /// Read the next segment's raw bytes (terminator-delimited), or `None`
+    /// at clean end of stream, without decoding them.
     ///
     /// The terminator byte is consumed but not returned. A release char
-    /// immediately before a terminator escapes it (the terminator is
-    /// then literal data, not a boundary). CR/LF between segments is
-    /// dropped; CR/LF inside an element is preserved. The raw segment bytes
-    /// are decoded once here (the shared framing layer that read them never
-    /// interprets bytes), so the in-band repertoire is honored without
-    /// touching segment framing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::Edifact`] when the segment bytes are not valid
-    /// in the active charset — a high byte under an ASCII repertoire, or
-    /// invalid UTF-8 under UNOY.
-    pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
+    /// immediately before a terminator escapes it (the terminator is then
+    /// literal data, not a boundary). CR/LF between segments is dropped;
+    /// CR/LF inside an element is preserved. The bytes are returned
+    /// undecoded so the reader can sniff the `UNB` syntax identifier (always
+    /// ASCII) before arming the charset, then decode the same bytes through
+    /// the negotiated repertoire via [`Self::decode`].
+    pub(crate) fn next_raw_segment(&mut self) -> Result<Option<Vec<u8>>, FormatError> {
         self.initialize()?;
         skip_inter_segment_whitespace(&mut self.reader)?;
 
         let framing = self.framing();
-        let raw = match read_raw_segment(
+        read_raw_segment(
             &mut self.reader,
             &framing,
             || {
@@ -191,13 +210,26 @@ impl<R: BufRead> SegmentTokenizer<R> {
                      the interchange is truncated"
                 ))
             },
-        )? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
+        )
+    }
 
-        let text = self.charset.decode(raw)?;
-        Ok(Some(text))
+    /// Read the next segment and decode it through the armed [`Charset`], or
+    /// `None` at clean end of stream.
+    ///
+    /// Convenience composition of [`Self::next_raw_segment`] and
+    /// [`Self::decode`] for body segments, which are always read after the
+    /// charset has been armed from the `UNB`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Edifact`] when the segment bytes are not valid
+    /// in the armed charset — a high byte under an ASCII repertoire, or
+    /// invalid UTF-8 under UNOY.
+    pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
+        match self.next_raw_segment()? {
+            Some(raw) => Ok(Some(self.decode(raw)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -409,33 +441,38 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_decodes_unb_with_high_byte_in_a_later_element() {
-        // The bootstrap charset must not break on a high byte before the
-        // syntax identifier is known: a UNB carrying a Latin-1 byte 0xE9 in
-        // a sender field still decodes (the tag/syntax id are ASCII).
+    fn raw_unb_decodes_high_byte_element_under_negotiated_charset() {
+        // The UNB is framed raw, the ASCII syntax id is sniffed to arm the
+        // charset, and only then is the UNB decoded — so a non-ASCII byte in
+        // a UNB sender element decodes under the negotiated repertoire, not a
+        // placeholder. 0xE9 under UNOC (Latin-1) is é.
         let mut data = b"UNB+UNOC:3+Caf".to_vec();
         data.push(0xE9);
         data.push(b'\'');
         let mut t = SegmentTokenizer::new(Cursor::new(data));
-        let first = t.next_segment().unwrap().unwrap();
+        let raw = t.next_raw_segment().unwrap().unwrap();
+        let charset = Charset::from_raw_unb_segment(&raw, &t.delimiters()).unwrap();
+        assert_eq!(charset, Charset::Latin1);
+        t.set_charset(charset);
+        let first = t.decode(raw).unwrap();
         assert_eq!(first, "UNB+UNOC:3+Café");
     }
 
     #[test]
-    fn rearmed_latin1_decodes_high_byte_body_segment() {
-        // After the UNB is decoded under the bootstrap charset, re-arming to
-        // Latin-1 (as the reader does once it parses UNOC) lets a body
-        // segment carrying a Latin-1 high byte decode correctly.
+    fn armed_latin1_decodes_high_byte_body_segment() {
+        // After the UNB is read raw and the charset armed to Latin-1, a body
+        // segment carrying a Latin-1 high byte decodes correctly.
         let mut body = b"NAD+BY+Caf".to_vec();
         body.push(0xE9);
         body.push(b'\'');
         let mut full = b"UNB+UNOC:3+S+R'".to_vec();
         full.extend_from_slice(&body);
         let mut t = SegmentTokenizer::new(Cursor::new(full));
-        let unb = t.next_segment().unwrap().unwrap();
-        assert_eq!(unb, "UNB+UNOC:3+S+R");
-        // The reader re-arms here, between segment 1 (UNB) and segment 2.
-        t.set_charset(Charset::Latin1);
+        let raw = t.next_raw_segment().unwrap().unwrap();
+        let charset = Charset::from_raw_unb_segment(&raw, &t.delimiters()).unwrap();
+        t.set_charset(charset);
+        assert_eq!(t.decode(raw).unwrap(), "UNB+UNOC:3+S+R");
+        // The body segment now decodes under the armed Latin-1 charset.
         let nad = t.next_segment().unwrap().unwrap();
         let parsed = split_segment(&nad, &t.delimiters());
         assert_eq!(parsed.tag, "NAD");
@@ -452,8 +489,11 @@ mod tests {
         let mut full = b"UNB+UNOA:1+S+R'".to_vec();
         full.extend_from_slice(&body);
         let mut t = SegmentTokenizer::new(Cursor::new(full));
-        let _ = t.next_segment().unwrap().unwrap(); // UNB under bootstrap
-        t.set_charset(Charset::Ascii);
+        let raw = t.next_raw_segment().unwrap().unwrap();
+        let charset = Charset::from_raw_unb_segment(&raw, &t.delimiters()).unwrap();
+        assert_eq!(charset, Charset::Ascii);
+        t.set_charset(charset);
+        let _ = t.decode(raw).unwrap(); // UNB is ASCII, decodes fine
         let err = t.next_segment().unwrap_err();
         assert!(matches!(err, FormatError::Edifact(m) if m.contains("ASCII")));
     }

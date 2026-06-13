@@ -60,9 +60,11 @@ pub struct EdifactWriter<W: Write> {
     config: EdifactWriterConfig,
     delims: Delimiters,
     /// Repertoire element text is encoded through, negotiated from the
-    /// resolved `UNB` syntax identifier when the header is written. Starts on
-    /// the byte-total bootstrap charset so the `UNB` (whose tag and syntax id
-    /// are ASCII) emits before the repertoire is known.
+    /// resolved `UNB` syntax identifier and armed before the `UNB` is
+    /// emitted, so the header's own elements encode under it. Holds the
+    /// [`Charset::default`] placeholder until `write_header` arms it; the
+    /// placeholder is never used to encode, since no segment is written
+    /// before the header.
     charset: Charset,
     /// Wire element columns keyed by the 1-based position parsed from the
     /// column name (`e01` → 1), each paired with its schema index. The
@@ -133,7 +135,7 @@ impl<W: Write> EdifactWriter<W> {
             writer,
             config,
             delims: Delimiters::level_a(),
-            charset: Charset::Bootstrap,
+            charset: Charset::default(),
             element_columns,
             seg_id_idx,
             msg_ref_idx,
@@ -175,12 +177,12 @@ impl<W: Write> EdifactWriter<W> {
 
         let unb_elements = self.resolve_unb_elements(record)?;
         // Negotiate the encoding repertoire from the resolved syntax
-        // identifier (UNB S001 component 1, e.g. `UNOC` in `UNOC:3`) before
-        // emitting any segment, so element text is encoded through the same
-        // repertoire the reader decodes under and the round-trip is
-        // byte-faithful. The UNB itself emits under the bootstrap charset,
-        // which is faithful for its ASCII content, then every subsequent
-        // body segment encodes through the negotiated repertoire.
+        // identifier (UNB S001 component 1, e.g. `UNOC` in `UNOC:3`) and arm
+        // it BEFORE the UNB is emitted, so the UNB's own elements — including
+        // a sender/recipient identification carrying non-ASCII text under
+        // UNOC or UNOY — encode through the negotiated repertoire and invert
+        // the reader's decode exactly. The syntax identifier itself is ASCII,
+        // so it encodes identically regardless.
         let syntax_id = unb_elements.first().ok_or_else(|| {
             FormatError::Edifact(
                 "the resolved UNB header carries no syntax-identifier element (S001), \
@@ -189,7 +191,7 @@ impl<W: Write> EdifactWriter<W> {
                     .into(),
             )
         })?;
-        let charset = Charset::from_unb_syntax_identifier(syntax_id, self.delims.component)?;
+        self.charset = Charset::from_unb_syntax_identifier(syntax_id, self.delims.component)?;
         // Echo the same control reference into the UNZ trailer that the
         // reader validates against, located structurally (after the
         // mandatory leading composites) so an empty optional element in
@@ -199,9 +201,6 @@ impl<W: Write> EdifactWriter<W> {
             .unwrap_or_default()
             .to_owned();
         self.write_segment("UNB", &unb_elements)?;
-        // Re-arm only after the UNB has emitted (it goes out under the
-        // bootstrap charset, which is faithful for its ASCII content).
-        self.charset = charset;
         Ok(())
     }
 

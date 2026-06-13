@@ -4,11 +4,14 @@
 //! Unlike X12 — which has no in-band repertoire marker and declares its
 //! encoding out-of-band on the source — an EDIFACT interchange names its
 //! repertoire on the wire: `UNB` data element S001 component 1 carries the
-//! syntax identifier (`UNOA`, `UNOB`, `UNOC`, …). The tokenizer starts on a
-//! byte-total bootstrap repertoire so the `UNB` itself decodes before its
-//! repertoire is known, then is re-armed once the reader has parsed the
-//! syntax identifier; every subsequent segment decodes through the
-//! negotiated repertoire.
+//! syntax identifier (`UNOA`, `UNOB`, `UNOC`, …). That identifier is always
+//! ASCII, so the reader frames the `UNB` raw and reads the level directly
+//! from the bytes ([`Charset::from_raw_unb_segment`]) before decoding
+//! anything; it then decodes the whole `UNB` — including its own non-ASCII
+//! sender/recipient identification — through the negotiated repertoire. The
+//! writer derives the same repertoire from the `UNB` it emits and arms it
+//! before writing the header. No element is ever processed under a wrong
+//! repertoire, so the `UNB` round-trips byte-for-byte just like the body.
 //!
 //! Only repertoires whose byte↔codepoint mapping is total and
 //! round-trippable in pure Rust are supported, so a read→write→read cycle is
@@ -16,6 +19,7 @@
 //! fails explicitly, naming the offending level, rather than guessing or
 //! silently substituting replacement characters.
 
+use crate::edifact::tokenizer::Delimiters;
 use crate::error::FormatError;
 
 /// The character repertoire used to decode and encode EDIFACT element text,
@@ -23,16 +27,17 @@ use crate::error::FormatError;
 ///
 /// Decoding happens per segment (no whole-interchange buffering), so the
 /// charset is consulted once per segment read rather than over the stream.
+/// The syntax identifier that selects the repertoire is itself ASCII and is
+/// read from the raw `UNB` bytes before any segment is decoded, so the
+/// `UNB`'s own non-ASCII elements (sender / recipient identification under
+/// UNOC or UNOY) decode and encode under the negotiated repertoire, never a
+/// placeholder — a read → write → read cycle is byte-faithful end to end.
+///
+/// The [`Default`] is [`Charset::Utf8`], used only as the tokenizer's
+/// pre-negotiation placeholder; it is overwritten before any byte is
+/// interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Charset {
-    /// The bootstrap repertoire used before the `UNB` syntax identifier is
-    /// known. Maps every byte `0xNN` to codepoint `U+00NN` (Latin-1 style),
-    /// so the `UNB` — whose tag and syntax identifier are pure ASCII —
-    /// decodes regardless of any high byte further along the segment, and
-    /// decoding never fails. Re-armed to the negotiated repertoire before
-    /// the first body segment is decoded.
-    #[default]
-    Bootstrap,
     /// Syntax level UNOA/UNOB: restricted/basic ASCII. A byte `>= 0x80` is
     /// rejected loudly rather than reinterpreted, so a high byte declared
     /// under an ASCII repertoire fails instead of silently corrupting.
@@ -44,7 +49,10 @@ pub(crate) enum Charset {
     /// corrupting the output.
     Latin1,
     /// Syntax level UNOY: UTF-8. Strict — invalid UTF-8 is an error, not a
-    /// lossy substitution, so a mis-declared interchange fails loudly.
+    /// lossy substitution, so a mis-declared interchange fails loudly. The
+    /// default placeholder, never used to interpret bytes before the real
+    /// repertoire is negotiated.
+    #[default]
     Utf8,
 }
 
@@ -83,9 +91,11 @@ impl Charset {
     /// (data element S001, e.g. `"UNOA:1"`), splitting off the level
     /// (component 1) on the active component separator before resolving.
     ///
-    /// Both the reader and the writer arm the charset from this one element,
-    /// so the "component 1 is the syntax level" structure lives here rather
-    /// than at each call site.
+    /// The writer arms the charset from this already-decoded element (its
+    /// header comes from config or a `$doc` echo), so the "component 1 is the
+    /// syntax level" structure lives here rather than at the call site. The
+    /// reader instead uses [`Self::from_raw_unb_segment`], because it must
+    /// know the repertoire before it can decode the `UNB`.
     ///
     /// # Errors
     ///
@@ -99,6 +109,52 @@ impl Charset {
         Self::from_syntax_id(level)
     }
 
+    /// Resolve the repertoire from the raw, still-undecoded bytes of a `UNB`
+    /// segment (terminator already stripped), reading the syntax-identifier
+    /// level (S001 component 1) directly from the bytes.
+    ///
+    /// The reader cannot decode the `UNB` until it knows the repertoire, and
+    /// the repertoire is named inside the `UNB` — so the level is read from
+    /// the raw bytes first. The level is always ASCII (`UNOA`..`UNOY`), and
+    /// ASCII bytes are identical under every supported repertoire, so reading
+    /// it byte-for-byte is unambiguous even when a later `UNB` element (a
+    /// sender/recipient identification) carries a non-ASCII byte. Once
+    /// resolved, the caller decodes the whole `UNB` through the returned
+    /// repertoire.
+    ///
+    /// The level spans from just after the tag's element separator to the
+    /// next component or element separator, honoring the release character so
+    /// an escaped delimiter inside the (pathological) identifier is not
+    /// mistaken for a boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Edifact`] when the segment carries no
+    /// syntax-identifier element, when that identifier is not ASCII (a
+    /// malformed `UNB`, since the level is spec-ASCII), or when the level
+    /// matches no mapped repertoire (see [`Self::from_syntax_id`]).
+    pub(crate) fn from_raw_unb_segment(
+        raw: &[u8],
+        delims: &Delimiters,
+    ) -> Result<Self, FormatError> {
+        let level_bytes = raw_unb_syntax_level(raw, delims).ok_or_else(|| {
+            FormatError::Edifact(
+                "UNB carries no syntax-identifier element (S001); the interchange \
+                 declares no character repertoire and is malformed"
+                    .into(),
+            )
+        })?;
+        let level = std::str::from_utf8(&level_bytes).map_err(|_| {
+            FormatError::Edifact(
+                "the UNB syntax-identifier level (S001 component 1) is not ASCII; the \
+                 interchange is malformed (the syntax level is always one of \
+                 UNOA/UNOB/UNOC/UNOY)"
+                    .into(),
+            )
+        })?;
+        Self::from_syntax_id(level)
+    }
+
     /// Decode raw segment bytes to a `String` through this repertoire,
     /// consuming the buffer so the UTF-8 path validates in place without a
     /// copy (this runs once per segment on the hot path).
@@ -107,17 +163,12 @@ impl Charset {
     ///
     /// Returns [`FormatError::Edifact`] when the bytes are not valid in the
     /// repertoire: a byte `>= 0x80` under [`Charset::Ascii`], or invalid
-    /// UTF-8 under [`Charset::Utf8`]. The bootstrap and Latin-1 repertoires
-    /// map every byte and never fail. The message names the active level so
-    /// a mis-declared syntax identifier is diagnosable.
+    /// UTF-8 under [`Charset::Utf8`]. Latin-1 maps every byte and never
+    /// fails. The message names the active level so a mis-declared syntax
+    /// identifier is diagnosable.
     pub(crate) fn decode(&self, bytes: Vec<u8>) -> Result<String, FormatError> {
         match self {
-            // Bootstrap and Latin-1 both map byte 0xNN to U+00NN, so every
-            // byte decodes; bootstrap exists only to read the UNB before its
-            // repertoire is known.
-            Charset::Bootstrap | Charset::Latin1 => {
-                Ok(bytes.into_iter().map(|b| b as char).collect())
-            }
+            Charset::Latin1 => Ok(latin1_decode(bytes)),
             Charset::Ascii => {
                 if let Some(&high) = bytes.iter().find(|&&b| b >= 0x80) {
                     return Err(FormatError::Edifact(format!(
@@ -127,9 +178,9 @@ impl Charset {
                          wider character set"
                     )));
                 }
-                // Every byte is < 0x80, so the slice is valid ASCII and
-                // therefore valid UTF-8.
-                Ok(bytes.into_iter().map(|b| b as char).collect())
+                // Every byte is < 0x80, so the bytes are valid ASCII; the
+                // Latin-1 byte→codepoint map is identical to ASCII here.
+                Ok(latin1_decode(bytes))
             }
             Charset::Utf8 => String::from_utf8(bytes).map_err(|e| {
                 FormatError::Edifact(format!(
@@ -149,11 +200,10 @@ impl Charset {
     /// repertoire cannot represent: any non-ASCII character under
     /// [`Charset::Ascii`], or a character above `U+00FF` under
     /// [`Charset::Latin1`]. The writer then fails explicitly rather than
-    /// emitting a structurally truncated value. UTF-8 (and the bootstrap
-    /// repertoire, for the ASCII control segments it ever sees) cannot fail.
+    /// emitting a structurally truncated value. UTF-8 encoding cannot fail.
     pub(crate) fn encode(&self, text: &str) -> Result<Vec<u8>, FormatError> {
         match self {
-            Charset::Utf8 | Charset::Bootstrap => Ok(text.as_bytes().to_vec()),
+            Charset::Utf8 => Ok(text.as_bytes().to_vec()),
             Charset::Ascii => {
                 if let Some(c) = text.chars().find(|c| !c.is_ascii()) {
                     return Err(FormatError::Edifact(format!(
@@ -165,22 +215,95 @@ impl Charset {
                 }
                 Ok(text.as_bytes().to_vec())
             }
-            Charset::Latin1 => text
-                .chars()
-                .map(|c| {
-                    u32::from(c).try_into().map_err(|_| {
-                        FormatError::Edifact(format!(
-                            "element text {text:?} contains character {c:?} (U+{:04X}), which \
-                             is outside ISO-8859-1 (Latin-1) and cannot be encoded; the \
-                             repertoire declared by the UNB syntax identifier (UNOC) cannot \
-                             represent it",
-                            u32::from(c)
-                        ))
-                    })
-                })
-                .collect(),
+            Charset::Latin1 => latin1_encode(text),
         }
     }
+}
+
+/// Extract the raw bytes of the `UNB` syntax-identifier level (S001
+/// component 1) from a raw `UNB` segment, or `None` when the segment has no
+/// data element after the tag.
+///
+/// Scans past the tag's element separator, then collects bytes up to the
+/// first component or element separator. The release character escapes the
+/// following byte so an escaped delimiter is treated as literal data,
+/// mirroring [`super::split_segment`]; the escaped byte is included verbatim
+/// (release char dropped) so the returned slice is the decoded level.
+fn raw_unb_syntax_level(raw: &[u8], delims: &Delimiters) -> Option<Vec<u8>> {
+    let mut iter = raw.iter().copied();
+    // Skip the tag up to and including the first (unescaped) element
+    // separator. A release before the separator escapes it.
+    let mut pending_release = false;
+    let mut found_tag_end = false;
+    for b in iter.by_ref() {
+        if pending_release {
+            pending_release = false;
+            continue;
+        }
+        if b == delims.release {
+            pending_release = true;
+            continue;
+        }
+        if b == delims.element {
+            found_tag_end = true;
+            break;
+        }
+    }
+    if !found_tag_end {
+        return None;
+    }
+    // Collect the first data element's first component (the syntax level).
+    let mut level: Vec<u8> = Vec::new();
+    let mut pending_release = false;
+    for b in iter {
+        if pending_release {
+            level.push(b);
+            pending_release = false;
+            continue;
+        }
+        if b == delims.release {
+            pending_release = true;
+            continue;
+        }
+        if b == delims.component || b == delims.element {
+            break;
+        }
+        level.push(b);
+    }
+    if pending_release {
+        // A dangling release at element end escapes nothing — keep it.
+        level.push(delims.release);
+    }
+    Some(level)
+}
+
+/// Decode bytes as ISO-8859-1 (Latin-1): byte `0xNN` is codepoint `U+00NN`
+/// across the whole range, so every byte maps and decoding never fails. The
+/// ASCII repertoire reuses this after rejecting high bytes, since the two
+/// maps agree below `0x80`.
+fn latin1_decode(bytes: Vec<u8>) -> String {
+    bytes.into_iter().map(|b| b as char).collect()
+}
+
+/// Encode text as ISO-8859-1 (Latin-1), one byte per character.
+///
+/// # Errors
+///
+/// Returns [`FormatError::Edifact`] when a character is above `U+00FF`, which
+/// Latin-1 cannot represent, so the value is rejected rather than truncated.
+fn latin1_encode(text: &str) -> Result<Vec<u8>, FormatError> {
+    text.chars()
+        .map(|c| {
+            u32::from(c).try_into().map_err(|_| {
+                FormatError::Edifact(format!(
+                    "element text {text:?} contains character {c:?} (U+{:04X}), which is \
+                     outside ISO-8859-1 (Latin-1) and cannot be encoded; the repertoire \
+                     declared by the UNB syntax identifier (UNOC) cannot represent it",
+                    u32::from(c)
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -230,15 +353,59 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_decodes_every_byte_and_never_fails() {
-        // The bootstrap repertoire must not break on a high byte before the
-        // repertoire is known.
-        let bytes: Vec<u8> = (0u8..=255).collect();
-        let decoded = Charset::Bootstrap.decode(bytes.clone()).unwrap();
-        assert_eq!(decoded.chars().count(), 256);
-        // The ASCII prefix a UNB tag/syntax-id lives in is faithful.
-        let unb = Charset::Bootstrap.decode(b"UNB+UNOA:1".to_vec()).unwrap();
-        assert_eq!(unb, "UNB+UNOA:1");
+    fn from_raw_unb_segment_sniffs_level_before_decoding() {
+        // The syntax level is read from raw UNB bytes (ASCII) even when a
+        // later element carries a high byte that the level's repertoire would
+        // later decode — proving the sniff does not need the body decoded.
+        let d = Delimiters::level_a();
+        let mut raw = b"UNB+UNOC:3+Caf".to_vec();
+        raw.push(0xE9); // a non-ASCII byte further along the UNB
+        assert_eq!(
+            Charset::from_raw_unb_segment(&raw, &d).unwrap(),
+            Charset::Latin1
+        );
+
+        // UNOA -> ASCII, UNOY -> UTF-8.
+        assert_eq!(
+            Charset::from_raw_unb_segment(b"UNB+UNOA:1+S+R", &d).unwrap(),
+            Charset::Ascii
+        );
+        assert_eq!(
+            Charset::from_raw_unb_segment(b"UNB+UNOY:4+S+R", &d).unwrap(),
+            Charset::Utf8
+        );
+    }
+
+    #[test]
+    fn from_raw_unb_segment_handles_level_without_a_component() {
+        // A syntax identifier that is just the level, with no `:version`
+        // component, still resolves (the level runs to the element sep).
+        let d = Delimiters::level_a();
+        assert_eq!(
+            Charset::from_raw_unb_segment(b"UNB+UNOC+S+R", &d).unwrap(),
+            Charset::Latin1
+        );
+    }
+
+    #[test]
+    fn from_raw_unb_segment_rejects_missing_syntax_id() {
+        // A UNB with no data element after the tag declares no repertoire.
+        let d = Delimiters::level_a();
+        let err = Charset::from_raw_unb_segment(b"UNB", &d).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("syntax-identifier")),
+            "expected missing-syntax-id error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_raw_unb_segment_rejects_unsupported_level() {
+        let d = Delimiters::level_a();
+        let err = Charset::from_raw_unb_segment(b"UNB+UNOD:4+S+R", &d).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("UNOD")),
+            "expected unsupported-level error naming UNOD, got {err:?}"
+        );
     }
 
     #[test]

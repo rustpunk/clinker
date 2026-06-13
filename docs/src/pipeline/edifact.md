@@ -243,12 +243,15 @@ without any configuration.
 | `UNOY`             | UTF-8; invalid byte sequences are an error      |
 
 Decoding stays streaming and per-segment — the interchange is never
-buffered whole. The `UNB` itself is decoded byte-for-byte before its
-syntax identifier is known (its tag and identifier are ASCII), then the
-repertoire is armed before the first body segment, so a `UNOC`
-interchange whose body carries Latin-1 high bytes (for example accented
-characters in free-text name or address fields) parses without error and
-the decoded element text matches the source bytes under Latin-1.
+buffered whole. The syntax identifier is itself ASCII, so it is read
+straight from the raw `UNB` bytes before any text is decoded; the `UNB`
+and every body segment are then decoded through the negotiated
+repertoire. The `UNB`'s own sender and recipient identification elements
+may legitimately carry non-ASCII text under `UNOC` or `UNOY`, and they
+decode (and re-encode on output) under that repertoire too — so a `UNOC`
+interchange whose header or body carries Latin-1 high bytes (for example
+accented characters in a party name) parses without error, surfaces the
+correct text in `$doc.UNB.*`, and round-trips byte-for-byte.
 
 The repertoire is enforced loudly. A `UNOA`/`UNOB` interchange whose body
 carries a high byte fails ("outside the ASCII repertoire") rather than
