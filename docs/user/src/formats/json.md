@@ -22,6 +22,7 @@ rules.
     options:
       format: ndjson          # array | ndjson | object (auto-detect if omitted)
       record_path: "$.data"   # JSONPath to the records array (object format)
+      max_index_bytes: 64MB   # cap on retained envelope sections (optional)
 ```
 
 ## Physical shapes
@@ -43,3 +44,22 @@ product. The [`array_paths`](../nodes/source.md#array-paths) field on the
 source controls whether each nested array **explodes** into one record per
 element or **joins** into a delimited string. That field is shared with
 the XML reader and documented on the Source Nodes page.
+
+## Bounding envelope retention: `max_index_bytes`
+
+When a source declares an `envelope:` and a pipeline reads `$doc.*` paths
+from it, the JSON reader runs a streaming pre-scan that walks the document
+once and retains only the declared section subtrees — every other key,
+including a multi-megabyte body array, is parsed-and-skipped without being
+stored. The retained sections live in a bounded document index.
+
+`max_index_bytes` caps that index. It is charged incrementally as each
+section is parsed, so even a single oversized declared section aborts
+mid-parse (naming the section and the cap) rather than risking an
+out-of-memory failure. It accepts a decimal size string (`64MB`, `500KB`)
+or a bare byte count; optional, defaulting to **64MB**. Only the declared
+sections a program actually reads are retained, so envelope metadata sits
+far below this ceiling in practice — the cap exists to convert an unbounded
+mistake into a clear error. See
+[Document Envelope Context](../pipelines/envelope-and-doc-context.md) for
+the full model.

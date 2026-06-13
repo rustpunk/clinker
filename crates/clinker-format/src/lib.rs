@@ -1,6 +1,7 @@
 pub mod bom;
 pub mod counting;
 pub mod csv;
+pub mod doc_index;
 pub mod edifact;
 pub mod envelope;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod x12;
 pub mod xml;
 
 pub use counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
+pub use doc_index::DocArenaIndex;
 pub use envelope::{
     EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
     NestedEnvelopeSection,
