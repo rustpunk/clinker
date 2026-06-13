@@ -27,11 +27,11 @@ use clinker_plan::error::PipelineError;
 /// Build a format-specific reader from input config and a re-openable source.
 ///
 /// Dispatches on `InputFormat` to construct the correct reader type. The JSON
-/// arm threads the [`ReopenableSource`] straight through so its envelope
-/// pre-scan and body stream each open a fresh `Read` without buffering the
-/// whole file; every other (one-pass) format opens the source once and streams
-/// that single `Read`. Returns `Box<dyn FormatReader>` — all downstream code
-/// uses trait methods (`schema()`, `next_record()`).
+/// and XML arms thread the [`ReopenableSource`] straight through so their
+/// envelope pre-scan and body stream each open a fresh `Read` without buffering
+/// the whole file; every other (one-pass) format opens the source once and
+/// streams that single `Read`. Returns `Box<dyn FormatReader>` — all downstream
+/// code uses trait methods (`schema()`, `next_record()`).
 fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
     source: ReopenableSource,
@@ -58,7 +58,7 @@ fn build_format_reader(
                 input.array_paths.as_deref(),
                 &input.declared_doc_paths,
             );
-            Ok(Box::new(XmlReader::new(open_one_shot(&source)?, config)?))
+            Ok(Box::new(XmlReader::from_source(source, config)?))
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => {
             let fields = extract_field_defs(input)?;

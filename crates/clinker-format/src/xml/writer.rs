@@ -433,7 +433,7 @@ mod tests {
 
         // Read back
         let cursor = std::io::Cursor::new(output.as_bytes().to_vec());
-        let mut reader = XmlReader::new(
+        let mut reader = XmlReader::from_reader(
             cursor,
             XmlReaderConfig {
                 record_path: Some("Root/Record".into()),

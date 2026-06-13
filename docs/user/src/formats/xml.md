@@ -60,8 +60,10 @@ sections a program actually reads are retained, so envelope metadata sits
 far below this ceiling in practice — the cap exists to convert an unbounded
 mistake into a clear error.
 
-The reader still buffers the raw source bytes for the lifetime of the read
-(one disk read backs both the body parser and the pre-scan); the pre-scan
-no longer materializes the section subtrees themselves. See
+The reader holds no whole-document buffer: the body walks the document
+element-at-a-time, and the envelope pre-scan opens the source a second time
+to walk it independently — a file source is read twice, never buffered. Peak
+memory is the bounded section index plus a single live record, not the input
+size. See
 [Document Envelope Context](../pipelines/envelope-and-doc-context.md) for
 the full model.

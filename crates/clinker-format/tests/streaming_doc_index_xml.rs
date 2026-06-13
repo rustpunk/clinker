@@ -1,11 +1,14 @@
-//! Bounded-retention behavior of the streaming XML envelope pre-scan.
+//! Bounded-retention and bounded-memory behavior of the streaming XML reader.
 //!
-//! Proves the pre-scan retains only the declared `$doc.*` section subtrees —
-//! a multi-MB body of undeclared records is event-walked and dropped, never
-//! flattened into the document index — and that an over-budget retention
-//! fails loud mid-build rather than after a full materialization.
+//! Proves the envelope pre-scan retains only the declared `$doc.*` section
+//! subtrees — a multi-MB body of undeclared records is event-walked and
+//! dropped, never flattened into the document index — that an over-budget
+//! retention fails loud mid-build rather than after a full materialization,
+//! and that the body itself streams element-at-a-time from a re-opened
+//! path-backed source with no whole-document buffer.
 
 use clinker_format::FormatError;
+use clinker_format::ReopenableSource;
 use clinker_format::envelope::{
     EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
 };
@@ -14,6 +17,7 @@ use clinker_format::xml::reader::{XmlReader, XmlReaderConfig};
 use clinker_record::Value;
 use cxl::analyzer::doc_paths::DocPath;
 use indexmap::IndexMap;
+use std::io::Write;
 
 /// One envelope section: name, slash-path, typed fields.
 type SectionSpec<'a> = (&'a str, &'a str, &'a [(&'a str, EnvelopeFieldType)]);
@@ -51,7 +55,7 @@ fn declared_paths(specs: &[SectionSpec]) -> Vec<DocPath> {
 }
 
 fn reader(xml: String, specs: &[SectionSpec], record_path: &str, cap: usize) -> XmlReader {
-    XmlReader::new(
+    XmlReader::from_reader(
         std::io::Cursor::new(xml.into_bytes()),
         XmlReaderConfig {
             record_path: Some(record_path.into()),
@@ -61,6 +65,16 @@ fn reader(xml: String, specs: &[SectionSpec], record_path: &str, cap: usize) -> 
         },
     )
     .expect("XML buffer read")
+}
+
+/// A unique temp path under the OS temp dir, namespaced by pid + thread so
+/// concurrent test threads never collide on a fixed name.
+fn temp_path(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "clinker-{tag}-{}-{:?}.xml",
+        std::process::id(),
+        std::thread::current().id()
+    ))
 }
 
 /// A document with a large undeclared body and a small declared trailer:
@@ -230,7 +244,7 @@ fn prescan_skips_entirely_when_no_doc_path_declared() {
     )];
     let cfg = envelope_config(specs);
 
-    let mut reader = XmlReader::new(
+    let mut reader = XmlReader::from_reader(
         std::io::Cursor::new(xml.as_bytes().to_vec()),
         XmlReaderConfig {
             record_path: Some("doc/records/record".into()),
@@ -322,7 +336,7 @@ fn prescan_prunes_the_unread_section_in_a_mixed_envelope() {
     // ...but only `Foot` is referenced by a `$doc` path.
     let declared = declared_paths(&[foot_spec]);
 
-    let mut reader = XmlReader::new(
+    let mut reader = XmlReader::from_reader(
         std::io::Cursor::new(xml.into_bytes()),
         XmlReaderConfig {
             record_path: Some("doc/records/record".into()),
@@ -367,4 +381,191 @@ fn prescan_preserves_namespaces_attributes_and_cdata() {
     let meta = unwrap_map(sections.get("Meta").expect("Meta retained"));
     assert_eq!(meta.get("tag.@kind"), Some(&Value::String("run".into())));
     assert_eq!(meta.get("note"), Some(&Value::String("a & b".into())));
+}
+
+/// A multi-MB body streams element-at-a-time from a path-backed source: the
+/// body walks one `<record>` at a time and re-opening by path means no
+/// whole-document byte buffer is held either.
+#[test]
+fn large_record_body_streams_without_collecting_or_buffering() {
+    // ~1.5 MB document of ~50k small records, written to a real file so the
+    // reader re-opens by path (the production shape) rather than buffering
+    // bytes.
+    let rows = 50_000usize;
+    let mut xml = String::from("<doc><records>");
+    for i in 0..rows {
+        xml.push_str(&format!(
+            "<record><id>{i}</id><name>row-{i}</name></record>"
+        ));
+    }
+    xml.push_str("</records></doc>");
+    assert!(
+        xml.len() > 1_000_000,
+        "body should be > 1 MB: {}",
+        xml.len()
+    );
+
+    let path = temp_path("large-body");
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(xml.as_bytes())
+        .unwrap();
+
+    let mut reader = XmlReader::from_source(
+        ReopenableSource::path(&path),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Reading the first record must not require materializing the rest: it
+    // streams one element. Then every record streams in order.
+    let mut count = 0usize;
+    let mut last_id = -1i64;
+    while let Some(rec) = reader.next_record().unwrap() {
+        let id = match rec.get("id") {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("expected integer id, got {other:?}"),
+        };
+        assert_eq!(id, last_id + 1, "body records stream in order");
+        last_id = id;
+        count += 1;
+    }
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(count, rows, "every body record streamed exactly once");
+}
+
+/// A path-backed input rewritten between the body open (at construction) and
+/// the envelope pre-scan (at `prepare_document`) is caught: the pre-scan
+/// refuses to splice an envelope from new bytes onto a body parsed from old
+/// ones, and fails loud instead of silently mismatching.
+#[test]
+fn envelope_prescan_rejects_a_file_changed_between_passes() {
+    let path = temp_path("changed-between-passes");
+    let original = r#"<doc><Summary><record_count>2</record_count></Summary><records><record><x>1</x></record><record><x>2</x></record></records></doc>"#;
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(original.as_bytes())
+        .unwrap();
+
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    // Construction opens the body and snapshots the file's identity.
+    let mut reader = XmlReader::from_source(
+        ReopenableSource::path(&path),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // An external producer rewrites the file to different content before the
+    // pre-scan re-opens it.
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(br#"<doc><Summary><record_count>9999</record_count></Summary><records><record><x>7</x></record><record><x>8</x></record><record><x>9</x></record></records></doc>"#)
+        .unwrap();
+
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("a file changed between the two passes must fail loud");
+    let _ = std::fs::remove_file(&path);
+    match err {
+        FormatError::Io(e) => assert!(
+            e.to_string().contains("changed between"),
+            "error names the mid-run change: {e}"
+        ),
+        other => panic!("expected an Io change error, got {other:?}"),
+    }
+}
+
+/// A malformed document (an unclosed element) surfaces a hard
+/// [`FormatError::Xml`] from the streaming walk rather than silently
+/// truncating the record stream — the pull parser reports the parse failure,
+/// it is not swallowed.
+#[test]
+fn malformed_unclosed_element_surfaces_xml_error() {
+    // `<name>` is never closed before EOF.
+    let xml = r#"<doc><records><record><id>1</id><name>unterminated</record></records></doc>"#;
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(xml.as_bytes().to_vec()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .expect("construction reads no bytes; a parse error surfaces while streaming");
+
+    // Drive the reader until it either errors or EOFs. A well-formedness
+    // violation must produce an `Xml` error, never a clean `None` that hides
+    // the truncation.
+    let mut saw_error = false;
+    loop {
+        match reader.next_record() {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(FormatError::Xml(_)) => {
+                saw_error = true;
+                break;
+            }
+            Err(other) => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+    }
+    assert!(
+        saw_error,
+        "an unclosed element must surface as FormatError::Xml, not silently truncate"
+    );
+}
+
+/// A deeply nested document (200+ levels) streams to completion without
+/// crashing: clinker's XML walk tracks depth with heap `Vec`s and `usize`
+/// counters, never native recursion, so a deep document cannot overflow the
+/// stack the way a recursive descent parser would.
+#[test]
+fn deeply_nested_document_streams_without_stack_overflow() {
+    const DEPTH: usize = 250;
+    // Build `<doc><records><record>` then DEPTH nested `<n>` wrappers around a
+    // leaf value, closing them all back out.
+    let mut xml = String::from("<doc><records><record>");
+    for _ in 0..DEPTH {
+        xml.push_str("<n>");
+    }
+    xml.push_str("<leaf>deep</leaf>");
+    for _ in 0..DEPTH {
+        xml.push_str("</n>");
+    }
+    xml.push_str("</record></records></doc>");
+
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(xml.into_bytes()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .expect("construction reads no bytes");
+
+    // The single deeply-nested record streams cleanly — the flattened leaf is
+    // present under its `.`-joined nesting prefix, and the iterative walk never
+    // recurses, so no stack overflow.
+    let rec = reader
+        .next_record()
+        .expect("deep nesting streams, never crashes")
+        .expect("one record");
+    let leaf_key: String = std::iter::repeat_n("n", DEPTH)
+        .chain(std::iter::once("leaf"))
+        .collect::<Vec<_>>()
+        .join(".");
+    assert_eq!(rec.get(&leaf_key), Some(&Value::String("deep".into())));
+    assert!(reader.next_record().unwrap().is_none());
 }

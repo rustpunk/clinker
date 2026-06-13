@@ -21,14 +21,13 @@
 //! even a single oversized declared section fails loud at ~the cap, before
 //! the whole subtree materializes, not after.
 
-use std::io::Cursor;
-use std::sync::Arc;
+use std::io::{BufReader, Read};
 
 use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
 use crate::error::FormatError;
-use crate::xml::reader::{NamespaceMode, elem_name_static, extract_attributes_static};
+use crate::xml::reader::{BodyParser, NamespaceMode, elem_name_static, extract_attributes_static};
 
 /// One matched section's name paired with its flat `(field, raw_string)`
 /// payload, as produced by [`extract_sections`].
@@ -78,13 +77,13 @@ impl SectionTarget {
 /// offending section and the cap when a declared section's retained bytes
 /// cross `max_index_bytes` mid-parse.
 pub(crate) fn extract_sections(
-    bytes: &Arc<[u8]>,
+    reader: BufReader<Box<dyn Read + Send>>,
     targets: &[SectionTarget],
     ns: &NamespaceMode,
     attr_prefix: &str,
     max_index_bytes: Option<usize>,
 ) -> Result<Vec<MatchedSection>, FormatError> {
-    let mut parser = XmlParser::from_reader(Cursor::new(Arc::clone(bytes)));
+    let mut parser = XmlParser::from_reader(reader);
     parser.config_mut().trim_text(true);
 
     let mut path_stack: Vec<String> = Vec::new();
@@ -201,7 +200,7 @@ fn path_matches(stack: &[String], segs: &[String]) -> bool {
 /// Returns [`FormatError::Xml`] on a parse failure, or naming `section` and
 /// the cap when the retained bytes cross `max_index_bytes` mid-subtree.
 fn read_section_payload(
-    parser: &mut XmlParser<Cursor<Arc<[u8]>>>,
+    parser: &mut BodyParser,
     buf: &mut Vec<u8>,
     ns: &NamespaceMode,
     attr_prefix: &str,
