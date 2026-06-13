@@ -1369,6 +1369,17 @@ impl ExecutionPlanDag {
                 PlanNode::Reshape { .. } => {
                     out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
                 }
+                PlanNode::Cull { config, name, .. } => {
+                    // Fork rendering: Cull is a two-port producer like Route.
+                    // Show the main and side-output ports so the two-output
+                    // topology is visible in the plan.
+                    out.push_str(&format!("  ◆ FORK [cull] '{name}'{line_suffix}\n"));
+                    out.push_str(&format!("  ├──> main → {name}\n"));
+                    out.push_str(&format!(
+                        "  ├──> {removed} → {name}.{removed}\n",
+                        removed = config.removed_to
+                    ));
+                }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
@@ -1494,6 +1505,17 @@ impl ExecutionPlanDag {
                     // Sibling rendering: Reshape is a grouping operator;
                     // it shares the `◇` glyph family with Aggregate.
                     out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Cull { config, name, .. } => {
+                    // Fork rendering: Cull is a two-port producer like Route,
+                    // so it gets the `◆ FORK` glyph and one line per output
+                    // port (main + the `removed_to` side output).
+                    out.push_str(&format!("  ◆ FORK [cull] '{name}'{line_suffix}\n"));
+                    out.push_str(&format!("  ├──> main → {name}\n"));
+                    out.push_str(&format!(
+                        "  ├──> {removed} → {name}.{removed}\n",
+                        removed = config.removed_to
+                    ));
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }

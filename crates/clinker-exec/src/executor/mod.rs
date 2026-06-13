@@ -8,6 +8,7 @@ pub(crate) mod commit;
 pub(crate) mod composition_dispatch;
 mod context;
 pub(crate) mod correlation_dispatch;
+pub(crate) mod cull_dispatch;
 pub(crate) mod dispatch;
 mod dlq;
 pub(crate) mod document_dlq;

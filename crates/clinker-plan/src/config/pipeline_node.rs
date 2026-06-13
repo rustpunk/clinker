@@ -129,6 +129,23 @@ pub enum PipelineNode {
         header: NodeHeader,
         config: ReshapeBody,
     },
+    /// Per-correlation-group record removal with a side-output port.
+    ///
+    /// Groups records by `partition_by`, evaluates a group-level
+    /// `drop_group_when` predicate over each whole group, and routes every
+    /// record of a dropped group to the `removed_to` output port while
+    /// untriggered groups flow to the main output port. Distinct from
+    /// Route (which fans out per-record on a row predicate) and from
+    /// Reshape (which mutates and synthesizes within a group): Cull removes
+    /// whole correlation groups based on an aggregate property of the
+    /// group, and emits the removed rows on a first-class producer-side
+    /// port rather than discarding them or routing to the DLQ. Both ports
+    /// carry the unchanged upstream schema — Cull does not widen.
+    Cull {
+        #[serde(flatten)]
+        header: NodeHeader,
+        config: CullBody,
+    },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
     /// keyed by the `body` handle.
@@ -357,6 +374,13 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         let (header, config) = payload.into_variant_parts();
                         Ok(PipelineNode::Reshape { header, config })
                     }
+                    "cull" => {
+                        let payload = CullPayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Cull { header, config })
+                    }
                     "composition" => {
                         let payload = CompositionPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
@@ -374,6 +398,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "combine",
                             "output",
                             "reshape",
+                            "cull",
                             "composition",
                         ],
                     )),
@@ -560,6 +585,34 @@ impl ReshapePayload {
     }
 }
 
+// ---- Cull ------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CullPayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: CullBody,
+}
+
+impl CullPayload {
+    fn into_variant_parts(self) -> (NodeHeader, CullBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
 // ---- Merge -----------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -673,6 +726,7 @@ impl PipelineNode {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
             PipelineNode::Merge { header, .. } => &header.name,
             PipelineNode::Combine { header, .. } => &header.name,
@@ -690,6 +744,7 @@ impl PipelineNode {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
             PipelineNode::Source { .. }
             | PipelineNode::Merge { .. }
@@ -721,6 +776,7 @@ impl PipelineNode {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => vec![header.input.value.name()],
             PipelineNode::Merge { header, .. } => {
                 header.inputs.iter().map(|i| i.value.name()).collect()
@@ -761,6 +817,7 @@ impl PipelineNode {
             PipelineNode::Combine { .. } => "combine",
             PipelineNode::Output { .. } => "output",
             PipelineNode::Reshape { .. } => "reshape",
+            PipelineNode::Cull { .. } => "cull",
             PipelineNode::Composition { .. } => "composition",
         }
     }
@@ -1386,6 +1443,55 @@ pub enum CopyFrom {
     Trigger,
     /// Start from an all-null row; `overrides` supplies every value.
     None,
+}
+
+/// Cull variant body. A blocking grouping operator: it buffers each
+/// correlation group (keyed by `partition_by`), evaluates each rule's
+/// group-level `drop_group_when` predicate over the whole group, and
+/// routes every record of a triggered group to the `removed_to` side
+/// output while untriggered groups flow to the main output.
+///
+/// Cull does not widen — both the main and `removed_to` ports carry the
+/// unchanged upstream schema. The two ports are first-class producer-side
+/// outputs (the Route fan-out seam): the main output is referenced as the
+/// node name, the side output as `<cull>.<removed_to>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CullBody {
+    /// Correlation-key fields. Records are grouped by the tuple of these
+    /// column values; every rule's predicate observes one whole group.
+    pub partition_by: Vec<String>,
+    /// Optional within-group ordering. Applied to each group before its
+    /// predicate runs, so an order-sensitive `drop_group_when` (e.g. one
+    /// reading the first or last row) is deterministic.
+    #[serde(default)]
+    pub order_by: Vec<crate::config::SortField>,
+    /// Declarative removal rules. A group is removed (routed to
+    /// `removed_to`) when any rule's `drop_group_when` predicate holds.
+    pub rules: Vec<CullRule>,
+    /// Name of the side-output port that carries removed groups' records.
+    /// Referenced downstream as `<cull>.<removed_to>`. Non-empty and
+    /// distinct from the main output (enforced at compile time).
+    pub removed_to: String,
+}
+
+/// One declarative Cull rule: a group-level removal predicate.
+///
+/// `drop_group_when` is a CXL boolean expression evaluated in **aggregate
+/// context** over the whole correlation group (group-by = `partition_by`), so
+/// it may use CXL's aggregate functions — `count(*)`, `sum(...)`, `min`/`max`,
+/// `avg`. CXL has no bare `any()` aggregate, so "remove the group if any row
+/// matches" is written `sum(if <cond> then 1 else 0) > 0`. When the predicate
+/// holds for a group, every record of that group is routed to the `removed_to`
+/// port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CullRule {
+    /// Rule name, used in diagnostics.
+    pub name: String,
+    /// CXL boolean predicate evaluated in aggregate context over the
+    /// whole group. A group for which this holds is removed.
+    pub drop_group_when: CxlSource,
 }
 
 /// The scope a Transform's `declares:` entry writes to. Each scope is

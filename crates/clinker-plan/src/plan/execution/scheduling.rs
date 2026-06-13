@@ -1037,6 +1037,25 @@ fn compute_one(
             }
         }
 
+        PlanNode::Cull { .. } => {
+            // Cull removes whole correlation groups but neither reorders nor
+            // synthesizes rows; the records that survive keep their relative
+            // order. The buffer drains group-by-group, though, so the
+            // cross-group emission order is not the input order — emit
+            // `NoOrdering` rather than claiming preservation. Group identity
+            // is preserved (`partition_by` covers every visible CK field), so
+            // the parent CK set flows through unchanged on both output ports.
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: None,
+                    provenance: OrderingProvenance::NoOrdering,
+                },
+                partitioning: parent_partitioning(),
+                ck_set: preserve_parent_ck_set(),
+                ..NodeProperties::unordered_single()
+            }
+        }
+
         PlanNode::Combine {
             name, propagate_ck, ..
         } => {

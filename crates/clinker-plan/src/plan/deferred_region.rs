@@ -1049,6 +1049,19 @@ fn propagate_through_node_for_body(node: &PlanNode, set: &mut HashSet<String>) {
                 set.insert(sf.field.clone());
             }
         }
+        PlanNode::Cull { config, .. } => {
+            // Cull observes the whole correlation group to evaluate its
+            // group-level removal predicate: it needs its partition_by and
+            // order_by columns retained in the buffer. The per-rule
+            // predicate column reads narrow further, but the partition/order
+            // superset is sound.
+            for p in &config.partition_by {
+                set.insert(p.clone());
+            }
+            for sf in &config.order_by {
+                set.insert(sf.field.clone());
+            }
+        }
         PlanNode::Source { .. } | PlanNode::Output { .. } => {
             // Sources and Outputs are region boundaries; never visited
             // as upstream in the propagation walk.

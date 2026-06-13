@@ -29,6 +29,7 @@
 - [Combine Nodes](nodes/combine.md)
 - [Aggregate Nodes](nodes/aggregate.md)
 - [Reshape Nodes](nodes/reshape.md)
+- [Cull Nodes](nodes/cull.md)
 - [Output Nodes](nodes/output.md)
 
 # Source Formats
@@ -90,5 +91,6 @@
 - [Routing to Multiple Outputs](cookbook/routing.md)
 - [Aggregation & Rollups](cookbook/aggregation.md)
 - [Slowly-Changing Dimensions (SCD Type 2)](cookbook/scd-type2.md)
+- [Backfill, Then Cull for Review](cookbook/backfill-and-cull.md)
 - [File Splitting](cookbook/file-splitting.md)
 - [Intra-Record Closures](cookbook/intra-record-closures.md)
