@@ -8,6 +8,7 @@ use std::sync::Arc;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+use clinker_format::hl7::Hl7FieldSplit;
 use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
@@ -838,10 +839,27 @@ fn build_hl7_reader_config(
     opts: Option<&clinker_plan::config::Hl7InputOptions>,
 ) -> Hl7ReaderConfig {
     let mut config = Hl7ReaderConfig::default();
-    if let Some(opts) = opts
-        && let Some(max) = opts.max_fields
-    {
-        config.max_fields = max;
+    if let Some(opts) = opts {
+        if let Some(max) = opts.max_fields {
+            config.max_fields = max;
+        }
+        if let Some(splits) = &opts.split_fields {
+            // Config validation already rejected an unparseable `field` name,
+            // a position past `max_fields`, and a zero axis width, so a field
+            // that fails to parse here is dropped defensively rather than
+            // surfaced — the split simply contributes no columns.
+            config.split_fields = splits
+                .iter()
+                .filter_map(|s| {
+                    s.field_position().map(|field_index| Hl7FieldSplit {
+                        field_index,
+                        repetitions: s.repetitions,
+                        components: s.components,
+                        subcomponents: s.subcomponents,
+                    })
+                })
+                .collect();
+        }
     }
     config
 }

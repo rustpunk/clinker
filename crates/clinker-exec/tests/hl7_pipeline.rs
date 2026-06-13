@@ -6,7 +6,9 @@
 //! pipeline re-emits the MSH/body segments (escaping field data) and
 //! re-parses identically; (3) the `hl7`+`split` combination is rejected at
 //! config time (diagnostic `E339`); (4) a batch/file envelope surfaces
-//! file-level `$doc` fields and a BTS count mismatch fails the run.
+//! file-level `$doc` fields and a BTS count mismatch fails the run;
+//! (5) opt-in composite-field splitting exposes component columns to CXL and
+//! re-assembles them byte-identically on an HL7→HL7 round-trip.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -369,5 +371,196 @@ nodes:
     assert!(
         err.contains("BTS batch message count mismatch") || err.contains("HL7"),
         "error should name the HL7 count failure: {err}"
+    );
+}
+
+#[test]
+fn hl7_split_fields_expose_component_columns_to_cxl() {
+    // Splitting MSH-9 (f08) into two components lets a Transform read the
+    // message code and trigger event without CXL string-splitting. PID-3
+    // (f03) splits into four components so the patient id and assigning
+    // authority surface separately.
+    let yaml = r#"
+pipeline:
+  name: hl7_split_read
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      options:
+        split_fields:
+          - { field: f08, components: 2 }
+          - { field: f03, components: 5 }
+      schema:
+        - { name: seg_id, type: string }
+        - { name: f08_c1, type: string }
+        - { name: f08_c2, type: string }
+        - { name: f03_c1, type: string }
+  - type: transform
+    name: tag
+    input: messages
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit code = f08_c1
+        emit trigger = f08_c2
+        emit patid = f03_c1
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_header: false
+"#;
+    let (report, output) =
+        run(yaml, "messages", &adt_a01(), "adt.hl7", "out").expect("run split read");
+    assert_eq!(report.counters.dlq_count, 0);
+    // The MSH row resolves the message code/trigger from the split f08.
+    let msh_row = output
+        .lines()
+        .find(|l| l.starts_with("MSH,"))
+        .expect("MSH row present");
+    assert!(msh_row.contains("ADT"), "MSH-9.1 message code: {msh_row}");
+    assert!(msh_row.contains("A01"), "MSH-9.2 trigger event: {msh_row}");
+    // The PID row resolves the patient id from the split f03.
+    let pid_row = output
+        .lines()
+        .find(|l| l.starts_with("PID,"))
+        .expect("PID row present");
+    assert!(
+        pid_row.contains("PATID123"),
+        "PID-3.1 patient id: {pid_row}"
+    );
+}
+
+#[test]
+fn hl7_split_field_round_trips_byte_identically() {
+    // An HL7→HL7 pipeline that splits PID-3 (f03) into four components must
+    // re-assemble the exact composite on output — the `^` separators are
+    // reinserted verbatim, never escaped — so the re-emitted PID-3 is
+    // byte-identical to the source and a re-parse reproduces it.
+    let yaml = r#"
+pipeline:
+  name: hl7_split_round_trip
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      options:
+        split_fields:
+          - { field: f03, components: 5 }
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: messages
+    config:
+      name: out
+      type: hl7
+      path: out.hl7
+      include_unmapped: true
+      options:
+        segment_newline: false
+"#;
+    let (report, output) =
+        run(yaml, "messages", &adt_a01(), "adt.hl7", "out").expect("run split round-trip");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    // PID-3 (`PATID123^^^HOSP^MR`) re-assembles byte-identically from its
+    // four split component columns; no component separator became an `\S\`.
+    assert!(
+        output.contains("PID|1||PATID123^^^HOSP^MR"),
+        "split PID-3 not byte-identical on round-trip: {output}"
+    );
+    assert!(
+        !output.contains("\\S\\"),
+        "component separator wrongly escaped on output: {output}"
+    );
+
+    // Re-parse the output (no split) to prove the wire field is intact.
+    let reparse_yaml = r#"
+pipeline:
+  name: hl7_split_reparse
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      schema:
+        - { name: seg_id, type: string }
+        - { name: f03, type: string }
+  - type: transform
+    name: tag
+    input: messages
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit f3 = f03
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_header: false
+"#;
+    let (reparse_report, reparse_csv) =
+        run(reparse_yaml, "messages", &output, "echo.hl7", "out").expect("re-parse round-trip");
+    assert_eq!(reparse_report.counters.dlq_count, 0);
+    // The PID row carries the re-assembled composite verbatim.
+    let pid_row = reparse_csv
+        .lines()
+        .find(|l| l.starts_with("PID,"))
+        .expect("PID row present");
+    assert!(
+        pid_row.contains("PATID123^^^HOSP^MR"),
+        "re-parsed PID-3 wrong: {pid_row}"
+    );
+}
+
+#[test]
+fn hl7_split_field_past_max_fields_is_rejected_at_config_time() {
+    // A split naming a position past `max_fields` is unreachable; reject it
+    // at config validation rather than silently dropping the column.
+    let yaml = r#"
+pipeline:
+  name: hl7_split_overflow
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      options:
+        max_fields: 4
+        split_fields:
+          - { field: f08, components: 2 }
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: messages
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = parse_config(yaml).expect_err("split past max_fields must fail config validation");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("max_fields") && msg.contains("f08"),
+        "expected a max_fields overflow naming f08, got: {msg}"
     );
 }

@@ -2831,6 +2831,10 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 )));
             }
         }
+
+        if let InputFormat::Hl7(Some(opts)) = &input.format {
+            validate_hl7_split_fields(&input.name, opts)?;
+        }
     }
 
     // Single-envelope output formats wrap every record in one frame whose
@@ -2979,6 +2983,68 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
+    Ok(())
+}
+
+/// Default `fNN` column count for an HL7 source when `max_fields` is unset,
+/// matching the reader's documented default. A split field must name a
+/// position within this range to be reachable.
+const HL7_DEFAULT_MAX_FIELDS: usize = 64;
+
+/// Validate an HL7 source's `split_fields` declarations: each names a
+/// reachable positional field (`fNN`, `1 <= N <= max_fields`) with at least
+/// one column on every structural axis, and no two splits target the same
+/// field.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Validation`] naming the offending split when a
+/// `field` is not a `fNN` name, names position 0 or a position past
+/// `max_fields`, declares a zero axis width, or duplicates another split's
+/// target field.
+fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Result<(), ConfigError> {
+    let Some(splits) = &opts.split_fields else {
+        return Ok(());
+    };
+    let max_fields = opts.max_fields.unwrap_or(HL7_DEFAULT_MAX_FIELDS);
+    let mut seen: Vec<usize> = Vec::with_capacity(splits.len());
+    for split in splits {
+        let position = split.field_position().ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "source '{source_name}': split field {:?} is not a positional `fNN` column name \
+                 (e.g. `f08`)",
+                split.field
+            ))
+        })?;
+        if position > max_fields {
+            return Err(ConfigError::Validation(format!(
+                "source '{source_name}': split field {:?} names position {position}, past the \
+                 configured max_fields of {max_fields}; raise `max_fields` or remove the split",
+                split.field
+            )));
+        }
+        for (axis, count) in [
+            ("components", split.components),
+            ("subcomponents", split.subcomponents),
+            ("repetitions", split.repetitions),
+        ] {
+            if count == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "source '{source_name}': split field {:?} declares `{axis}: 0`; every axis \
+                     width must be at least 1",
+                    split.field
+                )));
+            }
+        }
+        if seen.contains(&position) {
+            return Err(ConfigError::Validation(format!(
+                "source '{source_name}': field {:?} is split more than once; declare each split \
+                 field at most once",
+                split.field
+            )));
+        }
+        seen.push(position);
+    }
     Ok(())
 }
 

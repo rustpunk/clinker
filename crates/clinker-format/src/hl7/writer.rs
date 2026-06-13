@@ -34,6 +34,7 @@ use clinker_record::{Record, Schema, Value};
 
 use crate::error::FormatError;
 use crate::hl7::RAW_FIELDS_KEY;
+use crate::hl7::field_split::{SplitCoord, parse_split_column, reassemble_field};
 use crate::hl7::tokenizer::Delimiters;
 use crate::traits::FormatWriter;
 
@@ -69,6 +70,11 @@ pub struct Hl7Writer<W: Write> {
     /// slot, so a gapped (`f01, f03`) or reordered schema maps values to
     /// the positions the names declare.
     field_columns: Vec<FieldColumn>,
+    /// Split-leaf columns (`f08_c1`, `f03_r2_c1_s3`, …) resolved to their
+    /// wire coordinate. Each contributes one leaf to its field's
+    /// re-assembled wire value; the field position is taken from the
+    /// coordinate, not declaration order.
+    split_columns: Vec<SplitColumnRef>,
     seg_id_idx: Option<usize>,
     header_written: bool,
     finalized: bool,
@@ -95,6 +101,17 @@ struct FieldColumn {
     schema_index: usize,
 }
 
+/// A schema split-leaf column (`f08_c1`) resolved to its wire coordinate and
+/// the schema index its value is read from.
+struct SplitColumnRef {
+    /// The `(field, repetition, component, sub-component)` coordinate.
+    coord: SplitCoord,
+    /// The column name (`f08_c1`) — used verbatim in error messages.
+    name: String,
+    /// Index into the record's value list.
+    schema_index: usize,
+}
+
 impl<W: Write> Hl7Writer<W> {
     /// Build a writer over a sink with the given schema and config. The
     /// schema's `seg_id` and `fNN` columns are resolved to positional
@@ -102,6 +119,7 @@ impl<W: Write> Hl7Writer<W> {
     /// `MSH` record itself, so they need no separate index.
     pub fn new(writer: W, schema: Arc<Schema>, config: Hl7WriterConfig) -> Self {
         let mut field_columns = Vec::new();
+        let mut split_columns = Vec::new();
         let mut seg_id_idx = None;
         for (i, col) in schema.columns().iter().enumerate() {
             match &**col {
@@ -111,7 +129,17 @@ impl<W: Write> Hl7Writer<W> {
                 // so they are not mapped to wire fields here.
                 "set_ref" | "set_type" => {}
                 name => {
-                    if let Some(position) = field_position(name) {
+                    // A structured split-leaf name (`f08_c1`) re-assembles
+                    // into its field; a plain `fNN` maps to its wire slot.
+                    // The two grammars are disjoint — `field_position`
+                    // rejects any name with a non-digit after `f`.
+                    if let Some(coord) = parse_split_column(name) {
+                        split_columns.push(SplitColumnRef {
+                            coord,
+                            name: name.to_string(),
+                            schema_index: i,
+                        });
+                    } else if let Some(position) = field_position(name) {
                         field_columns.push(FieldColumn {
                             position,
                             name: name.to_string(),
@@ -122,11 +150,13 @@ impl<W: Write> Hl7Writer<W> {
             }
         }
         field_columns.sort_by_key(|c| c.position);
+        split_columns.sort_by_key(|c| c.coord.field_index);
         Self {
             writer,
             config,
             delims: Delimiters::default_set(),
             field_columns,
+            split_columns,
             seg_id_idx,
             header_written: false,
             finalized: false,
@@ -237,18 +267,22 @@ impl<W: Write> Hl7Writer<W> {
         Ok(())
     }
 
-    /// Collect a record's `fNN` columns into wire-position order, filling
-    /// any gap left by a missing position with an empty field, then
-    /// trimming trailing empties so no fabricated delimiters appear.
+    /// Collect a record's field columns into wire-position order, filling any
+    /// gap left by a missing position with an empty field, then trimming
+    /// trailing empties so no fabricated delimiters appear.
+    ///
+    /// A verbatim `fNN` column sets its wire field directly. A split field's
+    /// leaf columns (`f08_c1`, …) are re-assembled into the wire field at
+    /// their shared position by joining on the component / sub-component /
+    /// repetition separators — the exact inverse of the reader's split, so an
+    /// HL7→HL7 round-trip is byte-faithful.
     fn record_fields(&self, record: &Record) -> Result<Vec<String>, FormatError> {
         let values = record.values();
-        let max_position = self
-            .field_columns
-            .iter()
-            .map(|c| c.position)
-            .max()
-            .unwrap_or(0);
+        let max_verbatim = self.field_columns.iter().map(|c| c.position).max();
+        let max_split = self.split_columns.iter().map(|c| c.coord.field_index).max();
+        let max_position = max_verbatim.max(max_split).unwrap_or(0);
         let mut fields: Vec<String> = vec![String::new(); max_position];
+
         for col in &self.field_columns {
             let text = match values.get(col.schema_index) {
                 Some(v) => value_to_field(v, &col.name)?,
@@ -256,6 +290,30 @@ impl<W: Write> Hl7Writer<W> {
             };
             fields[col.position - 1] = text;
         }
+
+        // Re-assemble each split field from its leaf columns. The leaves of
+        // one field share a `field_index`; `split_columns` is sorted by it,
+        // so contiguous runs belong to the same field.
+        let mut start = 0;
+        while start < self.split_columns.len() {
+            let field_index = self.split_columns[start].coord.field_index;
+            let mut end = start;
+            let mut leaves: Vec<(SplitCoord, String)> = Vec::new();
+            while end < self.split_columns.len()
+                && self.split_columns[end].coord.field_index == field_index
+            {
+                let col = &self.split_columns[end];
+                let text = match values.get(col.schema_index) {
+                    Some(v) => value_to_field(v, &col.name)?,
+                    None => String::new(),
+                };
+                leaves.push((col.coord, text));
+                end += 1;
+            }
+            fields[field_index - 1] = reassemble_field(&leaves, &self.delims);
+            start = end;
+        }
+
         while matches!(fields.last(), Some(s) if s.is_empty()) {
             fields.pop();
         }
@@ -274,8 +332,8 @@ impl<W: Write> Hl7Writer<W> {
             if !known {
                 return Err(FormatError::Hl7(format!(
                     "record column {name:?} has no HL7 mapping. The writer maps only `seg_id`, \
-                     `set_ref`, `set_type`, and positional `fNN` field columns; project the \
-                     record to those before output"
+                     `set_ref`, `set_type`, positional `fNN` field columns, and split-leaf \
+                     columns (`f08_c1`, `f03_r2_c1_s3`); project the record to those before output"
                 )));
             }
         }
@@ -399,10 +457,11 @@ impl<W: Write + Send> FormatWriter for Hl7Writer<W> {
     }
 }
 
-/// Whether a schema column name is a positional HL7 field column (`f01`,
-/// `f02`, …): an `f` followed by one or more ASCII digits.
+/// Whether a schema column name is a writable HL7 field column: a verbatim
+/// positional column (`f01`, `f02`, …) or a structured split-leaf column
+/// (`f08_c1`, `f03_r2_c1_s3`, …). Both map to a wire field.
 fn is_field_column(name: &str) -> bool {
-    field_position(name).is_some()
+    field_position(name).is_some() || parse_split_column(name).is_some()
 }
 
 /// Parse the 1-based wire field position from a column name. `f01` → 1,
@@ -752,5 +811,95 @@ mod tests {
         );
         let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
         assert!(out.contains("PID|a||c\r"), "gapped mapping wrong: {out}");
+    }
+
+    #[test]
+    fn split_columns_reassemble_into_wire_field() {
+        // Component leaf columns re-join on the component separator at their
+        // shared wire position; the separator is verbatim, not escaped.
+        let cols: Vec<Box<str>> = vec![
+            "seg_id".into(),
+            "f01".into(),
+            "f03_c1".into(),
+            "f03_c2".into(),
+        ];
+        let schema = Arc::new(Schema::new(cols));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("PID".into()),
+                Value::String("1".into()),
+                Value::String("PATID".into()),
+                Value::String("MRN".into()),
+            ],
+        );
+        let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
+        assert!(
+            out.contains("PID|1||PATID^MRN\r"),
+            "reassembly wrong: {out}"
+        );
+        assert!(!out.contains("\\S\\"), "component separator escaped: {out}");
+    }
+
+    #[test]
+    fn split_columns_trim_trailing_empty_components() {
+        // A trailing-empty component must not fabricate a `^` inside the
+        // re-assembled field. The split sits at wire field 3, so fields 1
+        // and 2 are empty (`PID|||…`), exactly as a verbatim `f03` would be.
+        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
+        let schema = Arc::new(Schema::new(cols));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("PID".into()),
+                Value::String("PATID".into()),
+                Value::Null,
+            ],
+        );
+        let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
+        assert!(out.contains("PID|||PATID\r"), "{out}");
+        assert!(!out.contains("PATID^"), "fabricated trailing sep: {out}");
+    }
+
+    #[test]
+    fn split_columns_reassemble_repetitions_and_subcomponents() {
+        let cols: Vec<Box<str>> = vec![
+            "seg_id".into(),
+            "f03_r1_c1_s1".into(),
+            "f03_r1_c1_s2".into(),
+            "f03_r2_c1_s1".into(),
+        ];
+        let schema = Arc::new(Schema::new(cols));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("PID".into()),
+                Value::String("A".into()),
+                Value::String("B".into()),
+                Value::String("C".into()),
+            ],
+        );
+        let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
+        // Sub-components join on `&`, repetitions on `~`, at wire field 3.
+        assert!(out.contains("PID|||A&B~C\r"), "{out}");
+    }
+
+    #[test]
+    fn split_leaf_value_escapes_embedded_field_separator() {
+        // A literal field separator inside a split leaf is still escaped on
+        // output; only the structural component separator is verbatim.
+        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
+        let schema = Arc::new(Schema::new(cols));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("PID".into()),
+                Value::String("a|b".into()),
+                Value::String("MRN".into()),
+            ],
+        );
+        let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
+        // `a|b` → `a\F\b`, joined to `MRN` with a verbatim `^`, at wire field 3.
+        assert!(out.contains("PID|||a\\F\\b^MRN\r"), "{out}");
     }
 }

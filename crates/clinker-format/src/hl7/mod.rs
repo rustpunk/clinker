@@ -22,6 +22,12 @@
 //! writer mirrors this, reconstructing the envelope around emitted records
 //! and recomputing every count.
 //!
+//! A field is kept verbatim by default (its `^`/`~`/`&` structure rides
+//! inside one column), but a source may opt one or more fields into
+//! structural splitting via [`Hl7FieldSplit`]: the reader explodes the field
+//! into per-repetition / per-component / per-sub-component columns and the
+//! writer re-assembles the exact wire field from them.
+//!
 //! The optional envelope tiers surface as nested document-context levels:
 //! an `FHS` file header is the file-level document (extracted in the
 //! one-time pre-scan), and each `BHS` batch and `MSH` message opens a
@@ -33,10 +39,12 @@
 //! (so `$doc` envelope sections over `FHS` cost O(FHS)); the body streams
 //! one segment at a time. The whole file is never buffered.
 
+mod field_split;
 pub mod reader;
 mod tokenizer;
 pub mod writer;
 
+pub use field_split::Hl7FieldSplit;
 pub use reader::{Hl7Reader, Hl7ReaderConfig};
 pub use writer::{Hl7Writer, Hl7WriterConfig};
 
