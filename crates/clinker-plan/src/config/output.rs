@@ -247,6 +247,13 @@ pub struct X12OutputOptions {
     /// Defaults to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_newline: Option<bool>,
+    /// Character set element text is encoded through. Defaults to UTF-8; set
+    /// to match the source's `encoding` so a non-UTF-8 interchange
+    /// round-trips byte-faithfully. Supported values are `utf-8` and
+    /// `iso-8859-1` (Latin-1); a character the charset cannot represent is
+    /// rejected rather than emitted truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// HL7 v2 output options.

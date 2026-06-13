@@ -35,6 +35,7 @@ use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, coerce_sec
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 use crate::x12::RAW_ELEMENTS_KEY;
+use crate::x12::charset::Charset;
 use crate::x12::tokenizer::{ParsedSegment, SegmentTokenizer, split_isa, split_segment};
 
 /// Default ceiling on the number of positional element columns the record
@@ -53,12 +54,18 @@ pub struct X12ReaderConfig {
     /// Number of positional `eNN` element columns on the record schema. A
     /// body segment with more data elements than this is rejected.
     pub max_elements: usize,
+    /// Character set used to decode element text. X12 carries no in-band
+    /// element naming the body repertoire, so it is declared on the source
+    /// and defaults to UTF-8; a non-UTF-8 interchange (e.g. Latin-1 high
+    /// bytes in free-text fields) declares the matching encoding.
+    pub charset: Charset,
 }
 
 impl Default for X12ReaderConfig {
     fn default() -> Self {
         Self {
             max_elements: DEFAULT_MAX_ELEMENTS,
+            charset: Charset::default(),
         }
     }
 }
@@ -123,7 +130,7 @@ impl<R: Read> X12Reader<R> {
     pub fn new(reader: R, config: X12ReaderConfig) -> Self {
         let schema = build_schema(config.max_elements);
         Self {
-            tokenizer: SegmentTokenizer::new(BufReader::new(reader)),
+            tokenizer: SegmentTokenizer::new(BufReader::new(reader), config.charset),
             schema,
             max_elements: config.max_elements,
             initialized: false,
@@ -149,7 +156,7 @@ impl<R: Read> X12Reader<R> {
 
         let header = self.tokenizer.read_isa_header()?;
         let delims = self.tokenizer.delimiters();
-        let parsed = split_isa(&header, &delims);
+        let parsed = split_isa(&header, &delims, self.tokenizer.charset())?;
         // ISA13 (the interchange control number) is element index 12. It
         // is located structurally — the 13th element of the split header —
         // not by absolute byte offset, so producer padding quirks do not
@@ -842,7 +849,10 @@ mod tests {
         );
         let mut r = X12Reader::new(
             Cursor::new(data.into_bytes()),
-            X12ReaderConfig { max_elements: 2 },
+            X12ReaderConfig {
+                max_elements: 2,
+                ..Default::default()
+            },
         );
         let err = loop {
             match r.next_record() {
@@ -997,5 +1007,125 @@ mod tests {
         let recs2 = collect(&out);
         assert_eq!(recs2.len(), 3);
         assert_eq!(recs2[2].get("seg_id"), Some(&Value::String("PO1".into())));
+    }
+
+    /// A minimal interchange whose body carries Latin-1 high bytes (`0xE9`
+    /// for é, `0xF1` for ñ) in a free-text element. The bytes are not valid
+    /// UTF-8, so the default reader rejects them; the Latin-1 reader decodes
+    /// them to the matching codepoints.
+    fn latin1_interchange() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(ISA.as_bytes());
+        data.extend_from_slice(b"GS*PO*S*R*20240101*1200*1*X*004010~");
+        data.extend_from_slice(b"ST*850*0001~");
+        // N1*BT*Caf\xE9 A\xF1o~ — a free-text name with two Latin-1 high bytes.
+        data.extend_from_slice(b"N1*BT*Caf");
+        data.push(0xE9);
+        data.extend_from_slice(b" A");
+        data.push(0xF1);
+        data.extend_from_slice(b"o~");
+        data.extend_from_slice(b"SE*3*0001~");
+        data.extend_from_slice(b"GE*1*1~");
+        data.extend_from_slice(b"IEA*1*000000001~");
+        data
+    }
+
+    fn reader_bytes(data: Vec<u8>, charset: Charset) -> X12Reader<Cursor<Vec<u8>>> {
+        X12Reader::new(
+            Cursor::new(data),
+            X12ReaderConfig {
+                charset,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn latin1_body_high_bytes_decode_to_codepoints() {
+        let mut r = reader_bytes(latin1_interchange(), Charset::Latin1);
+        let recs: Vec<_> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        // ST and N1 are body records.
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].get("seg_id"), Some(&Value::String("N1".into())));
+        // The free-text element decodes through Latin-1: 0xE9→é, 0xF1→ñ.
+        assert_eq!(recs[1].get("e02"), Some(&Value::String("Café Año".into())));
+    }
+
+    #[test]
+    fn latin1_body_rejected_under_default_utf8() {
+        let mut r = reader_bytes(latin1_interchange(), Charset::Utf8);
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected a UTF-8 decode error"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::X12(m) if m.contains("not valid UTF-8")));
+    }
+
+    /// The headline acceptance: a Latin-1 interchange read with the matching
+    /// charset and re-written with it produces byte-identical output, and
+    /// the re-read body matches.
+    #[test]
+    fn latin1_read_write_read_is_byte_faithful() {
+        use crate::traits::{FormatReader, FormatWriter};
+        use crate::x12::writer::{X12Writer, X12WriterConfig};
+
+        let input = latin1_interchange();
+
+        // Read with the Latin-1 charset.
+        let mut r = reader_bytes(input.clone(), Charset::Latin1);
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        let schema = r.schema().unwrap();
+
+        // Re-emit through a Latin-1 writer with the literal ISA/GS headers,
+        // matching the input fixture so the bytes line up exactly.
+        let out: Vec<u8> = {
+            let mut buf = Vec::new();
+            let mut w = X12Writer::new(
+                Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                X12WriterConfig {
+                    interchange: Some(
+                        split_isa(
+                            ISA.as_bytes(),
+                            &crate::x12::tokenizer::Delimiters {
+                                element: b'*',
+                                subelement: b':',
+                                terminator: b'~',
+                            },
+                            Charset::Latin1,
+                        )
+                        .unwrap()
+                        .elements,
+                    ),
+                    group_header: Some(
+                        ["PO", "S", "R", "20240101", "1200", "1", "X", "004010"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    segment_newline: false,
+                    charset: Charset::Latin1,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                w.write_record(rec).unwrap();
+            }
+            w.flush().unwrap();
+            buf
+        };
+
+        // The output bytes equal the input bytes, including the two Latin-1
+        // high bytes — the round-trip never passed through UTF-8.
+        assert_eq!(out, input, "Latin-1 round-trip must be byte-faithful");
+
+        // Re-read the emitted bytes under Latin-1: the body decodes the same.
+        let mut r2 = reader_bytes(out, Charset::Latin1);
+        let recs2: Vec<_> = std::iter::from_fn(|| r2.next_record().unwrap()).collect();
+        assert_eq!(recs2.len(), 2);
+        assert_eq!(recs2[1].get("e02"), Some(&Value::String("Café Año".into())));
     }
 }

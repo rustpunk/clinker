@@ -13,6 +13,7 @@ use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
 use clinker_format::traits::FormatReader;
+use clinker_format::x12::Charset;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
@@ -52,7 +53,7 @@ fn build_format_reader(
             Ok(Box::new(EdifactReader::new(reader, config)))
         }
         clinker_plan::config::InputFormat::X12(opts) => {
-            let config = build_x12_reader_config(opts.as_ref());
+            let config = build_x12_reader_config(opts.as_ref())?;
             Ok(Box::new(X12Reader::new(reader, config)))
         }
         clinker_plan::config::InputFormat::Hl7(opts) => {
@@ -809,14 +810,28 @@ fn build_edifact_reader_config(
 
 fn build_x12_reader_config(
     opts: Option<&clinker_plan::config::X12InputOptions>,
-) -> X12ReaderConfig {
+) -> Result<X12ReaderConfig, PipelineError> {
     let mut config = X12ReaderConfig::default();
-    if let Some(opts) = opts
-        && let Some(max) = opts.max_elements
-    {
-        config.max_elements = max;
+    if let Some(opts) = opts {
+        if let Some(max) = opts.max_elements {
+            config.max_elements = max;
+        }
+        if let Some(encoding) = opts.encoding.as_deref() {
+            config.charset = parse_x12_charset(encoding)?;
+        }
     }
-    config
+    Ok(config)
+}
+
+/// Resolve a source-declared X12 `encoding` name to a [`Charset`], mapping
+/// an unsupported value to a config-validation error so the run fails at
+/// startup with the name the user must fix.
+fn parse_x12_charset(encoding: &str) -> Result<Charset, PipelineError> {
+    Charset::from_name(encoding).map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "X12 source: {e}"
+        )))
+    })
 }
 
 fn build_hl7_reader_config(
