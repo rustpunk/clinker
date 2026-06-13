@@ -2,10 +2,18 @@
 //!
 //! Reconstructs the three-tier interchange envelope around emitted body
 //! records: an `ISA` header (literal config elements or echoed from a
-//! `$doc` section), one `GS..GE` functional group, `ST..SE` transaction
-//! sets grouped on the `set_ref` column, and a closing `IEA`. Record
-//! columns map positionally — `seg_id` is the segment tag, `e01..` are the
-//! data elements.
+//! `$doc` section), `GS..GE` functional groups grouped on the optional
+//! `group_ref` column, `ST..SE` transaction sets grouped on the `set_ref`
+//! column, and a closing `IEA`. Record columns map positionally — `seg_id`
+//! is the segment tag, `e01..` are the data elements.
+//!
+//! A record stream carrying several distinct `group_ref` values writes one
+//! `GS..GE` functional group per value inside the single `ISA..IEA`
+//! interchange — a `PO` group of purchase orders and an `IN` group of
+//! invoices, say, share one envelope. With no `group_ref` column the whole
+//! stream collapses to a single functional group, byte-identical to a
+//! stream whose `group_ref` never changes; the `group_ref` grouping is the
+//! exact analog of how `set_ref` drives `ST..SE` boundaries one tier down.
 //!
 //! X12 has **no** release/escape character: a data value carrying a
 //! delimiter byte (the element separator, the sub-element separator, or
@@ -14,14 +22,14 @@
 //! a precise error naming the offending column.
 //!
 //! Memory model: streaming and O(1) in held state — only the currently
-//! open transaction set's segment count, the functional group's set count,
-//! and the interchange group count are retained. `flush` is the single
-//! end-of-stream finalizer: it closes the open set, the group, and writes
-//! the `IEA` trailer with recomputed counts, exactly once. An interchange
-//! is one envelope, so byte-limit file splitting (which would flush — and
-//! thus finalize — mid-stream) is rejected for X12 outputs at
-//! config-validation time; this writer is therefore only ever flushed at
-//! true end of stream.
+//! open transaction set's segment count, the open functional group's set
+//! count and control number, and the interchange group count are retained.
+//! `flush` is the single end-of-stream finalizer: it closes the open set,
+//! the open group, and writes the `IEA` trailer with recomputed counts,
+//! exactly once. An interchange is one envelope, so byte-limit file
+//! splitting (which would flush — and thus finalize — mid-stream) is
+//! rejected for X12 outputs at config-validation time; this writer is
+//! therefore only ever flushed at true end of stream.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -93,18 +101,15 @@ pub struct X12Writer<W: Write> {
     seg_id_idx: Option<usize>,
     set_ref_idx: Option<usize>,
     set_type_idx: Option<usize>,
+    group_ref_idx: Option<usize>,
     header_written: bool,
     finalized: bool,
     /// `ISA13` interchange control number, echoed in the `IEA02` trailer.
     isa_control_number: String,
-    /// `GS06` group control number for the single open functional group.
-    group_control_number: String,
-    /// Count of `ST` transaction sets written, for the `GE01` count.
-    set_count: u64,
     /// Count of `GS` functional groups written, for the `IEA01` count.
     group_count: u64,
     open_set: Option<OpenSet>,
-    group_open: bool,
+    open_group: Option<OpenGroup>,
 }
 
 /// A schema `eNN` element column resolved to its wire position and the
@@ -128,20 +133,38 @@ struct OpenSet {
     segment_count: u64,
 }
 
+/// State for the functional group currently being written. Carried per
+/// group so the closing `GE01` reflects only the sets inside *this* group,
+/// not the interchange-wide running total — the multi-group analog of how
+/// [`OpenSet`] scopes the `SE01` segment count to a single set.
+struct OpenGroup {
+    /// The record-level `group_ref` value that opened the group, or empty
+    /// when the stream carries no `group_ref` column. A non-empty value
+    /// closes the group and opens a new one when it changes.
+    group_ref: String,
+    /// `GS06` group control number echoed by `GE02`.
+    control_number: String,
+    /// `ST` transaction sets opened in this group so far, for the `GE01`
+    /// count and for deriving anonymous set control numbers within it.
+    set_count: u64,
+}
+
 impl<W: Write> X12Writer<W> {
     /// Build a writer over a sink with the given schema and config. The
-    /// schema's `seg_id` / `set_ref` / `set_type` / `eNN` columns are
-    /// resolved to positional indices once.
+    /// schema's `seg_id` / `set_ref` / `set_type` / `group_ref` / `eNN`
+    /// columns are resolved to positional indices once.
     pub fn new(writer: W, schema: Arc<Schema>, config: X12WriterConfig) -> Self {
         let mut element_columns = Vec::new();
         let mut seg_id_idx = None;
         let mut set_ref_idx = None;
         let mut set_type_idx = None;
+        let mut group_ref_idx = None;
         for (i, col) in schema.columns().iter().enumerate() {
             match &**col {
                 "seg_id" => seg_id_idx = Some(i),
                 "set_ref" => set_ref_idx = Some(i),
                 "set_type" => set_type_idx = Some(i),
+                "group_ref" => group_ref_idx = Some(i),
                 name => {
                     if let Some(position) = element_position(name) {
                         element_columns.push(ElementColumn {
@@ -162,19 +185,21 @@ impl<W: Write> X12Writer<W> {
             seg_id_idx,
             set_ref_idx,
             set_type_idx,
+            group_ref_idx,
             header_written: false,
             finalized: false,
             isa_control_number: String::new(),
-            group_control_number: String::new(),
-            set_count: 0,
             group_count: 0,
             open_set: None,
-            group_open: false,
+            open_group: None,
         }
     }
 
-    /// Emit the `ISA` interchange header and the `GS` functional-group
-    /// header on the first record.
+    /// Emit the `ISA` interchange header on the first record. The first
+    /// `GS` functional group opens lazily on the first body segment, driven
+    /// by that record's `group_ref`, exactly as the first `ST` set does — so
+    /// the group control number can echo a discriminator the header has not
+    /// yet seen.
     fn write_header(&mut self, record: &Record) -> Result<(), FormatError> {
         if self.header_written {
             return Ok(());
@@ -191,7 +216,6 @@ impl<W: Write> X12Writer<W> {
         // writer keeps the element separator and terminator at their
         // defaults so the header is self-consistent on re-read.
         self.write_segment("ISA", &isa_elements)?;
-        self.open_functional_group()?;
         Ok(())
     }
 
@@ -242,9 +266,14 @@ impl<W: Write> X12Writer<W> {
         ))
     }
 
-    /// Open the single functional group from the configured `group_header`,
-    /// recomputing its `GS06` control number.
-    fn open_functional_group(&mut self) -> Result<(), FormatError> {
+    /// Open a functional group from the configured `group_header`,
+    /// recomputing its `GS06` control number. A non-empty `group_ref` echoes
+    /// as the control number (the discriminator *is* the group identity, the
+    /// `GS06`/`GE02` analog of how a non-empty `set_ref` echoes as `ST02`);
+    /// an empty `group_ref` falls back to the sequential group ordinal so a
+    /// stream without a `group_ref` column keeps the single-group `1, 2, …`
+    /// numbering unchanged.
+    fn open_functional_group(&mut self, group_ref: &str) -> Result<(), FormatError> {
         let header = self.config.group_header.clone().ok_or_else(|| {
             FormatError::X12(
                 "no functional-group header configured: set the writer's `group_header` \
@@ -253,24 +282,53 @@ impl<W: Write> X12Writer<W> {
             )
         })?;
         self.group_count += 1;
+        let control_number = if group_ref.is_empty() {
+            self.group_count.to_string()
+        } else {
+            group_ref.to_string()
+        };
         // GS06 (element index 5) is the group control number; recompute it
         // so it is unique per group and echoed correctly by GE.
-        self.group_control_number = self.group_count.to_string();
         let mut gs = header;
-        set_or_push(&mut gs, 5, self.group_control_number.clone());
+        set_or_push(&mut gs, 5, control_number.clone());
         self.write_segment("GS", &gs)?;
-        self.group_open = true;
+        self.open_group = Some(OpenGroup {
+            group_ref: group_ref.to_string(),
+            control_number,
+            set_count: 0,
+        });
         Ok(())
     }
 
+    /// Open a new `GS` functional group (closing any previous one) when the
+    /// `group_ref` changes, or open the first group. A record with an empty
+    /// `group_ref` joins the current group; if none is open, it opens the
+    /// sole group — so a stream with no `group_ref` column produces exactly
+    /// one `GS..GE`, byte-identical to the single-group output.
+    fn transition_group(&mut self, group_ref: &str) -> Result<(), FormatError> {
+        let need_new = match &self.open_group {
+            None => true,
+            Some(open) => !group_ref.is_empty() && open.group_ref != *group_ref,
+        };
+        if !need_new {
+            return Ok(());
+        }
+        self.close_functional_group()?;
+        self.open_functional_group(group_ref)
+    }
+
     /// Map a body record to its segment tag and element list, then write
-    /// it, opening or closing `ST..SE` transaction sets on `set_ref`
-    /// transitions.
+    /// it, opening or closing `GS..GE` functional groups on `group_ref`
+    /// transitions and `ST..SE` transaction sets on `set_ref` transitions.
     fn write_body_record(&mut self, record: &Record) -> Result<(), FormatError> {
         self.reject_unknown_columns(record)?;
         let values = record.values();
         let seg_id = match self.seg_id_idx.and_then(|i| values.get(i)) {
             Some(v) => value_to_element(v, "seg_id")?,
+            None => String::new(),
+        };
+        let group_ref = match self.group_ref_idx.and_then(|i| values.get(i)) {
+            Some(v) => value_to_element(v, "group_ref")?,
             None => String::new(),
         };
         let set_ref = match self.set_ref_idx.and_then(|i| values.get(i)) {
@@ -281,6 +339,11 @@ impl<W: Write> X12Writer<W> {
             Some(v) => value_to_element(v, "set_type")?,
             None => String::new(),
         };
+
+        // The group boundary is the outer tier, so it transitions first: a
+        // group change closes the open set then the open group before
+        // opening the new group, which the next `transition_set` populates.
+        self.transition_group(&group_ref)?;
 
         // Service segments embedded in the record stream are skipped — the
         // writer reconstructs envelopes itself, so an ISA/GS/ST/SE/GE/IEA
@@ -327,13 +390,21 @@ impl<W: Write> X12Writer<W> {
                     .into(),
             ));
         };
+        // Anonymous sets number from the *open group's* set count, so the
+        // generated `ST02` control numbers restart per group rather than
+        // running interchange-wide. A set is always opened inside a group —
+        // `transition_group` has run for this record — so the group is open
+        // here; `unwrap_or(0)` keeps the path total in the unreachable case.
+        let group_set_count = self.open_group.as_ref().map(|g| g.set_count).unwrap_or(0);
         let control_number = if set_ref.is_empty() {
-            format!("{:04}", self.set_count + 1)
+            format!("{:04}", group_set_count + 1)
         } else {
             set_ref.to_string()
         };
         self.write_segment("ST", &[resolved_type, control_number.clone()])?;
-        self.set_count += 1;
+        if let Some(group) = self.open_group.as_mut() {
+            group.set_count += 1;
+        }
         self.open_set = Some(OpenSet {
             control_number,
             segment_count: 1,
@@ -351,18 +422,15 @@ impl<W: Write> X12Writer<W> {
         Ok(())
     }
 
-    /// Close the open functional group with its recomputed `GE` trailer
-    /// (transaction-set count, group control-number echo).
+    /// Close the open functional group with its recomputed `GE` trailer:
+    /// `GE01` is the count of transaction sets in *this* group (not the
+    /// interchange-wide total), `GE02` echoes the group control number. Any
+    /// transaction set still open is closed first, since `SE` always
+    /// precedes the enclosing `GE`.
     fn close_functional_group(&mut self) -> Result<(), FormatError> {
-        if self.group_open {
-            self.group_open = false;
-            self.write_segment(
-                "GE",
-                &[
-                    self.set_count.to_string(),
-                    self.group_control_number.clone(),
-                ],
-            )?;
+        self.close_open_set()?;
+        if let Some(group) = self.open_group.take() {
+            self.write_segment("GE", &[group.set_count.to_string(), group.control_number])?;
         }
         Ok(())
     }
@@ -403,13 +471,13 @@ impl<W: Write> X12Writer<W> {
             if name.starts_with('$') {
                 continue;
             }
-            let known =
-                matches!(name, "seg_id" | "set_ref" | "set_type") || is_element_column(name);
+            let known = matches!(name, "seg_id" | "set_ref" | "set_type" | "group_ref")
+                || is_element_column(name);
             if !known {
                 return Err(FormatError::X12(format!(
                     "record column {name:?} has no X12 mapping. The writer maps only \
-                     `seg_id`, `set_ref`, `set_type`, and positional `eNN` element \
-                     columns; project the record to those before output"
+                     `seg_id`, `set_ref`, `set_type`, `group_ref`, and positional `eNN` \
+                     element columns; project the record to those before output"
                 )));
             }
         }
@@ -489,7 +557,8 @@ impl<W: Write + Send> FormatWriter for X12Writer<W> {
             return Ok(());
         }
         self.finalized = true;
-        self.close_open_set()?;
+        // Closing the group cascades to close any open transaction set
+        // first, so the SE/GE ordering holds at end of stream too.
         self.close_functional_group()?;
         // Only write IEA if a header was actually emitted; a writer that
         // saw zero records produces nothing rather than a bare trailer.
@@ -929,6 +998,179 @@ mod tests {
         let s = schema();
         let out = write_all(literal_config(), &[], &s);
         assert!(out.is_empty(), "{out}");
+    }
+
+    /// Schema with a `group_ref` discriminator column ahead of `set_ref`,
+    /// for the multi-functional-group output tests.
+    fn grouped_schema() -> Arc<Schema> {
+        let mut cols: Vec<Box<str>> = vec![
+            "seg_id".into(),
+            "group_ref".into(),
+            "set_ref".into(),
+            "set_type".into(),
+        ];
+        for i in 1..=4 {
+            cols.push(format!("e{i:02}").into_boxed_str());
+        }
+        Arc::new(Schema::new(cols))
+    }
+
+    /// Body record carrying a `group_ref` value alongside `set_ref` /
+    /// `set_type`, mirroring [`body`] but with the group discriminator.
+    fn grouped_body(
+        schema: &Arc<Schema>,
+        seg: &str,
+        group_ref: &str,
+        set_ref: &str,
+        set_type: &str,
+        els: &[&str],
+    ) -> Record {
+        let string_or_null = |s: &str| {
+            if s.is_empty() {
+                Value::Null
+            } else {
+                Value::String(s.into())
+            }
+        };
+        let mut values = vec![
+            Value::String(seg.into()),
+            string_or_null(group_ref),
+            string_or_null(set_ref),
+            string_or_null(set_type),
+        ];
+        for i in 0..4 {
+            match els.get(i) {
+                Some(e) => values.push(Value::String((*e).into())),
+                None => values.push(Value::Null),
+            }
+        }
+        Record::new(Arc::clone(schema), values)
+    }
+
+    #[test]
+    fn group_ref_transition_opens_a_second_functional_group() {
+        let s = grouped_schema();
+        let out = write_all(
+            literal_config(),
+            &[
+                grouped_body(&s, "BEG", "PO", "0001", "850", &["a"]),
+                grouped_body(&s, "INV", "IN", "0002", "810", &["b"]),
+            ],
+            &s,
+        );
+        // Two distinct group_ref values → two GS..GE groups in one ISA..IEA.
+        assert_eq!(out.matches("GS*").count(), 2, "{out}");
+        assert_eq!(out.matches("GE*").count(), 2, "{out}");
+        // GS06 echoes the discriminator; each GE claims its own single set
+        // and echoes the matching control number.
+        assert!(
+            out.contains("GS*PO*SENDER*RECEIVER*20240101*1200*PO*X*004010~"),
+            "{out}"
+        );
+        assert!(
+            out.contains("GS*PO*SENDER*RECEIVER*20240101*1200*IN*X*004010~"),
+            "{out}"
+        );
+        assert!(out.contains("GE*1*PO~"), "first group GE wrong: {out}");
+        assert!(out.contains("GE*1*IN~"), "second group GE wrong: {out}");
+        // IEA claims both functional groups.
+        assert!(out.contains("IEA*2*000000001~"), "{out}");
+    }
+
+    #[test]
+    fn ge_counts_are_per_group_not_interchange_wide() {
+        // First group holds two sets, second holds one. Each GE01 must
+        // reflect only its own group's sets, not the running total.
+        let s = grouped_schema();
+        let out = write_all(
+            literal_config(),
+            &[
+                grouped_body(&s, "BEG", "PO", "0001", "850", &["a"]),
+                grouped_body(&s, "BEG", "PO", "0002", "850", &["b"]),
+                grouped_body(&s, "INV", "IN", "0003", "810", &["c"]),
+            ],
+            &s,
+        );
+        // First group: 2 sets; second group: 1 set.
+        assert!(
+            out.contains("GE*2*PO~"),
+            "first GE should claim 2 sets: {out}"
+        );
+        assert!(
+            out.contains("GE*1*IN~"),
+            "second GE should claim 1 set: {out}"
+        );
+        assert!(out.contains("IEA*2*000000001~"), "{out}");
+    }
+
+    #[test]
+    fn empty_group_ref_keeps_one_group_byte_identical() {
+        // A `group_ref` column whose value never changes (here always empty)
+        // must collapse to exactly one GS..GE, identical to a stream with no
+        // group_ref column at all.
+        let grouped = grouped_schema();
+        let with_group = write_all(
+            literal_config(),
+            &[
+                grouped_body(&grouped, "BEG", "", "0001", "850", &["a"]),
+                grouped_body(&grouped, "PO1", "", "0001", "850", &["b"]),
+            ],
+            &grouped,
+        );
+        let plain = schema();
+        let without_group = write_all(
+            literal_config(),
+            &[
+                body(&plain, "BEG", "0001", "850", &["a"]),
+                body(&plain, "PO1", "0001", "850", &["b"]),
+            ],
+            &plain,
+        );
+        assert_eq!(
+            with_group, without_group,
+            "empty group_ref must produce byte-identical output to no group_ref column"
+        );
+        assert_eq!(with_group.matches("GS*").count(), 1, "{with_group}");
+        assert!(with_group.contains("GE*1*1~"), "{with_group}");
+    }
+
+    #[test]
+    fn anonymous_set_numbers_restart_per_group() {
+        // With no set_ref but distinct group_ref values, each group's
+        // generated ST02 control number restarts at 0001 within its group.
+        let cols: Vec<Box<str>> = vec!["seg_id".into(), "group_ref".into()];
+        let schema = Arc::new(Schema::new(cols));
+        let rec = |seg: &str, group: &str| {
+            Record::new(
+                Arc::clone(&schema),
+                vec![Value::String(seg.into()), Value::String(group.into())],
+            )
+        };
+        let mut cfg = literal_config();
+        cfg.set_type = Some("850".into());
+        let out = write_all(cfg, &[rec("BEG", "PO"), rec("INV", "IN")], &schema);
+        // Each group opens an anonymous set numbered from that group's count.
+        assert_eq!(out.matches("ST*850*0001~").count(), 2, "{out}");
+        assert!(out.contains("GE*1*PO~"), "{out}");
+        assert!(out.contains("GE*1*IN~"), "{out}");
+    }
+
+    #[test]
+    fn group_ref_column_is_accepted_not_rejected() {
+        // The group discriminator is a recognized control column, never an
+        // unmapped user field.
+        let s = grouped_schema();
+        let out = write_all(
+            literal_config(),
+            &[grouped_body(&s, "BEG", "PO", "0001", "850", &["00"])],
+            &s,
+        );
+        assert!(out.contains("BEG*00~"), "{out}");
+        // group_ref drives the group, it is never emitted as a data element.
+        assert!(
+            !out.contains("*PO*PO*"),
+            "group_ref leaked into a segment: {out}"
+        );
     }
 
     #[test]
