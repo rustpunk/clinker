@@ -65,6 +65,16 @@ pub struct CompileArtifacts {
     /// in a predicate (e.g. `l.amount > $doc.Head.cutoff`) is still
     /// reachable by the compile-time `$doc` path walk.
     pub combine_where_typed: HashMap<String, Arc<TypedProgram>>,
+    /// Per-Route branch-condition typed programs, keyed by Route node
+    /// name — one program per branch, in declaration order. A Route's
+    /// node-keyed `typed` entry is an empty body (the node carries no
+    /// `cxl:` projection); the branch conditions are otherwise compiled
+    /// straight to runtime evaluators and never land in `typed`. This
+    /// side-table retains them so a `$doc` access used ONLY in a route
+    /// condition (e.g. `amount > $doc.Head.cutoff`) is still reachable by
+    /// the compile-time `$doc` path walk and attributed to the Route's
+    /// source(s).
+    pub route_branch_typed: HashMap<String, Vec<Arc<TypedProgram>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -1419,7 +1429,7 @@ fn bind_schema_inner(
                     Err(d) => diags.push(d),
                 }
             }
-            PipelineNode::Route { header, config: _ } => {
+            PipelineNode::Route { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
                     if let Ok(mut empty) = typecheck_cxl(
@@ -1432,6 +1442,37 @@ fn bind_schema_inner(
                     ) {
                         empty.output_row = cloned.clone();
                         artifacts.typed.insert(name.clone(), Arc::new(empty));
+                    }
+                    // Type-check each branch condition into its own program
+                    // so the compile-time `$doc` walk can reach an envelope
+                    // path referenced ONLY in a route predicate. The
+                    // condition is a boolean expression; wrapping it in
+                    // `filter` mirrors how the runtime compiles it, giving a
+                    // `Statement::Filter` whose predicate the `$doc` walk
+                    // descends. A condition that fails to type-check is not
+                    // diagnosed here — that surfaces through the existing
+                    // route-compilation path — so only well-typed branches
+                    // contribute paths.
+                    let branch_programs: Vec<Arc<TypedProgram>> = config
+                        .conditions
+                        .values()
+                        .filter_map(|cond| {
+                            typecheck_cxl(
+                                &name,
+                                &format!("filter {}", cond.source),
+                                &cloned,
+                                AggregateMode::Row,
+                                span,
+                                &bind_ctx.scoped_vars,
+                            )
+                            .ok()
+                            .map(Arc::new)
+                        })
+                        .collect();
+                    if !branch_programs.is_empty() {
+                        artifacts
+                            .route_branch_typed
+                            .insert(name.clone(), branch_programs);
                     }
                     schema_by_name.insert(name, cloned);
                 }
