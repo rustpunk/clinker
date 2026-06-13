@@ -64,13 +64,12 @@ pub(crate) fn dispatch_output(
     }
     // Envelope-reconstruction short-circuit. When this Output declares
     // `reconstruct_envelope: true`, its writer's `begin_document` /
-    // `end_document` framing must fire at each document's outermost
-    // boundary, so this arm reads the INTERLEAVED record/boundary stream
-    // (the same drain shape the document-DLQ arm uses) rather than the
-    // records-only `drain_split` below. Unlike the DLQ arm it buffers
-    // nothing: it streams each body record straight through `write_record`
-    // between the header and footer, so a 1 GiB document flows at
-    // O(1-record).
+    // `end_document` framing must fire around each document's records. This
+    // arm detects document boundaries from each record's `doc_ctx`
+    // (a change in `source_file` between consecutive records) rather than the
+    // records-only path's boundary-blind write loop. It buffers nothing: each
+    // body record streams straight through `write_record` between the header
+    // and footer, so a 1 GiB document flows at O(1-record).
     if ctx
         .output_configs
         .iter()
@@ -376,26 +375,30 @@ fn drain_output_input_events(
 }
 
 /// Execute the `Output` arm under envelope reconstruction
-/// (`reconstruct_envelope: true`). Drains this Output's input as the
-/// INTERLEAVED record + boundary [`StreamEvent`] stream and replays it
-/// through the writer with per-document framing: the writer's
-/// `begin_document` fires on a document's OUTERMOST `DocumentOpen`, each
-/// body record streams straight through `write_record`, and `end_document`
-/// fires on the OUTERMOST `DocumentClose`.
+/// (`reconstruct_envelope: true`). Replays this Output's records through the
+/// writer with per-document framing: the writer's `begin_document` fires on
+/// the first record of each document, every body record streams straight
+/// through `write_record`, and `end_document` fires when the document ends.
 ///
-/// Bounded-memory: unlike the document-DLQ arm, this path buffers no
-/// records. It holds only a per-file envelope-depth map (one `i64` per
-/// concurrently-open file) and the pending-open document context, so a
-/// multi-gigabyte document streams at O(1-record). The input drain is
-/// itself lazy — a spilled predecessor buffer streams from disk one
-/// `StreamEvent` at a time rather than materializing.
+/// Boundary detection is RECORD-driven, not punctuation-driven: every
+/// `Record` carries its `Arc<DocumentContext>`, and a document boundary is a
+/// change in the record's `doc_ctx().source_file()` between consecutive
+/// records. Punctuations cannot drive this — the executor's buffers
+/// tail-clump all `DocumentClose` events after all records, so an
+/// interleaved boundary stream never reaches a terminal Output. Keying on
+/// `source_file` (rather than the raw `DocumentId`) makes nested-envelope
+/// levels — which mint fresh ids via `DocumentContext::child` but share the
+/// file's `source_file` Arc — frame at the OUTERMOST (file) grain.
 ///
-/// `begin_document` is deferred until the writer exists (opened lazily on
-/// the first projected record, deriving the output schema from it, matching
-/// every other writer-open site). A document with zero body records that
-/// arrives before any record in the run has opened the writer emits no
-/// framing — the same "empty stream → no writer, no output" contract the
-/// records-only path honors via its `if unbuffered.is_empty()` short-circuit.
+/// Bounded-memory: this path buffers no records. It holds only the current
+/// document's `source_file` / context, so a multi-gigabyte document streams
+/// at O(1-record). The input drain is itself lazy — a spilled predecessor
+/// buffer streams from disk one record at a time rather than materializing.
+///
+/// Records with a non-concrete source file (the `<merged>` sentinel or an
+/// empty stamp — an in-pipeline synthesis or fan-in row that belongs to no
+/// document) stream through unframed, matching the document-DLQ arm's
+/// `is_concrete_file` guard.
 ///
 /// # Errors
 ///
@@ -431,52 +434,57 @@ fn dispatch_output_envelope(
         Some(&cxl_emit_names)
     };
 
+    // Emit the same `SchemaScan` stage metric the records-only arm does, so an
+    // envelope Output is not invisible to per-stage reporting.
+    let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
+    let mut any_record = false;
+
     let events = drain_output_input_event_iter(ctx, current_dag, node_idx);
     let mut driver = EnvelopeWriterDriver::default();
 
-    // The borrowed `ctx.writers` registry is consulted only when the writer
-    // opens (first record); bundling the raw-writer source as a closure lets
-    // the driver stay free of the `ExecutorContext` so its depth-loop and
-    // hook-sequencing are unit-testable against a probe writer.
+    // Schema-check errors join the driver's error sink (rather than `?`-ing
+    // out mid-loop, which would discard already-collected errors and skip the
+    // final flush), matching the records-only arm's collect-don't-discard
+    // error posture.
     for event in events {
-        match event? {
-            StreamEvent::Record(record, row_num) => {
-                if let Some(expected) = expected_input_schema.as_ref() {
-                    check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
-                }
-                let projected = {
-                    let _guard = ctx.projection_timer.guard();
-                    project_output_from_record(&record, &out_cfg, cxl_emit_names_opt)
-                };
-                let _guard = ctx.write_timer.guard();
-                driver.on_record(&projected, &mut |schema| {
-                    let raw_writer = ctx.writers.remove(name)?;
-                    Some(build_format_writer(&out_cfg, raw_writer, schema))
-                });
-                drop(_guard);
-                // Count exactly as the records-only arm does: both counters
-                // bump unconditionally per record, independent of whether a
-                // writer is open or even registered. That keeps flag-on (with
-                // no-op hooks) invariant against flag-off — same input yields
-                // the same `records_written` / `ok_count` even on the
-                // no-writer / dry-run path where no byte is emitted.
-                ctx.counters.records_written += 1;
-                ctx.records_emitted += 1;
-                if ctx.ok_source_rows.insert(row_num) {
-                    ctx.counters.ok_count += 1;
-                }
-            }
-            StreamEvent::Punctuation(p) => {
-                let _guard = ctx.write_timer.guard();
-                match p.kind() {
-                    crate::executor::stream_event::PunctuationKind::DocumentOpen => {
-                        driver.on_document_open(p.doc_ctx());
-                    }
-                    crate::executor::stream_event::PunctuationKind::DocumentClose => {
-                        driver.on_document_close(p.doc_ctx());
-                    }
-                }
-            }
+        // Boundaries come from records, so punctuations are irrelevant here —
+        // drop them exactly as the records-only `drain_split` path does.
+        let StreamEvent::Record(record, row_num) = event? else {
+            continue;
+        };
+        any_record = true;
+        if let Some(expected) = expected_input_schema.as_ref()
+            && let Err(e) =
+                check_input_schema(expected, record.schema(), name, "output", &upstream_name)
+        {
+            driver.errors.push(e);
+            continue;
+        }
+        let projected = {
+            let _guard = ctx.projection_timer.guard();
+            project_output_from_record(&record, &out_cfg, cxl_emit_names_opt)
+        };
+        {
+            let _guard = ctx.write_timer.guard();
+            // The borrowed `ctx.writers` registry is consulted only when the
+            // writer opens (first record); passing the raw-writer source as a
+            // closure keeps the driver free of `ExecutorContext` so its
+            // boundary logic is unit-testable against a probe writer.
+            driver.on_record(record.doc_ctx(), &projected, &mut |schema| {
+                let raw_writer = ctx.writers.remove(name)?;
+                Some(build_format_writer(&out_cfg, raw_writer, schema))
+            });
+        }
+        // Count exactly as the records-only arm does: both counters bump
+        // unconditionally per record, independent of whether a writer is open
+        // or even registered. That keeps flag-on (with no-op hooks) invariant
+        // against flag-off — same input yields the same `records_written` /
+        // `ok_count` even on the no-writer / dry-run path where no byte is
+        // emitted.
+        ctx.counters.records_written += 1;
+        ctx.records_emitted += 1;
+        if ctx.ok_source_rows.insert(row_num) {
+            ctx.counters.ok_count += 1;
         }
     }
     {
@@ -484,6 +492,11 @@ fn dispatch_output_envelope(
         driver.finish();
     }
 
+    if any_record {
+        ctx.collector.record(scan_timer.finish(1, 1));
+    } else {
+        ctx.collector.record(scan_timer.finish(0, 0));
+    }
     ctx.output_errors.append(&mut driver.errors);
     Ok(())
 }
@@ -500,24 +513,22 @@ type WriterFactory<'a> = dyn FnMut(
     + 'a;
 
 /// Per-Output state for the envelope-reconstruction arm. Holds the single
-/// writer (opened lazily on the first projected record), the
-/// not-yet-emitted document-open context, and per-file envelope depths —
-/// never any body records, so the arm's footprint is O(open files), not
-/// O(document size). Free of [`ExecutorContext`] so its depth-loop and
-/// hook-sequencing are unit-testable against a probe writer; the caller
-/// supplies the raw-writer source as a closure, counts records (so the
-/// per-record counters stay identical to the records-only arm regardless of
-/// writer state), and folds the accumulated errors back into the run context.
+/// writer (opened lazily on the first record) and the currently-open
+/// document — never any body records, so the arm's footprint is O(1), not
+/// O(document size). Free of [`ExecutorContext`] so its boundary logic is
+/// unit-testable against a probe writer; the caller supplies the raw-writer
+/// source as a closure, counts records (so the per-record counters stay
+/// identical to the records-only arm regardless of writer state), and folds
+/// the accumulated errors back into the run context.
 #[derive(Default)]
 struct EnvelopeWriterDriver {
     writer: Option<Box<dyn clinker_format::FormatWriter>>,
-    /// A document's open boundary whose `begin_document` is deferred until
-    /// the writer exists. Fired right before the document's first record (or
-    /// immediately, when the writer is already open from a prior document).
-    pending_begin: Option<Arc<clinker_record::DocumentContext>>,
-    /// Live envelope nesting depth per source file; an entry is removed when
-    /// the file's outermost close fires.
-    depths: HashMap<Arc<str>, i64>,
+    /// The currently-open document's context, set on its first record's
+    /// `begin_document` and cleared on its `end_document`. `None` before the
+    /// first concrete-file record and between documents. Held so the
+    /// matching `end_document` (at the next boundary or at `finish`) carries
+    /// the same context `begin_document` opened with.
+    open_doc: Option<Arc<clinker_record::DocumentContext>>,
     /// Writer-construction / framing / write / flush errors, appended to the
     /// run's error sink by the caller rather than short-circuiting, matching
     /// the records-only Output path.
@@ -525,40 +536,74 @@ struct EnvelopeWriterDriver {
 }
 
 impl EnvelopeWriterDriver {
-    /// Account a document's opening boundary. Increments the file's envelope
-    /// depth and, on the OUTERMOST open (depth 0 → 1), arms its
-    /// `begin_document` — fired immediately when the writer is already open
-    /// (a prior document opened it), otherwise deferred until the next
-    /// record opens the writer.
-    fn on_document_open(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
-        let file = Arc::clone(doc_ctx.source_file());
-        let depth = self.depths.entry(file).or_insert(0);
-        *depth += 1;
-        if *depth == 1 {
-            if self.writer.is_some() {
-                self.fire_begin(doc_ctx);
-            } else {
-                self.pending_begin = Some(Arc::clone(doc_ctx));
+    /// Write one already-projected body record, framing per document. The
+    /// record's own `doc_ctx` drives boundary detection: when its
+    /// `source_file` differs from the currently-open document's, the prior
+    /// document ends (`end_document`) and the new one begins
+    /// (`begin_document`) before the record is written. Records whose
+    /// `source_file` is non-concrete (an in-pipeline synthesis / fan-in row)
+    /// stream through unframed.
+    ///
+    /// Opens the writer lazily on the first record (via `open_writer`,
+    /// deriving the schema from it). A `None` from `open_writer` means no
+    /// writer is registered (a sibling already took it, or a dry run): the
+    /// record is dropped, matching the records-only Output path's behavior
+    /// when its writer registry slot is empty.
+    ///
+    /// Record counting is the caller's job (it bumps `records_written` /
+    /// `ok_count` unconditionally per record, exactly as the records-only
+    /// arm does), so a dropped record here still counts identically — that
+    /// is what keeps flag-on invariant against flag-off.
+    fn on_record(
+        &mut self,
+        doc_ctx: &Arc<clinker_record::DocumentContext>,
+        projected: &Record,
+        open_writer: &mut WriterFactory<'_>,
+    ) {
+        if self.writer.is_none() {
+            match open_writer(Arc::clone(projected.schema())) {
+                Some(Ok(w)) => self.writer = Some(w),
+                Some(Err(e)) => {
+                    self.errors.push(e);
+                    return;
+                }
+                None => return,
             }
+        }
+        self.maybe_cross_boundary(doc_ctx);
+        let writer = self.writer.as_mut().expect("writer opened above");
+        if let Err(e) = writer.write_record(projected) {
+            self.errors.push(e.into());
         }
     }
 
-    /// Account a document's closing boundary. Decrements the file's envelope
-    /// depth and, on the OUTERMOST close (depth back to 0), fires its
-    /// `end_document` if a writer is open. A close with no tracked open
-    /// (malformed input) is treated as the document's terminal close.
-    fn on_document_close(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
+    /// Fire `end_document` / `begin_document` when this record's document
+    /// differs from the currently-open one. A non-concrete source file
+    /// belongs to no document, so it neither closes the open document nor
+    /// opens one — it streams through inside whatever framing is current.
+    fn maybe_cross_boundary(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
         let file = doc_ctx.source_file();
-        let outermost = match self.depths.get_mut(file) {
-            Some(d) => {
-                *d -= 1;
-                *d <= 0
-            }
-            None => true,
-        };
-        if outermost {
-            self.depths.remove(file);
-            self.end_document(doc_ctx);
+        if !crate::executor::document_dlq::is_concrete_file(file) {
+            return;
+        }
+        let same_doc = self
+            .open_doc
+            .as_ref()
+            .is_some_and(|open| open.source_file().as_ref() == file.as_ref());
+        if same_doc {
+            return;
+        }
+        self.fire_end();
+        self.fire_begin(doc_ctx);
+        self.open_doc = Some(Arc::clone(doc_ctx));
+    }
+
+    /// Emit the open document's closing framing, if a document is open.
+    fn fire_end(&mut self) {
+        if let (Some(writer), Some(doc_ctx)) = (self.writer.as_mut(), self.open_doc.take())
+            && let Err(e) = writer.end_document(&doc_ctx)
+        {
+            self.errors.push(e.into());
         }
     }
 
@@ -571,48 +616,9 @@ impl EnvelopeWriterDriver {
         }
     }
 
-    /// Emit a document's closing framing through the writer, if one is open.
-    fn end_document(&mut self, doc_ctx: &clinker_record::DocumentContext) {
-        if let Some(writer) = self.writer.as_mut()
-            && let Err(e) = writer.end_document(doc_ctx)
-        {
-            self.errors.push(e.into());
-        }
-    }
-
-    /// Write one already-projected body record straight through the writer,
-    /// opening it (via `open_writer`, deriving the schema from this record)
-    /// and flushing any pending `begin_document` on first use. A `None` from
-    /// `open_writer` means no writer is registered (a sibling already took
-    /// it, or a dry run): the record is dropped, matching the records-only
-    /// Output path's behavior when its writer registry slot is empty.
-    ///
-    /// Record counting is the caller's job (it bumps `records_written` /
-    /// `ok_count` unconditionally per record, exactly as the records-only
-    /// arm does), so a dropped record here still counts identically — that
-    /// is what keeps flag-on invariant against flag-off.
-    fn on_record(&mut self, projected: &Record, open_writer: &mut WriterFactory<'_>) {
-        if self.writer.is_none() {
-            match open_writer(Arc::clone(projected.schema())) {
-                Some(Ok(w)) => self.writer = Some(w),
-                Some(Err(e)) => {
-                    self.errors.push(e);
-                    return;
-                }
-                None => return,
-            }
-            if let Some(doc_ctx) = self.pending_begin.take() {
-                self.fire_begin(&doc_ctx);
-            }
-        }
-        let writer = self.writer.as_mut().expect("writer opened above");
-        if let Err(e) = writer.write_record(projected) {
-            self.errors.push(e.into());
-        }
-    }
-
-    /// Flush the writer at end of stream, if one was ever opened.
+    /// Close the last open document and flush at end of stream.
     fn finish(&mut self) {
+        self.fire_end();
         if let Some(writer) = self.writer.as_mut()
             && let Err(e) = writer.flush()
         {
@@ -874,26 +880,21 @@ mod tests {
         rec
     }
 
-    /// Drive the driver over a probe writer, returning its hook-call log.
-    /// Mirrors the production loop's projection-free record path (the test
-    /// records are already in output shape) and lazy writer-open via a probe
-    /// factory.
-    fn run_log(events: &[Event]) -> (Vec<String>, u64) {
+    /// Drive the driver over a probe writer with a record-driven stream
+    /// (boundaries come from each record's `doc_ctx`, as in production),
+    /// returning its hook-call log and the count of records that reached
+    /// `write_record`. Records are already in output shape, so the dispatch
+    /// loop's projection step is elided.
+    fn run_log(records: &[Record]) -> (Vec<String>, u64) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut driver = EnvelopeWriterDriver::default();
-        for event in events {
-            match event {
-                Event::Open(d) => driver.on_document_open(d),
-                Event::Close(d) => driver.on_document_close(d),
-                Event::Record(rec) => {
-                    let log = Arc::clone(&log);
-                    driver.on_record(rec, &mut |_schema| {
-                        Some(Ok(Box::new(ProbeWriter {
-                            log: Arc::clone(&log),
-                        }) as Box<dyn FormatWriter>))
-                    });
-                }
-            }
+        for rec in records {
+            let log = Arc::clone(&log);
+            driver.on_record(rec.doc_ctx(), rec, &mut |_schema| {
+                Some(Ok(Box::new(ProbeWriter {
+                    log: Arc::clone(&log),
+                }) as Box<dyn FormatWriter>))
+            });
         }
         driver.finish();
         assert!(driver.errors.is_empty(), "probe writer never errors");
@@ -908,27 +909,14 @@ mod tests {
         (log, written)
     }
 
-    enum Event {
-        Open(Arc<DocumentContext>),
-        Close(Arc<DocumentContext>),
-        Record(Record),
-    }
-
     #[test]
-    fn fires_begin_and_end_once_per_document_at_outermost_boundaries() {
+    fn fires_begin_and_end_once_per_document_at_boundaries() {
         let a = doc("a.csv");
         let b = doc("b.csv");
-        // Two flat documents, each open → records → close, back to back.
-        let events = vec![
-            Event::Open(Arc::clone(&a)),
-            Event::Record(record(1, &a)),
-            Event::Record(record(2, &a)),
-            Event::Close(Arc::clone(&a)),
-            Event::Open(Arc::clone(&b)),
-            Event::Record(record(3, &b)),
-            Event::Close(Arc::clone(&b)),
-        ];
-        let (log, written) = run_log(&events);
+        // Two documents' records, back to back; the boundary is the
+        // `source_file` change between record 2 and record 3.
+        let records = vec![record(1, &a), record(2, &a), record(3, &b)];
+        let (log, written) = run_log(&records);
         assert_eq!(
             log,
             vec![
@@ -947,45 +935,66 @@ mod tests {
 
     #[test]
     fn nested_envelope_fires_only_at_outermost_pair() {
-        // One file, two envelope levels (the inner level shares the file's
-        // `source_file` Arc, as a multi-level format mints it). The driver
-        // must fire begin/end exactly once — at the outermost open and the
-        // outermost close — not per level.
+        // One file, two envelope levels: the inner level mints a fresh
+        // `DocumentId` via `child` but SHARES the file's `source_file` Arc.
+        // Keying boundary detection on `source_file` (not the id) frames at
+        // the outermost (file) grain, so a record carrying the inner-level
+        // context still belongs to the one file document — begin/end fire
+        // exactly once.
         let outer = doc("multi.x12");
         let inner = Arc::new(outer.child(DocumentId::next(), IndexMap::new()));
-        let events = vec![
-            Event::Open(Arc::clone(&outer)),
-            Event::Open(Arc::clone(&inner)),
-            Event::Record(record(1, &inner)),
-            Event::Close(Arc::clone(&inner)),
-            Event::Close(Arc::clone(&outer)),
-        ];
-        let (log, written) = run_log(&events);
+        let records = vec![record(1, &outer), record(2, &inner), record(3, &outer)];
+        let (log, written) = run_log(&records);
         assert_eq!(
             log,
-            vec!["begin:multi.x12", "write:1", "end:multi.x12", "flush"],
-            "begin/end fire once at the outermost pair, not per nested level",
+            vec![
+                "begin:multi.x12",
+                "write:1",
+                "write:2",
+                "write:3",
+                "end:multi.x12",
+                "flush",
+            ],
+            "begin/end fire once for the file, not per nested level",
         );
-        assert_eq!(written, 1);
+        assert_eq!(written, 3);
     }
 
     #[test]
-    fn begin_is_deferred_until_the_writer_opens() {
-        // The document opens before any record, so the writer is not yet
-        // open at the open boundary; `begin_document` must still fire — once
-        // — right before the first record streams.
-        let a = doc("deferred.csv");
-        let events = vec![
-            Event::Open(Arc::clone(&a)),
-            Event::Record(record(1, &a)),
-            Event::Close(Arc::clone(&a)),
-        ];
-        let (log, _written) = run_log(&events);
+    fn single_document_frames_once_and_ends_at_finish() {
+        // A document's `end_document` fires at `finish()` when no later
+        // boundary closes it — the EOF-with-open-document case.
+        let a = doc("solo.csv");
+        let records = vec![record(1, &a), record(2, &a)];
+        let (log, _written) = run_log(&records);
         assert_eq!(
             log,
-            vec!["begin:deferred.csv", "write:1", "end:deferred.csv", "flush"],
-            "deferred begin fires exactly once, before the first record",
+            vec![
+                "begin:solo.csv",
+                "write:1",
+                "write:2",
+                "end:solo.csv",
+                "flush"
+            ],
+            "the last open document is closed at finish()",
         );
+    }
+
+    #[test]
+    fn non_concrete_source_file_streams_unframed() {
+        // A record whose source file is the `<merged>` sentinel (a fan-in /
+        // synthesis row) belongs to no document: it neither opens nor closes
+        // framing, streaming through whatever document is current. Here the
+        // whole stream is non-concrete, so no begin/end ever fires.
+        let merged = doc("<merged>");
+        let records = vec![record(1, &merged), record(2, &merged)];
+        let (log, written) = run_log(&records);
+        assert_eq!(
+            log,
+            vec!["write:1", "write:2", "flush"],
+            "non-concrete-file records stream through unframed",
+        );
+        assert_eq!(written, 2);
     }
 
     #[test]
@@ -997,22 +1006,13 @@ mod tests {
         // unconditional `records_written` / `ok_count` increments produce the
         // exact same counts whether or not a writer materializes. That is what
         // keeps the `reconstruct_envelope` flag transparent on the no-writer
-        // path: counters match the records-only arm byte-for-byte.
+        // path: counters match the records-only arm.
         let a = doc("dry-run.csv");
-        let events = [
-            Event::Open(Arc::clone(&a)),
-            Event::Record(record(1, &a)),
-            Event::Record(record(2, &a)),
-            Event::Close(Arc::clone(&a)),
-        ];
+        let records = [record(1, &a), record(2, &a)];
         let mut driver = EnvelopeWriterDriver::default();
-        for event in &events {
-            match event {
-                Event::Open(d) => driver.on_document_open(d),
-                Event::Close(d) => driver.on_document_close(d),
-                // No writer is ever registered for this Output.
-                Event::Record(rec) => driver.on_record(rec, &mut |_schema| None),
-            }
+        for rec in &records {
+            // No writer is ever registered for this Output.
+            driver.on_record(rec.doc_ctx(), rec, &mut |_schema| None);
         }
         driver.finish();
         assert!(

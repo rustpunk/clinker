@@ -67,11 +67,11 @@ pub(super) fn compute_streaming_output_specs(
     // per-document Output buffer flushes or rejects each document at its
     // materialized `DocumentClose`, which a streaming-Output thread would
     // consume out of band before the buffer could decide the document.
-    // Envelope reconstruction disables it on the same axis: the
-    // punctuation-aware Output arm fires the writer's `begin_document` /
-    // `end_document` at the materialized boundaries, so a streaming-Output
-    // thread consuming the `DocumentClose` out of band would strand the
-    // footer.
+    // Envelope reconstruction disables it because the fused streaming
+    // consumer writes each record straight to disk with no per-document
+    // framing — only the materialized envelope arm detects document
+    // boundaries (from each record's `doc_ctx`) and fires the writer's
+    // `begin_document` / `end_document`.
     if config.any_source_has_correlation_key()
         || config.any_source_has_document_dlq()
         || config.any_output_reconstructs_envelope()

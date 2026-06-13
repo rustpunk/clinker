@@ -138,15 +138,6 @@ impl Punctuation {
         self.doc_ctx.id()
     }
 
-    /// Borrow the marked document's envelope context. Carries the same
-    /// `Arc<DocumentContext>` the document's body records hold, so an
-    /// operator acting at the boundary (the envelope-reconstructing Output
-    /// arm firing `begin_document` / `end_document`, a trailer-validation
-    /// operator) reads the document's sections from one shared Arc.
-    pub fn doc_ctx(&self) -> &Arc<DocumentContext> {
-        &self.doc_ctx
-    }
-
     /// Source file the marked document belongs to. Every envelope level of
     /// one file (the file-level document and each nested level) shares the
     /// same `source_file` Arc, so this identifies the OUTERMOST (file /

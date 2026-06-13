@@ -101,7 +101,8 @@ pub trait FormatWriter: Send {
 
     /// Emit any per-document opening framing (an envelope header) before the
     /// document's first body record streams. Called by the Output dispatch
-    /// arm on a document's OUTERMOST `DocumentOpen`, passing the same
+    /// arm on the first record of each document (boundaries are detected from
+    /// each record's `doc_ctx().source_file()`), passing the same
     /// [`DocumentContext`] the body records carry so the writer can read its
     /// envelope sections. The body records then flow through
     /// [`Self::write_record`] one at a time, and [`Self::end_document`] closes
@@ -121,8 +122,9 @@ pub trait FormatWriter: Send {
 
     /// Emit any per-document closing framing (an envelope footer / trailer)
     /// after the document's last body record has been written. Called by the
-    /// Output dispatch arm on a document's OUTERMOST `DocumentClose`, paired
-    /// with the [`Self::begin_document`] that opened it.
+    /// Output dispatch arm when the document ends — the next record's
+    /// `source_file` differs, or the input is exhausted — paired with the
+    /// [`Self::begin_document`] that opened it.
     ///
     /// Default impl is a no-op, mirroring [`Self::begin_document`].
     ///

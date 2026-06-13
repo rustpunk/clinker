@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, Record, Schema, Value, value_to_group_key};
+use clinker_record::{DocumentContext, GroupByKey, Record, Schema, Value, value_to_group_key};
 
 use crate::counting::{CountingWriter, SharedByteCounter};
 use crate::error::FormatError;
@@ -283,5 +283,29 @@ impl FormatWriter for SplittingWriter {
 
     fn bytes_written(&self) -> Option<u64> {
         Some(self.total_bytes + self.byte_counter.bytes_written())
+    }
+
+    /// Forward per-document opening framing to the active inner writer so it
+    /// reaches the real format writer rather than dying at this splitting
+    /// shim. Opens the first file if none is active yet, so a `begin_document`
+    /// preceding the document's first record still lands on a real writer.
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        if self.current_writer.is_none() {
+            self.open_new_file()?;
+        }
+        self.current_writer
+            .as_mut()
+            .expect("file opened above")
+            .begin_document(doc)
+    }
+
+    /// Forward per-document closing framing to the active inner writer, if one
+    /// is open. With no active writer (no record ever arrived) there is no
+    /// framing to close.
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        if let Some(writer) = self.current_writer.as_mut() {
+            writer.end_document(doc)?;
+        }
+        Ok(())
     }
 }

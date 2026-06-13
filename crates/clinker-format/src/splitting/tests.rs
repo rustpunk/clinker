@@ -872,6 +872,72 @@ fn test_splitting_writer_xml_produces_valid_files() {
     assert_eq!(count_items(&contents[2]), 1);
 }
 
+/// A `FormatWriter` that records per-document hook calls into shared state,
+/// for proving `SplittingWriter` forwards framing to its active inner writer.
+struct HookProbe {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl FormatWriter for HookProbe {
+    fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
+        self.log.lock().unwrap().push("write".into());
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        Ok(())
+    }
+    fn begin_document(&mut self, doc: &clinker_record::DocumentContext) -> Result<(), FormatError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("begin:{}", doc.source_file()));
+        Ok(())
+    }
+    fn end_document(&mut self, doc: &clinker_record::DocumentContext) -> Result<(), FormatError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("end:{}", doc.source_file()));
+        Ok(())
+    }
+}
+
+#[test]
+fn splitting_writer_forwards_document_hooks_to_active_inner() {
+    use clinker_record::DocumentId;
+    use indexmap::IndexMap;
+
+    let schema = make_schema(&["id"]);
+    let registry = FileRegistry::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_for_factory = Arc::clone(&log);
+    let writer_factory: WriterFactory = Box::new(move |_counting, _schema| {
+        Ok(Box::new(HookProbe {
+            log: Arc::clone(&log_for_factory),
+        }) as Box<dyn FormatWriter>)
+    });
+    let policy = SplitPolicy {
+        max_records: None,
+        max_bytes: None,
+        group_key: None,
+        repeat_header: false,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+    let mut writer = SplittingWriter::new(registry.file_factory(), writer_factory, schema, policy);
+
+    let doc = DocumentContext::new(DocumentId::next(), Arc::from("file.x12"), IndexMap::new());
+    // `begin_document` arrives before any record: the splitter must lazy-open
+    // the first file so the framing reaches a real inner writer.
+    writer.begin_document(&doc).unwrap();
+    writer.end_document(&doc).unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["begin:file.x12", "end:file.x12"],
+        "begin/end_document forward to the splitter's active inner writer",
+    );
+}
+
 // Helper for test_split_naming_pattern — wraps the executor's apply_split_naming logic
 // (we duplicate it here since the original is in clinker-exec and we're in clinker-format)
 pub(crate) fn apply_split_naming_wrapper(base_path: &str, naming: &str, seq: u32) -> String {
