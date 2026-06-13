@@ -92,36 +92,26 @@ Hash aggregation works on unsorted input and is the safe default. It uses more m
 
 ## Correlation-key interaction
 
-In a pipeline whose sources declare `correlation_key:` fields, the engine inspects each aggregate's `group_by` against the upstream CK lattice (the union of `$ck.*` shadow columns visible at the aggregate's input):
+When a pipeline's sources declare `correlation_key:` fields, an aggregate behaves one of two ways depending on its `group_by`:
 
-- `group_by` covers every upstream CK field — strict-collateral path. The aggregate emits one row per group, the row inherits the correlation identity of its inputs, and a DLQ trigger anywhere in the group rolls back the whole group including the aggregate output. Zero retraction overhead.
-- `group_by` omits any upstream CK field — retraction protocol path. A single correlation group may span multiple aggregate groups; CK fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output as user-named columns. The engine retracts only the failing records and refinalizes affected groups.
+- **`group_by` covers the correlation key** — if any record in a group fails, the whole group (including the aggregate output row) is sent to the DLQ.
+- **`group_by` omits a correlation-key field** — only the failing records are dropped and the affected groups are recomputed, so the surviving rows still produce a correct aggregate.
 
-Authors do not configure this — the engine selects the path automatically based on `group_by` content. A retraction-mode aggregate is incompatible with `strategy: streaming` (rejected with `E15Y`, because streaming aggregates emit at group-boundary close before the terminal correlation commit and that defeats the rollback window). See [Correlation Keys](../pipelines/correlation-keys.md#aggregate-interaction) for the full lattice rules.
-
-A retraction-mode aggregate emits one engine-managed `$ck.aggregate.<name>` shadow column on its output schema, alongside `[group_by_columns] ++ [emitted_binding_columns]`. The column carries the aggregator's per-group index at finalize and costs ~16 bytes per emitted row (the `Value::Integer` payload plus its slot overhead); it is hidden from default writer output. The synthetic column is the lineage hook that lifts the post-aggregate retract path: a Transform or Output that fails on an aggregate output row carries the column on the failing record, the orchestrator's detect phase decodes the index back to the contributing source row ids, and the recompute phase retracts those source rows so the failing aggregate row's contributors are removed from the writer payload — matching the upstream-failure DLQ-fan-out semantic. See [Correlation Keys → Where retraction triggers are sourced](../pipelines/correlation-keys.md#where-retraction-triggers-are-sourced) and the runnable demo at [`examples/pipelines/retract-demo/`](https://github.com/rustpunk/clinker/tree/main/examples/pipelines/retract-demo).
-
-The retraction protocol carries a per-aggregate cost — Reversible accumulators use a per-row lineage map, BufferRequired accumulators hold raw contributions until commit. Both paths additionally pay ~16 bytes per output row for the synthetic-CK shadow column. The [operator-by-operator retraction cost reference](../pipelines/correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator breakdown; `clinker run --explain` reports the live per-aggregate detail including the synthetic-CK line.
+You do not configure this; the engine picks the behavior from your `group_by`. The one restriction is that the second case cannot be combined with `strategy: streaming`. See [Correlation Keys](../pipelines/correlation-keys.md#aggregate-interaction) for the full rules.
 
 ## Time-windowed aggregates
 
-When `time_window:` is set on the aggregate body, the operator
-groups records not just by `group_by` but also by *event-time
-window*. Each record is assigned to one or more windows by the
-engine-stamped [`$source.event_time`](../cxl/system-variables.md)
-column; state accumulates per `(group_by, window)`; a window closes
-once `min_across_sources >= window_end + allowed_lateness` and emits
-one row per group it saw. The shape parallels Flink SQL
-[Window TVFs](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/window-tvf/),
-Spark Structured Streaming
-[window / session_window](https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#window-operations-on-event-time),
-and Beam
-[windowing](https://beam.apache.org/documentation/programming-guide/#windowing).
+When `time_window:` is set on the aggregate body, records are grouped
+not just by `group_by` but also by *event-time window*. Each record is
+placed into one or more windows by its event time (the
+[`$source.event_time`](../cxl/system-variables.md) value derived from
+the source's watermark), and each window emits one row per group once
+it closes.
 
 Every upstream-reachable source must declare a
-[`watermark:`](source.md#watermarks). Otherwise `min_across_sources`
-stays at `None`, no window ever closes, and the planner rejects the
-pipeline with
+[`watermark:`](source.md#watermarks) so the engine knows when a window
+is complete. Without one, no window ever closes and the planner rejects
+the pipeline with
 [**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
 
 The engine emits user-declared columns only — window bounds do not
@@ -245,11 +235,11 @@ sessions, two output rows.
 
 ### Allowed lateness
 
-`allowed_lateness` is an operator-side knob, distinct from the
-source-side `watermark.delay`. A window with `time_window:` closes
-when `min_across_sources >= window_end + allowed_lateness`. Records
-arriving after a window's `end + allowed_lateness` route to the DLQ
-as `LateRecord` with stage label `time_window:<aggregate-name>`.
+`allowed_lateness` extends how long a window stays open past its end
+before it emits, giving late-arriving records a grace period to still
+be counted. It is distinct from the source-side `watermark.delay`.
+Records that arrive after a window's `end + allowed_lateness` route to
+the DLQ as `LateRecord` with stage label `time_window:<aggregate-name>`.
 See [DLQ category: LateRecord](../ops/exit-codes.md#dlq-category-laterecord)
 for the DLQ row layout.
 
@@ -274,11 +264,10 @@ small to absorb the observed out-of-order tail.
 ### Worked example: multi-source session window
 
 This pipeline merges two independent login feeds and groups per-user
-events into gap-bounded sessions. Issue
-[#61](https://github.com/rustpunk/clinker/issues/61) tracks the
-multi-source synchronisation contract: a window cannot close until
-**every** upstream source has advanced its watermark past
-`window_end + allowed_lateness`.
+events into gap-bounded sessions. When several sources feed one
+time-windowed aggregate, a window cannot close until **every** source
+has advanced past the window's end — the slowest source paces the
+others, so no window emits before all of its records have arrived.
 
 ```yaml
 pipeline:
@@ -342,14 +331,13 @@ nodes:
       path: ./output/multi_source_session.csv
 ```
 
-Both sources declare their own `watermark.column` independently. At
-ingest, each record gets the engine-stamped `$source.event_time`
-column, so the aggregate is column-name-agnostic about which source
-delivered any given record. The aggregate's close decision reads
-`min_across_sources` across **both** sources' partitions: a session
-cannot emit until both `src_web` and `src_mobile` have advanced past
-the session's `end + allowed_lateness`. Drop the `watermark:` block
-on either source and the planner rejects the pipeline with
+Both sources declare their own `watermark.column` independently, and
+each source's records carry an event time regardless of which feed
+delivered them — so the aggregate does not care which column name a
+given source used. A session cannot emit until both `src_web` and
+`src_mobile` have advanced past the session's end plus its
+`allowed_lateness`. Drop the `watermark:` block on either source and
+the planner rejects the pipeline with
 [**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
 
 Run it from the repo:

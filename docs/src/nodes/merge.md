@@ -75,8 +75,6 @@ Records flow to output **as they become available** from any predecessor. Per-so
     mode: interleave
 ```
 
-When every direct predecessor of an unseeded `interleave` merge is a `Source` node, the executor **fuses** the Merge into the source ingest loop — predecessor channels are polled directly and Merge consumption proceeds at live ingest rate without any intermediate buffering tier.
-
 ### Seeded interleave — `interleave_seed:`
 
 Snapshot tests and benchmarks that need reproducible cross-input ordering can opt into a deterministic schedule:
@@ -90,44 +88,21 @@ Snapshot tests and benchmarks that need reproducible cross-input ordering can op
     interleave_seed: 42
 ```
 
-A seeded interleave **bypasses the fused live-channel path**. The Merge instead pre-buffers each predecessor's output into a Vec, then emits records in `fastrand`-driven order seeded by `interleave_seed`. Output is reproducible regardless of upstream timing — at the cost of opting out of live back-pressure across this Merge (see below).
+With a seed, the cross-input order is reproducible from run to run regardless of upstream timing. To get there, the Merge reads all of its inputs into memory before emitting, so a seeded interleave buffers more than the other modes — use it for tests and benchmarks, not high-volume production merges.
 
-## Back-pressure semantics
+## Choosing a mode
 
-How a slow consumer or slow upstream reader propagates back through the DAG depends on the merge mode.
+| Mode | Order | When to use |
+|------|-------|-------------|
+| `concat` | Inputs emitted in declaration order, each fully drained before the next. | Downstream depends on a stable, declaration-ordered sequence (byte-identical output, contiguous time partitions). |
+| `interleave` (unseeded) | Records emitted as they arrive; per-input order preserved, cross-input order varies. | Lowest latency and the consumer is order-insensitive (e.g. an aggregator grouping by key, or a writer that doesn't assert on row order). |
+| `interleave` (seeded) | Reproducible cross-input order. | Tests and benchmarks that assert on exact row sequence. Buffers all inputs in memory. |
 
-### `concat`
-
-Each Source ingest task pushes into its own bounded `mpsc` channel (capacity 1024 records per Source). Peer sources produce **concurrently** up to that capacity — the dispatch arm just consumes from `inputs[0]`'s channel before turning to `inputs[1]`'s.
-
-Consequences:
-
-- **Memory:** a non-leading input can hold up to one channel's worth of buffered records before its producer blocks. Multi-input `concat` over `N` Sources may carry up to `(N - 1) × 1024` records in flight even while only one input is being drained.
-- **Latency:** a record produced by `inputs[1]` while `inputs[0]` is still draining will not reach output until `inputs[0]` finishes, regardless of how fast it was produced.
-- **Producer-side back-pressure:** when a non-leading input's channel fills, its reader blocks at `blocking_send`, propagating pressure back to the upstream file/network reader. The upstream is throttled even though it is not the currently-consumed input.
-
-`concat` is the right choice when downstream consumers depend on declaration-ordered records (e.g. snapshot tests asserting on byte-identical output) or when the inputs represent ordered time partitions that must remain contiguous.
-
-### `interleave` (unseeded)
-
-Fused with Source predecessors, the Merge arm polls every predecessor's channel concurrently. Live back-pressure flows end-to-end:
-
-- A slow downstream operator delays Merge consumption, which fills the predecessor channels, which blocks the Source reader tasks.
-- A fast input does not wait on a slow peer — the Merge schedules whichever channel has a ready record.
-
-When predecessors are not all Sources (e.g. Transform → Merge), fusion does not apply and the Merge consumes pre-buffered predecessor outputs in round-robin order; live back-pressure across the Merge boundary itself is unavailable in that shape, though the upstream operator's own bounded buffer still throttles its predecessors.
-
-Unseeded `interleave` is the right choice when end-to-end latency matters and the downstream consumer is order-insensitive (e.g. an aggregator grouping on a key, or a writer that does not assert on row sequencing).
-
-### `interleave` (seeded)
-
-The seeded path **does not preserve live back-pressure across the Merge**: it pre-buffers each predecessor's full output into a `Vec` before emitting in `fastrand`-driven order. A slow consumer downstream of a seeded Merge will not throttle the Source readers while the buffers are still filling.
-
-If you need both run-to-run determinism and live back-pressure, prefer asserting on the multiset of records rather than their sequence and use unseeded `interleave`, or fall back to `concat` over deterministically-declared inputs.
+For high-volume merges, prefer `concat` or unseeded `interleave` — both stream their inputs and let a slow downstream consumer naturally throttle the upstream readers, so memory stays bounded. A seeded interleave does not, because it buffers everything first.
 
 ## Record ordering
 
-Records arrive in the order described by the mode in use — see [Modes](#modes) and [Back-pressure semantics](#back-pressure-semantics) above. If you need sorted output regardless of merge mode, apply a `sort_order` on the downstream output node.
+Records arrive in the order described by the mode in use — see [Modes](#modes) and [Choosing a mode](#choosing-a-mode) above. If you need sorted output regardless of merge mode, apply a `sort_order` on the downstream output node.
 
 ## Use cases
 

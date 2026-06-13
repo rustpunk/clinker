@@ -526,44 +526,22 @@ volume, stop the cleaner, restore permissions) is obvious from the message.
 
 A run's spill directory (`clinker-spill-<random>/`) is normally removed when the
 run ends — a clean exit, a run that aborts with a fatal error, or even a panic
-that unwinds all delete it, on every platform. (The run holds an advisory lock on
-a `.lock` file inside that directory; the lock is always released before the
-directory is removed, so the removal never trips over its own open handle — which
-matters on Windows, where an open file handle blocks deletion.) But a `SIGKILL`,
-the Linux OOM-killer, or a power loss kills the process before that cleanup runs,
-leaking the directory and every spill file inside it under the spill root. Over
-many crashed runs that fills the spill volume.
+all delete it. But a `SIGKILL`, the Linux OOM-killer, or a power loss kills the
+process before that cleanup runs, leaking the directory and every spill file
+inside it. Over many crashed runs that fills the spill volume.
 
-To prevent that, **a run reaps orphaned spill directories at startup — but
+To prevent that, **a run cleans up orphaned spill directories at startup — but
 only when a spill directory is explicitly configured** (`storage.spill.dir`),
-before it creates its own. Each live run holds an operating-system advisory lock
-on a `.lock` file inside its spill directory for the run's whole lifetime; the
-OS releases that lock automatically when the process exits, however it exits. At
-startup a run scans the configured spill root and, for each `clinker-spill-*`
-directory, tries to take that lock: if it succeeds the owning process is gone, so
-the directory is an orphan and is removed; if the lock is still held a concurrent
-live run owns it, so it is left alone. Asking the kernel "is anyone still
-holding this?" is robust against PID reuse and never reaps a directory a
-concurrent run is still using. The purge is best-effort: a failure to reap one
-directory is logged and the run proceeds.
+before it creates its own. It removes only directories left by dead runs and
+never touches one a concurrent run is still using.
 
 When `storage.spill.dir` is **not** set, the spill root defaults to the OS temp
 directory ([`std::env::temp_dir`], typically `$TMPDIR` or `/tmp`), and **no
-startup purge runs** there. In the default case a run cleans up after itself
-directly: the per-run spill directory is removed on every exit short of a hard
-kill — a clean exit, an error-return abort, or a panic that unwinds. Only a
-`SIGKILL`, the OOM-killer, or a power loss leaks one, and a directory leaked into
-the OS temp directory is the operating system's temp-reaper's responsibility to
-clean up, not Clinker's.
-
-The purge is deliberately confined to a configured spill root because it must
-never police the shared OS temp directory. That directory is used by every
-process on the host, so a startup sweep there would race not only concurrent
-Clinker runs (the lock-based check narrows that window but cannot eliminate it
-against a peer whose just-created spill directory is not yet locked) but also
-unrelated programs that happen to use a colliding name prefix. A run owns its
-configured spill volume and can safely sweep it; it does not own `/tmp` and so
-leaves it alone.
+startup purge runs** there. In the default case a run still cleans up its own
+spill directory on every exit short of a hard kill; a directory leaked into the
+OS temp directory by a hard kill is the operating system's temp-reaper's
+responsibility, not Clinker's. The purge is confined to a configured spill root
+because Clinker owns that volume but does not own the shared OS temp directory.
 
 ## `storage.staging` — opt-in source staging
 
@@ -628,61 +606,11 @@ patterns don't select reads in place, so its volume is irrelevant.
 
 ### How a file is staged
 
-Each matched source maps to a **stable, content-addressed** pair of files
-directly under `dir`, deterministic across runs of the same source:
-
-- `<source-id>.staged` — the local copy the reader opens.
-- `<source-id>.manifest.json` — a sidecar recording the source's identity:
-  its path, modification time, size, the BLAKE3 content hash, and the stage
-  time.
-- `<source-id>.lock` — a small advisory-lock file that serializes concurrent
-  invocations staging the same source (see [the staging
-  cache](#the-staging-cache-on_existing)). It carries no data and persists
-  between runs as the per-source coordination point, alongside the cached copy
-  it guards. Once that source's cache entry is gone and no run holds the lock, a
-  later startup [crash purge](#crash-purge-of-orphaned-artifacts) reclaims the
-  lock too, so a persistent staging root does not accumulate one orphan lock per
-  source that has ever passed through it.
-
-`<source-id>` is derived from the source's canonical path, so the same source
-always resolves to the same staged file. That stability is what makes the
-`reuse` cache work (a later run can find the prior copy) and it is why the layout
-is stable rather than per-run UUIDs.
-
-The copy is built to survive a crash at any point without leaving a corrupt or
-partial file a later run might trust:
-
-1. **Single-pass copy + hash.** The source is read once in ~1 MiB chunks; each
-   chunk is fed to both the BLAKE3 hasher and the destination file in the same
-   pass. The copy never holds the whole file in memory, so it stays a
-   memory-budget no-op regardless of file size.
-2. **Atomic publish.** Bytes are written to a `<source-id>.<run>.partial` temp
-   file, flushed and `fsync`'d, then **renamed** to `<source-id>.staged`. A
-   rename is an atomic replace on Linux, macOS, and Windows (Windows 10 1607+),
-   so a reader scanning for `.staged` files sees either nothing or the complete
-   file — never a half-written one. The `<run>` segment in the partial name
-   keeps any two in-flight copies of one source on distinct temp files, and the
-   per-source lock (see [the staging cache](#the-staging-cache-on_existing))
-   ensures only one of them ever runs at a time.
-3. **Durable rename.** On Linux/macOS the parent directory is `fsync`'d after
-   the rename, because on ext4/xfs a rename is only crash-durable once the
-   directory entry itself is flushed. On Windows the NTFS journal makes the
-   rename durable, so there is no separate directory flush to do.
-4. **Verify.** With `verify = blake3` (the default) the source is independently
-   re-read and hashed, and the two digests must match. A size check cannot
-   catch a soft-mount that silently truncated the read; two content digests
-   can. A mismatch removes the published copy and fails the run with a distinct
-   "staged copy is corrupt" diagnostic ([E335](#staging-copy-aborts)) — not a
-   generic I/O error.
-5. **Commit the manifest.** The identity manifest is written with the same
-   atomic temp-file + rename discipline. **The manifest is the commit marker:**
-   a `.staged` file is only trustworthy once its manifest exists. A crash
-   between the copy and the manifest leaves a `.staged` with no manifest, which
-   the next run's [crash purge](#crash-purge-of-orphaned-artifacts) reaps as an
-   orphan rather than half-trusting.
-
-If the copy fails partway, the `.partial` is removed before the error
-propagates.
+Staging copies the matched source to your local staging directory once, then
+verifies the copy against the source (with `verify = blake3`, the default, a
+content mismatch fails the run with [E335](#staging-copy-aborts)). From then on
+the pipeline reads from the local copy. The same source always resolves to the
+same staged file, so a later run can find and `reuse` a prior copy.
 
 ### The staging cache (`on_existing`)
 
@@ -692,45 +620,18 @@ decides what happens when that prior copy is found:
 
 | Mode | Behavior |
 | --- | --- |
-| `overwrite` (default) | Always re-stage. The prior copy and its manifest are removed and the source is copied fresh. The safe default: a copy from a crashed run must not be trusted. |
-| `reuse` | Reuse the prior copy **only when it is still fresh** — the source's current modification time and size both match what the manifest recorded. A fresh match **skips the copy entirely** (no bytes read off the share, nothing charged against the disk cap). A changed mtime or size means the source was rewritten, so the copy is stale and is re-staged. |
+| `overwrite` (default) | Always re-stage. The prior copy is removed and the source is copied fresh. The safe default: a copy from a crashed run must not be trusted. |
+| `reuse` | Reuse the prior copy **only when it is still fresh** — the source's current modification time and size both match what was recorded when it was staged. A fresh match **skips the copy entirely** (no bytes read off the share, nothing charged against the disk cap). A changed mtime or size means the source was rewritten, so the copy is stale and is re-staged. |
 | `error` | Fail the run with a clear diagnostic if a staged copy already exists, rather than overwrite or reuse it. For workflows that want an explicit "the cache is already populated" stop. |
 
 `reuse` is the mode that turns staging into a cache: re-running the same
 pipeline over an unchanged network share copies nothing on the second run. The
-freshness check is mtime + size, not a re-hash, so it is a cheap `stat` rather
-than a full read of the source.
+freshness check is mtime + size, not a re-hash, so it is cheap.
 
-Staging is collision-safe across **concurrent** invocations. Under the
-partition-and-run model — several `clinker` processes over a partitioned input
-sharing one staging volume — independent runs may stage, reuse, or clean up the
-*same* shared source at the same time. The per-source advisory lock (a
-`<source-id>.lock` file under the staging root) is a **reader-writer lock** that
-keeps every such overlap safe on Linux, macOS, and Windows:
-
-- **Exactly one copy.** A run that needs to copy takes the lock *exclusively*
-  for its copy-and-publish. The first run to take it copies and publishes; every
-  other run blocks, then acquires the lock, finds the now-fresh `.staged`, and
-  reuses it. So a source is copied exactly once no matter how many invocations
-  race for it.
-- **A reader is never yanked.** A run reading a staged copy holds the lock in
-  *shared* mode for as long as it has the file open, and keeps it held across the
-  moment it decides to reuse a copy and the moment it opens that copy — so the
-  file it chose cannot be deleted or replaced in between. Any number of readers
-  share the lock at once, so concurrent runs all read the same copy in parallel.
-- **Cleanup and overwrite wait for readers.** Removing or re-copying a staged
-  pair takes the lock *exclusively*, which a live reader's shared lock blocks.
-  Cleanup probes the lock without waiting: if a concurrent run is still reading
-  the copy, cleanup leaves it in place (the last run to release it, or a later
-  [crash purge](#crash-purge-of-orphaned-artifacts), reaps it). An overwrite
-  re-stage waits for in-flight readers to finish, then publishes atomically.
-
-On Windows the staged copy is additionally opened with a share mode that permits
-a concurrent delete or atomic-rename replace (`FILE_SHARE_DELETE`), so an open
-reader and a concurrent publish/cleanup interoperate there exactly as they do on
-POSIX, where an unlinked-but-open file stays readable. The net guarantee: across
-any mix of concurrent runs sharing a staged source, a reader always sees a
-complete, coherent `.staged` file and no run fails spuriously.
+Staging is safe to run from several `clinker` invocations at once over a shared
+staging volume: a source is copied exactly once no matter how many runs race for
+it, a run always reads a complete copy, and no run fails because a sibling was
+reading, cleaning up, or re-staging the same source.
 
 ### Cleanup (`on_success` | `always` | `never`)
 
@@ -748,65 +649,23 @@ manifest pointing at a staged file that is gone.
 
 ### Crash purge of orphaned artifacts
 
-A clean (or panicking) run runs its `cleanup`. But a `SIGKILL`, the Linux
-OOM-killer, or a power loss kills the process before any cleanup runs, leaking
-its staged artifacts under the staging root. To stop that from accumulating
-across crashes, **every run performs an idempotent crash purge at startup**,
-before it stages anything. It reaps four orphan shapes left under the staging root:
-
-- a `*.partial` — an interrupted copy. Reaped **only when its owning run is
-  dead** (see below), so a concurrent sibling's in-flight copy is never reaped;
-- a `*.staged` with no matching manifest — a copy that crashed before it could
-  commit its manifest;
-- a `*.manifest.json` with no matching staged file;
-- a `*.lock` whose source has no surviving cache entry — a coordination lock left
-  by a source that is no longer staged (not necessarily from a crash), reclaimed
-  under the liveness and age gates described below.
-
-A clean pair (a `.staged` with its committed `.manifest.json`) is the reuse
-cache and is **kept** — the purge never removes a complete, trustworthy copy —
-and the source's `.lock` is kept alongside it so a later reuse run has a lock to
-take.
-
-A `.lock` whose source has **no surviving cache entry** (no `.staged` and no
-`.manifest.json`) is itself reclaimed by the purge, under the same liveness gate
-as a partial: it is removed only when it is acquirable under a try-lock (no live
-run holds it) *and* has aged past the creation grace window (so a sibling
-mid-acquire is not raced), and the removal is performed while the purge holds the
-lock exclusively. A held lock, a lock still guarding a cached copy, and a
-freshly created lock are all kept. This bounds what would otherwise be unbounded
-growth of one zero-byte lock file per distinct source ever staged — relevant for
-a long-lived persistent cache (`on_existing = reuse`, `cleanup = never`) — while
-never removing a coordination point a live or cached source still needs.
-
-Because several invocations can share one staging volume, the purge must not
-reap a live sibling's in-flight `.partial`. It tells a crash corpse from a live
-copy the same way the spill-directory purge does: a `.partial` is reaped only
-when the source's `.lock` is **acquirable** under a try-lock (no live process
-holds it, so the owner is gone) *and* the partial has aged past a short
-creation grace window (so a copy that has just started but not yet taken the
-lock is left alone). A partial whose lock is still held, or one too young to
-have been locked yet, is kept. This asks the operating system "is anyone still
-staging this?" rather than guessing, so a concurrent purge can never delete a
-running sibling's work.
+A `SIGKILL`, the Linux OOM-killer, or a power loss can kill a run before its
+`cleanup` runs, leaving half-finished staging artifacts behind. To stop those
+from accumulating, every run cleans up leftover artifacts from dead runs at
+startup, before it stages anything. A complete staged copy is the reuse cache
+and is always kept; only incomplete leftovers are reclaimed.
 
 ### File permissions
 
 Staged copies hold verbatim source records — potentially PII, credentials, or
-financial data — and on a shared staging volume they must not be readable by
-other users. On Unix each staged file and its manifest are created with mode
-`0o600` (owner-only). On Windows there is no portable mode bit; staged files
-inherit the staging directory's ACL, so restrict the directory's ACL if the
-volume is shared.
+financial data — so on Unix they are created with owner-only permissions. On
+Windows staged files inherit the staging directory's permissions, so restrict
+the directory if the volume is shared with other users.
 
 ### Crash durability and the parent-directory fsync
 
-The atomic-rename guarantee only holds across a crash if the rename is durable.
-On POSIX filesystems (ext4, xfs) a rename's directory entry can still be in the
-page cache after `rename` returns, so Clinker `fsync`s the parent directory
-after the rename. Windows is intentionally exempt: the NTFS metadata journal
-already makes the rename crash-durable (the semantics `MOVEFILE_WRITE_THROUGH`
-requests), and Windows offers no directory-fsync equivalent.
+Staged copies survive a crash: a later run finds a complete file or nothing at
+all, never a half-written one.
 
 [`std::env::temp_dir`]: https://doc.rust-lang.org/std/env/fn.temp_dir.html
 [duckdb/duckdb#9401]: https://github.com/duckdb/duckdb/issues/9401

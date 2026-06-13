@@ -245,8 +245,10 @@ nodes:
 
 This computes per-store running averages and totals over the partition's history-up-to-and-including the current row.
 
-## Retraction interaction
+## Correlation-key error handling
 
-When a window sits downstream of a relaxed-CK aggregate whose dropped correlation-key fields overlap the window's `group_by`, the planner switches the window from streaming-emit to buffer-mode. The window operator stores per-partition raw row buffers until commit; on retraction, it reruns the configured `$window.*` evaluation over `partition − retracted_rows` and emits per-output deltas through the replay phase.
-
-All 13 window functions are covered uniformly by wholesale recompute. The [operator-by-operator retraction cost reference](../pipelines/correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator memory ceilings; `clinker run --explain` reports the live per-window detail.
+Window functions work correctly when a pipeline uses
+[correlation keys](../pipelines/correlation-keys.md) for group-atomic
+error handling: if records are retracted from an upstream group, the
+window recomputes the affected partitions so its output stays
+consistent. There is nothing to configure.

@@ -49,14 +49,12 @@ all equally valid. A section name is whatever string you put in the
 
 ## All sections are available everywhere in the body stream
 
-Before the first body record streams from a file, the reader runs a
-one-time **envelope pre-scan** that extracts *every* declared section —
-no matter where it physically sits in the file. A header at the top and
-a trailer at the bottom are both pulled out up front. The result: every
-body record sees every `$doc.<section>.<field>` value, from the first
-record to the last.
+Every declared section is available to *every* body record, no matter
+where the section physically sits in the file. A header at the top and a
+trailer at the bottom are both visible from the first record to the
+last, so every body record sees every `$doc.<section>.<field>` value.
 
-This means a trailer field is available *during* body streaming, not
+This means a trailer field is available *during* body processing, not
 just at end-of-file. A pipeline can compute, on every row, a ratio
 against the trailer's total:
 
@@ -65,19 +63,8 @@ project:
   - running_fraction: row_index / $doc.Summary.record_count
 ```
 
-The pre-scan reads the envelope-bearing segments of the file before
-body streaming begins. Envelope payloads are small (a few hundred bytes
-per document is typical), but reaching a trailing section requires the
-reader to have buffered the file — so envelope-aware sources hold the
-source file's bytes in memory for the lifetime of the read. Body
-records still stream one at a time; only the envelope sections (not the
-body) live in the document context.
-
-`$doc.*` is **not** the file in memory. It holds the parsed envelope
-sections only — body records flow through the pipeline one at a time,
-and the only stages that buffer multiple records are the usual blocking
-operators (Aggregate, Sort, grace-hash Combine) under the standard RSS
-budget.
+Only the envelope sections live in the document context — body records
+still flow through the pipeline one at a time.
 
 ## Extract rules per format
 
@@ -113,11 +100,10 @@ envelope:
         e05: string          # interchange control reference
 ```
 
-Only the `UNB` header is extractable. EDIFACT is scanned as a flat byte
-stream with only the header pre-read, so trailer segments (`UNT`, `UNZ`)
+Only the `UNB` header is extractable. Trailer segments (`UNT`, `UNZ`)
 that arrive after the body are **not** envelope sections — their control
-counts are validated inline by the reader instead. A `segment` extract
-naming any tag other than `UNB` is rejected at startup. See
+counts are validated by the reader instead. A `segment` extract naming
+any tag other than `UNB` is rejected at startup. See
 [EDIFACT Format](../formats/edifact.md) for the full reference.
 
 A JSON example:
@@ -190,19 +176,10 @@ gets a fresh document context with its own section values. Records from
 different files never share a context — a record's `$doc.*` always
 reflects the file that record came from.
 
-Document boundaries flow through the pipeline as inline punctuation
-signals (one when a document opens, one when it closes). These signals
-let document-scoped operators fire at exactly the right point. Today the
-signals propagate through Source, Transform, Route, and Sort, and are
-reconciled at the multi-input operators — Merge and Combine. A document
-opens downstream once (on first sighting) and closes downstream once —
-after **every input that opened the document has closed it** (its
-per-document close-count reaches its open-count). A document carried by
-one input closes after that input's single close; a document that
-genuinely spans several inputs closes only after the last of them, and
-emits one downstream close either way. So a downstream document-scoped
-operator fires exactly once regardless of how many inputs the document
-spanned.
+Document boundaries flow through the pipeline so that document-scoped
+operators fire at exactly the right point. A document-scoped operator
+fires exactly once per document, even when that document arrives across
+several inputs that a Merge or Combine brings together.
 
 ### Per-document aggregation
 
@@ -218,17 +195,11 @@ others have already been emitted and freed, or have not yet started).
 This applies only when a document boundary actually reaches the
 Aggregate. A plain single-file source is one document, so it still emits
 one aggregate. A `Merge` that combines several distinct single-document
-sources now forwards **each** source document's close (each document has
-open-count == close-count == 1 on its single branch), so those sources
-flush **independently** downstream — one roll-up per source document,
-exactly as feeding each source to its own Aggregate would. This holds for
-**every** `Merge` mode: `mode: concat`, `mode: interleave` over
-non-Source inputs, `mode: interleave` with an explicit `interleave_seed`,
-and the fused all-Source `mode: interleave` fast path with no seed. The
-roll-up split holds **regardless of whether the Aggregate's upstream
-streams or materializes** its output — both paths flush per document.
+sources flushes those sources **independently** downstream — one roll-up
+per source document, exactly as feeding each source to its own Aggregate
+would. This holds for every `Merge` mode.
 
-A `Combine` (join) carries reconciled boundaries on every strategy, so a
+A `Combine` (join) preserves document boundaries on every strategy, so a
 per-document Aggregate downstream of a join also rolls up per driver
 document.
 
@@ -304,10 +275,9 @@ reference.
 
 Boundaries nest correctly through the pipeline: each level opens before
 the records inside it and closes after them, in strict innermost-first
-order. A level that fans in through several branches is still reconciled
-once at a multi-input operator (Merge or Combine) — it opens downstream on
-first sighting and closes downstream once every input that opened it has
-closed it — exactly like a single-level document.
+order. A level that arrives across several branches is still handled
+once where a Merge or Combine brings those branches together — exactly
+like a single-level document.
 
 ## Header-only interchanges
 

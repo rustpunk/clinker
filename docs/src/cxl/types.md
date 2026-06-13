@@ -165,12 +165,8 @@ $ cxl eval -e 'emit result = null + 5'
 
 ## Type unification rules
 
-The type checker follows these rules when two types meet in an expression:
+When two types meet in an expression, CXL coerces them automatically:
 
-1. Same types unify to themselves: `Int + Int` produces `Int`
-2. `Any` unifies with anything: `Any + T` produces `T`
-3. `Numeric` resolves to the concrete type: `Numeric + Int` produces `Int`, `Numeric + Float` produces `Float`
-4. `Int` promotes to `Float`: `Int + Float` produces `Float`
-5. `Null` wraps: `Null + T` produces `Nullable(T)`
-6. `Nullable` propagates: `Nullable(A) + B` produces `Nullable(unified(A, B))`
-7. Incompatible types fail: `String + Int` is a type error
+- Numbers combine: mixing an integer and a float gives a float (`2 + 3.5` is `5.5`).
+- Anything combined with `null` is `null`.
+- Mismatched types are an error: `String + Int` fails. Convert first with `.to_int()` or `.to_string()` so both sides are the same type.

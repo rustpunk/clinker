@@ -127,7 +127,3 @@ nodes:
       type: csv
       path: "./output/invoices_enriched.csv"
 ```
-
-## Current status
-
-> **Note:** Composition support is being built in Phase 16c. The YAML shape parses and validates, but compilation currently returns a diagnostic (E100) per composition node. The documentation above reflects the intended design. Full compilation and expansion will land when Phase 16c is complete.

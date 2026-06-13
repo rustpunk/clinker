@@ -73,26 +73,17 @@ parse time.
 
 ### `$source.count` semantics
 
-`$source.count` is the **finalized per-source record total** for the
-Source that produced the current record. It is observable only after
-that Source's input stream closes:
+`$source.count` is the per-source record total for the Source that produced the
+current record. The total isn't known until the source finishes, so you can't
+use it during per-record evaluation: a read on a mid-stream record (in a
+Transform, Route, Window, or Merge) resolves to `Null`, while reads after the
+source has finished (such as a terminal aggregate emit) resolve to the per-source
+total.
 
-- **Mid-stream reads** (records emitted before the Source's input
-  closes — typical of Transform / Route / Window / Merge per-record
-  evaluation) resolve to `Null`. The final count cannot be known
-  before every record has been observed; the engine does not
-  speculate or block.
-- **Post-close reads** (terminal aggregate emits, commit-time
-  deferred dispatch, post-recompute paths, any record emitted after
-  the originating Source's `mpsc::Receiver` returned `None`) resolve
-  to the per-source total.
-
-Pipelines that previously used `$source.count` as a streaming
-denominator (e.g. `value / $source.count`) will now see `Null` from
-that division on mid-stream records. If you need a streaming row
-counter, declare a `scope: source` variable on a Transform and increment
-it from that Transform's CXL — that gives you a running count instead of
-waiting for the final.
+This means a streaming denominator like `value / $source.count` yields
+`Null` on mid-stream records. If you need a running row counter, declare
+a `scope: source` variable on a Transform and increment it from that
+Transform's CXL instead.
 
 ## Reading variables
 
@@ -152,9 +143,8 @@ the dependency between writers and readers visible at plan time.
 
 ## Init phase: pre-runtime population
 
-A Transform may set `phase: init` to run **to completion** before any
-runtime-phase node sees a record — useful for populating a `$pipeline.*`
-or `$source.*` value from a config source:
+Set `phase: init` on a Transform to pre-compute a `$pipeline.*` or
+`$source.*` value from a config-file source before the main run starts:
 
 ```yaml
 - type: source
@@ -189,14 +179,14 @@ or `$source.*` value from a config source:
 Init-phase nodes **must be terminal** — no runtime-phase node may
 consume from an init-phase Transform. (Init-phase nodes can chain
 through init-only descendants for compositions.) Use disjoint Sources
-for init vs runtime when you need both, since a Source shared between
-an init and a runtime branch only feeds the init pass.
+for init vs runtime when you need both: a Source shared between an init
+and a runtime branch only feeds the init pass.
 
 ## Compile-time validation
 
-Scoped variables earn their architectural payoff at plan time.
-Every reference and every writer is checked against a static
-registry, and every cross-DAG flow is verified against the topology.
+Scoped variables are checked before the run starts. Every reference and
+every writer is validated, and every flow from a writer to its readers is
+checked against the pipeline. Each code below tells you what to fix.
 
 | Code | What it catches                                                        |
 | ---- | ---------------------------------------------------------------------- |
@@ -213,14 +203,13 @@ registry, and every cross-DAG flow is verified against the topology.
 | E200 | A reference to an undeclared scoped variable (resolver-level failure). |
 
 Cross-Transform duplicate `declares:` (the same `(scope, name)` declared
-on two Transforms) is rejected at config-validation time, ahead of
-compilation. `$pipeline`, `$source`, and `$record` are flat shared
-namespaces; declare each name once and reference it from every consumer.
+on two Transforms) is rejected before the run starts. `$pipeline`,
+`$source`, and `$record` are flat shared namespaces; declare each name
+once and reference it from every consumer.
 
-Each diagnostic carries the offending span plus secondary spans
-pointing at the conflicting writer or the parent declaration, so
-the report shows up where the user is reading or writing — not in
-some unrelated configuration block.
+Each diagnostic points at the exact place you read or wrote the variable,
+plus the conflicting writer or parent declaration, so the report lands
+where you can act on it rather than in some unrelated configuration block.
 
 ## Post-merge access: qualified `$source.<input>.<key>`
 

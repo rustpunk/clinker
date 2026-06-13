@@ -53,14 +53,7 @@ $ cxl eval -e 'emit name = $pipeline.name'
 
 ## Compile-time type checking
 
-CXL catches type errors before data processing begins. The compilation pipeline runs four phases:
-
-1. **Parse** -- tokenize and build an AST from CXL source text
-2. **Resolve** -- bind field references, validate method names, check arity
-3. **Typecheck** -- infer types, validate operator compatibility, check method receiver types
-4. **Eval** -- execute the typed program against each record
-
-Errors at any phase produce rich diagnostics with source locations and fix suggestions via `miette`.
+CXL is statically type-checked, so type errors are caught before any data is processed. Run `cxl check` to validate a transform before a run. Errors come with source locations and fix suggestions.
 
 ```bash
 $ cxl check transform.cxl

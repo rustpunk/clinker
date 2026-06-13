@@ -212,11 +212,11 @@ With `drive: products`, the pipeline emits one row per product enriched with a m
 | `auto` (default) | Planner picks a strategy from the predicate shape. Hash join for equi predicates; IEJoin for pure-range predicates. |
 | `grace_hash` | Force grace hash join (disk-spilling partitioned hash). Applies only to pure-equi predicates; ignored on predicates with range conjuncts. |
 
-`grace_hash` is the right hint when build-side inputs are larger than the memory budget but fit on disk after partitioning. The planner falls back automatically to grace-hash spill when an in-memory hash table approaches the RSS soft limit, so `strategy: grace_hash` is mostly an explicit assertion for performance reasoning.
+You rarely need to set this — `auto` already spills a large join to disk when it would otherwise exceed the memory budget. Use `grace_hash` as an explicit assertion when you know the build side is larger than memory but fits on disk after partitioning.
 
 ## Correlation-key propagation
 
-Combine declares which correlation-key columns its output rows carry via the required `propagate_ck` field. The choice shapes both the combine's compile-time output schema and the runtime record builder.
+Combine declares which correlation-key columns its output rows carry via the required `propagate_ck` field.
 
 ```yaml
 - type: combine
@@ -241,21 +241,21 @@ Combine declares which correlation-key columns its output rows carry via the req
       named: [order_id]         # explicit subset (intersected with upstream)
 ```
 
-- `driver` -- output schema carries only the driver input's `$ck.<field>` columns. Build-side records contribute body fields; their CK identity is consumed by the match.
-- `all` -- output schema carries every input's `$ck.<field>` columns; the runtime copies build-side values onto each output row alongside the body's `emit` columns. Use when the build side carries CK fields downstream operators need to read.
-- `named: [<field>, ...]` -- explicit subset, intersected with what's actually present upstream. Use to project a multi-field CK down to a single field after a join.
+- `driver` -- output carries only the driver input's correlation-key columns. Build-side records contribute body fields, but their group identity is consumed by the match.
+- `all` -- output carries every input's correlation-key columns. Use when the build side carries keys that downstream operators need to read.
+- `named: [<field>, ...]` -- an explicit subset. Use to project a multi-field key down to a single field after a join.
 
-Driver wins on a name collision: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value. See the [Correlation-key combine interaction](../pipelines/correlation-keys.md#combine-interaction) reference for match-mode interaction details (especially `match: collect`, where the propagated slot is single-valued and the array column preserves full lineage).
+Driver wins on a name collision: if both the driver and a build input declare the same key field, the output keeps the driver's value. See the [Correlation-key combine interaction](../pipelines/correlation-keys.md#combine-interaction) reference for how each `match` mode fills the propagated key (especially `match: collect`).
 
 `propagate_ck` is required on every combine; pipelines without an explicit value fail to compile. Existing pipelines migrate by adding `propagate_ck: driver`, which is bit-for-bit equivalent to today's behavior.
 
 ## Memory considerations
 
-Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly 1.5-2x the raw CSV size in heap. A 50 MB product catalog typically uses 75-100 MB of hash-table memory. Tune with `pipeline.memory.limit` at the pipeline level; see [Memory Tuning](../ops/memory.md) for spill thresholds, the backpressure knob, and strategy overrides.
+Each non-driving (build-side) input is held in memory while the join runs, so plan for roughly 1.5–2× its file size — a 50 MB lookup table needs about 75–100 MB. If a build side is larger than the memory budget, the join spills to disk automatically rather than failing. Set the budget with `pipeline.memory.limit`; see [Memory Tuning](../ops/memory.md).
 
 ## Document boundaries
 
-A Combine forwards reconciled document boundaries to its output on **every** strategy -- the inline hash build-probe, IEJoin, grace-hash, sort-merge, and the streaming-probe path. So a per-document `Aggregate` downstream of a join flushes per document: a driver source that carries several documents (a `glob:` over monthly files, say) produces one roll-up per driver document after the join, not one fold spanning all of them. A document that spans both join inputs (the same document carried on the driver and the build side) opens and closes exactly once downstream -- the boundary is reconciled, never double-fired. See [Document Context & Envelopes](../pipelines/envelope-and-doc-context.md) for the per-document aggregation model.
+A Combine passes document boundaries through to its output, so a per-document `Aggregate` after a join still rolls up per document. A driver source that carries several documents (a `glob:` over monthly files, say) produces one roll-up per driver document after the join, not one fold spanning all of them. A document carried on both the driver and the build side opens and closes exactly once downstream. See [Document Context & Envelopes](../pipelines/envelope-and-doc-context.md) for the per-document aggregation model.
 
 ## Complete example
 

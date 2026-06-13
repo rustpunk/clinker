@@ -37,10 +37,9 @@ Key information shown:
 - **Node type** -- Source, Transform, Aggregate, Route, Merge, Output, Composition
 - **Parallelism strategy** -- how the optimizer plans to execute the node
 - **Connections** -- downstream nodes, with port labels for route branches
-- **Buffer class** (Physical Properties section) -- `buffer: streaming` for nodes whose output is handed straight to a single downstream consumer rather than crossing a charged inter-stage buffer (fused Source → Transform → Output chains, Merge.interleave of Sources, single-branch Route, non-fused Merge, `streaming`-strategy Aggregate, hash-build-probe Combine probe-side, and every sink Output); `buffer: materialized` for nodes whose output sits in an inter-stage buffer between dispatch arms. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for which streaming stages bound their footprint to one batch and which only spare the second copy
-- **Arbitration parameters** (Physical Properties section, plus a `=== Buffer Edges ===` block) -- each node's `arbitration: spill_priority=.., can_back_pressure=..` line shows which operator the memory arbitrator would spill or pause first. See [Reading `--explain` arbitration output](memory.md#reading---explain-arbitration-output) for the full annotation model and a worked example.
+- **Buffer class** (Physical Properties section) -- `buffer: streaming` for a node that hands its output straight to a single downstream consumer, or `buffer: materialized` for one that holds a whole stage's output in an inter-stage buffer. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the distinction.
 
-The buffer class is a pre-runtime signal for memory pressure: every `materialized` node charges its in-flight rows against `pipeline.memory.limit` and may spill to disk once the soft threshold trips. A `streaming` node's output crosses no charged inter-stage buffer, so it is never charged twice and never spill-eligible (though a non-fused streaming stage still builds its own result before handing it off — see [Streaming vs. Blocking Stages](streaming-vs-blocking.md)). Use the annotation alongside `--memory-limit` / `pipeline.memory.limit` to predict which stages dominate the RSS budget before running the pipeline.
+The buffer class is a pre-runtime signal for memory pressure: a `materialized` node holds its rows against `pipeline.memory.limit` and may spill to disk once the budget is tight, while a `streaming` node holds only a small in-flight slice. Use the annotation alongside `--memory-limit` / `pipeline.memory.limit` to predict which stages will dominate memory before running the pipeline.
 
 ## JSON format
 
@@ -104,32 +103,18 @@ clinker run pipeline.yaml --dry-run       # validate config
 
 ## Retraction section
 
-Pipelines whose at least one Aggregate has a `group_by` that omits a correlation-key field get a `=== Retraction ===` block in the text output. The engine selects the retraction-mode path automatically based on `group_by` content; the block is silent on every other pipeline, so strict-correlation and non-correlated `--explain` output stays identical to today's text.
+If at least one Aggregate has a `group_by` that omits a correlation-key field, the output includes a `=== Retraction ===` block. It lists which aggregates and windows use group-atomic retraction (see [Correlation Keys](../pipelines/correlation-keys.md)) and a rough per-row memory estimate for each, so you can gauge the memory cost before a production run. The block is absent on pipelines that don't use this mode.
 
-The block opens with a one-line summary -- `retraction enabled — N relaxed aggregates, M buffer-mode windows, fanout policy: <policy>.` -- followed by one block per retraction-mode Aggregate and one per buffer-mode window index.
-
-Per retraction-mode Aggregate the block reports:
-
-- the resolved accumulator path (`Reversible` or `BufferRequired`),
-- the per-row lineage memory cost (`~8 bytes/row` for Reversible, `n/a` for BufferRequired which holds raw contributions instead),
-- the worst-case degrade fallback when retraction's preconditions break at runtime.
-
-Per buffer-mode window index the block reports:
-
-- the source name and `partition_by` fields,
-- the per-row buffer cost in `Value` slots over the index's arena fields,
-- the worst-case partition memory ceiling under degrade.
-
-Group cardinality is honestly surfaced as "unknown at plan time" -- the planner has no group-cardinality side-table to consult before the run. Use the [operator-by-operator retraction cost reference](../pipelines/correlation-keys.md#operator-by-operator-retraction-cost-reference) and the per-row figures the explain block prints for capacity planning, then confirm the live shape via `clinker metrics collect` after the first production run.
+Exact group sizes are unknown until the pipeline runs, so treat the estimates as a planning aid and confirm the live shape with `clinker metrics collect` after the first run.
 
 ## Statistics
 
-When the plan carries any column statistics, the explain output ends with a `=== Statistics ===` section listing the planner-wide statistics catalog. Every figure is tagged with its provenance so you can tell a metadata-derived estimate from a record-exact measurement:
+When the plan carries column statistics, the output ends with a `=== Statistics ===` section. Each figure is tagged with where it came from:
 
-- **Row counts** -- one line per source node, e.g. `orders: ≈90 rows [file metadata] (informs combine build/probe + partition bits)`. A `[file metadata]` figure is derived at plan time by dividing the input file's on-disk byte length by an average-record-bytes constant, before any record is read. This is the same row count that drives a combine's build-side selection and its grace-hash partition-bit choice -- a build side large enough to risk overrunning the memory limit is what tips a pure-equality combine from the in-memory hash strategy to the disk-spilling grace-hash strategy. A `[exec sketch]` figure is the exact count a source measured during a run, superseding the estimate.
-- **Column sketches** -- distinct counts, heavy hitters, and membership filters that operators populate while records flow. All three are maintained by the grace-hash combine over its build-side join keys and recorded under the build input's `(node, column)`: a distinct-count estimate (`product_id: 12,431 distinct [exec sketch]`), a top-k heavy-hitter list with lower-bound counts (`product_id: heavy hitters [exec sketch, lower bound]: widget=9,000, gadget=3,200, ...`), and a membership filter sized up front from the build node's plan-time row-count estimate (`product_id: membership filter, 119048 bits / 7 probes [exec sketch, sized from estimate]`) -- built in the single build pass with no per-row buffer, and skipped entirely when no plan-time estimate is available. The heavy-hitter list is a lower bound on frequency: a value absent from it may still be frequent, so it is only ever used to promote a key, never to exclude one.
+- **Row counts** — an estimate per source. A `[file metadata]` figure is estimated from the input file's size before any record is read; a `[exec sketch]` figure is an exact count measured during an actual run. These row counts are what the optimizer uses to pick a Combine's [join strategy](../nodes/combine.md#strategy-hint).
+- **Column sketches** — distinct-value counts and frequent-value hints that a Combine gathers over its join keys while records flow, used to speed up matching.
 
-Row counts also appear inline on each combine's driving and build inputs (`est. 90 [file metadata] rows`). A statistic that was never gathered renders honestly as `null` rather than a fabricated zero -- a plan over sources whose sizes cannot be read (a `glob`/`regex` multi-file source, a network source, or a missing/unreadable file) adds no Statistics section at all. As with group cardinality above, confirm the live shape via `clinker metrics collect` after the first production run.
+A statistic that was never gathered renders as `null` rather than a fabricated zero — for example, a multi-file `glob` source or a network source whose size cannot be read adds no Statistics section at all.
 
 ## Looking up diagnostic codes
 

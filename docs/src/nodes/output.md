@@ -34,7 +34,7 @@ When `false`, only fields named by an `emit` statement in the upstream transform
 
 The default flipped from `false` to `true` in a recent release (see [issue #90](https://github.com/rustpunk/clinker/issues/90)). Pipelines that relied on the previous behavior -- where output records contained only the fields explicitly emitted upstream -- must now set `include_unmapped: false` explicitly to restore that shape.
 
-The flag composes independently with `include_correlation_keys: true` -- see below. See [Auto-Widen & Schema Drift -> Output controls](../formats/auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
+The flag composes independently with `include_correlation_keys: true` -- see below. See [Auto-Widen & Schema Drift -> Output controls](../formats/auto-widen.md#output-controls) for the full specification and cross-format flow examples.
 
 #### Worked example
 
@@ -57,17 +57,13 @@ With `include_unmapped: true` (the default), each output record carries `order_i
     include_correlation_keys: true    # Default: false
 ```
 
-When the pipeline declares `error_handling.correlation_key: <field>`, the engine adds shadow columns named `$ck.<field>` to the schema. These shadow columns preserve correlation-group identity through transforms that may rewrite the user-declared field. They are an internal engine namespace and are stripped from output by default.
+When a source declares a `correlation_key:`, the engine tracks correlation-group identity on hidden columns that are stripped from output by default. Set `include_correlation_keys: true` to surface them in the writer output — typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](../pipelines/correlation-keys.md).
 
-Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](../pipelines/correlation-keys.md) for the full lifecycle.
+`include_correlation_keys` does **not** surface auto-widened columns -- `include_unmapped` is the separate flag for that. The two are independent: each, both, or neither can be set.
 
-`include_correlation_keys` does **not** surface the `$widened` sidecar -- `include_unmapped` is the separate flag for that. The two are independent: each, both, or neither can be set.
+### Nested columns and non-JSON writers
 
-### Writer rejection of `Value::Map` payloads
-
-CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
-
-The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](../formats/auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
+The CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers can only write flat scalar columns; a nested value reaching one of them fails with an `UnserializableMapValue` error. JSON writes nested values natively. The usual cause is an auto-widened column reaching a non-JSON writer with `include_unmapped: false` — see [Auto-Widen & Schema Drift](../formats/auto-widen.md#writer-errors-on-unexpanded-columns) for the fix.
 
 ### Field mapping
 
@@ -294,13 +290,9 @@ At least one of `max_records` or `max_bytes` should be specified for splitting t
 
 When `group_key` is set, the split point is the first group boundary after the threshold is reached (greedy). Without `group_key`, files are split at the exact limit.
 
-## Streaming writes under fused `Merge.interleave`
+## Streaming writes after an interleave Merge
 
-When a single Output sits directly downstream of a `Merge` whose mode is `interleave` and whose every direct predecessor is a `Source`, the executor takes a streaming path: a bounded `tokio::sync::mpsc::channel` connects the Merge arm to the writer task, and `Writer::write_record` fires per record as Merge emits, concurrent with Merge production.
-
-The buffered alternative — which still runs for every other Output topology — waits until the Merge arm has accumulated every record before invoking the writer. With a slow upstream Source that defeats the live back-pressure the `Merge.interleave` fusion provides at the Source-channel layer: each record sits in `node_buffers[merge]` until the slow Source finishes.
-
-### Topology
+When a single Output sits directly after a `Merge` with `mode: interleave` whose inputs are all Sources, records are written to disk as they arrive rather than being buffered until the merge finishes. This keeps memory flat and lets a slow writer naturally pace the upstream readers.
 
 ```yaml
 - type: source
@@ -323,36 +315,7 @@ The buffered alternative — which still runs for every other Output topology �
     path: out.csv
 ```
 
-The streaming path is selected automatically — there is no opt-in setting. Pipelines that don't match the topology keep the buffered path.
-
-### Eligibility
-
-Every condition must hold for the streaming path to engage; if any fails, the buffered path runs:
-
-- The Output has exactly one incoming edge, and that predecessor is a `Merge` with `mode: interleave`.
-- Every direct predecessor of that Merge is a `Source` (same predicate the fused `Merge.interleave` arm uses for its live `tokio::select!`).
-- The Merge has no other downstream consumer besides this one Output (no fan-out).
-- The Output is not in the init-phase ancestor closure.
-- The OutputConfig has no `split:` block — splitting writers manage their own file rotation lifecycle.
-- The writer is registered in the single-file writer registry (not `fan_out_per_source_file`).
-- No `Source` in the pipeline declares a correlation key — the correlation-buffered output path defers writes to `CorrelationCommit` and is incompatible with per-record write.
-
-### Back-pressure flow
-
-Under the streaming path, back-pressure flows end-to-end:
-
-```
-writer slow → mpsc::Sender::send().await yields
-             → Merge arm yields
-             → Source mpsc::Receiver fills
-             → Source ingest task blocks on send
-```
-
-The bounded handoff channel between Merge and Output (256 slots) and the existing per-Source ingest channels (issue #67) form a single pace-bound chain from the underlying `Write` sink back to the source reader. A slow file system, a saturated network sink, or a deliberately-paced writer no longer accumulates records in pipeline-internal `Vec`s; the upstream readers slow down to match.
-
-### Counter semantics
-
-Counter behavior under the streaming path matches the buffered Output arm exactly: `records_written` increments once per `Writer::write_record` call, `ok_count` counts distinct source `row_num`s reaching the Output, and `dlq_count` is unaffected (DLQ entries originate upstream). Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses; the dispatcher folds the streaming task's per-task accounting back into the run-wide totals at end of DAG.
+This is automatic — there is no setting to enable it. It applies only to this exact shape: one interleave Merge of Sources feeding one non-splitting Output, in a pipeline without correlation keys. Any other topology buffers as usual, with identical output either way.
 
 ## Complete example
 

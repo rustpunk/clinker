@@ -112,4 +112,4 @@ Like the `$ck.*` correlation columns, these `$meta.*` columns stay out of the de
 
 ## Memory model
 
-The whole input materializes in memory before any output row is emitted: Reshape groups every record, then runs each group's rules. There is no group-size cap and no disk spill yet — bounded-memory governance (spill, group caps, and hysteresis around the spill thresholds) is tracked as follow-on work.
+Reshape buffers each whole correlation group in memory before emitting any output row, because a rule cannot decide what to synthesize until it has seen the entire group. Plan memory for your largest group.

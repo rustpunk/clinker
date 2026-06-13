@@ -140,7 +140,7 @@ Within the body, `let`, `emit`, `trace`, and nested `emit each` / `emit each ...
 
 ## Safety cap: `max_expansion`
 
-To bound fan-out, every transform body carries a `max_expansion` cap on the cumulative records `emit each` may produce from a single original input record. The cap is **cumulative across all nesting levels**: every leaf record a nested fan-out produces charges against one shared budget, so nesting cannot multiply past the cap undetected. If the cap is exceeded, the originating record routes to the DLQ with category `expansion_limit_exceeded` instead of producing a truncated or unbounded result. The default cap is 10000.
+By default, `emit each` can fan one input record into at most 10,000 output records. This limit is counted cumulatively across all nesting levels, so nested fan-out cannot multiply past it. A record that exceeds the limit routes to the DLQ with category `expansion_limit_exceeded` instead of producing an unbounded result. Override the limit with the `max_expansion` field in the transform config.
 
 See [Transform Nodes -> Expansion Cap](../nodes/transform.md#expansion-cap-max_expansion) for the YAML field and tuning guidance.
 

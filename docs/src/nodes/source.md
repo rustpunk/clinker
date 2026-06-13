@@ -52,12 +52,10 @@ schema:
 ### `long_unique` — storage hint for high-cardinality text
 
 A string column may carry an optional `long_unique: true` flag. It is an
-**advisory, opt-in storage hint**, not a type change: it tells the engine the
-column's values are *long and effectively unique* — never repeated across
-records — so it stores them in a leaner, header-free representation that drops
-the per-value bookkeeping the default representation keeps for values that
-might be shared. Typical candidates are UUIDs rendered as text, street
-addresses, and free-text comment or note fields.
+**advisory, opt-in hint**, not a type change: it tells Clinker the column's
+values are *long and effectively unique* — never repeated across records — so
+the run uses less memory for that column. Typical candidates are UUIDs
+rendered as text, street addresses, and free-text comment or note fields.
 
 ```yaml
 schema:
@@ -66,14 +64,12 @@ schema:
   - { name: department, type: string }                      # low-cardinality, default
 ```
 
-The flag changes only the in-memory footprint of the annotated column. The
-value's content, its comparison/grouping/join/sort behavior, and the on-disk
-encoding when a run spills to disk are all unchanged — a `long_unique` value
-compares and groups identically to the same text in any other column. Omitting
-the flag (the common case) leaves the default behavior untouched. Set it only
-when you know a column is genuinely high-cardinality free text; on a column
-whose values repeat, the default representation is the better choice because it
-shares repeated values instead of storing each copy independently.
+The flag lowers memory use only. A value's content and its
+comparison, grouping, join, sort, and output behavior are all unchanged — a
+`long_unique` value behaves identically to the same text in any other column.
+Omitting the flag (the common case) leaves the default behavior untouched. Set
+it only when you know a column is genuinely high-cardinality free text; on a
+column whose values repeat, leave it off.
 
 ## Transport vs format
 
@@ -135,9 +131,9 @@ The per-source `on_unmapped` policy decides what to do with input fields the sou
 ```
 
 See [Auto-Widen & Schema Drift](../formats/auto-widen.md) for the full
-specification: the `$widened` sidecar absorber design, propagation
-rules per downstream node type, the `include_unmapped` Output flag,
-**E315** merge-policy mismatch, and fixed-width inertness.
+specification: how undeclared columns flow through each downstream node
+type, the `include_unmapped` Output flag, **E315** merge-policy
+mismatch, and fixed-width behavior.
 
 ## Sort order
 
@@ -173,10 +169,11 @@ The shorthand form is also accepted -- a bare string defaults to ascending:
 
 An event-time watermark declares which column on the source carries
 each record's *event time* — the wall-clock instant the event
-happened, distinct from when Clinker read the row. When set, the
-engine reads the column on every record, subtracts the source's
-`delay`, and folds the result into a per-source monotonic watermark.
-The delay-corrected value is also stamped on every record as
+happened, distinct from when Clinker read the row. When set, Clinker
+takes the column on every record, subtracts the source's `delay`, and
+uses the result to track event-time progress so downstream time
+windows know when to close. The delay-corrected value is also stamped
+on every record as
 [`$source.event_time`](../cxl/system-variables.md), the column a
 downstream [time-windowed aggregate](aggregate.md#time-windowed-aggregates)
 uses to assign records to windows.
@@ -217,12 +214,10 @@ Fields:
   Without `delay`, the watermark advances strictly to the observed
   max — a single late record routes to the DLQ.
 
-- `idle_timeout` (optional duration, default unset) — if a live
-  source's receiver stays quiet longer than this, its partitions
-  flip to idle and stop holding back `min_across_sources`. Lets
-  downstream windows keep closing when one source pauses. `None`
-  means never go idle, preserving the prior behaviour for pipelines
-  without a window-close consumer.
+- `idle_timeout` (optional duration, default unset) — if a source
+  stays quiet longer than this, it stops holding back downstream
+  window-close progress, so windows keep closing when one source
+  pauses. Unset means the source never goes idle.
 
 Durations use the suffixes `ms`, `s`, `m`, `h`, `d`. `ms` is
 matched before the single-character `s`, so `500ms` reads as 500
@@ -230,8 +225,8 @@ milliseconds, not 500 seconds with a stray `m`.
 
 A pipeline whose aggregate declares `time_window:` **must** have a
 `watermark.column` on every upstream-reachable source. Without it,
-`min_across_sources` over the source set stays at `None` and the
-window can never close — the planner rejects this with
+event-time progress can never advance and the window can never close —
+the planner rejects this with
 [**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
 
 ## Array paths

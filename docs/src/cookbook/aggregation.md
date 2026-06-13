@@ -248,10 +248,11 @@ Omit `group_by` to aggregate all records into a single output row:
 
 ## Time-windowed rollups
 
-When the grouping dimension is *event-time bucket*, declare a
+To group records into event-time buckets, declare a
 [`watermark:`](../nodes/source.md#watermarks) on every source
 and a [`time_window:`](../nodes/aggregate.md#time-windowed-aggregates)
-on the aggregate. Three patterns cover the common shapes; all three
+on the aggregate. Each window emits one rollup per group when it closes.
+Three patterns cover the common shapes; all three
 ship as runnable pipelines under `examples/pipelines/`.
 
 ### Tumbling: hourly click counts
@@ -312,9 +313,8 @@ Run:
 cargo run -p clinker -- run examples/pipelines/tumbling_clicks.yaml
 ```
 
-The source's watermark advances with each record's `event_ts`; each
-hour-aligned bucket emits one row per `user_id` as soon as the
-watermark crosses `bucket_end`. Records observed out-of-order land
+Each hour-aligned bucket emits one row per `user_id` once its time
+window has passed. Records that arrive out-of-order land
 in the DLQ as `late_record` — add `delay:` on the source or
 `allowed_lateness:` on the aggregate if the input has a known
 out-of-order tail.
@@ -466,12 +466,11 @@ Run:
 cargo run -p clinker -- run examples/pipelines/multi_source_session.yaml
 ```
 
-Each source declares its own `watermark.column` independently. The
-aggregate's close decision reads `min_across_sources` across both
-sources' partitions: a session can't emit until both `src_web` and
-`src_mobile` have advanced past `session_end + allowed_lateness`.
-Drop the `watermark:` block on either source and the planner
-rejects the pipeline with
+Each source declares its own `watermark.column` independently. A
+session can't emit until both `src_web` and `src_mobile` have caught
+up past `session_end + allowed_lateness`, so the rollup waits for the
+slower source before closing. Drop the `watermark:` block on either
+source and the pipeline is rejected at plan time with
 [**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
 
 ### When to pick each

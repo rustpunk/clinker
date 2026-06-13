@@ -1,12 +1,6 @@
 # Auto-Widen & Schema Drift
 
-When an input file carries columns the source's declared `schema:`
-block does not name, Clinker decides what to do with them via the
-per-source `on_unmapped` policy. The engine-wide default is
-`auto_widen` — schema drift is preserved end-to-end without
-user-visible breakage. This chapter is the single source of truth
-for the absorber design, propagation rules, output controls, and
-diagnostics.
+When an input file carries columns the source's declared `schema:` block does not name, Clinker decides what to do with them via the per-source `on_unmapped` policy. The default is `auto_widen`, which preserves the extra columns end-to-end so schema drift never silently breaks a pipeline. This page covers the three modes, how undeclared columns flow downstream, the output controls, and the related diagnostics.
 
 ## The three modes
 
@@ -24,61 +18,24 @@ diagnostics.
       - { name: amount, type: numeric }
 ```
 
-- **`auto_widen`** *(default)* — per-record undeclared fields are
-  absorbed into a `Value::Map` payload carried by an
-  engine-stamped `$widened` sidecar column appended to the
-  source's schema. The sidecar's payload propagates through
-  downstream nodes and the sink expands it back to top-level
-  columns whenever `include_unmapped: true` is set on the Output
-  node (the default). Pattern precedent: Databricks Auto Loader's
-  `_rescued_data` sidecar and ClickHouse's `JSON` column type.
+- **`auto_widen`** *(default)* — undeclared input fields are carried along with each record and re-expanded to top-level columns at the output (when the Output node's `include_unmapped` is left at its default of `true`). Nothing is lost, and you don't have to declare every column up front.
+- **`drop`** — undeclared input fields are silently stripped at read time. The source carries only its declared `schema:`.
+- **`reject`** — any record carrying a field not in the declared schema fails the source with a diagnostic naming the offending field. The strict choice when unexpected columns should be treated as errors.
 
-- **`drop`** — undeclared input fields are silently stripped at
-  read time. No sidecar; the source's plan-time schema equals the
-  declared `schema:`. Matches Snowflake's
-  `MATCH_BY_COLUMN_NAME='CASE_INSENSITIVE'` with
-  `ERROR_ON_COLUMN_COUNT_MISMATCH=FALSE` and dbt's
-  `on_schema_change=ignore`.
+CXL expressions can only read fields you declared in `schema:` — carried-along undeclared fields are not visible to CXL, only to the output. To use an undeclared field in an expression, add it to the source `schema:`.
 
-- **`reject`** — any input record carrying a key not in the
-  declared schema fails the source with a
-  `FormatError::UndeclaredField` diagnostic naming the offending
-  field. Strict; matches dlt's `freeze` mode.
+## How undeclared columns flow downstream
 
-## The `$widened` sidecar absorber
+Carried-along columns follow these rules through each node type:
 
-`auto_widen` is implemented as an *on-schema* sidecar: the
-engine appends a single column named `$widened` to the source's
-schema, marked with `FieldMetadata::WidenedSidecar`. Each record's
-undeclared input fields are stored as the sidecar's
-`Value::Map` payload — keyed by input field name, valued by the
-read scalar.
-
-The on-schema design is deliberate. An off-schema sidecar (a
-parallel data structure outside `Schema`) is a silent-loss bug
-class: any code path that reconstructs a `Record` from
-`schema.columns()` and a value vector silently drops the
-side-channel. The on-schema slot inherits the same
-serialization, span propagation, sort/spill, and projection
-machinery as user-declared columns — there is no "remember to
-copy the sidecar" obligation on every consumer. CXL expressions
-cannot read or write the sidecar (the typechecker is blind to
-its contents); see [System variables → `$widened`](../cxl/system-variables.md)
-for the parser-level rejection.
-
-## Propagation through the DAG
-
-The `$widened` sidecar follows these rules through downstream
-nodes:
-
-| Node type     | Sidecar behavior |
+| Node type     | Behavior |
 |---|---|
-| Transform     | Inherits unchanged from input (transforms are row-preserving). |
-| Aggregate     | Output's `$widened` slot is `Value::Null` — per-row payloads have no canonical aggregation. Users who need an unmapped field at aggregate output must add it to `group_by` or emit it explicitly via an aggregate function. |
-| Combine       | Driver's sidecar rides through; build-side sidecars are dropped (mirrors `propagate_ck: Driver`). Build-side `iter_user_fields()` filters every engine-stamped column from `match: collect` array payloads, so build `$widened` cannot leak into the collect array. Users can lift a build-side unmapped field via `<build_qualifier>.<field>` in the combine body's CXL. |
-| Route / Merge | Row-preserving — sidecar passes through. `Merge` requires every input source to share the same `on_unmapped` policy; mixing fails compile with **E315** (see below). |
-| Composition   | Body inherits the parent's sidecar via the synthetic input port; whatever the body's terminal node carries flows back to the parent. The body's terminal-node propagation rule applies (e.g. an Aggregate terminal yields `Value::Null` at the parent boundary, a `match: first` Combine terminal carries the driver's payload). |
-| Output        | Sidecar expands to top-level columns when `include_unmapped: true` (the default). Set `include_unmapped: false` to strip the sidecar (and every other unmapped input field) so only explicitly-emitted columns reach the writer. |
+| Transform     | Passed through unchanged (transforms are row-preserving). |
+| Aggregate     | Dropped — per-row extra columns have no meaning on a grouped row. To keep one, add it to `group_by` or emit it explicitly. |
+| Combine       | The driver's carried columns ride through; build-side ones are dropped. To keep a build-side field, emit it explicitly in the combine body via `<build_qualifier>.<field>`. |
+| Route / Merge | Passed through. `Merge` requires every input to share the same `on_unmapped` policy — mixing fails with **E315** (see below). |
+| Composition   | The body inherits the parent's carried columns and whatever the body's last node carries flows back out. |
+| Output        | Expanded to top-level columns when `include_unmapped: true` (the default); stripped when `false`. |
 
 ## Output controls
 
@@ -93,26 +50,13 @@ nodes:
     include_unmapped: true    # default: true
 ```
 
-When `true` (the default), fields the source absorbed into
-`$widened` are expanded back to top-level columns at the sink.
-Useful for pass-through pipelines where every original input
-field should reach the output regardless of whether it was
-declared in `schema:`. Set `include_unmapped: false` to strip
-the sidecar (and every other input field not explicitly emitted
-upstream) so the writer sees only user-declared columns.
+When `true` (the default), undeclared fields the source carried along are expanded back to top-level columns at the sink — useful for pass-through pipelines where every original column should reach the output. Set `include_unmapped: false` to write only the columns explicitly emitted upstream.
 
-`include_unmapped` composes independently with
-`include_correlation_keys: true` — each, both, or neither can be
-set. `include_correlation_keys` does **not** surface
-`$widened`; the two flags are orthogonal.
+`include_unmapped` is independent of `include_correlation_keys`: each can be set on its own, and `include_correlation_keys` never surfaces auto-widened columns.
 
 ### Cross-format flow
 
-The expansion happens at the projection layer, before the
-writer sees the record. So a CSV source with `auto_widen` plus
-a JSON output with `include_unmapped: true` produces JSON
-objects whose top-level keys include both declared columns and
-absorbed input columns:
+Expansion happens before the writer runs, so a CSV source with `auto_widen` feeding a JSON output with `include_unmapped: true` produces JSON objects whose keys include both the declared columns and the absorbed ones:
 
 ```text
 input.csv:    id,extra,city
@@ -121,66 +65,22 @@ input.csv:    id,extra,city
 output.json:  {"id": "1", "extra": "foo", "city": "Paris"}
 ```
 
-The literal `$widened` slot is stripped during expansion; the
-writer never sees a `Value::Map`.
+### Writer errors on unexpanded columns
 
-### Writer rejection of `Value::Map` payloads
+The CSV, XML, and fixed-width writers can only write flat scalar columns. If carried-along columns reach one of these writers without being expanded — which happens when you set `include_unmapped: false` but a nested value is still present — the write fails with an `UnserializableMapValue` error naming the format and column. (JSON has no such limit; it writes nested values natively.)
 
-CSV, XML, and fixed-width writers refuse records carrying a
-`Value::Map` payload at any column slot, raising
-`FormatError::UnserializableMapValue { format, column }`. The
-rejection lives in each writer's value-to-string helper —
-single point of truth, no defensive prechecks. JSON serializes
-`Value::Map` natively as a nested object and does not raise.
-
-The most common cause: the `$widened` sidecar reaches the
-writer because the Output node set `include_unmapped: false`.
-Remediation is either to leave `include_unmapped` at its default
-of `true` (so the projection layer expands the map to top-level
-columns before write) or to coerce the map to a scalar in CXL
-before the emit. The error message lists both routes.
-
-The DLQ writer applies the same filter at its own layer:
-`dlq::dlq_user_columns` strips any column tagged
-`FieldMetadata::WidenedSidecar`, so the DLQ CSV header never
-contains `$widened` even when the DLQ entry's
-`original_record` retains the auto_widen schema shape.
-Correlation-lattice columns (`$ck.*`) are retained in the DLQ
-output for collateral debugging.
+The fix is to either leave `include_unmapped` at its default of `true`, so the columns are expanded to top-level before writing, or to convert the value to a scalar in CXL before emitting it. The error message lists both routes.
 
 ## E315 — Merge inputs must agree on policy
 
-Merge concatenates streams positionally against the merge node's
-`output_schema` (taken from the first input). Every input must
-agree on column shape — same column names, same `on_unmapped`
-policy, same `correlation_key` set.
-
-If two upstream sources disagree on whether they carry the
-`$widened` sidecar (one source uses `auto_widen`, another uses
-`drop` / `reject`), compile fails:
+`Merge` concatenates its inputs positionally, so every input must agree on column shape — same column names, same `on_unmapped` policy, same `correlation_key` set. If two upstream sources disagree on whether they carry auto-widened columns (one uses `auto_widen`, another uses `drop` / `reject`), compilation fails:
 
 ```text
 E315: merge "merged": input schemas disagree on the `$widened` auto_widen sidecar column.
 ```
 
-Remediation: set every merge upstream source to the same
-`on_unmapped` policy. The engine-wide default is `auto_widen`;
-for sources that should explicitly omit the sidecar, declare
-`on_unmapped: { mode: drop }` (or `reject`) on each.
+The fix is to set every merge upstream source to the same `on_unmapped` policy.
 
-## Fixed-width sources are structurally inert
+## Fixed-width sources
 
-Fixed-width sources are positional — the schema is constructed
-from `width` / `start..end` byte ranges, and bytes outside the
-declared ranges are invisible to the reader. `auto_widen`
-therefore can never populate the sidecar for fixed-width
-sources; the slot stays `Value::Null` for every record.
-
-The executor emits a `tracing::info` diagnostic at source-reader
-construction time when `auto_widen` is the policy on a
-fixed-width source, naming the source. The diagnostic fires
-once per reader instance; a source used as a combine
-build-side input across multiple combines may produce one log
-per combine. To avoid the noise, switch to `on_unmapped: drop`
-(or `reject`) for explicit scalar semantics, or accept the
-empty sidecar.
+Fixed-width sources are positional — the reader only sees the byte ranges your schema defines, so there are never any "extra" columns to absorb. `auto_widen` has no effect on a fixed-width source; use `on_unmapped: drop` (or `reject`) to make that explicit and silence the informational log the engine emits otherwise.
