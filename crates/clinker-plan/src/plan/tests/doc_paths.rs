@@ -178,6 +178,165 @@ nodes:
     assert!(diag.help.is_some(), "E340 must carry help text");
 }
 
+/// Compile a single-transform XML pipeline whose source declares a
+/// `Summary { total: int }` envelope section, with the transform body
+/// supplied by the caller. Returns the compile result so a test can assert
+/// success or inspect the diagnostics.
+fn compile_with_summary_envelope(
+    transform_cxl: &str,
+) -> Result<crate::plan::CompiledPlan, Vec<clinker_core_types::Diagnostic>> {
+    let mut yaml = String::from(
+        r#"
+pipeline:
+  name: doc_validate_demo
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          Summary:
+            extract: { xml_path: "/doc/Summary" }
+            fields:
+              total: int
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: t0
+    input: payments
+    config:
+      cxl: |
+"#,
+    );
+    for line in transform_cxl.lines() {
+        yaml.push_str(&format!("        {line}\n"));
+    }
+    yaml.push_str(
+        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+    );
+    let config = parse_config(&yaml).expect("parse doc-validate pipeline");
+    config.compile(&CompileContext::default())
+}
+
+#[test]
+fn test_undeclared_doc_section_aborts_compile_with_e341() {
+    // `$doc.Summry.total` misspells the declared `Summary` section, so the
+    // path names a section the XML source does not declare. The compile
+    // must abort with E341 anchored at the referencing transform.
+    let err = compile_with_summary_envelope("emit amount = amount\nemit t = $doc.Summry.total")
+        .expect_err("an undeclared `$doc` section must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E341")
+        .unwrap_or_else(|| panic!("expected an E341 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("Summry"),
+        "E341 message must name the undeclared section: {}",
+        diag.message
+    );
+    assert!(
+        diag.primary.span.synthetic_line_number().is_some(),
+        "E341 primary span must carry the referencing node's source line"
+    );
+    assert!(diag.help.is_some(), "E341 must carry help text");
+}
+
+#[test]
+fn test_undeclared_doc_field_aborts_compile_with_e341() {
+    // `$doc.Summary.totl` names the declared `Summary` section but a field
+    // the section does not declare — a distinct typo from a bad section.
+    let err = compile_with_summary_envelope("emit amount = amount\nemit t = $doc.Summary.totl")
+        .expect_err("an undeclared `$doc` field must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E341")
+        .unwrap_or_else(|| panic!("expected an E341 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("totl") && diag.message.contains("Summary"),
+        "E341 message must name the undeclared field and its section: {}",
+        diag.message
+    );
+}
+
+#[test]
+fn test_declared_doc_path_does_not_trip_e341() {
+    // The fully-declared `$doc.Summary.total` must compile without E341.
+    let plan = compile_with_summary_envelope("emit amount = amount\nemit t = $doc.Summary.total")
+        .expect("a declared `$doc` path must compile");
+    // Sanity: the path still surfaces onto the source's declared set.
+    let dag = plan.dag();
+    let source = dag
+        .graph
+        .node_indices()
+        .find_map(|idx| match &dag.graph[idx] {
+            PlanNode::Source { resolved, .. } => resolved.as_ref(),
+            _ => None,
+        })
+        .expect("source node present");
+    assert!(
+        source
+            .source
+            .declared_doc_paths
+            .contains(&path("Summary", "total", vec![])),
+    );
+}
+
+#[test]
+fn test_undeclared_doc_path_against_segment_format_is_not_validated() {
+    // X12 (and the other segment/positional formats) synthesize envelope
+    // levels beyond the declared config — `$doc.functional_group.*` and
+    // `$doc.transaction_set.*` are reader-derived, not config-declared. The
+    // closed-schema E341 check must NOT fire for these, or every multi-level
+    // EDI pipeline would be rejected.
+    let yaml = r#"
+pipeline:
+  name: x12_doc_open
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      path: po.x12
+      envelope:
+        sections:
+          interchange:
+            extract: { segment: "ISA" }
+            fields:
+              e13: string
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: t0
+    input: interchange
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit gs06 = $doc.functional_group.e06
+        emit st02 = $doc.transaction_set.e02
+  - type: output
+    name: out
+    input: t0
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse x12 pipeline");
+    let result = config.compile(&CompileContext::default());
+    if let Err(err) = &result {
+        assert!(
+            err.iter().all(|d| d.code != "E341"),
+            "segment-format `$doc` paths must not trip E341, got: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn test_negative_literal_doc_index_compiles() {
     // A negated integer literal is a static from-end index, so the path
