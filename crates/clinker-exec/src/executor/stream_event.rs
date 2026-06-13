@@ -39,6 +39,32 @@ pub enum PunctuationKind {
     DocumentClose,
 }
 
+/// Structural-integrity failure a source reader detected at an envelope
+/// trailer (an X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, or HL7 `BTS`/`FTS`
+/// count mismatch). Rides on the file-level [`PunctuationKind::DocumentClose`]
+/// the ingest thread emits for the condemned file.
+///
+/// The count is only known mid-stream — after every body record it counts
+/// has already streamed — so the ingest thread cannot reject the document
+/// before its first record. Instead it tags the document's close with this
+/// payload; the consumer-side Source dispatch arm reads it and marks the
+/// whole file failed through the document-DLQ reject seam, so #97's
+/// per-file Output buffer rejects every already-streamed record of the file
+/// at its close. The `record` is a representative body row of the document
+/// (widened, doc-context-stamped) that becomes the captured `trigger: true`
+/// root cause.
+#[derive(Debug, Clone)]
+pub struct StructuralReject {
+    /// A representative record of the condemned document — the engine-widened,
+    /// document-context-stamped row the reject seam captures as the
+    /// `trigger: true` root cause for the file's reject.
+    pub record: Record,
+    /// Source row number of the representative record, for DLQ attribution.
+    pub row_num: u64,
+    /// The precise count-mismatch message the reader built at the trailer.
+    pub message: String,
+}
+
 /// Document-boundary punctuation on the executor's record stream.
 ///
 /// Carries an `Arc<DocumentContext>` so operators reading the event can
@@ -48,16 +74,29 @@ pub enum PunctuationKind {
 /// from the same Arc that body records carried). The Arc clone is a
 /// refcount bump only; punctuations are O(1) per document, not per
 /// record.
+///
+/// A file-level `DocumentClose` may additionally carry a
+/// [`StructuralReject`] payload when the ingest thread condemned the file
+/// for an envelope count mismatch under `dlq_granularity: document`; every
+/// other punctuation leaves it `None`, so the structural-validation path
+/// adds zero cost to the dominant boundary-marking flow and stays invisible
+/// to operators that ignore it (they treat the close as an ordinary
+/// boundary).
 #[derive(Debug, Clone)]
 pub struct Punctuation {
     doc_ctx: Arc<DocumentContext>,
     kind: PunctuationKind,
+    structural_reject: Option<Box<StructuralReject>>,
 }
 
 impl Punctuation {
     /// Construct a punctuation for a given document context and kind.
     pub fn new(doc_ctx: Arc<DocumentContext>, kind: PunctuationKind) -> Self {
-        Self { doc_ctx, kind }
+        Self {
+            doc_ctx,
+            kind,
+            structural_reject: None,
+        }
     }
 
     /// Convenience: build a `DocumentOpen` punctuation.
@@ -68,6 +107,29 @@ impl Punctuation {
     /// Convenience: build a `DocumentClose` punctuation.
     pub fn document_close(doc_ctx: Arc<DocumentContext>) -> Self {
         Self::new(doc_ctx, PunctuationKind::DocumentClose)
+    }
+
+    /// Build a `DocumentClose` punctuation that condemns the document for an
+    /// envelope structural-count failure. The consumer-side Source dispatch
+    /// arm reads the [`StructuralReject`] payload and marks the file failed
+    /// via the document-DLQ reject seam before forwarding the close
+    /// downstream.
+    pub fn structural_reject_close(
+        doc_ctx: Arc<DocumentContext>,
+        reject: StructuralReject,
+    ) -> Self {
+        Self {
+            doc_ctx,
+            kind: PunctuationKind::DocumentClose,
+            structural_reject: Some(Box::new(reject)),
+        }
+    }
+
+    /// The structural-count reject payload this close carries, if any. `None`
+    /// for every normal boundary; `Some` only on the file-level close of a
+    /// document the ingest thread condemned for an envelope count mismatch.
+    pub fn structural_reject(&self) -> Option<&StructuralReject> {
+        self.structural_reject.as_deref()
     }
 
     /// Identity of the document this punctuation marks. Equality on
@@ -239,6 +301,39 @@ mod tests {
         };
         assert_eq!(rn, 42);
         assert_eq!(r.values()[0], Value::Integer(1));
+    }
+
+    #[test]
+    fn ordinary_close_carries_no_structural_reject() {
+        // The dominant boundary path leaves the structural-reject payload
+        // empty, so a structural-validation check on any close is a cheap None.
+        let ctx = doc_ctx();
+        let close = Punctuation::document_close(Arc::clone(&ctx));
+        assert!(close.structural_reject().is_none());
+        let open = Punctuation::document_open(ctx);
+        assert!(open.structural_reject().is_none());
+    }
+
+    #[test]
+    fn structural_reject_close_carries_payload_and_is_a_close() {
+        // A structural-reject close is a `DocumentClose` (so downstream
+        // per-document consumers treat it as an ordinary boundary) that
+        // additionally exposes its representative record, row, and message
+        // for the consumer-side reject seam.
+        let ctx = doc_ctx();
+        let reject = StructuralReject {
+            record: rec(7),
+            row_num: 42,
+            message: "SE segment count mismatch".to_string(),
+        };
+        let close = Punctuation::structural_reject_close(Arc::clone(&ctx), reject);
+        assert_eq!(close.kind(), PunctuationKind::DocumentClose);
+        let payload = close
+            .structural_reject()
+            .expect("a structural-reject close carries its payload");
+        assert_eq!(payload.row_num, 42);
+        assert_eq!(payload.record.values()[0], Value::Integer(7));
+        assert!(payload.message.contains("SE segment count mismatch"));
     }
 
     #[test]

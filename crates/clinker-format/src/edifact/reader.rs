@@ -257,7 +257,7 @@ impl<R: Read> EdifactReader<R> {
         // the UNT segment itself completes the count.
         let actual = msg.segment_count + 1;
         if claimed != actual {
-            return Err(FormatError::Edifact(format!(
+            return Err(FormatError::edifact_structural_count(format!(
                 "UNT segment count mismatch for message {:?}: trailer claims {claimed}, \
                  interchange contains {actual} (UNH..UNT inclusive)",
                 msg.reference
@@ -296,7 +296,7 @@ impl<R: Read> EdifactReader<R> {
                 ))
             })?;
         if claimed != self.message_count {
-            return Err(FormatError::Edifact(format!(
+            return Err(FormatError::edifact_structural_count(format!(
                 "UNZ message count mismatch: trailer claims {claimed}, interchange \
                  contains {} messages",
                 self.message_count
@@ -571,7 +571,9 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert!(matches!(err, FormatError::Edifact(m) if m.contains("UNT segment count mismatch")));
+        assert!(
+            matches!(err, FormatError::StructuralCount { format: "EDIFACT", ref message } if message.contains("UNT segment count mismatch"))
+        );
     }
 
     #[test]
@@ -601,7 +603,9 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert!(matches!(err, FormatError::Edifact(m) if m.contains("UNZ message count mismatch")));
+        assert!(
+            matches!(err, FormatError::StructuralCount { format: "EDIFACT", ref message } if message.contains("UNZ message count mismatch"))
+        );
     }
 
     #[test]

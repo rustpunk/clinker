@@ -233,6 +233,19 @@ truncation or corruption signal):
 Content after the `FTS` file trailer is rejected. A bare `MSH`-led file
 needs no trailers and validates with no count checks.
 
+### Routing a count mismatch to the DLQ
+
+By default a `BTS`/`FTS` **count** mismatch aborts the run. A source declaring
+`dlq_granularity: document` instead dead-letters the whole file to the DLQ —
+the file's records become a `structural_validation` trigger plus
+`document_rejected` collaterals, and no record of the malformed file reaches
+the sink. The count is only known at the trailer, after the body has streamed,
+so the rejection lands at the sink boundary (no record is written out), not
+literally before the first record. The grain is the whole file. Other
+corruption (truncation, post-trailer content) always aborts, even under the
+opt-in. An empty `BTS-1`/`FTS-1` still disables the check entirely. See
+[Malformed envelopes](../pipelines/error-handling.md#malformed-envelopes-structural-validation).
+
 ## Writing HL7
 
 An HL7 Output node re-emits the `MSH` and body segments from the record

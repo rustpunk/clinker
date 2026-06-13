@@ -222,6 +222,12 @@ impl FormatReader for CoercingReader {
         // its envelope nesting.
         self.inner.take_envelope_events()
     }
+
+    fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+        // File advancement is the inner multi-file reader's concern; coercion
+        // is per-record and stateless across files, so forward verbatim.
+        self.inner.advance_to_next_file()
+    }
 }
 
 /// Unwrap Nullable to get the inner type for coercion.

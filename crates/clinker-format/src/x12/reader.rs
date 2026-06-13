@@ -305,7 +305,7 @@ impl<R: Read> X12Reader<R> {
         })?;
         let claimed = parse_count(ge.elements.first(), "GE", "transaction-set count")?;
         if claimed != group.set_count {
-            return Err(FormatError::X12(format!(
+            return Err(FormatError::x12_structural_count(format!(
                 "GE transaction-set count mismatch for group {:?}: trailer claims {claimed}, \
                  group contains {} transaction sets",
                 group.control_number, group.set_count
@@ -370,7 +370,7 @@ impl<R: Read> X12Reader<R> {
         // itself completes the count.
         let actual = set.segment_count + 1;
         if claimed != actual {
-            return Err(FormatError::X12(format!(
+            return Err(FormatError::x12_structural_count(format!(
                 "SE segment count mismatch for transaction set {:?}: trailer claims {claimed}, \
                  set contains {actual} (ST..SE inclusive)",
                 set.control_number
@@ -398,7 +398,7 @@ impl<R: Read> X12Reader<R> {
         }
         let claimed = parse_count(iea.elements.first(), "IEA", "functional-group count")?;
         if claimed != self.group_count {
-            return Err(FormatError::X12(format!(
+            return Err(FormatError::x12_structural_count(format!(
                 "IEA functional-group count mismatch: trailer claims {claimed}, interchange \
                  contains {} groups",
                 self.group_count
@@ -940,7 +940,9 @@ mod tests {
             ST*850*0001~BEG*00*NE*A**20240101~SE*9*0001~GE*1*1~IEA*1*000000001~"
         );
         let err = error_from(&data);
-        assert!(matches!(err, FormatError::X12(m) if m.contains("SE segment count mismatch")));
+        assert!(
+            matches!(err, FormatError::StructuralCount { format: "X12", ref message } if message.contains("SE segment count mismatch"))
+        );
     }
 
     #[test]
@@ -961,7 +963,7 @@ mod tests {
         );
         let err = error_from(&data);
         assert!(
-            matches!(err, FormatError::X12(m) if m.contains("GE transaction-set count mismatch"))
+            matches!(err, FormatError::StructuralCount { format: "X12", ref message } if message.contains("GE transaction-set count mismatch"))
         );
     }
 
@@ -983,7 +985,7 @@ mod tests {
         );
         let err = error_from(&data);
         assert!(
-            matches!(err, FormatError::X12(m) if m.contains("IEA functional-group count mismatch"))
+            matches!(err, FormatError::StructuralCount { format: "X12", ref message } if message.contains("IEA functional-group count mismatch"))
         );
     }
 

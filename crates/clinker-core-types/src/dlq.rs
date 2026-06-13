@@ -73,6 +73,20 @@ pub enum DlqErrorCategory {
     /// Stage label `reshape:<node>:<rule_a>+<rule_b>` names the colliding
     /// rule pair.
     MutationConflict,
+    /// An envelope structural-integrity check failed: a trailer segment's
+    /// declared count did not match the body the reader actually saw (X12
+    /// `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`). The mismatch
+    /// is detected mid-stream when the trailer arrives — after the body
+    /// records it counts have already streamed — so under a source's
+    /// `dlq_granularity: document` policy it condemns the WHOLE source file:
+    /// this is the `trigger: true` root cause and every already-streamed
+    /// record of the same file becomes a `DocumentRejected` collateral, so
+    /// no record of a malformed envelope reaches the sink. Distinct from a
+    /// per-record eval failure — no single record is at fault; the document
+    /// as a whole is structurally invalid. Only emitted under the `document`
+    /// granularity opt-in; under the default `record` granularity a count
+    /// mismatch still aborts the run.
+    StructuralValidation,
 }
 
 impl DlqErrorCategory {
@@ -92,6 +106,7 @@ impl DlqErrorCategory {
             Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
             Self::CombineOutputRow => "combine_output_row",
             Self::MutationConflict => "mutation_conflict",
+            Self::StructuralValidation => "structural_validation",
         }
     }
 }
@@ -171,6 +186,10 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::MutationConflict.as_str(),
             "mutation_conflict"
+        );
+        assert_eq!(
+            DlqErrorCategory::StructuralValidation.as_str(),
+            "structural_validation"
         );
     }
 

@@ -3101,6 +3101,32 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
+    // Document-level dead-lettering is in direct tension with `fail_fast`:
+    // `dlq_granularity: document` says "do not abort the run on a bad
+    // document — dead-letter it and keep processing", while `fail_fast` says
+    // "abort on the first error". Under `fail_fast` a per-record failure
+    // aborts before any document-DLQ disposition, AND a malformed-envelope
+    // structural-count failure would dead-letter-and-continue, so the two
+    // settings give contradictory dispositions for the same run. Reject the
+    // combination up front rather than silently no-op'ing a user-set field.
+    if config.any_source_has_document_dlq()
+        && config.error_handling.strategy == ErrorStrategy::FailFast
+    {
+        let source = config
+            .source_configs()
+            .find(|s| s.dlq_granularity == DlqGranularity::Document)
+            .map(|s| s.name.as_str())
+            .unwrap_or("");
+        return Err(ConfigError::Validation(format!(
+            "[E344] source '{source}': `dlq_granularity: document` cannot be combined \
+             with `error_handling.strategy: fail_fast` — document-level dead-lettering \
+             keeps the run going past a bad document, which contradicts fail-fast's \
+             abort-on-first-error. Use `strategy: continue` (or `best_effort`) with \
+             `dlq_granularity: document`, or set `dlq_granularity: record` to keep \
+             fail-fast"
+        )));
+    }
+
     // Validate the flat `vars:` block (`$vars.<key>` static config)
     if let Some(ref vars) = config.pipeline.vars {
         for (name, decl) in vars {

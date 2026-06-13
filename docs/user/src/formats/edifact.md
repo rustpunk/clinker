@@ -149,6 +149,19 @@ the correct reference.
 A missing `UNZ` at end of input is a truncation error; content after the
 `UNZ` trailer is rejected.
 
+### Routing a count mismatch to the DLQ
+
+By default a `UNT`/`UNZ` **count** mismatch aborts the run. A source declaring
+`dlq_granularity: document` instead dead-letters the whole interchange / file
+to the DLQ — the file's records become a `structural_validation` trigger plus
+`document_rejected` collaterals, and no record of the malformed file reaches
+the sink. The count is only known at the trailer, after the body has streamed,
+so the rejection lands at the sink boundary (no record is written out), not
+literally before the first record. The grain is the whole file. The
+control-reference *echo* mismatches and every other corruption (truncation,
+post-trailer content) always abort, even under the opt-in. See [Malformed
+envelopes](../pipelines/error-handling.md#malformed-envelopes-structural-validation).
+
 ## Writing EDIFACT
 
 An EDIFACT Output node reconstructs the envelope around emitted records.

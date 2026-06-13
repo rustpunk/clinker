@@ -516,7 +516,83 @@ fn drive_record_source(
                     )?;
                     break;
                 }
-                Err(other) => return Err(other.into()),
+                Err(other) => {
+                    // An envelope trailer's declared count did not match the
+                    // body the reader streamed (X12 SE/GE/IEA, EDIFACT
+                    // UNT/UNZ, HL7 BTS/FTS). Under `dlq_granularity:
+                    // document` this condemns the WHOLE source file rather
+                    // than aborting the run: the count is only known here, at
+                    // the trailer, AFTER every body record it counts has
+                    // already streamed, so the document cannot be rejected
+                    // before its first record. Instead, tag the file's
+                    // close with a structural-reject payload carrying a
+                    // representative document record; the consumer-side
+                    // Source arm marks the file failed through the #97
+                    // reject seam, and #97's per-file Output buffer rejects
+                    // every already-streamed record of the file at its
+                    // close. Genuine corruption (truncation, bad delimiters,
+                    // control-number echo mismatch) is NOT a `StructuralCount`
+                    // and keeps aborting even under the opt-in.
+                    if other.is_structural_count()
+                        && src_cfg.dlq_granularity == clinker_plan::config::DlqGranularity::Document
+                    {
+                        let file_arc = src_reader
+                            .current_source_file()
+                            .cloned()
+                            .unwrap_or_else(|| Arc::clone(&static_source_file));
+                        // The document context the reject keys on. A malformed
+                        // file that streamed at least one body record has its
+                        // level stack open, so use the innermost level. A
+                        // ZERO-body malformed envelope (a trailer claiming a
+                        // count with no body segment — X12 `ISA … IEA*5~`,
+                        // EDIFACT `UNB … UNZ` with no `UNH`, HL7 `BHS`/`BTS`
+                        // with no `MSH`) never drained its queued `OpenLevel`
+                        // into the stack, so synthesize a file-level context
+                        // from the file grain instead. Either way the
+                        // representative record carries a real (non-synthetic)
+                        // document id and the file's `$source.file` stamp, so
+                        // the document-DLQ reject keys at the file grain.
+                        let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
+                            Arc::new(clinker_record::DocumentContext::new(
+                                clinker_record::DocumentId::next(),
+                                Arc::clone(&file_arc),
+                                indexmap::IndexMap::new(),
+                            ))
+                        });
+                        let rep_record = build_representative_record(
+                            &widened_schema,
+                            &doc_ctx,
+                            &file_arc,
+                            &source_name_arc,
+                        );
+                        let reject = crate::executor::stream_event::StructuralReject {
+                            record: rep_record,
+                            row_num: rn.saturating_add(1),
+                            message: other.to_string(),
+                        };
+                        emit_structural_reject_close(
+                            &mut stream,
+                            &mut doc_stack,
+                            &doc_ctx,
+                            reject,
+                        )?;
+                        // The trailer-count error fires at the file's closing
+                        // segment, so this file is fully consumed. Advance to
+                        // the next file of a multi-file source and keep
+                        // streaming — dead-lettering one malformed file must
+                        // not silently drop the clean files after it (that
+                        // would turn the prior loud run-abort into a silent
+                        // partial success). With the failed file's level stack
+                        // already drained above, the next record reopens a
+                        // fresh file-level document. A single-file source has
+                        // no next file, so this breaks at end-of-input.
+                        if src_reader.advance_to_next_file()? {
+                            continue;
+                        }
+                        break;
+                    }
+                    return Err(other.into());
+                }
             }
         }
         // Close every level still open at end-of-input, innermost first.
@@ -588,6 +664,84 @@ fn close_open_levels(
         )?;
     }
     Ok(())
+}
+
+/// Build a representative record for a document the ingest thread condemned
+/// for an envelope structural-count failure.
+///
+/// No single body record is at fault (the whole document is structurally
+/// invalid), so this synthesizes one onto the engine-widened schema: the
+/// body columns are `Null` and the three engine-stamped tail columns carry
+/// the file's `$source.file`, the source's `$source.name`, and a `Null`
+/// `$source.event_time`, mirroring the per-record widening in
+/// [`drive_record_source`]. The record carries the document's innermost
+/// context so its `source_file` stamp keys the document-DLQ reject at the
+/// correct file grain. It becomes the `trigger: true` root cause for the
+/// file's reject.
+fn build_representative_record(
+    widened_schema: &Arc<clinker_record::Schema>,
+    doc_ctx: &Arc<clinker_record::DocumentContext>,
+    file_arc: &Arc<str>,
+    source_name_arc: &Arc<str>,
+) -> clinker_record::Record {
+    let column_count = widened_schema.column_count();
+    // The three engine-stamped tail columns are the last three; every
+    // body column ahead of them is Null on this synthetic trigger row.
+    let mut values: Vec<clinker_record::Value> =
+        vec![clinker_record::Value::Null; column_count.saturating_sub(3)];
+    values.push(clinker_record::Value::from(file_arc.as_ref()));
+    values.push(clinker_record::Value::from(source_name_arc.as_ref()));
+    values.push(clinker_record::Value::Null);
+    let mut record = clinker_record::Record::new(Arc::clone(widened_schema), values);
+    record.set_doc_ctx(Arc::clone(doc_ctx));
+    record
+}
+
+/// Condemn the open document for an envelope structural-count failure: emit
+/// the innermost open level's `DocumentClose` carrying the structural-reject
+/// payload, then close every remaining open level (the file-level document
+/// and any enclosing nested levels) so the boundary stack stays balanced.
+///
+/// The reject payload rides the INNERMOST close because that is the level
+/// the trailer just failed; the consumer-side reject seam keys on the
+/// representative record's `$source.file` stamp, so the file grain is
+/// correct regardless of which level carries the payload. Draining the rest
+/// of the stack here keeps every `DocumentOpen` balanced by exactly one
+/// `DocumentClose`, the invariant downstream per-document consumers rely on.
+///
+/// When the stack is EMPTY — a zero-body malformed envelope whose queued
+/// `OpenLevel` never drained into the stack — the payload rides a standalone
+/// `DocumentClose` on the synthesized `synthesized_ctx` so the consumer-side
+/// Source arm still marks the file failed and emits its trigger (with no
+/// collaterals, since no record of the file streamed). The end-of-DAG sweep
+/// `reject_unclosed_failed_documents` then emits the trigger for that
+/// recordless document, so a zero-body malformed file still dead-letters.
+fn emit_structural_reject_close(
+    stream: &mut crate::executor::source_stream::SourceIngestChannel,
+    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    synthesized_ctx: &Arc<clinker_record::DocumentContext>,
+    reject: crate::executor::stream_event::StructuralReject,
+) -> Result<(), PipelineError> {
+    match doc_stack.pop() {
+        Some(innermost) => {
+            push_doc_punctuation(
+                stream,
+                crate::executor::stream_event::Punctuation::structural_reject_close(
+                    innermost, reject,
+                ),
+            )?;
+        }
+        None => {
+            push_doc_punctuation(
+                stream,
+                crate::executor::stream_event::Punctuation::structural_reject_close(
+                    Arc::clone(synthesized_ctx),
+                    reject,
+                ),
+            )?;
+        }
+    }
+    close_open_levels(stream, doc_stack)
 }
 
 /// Open the file-level document for `file_arc`, closing the prior file's

@@ -224,6 +224,38 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     true
 }
 
+/// Mark a document failed for an envelope structural-count failure if `p`
+/// is a file-level close carrying a [`crate::executor::stream_event::StructuralReject`]
+/// payload. A no-op for every ordinary boundary.
+///
+/// Called at every raw source-channel punctuation-drain site that holds
+/// `ctx` — the non-fused Source arm, the fused Source→Transform arm, and the
+/// fused Merge.interleave arm — so a structural-count failure condemns the
+/// whole file regardless of which fusion claimed the source receiver. The
+/// reject is keyed by the representative record's `$source.file` stamp, so
+/// the file grain is correct independent of the carrying close's level. The
+/// close still forwards downstream unchanged; #97's per-file Output buffer
+/// rejects every already-streamed record of the file at that close.
+pub(crate) fn mark_structural_reject_if_present(
+    ctx: &mut ExecutorContext<'_>,
+    p: &crate::executor::stream_event::Punctuation,
+) {
+    let Some(reject) = p.structural_reject() else {
+        return;
+    };
+    record_error_to_document_buffer_if_doc_dlq(
+        ctx,
+        &reject.record,
+        reject.row_num,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation,
+        reject.message.clone(),
+        Some("structural_validation".to_string()),
+        None,
+        None,
+        None,
+    );
+}
+
 /// Mark document `key` failed by `trigger`. The FIRST failure becomes the
 /// document's root-cause trigger; a later failure of an already-failed
 /// document stashes its record as an extra collateral (the trigger slot is

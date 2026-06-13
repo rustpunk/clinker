@@ -338,7 +338,7 @@ impl<R: Read> Hl7Reader<R> {
         if let Some(claimed) = parse_optional_count(fts.fields.first(), "FTS", "file batch count")?
             && claimed != self.batch_count
         {
-            return Err(FormatError::Hl7(format!(
+            return Err(FormatError::hl7_structural_count(format!(
                 "FTS file batch count mismatch: trailer claims {claimed}, file contains \
                  {} batches",
                 self.batch_count
@@ -379,7 +379,7 @@ impl<R: Read> Hl7Reader<R> {
             parse_optional_count(bts.fields.first(), "BTS", "batch message count")?
             && claimed != batch.message_count
         {
-            return Err(FormatError::Hl7(format!(
+            return Err(FormatError::hl7_structural_count(format!(
                 "BTS batch message count mismatch: trailer claims {claimed}, batch contains \
                  {} messages",
                 batch.message_count
@@ -928,7 +928,7 @@ mod tests {
             }
         };
         assert!(
-            matches!(err, FormatError::Hl7(m) if m.contains("BTS batch message count mismatch"))
+            matches!(err, FormatError::StructuralCount { format: "HL7", ref message } if message.contains("BTS batch message count mismatch"))
         );
     }
 
@@ -943,7 +943,9 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert!(matches!(err, FormatError::Hl7(m) if m.contains("FTS file batch count mismatch")));
+        assert!(
+            matches!(err, FormatError::StructuralCount { format: "HL7", ref message } if message.contains("FTS file batch count mismatch"))
+        );
     }
 
     #[test]

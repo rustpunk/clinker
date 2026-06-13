@@ -81,6 +81,21 @@ pub trait RecordSource: Send {
     /// so it ignores the token. Network readers holding a live socket
     /// override this to bound cancellation latency.
     fn set_shutdown_token(&mut self, _token: crate::pipeline::shutdown::ShutdownToken) {}
+
+    /// Abandon the current file and advance to the next, returning `Ok(true)`
+    /// when a next file opened or `Ok(false)` when none remain. Mirrors
+    /// [`FormatReader::advance_to_next_file`]: the ingest driver calls this
+    /// after dead-lettering a whole file for a structural-count failure under
+    /// `dlq_granularity: document`, so a multi-file source keeps reading its
+    /// remaining files past the malformed one. The default returns `Ok(false)`
+    /// for single-file and pathless transports.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces the next file's reader-construction or schema-mismatch error.
+    fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+        Ok(false)
+    }
 }
 
 /// Byte-stream transports reach the row-yielding contract by delegating
@@ -110,6 +125,10 @@ impl RecordSource for Box<dyn FormatReader> {
 
     fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
         (**self).take_envelope_events()
+    }
+
+    fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+        (**self).advance_to_next_file()
     }
 }
 
