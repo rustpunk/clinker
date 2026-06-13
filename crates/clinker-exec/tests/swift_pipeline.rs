@@ -334,3 +334,43 @@ nodes:
         "error should name the SWIFT block failure: {err}"
     );
 }
+
+#[test]
+fn swift_max_fields_option_caps_block4_field_count() {
+    // The source's `max_fields` option flows through to the reader. A message
+    // carrying more block-4 fields than the configured cap fails the run with
+    // a precise error naming the option — exercising the
+    // options -> build_swift_reader_config -> reader path end-to-end.
+    let over_cap = "{1:F01BANKBEBBAXXX0000000000}\
+        {4:\r\n:20:ONE\r\n:21:TWO\r\n:22:THREE\r\n-}";
+    let yaml = r#"
+pipeline:
+  name: swift_max_fields
+nodes:
+  - type: source
+    name: message
+    config:
+      name: message
+      type: swift
+      glob: ./*.swift
+      options:
+        max_fields: 2
+      schema:
+        - { name: block, type: string }
+        - { name: tag, type: string }
+        - { name: value, type: string }
+  - type: output
+    name: out
+    input: message
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = run(yaml, "message", over_cap, "big.swift", "out")
+        .expect_err("an over-cap message must fail the run");
+    assert!(
+        err.contains("max_fields") || err.contains("SWIFT"),
+        "error should name the field-count cap: {err}"
+    );
+}

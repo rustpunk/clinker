@@ -32,12 +32,14 @@ parent block rather than mistaken for top-level blocks.
 
 ### The `-}` text-block trailer
 
-Block 4 is special. Its body is free `:tag:value` text whose values may
-contain a literal `}`, so it is closed by the two-byte `-}` trailer rather
-than a bare brace. The reader closes block 4 only on `-}`; a `}` inside the
-message text is treated as data, not a frame boundary. Both the framing
-braces and the `-}` trailer are stripped from the stored values, so a record
-carries clean tag/value data.
+Block 4 is special. Its body is opaque line-structured free text — a field
+value (a `:77E:` envelope, a `:79:` narrative, an `:86:` information line)
+legitimately contains `{`, `}`, and even `-}` as data. So the reader does
+**not** brace-count inside block 4: it closes the block only on a
+*line-anchored* `-}` trailer — a `-}` that begins a line. An interior `{`,
+`}`, or a `-}` in the middle of a value is data, not a frame boundary. Both
+the framing braces and the closing `-}` trailer are stripped from the stored
+values, so a record carries clean tag/value data.
 
 ### Whitespace between blocks
 
@@ -57,11 +59,13 @@ readers use, so memory scales O(1) with message size:
 | `tag`   | The SWIFT field tag without its surrounding colons (`20`, `32A`, `61`) |
 | `value` | The field value, with continuation lines folded in verbatim   |
 
-A multi-line field (a `:50K:` ordering-customer block, a `:86:` narrative)
-keeps its continuation lines: any line of block 4 that does not begin a new
-`:tag:` is folded into the current field's value with its line break
-preserved. A repeated tag (the `:61:` / `:86:` statement lines of an MT940,
-for instance) streams as one record per occurrence, in order.
+A multi-line field (a `:50K:` ordering-customer block, a `:77E:` / `:86:`
+narrative) keeps its continuation lines: any line of block 4 that does not
+begin a new `:tag:` is folded into the current field's value with its line
+break preserved — including a blank line **inside** the value, so a narrative
+with an internal blank line round-trips faithfully. A repeated tag (the
+`:61:` / `:86:` statement lines of an MT940, for instance) streams as one
+record per occurrence, in order.
 
 The service blocks (`1`, `2`, `3`, `5`) are consumed by the reader to serve
 envelope sections and drive the message-level document context — they are

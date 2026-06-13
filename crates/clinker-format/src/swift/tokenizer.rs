@@ -134,11 +134,16 @@ impl<R: BufRead> BlockTokenizer<R> {
 
     /// Read one top-level block's raw bytes including the framing braces.
     ///
-    /// The first byte must be `{`. Brace depth tracks nested sub-blocks; the
-    /// block closes when depth returns to zero on a `}`. Block 4 is detected
-    /// by its `{4:` header and instead closes on the `-}` trailer at depth 1,
-    /// because its free `:tag:value` text may carry a bare `}` that is data,
-    /// not a frame.
+    /// The first byte must be `{`. A non-text block (1/2/3/5) closes on the
+    /// brace that returns depth to zero, so its nested `{tag:value}`
+    /// sub-blocks are tracked by depth. The message-text block (`{4:`) is
+    /// different: its body is opaque line-structured free text — a SWIFT
+    /// field value (a `:77E:` envelope, a `:79:` narrative, an `:86:`
+    /// information line) legitimately carries `{`, `}`, and even `-}` as
+    /// data. So once the `{4:` header is seen, brace counting stops entirely
+    /// and the block closes only on a line-anchored `-}` trailer: a `-}` that
+    /// begins a line (preceded by `\r\n`/`\n`, or at the very start of the
+    /// body). Every interior `{`/`}`/non-anchored `-}` byte is data.
     fn read_balanced_block(&mut self) -> Result<Vec<u8>, FormatError> {
         let mut raw: Vec<u8> = Vec::new();
         let mut depth: usize = 0;
@@ -169,19 +174,29 @@ impl<R: BufRead> BlockTokenizer<R> {
                     }
                     if b == b':' {
                         // The `{4:` header marks the message-text block, whose
-                        // free-text body is closed by the `-}` trailer.
+                        // free-text body is opaque from here on.
                         is_text_block = raw.starts_with(b"{4:");
                         header_seen = true;
+                        // Block 4's opening `{` is the only structural brace;
+                        // it counted toward depth, and the line-anchored `-}`
+                        // trailer is what closes it.
+                        continue;
                     }
+                }
+
+                if is_text_block {
+                    // Opaque free text: close only on a line-anchored `-}`
+                    // trailer. Interior braces and non-anchored `-}` are data.
+                    if b == b'}' && ends_with_line_anchored_trailer(&raw) {
+                        finished = true;
+                        break;
+                    }
+                    continue;
                 }
 
                 match b {
                     b'{' => depth += 1,
-                    // The message-text block closes only on the `-}` trailer
-                    // (a bare `}` there is free-text data); every other block
-                    // closes on a bare `}`. In both cases the opening `{`
-                    // counted, so the close drops depth toward zero.
-                    b'}' if !is_text_block || raw.ends_with(BLOCK4_TRAILER) => {
+                    b'}' => {
                         depth -= 1;
                         if depth == 0 {
                             finished = true;
@@ -204,6 +219,30 @@ impl<R: BufRead> BlockTokenizer<R> {
             }
         }
     }
+}
+
+/// Whether the accumulated block-4 bytes end in a line-anchored `-}` trailer:
+/// a `-}` that begins a line. The trailer is line-anchored when the byte
+/// immediately before the `-` is a line break (`\n` after a CRLF, or a lone
+/// `\r`) or the `-}` sits at the very start of the block body (right after
+/// the `{4:` header — an empty message-text block). A `-}` mid-line
+/// (e.g. `:79:SEE-}NOTE`) is data, not a frame boundary, so it is not
+/// anchored.
+fn ends_with_line_anchored_trailer(raw: &[u8]) -> bool {
+    let Some(before_trailer) = raw.len().checked_sub(BLOCK4_TRAILER.len()) else {
+        return false;
+    };
+    if &raw[before_trailer..] != BLOCK4_TRAILER {
+        return false;
+    }
+    // The trailer begins its own line when the byte before the `-` is a line
+    // break, or the `-}` sits at the body start (right after the three-byte
+    // `{4:` header — an empty message-text block).
+    const HEADER_LEN: usize = "{4:".len();
+    if before_trailer == HEADER_LEN {
+        return true;
+    }
+    matches!(raw.get(before_trailer - 1), Some(b'\n') | Some(b'\r'))
 }
 
 /// Parse one raw top-level block (`{n:body}` or `{4:body-}`) into its id and
@@ -255,29 +294,32 @@ fn parse_block(raw: &[u8]) -> Result<Option<ParsedBlock>, FormatError> {
 
 /// Split a block-4 body into its `:tag:value` lines.
 ///
-/// Each line of the form `:tag:value` begins a new field; a line that does
-/// not begin with `:` is a continuation of the current field's value and is
-/// folded back in verbatim (its leading line break preserved) so multi-line
-/// narrative fields round-trip. Leading/trailing line breaks framing the
-/// block body are insignificant and dropped.
+/// Each line of the form `:tag:value` begins a new field; any line that does
+/// not begin with `:` continues the current field's value, **including a
+/// blank line** — a blank line inside a multi-line narrative (`:77E:`,
+/// `:79:`) is part of the value and is folded in verbatim so the
+/// read → write → read round-trip is byte-faithful. The single line break
+/// that frames the body (the `\r\n` between the last field and the `-}`
+/// trailer) is structural and dropped; leading blank lines before the first
+/// field are likewise insignificant framing.
 ///
 /// # Errors
 ///
 /// Returns [`FormatError::Swift`] when a `:tag:` opener has no second colon
 /// closing the tag, or carries an empty tag — a malformed message-text line.
 pub(crate) fn split_block4(body: &str) -> Result<Vec<ParsedBlock4Line>, FormatError> {
+    // The body ends with the structural line break that precedes the `-}`
+    // trailer. Drop exactly that one break so its trailing empty segment is
+    // not folded as a spurious blank continuation onto the final field; an
+    // interior blank line inside a field still survives the split below.
+    let body = body
+        .strip_suffix('\n')
+        .map(|b| b.strip_suffix('\r').unwrap_or(b))
+        .unwrap_or(body);
+
     let mut lines: Vec<ParsedBlock4Line> = Vec::new();
-    // Split on line breaks; a `:tag:value` line opens a field, a non-`:` line
-    // continues the current field's value. The line breaks that bracket the
-    // block body (the `\r\n` after the `{4:` opener and before the `-}`
-    // trailer) and any blank lines between fields are insignificant framing,
-    // so an empty segment is skipped rather than folded — folding it would
-    // append a spurious trailing newline to the preceding field's value.
     for segment in body.split('\n') {
         let segment = segment.strip_suffix('\r').unwrap_or(segment);
-        if segment.is_empty() {
-            continue;
-        }
         if let Some(rest) = segment.strip_prefix(':') {
             let tag_end = rest.find(':').ok_or_else(|| {
                 FormatError::Swift(format!(
@@ -297,16 +339,19 @@ pub(crate) fn split_block4(body: &str) -> Result<Vec<ParsedBlock4Line>, FormatEr
                 value: value.to_string(),
             });
         } else if let Some(last) = lines.last_mut() {
-            // A continuation line of the current field's value. Re-join the
-            // line break the split removed so the value is byte-faithful.
+            // A continuation line of the current field's value (blank or not).
+            // Re-join the line break the split removed so the value — and any
+            // interior blank line within it — is byte-faithful.
             last.value.push('\n');
             last.value.push_str(segment);
-        } else {
+        } else if !segment.is_empty() {
             return Err(FormatError::Swift(format!(
                 "SWIFT block-4 body opens with a continuation line {segment:?} before any \
                  ':tag:value' field"
             )));
         }
+        // A leading blank segment before the first field is structural
+        // whitespace (the `\r\n` after the `{4:` opener) — skipped silently.
     }
     Ok(lines)
 }
@@ -444,12 +489,56 @@ mod tests {
     #[test]
     fn block4_bare_brace_in_value_is_data_not_a_close() {
         // A `}` inside block-4 free text must not close the block early; only
-        // `-}` does. Here a value carries a literal `}`.
+        // a line-anchored `-}` does. Here a value carries a literal `}`.
         let data = "{4:\r\n:20:REF}WITHBRACE\r\n-}";
         let blocks = collect_blocks(data);
         assert_eq!(blocks.len(), 1);
         let lines = split_block4(&blocks[0].body).unwrap();
         assert_eq!(lines[0].value, "REF}WITHBRACE");
+    }
+
+    #[test]
+    fn block4_open_brace_in_value_is_data_not_counted() {
+        // A `{` inside a block-4 field value (legitimate in `:79:`/`:77E:`
+        // narrative) must NOT inflate brace depth — block 4 is opaque free
+        // text, so the real `-}` still closes it. A `{`-counting framer would
+        // reject this whole message as truncated.
+        let data = "{1:F01X}{4:\r\n:79:A{B\r\n:86:C{D{E\r\n-}";
+        let blocks = collect_blocks(data);
+        assert_eq!(blocks.len(), 2);
+        let lines = split_block4(&blocks[1].body).unwrap();
+        assert_eq!(lines[0].tag, "79");
+        assert_eq!(lines[0].value, "A{B");
+        assert_eq!(lines[1].tag, "86");
+        assert_eq!(lines[1].value, "C{D{E");
+    }
+
+    #[test]
+    fn block4_mid_line_dash_brace_is_data_not_a_close() {
+        // A `-}` in the MIDDLE of a value (not beginning a line) is data, not
+        // the trailer; only a line-anchored `-}` closes the block. The block
+        // must continue past the mid-line `-}` to its real line-anchored one.
+        let data = "{4:\r\n:79:SEE-}NOTE\r\n:86:MORE\r\n-}";
+        let blocks = collect_blocks(data);
+        assert_eq!(blocks.len(), 1);
+        let lines = split_block4(&blocks[0].body).unwrap();
+        assert_eq!(lines.len(), 2, "block must not close at a mid-line trailer");
+        assert_eq!(lines[0].tag, "79");
+        assert_eq!(lines[0].value, "SEE-}NOTE");
+        assert_eq!(lines[1].tag, "86");
+        assert_eq!(lines[1].value, "MORE");
+    }
+
+    #[test]
+    fn block4_interior_blank_line_in_value_survives() {
+        // A blank line WITHIN a multi-line narrative value is part of the
+        // value, not framing — it must fold in so the round-trip is faithful.
+        let data = "{4:\r\n:77E:LINE1\r\n\r\nLINE3\r\n-}";
+        let blocks = collect_blocks(data);
+        let lines = split_block4(&blocks[0].body).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tag, "77E");
+        assert_eq!(lines[0].value, "LINE1\n\nLINE3");
     }
 
     #[test]
