@@ -184,7 +184,8 @@ fn dlq_user_columns(schema: &Schema) -> impl Iterator<Item = (usize, &str)> {
             Some(FieldMetadata::WidenedSidecar)
             | Some(FieldMetadata::SourceFile)
             | Some(FieldMetadata::SourceName)
-            | Some(FieldMetadata::SourceEventTime) => None,
+            | Some(FieldMetadata::SourceEventTime)
+            | Some(FieldMetadata::ReshapeAudit) => None,
             Some(FieldMetadata::SourceCorrelation { .. })
             | Some(FieldMetadata::AggregateGroupIndex { .. })
             | None => Some((i, c.as_ref())),
