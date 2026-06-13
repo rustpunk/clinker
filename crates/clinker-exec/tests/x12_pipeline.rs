@@ -332,6 +332,129 @@ nodes:
 }
 
 #[test]
+fn x12_output_emits_multiple_functional_groups() {
+    // A two-group source interchange is projected so the functional-group
+    // control number becomes a `group_ref` discriminator, then written back
+    // as X12. The writer must reopen a GS..GE group per discriminator,
+    // recompute each GE transaction-set count, and re-parse cleanly — proving
+    // multi-group output, not a single GS wrapping every set.
+    let multi = format!(
+        "{ISA}\
+        GS*PO*S*R*20240101*1200*1*X*004010~\
+        ST*850*0001~BEG*00*NE*A**20240101~SE*3*0001~\
+        ST*850*0002~BEG*00*NE*B**20240101~SE*3*0002~\
+        GE*2*1~\
+        GS*PO*S*R*20240101*1300*2*X*004010~\
+        ST*850*0003~BEG*00*NE*C**20240101~SE*3*0003~\
+        GE*1*2~\
+        IEA*2*000000001~"
+    );
+    let yaml = r#"
+pipeline:
+  name: x12_multi_out
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      glob: ./*.x12
+      schema:
+        - { name: seg_id, type: string }
+        - { name: set_ref, type: string }
+        - { name: set_type, type: string }
+        - { name: e01, type: string }
+        - { name: e02, type: string }
+        - { name: e03, type: string }
+        - { name: e04, type: string }
+  - type: transform
+    name: regroup
+    input: interchange
+    config:
+      cxl: |
+        emit seg_id = seg_id
+        emit group_ref = $doc.functional_group.e06
+        emit set_ref = set_ref
+        emit set_type = set_type
+        emit e01 = e01
+        emit e02 = e02
+        emit e03 = e03
+        emit e04 = e04
+  - type: output
+    name: out
+    input: regroup
+    config:
+      name: out
+      type: x12
+      path: out.x12
+      include_unmapped: true
+      options:
+        interchange: ["00", "          ", "00", "          ", "ZZ", "SENDER         ", "ZZ", "RECEIVER       ", "240101", "1200", "U", "00401", "000000001", "0", "P", ":"]
+        group_header: ["PO", "S", "R", "20240101", "1200", "1", "X", "004010"]
+        segment_newline: false
+"#;
+    let (report, output) =
+        run(yaml, "interchange", &multi, "multi.x12", "out").expect("run multi-group output");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    // Two functional groups, each echoing its source control number, with a
+    // per-group transaction-set count (first holds two sets, second one), and
+    // the IEA claiming both groups.
+    assert_eq!(output.matches("GS*").count(), 2, "output was: {output}");
+    assert_eq!(output.matches("GE*").count(), 2, "output was: {output}");
+    assert!(output.contains("GE*2*1~"), "first group GE wrong: {output}");
+    assert!(
+        output.contains("GE*1*2~"),
+        "second group GE wrong: {output}"
+    );
+    assert!(
+        output.contains("IEA*2*000000001~"),
+        "IEA count wrong: {output}"
+    );
+
+    // The reconstructed multi-group interchange re-parses without error and
+    // streams every body segment in order across both groups.
+    let reparse_yaml = r#"
+pipeline:
+  name: x12_multi_reparse
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      glob: ./*.x12
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: tag
+    input: interchange
+    config:
+      cxl: |
+        emit seg = seg_id
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: false
+      include_header: false
+"#;
+    let (reparse_report, reparse_csv) =
+        run(reparse_yaml, "interchange", &output, "echo.x12", "out")
+            .expect("re-parse multi-group round-trip");
+    assert_eq!(reparse_report.counters.dlq_count, 0);
+    let tags: Vec<&str> = reparse_csv.lines().map(str::trim).collect();
+    assert_eq!(
+        tags,
+        vec!["ST", "BEG", "ST", "BEG", "ST", "BEG"],
+        "round-trip body tags across both groups; x12 output was: {output}"
+    );
+}
+
+#[test]
 fn x12_output_with_split_is_rejected_at_config_time() {
     // An interchange is one three-tier envelope; byte-limit splitting would
     // finalize it mid-stream. The combination must fail config validation,

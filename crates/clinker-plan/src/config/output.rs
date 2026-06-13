@@ -219,8 +219,13 @@ pub struct EdifactOutputOptions {
 /// header comes from `interchange` (literal elements) or, when that is
 /// unset, is echoed from the `$doc` section named by `interchange_from_doc`
 /// for round-trip reconstruction. The `GS` functional-group header comes
-/// from `group_header`; transaction sets are grouped on the `set_ref`
-/// column, and the `SE`/`GE`/`IEA` control counts are recomputed.
+/// from `group_header`. Functional groups are grouped on the optional
+/// `group_ref` column and transaction sets on the `set_ref` column, so a
+/// stream carrying several distinct `group_ref` values writes one `GS..GE`
+/// group per value inside the single interchange (with no `group_ref`
+/// column the whole stream is one functional group). The `SE`/`GE`/`IEA`
+/// control counts are recomputed per set, per group, and for the
+/// interchange respectively.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct X12OutputOptions {
