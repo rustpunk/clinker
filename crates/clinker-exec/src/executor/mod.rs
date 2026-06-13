@@ -12,6 +12,7 @@ pub(crate) mod cull_dispatch;
 pub(crate) mod dispatch;
 mod dlq;
 pub(crate) mod document_dlq;
+pub(crate) mod envelope_dispatch;
 mod ingest;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;

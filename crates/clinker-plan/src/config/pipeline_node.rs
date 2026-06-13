@@ -41,7 +41,9 @@ use indexmap::IndexMap;
 use serde::de::{self, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::node_header::{CombineHeader, MergeHeader, NodeHeader, SourceHeader};
+use crate::config::node_header::{
+    CombineHeader, EnvelopeHeader, MergeHeader, NodeHeader, SourceHeader,
+};
 use crate::plan::index::AnalyticWindowSpec;
 use crate::yaml::CxlSource;
 
@@ -145,6 +147,22 @@ pub enum PipelineNode {
         #[serde(flatten)]
         header: NodeHeader,
         config: CullBody,
+    },
+    /// Frames a body stream into per-document documents. A discrete,
+    /// composable stage placeable after any operator (Transform / Merge /
+    /// Combine / Aggregate), mirroring the message/EDI/XML envelope-wrapper
+    /// prior art.
+    ///
+    /// This slice ships the `preserve` strategy only — one framed document per
+    /// body grain, byte-identical to today's per-document framing. The body
+    /// records pass through with their document context and grain unchanged;
+    /// the optional `header:` / `trailer:` ports are accepted in config but a
+    /// wired value is rejected at plan validation until a later release wires
+    /// them.
+    Envelope {
+        #[serde(flatten)]
+        header: EnvelopeHeader,
+        config: EnvelopeBody,
     },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
@@ -381,6 +399,13 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         let (header, config) = payload.into_variant_parts();
                         Ok(PipelineNode::Cull { header, config })
                     }
+                    "envelope" => {
+                        let payload = EnvelopePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Envelope { header, config })
+                    }
                     "composition" => {
                         let payload = CompositionPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
@@ -399,6 +424,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "output",
                             "reshape",
                             "cull",
+                            "envelope",
                             "composition",
                         ],
                     )),
@@ -613,6 +639,40 @@ impl CullPayload {
     }
 }
 
+// ---- Envelope --------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    body: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default)]
+    header: Option<crate::yaml::Spanned<crate::config::node_header::NodeInput>>,
+    #[serde(default)]
+    trailer: Option<crate::yaml::Spanned<crate::config::node_header::NodeInput>>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: EnvelopeBody,
+}
+
+impl EnvelopePayload {
+    fn into_variant_parts(self) -> (EnvelopeHeader, EnvelopeBody) {
+        (
+            EnvelopeHeader {
+                name: self.name,
+                description: self.description,
+                body: self.body,
+                header: self.header,
+                trailer: self.trailer,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
 // ---- Merge -----------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -730,6 +790,7 @@ impl PipelineNode {
             | PipelineNode::Composition { header, .. } => &header.name,
             PipelineNode::Merge { header, .. } => &header.name,
             PipelineNode::Combine { header, .. } => &header.name,
+            PipelineNode::Envelope { header, .. } => &header.name,
         }
     }
 
@@ -748,7 +809,8 @@ impl PipelineNode {
             | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
             PipelineNode::Source { .. }
             | PipelineNode::Merge { .. }
-            | PipelineNode::Combine { .. } => None,
+            | PipelineNode::Combine { .. }
+            | PipelineNode::Envelope { .. } => None,
         }
     }
 
@@ -784,6 +846,14 @@ impl PipelineNode {
             PipelineNode::Combine { header, .. } => {
                 header.input.values().map(|i| i.value.name()).collect()
             }
+            // Body first so a lineage walk picks the body spine; the optional
+            // header / trailer ports follow when wired (skipped when unset).
+            PipelineNode::Envelope { header, .. } => {
+                let mut inputs = vec![header.body.value.name()];
+                inputs.extend(header.header.iter().map(|i| i.value.name()));
+                inputs.extend(header.trailer.iter().map(|i| i.value.name()));
+                inputs
+            }
         }
     }
 
@@ -818,6 +888,7 @@ impl PipelineNode {
             PipelineNode::Output { .. } => "output",
             PipelineNode::Reshape { .. } => "reshape",
             PipelineNode::Cull { .. } => "cull",
+            PipelineNode::Envelope { .. } => "envelope",
             PipelineNode::Composition { .. } => "composition",
         }
     }
@@ -1250,6 +1321,27 @@ pub struct RouteBody {
     pub mode: crate::config::RouteMode,
     pub conditions: IndexMap<String, CxlSource>,
     pub default: String,
+}
+
+/// Envelope variant body. `body:` / `header:` / `trailer:` inputs live on
+/// [`EnvelopeHeader`], not here — this carries only the framing strategy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct EnvelopeBody {
+    #[serde(default)]
+    pub strategy: EnvelopeStrategy,
+}
+
+/// Envelope framing strategy. This slice ships `preserve`; the consolidation
+/// (`concat`) and synthesizing strategies are additive variants in later slices.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeStrategy {
+    /// One framed document per body grain — today's per-document framing,
+    /// made an explicit, composable stage. Body records pass through with
+    /// their document context and grain unchanged.
+    #[default]
+    Preserve,
 }
 
 /// Merge variant body. `inputs:` lives on `MergeHeader`, not here.
@@ -2431,6 +2523,179 @@ nodes:
         assert!(
             json.contains("long_unique"),
             "a flagged column must emit the key, got: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use crate::config::PipelineConfig;
+
+    /// A minimal pipeline whose body Transform feeds an Envelope node. The
+    /// `{envelope_block}` placeholder carries the node's config under test.
+    fn pipeline_with_envelope(envelope_block: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: envelope_cfg
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: id, type: int }}
+  - type: transform
+    name: body
+    input: src
+    config:
+      cxl: "emit id = id"
+{envelope_block}"#
+        )
+    }
+
+    /// Locate the single Envelope node in a parsed config.
+    fn envelope_of(config: &PipelineConfig) -> (&EnvelopeHeader, &EnvelopeBody) {
+        config
+            .nodes
+            .iter()
+            .find_map(|n| match &n.value {
+                PipelineNode::Envelope { header, config } => Some((header, config)),
+                _ => None,
+            })
+            .expect("config has an envelope node")
+    }
+
+    #[test]
+    fn envelope_preserve_parses_with_body_and_strategy() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    \
+             config: { strategy: preserve }\n",
+        );
+        let config: PipelineConfig = crate::yaml::from_str(&yaml).expect("parse envelope node");
+        let (header, body) = envelope_of(&config);
+        assert_eq!(header.name, "framed");
+        assert_eq!(header.body.value.name(), "body");
+        assert!(header.header.is_none(), "no header port wired");
+        assert!(header.trailer.is_none(), "no trailer port wired");
+        assert_eq!(body.strategy, EnvelopeStrategy::Preserve);
+    }
+
+    #[test]
+    fn envelope_strategy_defaults_to_preserve() {
+        // An empty `config: {}` selects the default strategy, which is the
+        // only variant this slice ships.
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    config: {}\n",
+        );
+        let config: PipelineConfig =
+            crate::yaml::from_str(&yaml).expect("parse default-strategy envelope");
+        let (_, body) = envelope_of(&config);
+        assert_eq!(
+            body.strategy,
+            EnvelopeStrategy::Preserve,
+            "the default envelope strategy is `preserve`"
+        );
+        // And the standalone enum default agrees.
+        assert_eq!(EnvelopeStrategy::default(), EnvelopeStrategy::Preserve);
+    }
+
+    #[test]
+    fn envelope_node_round_trips_through_serialize() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    \
+             config: { strategy: preserve }\n",
+        );
+        let config: PipelineConfig = crate::yaml::from_str(&yaml).expect("parse");
+        let envelope = config
+            .nodes
+            .iter()
+            .find(|n| matches!(n.value, PipelineNode::Envelope { .. }))
+            .expect("envelope node present");
+        // Serialize just the node and re-parse it — the hand-rolled
+        // `EnvelopeHeader::Serialize` drops spans and the unset ports, so the
+        // round-trip recovers an equal logical shape.
+        let json = serde_json::to_value(&envelope.value).expect("serialize envelope node");
+        let reparsed: PipelineNode =
+            serde_json::from_value(json).expect("re-parse serialized envelope node");
+        match reparsed {
+            PipelineNode::Envelope { header, config } => {
+                assert_eq!(header.name, "framed");
+                assert_eq!(header.body.value.name(), "body");
+                assert!(header.header.is_none());
+                assert!(header.trailer.is_none());
+                assert_eq!(config.strategy, EnvelopeStrategy::Preserve);
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_field_under_config() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    \
+             config: { strategy: preserve, bogus: 1 }\n",
+        );
+        let err = crate::yaml::from_str::<PipelineConfig>(&yaml)
+            .expect_err("unknown config field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "error should name the field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn envelope_requires_body_input() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    config: { strategy: preserve }\n",
+        );
+        let err = crate::yaml::from_str::<PipelineConfig>(&yaml)
+            .expect_err("missing body input must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("body"),
+            "error should name the missing `body`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_wired_header_port() {
+        // A wired `header:` is accepted by the YAML shape but rejected at plan
+        // validation this release — `preserve` reads only the body's own
+        // ambient envelope. Pin the not-yet-supported message.
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    header: body\n    \
+             config: { strategy: preserve }\n",
+        );
+        let err = crate::config::parse_config(&yaml)
+            .expect_err("a wired header port must be rejected at validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("envelope node 'framed'")
+                && msg.contains("`header`")
+                && msg.contains("not yet supported"),
+            "error must explain the not-yet-supported header wiring, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_wired_trailer_port() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    trailer: body\n    \
+             config: { strategy: preserve }\n",
+        );
+        let err = crate::config::parse_config(&yaml)
+            .expect_err("a wired trailer port must be rejected at validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("envelope node 'framed'")
+                && msg.contains("`trailer`")
+                && msg.contains("not yet supported"),
+            "error must explain the not-yet-supported trailer wiring, got: {msg}"
         );
     }
 }

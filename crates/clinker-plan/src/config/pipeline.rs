@@ -765,6 +765,7 @@ impl PipelineConfig {
                 | PipelineNode::Merge { .. }
                 | PipelineNode::Reshape { .. }
                 | PipelineNode::Cull { .. }
+                | PipelineNode::Envelope { .. }
                 | PipelineNode::Composition { .. }
                 | PipelineNode::Combine { .. } => None,
             })
@@ -1257,6 +1258,16 @@ impl PipelineConfig {
                 PipelineNode::Combine { header, .. } => {
                     for node_input in header.input.values() {
                         wire(&input_full_reference(&node_input.value), None);
+                    }
+                }
+                PipelineNode::Envelope { header, .. } => {
+                    // Wire the body spine plus any wired header / trailer port
+                    // (a wired value is rejected at validation this release,
+                    // but the edge is built unconditionally so the rejection
+                    // diagnostic still resolves the reference).
+                    wire(&input_full_reference(&header.body.value), None);
+                    for inp in [&header.header, &header.trailer].into_iter().flatten() {
+                        wire(&input_full_reference(&inp.value), None);
                     }
                 }
             }
@@ -2272,6 +2283,12 @@ fn resolve_all_input_references(
             PipelineNode::Combine { header, .. } => {
                 for (qualifier, node_input) in &header.input {
                     emit(consumer_name, Some(qualifier.as_str()), node_input);
+                }
+            }
+            PipelineNode::Envelope { header, .. } => {
+                emit(consumer_name, None, &header.body);
+                for inp in [&header.header, &header.trailer].into_iter().flatten() {
+                    emit(consumer_name, None, inp);
                 }
             }
         }
@@ -3433,6 +3450,21 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(name),
             })
         }
+        // Envelope lowers to a single-output pass-through carrying the framing
+        // strategy and the body's (unchanged) output schema. A missing typed
+        // entry means bind_schema could not resolve the body input — skip.
+        PipelineNode::Envelope { header, config } => {
+            artifacts.typed.get(name)?;
+            Some(crate::plan::execution::PlanNode::Envelope {
+                name: name.to_string(),
+                span,
+                strategy: config.strategy,
+                body_input: header.body.value.name().to_string(),
+                header_input: header.header.as_ref().map(|i| i.value.name().to_string()),
+                trailer_input: header.trailer.as_ref().map(|i| i.value.name().to_string()),
+                output_schema: schema_from_bound(name),
+            })
+        }
     }
 }
 
@@ -3962,6 +3994,30 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         for (name, decl) in vars {
             if let Some(default) = &decl.default {
                 check_scoped_var_default("vars", name, decl.var_type, default)?;
+            }
+        }
+    }
+
+    // Reject a wired `header:` / `trailer:` port on an Envelope node. The
+    // `preserve` strategy frames each body record with the body's own ambient
+    // envelope and reads no second stream, so an explicit header/trailer input
+    // would silently do nothing. A later release wires them; until then a wired
+    // value is a clear configuration error rather than a no-op.
+    for spanned in &config.nodes {
+        if let PipelineNode::Envelope { header, .. } = &spanned.value {
+            let wired = if header.header.is_some() {
+                Some("header")
+            } else if header.trailer.is_some() {
+                Some("trailer")
+            } else {
+                None
+            };
+            if let Some(port) = wired {
+                return Err(ConfigError::Validation(format!(
+                    "envelope node '{}': explicit `{port}` input wiring is not yet supported — \
+                     omit it to frame with the body's own envelope",
+                    header.name
+                )));
             }
         }
     }

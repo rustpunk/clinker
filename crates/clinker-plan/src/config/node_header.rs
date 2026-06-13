@@ -231,6 +231,69 @@ impl Serialize for CombineHeader {
     }
 }
 
+/// Header for envelope nodes — a required `body:` input plus two optional
+/// `header:` / `trailer:` ports.
+///
+/// The `body:` stream is the records the node frames into documents; the
+/// `header:` and `trailer:` ports name streams whose records prepend / append
+/// to each framed document. This slice accepts both optional ports in the YAML
+/// shape but rejects a *wired* value at plan validation — the `preserve`
+/// strategy frames each body record with the body's own ambient envelope and
+/// reads no second stream. A later release wires them.
+///
+/// Each input reference carries a [`Spanned`] wrapper so a diagnostic on an
+/// undeclared upstream can point at the exact YAML line/column. The
+/// `Serialize` impl is hand-rolled to drop the spans and skip the two unset
+/// optional ports, so the YAML round-trip shape is unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeHeader {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The records this node frames into documents. Required.
+    pub body: Spanned<NodeInput>,
+    /// Optional header-record stream. Accepted in config; a wired value is
+    /// rejected at plan validation this release (its draining lands later).
+    #[serde(default)]
+    pub header: Option<Spanned<NodeInput>>,
+    /// Optional trailer-record stream. Same not-yet-wired status as `header`.
+    #[serde(default)]
+    pub trailer: Option<Spanned<NodeInput>>,
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
+}
+
+impl Serialize for EnvelopeHeader {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = s.serialize_struct("EnvelopeHeader", 6)?;
+        state.serialize_field("name", &self.name)?;
+        if self.description.is_some() {
+            state.serialize_field("description", &self.description)?;
+        } else {
+            state.skip_field("description")?;
+        }
+        state.serialize_field("body", &self.body.value)?;
+        // Emit each optional port only when set, dropping its span. An unset
+        // port is skipped so the round-trip shape matches the authored YAML.
+        match &self.header {
+            Some(h) => state.serialize_field("header", &h.value)?,
+            None => state.skip_field("header")?,
+        }
+        match &self.trailer {
+            Some(t) => state.serialize_field("trailer", &t.value)?,
+            None => state.skip_field("trailer")?,
+        }
+        if self.notes.is_some() {
+            state.serialize_field("_notes", &self.notes)?;
+        } else {
+            state.skip_field("_notes")?;
+        }
+        state.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

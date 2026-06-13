@@ -5,7 +5,7 @@ A Clinker pipeline is a single flat `nodes:` list. Every entry carries a
 taxonomy**. There is no separate "join section" or "filter section":
 records flow through one homogeneous graph of typed nodes, wired together
 by [`input:` / `inputs:`](../pipelines/structure.md#wiring-input-and-inputs).
-This part documents the eight record-processing node kinds; a ninth,
+This part documents the nine record-processing node kinds; a tenth,
 [Composition](../pipelines/compositions.md), is a call-site that inlines a
 reusable sub-pipeline and is covered under Pipelines.
 
@@ -23,6 +23,7 @@ nodes, and leaves at an Output:
 | [Aggregate](aggregate.md) | Grouped or windowed reduction. | 1 → 1 | Blocking (or streaming when sorted) |
 | [Reshape](reshape.md) | Pivot / unpivot between wide and long record shapes. | 1 → 1 | Blocking |
 | [Cull](cull.md) | Per-correlation-group removal on a group-level predicate, with a `removed_to` side-output port. | 1 → 2 | Blocking |
+| [Envelope](envelope.md) | Frames a body stream into per-document documents; a composable framing stage. | 1 → 1 | Streaming |
 | [Output](output.md) | Writes records to a sink; the exit point. | 1 → 0 | Streaming |
 
 ## Streaming vs blocking
