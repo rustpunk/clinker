@@ -30,6 +30,7 @@ fn run_reshape(
 /// The full observable surface of a Reshape run: counters, DLQ entries, the
 /// rendered CSV output, and the run's cumulative on-disk spill volume. Spill
 /// tests assert `cumulative_spill_bytes > 0` to prove the disk path fired.
+#[derive(Debug)]
 struct ReshapeReport {
     counters: PipelineCounters,
     dlq_entries: Vec<DlqEntry>,
@@ -470,6 +471,53 @@ nodes:
     )
 }
 
+/// SCD spill pipeline with NO `order_by`, so within-group emit order is the
+/// records' arrival order. Used to prove a spilled group reloads in arrival
+/// order: with an `order_by`, a stable re-sort would mask a reorder, but with
+/// no `order_by` the within-group order is exactly the input order and any
+/// spill-induced reordering shows up directly in the output.
+fn scd_spill_pipeline_no_order(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: reshape_scd_spill_no_order
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: test.csv
+      schema:
+        - {{ name: employee_id, type: string }}
+        - {{ name: plan_start, type: int }}
+        - {{ name: plan_end, type: int }}
+        - {{ name: status, type: string }}
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      rules:
+        - name: fix_long_plan
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              plan_end: "plan_start"
+  - type: output
+    name: out
+    input: backfill
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
 /// Build a wide SCD input: `groups` employees, each with `rows_per_group`
 /// plan rows, the last of which trips the long-gap rule. Returns the CSV and
 /// the count of rows expected to trigger (one per group).
@@ -546,66 +594,96 @@ fn reshape_spills_under_memory_pressure() {
 }
 
 #[test]
-fn reshape_hysteresis_no_thrash() {
-    // A single group sized to straddle a small budget must still produce
-    // correct output: the buffer spills resident slices and reloads them at
-    // finalize, and the run completes without error (no per-record thrash
-    // collapse, no lost rows). The lone group's trigger row both mutates and
-    // synthesizes, so the reloaded group must re-run synthesis correctly.
-    let (csv, _) = scd_input(1, 400);
+fn reshape_spill_preserves_within_group_arrival_order() {
+    // A spilled group must emit in arrival order, identical to a resident
+    // group — output must not depend on the memory budget. With NO `order_by`,
+    // within-group order IS arrival order, so a spill-induced reorder shows up
+    // directly in the output (an `order_by` would stably re-sort and mask it).
+    // One employee, 50 rows whose `status` carries the arrival index, none
+    // triggering, so the output is the input rows in order. An 18K budget
+    // (≈14.4K soft) sits just below the single group's ≈15.6K footprint, so
+    // the group exceeds the soft threshold and partition-spills across buckets
+    // (the case that can reorder), yet still fits the finalize reload under
+    // the 18K hard limit. A 512M budget keeps it resident for the baseline.
+    let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
+    for r in 0..50u32 {
+        // Small gaps (plan_start == plan_end) so no row triggers; `status`
+        // pins each row's arrival index for an order-sensitive comparison.
+        csv.push_str(&format!("E,{},{},seq-{r:04}\n", r * 10, r * 10));
+    }
 
-    let report = run_reshape_report(&scd_spill_pipeline("8K"), &csv).unwrap();
-    assert!(report.dlq_entries.is_empty(), "no DLQ entries under spill");
+    let spilled = run_reshape_report(&scd_spill_pipeline_no_order("18K"), &csv).unwrap();
+    let in_memory = run_reshape_report(&scd_spill_pipeline_no_order("512M"), &csv).unwrap();
+
+    assert!(spilled.dlq_entries.is_empty(), "no DLQ entries under spill");
     assert!(
-        report.cumulative_spill_bytes > 0,
-        "the single large group trips the budget and spills"
+        spilled.cumulative_spill_bytes > 0,
+        "the single group must partition-spill under the 4K budget"
     );
-
-    // 400 originals + 1 synthesized row, all for the one employee.
-    let data_lines: Vec<&str> = report
+    assert_eq!(
+        in_memory.cumulative_spill_bytes, 0,
+        "the 512M budget keeps the group resident"
+    );
+    // Row-for-row identity (NOT a sorted-set comparison): a reorder across the
+    // spill round-trip is a hard failure here.
+    assert_eq!(
+        spilled.output, in_memory.output,
+        "a spilled group must emit byte-identical to the resident group"
+    );
+    // And the order is the input order: seq-0000, seq-0001, … seq-0049.
+    let seqs: Vec<&str> = spilled
         .output
         .lines()
         .skip(1)
         .filter(|l| !l.is_empty())
+        .map(|l| l.rsplit(',').next().unwrap())
         .collect();
+    let expected: Vec<String> = (0..50).map(|r| format!("seq-{r:04}")).collect();
     assert_eq!(
-        data_lines.len(),
-        401,
-        "400 originals + 1 synthesized survive the spill/reload round-trip"
+        seqs, expected,
+        "the spilled group must emit in arrival order"
     );
-    let synth_count = report
-        .output
-        .lines()
-        .filter(|l| l.contains("synthesized"))
-        .count();
-    assert_eq!(synth_count, 1, "exactly one synthesized row for the group");
 }
 
 #[test]
 fn reshape_skew_single_giant_group() {
     // One partition dwarfs the rest: employee-00000 holds 600 rows while 50
-    // other employees hold a handful each. The giant group alone exceeds the
-    // budget, so it must spill INCREMENTALLY (sliced by arrival hash) while
-    // the small groups stay resident. Correctness across the skewed spill is
-    // the gate: the giant group's trigger still mutates + synthesizes, and
-    // every small group passes through untouched.
+    // others hold a handful each. The giant group exceeds the soft threshold,
+    // so it must spill INCREMENTALLY (sliced by arrival hash) rather than be
+    // buffered whole — and the resident peak must stay bounded near the budget
+    // even though the giant group's total is several times larger. The budget
+    // is sized so the giant group still fits the finalize reload (it is not a
+    // fail-loud case — see `reshape_giant_group_exceeds_budget_fails_loud`).
     let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
-    // Giant group: 599 normal rows + 1 trigger row.
     for r in 0..599 {
         csv.push_str(&format!("employee-00000,{},{},base\n", r * 10, r * 10));
     }
     csv.push_str("employee-00000,1000,100,base\n");
-    // 50 small groups, 2 rows each, none triggering.
     for g in 1..=50 {
         csv.push_str(&format!("employee-{g:05},10,10,base\n"));
         csv.push_str(&format!("employee-{g:05},20,20,base\n"));
     }
 
-    let report = run_reshape_report(&scd_spill_pipeline("16K"), &csv).unwrap();
+    // 224K hard / ≈179K soft. The giant group (~187 KB) exceeds the soft
+    // threshold — so it partition-spills incrementally rather than being
+    // buffered whole — yet still fits the finalize reload under the 224K hard
+    // limit (this is the success path, not the fail-loud case). The small
+    // groups stay resident under the budget.
+    let report = run_reshape_report(&scd_spill_pipeline("224K"), &csv).unwrap();
     assert!(report.dlq_entries.is_empty(), "no DLQ entries under skew");
+
+    // The giant group went to disk: spill fired and evicted real volume. A
+    // single group that fits finalize can only spill its overflow above the
+    // soft threshold (≈ group − soft), so the volume is modest by design — the
+    // point is that eviction happened incrementally, not that the whole group
+    // was written. The bounded resident peak and arrival-order preservation
+    // under partition slicing are asserted directly against the buffer in the
+    // `spill_stops_at_soft_threshold_without_draining_all_groups` and
+    // `partition_spill_preserves_arrival_order` unit tests, which can observe
+    // the per-group resident bytes the run-level metric cannot isolate.
     assert!(
         report.cumulative_spill_bytes > 0,
-        "the giant group trips the budget and spills"
+        "the giant group must trip the soft threshold and evict its overflow to disk"
     );
 
     // Giant group: 600 originals + 1 synthesized. Small groups: 100 rows.
@@ -630,13 +708,35 @@ fn reshape_skew_single_giant_group() {
         synth_count, 1,
         "only the giant group's trigger synthesizes a row"
     );
-    // A small group passes through unchanged.
     assert!(
         report
             .output
             .lines()
             .any(|l| l == "employee-00001,10,10,base"),
         "small groups pass through untouched while the giant group spills"
+    );
+}
+
+#[test]
+fn reshape_giant_group_exceeds_budget_fails_loud() {
+    // The no-cascade contract requires the WHOLE correlation group resident at
+    // finalize to observe the rules. A single group larger than the memory
+    // budget therefore has no in-budget representation: skew slicing bounds the
+    // ingest peak, but the finalize reload still needs the whole group. Rather
+    // than OOM, the run must fail loud with a clear diagnostic naming the
+    // single-group limitation.
+    let (csv, _) = scd_input(1, 400); // one ~125 KB group
+
+    let err = run_reshape_report(&scd_spill_pipeline("8K"), &csv)
+        .expect_err("a single group larger than the budget must fail loud, not OOM");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("single Reshape correlation group"),
+        "the diagnostic must name the giant-group limitation: {rendered}"
+    );
+    assert!(
+        rendered.contains("memory budget") && rendered.contains("no-cascade"),
+        "the diagnostic must explain why one group must fit the budget: {rendered}"
     );
 }
 

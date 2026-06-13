@@ -203,3 +203,68 @@ fn synthesize_copy_from_none_missing_override_rejected() {
         &["copy_from: none", "must override every column", "label"],
     );
 }
+
+#[test]
+fn doc_context_reference_in_rule_rejected() {
+    // Reshape spills per-group input records to disk under memory pressure and
+    // re-runs the rules on reload, but the spill round-trip does not carry
+    // document envelope context, so a `$doc` reference would resolve to null
+    // for a spilled group and to the real envelope for a resident one —
+    // output that depends on the memory budget. The bind-time guard rejects
+    // any `$doc` reference in a `when` / `mutate.set` / `synthesize` fragment
+    // until envelope context survives the spill round-trip.
+    //
+    // The source declares an XML envelope so `$doc.BatchInfo.batch_id`
+    // type-resolves; the guard fires on the resolved reference, not a parse
+    // error.
+    let yaml = r#"
+pipeline:
+  name: reshape_doc_guard
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          BatchInfo:
+            extract: { xml_path: "/doc/BatchInfo" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: int }
+        - { name: note, type: string }
+  - type: reshape
+    name: rs
+    input: payments
+    config:
+      partition_by: [account]
+      rules:
+        - name: stamp_batch
+          when: "amount > 0"
+          mutate:
+            set:
+              note: "$doc.BatchInfo.batch_id"
+  - type: output
+    name: out
+    input: rs
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let diags = compile_diagnostics(yaml);
+    assert_e200_contains(
+        &diags,
+        &[
+            "references `$doc` document context",
+            "Reshape spills per-group state",
+            "current limitation",
+        ],
+    );
+}

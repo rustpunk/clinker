@@ -1237,11 +1237,17 @@ fn bind_reshape(
         }
     }
 
+    // Typed programs for every rule fragment, retained so the `$doc`
+    // envelope-reference guard below can walk them once the per-rule
+    // typechecks have all run. Each is `(label, typed)` where `label` names
+    // the rule fragment for the guard's diagnostic.
+    let mut typed_fragments: Vec<(String, TypedProgram)> = Vec::new();
+
     // Per-rule predicate + assignment typechecks and invariants.
     for rule in &config.rules {
         // `when` predicate compiles as a row filter.
         let when_src = format!("filter {}", rule.when.source);
-        if let Err(d) = typecheck_cxl(
+        match typecheck_cxl(
             &format!("{name}:{}:when", rule.name),
             &when_src,
             upstream,
@@ -1249,8 +1255,11 @@ fn bind_reshape(
             span,
             scoped_vars,
         ) {
-            diags.push(d);
-            ok = false;
+            Ok(typed) => typed_fragments.push((format!("rule {:?} `when`", rule.name), typed)),
+            Err(d) => {
+                diags.push(d);
+                ok = false;
+            }
         }
 
         if let Some(mutate) = &rule.mutate {
@@ -1299,7 +1308,7 @@ fn bind_reshape(
                     );
                     ok = false;
                 }
-                if let Err(d) = typecheck_cxl(
+                match typecheck_cxl(
                     &format!("{name}:{}:set.{field}", rule.name),
                     &format!("emit {field} = {}", value.source),
                     upstream,
@@ -1307,8 +1316,12 @@ fn bind_reshape(
                     span,
                     scoped_vars,
                 ) {
-                    diags.push(d);
-                    ok = false;
+                    Ok(typed) => typed_fragments
+                        .push((format!("rule {:?} `mutate.set.{field}`", rule.name), typed)),
+                    Err(d) => {
+                        diags.push(d);
+                        ok = false;
+                    }
                 }
             }
         }
@@ -1345,7 +1358,7 @@ fn bind_reshape(
                 }
             }
             for (field, value) in &synth.overrides {
-                if let Err(d) = typecheck_cxl(
+                match typecheck_cxl(
                     &format!("{name}:{}:override.{field}", rule.name),
                     &format!("emit {field} = {}", value.source),
                     upstream,
@@ -1353,10 +1366,67 @@ fn bind_reshape(
                     span,
                     scoped_vars,
                 ) {
-                    diags.push(d);
-                    ok = false;
+                    Ok(typed) => typed_fragments.push((
+                        format!("rule {:?} `synthesize.overrides.{field}`", rule.name),
+                        typed,
+                    )),
+                    Err(d) => {
+                        diags.push(d);
+                        ok = false;
+                    }
                 }
             }
+        }
+    }
+
+    // Reject `$doc` envelope references in any rule fragment. Reshape spills
+    // its per-group input records to disk under memory pressure and re-runs
+    // the rules on reload, but the spill envelope does not carry document
+    // context — a reloaded record resolves `$doc.*` to null, so a rule that
+    // reads `$doc` would produce output that depends on whether the group
+    // spilled (i.e. on the memory budget). Rather than silently differ, fail
+    // loud here until envelope context survives the spill round-trip.
+    if ok {
+        let programs: Vec<(&str, &TypedProgram)> = typed_fragments
+            .iter()
+            .map(|(label, typed)| (label.as_str(), typed))
+            .collect();
+        let doc_paths = cxl::analyzer::doc_paths::collect_doc_paths(&programs);
+        // Any `$doc` reference disqualifies the rule — both statically-resolved
+        // paths (`by_node`) and accesses whose index could not be resolved
+        // (`unresolvable`, e.g. a computed index). The first fragment label, in
+        // deterministic order, names the offender.
+        let referencing_fragment = doc_paths
+            .by_node
+            .values()
+            .flat_map(|labels| labels.iter())
+            .map(String::as_str)
+            .chain(
+                doc_paths
+                    .unresolvable
+                    .iter()
+                    .map(|(label, _)| label.as_str()),
+            )
+            .min();
+        if let Some(first_label) = referencing_fragment {
+            diags.push(
+                Diagnostic::error(
+                    "E200",
+                    format!(
+                        "reshape {name:?}: {first_label} references `$doc` document context, \
+                         which Reshape rules cannot use yet — Reshape spills per-group state to \
+                         disk under memory pressure and the spill round-trip does not preserve \
+                         envelope context, so a `$doc` reference would resolve differently for a \
+                         spilled group. This is a current limitation."
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "move the `$doc` lookup into an upstream Transform that copies the value into \
+                     a record column, then reference that column in the Reshape rule",
+                ),
+            );
+            ok = false;
         }
     }
 

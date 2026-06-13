@@ -132,7 +132,9 @@ Reshape stamps `$meta.synthetic`, `$meta.synthesized_by`, and `$meta.mutated_by`
 
 ### Bounded memory and spill
 
-The example's `memory.limit: "16K"` with `backpressure: spill` is deliberately tiny so the run exercises Reshape's disk-spill path on a small fixture. Reshape buffers each employee's group, and when the budget trips it spills the raw input records to disk and re-runs synthesis on reload — the output is identical whether a group stayed in memory or round-tripped through disk. The per-stage spill volume appears in `clinker run --explain` and in the post-run spill summary. For real workloads, drop the artificial limit (the default budget is 512 MB) and Reshape stays in memory until it genuinely needs to spill. See [Reshape's memory model](../nodes/reshape.md#memory-model) and [Memory & Spill](../ops/memory.md) for the full picture.
+The example's `memory.limit: "16K"` with `backpressure: spill` is deliberately tiny so the run exercises Reshape's disk-spill path on a small fixture. Reshape buffers each employee's group, and when the budget trips it spills the raw input records to disk and re-runs synthesis on reload — the output is identical whether a group stayed in memory or round-tripped through disk. The per-stage spill volume appears in `clinker run --explain` and in the post-run spill summary. For real workloads, drop the artificial limit (the default budget is 512 MB) and Reshape stays in memory until it genuinely needs to spill.
+
+Two limits apply: a *single* correlation group must still fit the memory budget at finalize (the no-cascade contract reloads the whole group to apply its rules — a group larger than the budget fails loud rather than crashing), and Reshape rules cannot reference `$doc` document context while spill is in play (such a pipeline is rejected at compile time). Each employee's group in this example is tiny, so neither limit is reached here. See [Reshape's memory model](../nodes/reshape.md#memory-model) and [Memory & Spill](../ops/memory.md) for the full picture.
 
 ### Idempotence
 

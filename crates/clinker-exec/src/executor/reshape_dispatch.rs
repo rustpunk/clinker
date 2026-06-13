@@ -56,7 +56,9 @@ use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
     push_dlq, source_file_arc_of, source_name_arc_of, tee_emit_to_region_input_buffers,
 };
-use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer};
+use crate::pipeline::memory::{
+    ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_core_types::dlq::{DlqErrorCategory, stage_reshape_mutation_conflict};
 use clinker_plan::config::pipeline_node::{
@@ -274,29 +276,42 @@ fn run_reshape_grouped(
     // slices of one oversized group) to disk whenever the arbitrator reports
     // the soft threshold is crossed. `handle` mirrors the live resident-byte
     // footprint for the arbitration round.
+    // The spill path needs only the arbitrator and the spill root, not the
+    // whole executor context — clone the cheap handles up front so the per-
+    // record loop borrows neither `ctx` mutably nor immutably across the call.
+    let budget = Arc::clone(&ctx.memory_budget);
+    let spill_root = Arc::clone(&ctx.spill_root_path);
+
     let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&input_schema), spill_compress);
     for (record, row_num) in input {
         let key = partition_key(&record, &config.partition_by);
         buffer.push(key, record, row_num);
         handle.set_bytes(buffer.resident_bytes() as u64);
-        // Poll the arbitrator at every admission. `should_spill` trips on RSS
-        // or the summed consumer bytes crossing the soft limit and flips this
-        // consumer's spill-request flag when the policy elects it; either trip
-        // evicts groups until the resident footprint drops back under budget.
-        if ctx.memory_budget.should_spill() || handle.take_spill_request() {
-            buffer.spill_until_under_budget(name, ctx)?;
+        // Poll for self-spill pressure at every admission. `should_spill_self`
+        // updates the peak and reports the soft-threshold crossing WITHOUT
+        // running the pausing arbitration round: Reshape relieves pressure by
+        // spilling its OWN buffer in-thread, and that round can elect and
+        // `pause()` a back-pressureable Source in a concurrent DAG branch that
+        // Reshape never resumes — the deadlock the hash aggregator avoids the
+        // same way. `take_spill_request` still honors a spill nudge another
+        // stage's arbitration round set on this consumer.
+        if budget.should_spill_self() || handle.take_spill_request() {
+            buffer.spill_until_under_budget(name, &budget, &spill_root, handle)?;
             handle.set_bytes(buffer.resident_bytes() as u64);
         }
     }
 
     // Finalize: stream each group back in first-seen order (from memory when
-    // it never spilled, else reloaded from its spill files), re-sort, and run
-    // the rule kernel unchanged. Releasing each group's resident bytes as it
-    // finalizes keeps the buffer footprint shrinking through the drain.
+    // it never spilled, else reloaded from its spill files and restored to
+    // arrival order), re-sort by `order_by`, and run the rule kernel
+    // unchanged. Releasing each group's resident bytes as it finalizes keeps
+    // the buffer footprint shrinking through the drain. The hard limit gates
+    // a single correlation group that is too large to observe whole.
+    let hard_limit = budget.hard_limit();
     let mut out: Vec<(Record, u64)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &key)?;
+        let mut group = buffer.take_group(name, &key, hard_limit)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
         if !config.order_by.is_empty() {
             sort_group(&mut group, &config.order_by);
@@ -331,9 +346,15 @@ struct ReshapeGroupState {
     /// Estimated heap bytes of `resident`, maintained incrementally so the
     /// buffer's running total never rescans the group.
     resident_bytes: usize,
-    /// Input-record slices already written to disk, oldest first. Reloaded in
-    /// order at finalize and concatenated ahead of `resident` so arrival
-    /// order survives the round-trip.
+    /// Estimated in-memory heap bytes of the records already spilled to disk,
+    /// summed at spill time. Drives the finalize-budget guard: a group whose
+    /// reloaded footprint (`resident_bytes + spilled_bytes`) exceeds the hard
+    /// limit cannot be observed whole, so finalize fails loud rather than
+    /// OOMing on reload.
+    spilled_bytes: usize,
+    /// Input-record slices already written to disk, oldest first. Reloaded at
+    /// finalize and merged with `resident` back into arrival order (by row
+    /// number) so a spilled group emits identically to a resident one.
     spilled: Vec<SpillFile<u64>>,
 }
 
@@ -342,6 +363,7 @@ impl ReshapeGroupState {
         Self {
             resident: Vec::new(),
             resident_bytes: 0,
+            spilled_bytes: 0,
             spilled: Vec::new(),
         }
     }
@@ -405,25 +427,37 @@ impl ReshapeGroupBuffer {
         std::mem::take(&mut self.group_order)
     }
 
-    /// Evict resident groups to disk until the arbitrator no longer reports
-    /// pressure (or nothing resident remains to evict).
+    /// Evict resident groups to disk, largest-first, until the resident
+    /// footprint drops back under the soft threshold (or nothing resident
+    /// remains to evict). Refreshes `handle` to the live resident total after
+    /// each eviction so the loop stops as soon as the buffer is back under
+    /// budget rather than draining every group.
     ///
-    /// Largest-resident-group-first, matching the grace-hash Largest-Size
+    /// Largest-resident-group-first matches the grace-hash Largest-Size
     /// victim policy: freeing the biggest holder reclaims the most headroom
-    /// per spill. A single group whose resident tail alone still trips the
+    /// per spill. A single group whose resident tail alone still exceeds the
     /// budget is sliced incrementally by arrival hash rather than buffered
-    /// whole — bounded-memory must hold even for one giant correlation group.
+    /// whole — the cross-group resident peak stays bounded even under one
+    /// giant correlation group.
+    ///
+    /// The stop condition keys on `self.resident_bytes` rather than the
+    /// arbitrator's `should_spill_self`: that poll reads the monotonic
+    /// `peak_rss` high-water, which never falls once crossed, so under a
+    /// budget below baseline RSS it would report pressure forever and evict
+    /// every group. The resident-byte total is the live, decreasing quantity
+    /// that actually reflects what spilling reclaims.
     fn spill_until_under_budget(
         &mut self,
         node_name: &str,
-        ctx: &mut ExecutorContext<'_>,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        handle: &Arc<ConsumerHandle>,
     ) -> Result<(), PipelineError> {
-        let soft = ctx.memory_budget.spill_threshold_bytes() as usize;
-        // Spill while pressure persists. Re-poll RSS via `should_spill_self`
-        // (no arbitration round — that could pause the drained-out Source) so
-        // a transient RSS spike that the OS reclaims lets accumulation resume
-        // in memory rather than thrashing one spill per record.
-        while self.resident_bytes > 0 && ctx.memory_budget.should_spill_self() {
+        let soft = budget.spill_threshold_bytes() as usize;
+        // A zero/absent soft limit means "spill everything on any trip" — the
+        // caller only enters this loop when the arbitrator already reported
+        // pressure, so fall back to draining all resident groups.
+        while self.resident_bytes > soft {
             let Some(key) = self.largest_resident_group() else {
                 break;
             };
@@ -432,10 +466,11 @@ impl ReshapeGroupBuffer {
                 // One group dwarfs the budget on its own: slice it across
                 // partitions so each wave evicts a fraction, never the whole
                 // group at once.
-                self.spill_group_partitioned(node_name, ctx, &key, soft)?;
+                self.spill_group_partitioned(node_name, budget, spill_root, &key, soft)?;
             } else {
-                self.spill_group_whole(node_name, ctx, &key)?;
+                self.spill_group_whole(node_name, budget, spill_root, &key)?;
             }
+            handle.set_bytes(self.resident_bytes as u64);
         }
         Ok(())
     }
@@ -454,7 +489,8 @@ impl ReshapeGroupBuffer {
     fn spill_group_whole(
         &mut self,
         node_name: &str,
-        ctx: &mut ExecutorContext<'_>,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
         key: &[GroupByKey],
     ) -> Result<(), PipelineError> {
         let state = self
@@ -466,16 +502,21 @@ impl ReshapeGroupBuffer {
         self.resident_bytes -= freed;
         let file = write_spill_slice(
             node_name,
-            ctx,
+            budget,
+            spill_root,
             &self.input_schema,
             self.compress,
             records.iter(),
         )?;
-        self.groups
+        let state = self
+            .groups
             .get_mut(key)
-            .expect("spill target group present")
-            .spilled
-            .push(file);
+            .expect("spill target group present");
+        state.spilled.push(file);
+        // Carry the evicted records' in-memory footprint into the group's
+        // on-disk total so the finalize-budget guard can size the reloaded
+        // group without re-reading the file.
+        state.spilled_bytes += freed;
         Ok(())
     }
 
@@ -487,7 +528,8 @@ impl ReshapeGroupBuffer {
     fn spill_group_partitioned(
         &mut self,
         node_name: &str,
-        ctx: &mut ExecutorContext<'_>,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
         key: &[GroupByKey],
         soft: usize,
     ) -> Result<(), PipelineError> {
@@ -531,7 +573,8 @@ impl ReshapeGroupBuffer {
             remaining -= bucket_bytes[p];
             let file = write_spill_slice(
                 node_name,
-                ctx,
+                budget,
+                spill_root,
                 &self.input_schema,
                 self.compress,
                 slice.iter(),
@@ -541,28 +584,70 @@ impl ReshapeGroupBuffer {
 
         // Re-seat the un-spilled buckets as the group's resident tail (its
         // byte total is `remaining`) and record the freshly written slices.
+        // The spilled fraction is `total_bytes - remaining`, accumulated into
+        // the group's on-disk total for the finalize-budget guard.
         let tail: Vec<(Record, u64)> = buckets.into_iter().flatten().collect();
+        let spilled_now = total_bytes - remaining;
         let state = self
             .groups
             .get_mut(key)
             .expect("partition-spill target group present");
         state.resident = tail;
         state.resident_bytes = remaining;
+        state.spilled_bytes += spilled_now;
         state.spilled.extend(spilled_files);
         self.resident_bytes += remaining;
         Ok(())
     }
 
-    /// Reload one group's full record set in arrival order: every spilled
-    /// slice (oldest first) followed by the resident tail. Releases the
-    /// group's resident bytes from the running total as it drains.
+    /// Reload one group's full record set in original arrival order, ready
+    /// for the no-cascade rule kernel.
+    ///
+    /// No-cascade requires the WHOLE group resident at finalize (every rule
+    /// observes the complete group), so a group whose reloaded footprint
+    /// (`resident_bytes + spilled_bytes`) exceeds `hard_limit` cannot be
+    /// observed within budget. The skew slicing bounds the *ingest* peak, but
+    /// one correlation group bigger than the finalize budget has no in-budget
+    /// representation — fail loud here rather than OOM on reload. A future
+    /// two-pass finalize could lift this.
+    ///
+    /// A spilled group's records arrive in spill-file then bucket order, not
+    /// arrival order, so the merged group is re-sorted by row number (the
+    /// `u64` payload is the source arrival index) — a spilled group then
+    /// emits identically to a resident one, which is essential because output
+    /// must not depend on the memory budget. The never-spilled fast path
+    /// keeps its already-ordered resident Vec untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when a single correlation group's
+    /// reloaded footprint exceeds `hard_limit`, or when a spill file cannot
+    /// be read back.
     fn take_group(
         &mut self,
         node_name: &str,
         key: &[GroupByKey],
+        hard_limit: u64,
     ) -> Result<Vec<(Record, u64)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
+
+        // Bounded-memory pillar: a group larger than the finalize budget
+        // cannot be observed whole, so refuse it rather than OOM on reload.
+        let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
+        if hard_limit > 0 && group_bytes > hard_limit {
+            return Err(reshape_giant_group_error(
+                node_name,
+                group_bytes,
+                hard_limit,
+            ));
+        }
+
+        if state.spilled.is_empty() {
+            // Fast path: never spilled, resident Vec already in arrival order.
+            return Ok(state.resident);
+        }
+
         let mut group: Vec<(Record, u64)> = Vec::new();
         for file in &state.spilled {
             let reader = file
@@ -573,6 +658,10 @@ impl ReshapeGroupBuffer {
             }
         }
         group.extend(state.resident);
+        // Restore arrival order: spill round-trips reorder records by file and
+        // bucket, so a spilled group must be re-sorted by its source row
+        // number to emit identically to a resident group.
+        group.sort_by_key(|(_, row_num)| *row_num);
         Ok(group)
     }
 }
@@ -582,17 +671,15 @@ impl ReshapeGroupBuffer {
 /// totals so `--explain` calibration and the disk-spill cap both see it.
 fn write_spill_slice<'a>(
     node_name: &str,
-    ctx: &mut ExecutorContext<'_>,
+    budget: &MemoryArbitrator,
+    spill_root: &std::path::Path,
     input_schema: &Arc<Schema>,
     compress: bool,
     records: impl Iterator<Item = &'a (Record, u64)>,
 ) -> Result<SpillFile<u64>, PipelineError> {
-    let mut writer: SpillWriter<u64> = SpillWriter::new(
-        Arc::clone(input_schema),
-        Some(&ctx.spill_root_path),
-        compress,
-    )
-    .map_err(|e| reshape_spill_error(node_name, e))?;
+    let mut writer: SpillWriter<u64> =
+        SpillWriter::new(Arc::clone(input_schema), Some(spill_root), compress)
+            .map_err(|e| reshape_spill_error(node_name, e))?;
     for (record, row_num) in records {
         writer
             .write_pair(record, row_num)
@@ -602,7 +689,7 @@ fn write_spill_slice<'a>(
         .finish()
         .map_err(|e| reshape_spill_error(node_name, e))?;
     let bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-    ctx.memory_budget.record_spill_bytes(node_name, bytes);
+    budget.record_spill_bytes(node_name, bytes);
     Ok(file)
 }
 
@@ -658,6 +745,24 @@ fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> Pipeline
         op: "reshape",
         node: node_name.to_string(),
         detail: format!("group-buffer spill failed: {e}"),
+    }
+}
+
+/// Hard error for a single correlation group that exceeds the finalize
+/// memory budget. The no-cascade contract requires the whole group resident
+/// to observe rules, so a group bigger than the budget has no in-budget
+/// representation — fail loud rather than OOM on reload.
+fn reshape_giant_group_error(node_name: &str, group_bytes: u64, hard_limit: u64) -> PipelineError {
+    PipelineError::Internal {
+        op: "reshape",
+        node: node_name.to_string(),
+        detail: format!(
+            "a single Reshape correlation group is ~{group_bytes} bytes, which exceeds the \
+             memory budget of {hard_limit} bytes. Reshape applies its rules against the whole \
+             group at once (the no-cascade contract), so a single group must fit the budget even \
+             though cross-group and ingest-time peaks spill to disk. Raise `memory.limit`, or \
+             partition the input so no one correlation group is this large."
+        ),
     }
 }
 
@@ -1045,5 +1150,168 @@ fn reshape_eval_error(
         op: "reshape",
         node: node_name.to_string(),
         detail: format!("rule {rule_name:?} field {field:?} eval failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::memory::NoOpPolicy;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec!["gid".into(), "payload".into()]))
+    }
+
+    /// One record carrying a `gid` group key and a fixed-width `payload`
+    /// string, so each record has a predictable, non-trivial heap footprint.
+    fn rec(schema: &Arc<Schema>, gid: &str, payload: &str) -> Record {
+        Record::new(
+            Arc::clone(schema),
+            vec![Value::String(gid.into()), Value::String(payload.into())],
+        )
+    }
+
+    /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
+    /// RSS is well below it, so `should_spill_self` is driven purely by the
+    /// caller's explicit spill calls rather than the live process RSS.
+    fn arbitrator(soft_bytes: u64) -> MemoryArbitrator {
+        // soft = limit * 0.80, so limit = soft / 0.80.
+        let limit = (soft_bytes as f64 / 0.80) as u64;
+        let arb = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
+        // Keep the RSS arm quiet: a tiny seeded peak never trips the soft
+        // limit, so the buffer's own resident-byte total governs spilling.
+        arb.set_peak_rss_for_test(1);
+        arb
+    }
+
+    /// The single group key these tests partition on.
+    fn single_group_key() -> Vec<GroupByKey> {
+        vec![GroupByKey::Str("g".into())]
+    }
+
+    /// Accumulate `n` records into one group, spilling whenever the resident
+    /// footprint exceeds the arbitrator's soft limit — the same admit-then-
+    /// spill cadence the dispatch loop runs. Returns the populated buffer.
+    fn fill_single_group(
+        schema: &Arc<Schema>,
+        arb: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        n: u64,
+    ) -> ReshapeGroupBuffer {
+        let handle = ConsumerHandle::new();
+        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(schema), true);
+        for row_num in 0..n {
+            let payload = format!("{row_num:063}");
+            buffer.push(single_group_key(), rec(schema, "g", &payload), row_num);
+            handle.set_bytes(buffer.resident_bytes() as u64);
+            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
+                buffer
+                    .spill_until_under_budget("rs", arb, spill_root, &handle)
+                    .unwrap();
+            }
+        }
+        buffer
+    }
+
+    // F2: a group with no `order_by` whose records partition-spill across
+    // buckets must reload in arrival (row-number) order, identical to the
+    // never-spilled path. The bug reassembled by bucket/spill order, making
+    // emit order depend on the memory budget.
+    #[test]
+    fn partition_spill_preserves_arrival_order() {
+        let schema = schema();
+        let spill_root = tempfile::tempdir().unwrap();
+        // One group, 64 records, each ~64-byte payload. Total ~5 KiB; a 512 B
+        // soft limit forces the single group to partition-spill.
+        let arb = arbitrator(512);
+        let key = single_group_key();
+        let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
+        // The group must have spilled (otherwise this asserts nothing).
+        assert!(
+            !buffer.groups[&key].spilled.is_empty(),
+            "the single oversized group must have partition-spilled"
+        );
+        let group = buffer.take_group("rs", &key, 0).unwrap();
+        let row_nums: Vec<u64> = group.iter().map(|(_, rn)| *rn).collect();
+        let expected: Vec<u64> = (0..64).collect();
+        assert_eq!(
+            row_nums, expected,
+            "a partition-spilled group must reload in arrival (row-number) order"
+        );
+    }
+
+    // F3: the spill loop must stop as soon as the resident footprint is back
+    // under the soft threshold — it must NOT evict every resident group. The
+    // bug read the monotonic RSS high-water and drained everything on the
+    // first trip.
+    #[test]
+    fn spill_stops_at_soft_threshold_without_draining_all_groups() {
+        let schema = schema();
+        let spill_root = tempfile::tempdir().unwrap();
+        // 20 small groups, each one ~80-byte record. Soft limit sized to hold
+        // roughly half of them resident.
+        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        for g in 0..20u64 {
+            let payload = format!("{g:063}");
+            buffer.push(
+                vec![GroupByKey::Int(g as i64)],
+                rec(&schema, &g.to_string(), &payload),
+                g,
+            );
+        }
+        let total = buffer.resident_bytes();
+        // Soft = ~40% of the total footprint, so spilling must stop with a
+        // meaningful resident remainder rather than draining to zero.
+        let soft = (total / 2) as u64;
+        let arb = arbitrator(soft.max(1));
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(total as u64);
+
+        buffer
+            .spill_until_under_budget("rs", &arb, spill_root.path(), &handle)
+            .unwrap();
+
+        assert!(
+            buffer.resident_bytes() <= arb.spill_threshold_bytes() as usize,
+            "spill loop must bring the resident footprint under the soft limit: \
+             resident={} soft={}",
+            buffer.resident_bytes(),
+            arb.spill_threshold_bytes()
+        );
+        assert!(
+            buffer.resident_bytes() > 0,
+            "spill loop must NOT drain every group — some must remain resident \
+             under the soft limit (resident={})",
+            buffer.resident_bytes()
+        );
+        // The handle the arbitrator reads must reflect the reduced footprint,
+        // not the stale pre-spill total.
+        assert_eq!(
+            handle.bytes() as usize,
+            buffer.resident_bytes(),
+            "the consumer handle must track the live resident footprint after spilling"
+        );
+    }
+
+    // F4 prerequisite: `take_group` refuses a single correlation group whose
+    // reloaded footprint exceeds the hard limit rather than reloading it and
+    // risking an OOM. The skew slicing bounds ingest peak, not the finalize
+    // reload of one giant group.
+    #[test]
+    fn take_group_rejects_a_group_larger_than_the_hard_limit() {
+        let schema = schema();
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        let key = single_group_key();
+        let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
+        // A hard limit far below the group's reloaded footprint must fail loud.
+        let err = buffer
+            .take_group("rs", &key, 256)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("single Reshape correlation group"),
+            "the diagnostic must name the giant-group limitation: {detail}"
+        );
     }
 }
