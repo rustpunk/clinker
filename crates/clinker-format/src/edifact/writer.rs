@@ -712,6 +712,53 @@ mod tests {
     }
 
     #[test]
+    fn unz_echoes_control_ref_past_split_date_time() {
+        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use indexmap::IndexMap;
+
+        // A UNB whose S004 date/time is transmitted as two separate
+        // elements (date "240101" at index 3, time "1200" at index 4)
+        // rather than the conformant single "240101:1200" composite. The
+        // true control reference "REF1" sits at index 5. Reconstructing the
+        // header from the stashed element list must keep the split verbatim,
+        // and the UNZ echo must skip the time part to name the real
+        // reference so the output validates on re-read.
+        let s = schema();
+        let raw = RecVal::Array(vec![
+            RecVal::String("UNOA:1".into()),
+            RecVal::String("SENDER".into()),
+            RecVal::String("RECEIVER".into()),
+            RecVal::String("240101".into()),
+            RecVal::String("1200".into()),
+            RecVal::String("REF1".into()),
+        ]);
+        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        unb.insert(super::RAW_ELEMENTS_KEY.into(), raw);
+        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
+        record.set_doc_ctx(ctx);
+
+        let cfg = EdifactWriterConfig {
+            interchange_from_doc: Some("unb".into()),
+            segment_newline: false,
+            ..Default::default()
+        };
+        let out = write_all(cfg, &[record], &s);
+        assert!(
+            out.starts_with("UNB+UNOA:1+SENDER+RECEIVER+240101+1200+REF1'"),
+            "split date/time UNB not reconstructed verbatim: {out}"
+        );
+        // UNZ echoes the real reference, not the time part "1200".
+        assert!(out.contains("UNZ+1+REF1'"), "{out}");
+    }
+
+    #[test]
     fn una_emitted_when_enabled() {
         let s = schema();
         let mut cfg = literal_config();
