@@ -291,3 +291,47 @@ pub struct Hl7OutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_newline: Option<bool>,
 }
+
+/// SWIFT MT output options.
+///
+/// The writer re-emits the block-4 `:tag:value` lines from the record stream
+/// and re-frames the single SWIFT envelope around them: the service blocks
+/// 1/2/3 first, then block 4, then the optional block-5 trailer. Each service
+/// block is written from a literal body or echoed from a user-declared `$doc`
+/// section (the `*_from_doc` options name the section the user wrote on the
+/// source — the engine reserves no section name). Block-4 free text is opaque,
+/// so values are written verbatim with no escaping, making the
+/// reader → writer → reader round-trip byte-faithful.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SwiftOutputOptions {
+    /// Literal block-1 (basic header) body written verbatim. Takes precedence
+    /// over `basic_header_from_doc` when both are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basic_header: Option<String>,
+    /// Name of a `$doc` section to echo the block-1 body from, for round-trip
+    /// header reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basic_header_from_doc: Option<String>,
+    /// Literal block-2 (application header) body. Takes precedence over
+    /// `app_header_from_doc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_header: Option<String>,
+    /// Name of a `$doc` section to echo the block-2 body from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_header_from_doc: Option<String>,
+    /// Literal block-3 (user header) body, including any nested `{sub:tag}`
+    /// content written verbatim. Takes precedence over `user_header_from_doc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_header: Option<String>,
+    /// Name of a `$doc` section to echo the block-3 body from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_header_from_doc: Option<String>,
+    /// Literal block-5 (trailer) body, written after block 4 closes. Takes
+    /// precedence over `trailer_from_doc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailer: Option<String>,
+    /// Name of a `$doc` section to echo the block-5 body from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailer_from_doc: Option<String>,
+}

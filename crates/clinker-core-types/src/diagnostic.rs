@@ -83,6 +83,7 @@
 //! | `E339`      | error    | `hl7` output combined with byte-limit `split` (a batch/file envelope is one indivisible FHS..FTS structure) |
 //! | `E340`      | error    | A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time |
 //! | `E341`      | error    | A `$doc.<section>.<field>` access names an envelope section or field a feeding XML/JSON source does not declare |
+//! | `E342`      | error    | `swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope) |
 
 use crate::span::{FileId, Span};
 

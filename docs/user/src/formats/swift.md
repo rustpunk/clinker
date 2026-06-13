@@ -1,15 +1,12 @@
 # SWIFT MT Format
 
-Clinker reads SWIFT MT (FIN) messages alongside CSV, JSON, XML,
+Clinker reads and writes SWIFT MT (FIN) messages alongside CSV, JSON, XML,
 fixed-width, EDIFACT, X12, and HL7 v2. A SWIFT MT message is a finite file
 built from brace-balanced blocks. The reader streams the message body one
 field at a time and surfaces the service blocks as document-envelope
-sections.
-
-> **Reader only.** This page documents reading SWIFT MT into Clinker. A
-> SWIFT MT *writer* (reconstructing the block structure around emitted
-> records) lands separately; until then a SWIFT source pairs with any other
-> output format (CSV, JSON, …).
+sections; the writer inverts the reader exactly, re-framing the block
+structure around emitted records so a read → write → read round-trip is
+byte-faithful.
 
 ## Block structure
 
@@ -156,10 +153,88 @@ rather than producing garbled records:
 A header-only message (no block 4, or an empty block 4) is valid: it
 produces no body records and drains cleanly.
 
+## Writing SWIFT MT
+
+A SWIFT Output node inverts the reader exactly. It re-emits each block-4
+record as a `:tag:value` line and re-frames the single message envelope
+around them: the service blocks 1/2/3 first, then block 4 (`{4:` … `-}`),
+then the optional block-5 trailer. Block-4 free text is opaque, so values are
+written **verbatim with no escaping** — an interior `{`, `}`, a mid-line `-}`,
+a folded continuation break, and an interior blank line all reproduce as data.
+The reader strips exactly the structural separators (braces, the leading `:`,
+the `-}` trailer, the line breaks) and keeps every other byte; the writer
+re-adds exactly those separators and nothing else, so a read → write → read
+round-trip returns byte-identical field values.
+
+Records map by the `tag` and `value` columns. The `block` column is the
+constant `4` discriminator (an empty `block` is treated as block 4, so a
+Transform that projects only `tag`/`value` writes fine); a record carrying a
+`block` other than `4` is rejected, because service blocks are never emitted
+as records — they ride the document context.
+
+```yaml
+nodes:
+  - type: output
+    name: out
+    input: messages
+    config:
+      name: out
+      type: swift
+      path: ./out/message.swift
+      options:
+        basic_header_from_doc: basic
+        app_header_from_doc: app
+        user_header_from_doc: user
+        trailer_from_doc: trailer
+```
+
+Each service block is written from a literal body or echoed from a
+user-declared `$doc` section:
+
+| Option                   | Meaning                                                          |
+| ------------------------ | ---------------------------------------------------------------- |
+| `basic_header`           | Literal block-1 body, written verbatim as `{1:<body>}`.          |
+| `basic_header_from_doc`  | Name of a `$doc` section to echo the block-1 body from.          |
+| `app_header`             | Literal block-2 body.                                            |
+| `app_header_from_doc`    | Name of a `$doc` section to echo the block-2 body from.          |
+| `user_header`            | Literal block-3 body (nested `{sub:tag}` content kept verbatim). |
+| `user_header_from_doc`   | Name of a `$doc` section to echo the block-3 body from.          |
+| `trailer`                | Literal block-5 body, written after block 4 closes.             |
+| `trailer_from_doc`       | Name of a `$doc` section to echo the block-5 body from.          |
+
+The `*_from_doc` options name the section the user declared on the **source**
+— the engine reserves no section name. A literal `*_header` wins over its
+`*_from_doc` companion when both are set; a service block with neither is
+omitted. The `_from_doc` echo reads the block body verbatim from the section's
+`body` field — the same single-field shape the reader writes — so a SWIFT
+source's service blocks (declared as `segment` envelope sections) round-trip
+unchanged when their section names are passed back to the writer here.
+
+The document context that carries the `$doc` sections rides on each body
+record, so the `*_from_doc` echoes require at least one block-4 record to
+read from. A document with **zero** block-4 records emits a valid empty
+message — `{4:` immediately closed by `-}` — wrapped only by the
+**literal-configured** service blocks (`basic_header`, `app_header`,
+`user_header`, `trailer`); the `*_from_doc` echoes are skipped because no
+record carries the document context. Use the literal options when a
+zero-record output must still emit its service blocks.
+
+Block-4 free text has no escape mechanism, so values are written verbatim.
+Almost any value round-trips faithfully, but two shapes are unrepresentable
+when the value is built from arbitrary records (CSV/JSON → Transform →
+SWIFT): a value whose continuation line — a line after a folded line break —
+begins with the block terminator `-}` (which would re-read as an early block
+close) or with a `:` tag marker (which would re-read as a spurious field).
+The writer rejects such a value with a clear error rather than emitting
+silently-corrupt output. Values read from a SWIFT source can never take these
+shapes, so a read → write → read round-trip is always safe.
+
+A SWIFT MT message is a single indivisible envelope, so a `swift` output
+cannot be combined with a byte-limit `split:` block — the pairing is rejected
+at config-validation time (diagnostic `E342`).
+
 ## Limitations
 
-- **Reader only.** A SWIFT MT writer lands separately; today a SWIFT source
-  pairs with any other output format.
 - **UTF-8 only.** SWIFT MT messages are decoded as UTF-8; a non-UTF-8 block
   body is rejected explicitly rather than corrupted silently.
 - **Field-content parsing.** The reader exposes each `:tag:value` line as a

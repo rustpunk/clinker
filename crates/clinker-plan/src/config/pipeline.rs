@@ -3031,6 +3031,11 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 "hl7",
                 "an HL7 v2 batch/file envelope is a single FHS..FTS structure",
             )),
+            OutputFormat::Swift(_) => Some((
+                "E342",
+                "swift",
+                "a SWIFT MT message is a single brace-balanced {1:..}..{5:..} envelope",
+            )),
             OutputFormat::Csv(_)
             | OutputFormat::Json(_)
             | OutputFormat::Xml(_)
