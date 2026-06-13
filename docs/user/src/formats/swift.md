@@ -25,17 +25,17 @@ A SWIFT MT message is a sequence of top-level blocks, each `{n:...}` where
 | `5`   | Trailer             | Optional; may carry nested `{tag:value}` sub-blocks |
 
 Unlike the flat delimiter-structured EDI formats (HL7, X12, EDIFACT), SWIFT
-framing is **brace-balanced** rather than terminator-delimited. The reader
-tracks brace depth to find each top-level block, so the nested sub-blocks of
-blocks 3 and 5 (for example `{3:{108:MSGREF}}`) are kept intact inside their
-parent block rather than mistaken for top-level blocks.
+framing is **brace-balanced** rather than terminator-delimited. Because of
+that, the nested sub-blocks of blocks 3 and 5 (for example
+`{3:{108:MSGREF}}`) are kept intact inside their parent block rather than
+mistaken for top-level blocks.
 
 ### The `-}` text-block trailer
 
 Block 4 is special. Its body is opaque line-structured free text — a field
 value (a `:77E:` envelope, a `:79:` narrative, an `:86:` information line)
-legitimately contains `{`, `}`, and even `-}` as data. So the reader does
-**not** brace-count inside block 4: it closes the block only on a
+legitimately contains `{`, `}`, and even `-}` as data. So braces inside
+block 4 are treated as data, not framing: the block closes only on a
 *line-anchored* `-}` trailer — a `-}` that begins a line. An interior `{`,
 `}`, or a `-}` in the middle of a value is data, not a frame boundary. Both
 the framing braces and the closing `-}` trailer are stripped from the stored
@@ -51,7 +51,7 @@ line breaks inside block 4 delimit the `:tag:value` fields.
 
 Each `:tag:value` line of block 4 becomes one record under a fixed
 positional schema — the same one-line-one-record model the X12 and HL7
-readers use, so memory scales O(1) with message size:
+readers use:
 
 | Column  | Meaning                                                       |
 | ------- | ------------------------------------------------------------- |
@@ -94,11 +94,10 @@ MT message is well under the cap.
 
 ## Envelope sections over the service blocks
 
-A SWIFT MT message is a single envelope: the four service blocks are
-extracted in a one-time pre-scan and surface as file-level `$doc` sections,
-exposing each block's text to CXL as `$doc.<section>.body`. One message-level
-document level brackets the body records, so a body record sees the enclosing
-message's headers through one `$doc.<section>.body` lookup.
+A SWIFT MT message is a single envelope: the four service blocks surface as
+file-level `$doc` sections, exposing each block's text to CXL as
+`$doc.<section>.body`. Every body record can read the enclosing message's
+headers through a `$doc.<section>.body` lookup.
 
 Declare the sections on the source with the `segment` extract rule naming the
 block id. The whole block body surfaces under the field name `body`, because
@@ -140,8 +139,8 @@ those rules belong to the tree formats.
 
 ## Malformed-message handling
 
-The reader fails the run with a precise `SWIFT` error rather than panicking
-on a structurally broken message:
+A structurally broken message fails the run with a precise `SWIFT` error
+rather than producing garbled records:
 
 - **Unbalanced brace** — a block that never closes (or whose brace depth
   never returns to zero) is a truncation error naming the offending block.
@@ -155,8 +154,7 @@ on a structurally broken message:
   block) in one message is rejected.
 
 A header-only message (no block 4, or an empty block 4) is valid: it
-produces no body records and drains cleanly, with the message-level document
-level still opening and closing in balance.
+produces no body records and drains cleanly.
 
 ## Limitations
 
