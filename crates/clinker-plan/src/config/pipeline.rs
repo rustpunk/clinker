@@ -812,7 +812,34 @@ impl PipelineConfig {
             }
             return Err(diags);
         }
-        let declared_doc_paths = doc_path_set.paths;
+        // Attribute each collected `$doc` path to the source(s) it flows
+        // from: trace every referencing node back through the DAG to its
+        // upstream Source set and stamp the path onto only those sources.
+        // A `$doc` access carries no source qualifier, so a multi-source
+        // run must not stamp the pipeline-wide union onto every source —
+        // a source would otherwise be told to extract envelope sections
+        // its own document never declares.
+        let node_sources = build_node_source_sets(&self.nodes, &artifacts);
+        let mut doc_paths_by_source: HashMap<String, std::collections::BTreeSet<_>> =
+            HashMap::new();
+        for (doc_path, nodes) in &doc_path_set.by_node {
+            for node_name in nodes {
+                let Some(sources) = node_sources.get(node_name) else {
+                    continue;
+                };
+                for source in sources {
+                    doc_paths_by_source
+                        .entry(source.clone())
+                        .or_default()
+                        .insert(doc_path.clone());
+                }
+            }
+        }
+        let declared_doc_paths: HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>> =
+            doc_paths_by_source
+                .into_iter()
+                .map(|(source, paths)| (source, paths.into_iter().collect()))
+                .collect();
         // Keep an analysis-by-name index so we can surface the analysis
         // alongside its matching entry regardless of filter order.
         let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
@@ -917,7 +944,7 @@ impl PipelineConfig {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 primary_source: primary_source.as_str(),
-                declared_doc_paths: &declared_doc_paths,
+                doc_paths_by_source: &declared_doc_paths,
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1996,6 +2023,158 @@ fn resolve_all_input_references(
     }
 }
 
+/// Map every CXL-bearing node name — top-level and composition-body — to
+/// the set of upstream `Source` names that feed it. The `$doc` path
+/// attributor unions these source sets across a path's referencing nodes
+/// to stamp each source with only the paths it actually delivers.
+///
+/// This is a parallel walk to `bind_schema`'s `upstream_sources` map
+/// (which feeds the E156 time-window watermark guard). The two
+/// intentionally diverge: that walk unions every input unconditionally,
+/// whereas this one narrows a `Combine` to its driving input and resolves
+/// a `Composition` through its full `inputs:` port set. The semantics here
+/// model where a record's document context actually flows; the watermark
+/// walk models which sources can deliver records at all. Keep them in sync
+/// on the shared shape (Source-seeds-self, declaration-order topo walk,
+/// composition-body recursion) when either changes.
+///
+/// The top-level walk runs in declaration order, which Stage-3 validation
+/// proved topologically sound, so each node's source set is the union of
+/// its direct inputs' sets (Sources seed themselves).
+///
+/// A `Combine` is the one node whose source set is NOT the union of its
+/// inputs: a joined record carries the DRIVING input's document context
+/// forward (the same per-driver-document rule a downstream Aggregate
+/// follows), and the predicate's `$doc` accesses likewise bind to the
+/// driving record's envelope. So a Combine's source set is the driving
+/// input's source set alone — using the union would tell the probe-side
+/// source to extract envelope sections only the driver's document
+/// declares. Both the Combine's `cxl:` body and its `where:` predicate
+/// program are keyed by the combine node's own name, so they share this
+/// driving-input source set with no extra handling.
+///
+/// A `Composition` forwards the union of EVERY bound `inputs:` port's
+/// source set, not just its primary port. `direct_input_names` reports
+/// only `header.input` (the single primary port) for a composition, so a
+/// multi-port call (`inputs: { primary: a, reference: b }`) would drop the
+/// non-primary ports' sources — a downstream `$doc` read off the
+/// composition output must still see them. Composition bodies are isolated
+/// mini-DAGs whose nodes draw their records from the same call-site port
+/// bindings; every body node (recursively, through nested compositions)
+/// inherits the same port-union set. A body `$doc` access carries no port
+/// qualifier, so it could read any incoming port's source envelope — the
+/// union is the correct attribution.
+fn build_node_source_sets(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+) -> HashMap<String, std::collections::BTreeSet<String>> {
+    use crate::plan::composition_body::CompositionBodyId;
+
+    let mut node_sources: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+
+    // Attribute every node in a composition body (recursively through
+    // nested bodies) to the call-site's source set.
+    fn attribute_body(
+        body_id: CompositionBodyId,
+        call_site_sources: &std::collections::BTreeSet<String>,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        node_sources: &mut HashMap<String, std::collections::BTreeSet<String>>,
+    ) {
+        let Some(body) = artifacts.body_of(body_id) else {
+            return;
+        };
+        for body_node_name in body.name_to_idx.keys() {
+            node_sources
+                .entry(body_node_name.clone())
+                .or_default()
+                .extend(call_site_sources.iter().cloned());
+        }
+        for nested in &body.nested_body_ids {
+            attribute_body(*nested, call_site_sources, artifacts, node_sources);
+        }
+    }
+
+    // The driving input's upstream node name for a combine, if the
+    // planner picked one (combines that fail driver selection are absent).
+    let combine_driver_upstream = |combine_name: &str| -> Option<String> {
+        let qualifier = artifacts.combine_driving.get(combine_name)?;
+        let inputs = artifacts.combine_inputs.get(combine_name)?;
+        inputs
+            .get(qualifier)
+            .map(|ci| ci.upstream_name.as_ref().to_string())
+    };
+
+    // Union of the source sets feeding the named producers, resolved
+    // against the sets recorded for already-walked nodes.
+    let union_of = |producers: &[&str],
+                    sources: &HashMap<String, std::collections::BTreeSet<String>>|
+     -> std::collections::BTreeSet<String> {
+        producers
+            .iter()
+            .filter_map(|inp| sources.get(*inp))
+            .flat_map(|s| s.iter().cloned())
+            .collect()
+    };
+
+    // Union of the source sets feeding a composition's `inputs:` port
+    // bindings — the authoritative call-site connectivity. `header.input`
+    // (what `direct_input_names` reports for a Composition) names only the
+    // single primary port, so it must NOT be used for a multi-port
+    // composition: a downstream `$doc` read off the composition output, or
+    // a body `$doc` access, can resolve against any bound port's source.
+    let composition_call_site_sources =
+        |inputs: &IndexMap<String, String>,
+         sources: &HashMap<String, std::collections::BTreeSet<String>>|
+         -> std::collections::BTreeSet<String> {
+            let producers: Vec<&str> = inputs
+                .values()
+                .map(|upstream| upstream.split('.').next().unwrap_or(upstream))
+                .collect();
+            union_of(&producers, sources)
+        };
+
+    for spanned in nodes {
+        let name = spanned.value.name().to_string();
+        let sources: std::collections::BTreeSet<String> = match &spanned.value {
+            PipelineNode::Source { .. } => std::iter::once(name.clone()).collect(),
+            // A joined record carries only the driving input's document
+            // context, so a Combine takes the driving input's source set —
+            // not the union of every input. Falls back to the input union
+            // when the planner could not pick a driver (the combine is then
+            // omitted from the DAG, so the set is unused either way).
+            PipelineNode::Combine { .. } => combine_driver_upstream(&name)
+                .and_then(|driver| node_sources.get(&driver).cloned())
+                .unwrap_or_else(|| union_of(&spanned.value.direct_input_names(), &node_sources)),
+            // A composition forwards the union of EVERY bound input port's
+            // source set, not just its primary port — a downstream node
+            // reading `$doc` off the composition output can see any port's
+            // document context. This matches the body-node attribution
+            // below, which unions the same port sources.
+            PipelineNode::Composition { inputs, .. } => {
+                composition_call_site_sources(inputs, &node_sources)
+            }
+            // Every other non-Source variant inherits the union of its
+            // direct inputs' source sets.
+            other => union_of(&other.direct_input_names(), &node_sources),
+        };
+
+        // A composition's body nodes feed from the call-site `inputs:`
+        // port bindings — union every bound port's source set so a body
+        // `$doc` access is attributed to whichever input could supply its
+        // envelope. That union is exactly the source set the Composition
+        // arm above computed into `sources`, so reuse it.
+        if let PipelineNode::Composition { .. } = &spanned.value
+            && let Some(&body_id) = artifacts.composition_body_assignments.get(&name)
+        {
+            attribute_body(body_id, &sources, artifacts, &mut node_sources);
+        }
+
+        node_sources.insert(name, sources);
+    }
+
+    node_sources
+}
+
 /// Cross-cutting inputs threaded into [`lower_node_to_plan_node`] for
 /// variants that need derived fields (Transform, Aggregate).
 ///
@@ -2012,16 +2191,38 @@ fn resolve_all_input_references(
 /// it requires the post-graph upstream `NodeIndex` for node-rooted
 /// windows. The Stage-5 lowering pass mutates the field in place
 /// after edges are wired and indices are deduplicated.
-#[derive(Default)]
 pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
     pub window_config: Option<&'a AnalyticWindowSpec>,
     pub primary_source: &'a str,
-    /// `$doc` envelope paths collected across the pipeline's programs,
-    /// surfaced onto each lowered `Source` node's `SourceConfig`. Empty
-    /// for the body-node lowering path (`LoweringCtx::default()`) — only
-    /// the top-level compile path collects and threads these.
-    pub declared_doc_paths: &'a [cxl::analyzer::doc_paths::DocPath],
+    /// `$doc` envelope paths each source must extract, keyed by source
+    /// name. A path lands here only for the source(s) feeding a node that
+    /// references it — never the pipeline-wide union — so a multi-source
+    /// run does not tell a source to extract another source's envelope
+    /// sections. A source absent from the map (or mapped to an empty
+    /// vec) reads no `$doc` paths. Empty for the body-node lowering path
+    /// (`LoweringCtx::default()`) — only the top-level compile path
+    /// collects and threads these.
+    pub doc_paths_by_source: &'a HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>>,
+}
+
+/// Empty per-source `$doc` map backing [`LoweringCtx::default`] — the
+/// body-node lowering path carries no document-path attribution (the
+/// top-level compile path is the only collector), so its borrow points
+/// here rather than at a freshly-allocated map per call.
+static EMPTY_DOC_PATHS_BY_SOURCE: std::sync::LazyLock<
+    HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>>,
+> = std::sync::LazyLock::new(HashMap::new);
+
+impl Default for LoweringCtx<'_> {
+    fn default() -> Self {
+        LoweringCtx {
+            analysis: None,
+            window_config: None,
+            primary_source: "",
+            doc_paths_by_source: &EMPTY_DOC_PATHS_BY_SOURCE,
+        }
+    }
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -2105,13 +2306,17 @@ pub(crate) fn lower_node_to_plan_node(
     match node {
         PipelineNode::Source { config, .. } => {
             let mut source = config.source.clone();
-            // Stamp the pipeline-wide `$doc` path set onto this source so
-            // a document reader can learn the declared path set before
-            // reading input. A `$doc` access carries no source qualifier,
-            // so the whole set is attached to every source; single-source
-            // document pipelines (the common case) thus see exactly their
-            // own paths.
-            source.declared_doc_paths = ctx.declared_doc_paths.to_vec();
+            // Stamp only THIS source's `$doc` path set so a document
+            // reader can learn the declared path set before reading input.
+            // The set is attributed per source upstream — each path lands
+            // on exactly the source(s) feeding a node that references it,
+            // so a multi-source run never asks a source to extract another
+            // source's envelope sections.
+            source.declared_doc_paths = ctx
+                .doc_paths_by_source
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
             Some(PlanNode::Source {
                 name: name.to_string(),
                 span,

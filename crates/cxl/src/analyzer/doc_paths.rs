@@ -1,12 +1,19 @@
 //! Compile-time `$doc` path analysis.
 //!
-//! Walks the typed AST of every CXL-bearing node and collects the set of
+//! Walks the typed AST of every CXL-bearing node and collects the
 //! `$doc.<section>.<field>` envelope paths the pipeline's programs
 //! actually reference, including trailing index accesses
-//! (`$doc.section.items[0]`). Document readers consult this set to learn,
-//! before reading any input, which declared envelope paths a run will
-//! consume — a declared section the programs never read need not be
-//! extracted.
+//! (`$doc.section.items[0]`), attributing each path to the node(s) that
+//! reference it. Document readers consult this set to learn, before
+//! reading any input, which declared envelope paths a run will consume —
+//! a declared section the programs never read need not be extracted.
+//!
+//! Attribution stops at the referencing node because a `$doc` access
+//! carries no source qualifier; the planner traces each node back through
+//! the DAG to its source(s) and stamps only those. A multi-source run
+//! must not tell every source to extract the pipeline-wide union, or a
+//! source would attempt to extract sections its own document never
+//! declares.
 //!
 //! A `$doc` access is statically resolvable iff its section, field, and
 //! every trailing index are literals. The CXL grammar guarantees the
@@ -17,7 +24,7 @@
 //! carrying the offending index span; the declared-path set cannot name a
 //! row-dependent element.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,13 +63,23 @@ pub struct DocPath {
 }
 
 /// The result of [`collect_doc_paths`]: every statically-resolved `$doc`
-/// path the programs reference, deduplicated and deterministically
-/// ordered, plus a fail-fast diagnostic for each `$doc` access that could
-/// not be statically resolved.
+/// path the programs reference, attributed to the node(s) that reference
+/// it, plus a fail-fast diagnostic for each `$doc` access that could not
+/// be statically resolved.
+///
+/// A `$doc` access carries no source qualifier, so attribution stops at
+/// the referencing node: the planner traces each node back through the
+/// DAG to the source(s) feeding it and stamps only those sources with the
+/// path. Stamping every source with the pipeline-wide union would tell a
+/// multi-source run to extract envelope sections a given source's own
+/// document never declares.
 #[derive(Debug, Clone, Default)]
 pub struct DocPathSet {
-    /// Deduplicated, sorted declared paths.
-    pub paths: Vec<DocPath>,
+    /// Each statically-resolved path mapped to the set of node names whose
+    /// program references it. The outer `BTreeMap` keys (paths) and inner
+    /// `BTreeSet` values (node names) are both ordered, so iteration is
+    /// deterministic independent of program walk order.
+    pub by_node: BTreeMap<DocPath, BTreeSet<String>>,
     /// One entry per `$doc` access whose index is not a literal. The
     /// `String` is the name of the program's node so the caller can anchor
     /// a plan-level diagnostic at that node; the [`TypeDiagnostic`] carries
@@ -70,13 +87,26 @@ pub struct DocPathSet {
     pub unresolvable: Vec<(String, TypeDiagnostic)>,
 }
 
-/// Collect the `$doc` path set referenced across a set of typed programs.
+#[cfg(test)]
+impl DocPathSet {
+    /// The deduplicated, sorted set of every resolved path across all
+    /// nodes, discarding per-node attribution — a test convenience for
+    /// asserting against the flat path list. Production callers consume
+    /// the per-node attribution in `by_node` directly; a pipeline-wide
+    /// flat-list consumer (diagnostics / display) can promote this out of
+    /// the test gate when one lands.
+    fn all_paths(&self) -> Vec<DocPath> {
+        self.by_node.keys().cloned().collect()
+    }
+}
+
+/// Collect the `$doc` path set referenced across a set of typed programs,
+/// attributing each resolved path to the node(s) that reference it.
 ///
-/// Each tuple is `(node_name, typed_program)`; the node name is unused
-/// today but kept to mirror [`super::analyze_all`]'s signature and to let
-/// a future caller attribute a path to its referencing node. Paths are
-/// deduplicated across all programs and returned in sorted order;
-/// unresolvable-index diagnostics are accumulated in walk order.
+/// Each tuple is `(node_name, typed_program)`. A path referenced by
+/// multiple nodes is attributed to each of them, so the planner can union
+/// the source sets of every referencing node when stamping a source.
+/// Unresolvable-index diagnostics are accumulated in walk order.
 pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
     let mut collector = DocPathCollector::default();
     for (name, typed) in programs {
@@ -86,7 +116,7 @@ pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
         }
     }
     DocPathSet {
-        paths: collector.paths.into_iter().collect(),
+        by_node: collector.by_node,
         unresolvable: collector.unresolvable,
     }
 }
@@ -104,11 +134,22 @@ pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
 /// still collected.
 #[derive(Default)]
 struct DocPathCollector<'a> {
-    /// Name of the program currently being walked, so an unresolvable-index
-    /// diagnostic can be attributed to its node.
+    /// Name of the program currently being walked, so each collected path
+    /// — and each unresolvable-index diagnostic — is attributed to its
+    /// node.
     node_name: &'a str,
-    paths: BTreeSet<DocPath>,
+    by_node: BTreeMap<DocPath, BTreeSet<String>>,
     unresolvable: Vec<(String, TypeDiagnostic)>,
+}
+
+impl DocPathCollector<'_> {
+    /// Record a resolved path against the node currently being walked.
+    fn record(&mut self, path: DocPath) {
+        self.by_node
+            .entry(path)
+            .or_default()
+            .insert(self.node_name.to_string());
+    }
 }
 
 impl Visitor for DocPathCollector<'_> {
@@ -122,16 +163,14 @@ impl Visitor for DocPathCollector<'_> {
             && let Some(classified) = classify_doc_index_chain(expr)
         {
             match classified {
-                Ok(path) => {
-                    self.paths.insert(path);
-                }
+                Ok(path) => self.record(path),
                 Err(diag) => self.unresolvable.push((self.node_name.to_string(), diag)),
             }
             return;
         }
 
         if let Expr::DocAccess { section, field, .. } = expr {
-            self.paths.insert(DocPath {
+            self.record(DocPath {
                 section: section.clone(),
                 field: field.clone(),
                 indices: Vec::new(),
@@ -276,6 +315,14 @@ mod tests {
         collect_doc_paths(&[("t", &typed)])
     }
 
+    /// Sorted node names a path was attributed to.
+    fn attributed_to(set: &DocPathSet, p: &DocPath) -> Vec<String> {
+        set.by_node
+            .get(p)
+            .map(|nodes| nodes.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn path(section: &str, field: &str, indices: Vec<DocIndex>) -> DocPath {
         DocPath {
             section: section.into(),
@@ -288,7 +335,10 @@ mod tests {
     fn test_collects_plain_two_level_path() {
         let set = collect("emit batch = $doc.Head.batch_id");
         assert!(set.unresolvable.is_empty());
-        assert_eq!(set.paths, vec![path("Head", "batch_id", vec![])]);
+        let p = path("Head", "batch_id", vec![]);
+        assert_eq!(set.all_paths(), vec![p.clone()]);
+        // The path is attributed to the single program's node.
+        assert_eq!(attributed_to(&set, &p), vec!["t".to_string()]);
     }
 
     #[test]
@@ -298,9 +348,9 @@ mod tests {
              emit b = $doc.Head.batch_id",
         );
         assert!(set.unresolvable.is_empty());
-        // BTreeSet ordering is by (section, field): Foot precedes Head.
+        // BTreeMap ordering is by (section, field): Foot precedes Head.
         assert_eq!(
-            set.paths,
+            set.all_paths(),
             vec![
                 path("Foot", "record_count", vec![]),
                 path("Head", "batch_id", vec![]),
@@ -314,7 +364,7 @@ mod tests {
             "emit a = $doc.Head.batch_id\n\
              emit b = $doc.Head.batch_id + 1",
         );
-        assert_eq!(set.paths, vec![path("Head", "batch_id", vec![])]);
+        assert_eq!(set.all_paths(), vec![path("Head", "batch_id", vec![])]);
     }
 
     #[test]
@@ -322,7 +372,7 @@ mod tests {
         let set = collect("emit first = $doc.summary.items[0]");
         assert!(set.unresolvable.is_empty());
         assert_eq!(
-            set.paths,
+            set.all_paths(),
             vec![path("summary", "items", vec![DocIndex::Int(0)])]
         );
     }
@@ -332,7 +382,7 @@ mod tests {
         let set = collect("emit run = $doc.meta.props[\"run_date\"]");
         assert!(set.unresolvable.is_empty());
         assert_eq!(
-            set.paths,
+            set.all_paths(),
             vec![path(
                 "meta",
                 "props",
@@ -346,7 +396,7 @@ mod tests {
         let set = collect("emit deep = $doc.summary.rows[2][\"k\"]");
         assert!(set.unresolvable.is_empty());
         assert_eq!(
-            set.paths,
+            set.all_paths(),
             vec![path(
                 "summary",
                 "rows",
@@ -361,7 +411,7 @@ mod tests {
         // Conditional-only usage must still be collected.
         let set = collect("emit v = if region == \"x\" then $doc.Head.batch_id else 0");
         assert!(set.unresolvable.is_empty());
-        assert_eq!(set.paths, vec![path("Head", "batch_id", vec![])]);
+        assert_eq!(set.all_paths(), vec![path("Head", "batch_id", vec![])]);
     }
 
     #[test]
@@ -373,7 +423,7 @@ mod tests {
              }",
         );
         assert!(set.unresolvable.is_empty());
-        assert_eq!(set.paths, vec![path("Foot", "record_count", vec![])]);
+        assert_eq!(set.all_paths(), vec![path("Foot", "record_count", vec![])]);
     }
 
     #[test]
@@ -381,7 +431,7 @@ mod tests {
         // `$doc` appears as the index of an unrelated array access.
         let set = collect("emit v = region[$doc.Head.offset]");
         assert!(set.unresolvable.is_empty());
-        assert_eq!(set.paths, vec![path("Head", "offset", vec![])]);
+        assert_eq!(set.all_paths(), vec![path("Head", "offset", vec![])]);
     }
 
     #[test]
@@ -391,7 +441,7 @@ mod tests {
         let src = "emit v = $doc.summary.items[idx]";
         let set = collect(src);
         assert!(
-            set.paths.is_empty(),
+            set.by_node.is_empty(),
             "no path is recorded for an unresolvable access"
         );
         assert_eq!(set.unresolvable.len(), 1);
@@ -417,7 +467,7 @@ mod tests {
             "a negated integer literal is a static index"
         );
         assert_eq!(
-            set.paths,
+            set.all_paths(),
             vec![path("summary", "items", vec![DocIndex::Int(-1)])]
         );
     }
@@ -447,14 +497,47 @@ mod tests {
             "emit a = $doc.Head.batch_id\n\
              emit b = $doc.summary.items[region]",
         );
-        assert_eq!(set.paths, vec![path("Head", "batch_id", vec![])]);
+        assert_eq!(set.all_paths(), vec![path("Head", "batch_id", vec![])]);
         assert_eq!(set.unresolvable.len(), 1);
     }
 
     #[test]
     fn test_no_doc_access_yields_empty_set() {
         let set = collect("emit v = amount + 1");
-        assert!(set.paths.is_empty());
+        assert!(set.by_node.is_empty());
         assert!(set.unresolvable.is_empty());
+    }
+
+    #[test]
+    fn test_attributes_each_path_to_its_referencing_node() {
+        // Two programs read disjoint `$doc` paths. Each path must be
+        // attributed to ONLY the node that references it — the foundation
+        // for stamping each source with just its own paths rather than the
+        // pipeline-wide union.
+        let a = compile("emit x = $doc.Head.batch_id");
+        let b = compile("emit y = $doc.Foot.record_count");
+        let set = collect_doc_paths(&[("node_a", &a), ("node_b", &b)]);
+
+        let head = path("Head", "batch_id", vec![]);
+        let foot = path("Foot", "record_count", vec![]);
+        assert_eq!(set.all_paths(), vec![foot.clone(), head.clone()]);
+        assert_eq!(attributed_to(&set, &head), vec!["node_a".to_string()]);
+        assert_eq!(attributed_to(&set, &foot), vec!["node_b".to_string()]);
+    }
+
+    #[test]
+    fn test_shared_path_is_attributed_to_every_referencing_node() {
+        // The same path read by two nodes is attributed to both, so the
+        // planner unions their source sets when stamping.
+        let a = compile("emit x = $doc.Head.batch_id");
+        let b = compile("emit y = $doc.Head.batch_id + 1");
+        let set = collect_doc_paths(&[("node_a", &a), ("node_b", &b)]);
+
+        let head = path("Head", "batch_id", vec![]);
+        assert_eq!(set.all_paths(), vec![head.clone()]);
+        assert_eq!(
+            attributed_to(&set, &head),
+            vec!["node_a".to_string(), "node_b".to_string()]
+        );
     }
 }

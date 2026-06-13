@@ -70,13 +70,16 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<clinker_format::EnvelopeConfig>,
 
-    /// `$doc.<section>.<field>` envelope paths the pipeline's CXL
-    /// programs actually reference, collected at compile time by
-    /// `cxl::analyzer::doc_paths`. Empty for sources whose downstream
-    /// programs read no `$doc` paths. Document readers consult this set
-    /// to skip extracting declared sections no program consumes. Derived
-    /// by the planner — never author-written — so it is excluded from
-    /// serialized config.
+    /// `$doc.<section>.<field>` envelope paths a program downstream of
+    /// THIS source actually references, collected at compile time by
+    /// `cxl::analyzer::doc_paths` and attributed per source: a path lands
+    /// here only when a node feeding from this source reads it, never the
+    /// pipeline-wide union, so a multi-source run is not told to extract
+    /// another source's envelope sections. Empty for sources whose
+    /// downstream programs read no `$doc` paths. Document readers consult
+    /// this set to skip extracting declared sections no program consumes.
+    /// Derived by the planner — never author-written — so it is excluded
+    /// from serialized config.
     #[serde(skip)]
     pub declared_doc_paths: Vec<cxl::analyzer::doc_paths::DocPath>,
 

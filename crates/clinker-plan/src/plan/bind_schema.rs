@@ -1174,6 +1174,14 @@ fn bind_schema_inner(
     // aggregate guard (E156) below. A node's set is the union of its
     // input nodes' sets, so the check at an Aggregate sees every Source
     // that can deliver records to it through any path.
+    //
+    // `crate::config::pipeline::build_node_source_sets` is a parallel
+    // source-attribution walk over the same DAG, sharing this walk's shape
+    // (Source-seeds-self, declaration-order topo order, union of inputs).
+    // It intentionally diverges where document context — not mere
+    // reachability — matters: it narrows a `Combine` to its driving input
+    // and resolves a `Composition` through its full `inputs:` port set.
+    // Keep the shared shape in sync across both when either changes.
     let mut source_has_watermark: HashMap<String, bool> = HashMap::new();
     let mut upstream_sources: HashMap<String, HashSet<String>> = HashMap::new();
 
