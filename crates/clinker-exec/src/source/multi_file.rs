@@ -347,14 +347,8 @@ mod tests {
         // dead-lettered for a structural-count failure. Returns Ok(false) once
         // no files remain.
         let files = vec![
-            FileSlot {
-                path: PathBuf::from("a.csv"),
-                reader: cursor("id,name\n1,alice\n2,bob\n"),
-            },
-            FileSlot {
-                path: PathBuf::from("b.csv"),
-                reader: cursor("id,name\n3,carol\n"),
-            },
+            slot("a.csv", "id,name\n1,alice\n2,bob\n"),
+            slot("b.csv", "id,name\n3,carol\n"),
         ];
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         // Read one record of file a, then abandon a's remaining record (id=2).
