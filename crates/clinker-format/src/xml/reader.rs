@@ -1,24 +1,26 @@
-//! Streaming XML reader using quick-xml pull parser.
+//! Streaming XML reader using quick-xml's pull parser.
 //!
 //! Navigates to `record_path`, extracts attributes with configurable prefix,
 //! flattens nested elements with `.` separator, handles namespaces.
 //!
-//! The reader buffers its entire input at construction time into an
-//! `Arc<[u8]>` so the envelope pre-scan (run before any body record emits)
-//! and the body iteration can each parse from a fresh cursor over the same
-//! byte slice. That raw byte buffer is retained for the reader's lifetime —
-//! it backs both the body parser and the transient pre-scan cursor, so
-//! there is one read from disk regardless of envelope declarations.
+//! **O(1 record) memory, no whole-document buffer:** the body walks the
+//! document element-at-a-time from a freshly re-opened `BufReader` —
+//! quick-xml's `read_event_into` pulls one event at a time, so only a single
+//! record's `element_stack` plus the event buffer is live at once, never the
+//! whole input.
 //!
-//! What the pre-scan removed is the full-tree *section materialization*, not
-//! the raw byte buffer: the envelope pre-scan no longer captures undeclared
-//! sections at all, and the retained payload of each declared section is
-//! bounded by `max_index_bytes`, charged incrementally so an oversized
-//! declared section aborts mid-parse before its subtree fully materializes.
-//! See [`crate::xml::streaming`] for the event-driven pruned-extraction
-//! pass.
+//! Envelope-aware sources run a streaming pre-scan before any body record
+//! emits: it walks the document once over its *own* freshly re-opened reader,
+//! flattening ONLY the subtrees the declared `$doc.*` paths name (every other
+//! element's body is event-walked and dropped, never allocated) into a
+//! path-pruned index capped by `max_index_bytes`, charged incrementally so an
+//! oversized declared section aborts mid-parse before its subtree fully
+//! materializes. The pre-scan and the body each open their own [`Read`] from
+//! the [`ReopenableSource`], so neither consumes the other and no shared
+//! whole-file byte buffer is retained for a file-backed input. See
+//! [`crate::xml::streaming`] for the event-driven pruned-extraction pass.
 
-use std::io::{self, Cursor, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -29,9 +31,11 @@ use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use cxl::analyzer::doc_paths::DocPath;
 
+use crate::bom::UTF8_BOM;
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
+use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 use crate::xml::streaming::{SectionTarget, extract_sections};
 
@@ -86,24 +90,37 @@ pub enum XmlArrayMode {
     Join,
 }
 
+/// A quick-xml pull parser over a re-opened, BOM-stripped `BufReader`.
+///
+/// Both the body parser and the envelope pre-scan parse over this same reader
+/// shape — a fresh `Read` from the [`ReopenableSource`], never a whole-document
+/// byte buffer.
+pub(crate) type BodyParser = XmlParser<BufReader<Box<dyn Read + Send>>>;
+
 /// Streaming XML reader.
 ///
-/// Buffers its entire input at construction time into an `Arc<[u8]>` so two
-/// parsers can walk the same bytes: one transient parser for the envelope
-/// pre-scan, and one stateful parser for body record iteration. Holding the
-/// raw bytes makes every declared section available to every body record,
-/// since a post-body section must be extracted before the first record
-/// emits.
+/// Walks the body element-at-a-time from a freshly re-opened `BufReader`, so
+/// only one record's `element_stack` plus the event buffer is live at once —
+/// never a whole-document byte buffer. The envelope pre-scan and the body
+/// iteration each open their own [`Read`] from `source`, so a post-body
+/// section (extracted before the first record emits) is available without
+/// retaining the input: a path-backed source is read twice, never buffered.
 ///
-/// The envelope pre-scan no longer materializes undeclared sections, and
-/// each retained section's payload is bounded by `max_index_bytes` (charged
-/// incrementally, aborting mid-parse on an oversized section). The raw byte
-/// buffer itself remains — only the full-tree section materialization was
-/// removed — so held memory is the source file's size plus the bounded
-/// section payloads while the reader exists.
+/// The envelope pre-scan retains only the declared sections' subtrees, each
+/// bounded by `max_index_bytes` (charged incrementally, aborting mid-parse on
+/// an oversized section), so held memory is O(declared sections) plus one
+/// live record while the reader exists.
 pub struct XmlReader {
-    bytes: Arc<[u8]>,
-    parser: XmlParser<Cursor<Arc<[u8]>>>,
+    /// The re-openable byte source. Body iteration and the envelope pre-scan
+    /// each open their own fresh [`Read`] from it, so no whole-document buffer
+    /// is held for a file-backed (`ReopenableSource::Path`) source.
+    source: ReopenableSource,
+    /// Content identity of the bytes the body open read, captured at
+    /// construction. The envelope pre-scan re-opens the source and confirms it
+    /// sees the same content, so a path-backed input rewritten between the two
+    /// passes fails loud instead of splicing a stale envelope onto a new body.
+    body_identity: SourceIdentity,
+    parser: BodyParser,
     config: XmlReaderConfig,
     schema: Option<Arc<Schema>>,
     buf: Vec<u8>,
@@ -120,28 +137,27 @@ pub struct XmlReader {
 }
 
 impl XmlReader {
-    /// Build a reader from any `Read` source. Drains the input into a
-    /// shared `Arc<[u8]>` buffer at construction; subsequent envelope
-    /// pre-scan and body iteration each parse from a fresh cursor over
-    /// the same bytes.
-    pub fn new<R: Read>(mut reader: R, config: XmlReaderConfig) -> io::Result<Self> {
-        let mut bytes_vec = Vec::new();
-        reader.read_to_end(&mut bytes_vec)?;
-        // Strip a leading UTF-8 BOM (Windows utf8 export) before the bytes
-        // reach the parser, so it does not precede the prolog/root element.
-        if bytes_vec.starts_with(&crate::bom::UTF8_BOM) {
-            bytes_vec.drain(..crate::bom::UTF8_BOM.len());
-        }
-        let bytes: Arc<[u8]> = Arc::from(bytes_vec);
-        Ok(Self::from_bytes(bytes, config))
-    }
-
-    /// Build a reader directly from a buffered byte slice. Used
-    /// internally by [`Self::new`] and by envelope pre-scan to reset
-    /// the body parser at start of stream.
-    fn from_bytes(bytes: Arc<[u8]>, config: XmlReaderConfig) -> Self {
-        let mut parser = XmlParser::from_reader(Cursor::new(Arc::clone(&bytes)));
-        parser.config_mut().trim_text(true);
+    /// Build a reader over a re-openable byte source.
+    ///
+    /// Streaming, O(1 record): the body opens one fresh [`Read`] from `source`
+    /// (and the envelope pre-scan opens a second), so a file-backed source is
+    /// never buffered whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError`] if the source cannot be opened or the leading
+    /// BOM probe fails. Construction reads no further: quick-xml pulls events
+    /// lazily, so a parse error surfaces later from `next_record`.
+    pub fn from_source(
+        source: ReopenableSource,
+        config: XmlReaderConfig,
+    ) -> Result<Self, FormatError> {
+        // XML runs two passes (envelope pre-scan + body stream), so the source
+        // must be re-openable. A `Path`/`Buffered` source passes through; a
+        // pathless `OneShot` is buffered here, on the reader-building thread —
+        // bounded because such inputs are small.
+        let source = source.into_reopenable().map_err(FormatError::Io)?;
+        let (parser, body_identity) = Self::open_body(&source)?;
 
         let path_segments: Vec<String> = config
             .record_path
@@ -149,8 +165,9 @@ impl XmlReader {
             .map(|p| p.split('/').map(String::from).collect())
             .unwrap_or_default();
 
-        XmlReader {
-            bytes,
+        Ok(XmlReader {
+            source,
+            body_identity,
             parser,
             config,
             schema: None,
@@ -160,7 +177,61 @@ impl XmlReader {
             xml_depth: 0,
             pending: None,
             done: false,
-        }
+        })
+    }
+
+    /// Build a reader by buffering a one-shot `Read` into a re-openable source.
+    ///
+    /// For pathless inputs (test cursors, the `<inline>`/`<empty>` slots, REST
+    /// bodies) that have no on-disk path to re-open: the bytes are captured
+    /// once into a small `ReopenableSource::Buffered`. Bounded because such
+    /// inputs are small by construction; file-backed sources use
+    /// [`from_source`](Self::from_source) with `ReopenableSource::Path` instead
+    /// and are never buffered whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError`] on a read failure or the same open errors as
+    /// [`from_source`](Self::from_source).
+    pub fn from_reader<R: Read + Send + 'static>(
+        reader: R,
+        config: XmlReaderConfig,
+    ) -> Result<Self, FormatError> {
+        let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
+        Self::from_source(source, config)
+    }
+
+    /// Open a fresh `BufReader` from the source with a leading UTF-8 BOM
+    /// stripped, returning the content-identity snapshot of the bytes it reads.
+    /// Each pass (body, pre-scan) re-opens, so the strip happens per open
+    /// rather than once over a shared buffer; the identity lets a later pass
+    /// detect the input changing between passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Io`] if the source cannot be opened or the BOM
+    /// probe read fails.
+    fn open_buf(
+        source: &ReopenableSource,
+    ) -> Result<(BufReader<Box<dyn Read + Send>>, SourceIdentity), FormatError> {
+        let (reader, identity) = source.open_with_identity().map_err(FormatError::Io)?;
+        let mut buf = BufReader::new(reader);
+        strip_leading_bom(&mut buf)?;
+        Ok((buf, identity))
+    }
+
+    /// Open the body parser over a fresh `BufReader` and snapshot the identity
+    /// of the bytes it read, so the envelope pre-scan can confirm it re-opens
+    /// the same content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Io`] if the source cannot be opened.
+    fn open_body(source: &ReopenableSource) -> Result<(BodyParser, SourceIdentity), FormatError> {
+        let (buf, identity) = Self::open_buf(source)?;
+        let mut parser = XmlParser::from_reader(buf);
+        parser.config_mut().trim_text(true);
+        Ok((parser, identity))
     }
 
     /// Navigate to the record_path and read one complete record element.
@@ -468,15 +539,28 @@ impl FormatReader for XmlReader {
             }
         }
 
-        // Single streaming pass over a fresh cursor: only the matched
-        // subtrees are flattened; every unmatched element body is
-        // counted-and-dropped. The cap is charged *as each declared
-        // section's payload is built*, so an oversized declared section
-        // aborts the parse mid-subtree rather than after the whole subtree
-        // materializes. Body iteration keeps its own independent cursor over
-        // `self.bytes`.
+        // Single streaming pass over a freshly re-opened reader: only the
+        // matched subtrees are flattened; every unmatched element body is
+        // event-walked and dropped. The cap is charged *as each declared
+        // section's payload is built*, so an oversized declared section aborts
+        // the parse mid-subtree rather than after the whole subtree
+        // materializes. Body iteration opens its own independent reader, so
+        // this pass does not consume it and no shared whole-file buffer is
+        // held.
+        //
+        // Confirm the pre-scan re-opens the same content the body opened. A
+        // path-backed input replaced or truncated between the two opens (an
+        // external producer re-emitting mid-run) would otherwise splice this
+        // envelope onto a body parsed from different bytes; the `(len, mtime)`
+        // identity check fails loud instead. This is a cheap courtesy guard
+        // under the finite-batch input-stability contract, not a fingerprint —
+        // see `SourceIdentity`.
+        let (prescan, prescan_identity) = Self::open_buf(&self.source)?;
+        prescan_identity
+            .ensure_matches(&self.body_identity)
+            .map_err(FormatError::Io)?;
         let matched = extract_sections(
-            &self.bytes,
+            prescan,
             &targets,
             &self.config.namespace_handling,
             &self.config.attribute_prefix,
@@ -553,6 +637,25 @@ pub(crate) fn extract_attributes_static(
     Ok(attrs)
 }
 
+/// Consume a single leading UTF-8 BOM from a freshly opened reader, if present.
+///
+/// Each pass re-opens its own `Read`, so a Windows-authored file (Excel /
+/// PowerShell utf8 export) carries the BOM on every open; stripping it here
+/// clears the marker before it precedes the prolog/root element, for both body
+/// iteration and the envelope pre-scan. The `BufReader`'s default capacity
+/// exceeds the 3-byte BOM, so the marker is always wholly inside the first fill.
+///
+/// # Errors
+///
+/// Returns [`FormatError::Io`] if the probe read fails.
+fn strip_leading_bom(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<(), FormatError> {
+    let buf = reader.fill_buf().map_err(FormatError::Io)?;
+    if buf.starts_with(&UTF8_BOM) {
+        reader.consume(UTF8_BOM.len());
+    }
+    Ok(())
+}
+
 /// Simple type inference from string values (same rules as JSON).
 fn infer_value(s: &str) -> Value {
     if s.is_empty() {
@@ -580,7 +683,8 @@ mod tests {
     use std::io::Cursor;
 
     fn reader_from_str(xml: &str, config: XmlReaderConfig) -> XmlReader {
-        XmlReader::new(Cursor::new(xml.as_bytes().to_vec()), config).expect("XML buffer read")
+        XmlReader::from_reader(Cursor::new(xml.as_bytes().to_vec()), config)
+            .expect("XML buffer read")
     }
 
     fn default_config_with_path(path: &str) -> XmlReaderConfig {
@@ -707,6 +811,100 @@ mod tests {
 
         // Body iteration still works from byte 0; envelope pre-scan
         // does not consume the body parser state.
+        let r1 = reader.next_record().expect("body record").expect("first");
+        assert_eq!(r1.get("x"), Some(&Value::Integer(1)));
+        let r2 = reader.next_record().expect("body record").expect("second");
+        assert_eq!(r2.get("x"), Some(&Value::Integer(2)));
+        assert!(reader.next_record().expect("eof").is_none());
+    }
+
+    #[test]
+    fn open_buf_strips_the_bom_on_every_open() {
+        // The body and the envelope pre-scan each call `open_buf` on their own
+        // fresh `Read`, so a Windows-authored file (Excel / PowerShell utf8
+        // export) presents the leading BOM to *both* opens. The strip must
+        // therefore live in `open_buf` (the shared per-open path), not in one
+        // caller. quick-xml 0.37 tolerates a stray prolog BOM, so a strip
+        // regression would NOT surface at the record/section level — it would
+        // only show as raw BOM bytes leading the parser's input. Assert the
+        // contract at that byte level, independent of quick-xml: every
+        // `open_buf` hands back a reader whose first bytes are the document,
+        // not `\u{feff}`. Two opens prove the strip is per-open, not one-shot.
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(b"<doc><x>1</x></doc>");
+        let source = ReopenableSource::buffer(Cursor::new(bytes)).expect("buffer source");
+
+        for pass in ["body", "pre-scan"] {
+            let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
+            let head = buf.fill_buf().expect("fill");
+            assert!(
+                head.starts_with(b"<doc>"),
+                "{pass} open leaked a BOM: stream starts with {:?}",
+                &head[..head.len().min(UTF8_BOM.len() + 2)]
+            );
+            assert!(
+                !head.starts_with(&UTF8_BOM),
+                "{pass} open left the BOM in place"
+            );
+        }
+    }
+
+    #[test]
+    fn open_buf_passes_through_a_bomless_open_unchanged() {
+        // A file with no BOM (the common case) must not lose its first bytes:
+        // `strip_leading_bom` consumes only when the marker is present, so the
+        // document element survives the probe intact.
+        let source =
+            ReopenableSource::buffer(Cursor::new(b"<doc><x>1</x></doc>".to_vec())).expect("buffer");
+        let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
+        assert!(buf.fill_buf().expect("fill").starts_with(b"<doc>"));
+    }
+
+    #[test]
+    fn prepare_document_extracts_sections_from_a_bom_prefixed_source() {
+        // End-to-end companion to `open_buf_strips_the_bom_on_every_open`: a
+        // BOM-prefixed envelope-bearing document still yields clean section
+        // values and clean body records, exercising the pre-scan and body
+        // opens through the full `prepare_document` / `next_record` path.
+        let xml = r#"<doc>
+            <BatchInfo><batch_id>RUN-001</batch_id><count>42</count></BatchInfo>
+            <records><record><x>1</x></record><record><x>2</x></record></records>
+            <Summary><hash>abc</hash></Summary>
+        </doc>"#;
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(xml.as_bytes());
+
+        let specs: &[SectionSpec] = &[
+            (
+                "BatchInfo",
+                "/doc/BatchInfo",
+                &[
+                    ("batch_id", EnvelopeFieldType::String),
+                    ("count", EnvelopeFieldType::Int),
+                ],
+            ),
+            (
+                "Summary",
+                "/doc/Summary",
+                &[("hash", EnvelopeFieldType::String)],
+            ),
+        ];
+        let cfg = envelope_config(specs);
+
+        let mut reader = XmlReader::from_reader(
+            Cursor::new(bytes),
+            envelope_reader_config(specs, "doc/records/record"),
+        )
+        .expect("XML buffer read");
+        let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
+        assert_eq!(sections.len(), 2);
+
+        let head = unwrap_section_map(sections.get("BatchInfo").expect("BatchInfo extracted"));
+        assert_eq!(head.get("batch_id"), Some(&Value::String("RUN-001".into())));
+        assert_eq!(head.get("count"), Some(&Value::Integer(42)));
+        let foot = unwrap_section_map(sections.get("Summary").expect("Summary extracted"));
+        assert_eq!(foot.get("hash"), Some(&Value::String("abc".into())));
+
         let r1 = reader.next_record().expect("body record").expect("first");
         assert_eq!(r1.get("x"), Some(&Value::Integer(1)));
         let r2 = reader.next_record().expect("body record").expect("second");
@@ -851,7 +1049,7 @@ mod tests {
         let xml = r#"<Root><Orders><Order><id>1</id><name>Alice</name></Order></Orders></Root>"#;
         let mut bytes = crate::bom::UTF8_BOM.to_vec();
         bytes.extend_from_slice(xml.as_bytes());
-        let mut r = XmlReader::new(
+        let mut r = XmlReader::from_reader(
             Cursor::new(bytes),
             default_config_with_path("Root/Orders/Order"),
         )

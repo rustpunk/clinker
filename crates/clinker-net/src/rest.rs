@@ -488,9 +488,9 @@ fn decode_body(
         }
         InputFormat::Xml(opts) => {
             let config = build_xml_config(opts.as_ref(), array_paths);
-            Ok(Box::new(clinker_format::xml::reader::XmlReader::new(
-                cursor, config,
-            )?))
+            Ok(Box::new(
+                clinker_format::xml::reader::XmlReader::from_reader(cursor, config)?,
+            ))
         }
         other => Err(schema_err(format!(
             "rest body decode requires json or xml format, got {}",
