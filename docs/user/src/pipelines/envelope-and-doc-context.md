@@ -63,8 +63,54 @@ project:
   - running_fraction: row_index / $doc.Summary.record_count
 ```
 
+The pre-scan reads the envelope-bearing segments of the file before
+body streaming begins. Envelope payloads are small (a few hundred bytes
+per document is typical), and how much of the file the reader retains to
+reach a trailing section depends on the format:
+
+- **JSON** streams the pre-scan. The reader walks the document once and
+  deserializes *only* the subtrees the declared sections point at —
+  every other key (including a multi-megabyte body array) is
+  parsed-and-skipped without being stored. The retained sections live in
+  a bounded **document index** capped by `max_index_bytes` (see below),
+  so memory scales with the declared sections, not the document size.
+- **XML** currently buffers the document to reach trailing sections;
+  streaming its pre-scan is tracked as a follow-up. Until then an
+  XML envelope-aware source holds the file's bytes for the lifetime of
+  the read.
+
 Only the envelope sections live in the document context — body records
-still flow through the pipeline one at a time.
+still flow through the pipeline one at a time, for every format.
+
+### Bounding JSON envelope retention with `max_index_bytes`
+
+The JSON document index is capped so a pathologically large declared
+section fails loud rather than exhausting memory. The cap is charged
+incrementally *as each section is parsed* — byte by byte while the
+section's subtree is built — so even a single oversized declared section
+aborts mid-parse, before its whole subtree materializes, naming the
+offending section and the cap. (Undeclared siblings, including a
+multi-megabyte body array, are skipped without being parsed into memory
+at all.)
+
+```yaml
+- type: source
+  name: events
+  config:
+    name: events
+    type: json
+    path: "./data/events.json"
+    options:
+      record_path: data.rows
+      max_index_bytes: 64MB   # cap on retained envelope sections
+```
+
+`max_index_bytes` accepts a decimal size string (`64MB`, `500KB`) or a
+bare byte count. It is optional; when omitted the reader applies a
+documented finite default of **64MB**. Only the declared sections a
+program actually reads are retained, so envelope metadata sits far below
+this ceiling in practice — the cap exists to convert an unbounded
+mistake into a clear error.
 
 ## Extract rules per format
 

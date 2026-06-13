@@ -453,6 +453,15 @@ pub struct JsonInputOptions {
     pub format: Option<JsonFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
+    /// Hard cap on the bytes the envelope pre-scan's path-pruned document
+    /// index may retain while extracting declared `$doc.*` sections.
+    /// Accepts a size string (`"64MB"`, `"500KB"`) via the same
+    /// [`ByteSize`] grammar the file-size filters use. The cap is charged
+    /// incrementally and fires mid-build (before OOM) when a retained
+    /// section would push the index over it. Genuinely optional —
+    /// `None` falls back to the reader's documented default cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_index_bytes: Option<ByteSize>,
 }
 
 /// XML-specific input options.
@@ -669,4 +678,32 @@ impl Hl7FieldSplitOption {
 /// `subcomponents` / `repetitions` split-declaration fields.
 fn one() -> usize {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ByteSize;
+
+    #[test]
+    fn json_options_parse_max_index_bytes_size_string() {
+        let opts: JsonInputOptions =
+            crate::yaml::from_str("format: ndjson\nmax_index_bytes: 64MB\n").unwrap();
+        // Decimal units: 64MB = 64_000_000 bytes.
+        assert_eq!(opts.max_index_bytes, Some(ByteSize(64_000_000)));
+    }
+
+    #[test]
+    fn json_options_max_index_bytes_absent_is_none() {
+        // Genuinely optional — an omitted cap leaves `None`, so the reader
+        // applies its documented default rather than failing to parse.
+        let opts: JsonInputOptions = crate::yaml::from_str("record_path: data.rows\n").unwrap();
+        assert_eq!(opts.max_index_bytes, None);
+    }
+
+    #[test]
+    fn json_options_max_index_bytes_accepts_bare_byte_count() {
+        let opts: JsonInputOptions = crate::yaml::from_str("max_index_bytes: 4096\n").unwrap();
+        assert_eq!(opts.max_index_bytes, Some(ByteSize(4096)));
+    }
 }

@@ -8,12 +8,20 @@
 //!   path, skipping non-matching keys without allocation, then streams the
 //!   array. Total memory: ~10KB buffer + one record.
 //!
-//! Envelope-aware sources buffer the full input at construction so the
-//! envelope pre-scan (which walks the entire JSON document for sections
-//! at arbitrary JSON pointer paths) can run before any body record
-//! emits. The buffered bytes are also the input to the body parser, so
-//! there is one read of the source from disk regardless of whether
-//! envelope sections are declared.
+//! Envelope-aware sources run a streaming pre-scan over the document
+//! before any body record emits: it walks the JSON once, deserializing
+//! ONLY the subtrees the declared `$doc.*` paths name (every other key is
+//! parsed-and-skipped via `IgnoredAny`) into a path-pruned arena index
+//! capped by `max_index_bytes`, rather than materializing the whole
+//! document tree. The pre-scan reads from a fresh cursor over the shared
+//! source buffer, so it does not consume body iteration.
+//!
+//! The source buffer itself is still a full `read_to_end` at construction
+//! — it backs both the body parser's cursor and the pre-scan's cursor, so
+//! there is one read from disk regardless of envelope declarations. Only
+//! the pre-scan's parsed-tree materialization is removed here; shrinking
+//! the raw byte buffer for purely-streamable bodies is a separate
+//! follow-up.
 
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::sync::Arc;
@@ -25,9 +33,13 @@ use clinker_record::{
 };
 use indexmap::IndexMap;
 
+use cxl::analyzer::doc_paths::DocPath;
+
 use crate::bom::UTF8_BOM;
+use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::FormatError;
+use crate::json::streaming::{SectionTarget, extract_sections};
 use crate::traits::FormatReader;
 
 // ── Public config types ──────────────────────────────────────────────
@@ -37,6 +49,17 @@ pub struct JsonReaderConfig {
     pub format: Option<JsonMode>,
     pub record_path: Option<String>,
     pub array_paths: Vec<ArrayPathSpec>,
+    /// `$doc.*` envelope paths a program downstream of this source
+    /// references, attributed to this source by the planner. The envelope
+    /// pre-scan retains only the sections these paths name; a declared
+    /// section no program reads is skipped, never materialized. Empty when
+    /// no downstream program reads any `$doc` path.
+    pub declared_doc_paths: Vec<DocPath>,
+    /// Hard cap on the bytes the envelope pre-scan's path-pruned index may
+    /// retain. The cap is charged incrementally as each section subtree is
+    /// retained and fires mid-build (before OOM). `None` disables the cap;
+    /// the source plumbing supplies a finite default.
+    pub max_index_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,10 +89,11 @@ pub struct JsonReader {
     schema: Option<Arc<Schema>>,
     config: JsonReaderConfig,
     pending: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Buffered source bytes shared with the envelope pre-scan. The
-    /// body parser drains a cursor over these bytes; `prepare_document`
-    /// re-parses the same bytes as a `serde_json::Value` to resolve
-    /// JSON pointer paths to envelope sections.
+    /// Buffered source bytes shared with the envelope pre-scan. The body
+    /// parser drains a cursor over these bytes; `prepare_document` opens a
+    /// fresh cursor over the same bytes and streams a single
+    /// `DeserializeSeed` pass that retains only declared `$doc.*` subtrees,
+    /// rather than re-parsing the whole document tree.
     raw_bytes: Arc<[u8]>,
 }
 
@@ -318,15 +342,27 @@ impl FormatReader for JsonReader {
             return Ok(IndexMap::new());
         }
 
-        // The pre-scan reads the full document as a `serde_json::Value`
-        // and resolves each declared section's JSON pointer against
-        // that parsed tree. Body iteration continues to drain its own
-        // cursor over `raw_bytes`; this parse is independent.
-        let root: serde_json::Value = serde_json::from_slice(&self.raw_bytes)
-            .map_err(|e| FormatError::Json(format!("envelope pre-scan: {e}")))?;
+        // The path-pruned index is the retention authority: it knows which
+        // sections some downstream program reads. A declared section no
+        // program references is not extracted at all — so when no `$doc`
+        // path is attributed to this source, the pre-scan skips the whole
+        // document.
+        let mut index =
+            DocArenaIndex::new(&self.config.declared_doc_paths, self.config.max_index_bytes);
+        if index.is_empty() {
+            return Ok(IndexMap::new());
+        }
 
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        // Resolve each declared section the index wants to its JSON pointer,
+        // validating the extract type fits a JSON source (a wrong-format
+        // extract is an authoring error surfaced eagerly). Sections the
+        // index does not want are dropped here so the streaming pass never
+        // descends into them.
+        let mut targets: Vec<SectionTarget> = Vec::new();
         for (name, section) in &config.sections {
+            if !index.wants_section(name) {
+                continue;
+            }
             let pointer = match &section.extract {
                 EnvelopeExtract::JsonPointer(p) => p.as_str(),
                 EnvelopeExtract::XmlPath(_) => {
@@ -343,24 +379,42 @@ impl FormatReader for JsonReader {
                     )));
                 }
             };
-            let node = match root.pointer(pointer) {
-                Some(n) => n,
+            targets.push(SectionTarget::new(name.clone(), pointer));
+        }
+
+        // Single streaming pass over a fresh cursor: only the matched
+        // subtrees are built; every other key is parsed-and-skipped. The cap
+        // is charged *as each declared section is constructed*, so an
+        // oversized declared section aborts the parse mid-build rather than
+        // after the whole subtree materializes. Body iteration keeps its own
+        // independent cursor over `raw_bytes`.
+        let mut prescan = BufReader::new(Cursor::new(Arc::clone(&self.raw_bytes)));
+        let matched = extract_sections(&mut prescan, &targets, self.config.max_index_bytes)?;
+
+        // Coerce each matched subtree to its declared field schema and retain
+        // it in the index, which accounts the coerced (field-filtered)
+        // retained bytes against the same cap. The streaming pass already
+        // bounded the raw parse; the index accounts what is actually kept.
+        for (name, section) in &config.sections {
+            let raw = match matched.get(name) {
+                Some(v) => v,
                 None => continue,
             };
-            let payload_obj = match node {
+            let payload_obj = match raw {
                 serde_json::Value::Object(obj) => obj,
                 other => {
                     return Err(FormatError::Json(format!(
-                        "envelope section {name:?}: JSON pointer {pointer:?} resolves to \
-                         {kind} but envelope sections must be JSON objects",
+                        "envelope section {name:?}: JSON pointer resolves to {kind} but \
+                         envelope sections must be JSON objects",
                         kind = json_value_kind(other),
                     )));
                 }
             };
             let typed = coerce_json_section_fields(name, payload_obj, &section.fields)?;
-            out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
+            let path = doc_path_for_section(name);
+            index.insert(&path, Value::Map(Box::new(typed)))?;
         }
-        Ok(out)
+        Ok(index.into_sections())
     }
 
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
@@ -576,6 +630,22 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     }
 }
 
+/// Build the section-level [`DocPath`] under which a whole matched section
+/// subtree is retained.
+///
+/// JSON retains an envelope section as one object (one JSON pointer → one
+/// object → all its fields), so the insert key is the section, not an
+/// individual field; [`DocArenaIndex::insert`] groups by `path.section`.
+/// The `field`/`indices` axes carry no meaning for a section-granular
+/// retention and are left empty.
+fn doc_path_for_section(name: &str) -> DocPath {
+    DocPath {
+        section: name.into(),
+        field: Box::from(""),
+        indices: Vec::new(),
+    }
+}
+
 /// Lowercase descriptor for the JSON value kind, used in
 /// envelope-section diagnostics when the pointer resolves to a
 /// non-object value.
@@ -695,6 +765,33 @@ mod tests {
         }
     }
 
+    /// Declared `$doc.*` paths covering every `(section, field)` in `specs`,
+    /// so the path-pruned index wants all of them — the runtime stand-in
+    /// for the planner's per-source attribution.
+    fn declared_paths(specs: &[SectionSpec]) -> Vec<DocPath> {
+        let mut out = Vec::new();
+        for (section, _pointer, fields) in specs {
+            for (field, _ty) in *fields {
+                out.push(DocPath {
+                    section: (*section).into(),
+                    field: (*field).into(),
+                    indices: Vec::new(),
+                });
+            }
+        }
+        out
+    }
+
+    /// A reader config whose declared paths want every section in `specs`,
+    /// for an envelope-bearing source with the given `record_path` body.
+    fn envelope_reader_config(specs: &[SectionSpec], record_path: &str) -> JsonReaderConfig {
+        JsonReaderConfig {
+            record_path: Some(record_path.into()),
+            declared_doc_paths: declared_paths(specs),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn prepare_document_extracts_arbitrary_named_sections() {
         let json = r#"{
@@ -702,7 +799,7 @@ mod tests {
             "records": [{"x": 1}, {"x": 2}],
             "Summary": {"hash": "abc", "processed": 2}
         }"#;
-        let cfg = envelope_config(&[
+        let specs: &[SectionSpec] = &[
             (
                 "BatchInfo",
                 "/BatchInfo",
@@ -719,14 +816,9 @@ mod tests {
                     ("processed", EnvelopeFieldType::Int),
                 ],
             ),
-        ]);
-        let mut reader = reader_from_str(
-            json,
-            JsonReaderConfig {
-                record_path: Some("records".into()),
-                ..Default::default()
-            },
-        );
+        ];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(json, envelope_reader_config(specs, "records"));
         let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
 
         assert_eq!(sections.len(), 2);
@@ -754,6 +846,19 @@ mod tests {
         assert!(sections.is_empty());
     }
 
+    /// A config wanting a single section named `Bad`, so the wrong-format
+    /// extract validation fires for that section in the rejection tests.
+    fn config_wanting_bad_section() -> JsonReaderConfig {
+        JsonReaderConfig {
+            declared_doc_paths: vec![DocPath {
+                section: "Bad".into(),
+                field: "any".into(),
+                indices: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn prepare_document_rejects_xml_path_extract() {
         use crate::envelope::EnvelopeSection;
@@ -765,7 +870,7 @@ mod tests {
                 fields: IndexMap::new(),
             },
         );
-        let mut reader = reader_from_str(r#"{"records":[]}"#, default_config());
+        let mut reader = reader_from_str(r#"{"records":[]}"#, config_wanting_bad_section());
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Json(msg) if msg.contains("xml_path")));
     }
@@ -781,7 +886,7 @@ mod tests {
                 fields: IndexMap::new(),
             },
         );
-        let mut reader = reader_from_str(r#"{"records":[]}"#, default_config());
+        let mut reader = reader_from_str(r#"{"records":[]}"#, config_wanting_bad_section());
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Json(msg) if msg.contains("segment")));
     }
@@ -792,14 +897,9 @@ mod tests {
         // misconfiguration — envelope sections are object payloads of
         // typed fields.
         let json = r#"{"value": 42, "records": []}"#;
-        let cfg = envelope_config(&[("Val", "/value", &[("v", EnvelopeFieldType::Int)])]);
-        let mut reader = reader_from_str(
-            json,
-            JsonReaderConfig {
-                record_path: Some("records".into()),
-                ..Default::default()
-            },
-        );
+        let specs: &[SectionSpec] = &[("Val", "/value", &[("v", EnvelopeFieldType::Int)])];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(json, envelope_reader_config(specs, "records"));
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Json(msg) if msg.contains("number")));
     }
@@ -807,14 +907,10 @@ mod tests {
     #[test]
     fn prepare_document_missing_pointer_yields_no_entry() {
         let json = r#"{"records": [{"x":1}]}"#;
-        let cfg = envelope_config(&[("Trailer", "/trailer", &[("count", EnvelopeFieldType::Int)])]);
-        let mut reader = reader_from_str(
-            json,
-            JsonReaderConfig {
-                record_path: Some("records".into()),
-                ..Default::default()
-            },
-        );
+        let specs: &[SectionSpec] =
+            &[("Trailer", "/trailer", &[("count", EnvelopeFieldType::Int)])];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(json, envelope_reader_config(specs, "records"));
         let sections = reader.prepare_document(&cfg).unwrap();
         assert!(sections.is_empty());
     }
@@ -825,7 +921,7 @@ mod tests {
             "Meta": {"run_date": "2026-05-22", "enabled": true, "ratio": 0.5},
             "records": [{"x":1}]
         }"#;
-        let cfg = envelope_config(&[(
+        let specs: &[SectionSpec] = &[(
             "Meta",
             "/Meta",
             &[
@@ -833,14 +929,9 @@ mod tests {
                 ("enabled", EnvelopeFieldType::Bool),
                 ("ratio", EnvelopeFieldType::Float),
             ],
-        )]);
-        let mut reader = reader_from_str(
-            json,
-            JsonReaderConfig {
-                record_path: Some("records".into()),
-                ..Default::default()
-            },
-        );
+        )];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(json, envelope_reader_config(specs, "records"));
         let sections = reader.prepare_document(&cfg).unwrap();
         let meta = unwrap_section_map(sections.get("Meta").unwrap());
         assert!(matches!(meta.get("run_date"), Some(Value::Date(_))));
@@ -940,28 +1031,23 @@ mod tests {
 
     #[test]
     fn test_json_envelope_prescan_strips_leading_bom() {
-        // The envelope pre-scan re-parses `raw_bytes` via
-        // `serde_json::from_slice`; the source-level strip must clear
-        // the BOM for that path too, not just body iteration.
+        // The envelope pre-scan streams `raw_bytes` from a fresh cursor;
+        // the source-level strip must clear the BOM for that path too, not
+        // just body iteration.
         let json = r#"{
             "BatchInfo": {"batch_id": "RUN-001", "count": 42},
             "records": [{"x": 1}, {"x": 2}]
         }"#;
-        let cfg = envelope_config(&[(
+        let specs: &[SectionSpec] = &[(
             "BatchInfo",
             "/BatchInfo",
             &[
                 ("batch_id", EnvelopeFieldType::String),
                 ("count", EnvelopeFieldType::Int),
             ],
-        )]);
-        let mut reader = reader_from_str_with_bom(
-            json,
-            JsonReaderConfig {
-                record_path: Some("records".into()),
-                ..Default::default()
-            },
-        );
+        )];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str_with_bom(json, envelope_reader_config(specs, "records"));
         let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
         let head = unwrap_section_map(sections.get("BatchInfo").unwrap());
         assert_eq!(head.get("batch_id"), Some(&Value::String("RUN-001".into())));
