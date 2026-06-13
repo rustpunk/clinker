@@ -9,9 +9,11 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
+use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 
@@ -21,6 +23,23 @@ fn run_reshape(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+    let report = run_reshape_report(yaml, csv_input)?;
+    Ok((report.counters, report.dlq_entries, report.output))
+}
+
+/// The full observable surface of a Reshape run: counters, DLQ entries, the
+/// rendered CSV output, and the run's cumulative on-disk spill volume. Spill
+/// tests assert `cumulative_spill_bytes > 0` to prove the disk path fired.
+struct ReshapeReport {
+    counters: PipelineCounters,
+    dlq_entries: Vec<DlqEntry>,
+    output: String,
+    cumulative_spill_bytes: u64,
+}
+
+/// Run a Reshape pipeline and surface the full [`ReshapeReport`], including
+/// the cumulative spill volume the memory-pressure tests gate on.
+fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).expect("fixture pipeline must parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
@@ -46,7 +65,12 @@ fn run_reshape(
     )]);
 
     let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    Ok(ReshapeReport {
+        counters: report.counters,
+        dlq_entries: report.dlq_entries,
+        output: buf.as_string(),
+        cumulative_spill_bytes: report.cumulative_spill_bytes,
+    })
 }
 
 /// SCD-Type-2 shape: per employee, a row whose `plan_start - plan_end`
@@ -387,4 +411,312 @@ fn copy_from_none_synthesizes_fully_overridden_row() {
     // `ok_count` counts distinct source rows reaching output; the synthesized
     // row borrows its trigger's identity, so both source rows count clean.
     assert_eq!(counters.ok_count, 2, "both source rows emit clean");
+}
+
+/// SCD pipeline parameterized on the pipeline-level `memory.limit`, with the
+/// `spill` backpressure policy so a sub-baseline limit forces the disk path
+/// instead of being rejected as unsatisfiable (a producer-pausing policy
+/// rejects a limit below baseline RSS up front). The rule both mutates the
+/// trigger row and synthesizes a `copy_from: none` row, so the spill
+/// round-trip exercises the synthesized-row schema-width path at runtime.
+fn scd_spill_pipeline(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: reshape_scd_spill
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: test.csv
+      schema:
+        - {{ name: employee_id, type: string }}
+        - {{ name: plan_start, type: int }}
+        - {{ name: plan_end, type: int }}
+        - {{ name: status, type: string }}
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      order_by:
+        - {{ field: plan_start, order: asc }}
+      rules:
+        - name: fix_long_plan
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              plan_end: "plan_start"
+          synthesize:
+            copy_from: none
+            overrides:
+              employee_id: "employee_id"
+              plan_start: "plan_start"
+              plan_end: "plan_start"
+              status: "'synthesized'"
+  - type: output
+    name: out
+    input: backfill
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// Build a wide SCD input: `groups` employees, each with `rows_per_group`
+/// plan rows, the last of which trips the long-gap rule. Returns the CSV and
+/// the count of rows expected to trigger (one per group).
+fn scd_input(groups: usize, rows_per_group: usize) -> (String, usize) {
+    let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
+    for g in 0..groups {
+        for r in 0..rows_per_group {
+            let employee = format!("employee-{g:05}");
+            if r == rows_per_group - 1 {
+                // Long-gap trigger row: plan_start - plan_end = 900 > 365.
+                csv.push_str(&format!("{employee},1000,100,baseline-{r}\n"));
+            } else {
+                // Normal row: small gap, no trigger.
+                csv.push_str(&format!("{employee},{},{},baseline-{r}\n", r * 10, r * 10));
+            }
+        }
+    }
+    (csv, groups)
+}
+
+#[test]
+fn reshape_spills_under_memory_pressure() {
+    // A 4K budget against a baseline RSS in the megabytes forces the disk
+    // path from the first admitted record. The synthesized `copy_from: none`
+    // row makes the spill round-trip exercise the synthesized-row
+    // schema-width path. The output must be byte-identical to the same input
+    // run with an ample budget (spill is a memory strategy, never a data
+    // transform) AND the run must report on-disk spill volume.
+    let (csv, trigger_groups) = scd_input(200, 8);
+
+    let spilled = run_reshape_report(&scd_spill_pipeline("4K"), &csv).unwrap();
+    let in_memory = run_reshape_report(&scd_spill_pipeline("512M"), &csv).unwrap();
+
+    assert!(
+        spilled.dlq_entries.is_empty(),
+        "spilling run produces no DLQ entries: {:?}",
+        spilled.dlq_entries
+    );
+    assert!(
+        spilled.cumulative_spill_bytes > 0,
+        "the 4K budget must force the disk spill path"
+    );
+    assert_eq!(
+        in_memory.cumulative_spill_bytes, 0,
+        "the 512M budget keeps everything in memory"
+    );
+
+    // Spill is transparent: identical output regardless of budget. Compare
+    // sorted line sets so any reordering across the spill round-trip is
+    // caught as a difference.
+    let mut spilled_lines: Vec<&str> = spilled.output.lines().collect();
+    let mut memory_lines: Vec<&str> = in_memory.output.lines().collect();
+    spilled_lines.sort_unstable();
+    memory_lines.sort_unstable();
+    assert_eq!(
+        spilled_lines, memory_lines,
+        "spilled output must be byte-identical to the in-memory run"
+    );
+
+    // Every trigger group synthesized exactly one row.
+    let synth_count = spilled
+        .output
+        .lines()
+        .filter(|l| l.contains("synthesized"))
+        .count();
+    assert_eq!(
+        synth_count, trigger_groups,
+        "one synthesized row per trigger group survives the spill round-trip"
+    );
+    assert!(
+        !spilled.output.contains("$meta."),
+        "audit columns must not leak even across spill"
+    );
+}
+
+#[test]
+fn reshape_hysteresis_no_thrash() {
+    // A single group sized to straddle a small budget must still produce
+    // correct output: the buffer spills resident slices and reloads them at
+    // finalize, and the run completes without error (no per-record thrash
+    // collapse, no lost rows). The lone group's trigger row both mutates and
+    // synthesizes, so the reloaded group must re-run synthesis correctly.
+    let (csv, _) = scd_input(1, 400);
+
+    let report = run_reshape_report(&scd_spill_pipeline("8K"), &csv).unwrap();
+    assert!(report.dlq_entries.is_empty(), "no DLQ entries under spill");
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "the single large group trips the budget and spills"
+    );
+
+    // 400 originals + 1 synthesized row, all for the one employee.
+    let data_lines: Vec<&str> = report
+        .output
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        data_lines.len(),
+        401,
+        "400 originals + 1 synthesized survive the spill/reload round-trip"
+    );
+    let synth_count = report
+        .output
+        .lines()
+        .filter(|l| l.contains("synthesized"))
+        .count();
+    assert_eq!(synth_count, 1, "exactly one synthesized row for the group");
+}
+
+#[test]
+fn reshape_skew_single_giant_group() {
+    // One partition dwarfs the rest: employee-00000 holds 600 rows while 50
+    // other employees hold a handful each. The giant group alone exceeds the
+    // budget, so it must spill INCREMENTALLY (sliced by arrival hash) while
+    // the small groups stay resident. Correctness across the skewed spill is
+    // the gate: the giant group's trigger still mutates + synthesizes, and
+    // every small group passes through untouched.
+    let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
+    // Giant group: 599 normal rows + 1 trigger row.
+    for r in 0..599 {
+        csv.push_str(&format!("employee-00000,{},{},base\n", r * 10, r * 10));
+    }
+    csv.push_str("employee-00000,1000,100,base\n");
+    // 50 small groups, 2 rows each, none triggering.
+    for g in 1..=50 {
+        csv.push_str(&format!("employee-{g:05},10,10,base\n"));
+        csv.push_str(&format!("employee-{g:05},20,20,base\n"));
+    }
+
+    let report = run_reshape_report(&scd_spill_pipeline("16K"), &csv).unwrap();
+    assert!(report.dlq_entries.is_empty(), "no DLQ entries under skew");
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "the giant group trips the budget and spills"
+    );
+
+    // Giant group: 600 originals + 1 synthesized. Small groups: 100 rows.
+    let data_lines: Vec<&str> = report
+        .output
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        data_lines.len(),
+        701,
+        "600 + 1 synthesized (giant) + 100 (small) rows survive: got {}",
+        data_lines.len()
+    );
+    let synth_count = report
+        .output
+        .lines()
+        .filter(|l| l.contains("synthesized"))
+        .count();
+    assert_eq!(
+        synth_count, 1,
+        "only the giant group's trigger synthesizes a row"
+    );
+    // A small group passes through unchanged.
+    assert!(
+        report
+            .output
+            .lines()
+            .any(|l| l == "employee-00001,10,10,base"),
+        "small groups pass through untouched while the giant group spills"
+    );
+}
+
+/// Workspace root, derived from the crate manifest, so the example fixture
+/// is located independently of the harness cwd.
+fn examples_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("pipelines")
+}
+
+#[test]
+fn scd_type2_e2e_with_spill() {
+    // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. Its
+    // pipeline-level `memory.limit: 16K` with the `spill` policy forces the
+    // disk path on this small fixture, so the example doubles as the
+    // bounded-memory smoke test: the mutate+synthesize output must be correct
+    // AND the run must report on-disk spill volume.
+    let yaml = std::fs::read_to_string(examples_dir().join("scd_type2.yaml"))
+        .expect("read scd_type2.yaml example");
+    let csv = std::fs::read_to_string(examples_dir().join("data").join("scd_plans.csv"))
+        .expect("read scd_plans.csv example data");
+
+    let config = parse_config(&yaml).expect("example pipeline must parse");
+    // The example's `path:` fields are relative `./data` / `./output`
+    // strings; anchor compile-time path validation at the examples dir. The
+    // writer is an in-memory buffer, so no output file is opened.
+    let ctx = CompileContext::new(examples_dir());
+    let plan = config.compile(&ctx).expect("example pipeline must compile");
+
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "plans".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "scd_plans.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "scd-e2e".to_string(),
+        batch_id: "scd-e2e".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("example pipeline run");
+    let output = buf.as_string();
+
+    assert!(
+        report.dlq_entries.is_empty(),
+        "example run produces no DLQ entries: {:?}",
+        report.dlq_entries
+    );
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "the example's 16K budget forces the disk spill path"
+    );
+
+    // Three employees have over-long windows (E001, E002, E004), so three
+    // synthesized rows appear, each marked `status=synthesized`.
+    let synth_count = output.lines().filter(|l| l.contains("synthesized")).count();
+    assert_eq!(
+        synth_count, 3,
+        "one synthesized continuation row per over-long window: {output}"
+    );
+    // The trigger rows have their window closed at the start boundary.
+    assert!(
+        output.lines().any(|l| l.contains("E001,1000,1000")),
+        "E001's over-long window is closed at its start: {output}"
+    );
+    assert!(
+        !output.contains("$meta."),
+        "audit columns must not leak into default output: {output}"
+    );
 }

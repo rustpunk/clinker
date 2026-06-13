@@ -112,4 +112,15 @@ Like the `$ck.*` correlation columns, these `$meta.*` columns stay out of the de
 
 ## Memory model
 
-Reshape buffers each whole correlation group in memory before emitting any output row, because a rule cannot decide what to synthesize until it has seen the entire group. Plan memory for your largest group.
+Reshape is a **blocking, grouped** operator: it groups every input record by `partition_by` before any rule fires, because each rule must observe its whole correlation group (the [no-cascade contract](#no-cascade) forbids folding a group incrementally). It therefore cannot stream — the full group set materializes before the first output row leaves.
+
+That per-group buffer is governed by the same central memory arbitrator every other blocking operator polls (see [Memory & Spill](../ops/memory.md)). As records are grouped, Reshape tracks the live in-memory footprint and, whenever the run crosses the **soft** spill threshold (80% of `memory.limit` by default), it spills buffered groups to disk:
+
+- **What spills:** the **raw input records**, never the post-processed output rows. On reload at finalize, mutation and synthesis re-run in memory exactly as they would have without spilling, so the output is byte-identical whether a group stayed resident or round-tripped through disk. Spilling input records (rather than output rows) is also what keeps a `copy_from: none` synthesized row — built against the wider output schema — from being reconstructed against the wrong schema; input records all share one uniform schema.
+- **Spill priority:** `15`, between grace-hash Combine (`10`) and external sort (`20`). A grouped record buffer costs more to evict than grace partitions (reload pays the re-synthesis CPU) but less than an external-sort merge. Reshape **cannot back-pressure** — once its predecessor has drained there is no upstream channel to pause — so under memory pressure it always spills rather than pausing a producer.
+- **Hysteresis:** spill is driven by the resident-byte budget with the run's RSS as a backstop. A transient RSS spike that the OS reclaims lets grouping resume in memory rather than thrashing one spill per record; the buffer spills the largest resident groups first and stops as soon as the footprint drops back under the threshold.
+- **Skew (one giant group):** a single correlation group too large to fit on its own is spilled **incrementally** — sliced by the upper bits of each record's arrival hash so successive spill waves evict fractions of the one group — while smaller groups stay resident under the budget. A skewed partition never forces buffering the whole oversized group before any of it reaches disk.
+
+Reshape's buffer is **byte-budget-only**: it does not honor the `error_handling.max_group_buffer` record-count cap. That cap bounds the [correlation-commit](../pipelines/correlation-keys.md) group buffer used by the retraction machinery, a different buffer; Reshape's footprint is bounded by `memory.limit` and the spill path, not by a per-group record count.
+
+The on-disk spill volume Reshape produces is surfaced per stage in `clinker run --explain` (the **Estimated spill volume** and **Spill compression** sections) and, after a run, in the actual per-stage spill totals.

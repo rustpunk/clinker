@@ -1,0 +1,68 @@
+# Slowly-Changing Dimension (SCD Type 2) backfill.
+#
+# Each employee's benefit-plan history is a correlation group keyed on
+# `employee_id`. Within a group, a row whose coverage window runs longer than
+# one fiscal year (here, `plan_start - plan_end > 365` day-numbers) is treated
+# as an un-split SCD record: the Reshape node MUTATES the trigger row to close
+# its window at the start boundary and SYNTHESIZES a fresh continuation row
+# that carries the rest of the window forward, marked `status=synthesized`.
+#
+# Reshape is a blocking, grouped operator: it observes each employee's whole
+# group before any rule fires (the no-cascade contract), then governs that
+# per-group buffer against the configured memory budget — spilling the raw
+# input records to disk under pressure and re-running synthesis on reload.
+pipeline:
+  name: scd_type2_backfill
+  # A small budget here forces the spill path even on this tiny fixture, so
+  # the example doubles as a demonstration of bounded-memory Reshape. Raise or
+  # remove it for production volumes.
+  memory: { limit: "16K", backpressure: spill }
+
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: ./data/scd_plans.csv
+      options:
+        has_header: true
+      schema:
+        - { name: employee_id, type: string }
+        - { name: plan_start, type: int }
+        - { name: plan_end, type: int }
+        - { name: status, type: string }
+
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      order_by:
+        - { field: plan_start, order: asc }
+      rules:
+        - name: split_long_plan
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              # Close the over-long window at its start boundary.
+              plan_end: "plan_start"
+          synthesize:
+            copy_from: none
+            overrides:
+              employee_id: "employee_id"
+              # The continuation row picks up where the closed window ended.
+              plan_start: "plan_start"
+              plan_end: "plan_end"
+              status: "'synthesized'"
+
+  - type: output
+    name: out
+    input: backfill
+    config:
+      name: out
+      type: csv
+      path: ./output/scd_type2.csv
+
+error_handling:
+  strategy: continue

@@ -484,3 +484,93 @@ fn explain_renders_exec_sketches_in_statistics_block() {
     );
     insta::assert_snapshot!("explain_exec_sketches_statistics", text);
 }
+
+/// Source → Reshape → Output anchored on a sized CSV. Reshape spills its raw
+/// input records under memory pressure, so it must render as a disk-spilling
+/// stage in both the spill-volume estimate and the spill-compression
+/// projection — the cascade driven by `writes_spill_files` returning `true`.
+fn source_reshape_output_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: reshape_explain_demo
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: plans.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: plan_start, type: int }
+        - { name: plan_end, type: int }
+        - { name: status, type: string }
+
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      rules:
+        - name: fix_long_plan
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              plan_end: "plan_start"
+
+  - type: output
+    name: out
+    input: backfill
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+}
+
+#[test]
+fn explain_reshape_appears_as_disk_spilling_stage() {
+    // A sized source seeds a non-`unknown` per-stage spill estimate. The flip
+    // of `writes_spill_files` for Reshape auto-enrolls it in the spill-volume
+    // estimate and the spill-compression projection with no hand-edit to the
+    // explain renderer.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_padded_csv(tmp.path(), "plans.csv", "employee_id,plan_start", 40 * 1024);
+
+    let config: PipelineConfig = parse_config(source_reshape_output_yaml()).expect("parse_config");
+    let ctx = CompileContext::with_pipeline_dir(tmp.path(), "");
+    let plan = config.compile(&ctx).expect("compile");
+    let text = plan.dag().explain_text(&config);
+
+    // Reshape carries its own arbitration class: priority 15, no back-pressure.
+    assert!(
+        text.contains("arbitration: spill_priority=15, can_back_pressure=false"),
+        "Reshape must render its priority-15 arbitration class; got:\n{text}"
+    );
+    // The spill-volume estimate names the Reshape stage with a real byte
+    // figure (not `unknown`), proving the sized seed reached it.
+    let estimate_line = text
+        .lines()
+        .find(|l| l.contains("backfill") && l.contains('→'))
+        .unwrap_or_else(|| panic!("Reshape must appear in the spill estimate; got:\n{text}"));
+    assert!(
+        !estimate_line.contains("unknown"),
+        "Reshape spill estimate must carry a concrete byte figure, not `unknown`: {estimate_line}"
+    );
+
+    // The spill-compression projection (driven by the same `writes_spill_files`
+    // predicate) lists the Reshape stage with a resolved lz4/off decision.
+    let compression = plan
+        .dag()
+        .spill_compression_explain(clinker_plan::config::CompressMode::Auto, 1_024);
+    let compression_line = compression
+        .lines()
+        .find(|l| l.contains("backfill"))
+        .unwrap_or_else(|| {
+            panic!("Reshape must appear in the spill-compression projection; got:\n{compression}")
+        });
+    assert!(
+        compression_line.contains("lz4") || compression_line.contains("off"),
+        "Reshape compression decision must resolve to lz4 or off: {compression_line}"
+    );
+}
