@@ -819,6 +819,100 @@ mod tests {
     }
 
     #[test]
+    fn open_buf_strips_the_bom_on_every_open() {
+        // The body and the envelope pre-scan each call `open_buf` on their own
+        // fresh `Read`, so a Windows-authored file (Excel / PowerShell utf8
+        // export) presents the leading BOM to *both* opens. The strip must
+        // therefore live in `open_buf` (the shared per-open path), not in one
+        // caller. quick-xml 0.37 tolerates a stray prolog BOM, so a strip
+        // regression would NOT surface at the record/section level — it would
+        // only show as raw BOM bytes leading the parser's input. Assert the
+        // contract at that byte level, independent of quick-xml: every
+        // `open_buf` hands back a reader whose first bytes are the document,
+        // not `\u{feff}`. Two opens prove the strip is per-open, not one-shot.
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(b"<doc><x>1</x></doc>");
+        let source = ReopenableSource::buffer(Cursor::new(bytes)).expect("buffer source");
+
+        for pass in ["body", "pre-scan"] {
+            let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
+            let head = buf.fill_buf().expect("fill");
+            assert!(
+                head.starts_with(b"<doc>"),
+                "{pass} open leaked a BOM: stream starts with {:?}",
+                &head[..head.len().min(UTF8_BOM.len() + 2)]
+            );
+            assert!(
+                !head.starts_with(&UTF8_BOM),
+                "{pass} open left the BOM in place"
+            );
+        }
+    }
+
+    #[test]
+    fn open_buf_passes_through_a_bomless_open_unchanged() {
+        // A file with no BOM (the common case) must not lose its first bytes:
+        // `strip_leading_bom` consumes only when the marker is present, so the
+        // document element survives the probe intact.
+        let source =
+            ReopenableSource::buffer(Cursor::new(b"<doc><x>1</x></doc>".to_vec())).expect("buffer");
+        let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
+        assert!(buf.fill_buf().expect("fill").starts_with(b"<doc>"));
+    }
+
+    #[test]
+    fn prepare_document_extracts_sections_from_a_bom_prefixed_source() {
+        // End-to-end companion to `open_buf_strips_the_bom_on_every_open`: a
+        // BOM-prefixed envelope-bearing document still yields clean section
+        // values and clean body records, exercising the pre-scan and body
+        // opens through the full `prepare_document` / `next_record` path.
+        let xml = r#"<doc>
+            <BatchInfo><batch_id>RUN-001</batch_id><count>42</count></BatchInfo>
+            <records><record><x>1</x></record><record><x>2</x></record></records>
+            <Summary><hash>abc</hash></Summary>
+        </doc>"#;
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(xml.as_bytes());
+
+        let specs: &[SectionSpec] = &[
+            (
+                "BatchInfo",
+                "/doc/BatchInfo",
+                &[
+                    ("batch_id", EnvelopeFieldType::String),
+                    ("count", EnvelopeFieldType::Int),
+                ],
+            ),
+            (
+                "Summary",
+                "/doc/Summary",
+                &[("hash", EnvelopeFieldType::String)],
+            ),
+        ];
+        let cfg = envelope_config(specs);
+
+        let mut reader = XmlReader::from_reader(
+            Cursor::new(bytes),
+            envelope_reader_config(specs, "doc/records/record"),
+        )
+        .expect("XML buffer read");
+        let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
+        assert_eq!(sections.len(), 2);
+
+        let head = unwrap_section_map(sections.get("BatchInfo").expect("BatchInfo extracted"));
+        assert_eq!(head.get("batch_id"), Some(&Value::String("RUN-001".into())));
+        assert_eq!(head.get("count"), Some(&Value::Integer(42)));
+        let foot = unwrap_section_map(sections.get("Summary").expect("Summary extracted"));
+        assert_eq!(foot.get("hash"), Some(&Value::String("abc".into())));
+
+        let r1 = reader.next_record().expect("body record").expect("first");
+        assert_eq!(r1.get("x"), Some(&Value::Integer(1)));
+        let r2 = reader.next_record().expect("body record").expect("second");
+        assert_eq!(r2.get("x"), Some(&Value::Integer(2)));
+        assert!(reader.next_record().expect("eof").is_none());
+    }
+
+    #[test]
     fn prepare_document_empty_config_returns_empty() {
         let xml = r#"<doc><a><x>1</x></a></doc>"#;
         let mut reader = reader_from_str(xml, default_config_with_path("doc/a"));
