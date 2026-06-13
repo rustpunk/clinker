@@ -66,6 +66,29 @@ pub trait FormatReader: Send {
     fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
         Vec::new()
     }
+
+    /// Abandon the file currently being read and advance to the next one,
+    /// returning `Ok(true)` when a next file was opened (and
+    /// [`Self::current_source_file`] now names it) or `Ok(false)` when no
+    /// files remain.
+    ///
+    /// The ingest driver calls this after dead-lettering a whole file for a
+    /// structural-integrity failure under `dlq_granularity: document`, to keep
+    /// reading the remaining files of a multi-file source instead of stopping
+    /// the source at the first malformed file. The structural-count failures
+    /// that trigger it fire at the file's closing trailer, so the abandoned
+    /// file is already fully consumed — no unread records of it are lost.
+    ///
+    /// Default impl returns `Ok(false)`: a single-file reader has no next file.
+    /// Wrappers holding an inner reader (`CoercingReader`) must delegate;
+    /// [`MultiFileFormatReader`](crate) overrides it to advance its file cursor.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces the next file's reader-construction or schema-mismatch error.
+    fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+        Ok(false)
+    }
 }
 
 /// Streaming record writer. Consumes records one at a time.

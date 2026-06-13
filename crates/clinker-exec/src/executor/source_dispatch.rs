@@ -171,6 +171,10 @@ pub(crate) fn dispatch_source(
                     drained.push((rec, rn));
                 }
                 Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                    // Mark a structural-count close failed BEFORE forwarding it,
+                    // so the Output arm's per-file buffer rejects the file at
+                    // this close rather than flushing it.
+                    crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
                     drained_puncts.push(p);
                 }
                 None => break,

@@ -63,6 +63,15 @@ project:
   - running_fraction: row_index / $doc.Summary.record_count
 ```
 
+Note that an *extracted* trailer section you read via `$doc.*` is distinct
+from the **structural counts** an EDI reader validates internally (the X12
+`SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS` segment counts). Those
+trailer counts are checked by the reader against the body it streamed, and a
+mismatch is a structural-integrity failure — see [Malformed
+envelopes](error-handling.md#malformed-envelopes-structural-validation) for
+how `dlq_granularity: document` dead-letters a malformed file instead of
+aborting the run.
+
 The pre-scan reads the envelope-bearing segments of the file before
 body streaming begins. Envelope payloads are small (a few hundred bytes
 per document is typical), and how much of the file the reader retains to
@@ -166,8 +175,12 @@ envelope:
 
 Only the `UNB` header is extractable. Trailer segments (`UNT`, `UNZ`)
 that arrive after the body are **not** envelope sections — their control
-counts are validated by the reader instead. A `segment` extract naming
-any tag other than `UNB` is rejected at startup. See
+counts are validated by the reader instead. A mismatch between a trailer's
+declared count and the body the reader streamed is a structural-integrity
+failure: by default it aborts the run, and under a source's
+`dlq_granularity: document` opt-in it dead-letters the whole file to the DLQ
+(see [Malformed envelopes](error-handling.md#malformed-envelopes-structural-validation)).
+A `segment` extract naming any tag other than `UNB` is rejected at startup. See
 [EDIFACT Format](../formats/edifact.md) for the full reference.
 
 A JSON example:

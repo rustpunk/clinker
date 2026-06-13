@@ -2157,6 +2157,10 @@ pub(crate) fn merge_fused_interleave(
         let item: Option<(Record, u64)> = match item {
             Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => Some((r, rn)),
             Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                // A structural-count close condemns its whole file; mark it
+                // failed before the reconcile so the Output arm's per-file
+                // buffer rejects every already-streamed record of the file.
+                crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
                 collected_puncts.push(p);
                 continue;
             }
@@ -2508,6 +2512,11 @@ pub(crate) fn transform_fused_consume(
             let (record, rn) = match item {
                 Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
                 Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                    // A structural-count close condemns its whole file; mark
+                    // it failed before forwarding so the Output arm's
+                    // per-file buffer rejects every already-streamed record
+                    // of the file at this close.
+                    crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
                     event_batcher.push_punctuation(p)?;
                     continue;
                 }

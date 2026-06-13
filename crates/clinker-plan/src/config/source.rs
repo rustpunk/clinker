@@ -131,12 +131,15 @@ pub struct SourceConfig {
 /// Per-source dead-letter granularity under `continue` / `best_effort`.
 ///
 /// Selects whether a record failure dead-letters just the failing record
-/// or the whole document it belongs to. Has no effect under `fail_fast`,
-/// where the first failure aborts the run regardless. A pure policy enum —
-/// it carries no state and imposes no memory cost itself; the runtime cost
-/// of `Document` is the per-document record buffer the executor holds open
-/// only for currently-open documents (peak = concurrently-open documents,
-/// not total input), which spills to disk under memory pressure.
+/// or the whole document it belongs to. `Document` is incompatible with
+/// `error_handling.strategy: fail_fast` — document-level dead-lettering keeps
+/// the run going past a bad document, which contradicts fail-fast's
+/// abort-on-first-error, so the pairing is rejected at config-validation time
+/// (E344). A pure policy enum — it carries no state and imposes no memory cost
+/// itself; the runtime cost of `Document` is the per-document record buffer the
+/// executor holds open only for currently-open documents (peak =
+/// concurrently-open documents, not total input), which spills to disk under
+/// memory pressure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DlqGranularity {

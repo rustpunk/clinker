@@ -269,6 +269,21 @@ impl FormatReader for MultiFileFormatReader {
             }
         }
     }
+
+    fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+        // Drop the active (dead-lettered, trailer-reached) inner reader and
+        // open the next slot. A structural-count failure fires at the file's
+        // closing trailer, so the abandoned file is fully consumed — nothing
+        // unread is lost. Verify the new file's schema before its records
+        // flow, exactly as the EOF-driven advance in `next_record` does.
+        self.active = None;
+        if !self.advance()? {
+            return Ok(false);
+        }
+        let new_schema = self.active.as_mut().unwrap().schema()?;
+        self.assert_schema_match(&new_schema)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +337,54 @@ mod tests {
         r.next_record().unwrap();
         let after_second = r.current_file().to_string();
         assert!(after_second.ends_with("b.csv"));
+    }
+
+    #[test]
+    fn advance_to_next_file_abandons_current_and_opens_next() {
+        // `advance_to_next_file` drops the active file (skipping any of its
+        // unread records) and opens the next, updating `current_file`. This is
+        // the seam the ingest driver uses to keep streaming past a file it
+        // dead-lettered for a structural-count failure. Returns Ok(false) once
+        // no files remain.
+        let files = vec![
+            FileSlot {
+                path: PathBuf::from("a.csv"),
+                reader: cursor("id,name\n1,alice\n2,bob\n"),
+            },
+            FileSlot {
+                path: PathBuf::from("b.csv"),
+                reader: cursor("id,name\n3,carol\n"),
+            },
+        ];
+        let mut r = MultiFileFormatReader::new(files, csv_factory());
+        // Read one record of file a, then abandon a's remaining record (id=2).
+        assert!(r.next_record().unwrap().is_some());
+        assert!(r.current_file().to_string().ends_with("a.csv"));
+        assert!(
+            r.advance_to_next_file().unwrap(),
+            "a next file (b) opens, so advance reports true"
+        );
+        assert!(
+            r.current_file().to_string().ends_with("b.csv"),
+            "current_file moves to the next file after advancing"
+        );
+        // Only file b's record (carol) remains — a's unread tail (bob) is gone.
+        let mut remaining: Vec<String> = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            if let clinker_record::Value::String(s) = &rec.values()[1] {
+                remaining.push(s.as_str().to_string());
+            }
+        }
+        assert_eq!(
+            remaining,
+            vec!["carol".to_string()],
+            "file a's unread record was abandoned by the advance; only file b streams"
+        );
+        // No files remain, so a further advance reports false.
+        assert!(
+            !r.advance_to_next_file().unwrap(),
+            "advancing past the last file reports false"
+        );
     }
 
     #[test]

@@ -33,6 +33,19 @@ pub enum FormatError {
     /// missing/non-numeric block id, missing `-}` block-4 trailer,
     /// malformed `:tag:value` line, truncation, non-UTF-8 message).
     Swift(String),
+    /// An envelope trailer's declared structural COUNT did not match the
+    /// body the reader streamed: X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`,
+    /// or HL7 `BTS`/`FTS`. Distinct from the format-specific variants above
+    /// (which also cover truncation, bad delimiters, and control-number echo
+    /// mismatches) so the executor can route ONLY a count mismatch to the
+    /// document-level DLQ under `dlq_granularity: document`, while genuine
+    /// corruption keeps aborting the run. `format` names the spec for the
+    /// DLQ stage label; `message` is the precise count-mismatch description
+    /// the reader built at the trailer.
+    StructuralCount {
+        format: &'static str,
+        message: String,
+    },
     InvalidRecord {
         row: u64,
         message: String,
@@ -80,6 +93,9 @@ impl fmt::Display for FormatError {
             Self::X12(msg) => write!(f, "X12 error: {msg}"),
             Self::Hl7(msg) => write!(f, "HL7 error: {msg}"),
             Self::Swift(msg) => write!(f, "SWIFT error: {msg}"),
+            Self::StructuralCount { format, message } => {
+                write!(f, "{format} structural count error: {message}")
+            }
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }
@@ -97,6 +113,42 @@ impl fmt::Display for FormatError {
                  user emitted a map explicitly, coerce to a scalar in CXL before the emit."
             ),
         }
+    }
+}
+
+impl FormatError {
+    /// Build a [`FormatError::StructuralCount`] for an X12 envelope
+    /// count mismatch (`SE`/`GE`/`IEA`).
+    pub fn x12_structural_count(message: impl Into<String>) -> Self {
+        Self::StructuralCount {
+            format: "X12",
+            message: message.into(),
+        }
+    }
+
+    /// Build a [`FormatError::StructuralCount`] for an EDIFACT envelope
+    /// count mismatch (`UNT`/`UNZ`).
+    pub fn edifact_structural_count(message: impl Into<String>) -> Self {
+        Self::StructuralCount {
+            format: "EDIFACT",
+            message: message.into(),
+        }
+    }
+
+    /// Build a [`FormatError::StructuralCount`] for an HL7 batch/file
+    /// envelope count mismatch (`BTS`/`FTS`).
+    pub fn hl7_structural_count(message: impl Into<String>) -> Self {
+        Self::StructuralCount {
+            format: "HL7",
+            message: message.into(),
+        }
+    }
+
+    /// `true` for a [`FormatError::StructuralCount`] — the only class the
+    /// executor reclassifies from run-aborting to document-DLQ under
+    /// `dlq_granularity: document`. Every other variant keeps aborting.
+    pub fn is_structural_count(&self) -> bool {
+        matches!(self, Self::StructuralCount { .. })
     }
 }
 

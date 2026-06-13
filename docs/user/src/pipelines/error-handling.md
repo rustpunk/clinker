@@ -94,6 +94,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
 | `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` / `best_effort` across every Combine join mode; `fail_fast` propagates the eval error |
+| `structural_validation` | An envelope trailer's declared count did not match the body the reader streamed (X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`). The root-cause `trigger: true` entry for a malformed envelope rejected under a source's `dlq_granularity: document` policy; every already-streamed record of the same file is a `document_rejected` collateral |
 
 ## Advanced options
 
@@ -170,7 +171,41 @@ This is the document-shaped analogue of [correlation keys](#correlation-key): us
 
 **Output restriction.** Document-level DLQ flushes each whole document to a single output writer, so it cannot be combined with a [per-source-file output](../nodes/output.md) (a `{source_file}` / `{source_path}` path template over a multi-file source). The two are rejected together at compile time (E343); use a single output path, or set `dlq_granularity: record` if per-file output is the requirement.
 
+**Strategy requirement.** `dlq_granularity: document` requires `error_handling.strategy: continue` (or `best_effort`). It is incompatible with the default `fail_fast`: document-level dead-lettering keeps the run going past a bad document, which contradicts fail-fast's abort-on-first-error. The combination is rejected at compile time (E344) — set `strategy: continue` to dead-letter bad documents, or keep `fail_fast` with the default `dlq_granularity: record`.
+
 **Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
+
+### Malformed envelopes (structural validation)
+
+Envelope formats carry their own structural-integrity claims: an X12 interchange declares a segment count in each `SE`/`GE`/`IEA` trailer, EDIFACT in each `UNT`/`UNZ`, HL7 batch/file in each `BTS`/`FTS`. When the declared count does not match the body the reader actually streamed, the file is structurally invalid.
+
+Under `dlq_granularity: document`, such a count mismatch dead-letters the **whole source file** to the DLQ rather than aborting the run:
+
+- the file's records dead-letter as one `structural_validation` root-cause entry (`_cxl_dlq_trigger = true`) plus a `document_rejected` collateral for every other already-streamed record of the file;
+- **no** record of the malformed file reaches the success sink.
+
+```yaml
+nodes:
+  - type: source
+    name: claims
+    config:
+      name: claims
+      type: x12
+      glob: ./claims/*.edi
+      dlq_granularity: document   # reuse the document opt-in — no separate config
+```
+
+The opt-in is the same `dlq_granularity: document` knob that governs per-record document rejection above; there is no separate `validation:` block. A malformed envelope is simply one more reason a source under the `document` policy condemns a whole document.
+
+**Honest timing — rejected at the sink boundary, not before the first record.** The trailer that carries the count arrives at the *end* of the file, after every body record it counts has already streamed through the DAG. Clinker is a bounded-memory streaming engine — it does not buffer the whole file up front to pre-validate it (that would defeat the streaming model). So the count mismatch is detected mid-stream, the file is marked failed, and the document-level DLQ buffer rejects every already-streamed record of the file at its close. The user-visible outcome is the same — **no record of a malformed envelope is ever written to the output** — but the rejection lands at the sink boundary, not literally before the file's first record streams.
+
+**Grain — the whole file.** An `SE`-level mismatch (one transaction set inside a larger interchange) rejects the **entire interchange / file**, not just that one transaction set, because the document grain is the outermost source file (see [Document grain](#document-level-dlq) above). Split the input so each interchange is its own file if you need finer rejection.
+
+**Multiple files keep flowing.** When a `glob` / `paths` source matches several files and one is malformed, only that file dead-letters — ingestion continues to the remaining files, so the clean files after a bad one still reach the sink. (This is unlike the default `record` granularity, where a count mismatch aborts the whole run and no file's records are written.) Dead-lettering one malformed file never silently drops the good files around it.
+
+**Default behavior unchanged.** Under the default `dlq_granularity: record`, a structural count mismatch still **aborts the run** exactly as before — the document-DLQ disposition is strictly opt-in. Genuine corruption that is *not* a count mismatch (a truncated stream, a bad delimiter, a control-number echo mismatch, a segment after the interchange trailer) **always aborts**, even under the `document` opt-in: only the trailer-count claims are reclassified to the DLQ; structural corruption that makes the stream un-parseable is never silently dead-lettered.
+
+> **Cryptographic integrity (checksums / signatures) is not yet validated.** Envelope formats can also carry a SHA-256 body hash, a JWS-signed JSON payload, or an XML Signature. Clinker extracts these envelope sections but does not yet verify them. Tracked for a future release.
 
 ## Exit codes
 
