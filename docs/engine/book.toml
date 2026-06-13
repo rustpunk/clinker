@@ -5,5 +5,8 @@ language = "en"
 src = "src"
 
 [output.html]
+# Share the User Guide's theme rather than duplicating it (path is
+# relative to this book's root, i.e. docs/engine/ -> docs/theme).
+theme = "../theme"
 default-theme = "enamel"
 preferred-dark-theme = "blueprint"
