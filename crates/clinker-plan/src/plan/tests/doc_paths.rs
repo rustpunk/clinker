@@ -282,6 +282,81 @@ nodes:
 }
 
 #[test]
+fn test_doc_path_in_route_branch_condition_is_collected() {
+    // A `$doc` access referenced ONLY in a Route branch condition must
+    // reach the declared path set. A Route's node-keyed typed program is
+    // an empty body and its branch conditions compile straight to runtime
+    // evaluators, so this exercises the route-branch side-table that feeds
+    // the all-programs walk. The path attributes to the Route's upstream
+    // source (the Route inherits its input's source set).
+    let yaml = r#"
+pipeline:
+  name: route_doc
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              cutoff: int
+      schema:
+        - { name: amount, type: int }
+  - type: route
+    name: split
+    input: payments
+    config:
+      mode: exclusive
+      conditions:
+        big: "amount > $doc.Head.cutoff"
+      default: small
+  - type: output
+    name: big_out
+    input: split.big
+    config:
+      name: big_out
+      type: csv
+      path: big.csv
+  - type: output
+    name: small_out
+    input: split.small
+    config:
+      name: small_out
+      type: csv
+      path: small.csv
+"#;
+    let config = parse_config(yaml).expect("parse route-doc pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile route-doc pipeline");
+    let dag = plan.dag();
+    let source = dag
+        .graph
+        .node_indices()
+        .find_map(|idx| match &dag.graph[idx] {
+            PlanNode::Source { resolved, .. } => resolved.as_ref(),
+            _ => None,
+        })
+        .expect("source node present with resolved payload");
+    assert!(
+        source
+            .source
+            .declared_doc_paths
+            .contains(&path("Head", "cutoff", vec![])),
+        "`$doc.Head.cutoff` used only in a route branch condition must reach the \
+         declared set, got {:?}",
+        source.source.declared_doc_paths
+    );
+}
+
+#[test]
 fn test_multi_source_paths_are_attributed_per_source() {
     // Two independent single-source chains read disjoint `$doc` paths.
     // Each source must carry ONLY the path its own downstream program

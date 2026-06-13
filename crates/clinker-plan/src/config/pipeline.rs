@@ -764,8 +764,10 @@ impl PipelineConfig {
         // residual filters / emit bodies and in composition-body
         // programs, all of which land in `artifacts.typed` under their
         // node name (body programs are inserted there by the recursive
-        // bind_schema pass). Missing any of them would drop a referenced
-        // path from the declared set.
+        // bind_schema pass). Combine `where:` predicates and Route branch
+        // conditions are typed into separate side-tables and chained in
+        // below. Missing any of them would drop a referenced path from the
+        // declared set.
         let doc_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = artifacts
             .typed
             .iter()
@@ -779,6 +781,20 @@ impl PipelineConfig {
                     .combine_where_typed
                     .iter()
                     .map(|(name, tp)| (name.as_str(), tp.as_ref())),
+            )
+            // A Route's node-keyed `typed` entry is an empty body; its
+            // branch-condition programs live in a separate side-table, one
+            // per branch. Include each, keyed by the Route node name so the
+            // per-node source attribution stamps the path onto the Route's
+            // source(s) — a `$doc` access used only in a route condition
+            // would otherwise be dropped.
+            .chain(
+                artifacts
+                    .route_branch_typed
+                    .iter()
+                    .flat_map(|(name, programs)| {
+                        programs.iter().map(move |tp| (name.as_str(), tp.as_ref()))
+                    }),
             )
             .collect();
         let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&doc_refs);
