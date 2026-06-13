@@ -248,6 +248,17 @@ impl PipelineConfig {
             .any(|s| s.dlq_granularity == DlqGranularity::Document)
     }
 
+    /// Whether any Output declares `reconstruct_envelope: true`. Gates the
+    /// fused streaming-writer fast path off pipeline-wide, mirroring
+    /// `any_source_has_document_dlq`: the fused streaming consumer writes each
+    /// record straight to disk with no per-document framing, so an
+    /// envelope-reconstructing Output must take the materialized arm, which
+    /// detects document boundaries from each record's context and fires the
+    /// writer's `begin_document` / `end_document`.
+    pub fn any_output_reconstructs_envelope(&self) -> bool {
+        self.output_configs().any(|o| o.reconstruct_envelope)
+    }
+
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
@@ -3125,6 +3136,72 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
              `dlq_granularity: document`, or set `dlq_granularity: record` to keep \
              fail-fast"
         )));
+    }
+
+    // `reconstruct_envelope` drives a single per-document writer through the
+    // punctuation-unaware Output arm, which streams each record straight
+    // through one writer with per-document header/footer framing. Three
+    // pipeline shapes silently misbehave when combined with it, so each is
+    // rejected up front rather than producing wrong output that reports
+    // success:
+    //
+    //  * per-file `split` / fan-out: the envelope arm consults only the
+    //    single-writer registry, never the per-file fan-out registry, so a
+    //    file-keyed Output finds no writer and silently drops EVERY record
+    //    while the run counters still report them written — total silent data
+    //    loss.
+    //  * `dlq_granularity: document`: the document-DLQ Output arm takes
+    //    precedence over the envelope arm, so the framing hooks never fire and
+    //    envelope reconstruction silently does nothing.
+    //  * `correlation_key`: correlation buffering owns the writes through its
+    //    own commit terminal, which the envelope arm bypasses — dirty groups
+    //    would leak into the framed output and inflate `ok_count`.
+    if config.any_output_reconstructs_envelope() {
+        // Source-level conflicts are pipeline-wide (any envelope Output is
+        // incompatible with them), so resolve them once. The per-output loop
+        // below names the offending output directly — no re-derivation.
+        let has_document_dlq = config.any_source_has_document_dlq();
+        let has_correlation_key = config.any_source_has_correlation_key();
+        for output in config.output_configs() {
+            if !output.reconstruct_envelope {
+                continue;
+            }
+            let out = &output.name;
+            let per_file_fanout = output.split.is_some()
+                || crate::config::path_template::PathTemplate::parse(&output.path)
+                    .map(|t| t.has_per_record_tokens())
+                    .unwrap_or(false);
+            if per_file_fanout {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined \
+                     with per-file output splitting (`split:`) or a per-source-file path \
+                     template (`{{source_file}}` / `{{source_path}}`) — envelope \
+                     reconstruction frames one document stream into a single writer, \
+                     which is incompatible with routing each record to a file-keyed \
+                     writer. Use a single output path without `split:`, or drop \
+                     `reconstruct_envelope`",
+                )));
+            }
+            if has_document_dlq {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                     source declaring `dlq_granularity: document` — document-level \
+                     dead-lettering routes the Output through its own per-document buffer, \
+                     which takes precedence over envelope framing and silently leaves the \
+                     header/footer unwritten. Use `dlq_granularity: record`, or drop \
+                     `reconstruct_envelope`"
+                )));
+            }
+            if has_correlation_key {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                     source declaring `correlation_key` — correlation buffering owns the \
+                     writes through its own commit stage, which envelope framing bypasses, so \
+                     dirty correlation groups would leak into the framed output and inflate \
+                     the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`"
+                )));
+            }
+        }
     }
 
     // Validate the flat `vars:` block (`$vars.<key>` static config)

@@ -164,7 +164,7 @@ impl DocumentDlqState {
 /// A source-file Arc identifies a real document only when it names a
 /// concrete file — not the empty stamp or the `<merged>` sentinel a
 /// fan-in (Combine / post-aggregate) record carries.
-fn is_concrete_file(file: &Arc<str>) -> bool {
+pub(crate) fn is_concrete_file(file: &Arc<str>) -> bool {
     !file.is_empty() && file.as_ref() != MERGED_SOURCE_FILE.as_ref()
 }
 

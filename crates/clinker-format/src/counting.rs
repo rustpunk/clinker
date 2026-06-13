@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clinker_record::Record;
+use clinker_record::{DocumentContext, Record};
 
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
@@ -122,6 +122,17 @@ impl FormatWriter for CountedFormatWriter {
     fn bytes_written(&self) -> Option<u64> {
         Some(self.counter.bytes_written())
     }
+
+    /// Forward to the wrapped writer so per-document framing reaches the real
+    /// format writer rather than dying at this counting shim.
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.begin_document(doc)
+    }
+
+    /// Forward to the wrapped writer; see [`Self::begin_document`].
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.end_document(doc)
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +207,61 @@ mod tests {
 
         let bytes = counted.bytes_written().unwrap();
         assert!(bytes > 0, "should have written some bytes");
+    }
+
+    /// A `FormatWriter` that records every hook call, so a wrapper test can
+    /// prove per-document framing reaches the inner writer.
+    struct HookProbe {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FormatWriter for HookProbe {
+        fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
+            self.log.lock().unwrap().push("write".into());
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), FormatError> {
+            Ok(())
+        }
+        fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("begin:{}", doc.source_file()));
+            Ok(())
+        }
+        fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("end:{}", doc.source_file()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn counted_format_writer_forwards_document_hooks_to_inner() {
+        use std::sync::{Arc, Mutex};
+
+        use clinker_record::DocumentId;
+        use indexmap::IndexMap;
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = HookProbe {
+            log: Arc::clone(&log),
+        };
+        let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
+
+        let doc = DocumentContext::new(DocumentId::next(), Arc::from("file.x12"), IndexMap::new());
+        counted.begin_document(&doc).unwrap();
+        counted.end_document(&doc).unwrap();
+
+        // The hooks must reach the wrapped writer rather than dying on the
+        // counting shim's no-op default.
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["begin:file.x12", "end:file.x12"],
+            "begin/end_document forward through the counting wrapper",
+        );
     }
 }
