@@ -1,0 +1,9 @@
+employee_id,plan_start,plan_end,status
+E001,100,90,baseline
+E001,1000,100,baseline
+E002,200,150,baseline
+E002,2000,300,baseline
+E003,300,250,baseline
+E004,400,380,baseline
+E004,1500,400,baseline
+E005,500,450,baseline

@@ -888,19 +888,28 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
                 can_back_pressure: false,
             }
         }
+        // Reshape buffers every input record per correlation group before
+        // any rule fires (the no-cascade contract forbids incremental folding
+        // — a rule must observe the whole group), then spills the raw input
+        // records via a whole-record postcard+LZ4 round-trip and re-runs
+        // synthesis on reload. Priority `15` sits between grace-hash (`10`)
+        // and sort (`20`): a grouped record buffer that is costlier to evict
+        // than grace partitions (it pays the re-synthesis CPU on reload) but
+        // cheaper than an external-sort merge. No upstream channel to gate,
+        // so it cannot back-pressure.
+        PlanNode::Reshape { .. } => ArbitrationClass {
+            spill_priority: Some(15),
+            can_back_pressure: false,
+        },
         // Stateless or sink stages register no spillable consumer:
         // Transform / Route / Merge stream record-at-a-time, Output is a
         // sink, Composition is a structural wrapper whose body nodes
         // carry their own classes, and CorrelationCommit's group buffer
         // is bounded by `max_group_buffer` rather than the arbitrator.
-        // Reshape buffers per-group state entirely in memory with no
-        // group-size cap; its disk-spill governance lands with the follow-on
-        // memory work, so it registers no spillable consumer yet.
         PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Output { .. }
-        | PlanNode::Reshape { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => ArbitrationClass {
             spill_priority: None,
@@ -932,7 +941,9 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
 /// - external sort (`PlanNode::Sort`),
 /// - hash Aggregate (`PlanNode::Aggregation` with the hash strategy;
 ///   streaming aggregate holds one group and never spills),
-/// - grace-hash and sort-merge Combine.
+/// - grace-hash and sort-merge Combine,
+/// - Reshape (`PlanNode::Reshape`), which spills its raw per-group input
+///   records and re-runs synthesis on reload.
 ///
 /// Surfaces that describe what hits disk — the `--explain`
 /// spill-compression projection, the per-stage estimated spill volume,
@@ -955,12 +966,15 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
             strategy,
             CombineStrategy::GraceHash { .. } | CombineStrategy::SortMerge
         ),
+        // Reshape spills its raw input records per group when the buffer trips
+        // the budget and re-runs synthesis on reload, so it writes real spill
+        // files and must appear in the disk-spill projection surfaces.
+        PlanNode::Reshape { .. } => true,
         PlanNode::Source { .. }
         | PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Output { .. }
-        | PlanNode::Reshape { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => false,
     }

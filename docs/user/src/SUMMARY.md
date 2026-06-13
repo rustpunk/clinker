@@ -89,5 +89,6 @@
 - [Multi-Input Combine](cookbook/combine.md)
 - [Routing to Multiple Outputs](cookbook/routing.md)
 - [Aggregation & Rollups](cookbook/aggregation.md)
+- [Slowly-Changing Dimensions (SCD Type 2)](cookbook/scd-type2.md)
 - [File Splitting](cookbook/file-splitting.md)
 - [Intra-Record Closures](cookbook/intra-record-closures.md)

@@ -203,3 +203,109 @@ fn synthesize_copy_from_none_missing_override_rejected() {
         &["copy_from: none", "must override every column", "label"],
     );
 }
+
+/// Wrap a reshape `rules:` block in a pipeline whose source declares an XML
+/// envelope (`$doc.BatchInfo.batch_id` type-resolves), so the `$doc` guard
+/// fires on a resolved reference rather than a parse or unknown-section
+/// error. The upstream schema is `account: string, amount: int, note:
+/// string`; the partition key is `account`.
+fn pipeline_with_envelope_reshape_rules(rules: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: reshape_doc_guard
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          BatchInfo:
+            extract: {{ xml_path: "/doc/BatchInfo" }}
+            fields:
+              batch_id: string
+      schema:
+        - {{ name: account, type: string }}
+        - {{ name: amount, type: int }}
+        - {{ name: note, type: string }}
+  - type: reshape
+    name: rs
+    input: payments
+    config:
+      partition_by: [account]
+      rules:
+{rules}
+  - type: output
+    name: out
+    input: rs
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// The substrings every `$doc`-guard diagnostic must carry, regardless of
+/// which rule fragment triggered it.
+const DOC_GUARD_NEEDLES: &[&str] = &[
+    "references `$doc` document context",
+    "Reshape spills per-group state",
+    "current limitation",
+];
+
+#[test]
+fn doc_context_reference_in_mutate_set_rejected() {
+    // Reshape spills per-group input records to disk under memory pressure and
+    // re-runs the rules on reload, but the spill round-trip does not carry
+    // document envelope context, so a `$doc` reference would resolve to null
+    // for a spilled group and to the real envelope for a resident one —
+    // output that depends on the memory budget. The guard scans every rule
+    // fragment; this pins the `mutate.set` site.
+    let yaml = pipeline_with_envelope_reshape_rules(
+        r#"        - name: stamp_batch
+          when: "amount > 0"
+          mutate:
+            set:
+              note: "$doc.BatchInfo.batch_id""#,
+    );
+    let diags = compile_diagnostics(&yaml);
+    assert_e200_contains(&diags, DOC_GUARD_NEEDLES);
+}
+
+#[test]
+fn doc_context_reference_in_when_rejected() {
+    // The guard must also fire on a `$doc` reference in the `when` predicate,
+    // not just an assignment fragment.
+    let yaml = pipeline_with_envelope_reshape_rules(
+        r#"        - name: stamp_batch
+          when: "$doc.BatchInfo.batch_id == note"
+          mutate:
+            set:
+              note: "'x'""#,
+    );
+    let diags = compile_diagnostics(&yaml);
+    assert_e200_contains(&diags, DOC_GUARD_NEEDLES);
+}
+
+#[test]
+fn doc_context_reference_in_synthesize_override_rejected() {
+    // And on a `$doc` reference in a `synthesize.overrides` expression.
+    let yaml = pipeline_with_envelope_reshape_rules(
+        r#"        - name: emit_batch_row
+          when: "amount > 0"
+          synthesize:
+            copy_from: none
+            overrides:
+              account: "account"
+              amount: "amount"
+              note: "$doc.BatchInfo.batch_id""#,
+    );
+    let diags = compile_diagnostics(&yaml);
+    assert_e200_contains(&diags, DOC_GUARD_NEEDLES);
+}
