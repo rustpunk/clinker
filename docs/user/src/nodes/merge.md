@@ -1,0 +1,207 @@
+# Merge Nodes
+
+Merge nodes concatenate multiple upstream branches into a single stream. They are the counterpart to route nodes -- where a route splits one stream into many, a merge joins many streams back into one.
+
+Merge is for streamwise concatenation of inputs that share a schema. For record-level joining across inputs that have different schemas, see [Combine Nodes](combine.md).
+
+## Basic structure
+
+```yaml
+- type: merge
+  name: combined
+  inputs:
+    - east_data
+    - west_data
+  config: {}
+```
+
+Note the key differences from other node types:
+
+- Uses **`inputs:`** (plural), not `input:` (singular).
+- The `config:` block is empty -- all wiring is on the node header.
+- Using `input:` (singular) on a merge node is a parse error.
+
+## Wiring
+
+The `inputs:` field is a list of upstream node references. These can be bare node names or port references from route nodes:
+
+```yaml
+- type: merge
+  name: rejoin
+  inputs:
+    - process_high
+    - process_medium
+    - classify.low           # Port syntax for a route branch
+  config: {}
+```
+
+Downstream nodes wire to the merge as a normal single-input reference:
+
+```yaml
+- type: output
+  name: final_output
+  input: rejoin
+  config:
+    name: final_output
+    type: csv
+    path: "./output/combined.csv"
+```
+
+## Modes
+
+Merge's cross-input ordering discipline is selected by `config.mode`. Two modes exist; `concat` is the default.
+
+### `concat` (default)
+
+Predecessor records drain in **declaration order**: `inputs[0]` flows to output first, then `inputs[1]`, then `inputs[2]`, and so on. Within a single predecessor, per-source FIFO order is preserved. Output is reproducible run-to-run.
+
+```yaml
+- type: merge
+  name: combined
+  inputs: [east, west]
+  config:
+    mode: concat
+```
+
+### `interleave`
+
+Records flow to output **as they become available** from any predecessor. Per-source FIFO is preserved within each input; cross-input order follows wall-clock arrival and is non-deterministic.
+
+```yaml
+- type: merge
+  name: combined
+  inputs: [east, west]
+  config:
+    mode: interleave
+```
+
+### Seeded interleave — `interleave_seed:`
+
+Snapshot tests and benchmarks that need reproducible cross-input ordering can opt into a deterministic schedule:
+
+```yaml
+- type: merge
+  name: combined
+  inputs: [east, west]
+  config:
+    mode: interleave
+    interleave_seed: 42
+```
+
+With a seed, the cross-input order is reproducible from run to run regardless of upstream timing. To get there, the Merge reads all of its inputs into memory before emitting, so a seeded interleave buffers more than the other modes — use it for tests and benchmarks, not high-volume production merges.
+
+## Choosing a mode
+
+| Mode | Order | When to use |
+|------|-------|-------------|
+| `concat` | Inputs emitted in declaration order, each fully drained before the next. | Downstream depends on a stable, declaration-ordered sequence (byte-identical output, contiguous time partitions). |
+| `interleave` (unseeded) | Records emitted as they arrive; per-input order preserved, cross-input order varies. | Lowest latency and the consumer is order-insensitive (e.g. an aggregator grouping by key, or a writer that doesn't assert on row order). |
+| `interleave` (seeded) | Reproducible cross-input order. | Tests and benchmarks that assert on exact row sequence. Buffers all inputs in memory. |
+
+For high-volume merges, prefer `concat` or unseeded `interleave` — both stream their inputs and let a slow downstream consumer naturally throttle the upstream readers, so memory stays bounded. A seeded interleave does not, because it buffers everything first.
+
+## Record ordering
+
+Records arrive in the order described by the mode in use — see [Modes](#modes) and [Choosing a mode](#choosing-a-mode) above. If you need sorted output regardless of merge mode, apply a `sort_order` on the downstream output node.
+
+## Use cases
+
+### Reuniting route branches
+
+The most common pattern is routing records through different processing paths and then merging them back together:
+
+```yaml
+- type: route
+  name: classify
+  input: orders
+  config:
+    mode: exclusive
+    conditions:
+      high: "amount > 1000"
+    default: standard
+
+- type: transform
+  name: process_high
+  input: classify.high
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit amount = amount
+      emit surcharge = amount * 0.02
+      emit tier = "premium"
+
+- type: transform
+  name: process_standard
+  input: classify.standard
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit amount = amount
+      emit surcharge = 0
+      emit tier = "standard"
+
+- type: merge
+  name: all_orders
+  inputs:
+    - process_high
+    - process_standard
+  config: {}
+
+- type: output
+  name: result
+  input: all_orders
+  config:
+    name: result
+    type: csv
+    path: "./output/all_orders.csv"
+```
+
+### Unioning multiple sources
+
+Merge nodes can combine records from multiple source files that share the same schema:
+
+```yaml
+- type: source
+  name: jan_sales
+  config:
+    name: jan_sales
+    type: csv
+    path: "./data/sales_jan.csv"
+    schema:
+      - { name: sale_id, type: int }
+      - { name: amount, type: float }
+      - { name: region, type: string }
+
+- type: source
+  name: feb_sales
+  config:
+    name: feb_sales
+    type: csv
+    path: "./data/sales_feb.csv"
+    schema:
+      - { name: sale_id, type: int }
+      - { name: amount, type: float }
+      - { name: region, type: string }
+
+- type: merge
+  name: all_sales
+  inputs:
+    - jan_sales
+    - feb_sales
+  config: {}
+
+- type: aggregate
+  name: totals
+  input: all_sales
+  config:
+    group_by: [region]
+    cxl: |
+      emit total = sum(amount)
+      emit count = count(*)
+```
+
+## Schema constraints across inputs
+
+Merge concatenates streams positionally against the merge node's `output_schema` (taken from the first input). Every input must therefore agree on column shape — same column names, same `on_unmapped` policy, same `correlation_key` set.
+
+Disagreement on the `$widened` `auto_widen` sidecar (one source uses `auto_widen`, another uses `drop` / `reject`) fails compile with **E315**. See [Auto-Widen & Schema Drift → E315](../formats/auto-widen.md#e315--merge-inputs-must-agree-on-policy) for the full diagnostic shape and remediation.

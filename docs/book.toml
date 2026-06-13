@@ -1,9 +1,0 @@
-[book]
-title = "Clinker User Guide"
-authors = ["Rustpunk"]
-language = "en"
-src = "src"
-
-[output.html]
-default-theme = "enamel"
-preferred-dark-theme = "blueprint"
