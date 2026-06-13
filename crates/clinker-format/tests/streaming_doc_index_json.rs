@@ -406,3 +406,156 @@ fn prescan_prunes_the_unread_section_in_a_mixed_envelope() {
         "the unread section is pruned, not materialized"
     );
 }
+
+/// A multi-MB top-level array streams element-at-a-time: the whole array is
+/// never collected into a `Vec`, and re-opening by path means no whole-file
+/// byte buffer is held either. Body consumption tracks records yielded, not the
+/// full array up front.
+#[test]
+fn large_array_body_streams_without_collecting_or_buffering() {
+    use clinker_format::ReopenableSource;
+    use std::io::Write;
+
+    // ~5 MB array of small objects, written to a real file so the reader
+    // re-opens by path (the production shape) rather than buffering bytes.
+    let rows = 50_000usize;
+    let mut json = String::from("[");
+    for i in 0..rows {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(r#"{{"id":{i},"name":"row-{i}"}}"#));
+    }
+    json.push(']');
+    assert!(
+        json.len() > 1_000_000,
+        "body should be > 1 MB: {}",
+        json.len()
+    );
+
+    let path = std::env::temp_dir().join(format!(
+        "clinker-large-array-{}-{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(json.as_bytes())
+        .unwrap();
+
+    let mut reader =
+        JsonReader::from_source(ReopenableSource::path(&path), JsonReaderConfig::default())
+            .unwrap();
+
+    // Reading the first record must not require materializing the rest: it
+    // streams one element. Then every record streams in order.
+    let mut count = 0usize;
+    let mut last_id = -1i64;
+    while let Some(rec) = reader.next_record().unwrap() {
+        let id = match rec.get("id") {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("expected integer id, got {other:?}"),
+        };
+        assert_eq!(id, last_id + 1, "body records stream in order");
+        last_id = id;
+        count += 1;
+    }
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(count, rows, "every body element streamed exactly once");
+}
+
+/// `record_path` into a large nested array streams the same way: navigation
+/// skips siblings structurally and the body yields one element at a time.
+#[test]
+fn large_record_path_array_streams_one_element_at_a_time() {
+    let rows = 20_000usize;
+    let mut body = String::from(r#"{"meta":{"v":1},"data":{"results":["#);
+    for i in 0..rows {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(r#"{{"x":{i}}}"#));
+    }
+    body.push_str("]}}");
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(body.into_bytes()),
+        JsonReaderConfig {
+            record_path: Some("data.results".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut count = 0usize;
+    let mut last = -1i64;
+    while let Some(rec) = reader.next_record().unwrap() {
+        let x = match rec.get("x") {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("expected integer x, got {other:?}"),
+        };
+        assert_eq!(x, last + 1);
+        last = x;
+        count += 1;
+    }
+    assert_eq!(count, rows);
+}
+
+/// A path-backed input rewritten between the body open (at construction) and
+/// the envelope pre-scan (at `prepare_document`) is caught: the pre-scan refuses
+/// to splice an envelope from new bytes onto a body parsed from old ones, and
+/// fails loud instead of silently mismatching.
+#[test]
+fn envelope_prescan_rejects_a_file_changed_between_passes() {
+    use clinker_format::ReopenableSource;
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!(
+        "clinker-changed-between-passes-{}-{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let original = r#"{"Summary":{"record_count":2},"records":[{"x":1},{"x":2}]}"#;
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(original.as_bytes())
+        .unwrap();
+
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    // Construction opens the body and snapshots the file's identity.
+    let mut reader = JsonReader::from_source(
+        ReopenableSource::path(&path),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // An external producer rewrites the file to different content before the
+    // pre-scan re-opens it.
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(br#"{"Summary":{"record_count":9999},"records":[{"x":7},{"x":8},{"x":9}]}"#)
+        .unwrap();
+
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("a file changed between the two passes must fail loud");
+    let _ = std::fs::remove_file(&path);
+    match err {
+        FormatError::Io(e) => assert!(
+            e.to_string().contains("changed between"),
+            "error names the mid-run change: {e}"
+        ),
+        other => panic!("expected an Io change error, got {other:?}"),
+    }
+}

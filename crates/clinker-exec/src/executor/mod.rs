@@ -225,10 +225,7 @@ pub fn single_file_reader(
     path: impl Into<std::path::PathBuf>,
     reader: Box<dyn Read + Send>,
 ) -> crate::source::SourceInput {
-    crate::source::SourceInput::Files(vec![crate::source::multi_file::FileSlot {
-        path: path.into(),
-        reader,
-    }])
+    crate::source::SourceInput::Files(vec![crate::source::multi_file::FileSlot::new(path, reader)])
 }
 
 /// Dummy storage type for streaming (no-window) evaluation.

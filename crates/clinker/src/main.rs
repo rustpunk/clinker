@@ -1050,10 +1050,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // `open_source_file` adds the Windows FILE_SHARE_DELETE share mode so
             // a concurrent atomic-rename publish or delete still interoperates
             // with this open handle on Windows.
-            let file = clinker_channel::open_source_file(&read_path)?;
-            slots.push(clinker_exec::source::multi_file::FileSlot::new(
+            // Validate readability up front (surfacing a permission/missing
+            // error here, before the executor thread starts) while leaving the
+            // reader to re-open the stable staged `read_path` per pass. The
+            // staged copy is held under this source's shared advisory read lock
+            // for the run, so re-opens read byte-identical content.
+            clinker_channel::open_source_file(&read_path)?;
+            slots.push(clinker_exec::source::multi_file::FileSlot::from_path(
                 path.clone(),
-                Box::new(file),
+                read_path,
             ));
         }
         source_files_by_name.insert(source_name.clone(), paths);
