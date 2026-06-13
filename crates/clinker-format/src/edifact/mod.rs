@@ -20,6 +20,7 @@
 //! (so `$doc` envelope sections over `UNB` cost O(UNB)); the body streams
 //! one segment at a time. The whole interchange is never buffered.
 
+mod charset;
 pub mod reader;
 mod tokenizer;
 pub mod writer;

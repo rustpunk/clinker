@@ -226,11 +226,46 @@ middle element is empty and the user declares only the fields they care
 about. Supply `interchange` literal elements instead when the records
 have no source `UNB` section to echo.
 
+## Character set
+
+EDIFACT names its body character repertoire **in-band**: the `UNB`
+header's syntax identifier (data element S001, component 1 — the `UNOA`
+in `UNOA:1`) declares the repertoire for the whole interchange. There is
+therefore **no `encoding` option** on an EDIFACT source or sink; the
+reader discovers the repertoire from the `UNB` and the writer re-derives
+it from the `UNB` it emits, so a read → write round-trip is byte-faithful
+without any configuration.
+
+| `UNB` syntax level | Repertoire                                      |
+| ------------------ | ----------------------------------------------- |
+| `UNOA`, `UNOB`     | ASCII; a byte `>= 0x80` is an error             |
+| `UNOC`             | ISO-8859-1 (Latin-1), one byte per character    |
+| `UNOY`             | UTF-8; invalid byte sequences are an error      |
+
+Decoding stays streaming and per-segment — the interchange is never
+buffered whole. The syntax identifier is itself ASCII, so it is read
+straight from the raw `UNB` bytes before any text is decoded; the `UNB`
+and every body segment are then decoded through the negotiated
+repertoire. The `UNB`'s own sender and recipient identification elements
+may legitimately carry non-ASCII text under `UNOC` or `UNOY`, and they
+decode (and re-encode on output) under that repertoire too — so a `UNOC`
+interchange whose header or body carries Latin-1 high bytes (for example
+accented characters in a party name) parses without error, surfaces the
+correct text in `$doc.UNB.*`, and round-trips byte-for-byte.
+
+The repertoire is enforced loudly. A `UNOA`/`UNOB` interchange whose body
+carries a high byte fails ("outside the ASCII repertoire") rather than
+silently reinterpreting it; a `UNOY` interchange with invalid UTF-8 fails
+("not valid UTF-8"); and a `UNB` declaring an unsupported syntax level
+(`UNOD`..`UNOX`) fails at startup with a precise error naming the level,
+never falling back to a guessed encoding or substituting replacement
+characters. On output the writer encodes element text through the same
+repertoire the `UNB` declares; a character the repertoire cannot
+represent (a non-ASCII character under `UNOA`/`UNOB`, or a codepoint above
+`U+00FF` under `UNOC`) is rejected rather than emitted truncated.
+
 ## Limitations
 
-- **Charset.** Element text is decoded as UTF-8. Non-UTF-8 interchanges
-  (UNOA/UNOB/Latin-1 high bytes) are rejected explicitly rather than
-  silently corrupted.
 - **Functional groups.** A single `UNB..UNZ` interchange is supported;
   `UNG`/`UNE` functional-group segments are rejected with a precise
   error.
