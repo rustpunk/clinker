@@ -255,3 +255,17 @@ have no source `UNB` section to echo.
   single empty-padding shapes re-emit with the correct reference; only
   this simultaneous double degeneracy carries the limitation, and it is
   rare in practice.
+- **Split date/time vs. a short numeric control reference.** The
+  deterministic split-recombination rule reads a bare date token (all
+  digits, six or eight wide) in the S004 slot followed by a bare time
+  token (all digits, four or six wide) as a split date/time, joining the
+  two into one slot before locating data element 0020. A header that
+  genuinely places a bare date-only S004 immediately ahead of a short
+  all-numeric control reference of exactly four or six digits is
+  byte-identical to that split, so the reference is mis-located as the
+  time component and the recombined date/time absorbs it. This is the
+  read-side counterpart of the deterministic tradeoff: position alone
+  cannot distinguish the two, and a content-shape sniff was rejected as
+  over-broad. The conformant single `date:time` composite, a date-only
+  S004 followed by a non-numeric or differently-sized reference, and an
+  empty (rather than date-only) S004 slot are all unaffected.
