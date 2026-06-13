@@ -1,0 +1,158 @@
+/*
+ * Rustpunk syntax highlighting — dual-theme
+ * Enamel (light): industrial color-coded wiring — distinct hues for readability
+ * Blueprint (dark): drafting-table annotation colors — breaks monochrome teal
+ */
+
+/* ── Shared ── */
+
+.hljs {
+    display: block;
+    overflow-x: auto;
+}
+
+.hljs-emphasis {
+    font-style: italic;
+}
+
+.hljs-strong {
+    font-weight: bold;
+}
+
+/* ── Enamel (light surface) ── */
+
+.enamel pre > .hljs {
+    background: #E6E9EC;
+    color: #3A4E5C;
+}
+
+/* Comments — recessive gray */
+.enamel .hljs-comment,
+.enamel .hljs-quote {
+    color: #6A7280;
+}
+
+/* Keywords — oxide-red: the dominant structural color */
+.enamel .hljs-keyword,
+.enamel .hljs-selector-tag {
+    color: #8B3510;
+    font-weight: bold;
+}
+
+/* Strings — deep green: distinct from everything else */
+.enamel .hljs-string,
+.enamel .hljs-symbol,
+.enamel .hljs-bullet {
+    color: #1A6B35;
+}
+
+/* Numbers, types, literals — deep blue: reads as measured values */
+.enamel .hljs-number,
+.enamel .hljs-meta,
+.enamel .hljs-built_in,
+.enamel .hljs-builtin-name,
+.enamel .hljs-literal,
+.enamel .hljs-type,
+.enamel .hljs-params {
+    color: #1A5C8A;
+}
+
+/* Function names, section titles — dark steel, bold */
+.enamel .hljs-title,
+.enamel .hljs-section {
+    color: #1A3A5C;
+    font-weight: bold;
+}
+
+/* Variables, attributes, tags — warm amber-brown */
+.enamel .hljs-variable,
+.enamel .hljs-template-variable,
+.enamel .hljs-attribute,
+.enamel .hljs-attr,
+.enamel .hljs-tag,
+.enamel .hljs-name,
+.enamel .hljs-regexp,
+.enamel .hljs-link,
+.enamel .hljs-selector-id,
+.enamel .hljs-selector-class {
+    color: #9A4A10;
+}
+
+.enamel .hljs-addition {
+    color: #1A6B35;
+    background-color: #D2E8D8;
+}
+
+.enamel .hljs-deletion {
+    color: #B7410E;
+    background-color: #E8D2C4;
+}
+
+/* ── Blueprint (dark surface) ── */
+
+.blueprint pre > .hljs {
+    background: #080F0E;
+    color: #A0CCC7;
+}
+
+/* Comments — ghost teal, recessive */
+.blueprint .hljs-comment,
+.blueprint .hljs-quote {
+    color: #4A6F68;
+}
+
+/* Keywords — bright verdigris: the structural accent */
+.blueprint .hljs-keyword,
+.blueprint .hljs-selector-tag {
+    color: #43B3AE;
+    font-weight: bold;
+}
+
+/* Strings — warm amber/gold: high contrast against teal */
+.blueprint .hljs-string,
+.blueprint .hljs-symbol,
+.blueprint .hljs-bullet {
+    color: #D4A055;
+}
+
+/* Numbers, types, literals — hazard gold: measured values */
+.blueprint .hljs-number,
+.blueprint .hljs-meta,
+.blueprint .hljs-built_in,
+.blueprint .hljs-builtin-name,
+.blueprint .hljs-literal,
+.blueprint .hljs-type,
+.blueprint .hljs-params {
+    color: #E8A524;
+}
+
+/* Function names, section titles — bright text, stands out */
+.blueprint .hljs-title,
+.blueprint .hljs-section {
+    color: #B0DAD6;
+    font-weight: bold;
+}
+
+/* Variables, attributes, tags — ember/oxide: warm counterpoint */
+.blueprint .hljs-variable,
+.blueprint .hljs-template-variable,
+.blueprint .hljs-attribute,
+.blueprint .hljs-attr,
+.blueprint .hljs-tag,
+.blueprint .hljs-name,
+.blueprint .hljs-regexp,
+.blueprint .hljs-link,
+.blueprint .hljs-selector-id,
+.blueprint .hljs-selector-class {
+    color: #C75B2A;
+}
+
+.blueprint .hljs-addition {
+    color: #43B3AE;
+    background-color: #0A1412;
+}
+
+.blueprint .hljs-deletion {
+    color: #C75B2A;
+    background-color: #14100C;
+}

@@ -1,0 +1,9 @@
+[book]
+title = "Clinker Engine Internals"
+authors = ["Rustpunk"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "enamel"
+preferred-dark-theme = "blueprint"
