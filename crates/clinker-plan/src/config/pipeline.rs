@@ -1015,7 +1015,6 @@ impl PipelineConfig {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 primary_source: primary_source.as_str(),
-                doc_paths_by_source: &declared_doc_paths,
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1962,7 +1961,29 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        let plan = CompiledPlan::new(dag, self.clone(), artifacts);
+        // Stamp the runtime config's source bodies with their declared
+        // `$doc.*` path set. The executor's ingest path reads source configs
+        // from `PipelineConfig::source_configs` (the config nodes), so the
+        // envelope pre-scan only learns which sections a downstream program
+        // reads from this stamp. The attribution map is keyed by node
+        // identity (`header.name`), which can differ from the nested
+        // `config.name:`, so the lookup keys on `header.name` and writes onto
+        // that node's source body. A source no program reads a `$doc` path
+        // through keeps an empty set, which the reader treats as "skip the
+        // pre-scan entirely".
+        let mut runtime_config = self.clone();
+        for spanned in runtime_config.nodes.iter_mut() {
+            if let PipelineNode::Source {
+                header,
+                config: body,
+            } = &mut spanned.value
+                && let Some(paths) = declared_doc_paths.get(&header.name)
+            {
+                body.source.declared_doc_paths = paths.clone();
+            }
+        }
+
+        let plan = CompiledPlan::new(dag, runtime_config, artifacts);
         Ok((plan, diags))
     }
 }
@@ -2332,38 +2353,11 @@ fn build_node_source_sets(
 /// it requires the post-graph upstream `NodeIndex` for node-rooted
 /// windows. The Stage-5 lowering pass mutates the field in place
 /// after edges are wired and indices are deduplicated.
+#[derive(Default)]
 pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
     pub window_config: Option<&'a AnalyticWindowSpec>,
     pub primary_source: &'a str,
-    /// `$doc` envelope paths each source must extract, keyed by source
-    /// name. A path lands here only for the source(s) feeding a node that
-    /// references it — never the pipeline-wide union — so a multi-source
-    /// run does not tell a source to extract another source's envelope
-    /// sections. A source absent from the map (or mapped to an empty
-    /// vec) reads no `$doc` paths. Empty for the body-node lowering path
-    /// (`LoweringCtx::default()`) — only the top-level compile path
-    /// collects and threads these.
-    pub doc_paths_by_source: &'a HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>>,
-}
-
-/// Empty per-source `$doc` map backing [`LoweringCtx::default`] — the
-/// body-node lowering path carries no document-path attribution (the
-/// top-level compile path is the only collector), so its borrow points
-/// here rather than at a freshly-allocated map per call.
-static EMPTY_DOC_PATHS_BY_SOURCE: std::sync::LazyLock<
-    HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>>,
-> = std::sync::LazyLock::new(HashMap::new);
-
-impl Default for LoweringCtx<'_> {
-    fn default() -> Self {
-        LoweringCtx {
-            analysis: None,
-            window_config: None,
-            primary_source: "",
-            doc_paths_by_source: &EMPTY_DOC_PATHS_BY_SOURCE,
-        }
-    }
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -2451,18 +2445,11 @@ pub(crate) fn lower_node_to_plan_node(
 
     match node {
         PipelineNode::Source { config, .. } => {
-            let mut source = config.source.clone();
-            // Stamp only THIS source's `$doc` path set so a document
-            // reader can learn the declared path set before reading input.
-            // The set is attributed per source upstream — each path lands
-            // on exactly the source(s) feeding a node that references it,
-            // so a multi-source run never asks a source to extract another
-            // source's envelope sections.
-            source.declared_doc_paths = ctx
-                .doc_paths_by_source
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
+            // The `$doc` path set the reader extracts is stamped on the
+            // runtime `PipelineConfig` source body (see `compile_with_diagnostics`),
+            // which is what the executor's ingest path reads; the DAG payload
+            // does not carry it.
+            let source = config.source.clone();
             Some(PlanNode::Source {
                 name: name.to_string(),
                 span,

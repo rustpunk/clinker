@@ -46,7 +46,11 @@ fn build_format_reader(
             Ok(Box::new(JsonReader::from_reader(reader, config)?))
         }
         clinker_plan::config::InputFormat::Xml(opts) => {
-            let config = build_xml_reader_config(opts.as_ref(), input.array_paths.as_deref());
+            let config = build_xml_reader_config(
+                opts.as_ref(),
+                input.array_paths.as_deref(),
+                &input.declared_doc_paths,
+            );
             Ok(Box::new(XmlReader::new(reader, config)?))
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => {
@@ -783,12 +787,30 @@ fn build_json_reader_config(
     config
 }
 
-/// Build XML reader config from optional XML input options and array paths.
+/// Default cap on the XML envelope pre-scan's path-pruned document index
+/// when a source declares no explicit `max_index_bytes`. Finite by design:
+/// the index retains only declared `$doc.*` subtrees, so 64 MB is generous
+/// headroom for envelope metadata while still failing loud before an
+/// unbounded-retention OOM. Mirrors [`DEFAULT_JSON_MAX_INDEX_BYTES`].
+const DEFAULT_XML_MAX_INDEX_BYTES: usize = 64 * 1_000_000;
+
+/// Build XML reader config from optional XML input options, array paths, and
+/// the source's planner-attributed `$doc.*` path set.
+///
+/// `declared_doc_paths` is the set of envelope paths some downstream program
+/// references through this source; the reader's pre-scan retains only the
+/// sections these paths name. When the source declares no `max_index_bytes`,
+/// the pre-scan index is capped at [`DEFAULT_XML_MAX_INDEX_BYTES`].
 fn build_xml_reader_config(
     opts: Option<&clinker_plan::config::XmlInputOptions>,
     array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
+    declared_doc_paths: &[cxl::analyzer::doc_paths::DocPath],
 ) -> XmlReaderConfig {
-    let mut config = XmlReaderConfig::default();
+    let mut config = XmlReaderConfig {
+        declared_doc_paths: declared_doc_paths.to_vec(),
+        max_index_bytes: Some(DEFAULT_XML_MAX_INDEX_BYTES),
+        ..Default::default()
+    };
     if let Some(opts) = opts {
         config.record_path = opts.record_path.clone();
         if let Some(ref prefix) = opts.attribute_prefix {
@@ -798,6 +820,9 @@ fn build_xml_reader_config(
             Some(clinker_plan::config::NamespaceHandling::Qualify) => NamespaceMode::Qualify,
             _ => NamespaceMode::Strip,
         };
+        if let Some(cap) = opts.max_index_bytes {
+            config.max_index_bytes = Some(cap.0 as usize);
+        }
     }
     if let Some(paths) = array_paths {
         config.array_paths = paths
