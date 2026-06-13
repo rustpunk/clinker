@@ -1,0 +1,370 @@
+//! Bounded-retention behavior of the streaming XML envelope pre-scan.
+//!
+//! Proves the pre-scan retains only the declared `$doc.*` section subtrees —
+//! a multi-MB body of undeclared records is event-walked and dropped, never
+//! flattened into the document index — and that an over-budget retention
+//! fails loud mid-build rather than after a full materialization.
+
+use clinker_format::FormatError;
+use clinker_format::envelope::{
+    EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
+};
+use clinker_format::traits::FormatReader;
+use clinker_format::xml::reader::{XmlReader, XmlReaderConfig};
+use clinker_record::Value;
+use cxl::analyzer::doc_paths::DocPath;
+use indexmap::IndexMap;
+
+/// One envelope section: name, slash-path, typed fields.
+type SectionSpec<'a> = (&'a str, &'a str, &'a [(&'a str, EnvelopeFieldType)]);
+
+fn envelope_config(specs: &[SectionSpec]) -> EnvelopeConfig {
+    let mut cfg = EnvelopeConfig::default();
+    for (name, xpath, fields) in specs {
+        let mut field_map = IndexMap::new();
+        for (fname, ftype) in *fields {
+            field_map.insert((*fname).to_string(), *ftype);
+        }
+        cfg.sections.insert(
+            (*name).to_string(),
+            EnvelopeSection {
+                extract: EnvelopeExtract::XmlPath((*xpath).to_string()),
+                fields: field_map,
+            },
+        );
+    }
+    cfg
+}
+
+fn declared_paths(specs: &[SectionSpec]) -> Vec<DocPath> {
+    let mut out = Vec::new();
+    for (section, _xpath, fields) in specs {
+        for (field, _ty) in *fields {
+            out.push(DocPath {
+                section: (*section).into(),
+                field: (*field).into(),
+                indices: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+fn reader(xml: String, specs: &[SectionSpec], record_path: &str, cap: usize) -> XmlReader {
+    XmlReader::new(
+        std::io::Cursor::new(xml.into_bytes()),
+        XmlReaderConfig {
+            record_path: Some(record_path.into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(cap),
+            ..Default::default()
+        },
+    )
+    .expect("XML buffer read")
+}
+
+/// A document with a large undeclared body and a small declared trailer:
+/// `<doc><records>...N large records...</records><Summary>...</Summary></doc>`.
+fn doc_with_large_body_and_small_trailer(rows: usize) -> String {
+    let mut s = String::from("<doc><records>");
+    for i in 0..rows {
+        // Each record carries a large, undeclared text blob — the bytes the
+        // pre-scan must drop rather than retain.
+        s.push_str(&format!(
+            "<record><id>{i}</id><blob>{}</blob></record>",
+            "x".repeat(2_000)
+        ));
+    }
+    s.push_str(&format!(
+        "</records><Summary><record_count>{rows}</record_count></Summary></doc>"
+    ));
+    s
+}
+
+fn unwrap_map(value: &Value) -> &IndexMap<Box<str>, Value> {
+    match value {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    }
+}
+
+#[test]
+fn prescan_retains_only_declared_trailer_not_the_body() {
+    let rows = 2_000;
+    let xml = doc_with_large_body_and_small_trailer(rows);
+    let input_len = xml.len();
+    // The body alone is multiple MB.
+    assert!(
+        input_len > 4_000_000,
+        "body should be multi-MB: {input_len}"
+    );
+
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
+
+    // The trailer was extracted and typed.
+    let summary = unwrap_map(sections.get("Summary").expect("Summary section retained"));
+    assert_eq!(
+        summary.get("record_count"),
+        Some(&Value::Integer(rows as i64))
+    );
+
+    // The retained bytes are orders of magnitude smaller than the input: the
+    // body's undeclared subtrees were dropped, never stored. Measuring the
+    // section map's own heap footprint (the real retained memory, not a
+    // serialized proxy) makes the skip-not-just-correct-output guarantee
+    // load-bearing — a single retained int sits far below input/1000.
+    let retained: usize = sections.iter().map(|(k, v)| k.len() + v.heap_size()).sum();
+    assert!(
+        retained < input_len / 1_000,
+        "retained section heap ({retained} bytes) must be <<< input ({input_len} bytes)"
+    );
+
+    // The body still streams: every record is present, in order.
+    let mut count = 0usize;
+    let mut last_id = -1i64;
+    while let Some(rec) = reader.next_record().unwrap() {
+        let id = match rec.get("id") {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("expected integer id, got {other:?}"),
+        };
+        assert_eq!(id, last_id + 1, "body records stream in order");
+        last_id = id;
+        count += 1;
+    }
+    assert_eq!(count, rows, "every body record streamed");
+}
+
+#[test]
+fn prescan_fails_loud_mid_build_on_a_single_oversized_section() {
+    // ONE declared section far larger than the cap. The cap must fire DURING
+    // that section's flattening — before the whole subtree materializes —
+    // naming the section and the cap, rather than OOMing. This is the
+    // single-section guarantee: the cap aborts the build, it is not a
+    // post-hoc measurement of an already-built section.
+    let huge_body: String = (0..50_000)
+        .map(|i| format!("<row>row-{i}-{}</row>", "y".repeat(40)))
+        .collect();
+    let xml = format!(
+        "<doc><Header>{huge_body}</Header><records><record><x>1</x></record></records></doc>"
+    );
+    let input_len = xml.len();
+    // The single declared section is multiple MB on its own.
+    assert!(
+        input_len > 2_000_000,
+        "section should be multi-MB: {input_len}"
+    );
+
+    let specs: &[SectionSpec] = &[(
+        "Header",
+        "/doc/Header",
+        &[("row", EnvelopeFieldType::String)],
+    )];
+    let cfg = envelope_config(specs);
+
+    // 8KB cap — far below the multi-MB declared section.
+    let mut reader = reader(xml, specs, "doc/records/record", 8_000);
+
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("over-cap retention must fail");
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("max_index_bytes"),
+                "error names the cap: {msg}"
+            );
+            assert!(msg.contains("Header"), "error names the section: {msg}");
+            assert!(
+                msg.contains("mid-parse"),
+                "error states the abort is mid-parse: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
+#[test]
+fn prescan_fails_loud_when_cumulative_sections_exceed_cap() {
+    // Two declared sections that each fit, but whose cumulative retained
+    // bytes cross the cap — proves the running total is charged across the
+    // single streaming pass, not reset per section.
+    let chunk = "q".repeat(3_000);
+    let xml = format!(
+        "<doc><A><v>{chunk}</v></A><B><v>{chunk}</v></B>\
+         <records><record><x>1</x></record></records></doc>"
+    );
+    let specs: &[SectionSpec] = &[
+        ("A", "/doc/A", &[("v", EnvelopeFieldType::String)]),
+        ("B", "/doc/B", &[("v", EnvelopeFieldType::String)]),
+    ];
+    let cfg = envelope_config(specs);
+
+    // 4KB cap: each 3KB section fits alone, but the pair (6KB) does not.
+    let mut reader = reader(xml, specs, "doc/records/record", 4_000);
+
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("cumulative over-cap retention must fail");
+    assert!(matches!(err, FormatError::Xml(msg) if msg.contains("max_index_bytes")));
+}
+
+#[test]
+fn prescan_skips_entirely_when_no_doc_path_declared() {
+    // An envelope is declared, but no downstream program reads any `$doc`
+    // path (empty `declared_doc_paths`). The path-pruned index is empty, so
+    // the pre-scan skips the document and extracts nothing — the body is
+    // never walked for sections.
+    let xml = r#"<doc><Summary><record_count>3</record_count></Summary><records><record><x>1</x></record><record><x>2</x></record><record><x>3</x></record></records></doc>"#;
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = XmlReader::new(
+        std::io::Cursor::new(xml.as_bytes().to_vec()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            // No declared paths — nothing downstream reads `$doc.*`.
+            declared_doc_paths: Vec::new(),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .expect("XML buffer read");
+
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+    assert!(
+        sections.is_empty(),
+        "no declared path means no section is extracted"
+    );
+    // Body still streams normally.
+    let mut count = 0;
+    while reader.next_record().unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn prescan_skips_cleanly_for_absent_section() {
+    // A section the config declares but the XML doesn't carry is absent from
+    // the returned map and does NOT abort the run — CXL resolves a missing
+    // section to `Value::Null`.
+    let xml = r#"<doc><records><record><x>1</x></record></records></doc>"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Trailer",
+        "/doc/Trailer",
+        &[("count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader
+        .prepare_document(&cfg)
+        .expect("an absent section is a graceful miss, not an error");
+    assert!(
+        sections.is_empty(),
+        "no section resolves for an absent path"
+    );
+}
+
+#[test]
+fn prescan_skips_cleanly_when_path_traverses_non_matching_structure() {
+    // The declared path `/doc/meta/Summary` never appears — `meta` is not a
+    // child of `doc` in this document. The path simply never matches the
+    // descent stack, so the section is a graceful miss, not a hard error.
+    let xml = r#"<doc><other><Summary><record_count>7</record_count></Summary></other><records><record><x>1</x></record></records></doc>"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/meta/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader
+        .prepare_document(&cfg)
+        .expect("a non-matching path is a graceful miss, not an error");
+    assert!(
+        sections.is_empty(),
+        "no section resolves through a non-matching structure"
+    );
+}
+
+#[test]
+fn prescan_prunes_the_unread_section_in_a_mixed_envelope() {
+    // The envelope declares two sections, but only one has a declared `$doc`
+    // path. The read section is present; the unread one is pruned — absent
+    // from the output, never materialized.
+    let xml = r#"<doc><Head><batch_id>B-1</batch_id></Head><Foot><record_count>5</record_count></Foot><records><record><x>1</x></record></records></doc>"#.to_string();
+    let head_spec: SectionSpec = (
+        "Head",
+        "/doc/Head",
+        &[("batch_id", EnvelopeFieldType::String)],
+    );
+    let foot_spec: SectionSpec = (
+        "Foot",
+        "/doc/Foot",
+        &[("record_count", EnvelopeFieldType::Int)],
+    );
+    // Both sections are declared in the envelope config...
+    let cfg = envelope_config(&[head_spec, foot_spec]);
+    // ...but only `Foot` is referenced by a `$doc` path.
+    let declared = declared_paths(&[foot_spec]);
+
+    let mut reader = XmlReader::new(
+        std::io::Cursor::new(xml.into_bytes()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            declared_doc_paths: declared,
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .expect("XML buffer read");
+
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+    assert!(
+        sections.contains_key("Foot"),
+        "the read section is retained"
+    );
+    assert!(
+        !sections.contains_key("Head"),
+        "the unread section is pruned, not materialized"
+    );
+}
+
+#[test]
+fn prescan_preserves_namespaces_attributes_and_cdata() {
+    // The streaming pre-scan must map element names, child attributes, and
+    // CData exactly as the body reader does: a namespace-stripped section
+    // element, an attribute on a child element (prefixed and `.`-joined),
+    // and a CData child payload all coerce into the declared section fields
+    // byte-identically to body extraction.
+    let xml = r#"<doc><ns:Meta><tag kind="run"></tag><note><![CDATA[a & b]]></note></ns:Meta><records><record><x>1</x></record></records></doc>"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Meta",
+        "/doc/Meta",
+        &[
+            ("tag.@kind", EnvelopeFieldType::String),
+            ("note", EnvelopeFieldType::String),
+        ],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+    let meta = unwrap_map(sections.get("Meta").expect("Meta retained"));
+    assert_eq!(meta.get("tag.@kind"), Some(&Value::String("run".into())));
+    assert_eq!(meta.get("note"), Some(&Value::String("a & b".into())));
+}

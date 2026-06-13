@@ -11,7 +11,6 @@
 use cxl::analyzer::doc_paths::{DocIndex, DocPath};
 
 use crate::config::{CompileContext, parse_config};
-use crate::plan::execution::PlanNode;
 
 /// Compile a document-aware pipeline whose two transforms read distinct
 /// `$doc` paths, and return the path set stamped on the single Source.
@@ -63,16 +62,27 @@ nodes:
         .compile(&CompileContext::default())
         .expect("compile doc-paths pipeline");
 
-    let dag = plan.dag();
-    let source = dag
-        .graph
-        .node_indices()
-        .find_map(|idx| match &dag.graph[idx] {
-            PlanNode::Source { resolved, .. } => resolved.as_ref(),
+    // Read the live stamp off the runtime `PipelineConfig` source body — the
+    // set the executor's ingest path actually reads (the DAG payload does not
+    // carry it).
+    source_doc_paths(&plan, "payments")
+}
+
+/// The `$doc` path set stamped on the runtime source body named `source_name`
+/// (by node identity / `header.name`), as the executor's ingest path reads
+/// it. Returns an empty vec when no such source carries paths.
+fn source_doc_paths(plan: &crate::plan::CompiledPlan, source_name: &str) -> Vec<DocPath> {
+    use crate::config::pipeline_node::PipelineNode;
+    plan.config()
+        .nodes
+        .iter()
+        .find_map(|spanned| match &spanned.value {
+            PipelineNode::Source { header, config } if header.name == source_name => {
+                Some(config.source.declared_doc_paths.clone())
+            }
             _ => None,
         })
-        .expect("source node present with resolved payload");
-    source.source.declared_doc_paths.clone()
+        .unwrap_or_default()
 }
 
 fn path(section: &str, field: &str, indices: Vec<DocIndex>) -> DocPath {
@@ -96,6 +106,63 @@ fn test_doc_paths_surface_onto_source() {
             path("BatchInfo", "batch_id", vec![]),
             path("Summary", "total", vec![]),
         ]
+    );
+}
+
+#[test]
+fn test_doc_paths_surface_when_header_name_differs_from_config_name() {
+    // A Source whose node identity (`header.name`) differs from its nested
+    // `config.name:` is a shape the compiler accepts. The `$doc` attribution
+    // map is keyed by node identity, so the runtime stamp must look up by
+    // `header.name` and still land the path set on that node's source body —
+    // otherwise the pre-scan prunes every section and `$doc.*` resolves
+    // empty at run time.
+    let yaml = r#"
+pipeline:
+  name: divergent_name_doc
+nodes:
+  - type: source
+    name: node_identity
+    config:
+      name: config_name
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+        sections:
+          Summary:
+            extract: { xml_path: "/doc/Summary" }
+            fields:
+              total: int
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: t0
+    input: node_identity
+    config:
+      cxl: |
+        emit amount = amount
+        emit total = $doc.Summary.total
+  - type: output
+    name: out
+    input: t0
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse divergent-name pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile divergent-name pipeline");
+    // The stamp keys on node identity (`node_identity`), not the inner
+    // `config.name:` (`config_name`).
+    let paths = source_doc_paths(&plan, "node_identity");
+    assert_eq!(
+        paths,
+        vec![path("Summary", "total", vec![])],
+        "the `$doc` path must reach the source body keyed by node identity"
     );
 }
 
@@ -269,21 +336,7 @@ fn test_declared_doc_path_does_not_trip_e341() {
     let plan = compile_with_summary_envelope("emit amount = amount\nemit t = $doc.Summary.total")
         .expect("a declared `$doc` path must compile");
     // Sanity: the path still surfaces onto the source's declared set.
-    let dag = plan.dag();
-    let source = dag
-        .graph
-        .node_indices()
-        .find_map(|idx| match &dag.graph[idx] {
-            PlanNode::Source { resolved, .. } => resolved.as_ref(),
-            _ => None,
-        })
-        .expect("source node present");
-    assert!(
-        source
-            .source
-            .declared_doc_paths
-            .contains(&path("Summary", "total", vec![])),
-    );
+    assert!(source_doc_paths(&plan, "payments").contains(&path("Summary", "total", vec![])));
 }
 
 #[test]
@@ -409,7 +462,6 @@ nodes:
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile combine-doc pipeline");
-    let dag = plan.dag();
     let head_cutoff = path("Head", "cutoff", vec![]);
     // A joined record carries the DRIVING input's document context, so a
     // `$doc` access in the Combine predicate is attributed to the driver
@@ -417,25 +469,12 @@ nodes:
     // order driver default) and is the source whose envelope declares
     // `Head`. The probe-side `right` source — which has no envelope —
     // must NOT be told to extract it.
-    let paths_for = |source_name: &str| -> Vec<DocPath> {
-        dag.graph
-            .node_indices()
-            .find_map(|idx| match &dag.graph[idx] {
-                PlanNode::Source {
-                    name,
-                    resolved: Some(r),
-                    ..
-                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    };
     assert!(
-        paths_for("left").contains(&head_cutoff),
+        source_doc_paths(&plan, "left").contains(&head_cutoff),
         "the driving source `left` must carry the Combine-predicate `$doc` path"
     );
     assert!(
-        !paths_for("right").contains(&head_cutoff),
+        !source_doc_paths(&plan, "right").contains(&head_cutoff),
         "the probe source `right` must NOT carry the driver's `$doc` path"
     );
 }
@@ -495,23 +534,11 @@ nodes:
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile route-doc pipeline");
-    let dag = plan.dag();
-    let source = dag
-        .graph
-        .node_indices()
-        .find_map(|idx| match &dag.graph[idx] {
-            PlanNode::Source { resolved, .. } => resolved.as_ref(),
-            _ => None,
-        })
-        .expect("source node present with resolved payload");
+    let paths = source_doc_paths(&plan, "payments");
     assert!(
-        source
-            .source
-            .declared_doc_paths
-            .contains(&path("Head", "cutoff", vec![])),
+        paths.contains(&path("Head", "cutoff", vec![])),
         "`$doc.Head.cutoff` used only in a route branch condition must reach the \
-         declared set, got {:?}",
-        source.source.declared_doc_paths
+         declared set, got {paths:?}"
     );
 }
 
@@ -586,23 +613,15 @@ nodes:
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile multi-source pipeline");
-    let dag = plan.dag();
-    let paths_for = |source_name: &str| -> Vec<DocPath> {
-        dag.graph
-            .node_indices()
-            .find_map(|idx| match &dag.graph[idx] {
-                PlanNode::Source {
-                    name,
-                    resolved: Some(r),
-                    ..
-                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    };
     // `alpha` carries only its own section; `beta` only its own.
-    assert_eq!(paths_for("alpha"), vec![path("AHead", "a_batch", vec![])]);
-    assert_eq!(paths_for("beta"), vec![path("BHead", "b_batch", vec![])]);
+    assert_eq!(
+        source_doc_paths(&plan, "alpha"),
+        vec![path("AHead", "a_batch", vec![])]
+    );
+    assert_eq!(
+        source_doc_paths(&plan, "beta"),
+        vec![path("BHead", "b_batch", vec![])]
+    );
 }
 
 #[test]
@@ -686,22 +705,10 @@ nodes:
     let compiled = config
         .compile(&ctx)
         .expect("compile composition-doc pipeline");
-    let dag = compiled.dag();
-    let source = dag
-        .graph
-        .node_indices()
-        .find_map(|idx| match &dag.graph[idx] {
-            PlanNode::Source { resolved, .. } => resolved.as_ref(),
-            _ => None,
-        })
-        .expect("parent source present");
+    let paths = source_doc_paths(&compiled, "payments");
     assert!(
-        source
-            .source
-            .declared_doc_paths
-            .contains(&path("Head", "cutoff", vec![])),
-        "`$doc.Head.cutoff` used in the composition body must reach the declared set, got {:?}",
-        source.source.declared_doc_paths
+        paths.contains(&path("Head", "cutoff", vec![])),
+        "`$doc.Head.cutoff` used in the composition body must reach the declared set, got {paths:?}"
     );
 }
 
@@ -810,30 +817,16 @@ nodes:
         std::path::PathBuf::from("pipelines"),
     );
     let compiled = config.compile(&ctx).expect("compile multi-port pipeline");
-    let dag = compiled.dag();
-    let paths_for = |source_name: &str| -> Vec<DocPath> {
-        dag.graph
-            .node_indices()
-            .find_map(|idx| match &dag.graph[idx] {
-                PlanNode::Source {
-                    name,
-                    resolved: Some(r),
-                    ..
-                } if name == source_name => Some(r.source.declared_doc_paths.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    };
     let shared_tag = path("Shared", "tag", vec![]);
     // The downstream `$doc` read must reach BOTH the primary (`customers`)
     // and the non-primary (`zip_lookup`) port sources.
     assert!(
-        paths_for("customers").contains(&shared_tag),
+        source_doc_paths(&compiled, "customers").contains(&shared_tag),
         "primary port source `customers` must carry the downstream `$doc` path"
     );
+    let zip_paths = source_doc_paths(&compiled, "zip_lookup");
     assert!(
-        paths_for("zip_lookup").contains(&shared_tag),
-        "non-primary port source `zip_lookup` must carry the downstream `$doc` path, got {:?}",
-        paths_for("zip_lookup")
+        zip_paths.contains(&shared_tag),
+        "non-primary port source `zip_lookup` must carry the downstream `$doc` path, got {zip_paths:?}"
     );
 }

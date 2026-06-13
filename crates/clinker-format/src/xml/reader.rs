@@ -4,12 +4,19 @@
 //! flattens nested elements with `.` separator, handles namespaces.
 //!
 //! The reader buffers its entire input at construction time into an
-//! `Arc<[u8]>` so the envelope pre-scan (run before any body record
-//! emits) and the body iteration can each parse from a fresh cursor
-//! over the same byte slice. ETL XML files are typically MB-scale; the
-//! buffering trade-off enables the locked "all `$doc.*` sections
-//! available throughout the body stream" semantics without re-opening
-//! the source mid-stream.
+//! `Arc<[u8]>` so the envelope pre-scan (run before any body record emits)
+//! and the body iteration can each parse from a fresh cursor over the same
+//! byte slice. That raw byte buffer is retained for the reader's lifetime —
+//! it backs both the body parser and the transient pre-scan cursor, so
+//! there is one read from disk regardless of envelope declarations.
+//!
+//! What the pre-scan removed is the full-tree *section materialization*, not
+//! the raw byte buffer: the envelope pre-scan no longer captures undeclared
+//! sections at all, and the retained payload of each declared section is
+//! bounded by `max_index_bytes`, charged incrementally so an oversized
+//! declared section aborts mid-parse before its subtree fully materializes.
+//! See [`crate::xml::streaming`] for the event-driven pruned-extraction
+//! pass.
 
 use std::io::{self, Cursor, Read};
 use std::sync::Arc;
@@ -20,9 +27,13 @@ use quick_xml::events::Event;
 
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
+use cxl::analyzer::doc_paths::DocPath;
+
+use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
+use crate::xml::streaming::{SectionTarget, extract_sections};
 
 /// XML reader configuration.
 pub struct XmlReaderConfig {
@@ -30,6 +41,17 @@ pub struct XmlReaderConfig {
     pub attribute_prefix: String,
     pub namespace_handling: NamespaceMode,
     pub array_paths: Vec<XmlArrayPath>,
+    /// `$doc.*` envelope paths a program downstream of this source
+    /// references, attributed to this source by the planner. The envelope
+    /// pre-scan retains only the sections these paths name; a declared
+    /// section no program reads is skipped, never materialized. Empty when
+    /// no downstream program reads any `$doc` path.
+    pub declared_doc_paths: Vec<DocPath>,
+    /// Hard cap on the bytes the envelope pre-scan's path-pruned index may
+    /// retain. The cap is charged incrementally as each section's payload is
+    /// built and fires mid-parse (before OOM). `None` disables the cap; the
+    /// source plumbing supplies a finite default.
+    pub max_index_bytes: Option<usize>,
 }
 
 impl Default for XmlReaderConfig {
@@ -39,6 +61,8 @@ impl Default for XmlReaderConfig {
             attribute_prefix: "@".into(),
             namespace_handling: NamespaceMode::Strip,
             array_paths: vec![],
+            declared_doc_paths: Vec::new(),
+            max_index_bytes: None,
         }
     }
 }
@@ -64,14 +88,19 @@ pub enum XmlArrayMode {
 
 /// Streaming XML reader.
 ///
-/// Buffers its entire input at construction time into an `Arc<[u8]>`
-/// so two parsers can walk the same bytes: one transient parser for
-/// the envelope pre-scan, and one stateful parser for body record
-/// iteration. The trade-off — held memory equal to the source file's
-/// size while the reader exists — enables the locked
-/// "all `$doc.*` sections available throughout the body stream"
-/// semantics, since post-body envelope sections must be extracted
-/// before the first body record emits.
+/// Buffers its entire input at construction time into an `Arc<[u8]>` so two
+/// parsers can walk the same bytes: one transient parser for the envelope
+/// pre-scan, and one stateful parser for body record iteration. Holding the
+/// raw bytes makes every declared section available to every body record,
+/// since a post-body section must be extracted before the first record
+/// emits.
+///
+/// The envelope pre-scan no longer materializes undeclared sections, and
+/// each retained section's payload is bounded by `max_index_bytes` (charged
+/// incrementally, aborting mid-parse on an oversized section). The raw byte
+/// buffer itself remains — only the full-tree section materialization was
+/// removed — so held memory is the source file's size plus the bounded
+/// section payloads while the reader exists.
 pub struct XmlReader {
     bytes: Arc<[u8]>,
     parser: XmlParser<Cursor<Arc<[u8]>>>,
@@ -398,20 +427,30 @@ impl FormatReader for XmlReader {
             return Ok(IndexMap::new());
         }
 
-        // Compile each declared section's XmlPath into a path-segment
-        // vector once; a JsonPointer arrival means a config-for-wrong-
-        // format mistake and surfaces as a format error.
-        let mut sections: Vec<(Box<str>, Vec<String>, &crate::envelope::EnvelopeSection)> =
-            Vec::with_capacity(config.sections.len());
+        // The path-pruned index is the retention authority: it knows which
+        // sections some downstream program reads. A declared section no
+        // program references is not extracted at all — so when no `$doc`
+        // path is attributed to this source, the pre-scan skips the whole
+        // document.
+        let mut index =
+            DocArenaIndex::new(&self.config.declared_doc_paths, self.config.max_index_bytes);
+        if index.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
+        // Compile only the wanted sections' XmlPaths into path-segment
+        // targets; a JsonPointer/Segment arrival means a config-for-wrong-
+        // format mistake and surfaces as a format error. Sections the index
+        // does not want are dropped here so the streaming pass never
+        // descends into them.
+        let mut targets: Vec<SectionTarget> = Vec::new();
         for (name, section) in &config.sections {
+            if !index.wants_section(name) {
+                continue;
+            }
             match &section.extract {
                 EnvelopeExtract::XmlPath(p) => {
-                    let segments: Vec<String> = p
-                        .trim_start_matches('/')
-                        .split('/')
-                        .map(String::from)
-                        .collect();
-                    sections.push((Box::from(name.as_str()), segments, section));
+                    targets.push(SectionTarget::new(Box::from(name.as_str()), p));
                 }
                 EnvelopeExtract::JsonPointer(_) => {
                     return Err(FormatError::Xml(format!(
@@ -429,82 +468,61 @@ impl FormatReader for XmlReader {
             }
         }
 
-        // Transient parser over a fresh cursor; the body parser's state
-        // remains untouched and starts streaming from byte 0 when
-        // `next_record` is first called.
-        let mut transient = XmlParser::from_reader(Cursor::new(Arc::clone(&self.bytes)));
-        transient.config_mut().trim_text(true);
-        let mut path_stack: Vec<String> = Vec::new();
-        let mut captured: IndexMap<Box<str>, IndexMap<Box<str>, Value>> = IndexMap::new();
-        let mut buf: Vec<u8> = Vec::new();
+        // Single streaming pass over a fresh cursor: only the matched
+        // subtrees are flattened; every unmatched element body is
+        // counted-and-dropped. The cap is charged *as each declared
+        // section's payload is built*, so an oversized declared section
+        // aborts the parse mid-subtree rather than after the whole subtree
+        // materializes. Body iteration keeps its own independent cursor over
+        // `self.bytes`.
+        let matched = extract_sections(
+            &self.bytes,
+            &targets,
+            &self.config.namespace_handling,
+            &self.config.attribute_prefix,
+            self.config.max_index_bytes,
+        )?;
 
-        loop {
-            buf.clear();
-            let event = transient
-                .read_event_into(&mut buf)
-                .map_err(|e| FormatError::Xml(e.to_string()))?;
-            match event {
-                Event::Start(ref e) => {
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
-                    path_stack.push(name);
-                    if let Some((sec_name, _, section)) = sections
-                        .iter()
-                        .find(|(_, segs, _)| path_matches(&path_stack, segs))
-                    {
-                        let payload = read_section_payload(
-                            &mut transient,
-                            &mut buf,
-                            &self.config.namespace_handling,
-                            &self.config.attribute_prefix,
-                            path_stack.len(),
-                        )?;
-                        let typed = coerce_section_fields(payload, &section.fields)
-                            .map_err(FormatError::Xml)?;
-                        captured.insert(Box::from(&**sec_name), typed);
-                        // `read_section_payload` consumed the matched
-                        // subtree up to its closing `End`. Pop the
-                        // element off the path stack now since the
-                        // upcoming loop iteration will not see that
-                        // `End` event.
-                        path_stack.pop();
-                    }
-                }
-                Event::Empty(ref e) => {
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
-                    path_stack.push(name);
-                    if let Some((sec_name, _, section)) = sections
-                        .iter()
-                        .find(|(_, segs, _)| path_matches(&path_stack, segs))
-                    {
-                        let mut payload: Vec<(String, String)> = Vec::new();
-                        let attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
-                        payload.extend(attrs);
-                        let typed = coerce_section_fields(payload, &section.fields)
-                            .map_err(FormatError::Xml)?;
-                        captured.insert(Box::from(&**sec_name), typed);
-                    }
-                    path_stack.pop();
-                }
-                Event::End(_) => {
-                    path_stack.pop();
-                }
-                Event::Eof => break,
-                _ => {}
-            }
+        // Coerce each matched payload to its declared field schema and retain
+        // it in the index, which accounts the coerced (field-filtered)
+        // retained bytes against the same cap. The streaming pass already
+        // bounded the raw parse; the index accounts what is actually kept.
+        for (name, payload) in matched {
+            let section = match config.sections.get(&*name) {
+                Some(s) => s,
+                None => continue,
+            };
+            let typed =
+                coerce_section_fields(payload, &section.fields).map_err(FormatError::Xml)?;
+            let path = doc_path_for_section(&name);
+            index.insert(&path, Value::Map(Box::new(typed)))?;
         }
-
-        // Convert the captured fields into the trait return shape:
-        // each section's payload is a `Value::Map`.
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(captured.len());
-        for (sec_name, fields) in captured {
-            out.insert(sec_name, Value::Map(Box::new(fields)));
-        }
-        Ok(out)
+        Ok(index.into_sections())
     }
 }
 
-/// Extract element name without borrowing self.
-fn elem_name_static(ns: &NamespaceMode, qname: &quick_xml::name::QName) -> String {
+/// Build the section-level [`DocPath`] under which a whole matched section
+/// payload is retained.
+///
+/// XML retains an envelope section as one flattened map (one element subtree
+/// → one map of `$doc.<section>.<field>` values), so the insert key is the
+/// section, not an individual field; [`DocArenaIndex::insert`] groups by
+/// `path.section`. The `field`/`indices` axes carry no meaning for a
+/// section-granular retention and are left empty.
+fn doc_path_for_section(name: &str) -> DocPath {
+    DocPath {
+        section: name.into(),
+        field: Box::from(""),
+        indices: Vec::new(),
+    }
+}
+
+/// Resolve an element's name under the configured namespace policy.
+///
+/// `Strip` drops the namespace prefix (keeping the local name); `Qualify`
+/// keeps the full namespace-qualified name. Shared by body iteration and
+/// the envelope streaming pre-scan so both map element names identically.
+pub(crate) fn elem_name_static(ns: &NamespaceMode, qname: &quick_xml::name::QName) -> String {
     let local = qname.local_name();
     let bytes = match ns {
         NamespaceMode::Strip => local.as_ref(),
@@ -513,8 +531,12 @@ fn elem_name_static(ns: &NamespaceMode, qname: &quick_xml::name::QName) -> Strin
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Extract attributes without borrowing self.
-fn extract_attributes_static(
+/// Extract an element's attributes as `(prefixed_key, value)` pairs.
+///
+/// Each attribute key is prefixed with `prefix` (default `@`) so attributes
+/// and child elements never collide in the flattened field set. Shared by
+/// body iteration and the envelope streaming pre-scan.
+pub(crate) fn extract_attributes_static(
     prefix: &str,
     elem: &quick_xml::events::BytesStart,
 ) -> Result<Vec<(String, String)>, FormatError> {
@@ -529,94 +551,6 @@ fn extract_attributes_static(
         attrs.push((format!("{prefix}{key}"), val));
     }
     Ok(attrs)
-}
-
-/// Match the runtime descent stack against a declared section path.
-/// Both are taken as slices of element names; a section path is
-/// rooted at the document, so an exact-match (modulo length) wins.
-fn path_matches(stack: &[String], segs: &[String]) -> bool {
-    if stack.len() != segs.len() {
-        return false;
-    }
-    stack.iter().zip(segs.iter()).all(|(a, b)| a == b)
-}
-
-/// Read the subtree under the current `Start` element (already
-/// pushed onto the caller's `path_stack`) into a flat list of
-/// `(field_name, raw_string)` pairs. Mirrors `extract_record_fields`
-/// but operates on a transient envelope-scan parser and returns
-/// without touching the caller's body-iteration state.
-fn read_section_payload(
-    parser: &mut XmlParser<Cursor<Arc<[u8]>>>,
-    buf: &mut Vec<u8>,
-    ns: &NamespaceMode,
-    attr_prefix: &str,
-    section_depth: usize,
-) -> Result<Vec<(String, String)>, FormatError> {
-    let mut fields: Vec<(String, String)> = Vec::new();
-    let mut element_stack: Vec<String> = Vec::new();
-    let mut depth_here = section_depth;
-    loop {
-        buf.clear();
-        let event = parser
-            .read_event_into(buf)
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
-        match event {
-            Event::Start(ref e) => {
-                depth_here += 1;
-                let name = elem_name_static(ns, &e.name());
-                element_stack.push(name);
-                let attrs = extract_attributes_static(attr_prefix, e)?;
-                let prefix = element_stack.join(".");
-                for (k, v) in attrs {
-                    fields.push((format!("{prefix}.{k}"), v));
-                }
-            }
-            Event::End(_) => {
-                depth_here -= 1;
-                if depth_here < section_depth {
-                    return Ok(fields);
-                }
-                element_stack.pop();
-            }
-            Event::Empty(ref e) => {
-                let name = elem_name_static(ns, &e.name());
-                let prefix = if element_stack.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}.{name}", element_stack.join("."))
-                };
-                fields.push((prefix.clone(), String::new()));
-                let attrs = extract_attributes_static(attr_prefix, e)?;
-                for (k, v) in attrs {
-                    fields.push((format!("{prefix}.{k}"), v));
-                }
-            }
-            Event::Text(ref t) => {
-                let text = t
-                    .unescape()
-                    .map_err(|e| FormatError::Xml(e.to_string()))?
-                    .into_owned();
-                if !text.is_empty() {
-                    let field_name = element_stack.join(".");
-                    if !field_name.is_empty() {
-                        fields.push((field_name, text));
-                    }
-                }
-            }
-            Event::CData(ref cd) => {
-                let text = String::from_utf8_lossy(cd.as_ref()).into_owned();
-                if !text.is_empty() {
-                    let field_name = element_stack.join(".");
-                    if !field_name.is_empty() {
-                        fields.push((field_name, text));
-                    }
-                }
-            }
-            Event::Eof => return Ok(fields),
-            _ => {}
-        }
-    }
 }
 
 /// Simple type inference from string values (same rules as JSON).
@@ -659,6 +593,47 @@ mod tests {
     /// `(section name, XPath, [(field name, type)])` for one envelope section.
     type SectionSpec<'a> = (&'a str, &'a str, &'a [(&'a str, EnvelopeFieldType)]);
 
+    /// Declared `$doc.*` paths covering every `(section, field)` in `specs`,
+    /// so the path-pruned index wants all of them — the runtime stand-in for
+    /// the planner's per-source attribution.
+    fn declared_paths(specs: &[SectionSpec]) -> Vec<DocPath> {
+        let mut out = Vec::new();
+        for (section, _xpath, fields) in specs {
+            for (field, _ty) in *fields {
+                out.push(DocPath {
+                    section: (*section).into(),
+                    field: (*field).into(),
+                    indices: Vec::new(),
+                });
+            }
+        }
+        out
+    }
+
+    /// A reader config over `record_path` whose declared paths want every
+    /// section in `specs`, for an envelope-bearing source.
+    fn envelope_reader_config(specs: &[SectionSpec], record_path: &str) -> XmlReaderConfig {
+        XmlReaderConfig {
+            record_path: Some(record_path.into()),
+            declared_doc_paths: declared_paths(specs),
+            ..Default::default()
+        }
+    }
+
+    /// A reader config wanting a single section named `Bad`, so the
+    /// wrong-format extract validation fires for that section.
+    fn config_wanting_bad_section(record_path: &str) -> XmlReaderConfig {
+        XmlReaderConfig {
+            record_path: Some(record_path.into()),
+            declared_doc_paths: vec![DocPath {
+                section: "Bad".into(),
+                field: "any".into(),
+                indices: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
     fn envelope_config(sections: &[SectionSpec]) -> EnvelopeConfig {
         use crate::envelope::EnvelopeSection;
         let mut cfg = EnvelopeConfig::default();
@@ -696,7 +671,7 @@ mod tests {
             <records><record><x>1</x></record><record><x>2</x></record></records>
             <Summary><hash>abc</hash><processed>2</processed></Summary>
         </doc>"#;
-        let cfg = envelope_config(&[
+        let specs: &[SectionSpec] = &[
             (
                 "BatchInfo",
                 "/doc/BatchInfo",
@@ -713,9 +688,10 @@ mod tests {
                     ("processed", EnvelopeFieldType::Int),
                 ],
             ),
-        ]);
+        ];
+        let cfg = envelope_config(specs);
 
-        let mut reader = reader_from_str(xml, default_config_with_path("doc/records/record"));
+        let mut reader = reader_from_str(xml, envelope_reader_config(specs, "doc/records/record"));
         let sections = reader.prepare_document(&cfg).expect("envelope pre-scan");
 
         // Both sections present — the post-body section is available
@@ -760,7 +736,7 @@ mod tests {
                 fields: IndexMap::new(),
             },
         );
-        let mut reader = reader_from_str(xml, default_config_with_path("doc/a"));
+        let mut reader = reader_from_str(xml, config_wanting_bad_section("doc/a"));
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Xml(msg) if msg.contains("json_pointer")));
     }
@@ -777,7 +753,7 @@ mod tests {
                 fields: IndexMap::new(),
             },
         );
-        let mut reader = reader_from_str(xml, default_config_with_path("doc/a"));
+        let mut reader = reader_from_str(xml, config_wanting_bad_section("doc/a"));
         let err = reader.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::Xml(msg) if msg.contains("segment")));
     }
@@ -788,12 +764,13 @@ mod tests {
         // is absent from the returned map; CXL resolves missing
         // sections to `Value::Null`.
         let xml = r#"<doc><records><record><x>1</x></record></records></doc>"#;
-        let cfg = envelope_config(&[(
+        let specs: &[SectionSpec] = &[(
             "Trailer",
             "/doc/Trailer",
             &[("count", EnvelopeFieldType::Int)],
-        )]);
-        let mut reader = reader_from_str(xml, default_config_with_path("doc/records/record"));
+        )];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(xml, envelope_reader_config(specs, "doc/records/record"));
         let sections = reader.prepare_document(&cfg).expect("scan ok");
         assert!(sections.is_empty());
     }
@@ -808,7 +785,7 @@ mod tests {
             </Meta>
             <records><record><x>1</x></record></records>
         </doc>"#;
-        let cfg = envelope_config(&[(
+        let specs: &[SectionSpec] = &[(
             "Meta",
             "/doc/Meta",
             &[
@@ -816,8 +793,9 @@ mod tests {
                 ("enabled", EnvelopeFieldType::Bool),
                 ("ratio", EnvelopeFieldType::Float),
             ],
-        )]);
-        let mut reader = reader_from_str(xml, default_config_with_path("doc/records/record"));
+        )];
+        let cfg = envelope_config(specs);
+        let mut reader = reader_from_str(xml, envelope_reader_config(specs, "doc/records/record"));
         let sections = reader.prepare_document(&cfg).expect("scan ok");
         let meta = unwrap_section_map(sections.get("Meta").unwrap());
         assert!(matches!(meta.get("run_date"), Some(Value::Date(_))));

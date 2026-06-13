@@ -73,25 +73,30 @@ reach a trailing section depends on the format:
   every other key (including a multi-megabyte body array) is
   parsed-and-skipped without being stored. The retained sections live in
   a bounded **document index** capped by `max_index_bytes` (see below),
-  so memory scales with the declared sections, not the document size.
-- **XML** currently buffers the document to reach trailing sections;
-  streaming its pre-scan is tracked as a follow-up. Until then an
-  XML envelope-aware source holds the file's bytes for the lifetime of
-  the read.
+  so retained section memory scales with the declared sections, not the
+  document size.
+- **XML** streams the pre-scan too. The reader event-walks the document
+  once and flattens *only* the declared section subtrees — every other
+  element, including a multi-megabyte body, is event-walked and dropped
+  without being materialized. The retained sections live in the same
+  bounded **document index** capped by `max_index_bytes`. The reader still
+  holds the file's raw bytes for the lifetime of the read (one disk read
+  backs both the body parser and the pre-scan), but the pre-scan no longer
+  materializes the undeclared section subtrees.
 
 Only the envelope sections live in the document context — body records
 still flow through the pipeline one at a time, for every format.
 
-### Bounding JSON envelope retention with `max_index_bytes`
+### Bounding envelope retention with `max_index_bytes`
 
-The JSON document index is capped so a pathologically large declared
-section fails loud rather than exhausting memory. The cap is charged
-incrementally *as each section is parsed* — byte by byte while the
-section's subtree is built — so even a single oversized declared section
-aborts mid-parse, before its whole subtree materializes, naming the
-offending section and the cap. (Undeclared siblings, including a
-multi-megabyte body array, are skipped without being parsed into memory
-at all.)
+For JSON and XML sources, the document index is capped so a
+pathologically large declared section fails loud rather than exhausting
+memory. The cap is charged incrementally *as each section is parsed* —
+byte by byte while the section's subtree is built — so even a single
+oversized declared section aborts mid-parse, before its whole subtree
+materializes, naming the offending section and the cap. (Undeclared
+siblings, including a multi-megabyte body, are skipped without being
+parsed into the index at all.)
 
 ```yaml
 - type: source
@@ -104,6 +109,9 @@ at all.)
       record_path: data.rows
       max_index_bytes: 64MB   # cap on retained envelope sections
 ```
+
+The same `max_index_bytes` option applies to an XML source's `options:`
+block, capping its envelope pre-scan identically.
 
 `max_index_bytes` accepts a decimal size string (`64MB`, `500KB`) or a
 bare byte count. It is optional; when omitted the reader applies a
@@ -130,6 +138,16 @@ fails fast when the source opens, rather than silently producing empty
 sections. CSV and fixed-width sources do not yet support envelope
 extraction; declaring envelope sections on those formats is a no-op
 today.
+
+### Network (REST) sources carry no `$doc` context
+
+A `rest` source pulls its records page by page over paginated HTTP — it
+has no single buffered document with head and tail sections, so it
+carries no envelope context. Any `$doc.<section>.<field>` read against a
+REST source resolves to `null`, even when the source declares an
+`envelope:` block. Envelope sections are a file-document concept; pull
+the document-level metadata into record fields through the API's own
+response shape (`record_path`, `array_paths`) instead.
 
 ### EDIFACT `segment` extract
 
