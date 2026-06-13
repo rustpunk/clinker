@@ -615,6 +615,18 @@ pub struct Hl7InputOptions {
     pub split_fields: Option<Vec<Hl7FieldSplitOption>>,
 }
 
+/// SWIFT MT input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SwiftInputOptions {
+    /// Maximum number of block-4 `:tag:value` field lines a single message
+    /// may carry. A message exceeding this is rejected with guidance rather
+    /// than streamed unbounded — a corruption guard, since a real MT message
+    /// is well under it. Defaults to 10000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fields: Option<usize>,
+}
+
 /// One opt-in HL7 composite-field split declaration.
 ///
 /// Names the positional field to explode and the column width on each

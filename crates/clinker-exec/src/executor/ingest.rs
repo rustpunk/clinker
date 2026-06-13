@@ -13,6 +13,7 @@ use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
+use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
 use clinker_format::x12::Charset;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
@@ -60,6 +61,10 @@ fn build_format_reader(
         clinker_plan::config::InputFormat::Hl7(opts) => {
             let config = build_hl7_reader_config(opts.as_ref());
             Ok(Box::new(Hl7Reader::new(reader, config)))
+        }
+        clinker_plan::config::InputFormat::Swift(opts) => {
+            let config = build_swift_reader_config(opts.as_ref());
+            Ok(Box::new(SwiftReader::new(reader, config)))
         }
     }
 }
@@ -862,6 +867,18 @@ fn build_hl7_reader_config(
                 })
                 .collect();
         }
+    }
+    config
+}
+
+fn build_swift_reader_config(
+    opts: Option<&clinker_plan::config::SwiftInputOptions>,
+) -> SwiftReaderConfig {
+    let mut config = SwiftReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(max) = opts.max_fields
+    {
+        config.max_fields = max;
     }
     config
 }

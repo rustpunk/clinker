@@ -18,6 +18,7 @@ pub enum InputFormat {
     Edifact(Option<EdifactInputOptions>),
     X12(Option<X12InputOptions>),
     Hl7(Option<Hl7InputOptions>),
+    Swift(Option<SwiftInputOptions>),
 }
 
 impl InputFormat {
@@ -31,6 +32,7 @@ impl InputFormat {
             InputFormat::Edifact(_) => "edifact",
             InputFormat::X12(_) => "x12",
             InputFormat::Hl7(_) => "hl7",
+            InputFormat::Swift(_) => "swift",
         }
     }
 
