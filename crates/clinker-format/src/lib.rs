@@ -16,6 +16,7 @@ pub mod xml;
 pub use counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 pub use envelope::{
     EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
+    NestedEnvelopeSection,
 };
 pub use error::FormatError;
 pub use traits::{FormatReader, FormatWriter};

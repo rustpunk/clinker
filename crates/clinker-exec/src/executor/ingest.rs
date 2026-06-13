@@ -820,6 +820,8 @@ fn build_x12_reader_config(
         if let Some(encoding) = opts.encoding.as_deref() {
             config.charset = parse_x12_charset(encoding)?;
         }
+        config.group_section = opts.group_section.clone();
+        config.set_section = opts.set_section.clone();
     }
     Ok(config)
 }

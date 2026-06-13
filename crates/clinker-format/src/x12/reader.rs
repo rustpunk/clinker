@@ -31,7 +31,9 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, coerce_section_fields};
+use crate::envelope::{
+    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, NestedEnvelopeSection, coerce_section_fields,
+};
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 use crate::x12::RAW_ELEMENTS_KEY;
@@ -59,6 +61,18 @@ pub struct X12ReaderConfig {
     /// and defaults to UTF-8; a non-UTF-8 interchange (e.g. Latin-1 high
     /// bytes in free-text fields) declares the matching encoding.
     pub charset: Charset,
+    /// Optional user-declared name + typed field schema for the `GS`
+    /// functional-group nested level. When set, the reader surfaces the
+    /// group under the chosen section name with its declared elements
+    /// coerced to their types. When `None`, the group surfaces under the
+    /// default `functional_group` section keyed by untyped positional
+    /// `eNN` strings.
+    pub group_section: Option<NestedEnvelopeSection>,
+    /// Optional user-declared name + typed field schema for the `ST`
+    /// transaction-set nested level, mirroring `group_section`. When
+    /// `None`, the set surfaces under the default `transaction_set`
+    /// section keyed by untyped positional `eNN` strings.
+    pub set_section: Option<NestedEnvelopeSection>,
 }
 
 impl Default for X12ReaderConfig {
@@ -66,6 +80,8 @@ impl Default for X12ReaderConfig {
         Self {
             max_elements: DEFAULT_MAX_ELEMENTS,
             charset: Charset::default(),
+            group_section: None,
+            set_section: None,
         }
     }
 }
@@ -99,6 +115,12 @@ pub struct X12Reader<R: Read> {
     /// Nested-envelope events queued during the most recent `next_record`,
     /// drained by the driver via [`FormatReader::take_envelope_events`].
     pending_events: Vec<EnvelopeEvent>,
+    /// User-declared name + typed schema for the `GS` level, applied when
+    /// opening each functional group. `None` keeps the positional default.
+    group_section: Option<NestedEnvelopeSection>,
+    /// User-declared name + typed schema for the `ST` level, applied when
+    /// opening each transaction set. `None` keeps the positional default.
+    set_section: Option<NestedEnvelopeSection>,
     done: bool,
 }
 
@@ -141,6 +163,8 @@ impl<R: Read> X12Reader<R> {
             group_count: 0,
             interchange_closed: false,
             pending_events: Vec::new(),
+            group_section: config.group_section,
+            set_section: config.set_section,
             done: false,
         }
     }
@@ -260,9 +284,9 @@ impl<R: Read> X12Reader<R> {
             set_count: 0,
         });
         self.group_count += 1;
-        self.pending_events.push(EnvelopeEvent::OpenLevel {
-            sections: group_sections(gs),
-        });
+        let sections = nested_sections(gs, self.group_section.as_ref(), DEFAULT_GROUP_SECTION)?;
+        self.pending_events
+            .push(EnvelopeEvent::OpenLevel { sections });
         Ok(())
     }
 
@@ -326,9 +350,9 @@ impl<R: Read> X12Reader<R> {
         if let Some(group) = self.open_group.as_mut() {
             group.set_count += 1;
         }
-        self.pending_events.push(EnvelopeEvent::OpenLevel {
-            sections: set_sections(st),
-        });
+        let sections = nested_sections(st, self.set_section.as_ref(), DEFAULT_SET_SECTION)?;
+        self.pending_events
+            .push(EnvelopeEvent::OpenLevel { sections });
         Ok(())
     }
 
@@ -474,12 +498,7 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
                      validated by the reader, not exposed as $doc fields."
                 )));
             }
-            let raw: Vec<(String, String)> = self
-                .isa_elements
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (positional_key(i), e.clone()))
-                .collect();
+            let raw = positional_pairs(&self.isa_elements);
             let mut typed =
                 coerce_section_fields(raw, &section.fields).map_err(FormatError::X12)?;
             // Stash the complete, ordered ISA element list under an
@@ -501,35 +520,58 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
     }
 }
 
-/// Build the `GS` functional-group `$doc` sections under a fixed
-/// `functional_group` name keyed by positional `eNN` elements.
+/// Section name the `GS` functional group surfaces under when the source
+/// declares no name of its own.
+const DEFAULT_GROUP_SECTION: &str = "functional_group";
+
+/// Section name the `ST` transaction set surfaces under when the source
+/// declares no name of its own.
+const DEFAULT_SET_SECTION: &str = "transaction_set";
+
+/// Build the `$doc` sections for a nested `GS`/`ST` level.
 ///
 /// A nested level surfaces its header through the document context exactly
-/// as the file-level `ISA` does, so a `$doc.functional_group.e06`
-/// reference resolves to the group control number on every record inside
-/// the group.
-fn group_sections(gs: &ParsedSegment) -> IndexMap<Box<str>, Value> {
-    positional_section("functional_group", &gs.elements)
-}
-
-/// Build the `ST` transaction-set `$doc` sections under a fixed
-/// `transaction_set` name keyed by positional `eNN` elements.
-fn set_sections(st: &ParsedSegment) -> IndexMap<Box<str>, Value> {
-    positional_section("transaction_set", &st.elements)
-}
-
-/// Build a single-named `$doc` section whose fields are the segment's
-/// positional elements (`e01`, `e02`, …). Used for the nested `GS`/`ST`
-/// levels, which carry their whole header verbatim rather than a
-/// user-declared field schema.
-fn positional_section(name: &str, elements: &[String]) -> IndexMap<Box<str>, Value> {
-    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(elements.len());
-    for (i, e) in elements.iter().enumerate() {
-        fields.insert(positional_key(i).into_boxed_str(), string_or_null(e));
-    }
+/// as the file-level `ISA` does. When the source declares a section name
+/// and typed `fields` schema for the level, the segment's positional
+/// elements are coerced to the declared types under the chosen name — so
+/// `$doc.<chosen>.<field>` resolves to a typed value. With no declaration,
+/// the level surfaces under `default_name` keyed by untyped positional
+/// `eNN` strings, the same behavior every X12 source had before nested
+/// declarations existed.
+///
+/// # Errors
+///
+/// Returns a [`FormatError::X12`] if a declared element fails coercion to
+/// its declared type (the wire value cannot be parsed as the field's type).
+fn nested_sections(
+    segment: &ParsedSegment,
+    declared: Option<&NestedEnvelopeSection>,
+    default_name: &str,
+) -> Result<IndexMap<Box<str>, Value>, FormatError> {
     let mut sections: IndexMap<Box<str>, Value> = IndexMap::with_capacity(1);
-    sections.insert(Box::from(name), Value::Map(Box::new(fields)));
-    sections
+    match declared {
+        Some(section) => {
+            // Coerce the level's positional elements through the declared
+            // field schema, exactly as the file-level ISA section does, so
+            // a declared GS/ST field is typed the same way a declared ISA
+            // field is.
+            let raw = positional_pairs(&segment.elements);
+            let typed = coerce_section_fields(raw, &section.fields).map_err(FormatError::X12)?;
+            sections.insert(
+                Box::from(section.name.as_str()),
+                Value::Map(Box::new(typed)),
+            );
+        }
+        None => {
+            let mut fields: IndexMap<Box<str>, Value> =
+                IndexMap::with_capacity(segment.elements.len());
+            for (i, e) in segment.elements.iter().enumerate() {
+                fields.insert(positional_key(i).into_boxed_str(), string_or_null(e));
+            }
+            sections.insert(Box::from(default_name), Value::Map(Box::new(fields)));
+        }
+    }
+    Ok(sections)
 }
 
 /// Parse a trailer control count, naming the segment and field on failure.
@@ -558,6 +600,17 @@ fn build_schema(max_elements: usize) -> Arc<Schema> {
 /// Positional element column name for element index `i`: `e01`, `e02`, …
 fn positional_key(i: usize) -> String {
     format!("e{:02}", i + 1)
+}
+
+/// Pair each element with its positional key (`e01`, `e02`, …) for
+/// [`coerce_section_fields`], the raw input shape both the file-level `ISA`
+/// section and a declared nested `GS`/`ST` section coerce against.
+fn positional_pairs(elements: &[String]) -> Vec<(String, String)> {
+    elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (positional_key(i), e.clone()))
+        .collect()
 }
 
 /// Map an element string to a `Value`: empty text becomes `Null` so an
@@ -717,6 +770,146 @@ mod tests {
         };
         assert_eq!(set.get("e01"), Some(&Value::String("850".into())));
         assert_eq!(set.get("e02"), Some(&Value::String("0001".into())));
+    }
+
+    /// Build a [`NestedEnvelopeSection`] from a chosen name and a list of
+    /// `(positional element, declared type)` field declarations.
+    fn nested_section(name: &str, fields: &[(&str, EnvelopeFieldType)]) -> NestedEnvelopeSection {
+        let mut field_map = IndexMap::new();
+        for (k, ty) in fields {
+            field_map.insert((*k).to_string(), *ty);
+        }
+        NestedEnvelopeSection {
+            name: name.to_string(),
+            fields: field_map,
+        }
+    }
+
+    /// The first body record's two `OpenLevel` events carry the GS section
+    /// (index 0) and the ST section (index 1).
+    fn first_open_levels(mut r: X12Reader<Cursor<Vec<u8>>>) -> Vec<IndexMap<Box<str>, Value>> {
+        let _ = r.next_record().unwrap().unwrap();
+        r.take_envelope_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                EnvelopeEvent::OpenLevel { sections } => Some(sections),
+                EnvelopeEvent::CloseLevel => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declared_group_and_set_sections_surface_under_chosen_names_typed() {
+        // A source naming the GS level `group` with a numeric control field
+        // and the ST level `txn` with a numeric id and string control sees
+        // both levels under those names, each element coerced to its
+        // declared type rather than a positional `eNN` string.
+        let config = X12ReaderConfig {
+            group_section: Some(nested_section("group", &[("e06", EnvelopeFieldType::Int)])),
+            set_section: Some(nested_section(
+                "txn",
+                &[
+                    ("e01", EnvelopeFieldType::Int),
+                    ("e02", EnvelopeFieldType::String),
+                ],
+            )),
+            ..Default::default()
+        };
+        let r = X12Reader::new(Cursor::new(interchange().into_bytes()), config);
+        let levels = first_open_levels(r);
+        assert_eq!(levels.len(), 2, "GS and ST each open one level");
+
+        let group = match levels[0].get("group").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected group map, got {other:?}"),
+        };
+        // GS06 (group control number "1") coerces to an integer.
+        assert_eq!(group.get("e06"), Some(&Value::Integer(1)));
+        // The default `functional_group` name is NOT used when a name is
+        // declared.
+        assert!(levels[0].get("functional_group").is_none());
+
+        let txn = match levels[1].get("txn").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected txn map, got {other:?}"),
+        };
+        // ST01 (set id "850") coerces to an integer; ST02 stays a string.
+        assert_eq!(txn.get("e01"), Some(&Value::Integer(850)));
+        assert_eq!(txn.get("e02"), Some(&Value::String("0001".into())));
+        assert!(levels[1].get("transaction_set").is_none());
+    }
+
+    #[test]
+    fn undeclared_nested_levels_keep_positional_default_names() {
+        // With no declaration the GS/ST levels surface under the default
+        // `functional_group` / `transaction_set` names keyed by untyped
+        // positional `eNN` strings — the pre-declaration behavior.
+        let levels = first_open_levels(reader(&interchange()));
+        assert_eq!(levels.len(), 2);
+        assert!(levels[0].get("functional_group").is_some());
+        assert!(levels[1].get("transaction_set").is_some());
+        let group = match levels[0].get("functional_group").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        // Untyped: the group control number stays a string.
+        assert_eq!(group.get("e06"), Some(&Value::String("1".into())));
+    }
+
+    #[test]
+    fn declaring_only_the_group_section_leaves_the_set_positional() {
+        // The two levels are declared independently: naming only the GS
+        // level types it while the ST level keeps the positional default.
+        let config = X12ReaderConfig {
+            group_section: Some(nested_section("grp", &[("e01", EnvelopeFieldType::String)])),
+            ..Default::default()
+        };
+        let r = X12Reader::new(Cursor::new(interchange().into_bytes()), config);
+        let levels = first_open_levels(r);
+        assert!(levels[0].get("grp").is_some());
+        assert!(levels[0].get("functional_group").is_none());
+        // The undeclared ST level still uses the default name.
+        assert!(levels[1].get("transaction_set").is_some());
+    }
+
+    #[test]
+    fn undeclared_elements_are_dropped_from_a_declared_section() {
+        // A declared field schema is the contract: only declared elements
+        // surface, so an element the schema omits is absent from the typed
+        // view even though it is on the wire.
+        let config = X12ReaderConfig {
+            set_section: Some(nested_section("txn", &[("e01", EnvelopeFieldType::String)])),
+            ..Default::default()
+        };
+        let r = X12Reader::new(Cursor::new(interchange().into_bytes()), config);
+        let levels = first_open_levels(r);
+        let txn = match levels[1].get("txn").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(txn.get("e01"), Some(&Value::String("850".into())));
+        // ST02 is on the wire but undeclared, so it is not in the section.
+        assert!(txn.get("e02").is_none());
+    }
+
+    #[test]
+    fn declared_section_coercion_failure_errors() {
+        // Declaring a non-numeric element as an integer fails the read with
+        // a coercion error, the same way a mistyped ISA field does.
+        let config = X12ReaderConfig {
+            group_section: Some(nested_section(
+                // GS01 is the functional id code "PO" — not an integer.
+                "grp",
+                &[("e01", EnvelopeFieldType::Int)],
+            )),
+            ..Default::default()
+        };
+        let mut r = X12Reader::new(Cursor::new(interchange().into_bytes()), config);
+        let err = r.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::X12(m) if m.contains("cannot coerce")),
+            "expected a coercion error, got {err:?}"
+        );
     }
 
     #[test]

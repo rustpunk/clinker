@@ -261,6 +261,30 @@ innermost wins for records inside it — the same shadowing rule a nested
 scope follows in any language. Picking distinct per-level names (as above)
 keeps every level independently visible.
 
+The reader-supplied default names are not the only option: an X12 source
+can name the `GS` and `ST` levels itself and give each a typed field
+schema, so a nested level is addressable under a chosen name with coerced
+fields exactly like the declared `ISA` section. The declaration lives on
+the source's `options` (not the `envelope:` block, which is reserved for
+the pre-scannable file-level header), and each nested level is named
+independently:
+
+```yaml
+type: x12
+options:
+  group_section:
+    name: functional_group       # your choice — the engine reserves no name
+    fields: { e06: int }         # GS06 group control number, typed
+  set_section:
+    name: transaction_set        # your choice
+    fields: { e01: int }         # ST01 transaction-set id, typed
+```
+
+Omit a level's declaration and it falls back to its reader-supplied
+default name keyed by untyped positional `eNN` strings. See
+[X12 Format](x12.md#naming-and-typing-the-nested-levels) for the full
+reference.
+
 Boundaries nest correctly through the pipeline: each level opens before
 the records inside it and closes after them, in strict innermost-first
 order. A level that fans in through several branches is still reconciled

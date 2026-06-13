@@ -578,6 +578,22 @@ pub struct X12InputOptions {
     /// precise error naming it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
+    /// Optional user-declared section name and typed field schema for the
+    /// `GS` functional-group nested envelope level. The interchange header
+    /// (`ISA`) is declared through `envelope:` because a bounded pre-scan
+    /// resolves it; the `GS` group exists only mid-file, so its name and
+    /// schema are declared here and applied when the reader crosses each
+    /// group boundary. When absent the group surfaces under the default
+    /// `functional_group` section keyed by untyped positional `eNN`
+    /// strings, unchanged from before this option existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_section: Option<clinker_format::NestedEnvelopeSection>,
+    /// Optional user-declared section name and typed field schema for the
+    /// `ST` transaction-set nested envelope level, mirroring
+    /// `group_section`. When absent the set surfaces under the default
+    /// `transaction_set` section keyed by untyped positional `eNN` strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_section: Option<clinker_format::NestedEnvelopeSection>,
 }
 
 /// HL7 v2 input options.

@@ -170,6 +170,74 @@ nodes:
 }
 
 #[test]
+fn x12_source_exposes_declared_nested_section_names_typed() {
+    // The source names the GS level `grp` (with the functional id `e01`
+    // typed as a string and the group control `e06` typed as an int) and
+    // the ST level `txn` (the set id `e01` typed as an int). A Transform
+    // reads the nested fields under those chosen names — proving the GS/ST
+    // levels are addressable as `$doc.<chosen>.<field>` with coerced types,
+    // exactly like the declared ISA section.
+    let yaml = r#"
+pipeline:
+  name: x12_nested_decl
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      glob: ./*.x12
+      options:
+        group_section:
+          name: grp
+          fields:
+            e01: string
+            e06: int
+        set_section:
+          name: txn
+          fields:
+            e01: int
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: tag
+    input: interchange
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit gs_id = $doc.grp.e01
+        emit gs_ctrl = $doc.grp.e06
+        emit st_id = $doc.txn.e01
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: false
+      include_header: false
+"#;
+    let (report, output) = run(yaml, "interchange", &purchase_order(), "po.x12", "out")
+        .expect("run nested-section pipeline");
+    assert_eq!(report.counters.total_count, 3, "output was: {output}");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    // Columns in emit order: seg, gs_id (GS01), gs_ctrl (GS06), st_id (ST01).
+    // GS01 functional id "PO", GS06 group control "1" (coerced int prints
+    // as "1"), ST01 set id "850" (coerced int) resolve on every body row
+    // under the author's chosen section names.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 3, "3 body rows, no header; got: {output}");
+    for row in &lines {
+        let cols: Vec<&str> = row.split(',').collect();
+        assert_eq!(cols[1], "PO", "gs_id (GS01) wrong in row: {row}");
+        assert_eq!(cols[2], "1", "gs_ctrl (GS06) wrong in row: {row}");
+        assert_eq!(cols[3], "850", "st_id (ST01) wrong in row: {row}");
+    }
+}
+
+#[test]
 fn x12_round_trip_reparses_identically() {
     // Source parses X12 and writes X12, reconstructing the three-tier
     // envelope from the echoed ISA `$doc` section plus a literal GS header.
