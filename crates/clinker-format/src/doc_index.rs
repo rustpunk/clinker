@@ -37,12 +37,6 @@ pub struct DocArenaIndex {
     /// consults [`Self::wants_section`] before descending into a section,
     /// so an undeclared section is skipped without materializing it.
     wanted_sections: Vec<Box<str>>,
-    /// Declared `(section, field)` pairs. A reader that can prune at field
-    /// granularity (a future finer-grained walk) consults
-    /// [`Self::wants_field`]; the JSON pre-scan retains whole sections, so
-    /// it prunes at section granularity and this set is the contract for
-    /// the eventual field-level pruning.
-    wanted_fields: Vec<(Box<str>, Box<str>)>,
     /// Retained section subtrees, keyed by section name in insertion
     /// order. One entry per inserted section.
     sections: IndexMap<Box<str>, Value>,
@@ -63,7 +57,6 @@ impl DocArenaIndex {
     /// checked incrementally in [`Self::insert`].
     pub fn new(declared: &[DocPath], max_index_bytes: Option<usize>) -> Self {
         let mut wanted_sections: Vec<Box<str>> = Vec::new();
-        let mut wanted_fields: Vec<(Box<str>, Box<str>)> = Vec::new();
         for path in declared {
             if !wanted_sections
                 .iter()
@@ -71,17 +64,9 @@ impl DocArenaIndex {
             {
                 wanted_sections.push(path.section.clone());
             }
-            let pair = (path.section.clone(), path.field.clone());
-            if !wanted_fields
-                .iter()
-                .any(|(s, f)| s.as_ref() == pair.0.as_ref() && f.as_ref() == pair.1.as_ref())
-            {
-                wanted_fields.push(pair);
-            }
         }
         DocArenaIndex {
             wanted_sections,
-            wanted_fields,
             sections: IndexMap::new(),
             retained_bytes: 0,
             max_index_bytes,
@@ -101,25 +86,20 @@ impl DocArenaIndex {
         self.wanted_sections.iter().any(|s| s.as_ref() == section)
     }
 
-    /// `true` when some declared path references `section.field`. A reader
-    /// that prunes at field granularity consults this before retaining an
-    /// individual field; a reader that retains whole sections prunes with
-    /// [`Self::wants_section`] alone.
-    pub fn wants_field(&self, section: &str, field: &str) -> bool {
-        self.wanted_fields
-            .iter()
-            .any(|(s, f)| s.as_ref() == section && f.as_ref() == field)
-    }
-
-    /// Charge `value`'s heap-size estimate against the cap, then retain it
-    /// under `path.section`.
+    /// Charge an already-built `value`'s heap-size estimate against the cap,
+    /// then retain it under `path.section`.
     ///
-    /// The byte charge is computed *before* the value is stored and added
-    /// to the running total; if the new total would exceed
-    /// `max_index_bytes` the value is dropped and an error returns, so an
-    /// over-budget document fails mid-build rather than after the whole
-    /// index materializes. A repeated section name overwrites the prior
-    /// retention (a reader inserts each section once).
+    /// This is the index's authoritative retained-bytes accountant for a
+    /// finished subtree, and the parser-agnostic store seam: an XML reader
+    /// hands an event-built `Value` here exactly as the JSON reader hands a
+    /// coerced one. The byte charge is computed *before* the value is stored
+    /// and added to the running total; if the new total would exceed
+    /// `max_index_bytes` the value is dropped and an error returns. A reader
+    /// that builds a subtree through a streaming parse should *also* bound
+    /// the raw parse incrementally (see the JSON reader's byte-counting
+    /// pre-scan), so a single oversized declared subtree never fully
+    /// materializes before reaching this accountant. A repeated section name
+    /// overwrites the prior retention (a reader inserts each section once).
     ///
     /// # Errors
     ///
@@ -209,24 +189,23 @@ mod tests {
     }
 
     #[test]
-    fn wants_field_matches_section_and_field() {
+    fn distinct_fields_of_one_section_collapse_to_a_single_wanted_section() {
+        // Two paths into the same section (different fields) want that one
+        // section once — the JSON pre-scan retains the whole section object,
+        // so field granularity does not split retention.
         let idx = DocArenaIndex::new(
-            &[path("Summary", "record_count"), path("Header", "batch_id")],
+            &[path("Summary", "record_count"), path("Summary", "checksum")],
             None,
         );
-        assert!(idx.wants_field("Summary", "record_count"));
-        assert!(idx.wants_field("Header", "batch_id"));
-        // Right section, undeclared field.
-        assert!(!idx.wants_field("Summary", "checksum"));
-        // Undeclared section.
-        assert!(!idx.wants_field("Footer", "record_count"));
+        assert!(idx.wants_section("Summary"));
+        assert!(!idx.wants_section("Header"));
     }
 
     #[test]
-    fn indexed_paths_collapse_to_their_section_and_field() {
+    fn indexed_paths_collapse_to_their_section() {
         // `$doc.summary.items[0]` and `$doc.summary.items[1]` both name the
-        // `summary.items` field — section/field pruning ignores the trailing
-        // index, which selects an element of the already-retained subtree.
+        // `summary` section — section pruning ignores the field and trailing
+        // index, which select an element of the already-retained subtree.
         let idx = DocArenaIndex::new(
             &[
                 indexed_path("summary", "items", vec![DocIndex::Int(0)]),
@@ -235,7 +214,6 @@ mod tests {
             None,
         );
         assert!(idx.wants_section("summary"));
-        assert!(idx.wants_field("summary", "items"));
     }
 
     #[test]

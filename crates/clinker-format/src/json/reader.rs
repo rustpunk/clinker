@@ -383,15 +383,18 @@ impl FormatReader for JsonReader {
         }
 
         // Single streaming pass over a fresh cursor: only the matched
-        // subtrees are deserialized; every other key is parsed-and-skipped.
-        // Body iteration keeps its own independent cursor over `raw_bytes`.
+        // subtrees are built; every other key is parsed-and-skipped. The cap
+        // is charged *as each declared section is constructed*, so an
+        // oversized declared section aborts the parse mid-build rather than
+        // after the whole subtree materializes. Body iteration keeps its own
+        // independent cursor over `raw_bytes`.
         let mut prescan = BufReader::new(Cursor::new(Arc::clone(&self.raw_bytes)));
-        let matched = extract_sections(&mut prescan, &targets)?;
+        let matched = extract_sections(&mut prescan, &targets, self.config.max_index_bytes)?;
 
-        // Coerce each matched subtree to its declared field schema and
-        // charge it against the index cap before retaining it — an
-        // over-budget document fails here, mid-build, rather than after a
-        // full materialization.
+        // Coerce each matched subtree to its declared field schema and retain
+        // it in the index, which accounts the coerced (field-filtered)
+        // retained bytes against the same cap. The streaming pass already
+        // bounded the raw parse; the index accounts what is actually kept.
         for (name, section) in &config.sections {
             let raw = match matched.get(name) {
                 Some(v) => v,
