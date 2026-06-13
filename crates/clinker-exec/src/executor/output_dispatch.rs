@@ -881,7 +881,6 @@ mod tests {
     use clinker_format::FormatWriter;
     use clinker_format::error::FormatError;
     use clinker_record::{DocumentContext, DocumentId, FieldResolver, Schema, Value};
-    use indexmap::IndexMap;
     use std::sync::Mutex;
 
     /// A [`FormatWriter`] that records every hook invocation as an ordered
@@ -925,7 +924,7 @@ mod tests {
         Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
-            IndexMap::new(),
+            clinker_record::EnvelopeRecord::empty(),
         ))
     }
 
@@ -998,7 +997,8 @@ mod tests {
         // interchange document — begin/end fire exactly once for the whole
         // `ISA..IEA`, not once per transaction set.
         let outer = doc("multi.x12");
-        let inner = Arc::new(outer.child(DocumentId::next(), IndexMap::new()));
+        let inner =
+            Arc::new(outer.child(DocumentId::next(), clinker_record::EnvelopeRecord::empty()));
         let records = vec![record(1, &outer), record(2, &inner), record(3, &outer)];
         let (log, written) = run_log(&records);
         assert_eq!(
@@ -1028,10 +1028,14 @@ mod tests {
         let file_doc = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::clone(&file),
-            IndexMap::new(),
+            clinker_record::EnvelopeRecord::empty(),
         ));
-        let msg1 = Arc::new(file_doc.child_frame(DocumentId::next(), IndexMap::new()));
-        let msg2 = Arc::new(file_doc.child_frame(DocumentId::next(), IndexMap::new()));
+        let msg1 = Arc::new(
+            file_doc.child_frame(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
+        );
+        let msg2 = Arc::new(
+            file_doc.child_frame(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
+        );
         let records = vec![record(1, &msg1), record(2, &msg1), record(3, &msg2)];
         let (log, written) = run_log(&records);
         assert_eq!(

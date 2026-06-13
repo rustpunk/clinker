@@ -897,7 +897,7 @@ mod tests {
         use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
         use crate::envelope::EnvelopeFieldType;
         use crate::traits::FormatWriter;
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         // UNB element 4 (index 3, the prep date/time) is empty, so the
         // control reference "REF9" stays at the standard 5th-element
@@ -923,7 +923,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let schema = r.schema().unwrap();
         let out = {
@@ -1036,7 +1036,7 @@ mod tests {
         use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
         use crate::envelope::EnvelopeFieldType;
         use crate::traits::FormatWriter;
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         // NAD body element "Caf鏃" carries 0xE9 (é); a second body element
         // carries 0xF1 (ñ). UNOC declares Latin-1.
@@ -1062,7 +1062,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let schema = r.schema().unwrap();
         let out_bytes = {
@@ -1109,7 +1109,7 @@ mod tests {
         use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
         use crate::envelope::EnvelopeFieldType;
         use crate::traits::FormatWriter;
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         // UNB sender element (e02) is "Café" with é = 0xE9 (a single Latin-1
         // byte). UNOC declares Latin-1.
@@ -1144,7 +1144,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let schema = r.schema().unwrap();
         let out_bytes = {
@@ -1181,7 +1181,7 @@ mod tests {
         use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
         use crate::envelope::EnvelopeFieldType;
         use crate::traits::FormatWriter;
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         // UNB sender element is "Café" with é = 0xC3 0xA9 (two UTF-8 bytes).
         // A byte-wise placeholder decode would surface "Ã©" (two codepoints).
@@ -1209,7 +1209,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let schema = r.schema().unwrap();
         let out_bytes = {

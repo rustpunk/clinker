@@ -411,7 +411,6 @@ mod tests {
     use clinker_record::{
         DocumentContext, DocumentId, Record, Schema, Value, synthetic_document_context,
     };
-    use indexmap::IndexMap;
 
     use crate::executor::stream_event::PunctuationKind;
 
@@ -429,7 +428,7 @@ mod tests {
         Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(""),
-            IndexMap::new(),
+            clinker_record::EnvelopeRecord::empty(),
         ))
     }
 

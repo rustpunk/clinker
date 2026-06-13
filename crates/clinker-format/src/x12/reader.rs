@@ -1158,7 +1158,7 @@ mod tests {
     fn reader_doc_writer_round_trip_preserves_isa_and_structure() {
         use crate::traits::FormatWriter;
         use crate::x12::writer::{X12Writer, X12WriterConfig};
-        use clinker_record::{DocumentContext, DocumentId};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
         let input = interchange();
 
@@ -1173,7 +1173,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let schema = r.schema().unwrap();
         let out = {

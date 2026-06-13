@@ -583,7 +583,7 @@ fn drive_record_source(
                             Arc::new(clinker_record::DocumentContext::new(
                                 clinker_record::DocumentId::next(),
                                 Arc::clone(&file_arc),
-                                indexmap::IndexMap::new(),
+                                clinker_record::EnvelopeRecord::empty(),
                             ))
                         });
                         let rep_record = build_representative_record(
@@ -812,7 +812,7 @@ fn open_file_level_doc(
     let new_ctx = Arc::new(clinker_record::DocumentContext::new(
         clinker_record::DocumentId::next(),
         Arc::clone(file_arc),
-        envelope_sections,
+        clinker_record::EnvelopeRecord::from_sections(envelope_sections),
     ));
     push_doc_punctuation(
         stream,
@@ -867,9 +867,10 @@ fn apply_envelope_events(
                 // output-envelope / document-DLQ frame via `child_frame`;
                 // `Inherit` (an X12 `GS`/`ST`) stays inside the enclosing
                 // interchange frame via `child`.
+                let envelope = clinker_record::EnvelopeRecord::from_sections(sections);
                 let child = Arc::new(match frame {
-                    clinker_format::FrameRole::NewFrame => parent.child_frame(id, sections),
-                    clinker_format::FrameRole::Inherit => parent.child(id, sections),
+                    clinker_format::FrameRole::NewFrame => parent.child_frame(id, envelope),
+                    clinker_format::FrameRole::Inherit => parent.child(id, envelope),
                 });
                 push_doc_punctuation(
                     stream,

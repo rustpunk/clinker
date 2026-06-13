@@ -2112,7 +2112,6 @@ fn emit_aggregate_finalize_dlq(
 mod tests {
     use super::*;
     use clinker_record::{DocumentContext, Value};
-    use indexmap::IndexMap;
 
     fn record_in_document(doc_id: DocumentId, tag: &str) -> Record {
         let schema = Arc::new(Schema::new(vec!["tag".into()]));
@@ -2120,7 +2119,7 @@ mod tests {
         record.set_doc_ctx(Arc::new(DocumentContext::new(
             doc_id,
             Arc::from("file.csv"),
-            IndexMap::new(),
+            clinker_record::EnvelopeRecord::empty(),
         )));
         record
     }

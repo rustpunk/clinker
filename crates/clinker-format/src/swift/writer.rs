@@ -435,7 +435,7 @@ mod tests {
         DEFAULT_APP_HEADER_SECTION, DEFAULT_BASIC_HEADER_SECTION, DEFAULT_TRAILER_SECTION,
         DEFAULT_USER_HEADER_SECTION,
     };
-    use clinker_record::{DocumentContext, DocumentId};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
     use indexmap::IndexMap;
     use std::io::Cursor;
 
@@ -476,7 +476,7 @@ mod tests {
         Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.swift"),
-            out,
+            EnvelopeRecord::from_sections(out),
         ))
     }
 

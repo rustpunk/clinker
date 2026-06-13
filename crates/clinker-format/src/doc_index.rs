@@ -37,6 +37,15 @@ pub struct DocArenaIndex {
     /// consults [`Self::wants_section`] before descending into a section,
     /// so an undeclared section is skipped without materializing it.
     wanted_sections: Vec<Box<str>>,
+    /// Field-level retention per section, consulted by [`Self::wants_field`]
+    /// so a reader coerces only the fields some program actually reads.
+    /// A section maps to `Some(set)` when every path into it names a concrete
+    /// field — only those fields are retained. It maps to `None` (retain all
+    /// fields) when any path references the whole section (empty field) or
+    /// reaches in by index, since an index selects an element of the
+    /// already-retained subtree and a whole-section reference needs every
+    /// field. Absent from the map ⇒ no path wants the section at all.
+    wanted_fields: IndexMap<Box<str>, Option<Vec<Box<str>>>>,
     /// Retained section subtrees, keyed by section name in insertion
     /// order. One entry per inserted section.
     sections: IndexMap<Box<str>, Value>,
@@ -57,6 +66,7 @@ impl DocArenaIndex {
     /// checked incrementally in [`Self::insert`].
     pub fn new(declared: &[DocPath], max_index_bytes: Option<usize>) -> Self {
         let mut wanted_sections: Vec<Box<str>> = Vec::new();
+        let mut wanted_fields: IndexMap<Box<str>, Option<Vec<Box<str>>>> = IndexMap::new();
         for path in declared {
             if !wanted_sections
                 .iter()
@@ -64,9 +74,24 @@ impl DocArenaIndex {
             {
                 wanted_sections.push(path.section.clone());
             }
+            // A whole-section reference (empty field) or any indexed reference
+            // promotes the section to retain-all (`None`); a concrete field
+            // adds to the section's set unless the section is already
+            // retain-all. `IndexMap`'s entry API keeps the first-seen order.
+            let entry = wanted_fields
+                .entry(path.section.clone())
+                .or_insert_with(|| Some(Vec::new()));
+            if path.field.is_empty() || !path.indices.is_empty() {
+                *entry = None;
+            } else if let Some(fields) = entry
+                && !fields.iter().any(|f| f.as_ref() == path.field.as_ref())
+            {
+                fields.push(path.field.clone());
+            }
         }
         DocArenaIndex {
             wanted_sections,
+            wanted_fields,
             sections: IndexMap::new(),
             retained_bytes: 0,
             max_index_bytes,
@@ -84,6 +109,27 @@ impl DocArenaIndex {
     /// materializing its subtree.
     pub fn wants_section(&self, section: &str) -> bool {
         self.wanted_sections.iter().any(|s| s.as_ref() == section)
+    }
+
+    /// `true` when some declared path reads `field` of `section` — the reader
+    /// coerces and retains the field; otherwise it skips coercing it.
+    ///
+    /// A section reached only by concrete `(section, field)` paths prunes to
+    /// exactly those fields. A section reached by a whole-section reference
+    /// (empty field) or any indexed path retains every field (an index selects
+    /// an element of the already-retained subtree), so this returns `true` for
+    /// any field of such a section. A section no path references at all wants
+    /// no fields — but a reader gates on [`Self::wants_section`] first, so this
+    /// is reached only for a wanted section.
+    pub fn wants_field(&self, section: &str, field: &str) -> bool {
+        match self.wanted_fields.get(section) {
+            // Retain-all: whole-section or indexed reference.
+            Some(None) => true,
+            // Concrete field set: retain only the named fields.
+            Some(Some(fields)) => fields.iter().any(|f| f.as_ref() == field),
+            // Section not referenced by any path.
+            None => false,
+        }
     }
 
     /// Charge an already-built `value`'s heap-size estimate against the cap,
@@ -214,6 +260,50 @@ mod tests {
             None,
         );
         assert!(idx.wants_section("summary"));
+    }
+
+    #[test]
+    fn wants_field_prunes_to_concrete_fields_only() {
+        // A section reached by two concrete fields retains exactly those; a
+        // sibling field the program never reads is pruned.
+        let idx = DocArenaIndex::new(
+            &[path("Summary", "record_count"), path("Summary", "checksum")],
+            None,
+        );
+        assert!(idx.wants_field("Summary", "record_count"));
+        assert!(idx.wants_field("Summary", "checksum"));
+        assert!(!idx.wants_field("Summary", "unread"));
+        // A section no path references wants nothing.
+        assert!(!idx.wants_field("Header", "anything"));
+    }
+
+    #[test]
+    fn wants_field_whole_section_reference_retains_all() {
+        // An empty-field (whole-section) reference promotes the section to
+        // retain-all, so an unnamed field is still wanted.
+        let idx = DocArenaIndex::new(&[path("Summary", "")], None);
+        assert!(idx.wants_section("Summary"));
+        assert!(idx.wants_field("Summary", "anything"));
+        assert!(idx.wants_field("Summary", "else_entirely"));
+    }
+
+    #[test]
+    fn wants_field_indexed_reference_retains_all_of_its_section() {
+        // An indexed path selects an element of the already-retained subtree,
+        // so the whole section is retained — every field is wanted, even a
+        // concrete sibling field declared alongside.
+        let idx = DocArenaIndex::new(
+            &[
+                indexed_path("summary", "items", vec![DocIndex::Int(0)]),
+                path("summary", "checksum"),
+            ],
+            None,
+        );
+        assert!(idx.wants_field("summary", "items"));
+        assert!(idx.wants_field("summary", "checksum"));
+        // Retain-all wins even though `checksum` is a concrete field — the
+        // indexed reference dominates the section's retention.
+        assert!(idx.wants_field("summary", "unread_sibling"));
     }
 
     #[test]

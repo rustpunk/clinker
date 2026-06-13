@@ -163,14 +163,14 @@ pub(crate) fn test_doc_with_sections(
     std::sync::Arc::new(DocumentContext::new(
         clinker_record::DocumentId::next(),
         std::sync::Arc::from("test.doc"),
-        map,
+        clinker_record::EnvelopeRecord::from_sections(map),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::DocumentId;
+    use clinker_record::{DocumentId, EnvelopeRecord};
     use std::sync::Arc;
 
     fn section(fields: &[(&str, Value)]) -> Value {
@@ -184,7 +184,11 @@ mod tests {
     fn doc_with(section_name: &str, fields: &[(&str, Value)]) -> DocumentContext {
         let mut sections = IndexMap::new();
         sections.insert(Box::from(section_name), section(fields));
-        DocumentContext::new(DocumentId::next(), Arc::from("f.csv"), sections)
+        DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("f.csv"),
+            EnvelopeRecord::from_sections(sections),
+        )
     }
 
     #[test]

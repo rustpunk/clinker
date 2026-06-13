@@ -906,8 +906,7 @@ impl FormatWriter for HookProbe {
 
 #[test]
 fn splitting_writer_forwards_document_hooks_to_active_inner() {
-    use clinker_record::DocumentId;
-    use indexmap::IndexMap;
+    use clinker_record::{DocumentId, EnvelopeRecord};
 
     let schema = make_schema(&["id"]);
     let registry = FileRegistry::new();
@@ -927,7 +926,11 @@ fn splitting_writer_forwards_document_hooks_to_active_inner() {
     };
     let mut writer = SplittingWriter::new(registry.file_factory(), writer_factory, schema, policy);
 
-    let doc = DocumentContext::new(DocumentId::next(), Arc::from("file.x12"), IndexMap::new());
+    let doc = DocumentContext::new(
+        DocumentId::next(),
+        Arc::from("file.x12"),
+        EnvelopeRecord::empty(),
+    );
     // `begin_document` arrives before any record: the splitter must lazy-open
     // the first file so the framing reaches a real inner writer.
     writer.begin_document(&doc).unwrap();

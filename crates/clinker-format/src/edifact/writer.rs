@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn unb_echoed_from_doc_section() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         // Build a record carrying a `$doc.unb` section with positional
@@ -638,7 +638,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
 
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn unb_from_doc_raw_preserves_empty_middle_element() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         // A real UNB whose element 4 (index 3) is empty. The reader
@@ -682,7 +682,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn unz_echoes_control_ref_shifted_past_empty_padding() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         // A UNB with all four mandatory leading composites populated plus
@@ -732,7 +732,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn unz_echoes_control_ref_past_split_date_time() {
-        use clinker_record::{DocumentContext, DocumentId, Value as RecVal};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
         use indexmap::IndexMap;
 
         // A UNB whose S004 date/time is transmitted as two separate
@@ -780,7 +780,7 @@ mod tests {
         let ctx = Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
-            sections,
+            EnvelopeRecord::from_sections(sections),
         ));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
