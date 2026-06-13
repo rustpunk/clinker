@@ -13,6 +13,7 @@ use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
+use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
 use clinker_format::x12::Charset;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
@@ -60,6 +61,10 @@ fn build_format_reader(
         clinker_plan::config::InputFormat::Hl7(opts) => {
             let config = build_hl7_reader_config(opts.as_ref());
             Ok(Box::new(Hl7Reader::new(reader, config)))
+        }
+        clinker_plan::config::InputFormat::Swift(opts) => {
+            let config = build_swift_reader_config(opts.as_ref());
+            Ok(Box::new(SwiftReader::new(reader, config)))
         }
     }
 }
@@ -866,6 +871,18 @@ fn build_hl7_reader_config(
     config
 }
 
+fn build_swift_reader_config(
+    opts: Option<&clinker_plan::config::SwiftInputOptions>,
+) -> SwiftReaderConfig {
+    let mut config = SwiftReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(max) = opts.max_fields
+    {
+        config.max_fields = max;
+    }
+    config
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests observe the exact `StreamEvent` punctuation stream the
@@ -990,24 +1007,29 @@ nodes:
         unreachable!("source node present")
     }
 
-    /// Drive `drive_record_source` over the script and return the ordered
-    /// stream of records and document boundaries the driver emitted.
-    fn drive(steps: Vec<Step>) -> Vec<Observed> {
+    /// Drive `drive_record_source` over a pathless source and collect the
+    /// ordered raw stream the driver emitted. The reader (scripted stand-in
+    /// or a real format reader) is small relative to the channel capacity, so
+    /// the driver runs to completion on this thread and drops the sender,
+    /// after which the receiver drains cleanly. Each caller projects the
+    /// returned `StreamEvent`s into the boundary/record shape it asserts on.
+    fn drive_to_stream_events(reader: Box<dyn crate::source::RecordSource>) -> Vec<StreamEvent> {
         let src_cfg = pathless_source_config();
-        let reader: Box<dyn crate::source::RecordSource> = Box::new(ScriptedReader::new(steps));
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
             crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
             handle,
         );
-
-        // The script is far smaller than the channel capacity, so the
-        // driver never blocks on a full channel; it runs to completion on
-        // this thread and drops the sender, after which the receiver
-        // drains cleanly.
         drive_record_source(src_cfg, reader, stream, None).expect("drive");
+        rx.iter().collect()
+    }
 
-        rx.iter()
+    /// Drive the script and return the ordered stream of records and document
+    /// boundaries the driver emitted.
+    fn drive(steps: Vec<Step>) -> Vec<Observed> {
+        let reader: Box<dyn crate::source::RecordSource> = Box::new(ScriptedReader::new(steps));
+        drive_to_stream_events(reader)
+            .into_iter()
             .map(|ev| match ev {
                 StreamEvent::Record(rec, _) => match rec.values()[0] {
                     Value::Integer(id) => Observed::Record(id),
@@ -1122,5 +1144,92 @@ nodes:
             "header-only interchange has no body records"
         );
         assert_eq!(observed.len(), 4);
+    }
+
+    /// One observed event from driving a real [`FormatReader`], with records
+    /// projected to a chosen string column so a per-record assertion can name
+    /// which record landed where in the boundary stream.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ObservedTagged {
+        Open,
+        Close,
+        Record(String),
+    }
+
+    /// Drive a real [`FormatReader`] (not the scripted stand-in) through the
+    /// shared ingest loop and return the ordered stream of document
+    /// boundaries and records, each record projected to its named string
+    /// column. Pins the exact interleaving of `DocumentOpen`/`DocumentClose`
+    /// punctuations with body records that the driver emits.
+    fn drive_format_reader(
+        reader: Box<dyn FormatReader>,
+        record_column: &str,
+    ) -> Vec<ObservedTagged> {
+        let src_reader: Box<dyn crate::source::RecordSource> = Box::new(reader);
+        drive_to_stream_events(src_reader)
+            .into_iter()
+            .map(|ev| match ev {
+                StreamEvent::Record(rec, _) => {
+                    let tag = match rec.get(record_column) {
+                        Some(Value::String(s)) => s.to_string(),
+                        other => panic!("record column {record_column:?} not a string: {other:?}"),
+                    };
+                    ObservedTagged::Record(tag)
+                }
+                StreamEvent::Punctuation(p) => match p.kind() {
+                    PunctuationKind::DocumentOpen => ObservedTagged::Open,
+                    PunctuationKind::DocumentClose => ObservedTagged::Close,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn swift_message_close_follows_its_last_record() {
+        // A SWIFT message's CloseLevel must be applied AFTER the message's
+        // last body record, not before it: the driver drains
+        // `take_envelope_events` and applies each boundary before pushing the
+        // record that pull returned, so a close queued alongside the final
+        // record-bearing pull would strand that record outside its own
+        // document level. This locks the close onto the terminal `Ok(None)`
+        // pull so every body record stays inside the message document.
+        let mt103 = "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}\
+            {4:\r\n:20:REF1\r\n:23B:CRED\r\n:32A:240101USD100,00\r\n-}";
+        let reader: Box<dyn FormatReader> = Box::new(SwiftReader::new(
+            std::io::Cursor::new(mt103.as_bytes().to_vec()),
+            SwiftReaderConfig::default(),
+        ));
+        let observed = drive_format_reader(reader, "tag");
+        // File document opens, the message level opens, all three block-4
+        // records stream, THEN the message and file levels close. The third
+        // record (`32A`) must precede the message `Close`.
+        assert_eq!(
+            observed,
+            vec![
+                ObservedTagged::Open, // file-level document
+                ObservedTagged::Open, // message level
+                ObservedTagged::Record("20".to_string()),
+                ObservedTagged::Record("23B".to_string()),
+                ObservedTagged::Record("32A".to_string()),
+                ObservedTagged::Close, // message level — after the last record
+                ObservedTagged::Close, // file-level document
+            ],
+            "the message Close must follow its last body record"
+        );
+        // Pin the invariant directly: the last record precedes the first
+        // Close. A regression that queues the close on the final
+        // record-bearing pull would place a Close before the `32A` record.
+        let last_record = observed
+            .iter()
+            .rposition(|o| matches!(o, ObservedTagged::Record(_)))
+            .expect("at least one record");
+        let first_close = observed
+            .iter()
+            .position(|o| *o == ObservedTagged::Close)
+            .expect("at least one close");
+        assert!(
+            last_record < first_close,
+            "every body record must precede the message close; got {observed:?}"
+        );
     }
 }
