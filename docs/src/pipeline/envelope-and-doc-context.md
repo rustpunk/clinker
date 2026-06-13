@@ -165,6 +165,23 @@ follows the same missing-value convention as `$source.*` and
 simply absent from the context; any `$doc.<missing_section>.<field>`
 resolves to `null`.
 
+## Declared-path validation (XML and JSON)
+
+For XML and JSON sources, the `envelope:` block is the complete schema:
+the reader extracts exactly the sections and fields it declares. So a
+`$doc.<section>.<field>` reference that names a section the source does
+not declare — or a field the declared section does not declare — is
+almost always a typo (`$doc.Summry.total` against a declared `Summary`),
+and would otherwise resolve silently to `null`. clinker rejects it at
+compile time with error `E341`, pointing at the node that made the
+reference. Run `clinker explain --code E341` for the full write-up.
+
+Segment- and positional-based formats (X12, EDIFACT, HL7, fixed-width)
+synthesize extra envelope levels and positional fields beyond what the
+config declares — an X12 reader exposes `$doc.functional_group.*` and
+`$doc.transaction_set.*` the config never names — so their `$doc` paths
+are not checked this way.
+
 ## One document per file
 
 Each source file is its own document with its own envelope context.

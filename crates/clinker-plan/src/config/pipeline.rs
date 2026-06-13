@@ -798,21 +798,22 @@ impl PipelineConfig {
             )
             .collect();
         let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&doc_refs);
+        // Anchor each `$doc` diagnostic at the offending node's source line.
+        // Top-level node lines come from the saphyr-captured YAML position;
+        // a composition-body node (not present in `self.nodes`) falls back
+        // to a synthetic span. Shared by the E340 unresolvable-index pass
+        // and the E341 undeclared-path pass below.
+        let doc_node_line: HashMap<&str, u32> = self
+            .nodes
+            .iter()
+            .filter_map(|sp| {
+                let line = sp.referenced.line();
+                (line > 0).then(|| (sp.value.name(), line as u32))
+            })
+            .collect();
         if !doc_path_set.unresolvable.is_empty() {
-            // Anchor each diagnostic at the offending node's source line.
-            // Top-level node lines come from the saphyr-captured YAML
-            // position; a composition-body node (not present in
-            // `self.nodes`) falls back to a synthetic span.
-            let node_line: HashMap<&str, u32> = self
-                .nodes
-                .iter()
-                .filter_map(|sp| {
-                    let line = sp.referenced.line();
-                    (line > 0).then(|| (sp.value.name(), line as u32))
-                })
-                .collect();
             for (node_name, d) in &doc_path_set.unresolvable {
-                let primary = match node_line.get(node_name.as_str()) {
+                let primary = match doc_node_line.get(node_name.as_str()) {
                     Some(&line) => Span::line_only(line),
                     None => Span::SYNTHETIC,
                 };
@@ -856,6 +857,59 @@ impl PipelineConfig {
                 .into_iter()
                 .map(|(source, paths)| (source, paths.into_iter().collect()))
                 .collect();
+        // E341 — a `$doc.<section>.<field>` access must name a section and
+        // field the feeding source's envelope actually declares. Without
+        // this check a typo (`$doc.Summry.total` against a declared
+        // `Summary`) compiles silently and resolves to `Value::Null` at
+        // run time; the cxl typechecker cannot catch it because `$doc.*`
+        // types as `Any` with no envelope context in scope.
+        //
+        // Only XML and JSON sources are validated: their reader extracts
+        // exactly the declared sections, each with exactly the declared
+        // fields, so the `EnvelopeConfig` is the authoritative closed
+        // schema. Segment- and positional-based formats (X12, EDIFACT,
+        // HL7, fixed-width) synthesize multi-level sections and positional
+        // fields beyond the declared config — e.g. an X12 reader exposes
+        // `$doc.functional_group.*` and `$doc.transaction_set.*` the config
+        // never names — so a closed-schema check would false-positive on
+        // them and is skipped.
+        let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+        for (doc_path, ref_nodes) in &doc_path_set.by_node {
+            for node_name in ref_nodes {
+                let Some(sources) = node_sources.get(node_name) else {
+                    continue;
+                };
+                for source_name in sources {
+                    let Some(source) = source_by_name.get(source_name.as_str()) else {
+                        continue;
+                    };
+                    if !envelope_schema_is_closed(&source.format) {
+                        continue;
+                    }
+                    let Some(problem) = undeclared_doc_path_problem(source, doc_path) else {
+                        continue;
+                    };
+                    let primary = match doc_node_line.get(node_name.as_str()) {
+                        Some(&line) => Span::line_only(line),
+                        None => Span::SYNTHETIC,
+                    };
+                    diags.push(
+                        Diagnostic::error(
+                            "E341",
+                            problem.message,
+                            LabeledSpan::primary(primary, String::new()),
+                        )
+                        .with_help(problem.help),
+                    );
+                }
+            }
+        }
+        if diags.iter().any(|d| d.code == "E341") {
+            return Err(diags);
+        }
         // Keep an analysis-by-name index so we can surface the analysis
         // alongside its matching entry regardless of filter order.
         let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
@@ -2036,6 +2090,74 @@ fn resolve_all_input_references(
                 }
             }
         }
+    }
+}
+
+/// Whether a source format's `EnvelopeConfig` is the complete, closed set
+/// of `$doc` sections and fields the reader can supply.
+///
+/// XML and JSON readers extract exactly the declared sections, each with
+/// exactly the declared fields, so a used `$doc` path naming anything the
+/// config omits is a genuine typo. Segment- and positional-based formats
+/// (X12, EDIFACT, HL7, fixed-width) synthesize multi-level envelope
+/// sections and positional fields beyond the declared config — an X12
+/// reader exposes `$doc.functional_group.*` / `$doc.transaction_set.*`
+/// the config never names — so their envelope is open and the closed-set
+/// `$doc` validation is skipped for them.
+fn envelope_schema_is_closed(format: &InputFormat) -> bool {
+    matches!(format, InputFormat::Xml(_) | InputFormat::Json(_))
+}
+
+/// A rejected `$doc` path against a closed envelope schema: the formatted
+/// diagnostic message plus its fix-it help text.
+struct UndeclaredDocPath {
+    message: String,
+    help: String,
+}
+
+/// Check one `$doc.<section>.<field>` path against a source's declared
+/// envelope, returning the diagnostic content when the path names an
+/// undeclared section or an undeclared field within a declared section.
+///
+/// Returns `None` when the path is fully declared. The caller has already
+/// confirmed the source's format carries a closed envelope schema, so an
+/// absent `envelope:` block means every `$doc` path is undeclared.
+fn undeclared_doc_path_problem(
+    source: &crate::config::SourceConfig,
+    doc_path: &cxl::analyzer::doc_paths::DocPath,
+) -> Option<UndeclaredDocPath> {
+    let section_name = &*doc_path.section;
+    let field_name = &*doc_path.field;
+    let source_name = &source.name;
+    let section = source
+        .envelope
+        .as_ref()
+        .and_then(|env| env.sections.get(section_name));
+    match section {
+        None => Some(UndeclaredDocPath {
+            message: format!(
+                "`$doc.{section_name}.{field_name}` references envelope section \
+                 '{section_name}', but source '{source_name}' declares no such section"
+            ),
+            help: format!(
+                "declare the section under the source's `envelope.sections`, or correct \
+                 the name to a declared section. Section names are user-chosen and \
+                 case-sensitive — '{section_name}' must match a key under \
+                 `envelope.sections` exactly"
+            ),
+        }),
+        Some(section) if !section.fields.contains_key(field_name) => Some(UndeclaredDocPath {
+            message: format!(
+                "`$doc.{section_name}.{field_name}` references field '{field_name}' in \
+                 envelope section '{section_name}', but source '{source_name}' declares no \
+                 such field in that section"
+            ),
+            help: format!(
+                "add '{field_name}' to `envelope.sections.{section_name}.fields`, or correct \
+                 the name to a declared field. Field names are case-sensitive"
+            ),
+        }),
+        Some(_) => None,
     }
 }
 
