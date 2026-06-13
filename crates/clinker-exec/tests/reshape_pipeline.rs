@@ -294,3 +294,97 @@ nodes:
         "both rules apply against the original group state: {output}"
     );
 }
+
+/// A `synthesize` rule with `copy_from: none` that overrides every user
+/// column. The synthesized row is born from an all-null base, so every
+/// output value comes from an `overrides` expression. This exercises the
+/// `CopyFrom::None` dispatch path end-to-end — the path the compile-only
+/// `copy_from: none` validation tests never reach.
+const COPY_FROM_NONE_PIPELINE: &str = r#"
+pipeline:
+  name: reshape_copy_from_none
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: test.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: label, type: string }
+  - type: reshape
+    name: emit_summary
+    input: rows
+    config:
+      partition_by: [id]
+      rules:
+        - name: summarize_big
+          when: "amount > 100"
+          synthesize:
+            copy_from: none
+            overrides:
+              id: "id"
+              amount: "amount * 2"
+              label: "'synthetic-summary'"
+  - type: output
+    name: out
+    input: emit_summary
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+#[test]
+fn copy_from_none_synthesizes_fully_overridden_row() {
+    // Group A's amount=150 (>100) fires the rule and synthesizes a brand-new
+    // row from an all-null base, every column supplied by an override:
+    // id=A (the trigger's), amount=300 (150*2), label='synthetic-summary'.
+    // Group B's amount=50 does not fire. Before the sizing fix, building the
+    // synthesized Record from an empty values Vec against the wider output
+    // schema (3 user cols + 3 `$meta.*` audit cols) tripped the
+    // `Record::new` length `debug_assert`, panicking this debug-build run.
+    let csv = "id,amount,label\n\
+               A,150,original\n\
+               B,50,original\n";
+    let (counters, dlq, output) = run_reshape(COPY_FROM_NONE_PIPELINE, csv).unwrap();
+
+    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+
+    let lines: Vec<&str> = output.lines().collect();
+    // The two originals pass through plus exactly one synthesized row.
+    let data_lines: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .copied()
+        .collect();
+    assert_eq!(
+        data_lines.len(),
+        3,
+        "2 originals + 1 synthesized data row: {output}"
+    );
+
+    // The synthesized row carries every overridden value (none null): the
+    // trigger's id, the doubled amount, and the literal label.
+    assert!(
+        lines.iter().any(|l| l == &"A,300,synthetic-summary"),
+        "fully-overridden synthesized row must be present and non-null: {output}"
+    );
+
+    // Originals are untouched, and no audit column leaks into output.
+    assert!(lines.iter().any(|l| l == &"A,150,original"));
+    assert!(lines.iter().any(|l| l == &"B,50,original"));
+    assert!(
+        !output.contains("$meta."),
+        "$meta.* audit columns must not leak into default output: {output}"
+    );
+
+    // `ok_count` counts distinct source rows reaching output; the synthesized
+    // row borrows its trigger's identity, so both source rows count clean.
+    assert_eq!(counters.ok_count, 2, "both source rows emit clean");
+}

@@ -10,9 +10,9 @@
 //! # Memory model
 //!
 //! The whole input materializes into per-group buffers before any output
-//! row leaves — group observation must see the complete group. Disk-spill
-//! governance for these buffers lands with the follow-on memory work; this
-//! arm accumulates in memory bounded by the correlation group cap.
+//! row leaves — group observation must see the complete group. There is no
+//! group-size cap and no disk spill yet: this arm accumulates everything in
+//! memory. Bounded-memory governance (spill, group caps) is follow-on work.
 //!
 //! # No-cascade contract
 //!
@@ -245,7 +245,15 @@ fn process_group(
             if let Some(synth) = rule.synth.as_mut() {
                 let mut new_row = match synth.copy_from {
                     CopyFrom::Trigger => clone_into_schema(record, output_schema),
-                    CopyFrom::None => Record::new(Arc::clone(output_schema), Vec::new()),
+                    // Born sized to the full output schema (upstream cols +
+                    // the three `$meta.*` audit cols) so each override lands
+                    // in its schema-indexed slot. Binding guarantees a
+                    // `copy_from: none` rule overrides every user column, so
+                    // no `Null` survives below.
+                    CopyFrom::None => Record::new(
+                        Arc::clone(output_schema),
+                        vec![Value::Null; output_schema.column_count()],
+                    ),
                 };
                 for (field, evaluator) in synth.overrides.iter_mut() {
                     let value = eval_scalar(evaluator, &eval_ctx, record, field)

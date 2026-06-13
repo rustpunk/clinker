@@ -893,9 +893,9 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
         // sink, Composition is a structural wrapper whose body nodes
         // carry their own classes, and CorrelationCommit's group buffer
         // is bounded by `max_group_buffer` rather than the arbitrator.
-        // Reshape buffers per-group state in memory bounded by the
-        // correlation group cap; its disk-spill governance lands with the
-        // follow-on memory work, so it registers no spillable consumer yet.
+        // Reshape buffers per-group state entirely in memory with no
+        // group-size cap; its disk-spill governance lands with the follow-on
+        // memory work, so it registers no spillable consumer yet.
         PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
