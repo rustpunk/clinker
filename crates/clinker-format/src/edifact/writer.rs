@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
 
+use crate::edifact::charset::Charset;
 use crate::edifact::tokenizer::Delimiters;
 use crate::edifact::{RAW_ELEMENTS_KEY, unb_control_reference};
 use crate::error::FormatError;
@@ -58,6 +59,13 @@ pub struct EdifactWriter<W: Write> {
     writer: W,
     config: EdifactWriterConfig,
     delims: Delimiters,
+    /// Repertoire element text is encoded through, negotiated from the
+    /// resolved `UNB` syntax identifier and armed before the `UNB` is
+    /// emitted, so the header's own elements encode under it. Holds the
+    /// [`Charset::default`] placeholder until `write_header` arms it; the
+    /// placeholder is never used to encode, since no segment is written
+    /// before the header.
+    charset: Charset,
     /// Wire element columns keyed by the 1-based position parsed from the
     /// column name (`e01` → 1), each paired with its schema index. The
     /// numeric suffix — not schema-declaration order — determines the wire
@@ -127,6 +135,7 @@ impl<W: Write> EdifactWriter<W> {
             writer,
             config,
             delims: Delimiters::level_a(),
+            charset: Charset::default(),
             element_columns,
             seg_id_idx,
             msg_ref_idx,
@@ -167,6 +176,22 @@ impl<W: Write> EdifactWriter<W> {
         }
 
         let unb_elements = self.resolve_unb_elements(record)?;
+        // Negotiate the encoding repertoire from the resolved syntax
+        // identifier (UNB S001 component 1, e.g. `UNOC` in `UNOC:3`) and arm
+        // it BEFORE the UNB is emitted, so the UNB's own elements — including
+        // a sender/recipient identification carrying non-ASCII text under
+        // UNOC or UNOY — encode through the negotiated repertoire and invert
+        // the reader's decode exactly. The syntax identifier itself is ASCII,
+        // so it encodes identically regardless.
+        let syntax_id = unb_elements.first().ok_or_else(|| {
+            FormatError::Edifact(
+                "the resolved UNB header carries no syntax-identifier element (S001), \
+                 so no character repertoire can be negotiated; supply a UNB whose first \
+                 element names a syntax level (e.g. `UNOC:3`)"
+                    .into(),
+            )
+        })?;
+        self.charset = Charset::from_unb_syntax_identifier(syntax_id, self.delims.component)?;
         // Echo the same control reference into the UNZ trailer that the
         // reader validates against, located structurally (after the
         // mandatory leading composites) so an empty optional element in
@@ -407,8 +432,16 @@ impl<W: Write> EdifactWriter<W> {
         Ok(())
     }
 
-    /// Write one element, prefixing each service character that would
-    /// otherwise be read as a delimiter with the release character.
+    /// Encode one element through the negotiated repertoire, then write the
+    /// encoded bytes prefixing each service character that would otherwise
+    /// be read as a delimiter with the release character.
+    ///
+    /// Encoding runs *before* escaping so the release escapes apply to the
+    /// wire bytes the reader will see: a Latin-1 byte that happens to equal
+    /// the element separator `+` or the terminator `'` must still be escaped,
+    /// which a pre-encode escape pass over the UTF-8 source could miss. This
+    /// inverts the reader's escape-then-decode order exactly, so a
+    /// reader→writer→reader cycle is byte-faithful for the negotiated charset.
     ///
     /// Escaped: the segment terminator, the element separator, and the
     /// release character itself. The component separator is *not* escaped
@@ -416,11 +449,19 @@ impl<W: Write> EdifactWriter<W> {
     /// composite structure (mirroring the reader, which keeps unescaped
     /// component separators verbatim), so composite elements like
     /// `UNOA:1` re-emit unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Edifact`] when the element text carries a
+    /// character the negotiated repertoire cannot represent (a non-ASCII
+    /// character under UNOA/UNOB, or a character above `U+00FF` under UNOC),
+    /// so an unrepresentable value is rejected rather than emitted truncated.
     fn write_escaped_element(&mut self, element: &str) -> Result<(), FormatError> {
         let release = self.delims.release;
         let terminator = self.delims.terminator;
         let separator = self.delims.element;
-        for &b in element.as_bytes() {
+        let encoded = self.charset.encode(element)?;
+        for &b in &encoded {
             if b == release || b == terminator || b == separator {
                 self.writer.write_all(&[release]).map_err(FormatError::Io)?;
             }
@@ -1007,6 +1048,122 @@ mod tests {
         assert!(
             out.contains("BGM+first+second'"),
             "reordered mapping wrong: {out}"
+        );
+    }
+
+    /// A UNOC interchange config: the syntax identifier declares Latin-1, so
+    /// the writer encodes element text through the single-byte repertoire.
+    fn unoc_config() -> EdifactWriterConfig {
+        EdifactWriterConfig {
+            interchange: Some(vec![
+                "UNOC:3".into(),
+                "S".into(),
+                "R".into(),
+                "240101:1200".into(),
+                "REF1".into(),
+            ]),
+            segment_newline: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unoc_encodes_high_byte_element_to_single_latin1_byte() {
+        // Under UNOC the writer encodes "Café" with é as the single Latin-1
+        // byte 0xE9, not the two-byte UTF-8 sequence.
+        let s = schema();
+        let mut buf = Vec::new();
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        w.write_record(&body(&s, "NAD", "M1", "ORDERS", &["Café"]))
+            .unwrap();
+        w.flush().unwrap();
+        // The body element bytes are "Caf" + 0xE9, escaped as needed.
+        assert!(
+            buf.windows(4).any(|w| w == [b'C', b'a', b'f', 0xE9]),
+            "é was not encoded to the single Latin-1 byte 0xE9: {buf:?}"
+        );
+        // No UTF-8 two-byte sequence for é (0xC3 0xA9) appears.
+        assert!(
+            !buf.windows(2).any(|w| w == [0xC3, 0xA9]),
+            "é leaked as a UTF-8 sequence: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn unoc_latin1_byte_equal_to_delimiter_is_release_escaped() {
+        // A Latin-1 codepoint that encodes to a byte equal to a service
+        // delimiter must still be release-escaped on the encoded bytes. The
+        // element separator '+' is 0x2B; encode-then-escape is what makes a
+        // data byte 0x2B survive as ?+ rather than splitting the element.
+        let s = schema();
+        let mut buf = Vec::new();
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        // U+002B is '+', which round-trips through Latin-1 to byte 0x2B.
+        w.write_record(&body(&s, "BGM", "M1", "ORDERS", &["A+B"]))
+            .unwrap();
+        w.flush().unwrap();
+        // "A?+B" — the data '+' is escaped, the element is not split.
+        assert!(
+            buf.windows(5).any(|w| w == b"A?+B'"),
+            "data '+' was not release-escaped under UNOC: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn unoc_rejects_char_outside_latin1() {
+        // A euro sign (U+20AC) is above U+00FF and has no Latin-1 byte; the
+        // writer must reject it, not truncate.
+        let s = schema();
+        let mut buf = Vec::new();
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        let err = w
+            .write_record(&body(&s, "FTX", "M1", "ORDERS", &["price €5"]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("Latin-1") && m.contains("U+20AC")),
+            "expected out-of-range encode rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unoa_rejects_non_ascii_element() {
+        // Under a UNOA (ASCII) header a non-ASCII element is rejected loudly.
+        let s = schema();
+        let mut buf = Vec::new();
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let err = w
+            .write_record(&body(&s, "NAD", "M1", "ORDERS", &["Café"]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("ASCII")),
+            "expected ASCII encode rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_syntax_level_header_errors_naming_level() {
+        // A literal UNB declaring an unmapped syntax level fails when the
+        // header is written, naming the offending level.
+        let s = schema();
+        let cfg = EdifactWriterConfig {
+            interchange: Some(vec![
+                "UNOD:4".into(),
+                "S".into(),
+                "R".into(),
+                "240101:1200".into(),
+                "REF1".into(),
+            ]),
+            segment_newline: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let err = w
+            .write_record(&body(&s, "BGM", "M1", "ORDERS", &["220"]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("UNOD") && m.contains("unsupported")),
+            "expected unsupported-level header error, got {err:?}"
         );
     }
 

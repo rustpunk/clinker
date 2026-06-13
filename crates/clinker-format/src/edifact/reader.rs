@@ -21,6 +21,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
+use crate::edifact::charset::Charset;
 use crate::edifact::tokenizer::{ParsedSegment, SegmentTokenizer, split_segment};
 use crate::edifact::{RAW_ELEMENTS_KEY, unz_echo_matches_unb};
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
@@ -104,17 +105,33 @@ impl<R: Read> EdifactReader<R> {
     /// Consume the optional `UNA` and the mandatory `UNB`, stashing the
     /// `UNB` data elements for envelope serving and for the deferred
     /// control-reference validation against the `UNZ` trailer. Idempotent.
+    ///
+    /// The `UNB` is framed raw first so its in-band syntax identifier (S001
+    /// component 1, always ASCII) can arm the charset before the segment is
+    /// decoded. The `UNB`'s own elements — including a sender/recipient
+    /// identification carrying non-ASCII text under UNOC or UNOY — are then
+    /// decoded through the negotiated repertoire, so `$doc.UNB.*` and the
+    /// `UNZ` echo hold correctly-decoded values, not bytes read under a
+    /// placeholder.
     fn ensure_initialized(&mut self) -> Result<(), FormatError> {
         if self.initialized {
             return Ok(());
         }
         self.initialized = true;
 
-        let first = self.tokenizer.next_segment()?.ok_or_else(|| {
+        let raw = self.tokenizer.next_raw_segment()?.ok_or_else(|| {
             FormatError::Edifact("empty interchange: no UNB segment found".into())
         })?;
         let delims = self.tokenizer.delimiters();
-        let parsed = split_segment(&first, &delims);
+
+        // Arm the charset from the raw UNB's syntax identifier (ASCII, read
+        // before decoding), then decode the UNB through that repertoire so
+        // its non-ASCII elements come out correct.
+        let charset = Charset::from_raw_unb_segment(&raw, &delims)?;
+        self.tokenizer.set_charset(charset);
+        let decoded = self.tokenizer.decode(raw)?;
+
+        let parsed = split_segment(&decoded, &delims);
         if parsed.tag != "UNB" {
             return Err(FormatError::Edifact(format!(
                 "interchange must begin with a UNB segment, found {:?}",
@@ -931,5 +948,282 @@ mod tests {
         // 3. Re-read the emitted interchange: the decoded value matches.
         let recs2 = collect(&out);
         assert_eq!(recs2[1].get("e01"), Some(&Value::String("O'BRIEN".into())));
+    }
+
+    /// Collect every body record from a raw byte interchange — the
+    /// Latin-1 path carries high bytes that are not valid UTF-8, so the
+    /// fixture cannot be a `&str`.
+    fn collect_bytes(data: Vec<u8>) -> Vec<Record> {
+        let mut r = EdifactReader::new(Cursor::new(data), EdifactReaderConfig::default());
+        let mut out = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            out.push(rec);
+        }
+        out
+    }
+
+    #[test]
+    fn unoc_body_segment_decodes_latin1_high_byte() {
+        // A UNOC interchange whose first body segment carries the Latin-1
+        // byte 0xE9 (é) decodes correctly — the charset is armed from the raw
+        // UNB before any segment is decoded, so the body decodes under
+        // Latin-1.
+        let mut data = b"UNB+UNOC:3+S+R+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf"
+            .to_vec();
+        data.push(0xE9);
+        data.extend_from_slice(b"'UNT+3+M1'UNZ+1+REF1'");
+        let recs = collect_bytes(data);
+        // UNH, NAD body records.
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].get("seg_id"), Some(&Value::String("NAD".into())));
+        assert_eq!(recs[1].get("e02"), Some(&Value::String("Café".into())));
+    }
+
+    #[test]
+    fn unoa_high_byte_body_segment_rejected_loudly() {
+        // The same high byte under a UNOA (ASCII) syntax identifier must
+        // fail loud rather than reinterpret it.
+        let mut data = b"UNB+UNOA:1+S+R+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf"
+            .to_vec();
+        data.push(0xE9);
+        data.extend_from_slice(b"'UNT+3+M1'UNZ+1+REF1'");
+        let mut r = EdifactReader::new(Cursor::new(data), EdifactReaderConfig::default());
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected ASCII high-byte rejection"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::Edifact(m) if m.contains("ASCII")));
+    }
+
+    #[test]
+    fn unsupported_syntax_level_unb_fails_naming_level() {
+        // A UNB declaring an unmapped syntax level (UNOD) fails loudly at
+        // initialization, naming the offending level, rather than guessing a
+        // fallback.
+        let data = "UNB+UNOD:4+S+R+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'";
+        let mut r = reader(data);
+        let err = r.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Edifact(m) if m.contains("UNOD") && m.contains("unsupported")),
+            "expected unsupported-level error naming UNOD, got {err:?}"
+        );
+    }
+
+    /// Full reader → writer → reader round-trip of a UNOC interchange whose
+    /// body element carries Latin-1 high bytes (0xE9 é, 0xF1 ñ): the reader
+    /// decodes them under Latin-1, the writer re-encodes them to the same
+    /// single bytes, and a re-read recovers the identical decoded text. This
+    /// proves encode-then-escape on the writer inverts escape-then-decode on
+    /// the reader for the negotiated repertoire.
+    #[test]
+    fn latin1_body_round_trips_reader_writer_reader() {
+        use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
+        use crate::envelope::EnvelopeFieldType;
+        use crate::traits::FormatWriter;
+        use clinker_record::{DocumentContext, DocumentId};
+
+        // NAD body element "Caf鏃" carries 0xE9 (é); a second body element
+        // carries 0xF1 (ñ). UNOC declares Latin-1.
+        let mut input = b"UNB+UNOC:3+SENDER+RECEIVER+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf"
+            .to_vec();
+        input.push(0xE9); // é
+        input.extend_from_slice(b"+A");
+        input.push(0xF1); // ñ
+        input.extend_from_slice(b"o'UNT+3+M1'UNZ+1+REF1'");
+
+        // 1. Read the envelope + body under Latin-1.
+        let cfg = unb_section(&[("e05", EnvelopeFieldType::String)]);
+        let mut r = EdifactReader::new(Cursor::new(input), EdifactReaderConfig::default());
+        let sections = r.prepare_document(&cfg).unwrap();
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        assert_eq!(body_recs.len(), 2); // UNH, NAD
+        assert_eq!(body_recs[1].get("e02"), Some(&Value::String("Café".into())));
+        assert_eq!(body_recs[1].get("e03"), Some(&Value::String("Año".into())));
+
+        // 2. Re-emit through the writer, which negotiates UNOC from the
+        // echoed UNB and re-encodes the high-byte elements to single bytes.
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        let schema = r.schema().unwrap();
+        let out_bytes = {
+            let mut buf = Vec::new();
+            let mut w = EdifactWriter::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                EdifactWriterConfig {
+                    interchange_from_doc: Some("interchange".into()),
+                    segment_newline: false,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            buf
+        };
+
+        // The é and ñ are emitted as the single Latin-1 bytes, not UTF-8
+        // multi-byte sequences.
+        assert!(out_bytes.windows(4).any(|w| w == [b'C', b'a', b'f', 0xE9]));
+        assert!(out_bytes.windows(3).any(|w| w == [b'A', 0xF1, b'o']));
+
+        // 3. Re-read: the decoded text is identical, so the round-trip is
+        // byte-faithful for the negotiated repertoire.
+        let recs2 = collect_bytes(out_bytes);
+        assert_eq!(recs2[1].get("e02"), Some(&Value::String("Café".into())));
+        assert_eq!(recs2[1].get("e03"), Some(&Value::String("Año".into())));
+    }
+
+    /// Read → write → read with a non-ASCII byte in a `UNB` *header* element
+    /// (the sender identification), under UNOC (Latin-1). The header itself —
+    /// not just the body — must decode and re-encode under the negotiated
+    /// repertoire, so `$doc.UNB.*` surfaces the correct text and the emitted
+    /// bytes are identical to the input. This is the regression guard for the
+    /// header being processed under a placeholder charset whose decode and
+    /// encode are not inverses for high bytes.
+    #[test]
+    fn unoc_unb_sender_element_round_trips_byte_for_byte() {
+        use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
+        use crate::envelope::EnvelopeFieldType;
+        use crate::traits::FormatWriter;
+        use clinker_record::{DocumentContext, DocumentId};
+
+        // UNB sender element (e02) is "Café" with é = 0xE9 (a single Latin-1
+        // byte). UNOC declares Latin-1.
+        let mut input = b"UNB+UNOC:3+Caf".to_vec();
+        input.push(0xE9); // é in the sender id
+        input.extend_from_slice(
+            b"+RECEIVER+240101:1200+REF1'\
+              UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'",
+        );
+
+        // Reader surfaces the correct decoded sender in $doc.UNB.e02.
+        let cfg = unb_section(&[
+            ("e02", EnvelopeFieldType::String),
+            ("e05", EnvelopeFieldType::String),
+        ]);
+        let mut r = EdifactReader::new(Cursor::new(input.clone()), EdifactReaderConfig::default());
+        let sections = r.prepare_document(&cfg).unwrap();
+        let interchange = match sections.get("interchange").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(
+            interchange.get("e02"),
+            Some(&Value::String("Café".into())),
+            "UNB sender decoded under a placeholder, not the negotiated charset"
+        );
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        assert_eq!(body_recs.len(), 2); // UNH, BGM
+
+        // Re-emit: the UNB must be encoded under UNOC, so the sender's é is
+        // the single byte 0xE9 again — byte-identical to the input.
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        let schema = r.schema().unwrap();
+        let out_bytes = {
+            let mut buf = Vec::new();
+            let mut w = EdifactWriter::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                EdifactWriterConfig {
+                    interchange_from_doc: Some("interchange".into()),
+                    segment_newline: false,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            buf
+        };
+        assert_eq!(
+            out_bytes, input,
+            "UNOC UNB header did not round-trip byte-for-byte"
+        );
+    }
+
+    /// Read → write → read with a multi-byte UTF-8 character in a `UNB`
+    /// header element, under UNOY (UTF-8). The reader must surface one
+    /// codepoint (not mojibake from a byte-wise placeholder decode), and the
+    /// emitted bytes must be byte-faithful.
+    #[test]
+    fn unoy_unb_element_decodes_one_codepoint_and_round_trips() {
+        use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
+        use crate::envelope::EnvelopeFieldType;
+        use crate::traits::FormatWriter;
+        use clinker_record::{DocumentContext, DocumentId};
+
+        // UNB sender element is "Café" with é = 0xC3 0xA9 (two UTF-8 bytes).
+        // A byte-wise placeholder decode would surface "Ã©" (two codepoints).
+        let input = "UNB+UNOY:4+Café+RECEIVER+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'"
+            .as_bytes()
+            .to_vec();
+
+        let cfg = unb_section(&[("e02", EnvelopeFieldType::String)]);
+        let mut r = EdifactReader::new(Cursor::new(input.clone()), EdifactReaderConfig::default());
+        let sections = r.prepare_document(&cfg).unwrap();
+        let interchange = match sections.get("interchange").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        // One codepoint, not mojibake.
+        assert_eq!(
+            interchange.get("e02"),
+            Some(&Value::String("Café".into())),
+            "UNB sender decoded byte-wise instead of as UTF-8"
+        );
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        assert_eq!(body_recs.len(), 2);
+
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            sections,
+        ));
+        let schema = r.schema().unwrap();
+        let out_bytes = {
+            let mut buf = Vec::new();
+            let mut w = EdifactWriter::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                EdifactWriterConfig {
+                    interchange_from_doc: Some("interchange".into()),
+                    segment_newline: false,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            buf
+        };
+        assert_eq!(
+            out_bytes, input,
+            "UNOY UNB header did not round-trip byte-for-byte"
+        );
     }
 }

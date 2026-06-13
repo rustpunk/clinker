@@ -28,6 +28,11 @@ pub enum FormatError {
     /// constraint (missing/truncated MSH header, BTS/FTS count mismatch,
     /// unbalanced batch/file envelope, truncation, non-UTF-8 charset).
     Hl7(String),
+    /// A SWIFT MT parse or malformed-block failure. Carries a precise
+    /// message naming the offending block or constraint (unbalanced brace,
+    /// missing/non-numeric block id, missing `-}` block-4 trailer,
+    /// malformed `:tag:value` line, truncation, non-UTF-8 message).
+    Swift(String),
     InvalidRecord {
         row: u64,
         message: String,
@@ -74,6 +79,7 @@ impl fmt::Display for FormatError {
             Self::Edifact(msg) => write!(f, "EDIFACT error: {msg}"),
             Self::X12(msg) => write!(f, "X12 error: {msg}"),
             Self::Hl7(msg) => write!(f, "HL7 error: {msg}"),
+            Self::Swift(msg) => write!(f, "SWIFT error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }

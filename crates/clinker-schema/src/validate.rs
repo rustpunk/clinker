@@ -133,6 +133,10 @@ fn validate_input(
         InputFormat::Edifact(_) => schema.metadata.format == crate::model::SourceFormat::Edifact,
         InputFormat::X12(_) => schema.metadata.format == crate::model::SourceFormat::X12,
         InputFormat::Hl7(_) => schema.metadata.format == crate::model::SourceFormat::Hl7,
+        // SWIFT MT sources stream a static `[block, tag, value]` schema rather
+        // than a declared `.schema.yaml` format, so there is no schema-format
+        // token to match against (the same posture fixed-width takes).
+        InputFormat::Swift(_) => false,
     };
 
     if !format_matches {

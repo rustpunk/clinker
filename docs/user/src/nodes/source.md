@@ -76,7 +76,7 @@ column whose values repeat, leave it off.
 A source declaration has two independent layers:
 
 - **Transport** (`transport:`) selects *where* the records come from. The only transport today is `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
-- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`.
+- **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`, `swift`.
 
 ```yaml
 - type: source
@@ -106,6 +106,7 @@ has its own reference page covering its options and decoding model:
 | `edifact` | UN/EDIFACT interchanges | [EDIFACT Format](../formats/edifact.md) |
 | `x12` | ANSI ASC X12 interchanges | [X12 Format](../formats/x12.md) |
 | `hl7` | HL7 v2.x pipe-and-hat messages | [HL7 v2 Format](../formats/hl7.md) |
+| `swift` | SWIFT MT (FIN) messages | [SWIFT MT Format](../formats/swift.md) |
 
 The same `schema:` rules apply regardless of format: the reader maps each
 decoded record onto the declared schema, and undeclared input fields fall

@@ -40,6 +40,7 @@
 - [EDIFACT Format](formats/edifact.md)
 - [X12 Format](formats/x12.md)
 - [HL7 v2 Format](formats/hl7.md)
+- [SWIFT MT Format](formats/swift.md)
 - [Network Sources (REST)](formats/source-network.md)
 - [Auto-Widen & Schema Drift](formats/auto-widen.md)
 
