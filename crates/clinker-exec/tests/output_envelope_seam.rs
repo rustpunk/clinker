@@ -80,7 +80,8 @@ const DOC_JSON: &str = r#"{
   ]
 }"#;
 
-fn run(reconstruct_envelope: bool) -> String {
+/// Run the pipeline and return the written bytes plus the run counters.
+fn run(reconstruct_envelope: bool) -> (String, clinker_record::PipelineCounters) {
     let yaml = pipeline_yaml(reconstruct_envelope);
     let config = parse_config(&yaml).expect("parse envelope pipeline");
     let plan = config
@@ -114,13 +115,13 @@ fn run(reconstruct_envelope: bool) -> String {
         .expect("run envelope pipeline");
     assert_eq!(report.counters.total_count, 3, "three body records");
     assert_eq!(report.counters.dlq_count, 0);
-    buf.as_string()
+    (buf.as_string(), report.counters)
 }
 
 #[test]
 fn reconstruct_envelope_flag_streams_records_byte_identically() {
-    let baseline = run(false);
-    let with_envelope = run(true);
+    let (baseline, baseline_counters) = run(false);
+    let (with_envelope, envelope_counters) = run(true);
 
     // Sanity: the baseline carried the body rows the punctuation-aware arm
     // must also carry.
@@ -137,4 +138,16 @@ fn reconstruct_envelope_flag_streams_records_byte_identically() {
         with_envelope, baseline,
         "envelope-reconstruction arm must stream records byte-identically while the hooks are no-ops",
     );
+    // Counters must also be invariant under the flag — not just the bytes.
+    assert_eq!(
+        envelope_counters.records_written, baseline_counters.records_written,
+        "records_written must match flag-on vs flag-off",
+    );
+    assert_eq!(
+        envelope_counters.ok_count, baseline_counters.ok_count,
+        "ok_count must match flag-on vs flag-off",
+    );
+    // Three records reached the Output and all three counted.
+    assert_eq!(baseline_counters.records_written, 3);
+    assert_eq!(baseline_counters.ok_count, 3);
 }

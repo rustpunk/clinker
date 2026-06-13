@@ -454,6 +454,14 @@ fn dispatch_output_envelope(
                     Some(build_format_writer(&out_cfg, raw_writer, schema))
                 });
                 drop(_guard);
+                // Count exactly as the records-only arm does: both counters
+                // bump unconditionally per record, independent of whether a
+                // writer is open or even registered. That keeps flag-on (with
+                // no-op hooks) invariant against flag-off — same input yields
+                // the same `records_written` / `ok_count` even on the
+                // no-writer / dry-run path where no byte is emitted.
+                ctx.counters.records_written += 1;
+                ctx.records_emitted += 1;
                 if ctx.ok_source_rows.insert(row_num) {
                     ctx.counters.ok_count += 1;
                 }
@@ -476,8 +484,6 @@ fn dispatch_output_envelope(
         driver.finish();
     }
 
-    ctx.counters.records_written += driver.records_written;
-    ctx.records_emitted += driver.records_written;
     ctx.output_errors.append(&mut driver.errors);
     Ok(())
 }
@@ -499,8 +505,9 @@ type WriterFactory<'a> = dyn FnMut(
 /// never any body records, so the arm's footprint is O(open files), not
 /// O(document size). Free of [`ExecutorContext`] so its depth-loop and
 /// hook-sequencing are unit-testable against a probe writer; the caller
-/// supplies the raw-writer source as a closure and folds the accumulated
-/// counters / errors back into the run context.
+/// supplies the raw-writer source as a closure, counts records (so the
+/// per-record counters stay identical to the records-only arm regardless of
+/// writer state), and folds the accumulated errors back into the run context.
 #[derive(Default)]
 struct EnvelopeWriterDriver {
     writer: Option<Box<dyn clinker_format::FormatWriter>>,
@@ -511,9 +518,6 @@ struct EnvelopeWriterDriver {
     /// Live envelope nesting depth per source file; an entry is removed when
     /// the file's outermost close fires.
     depths: HashMap<Arc<str>, i64>,
-    /// Body records written straight through, folded into the run's
-    /// `records_written` / `records_emitted` counters by the caller.
-    records_written: u64,
     /// Writer-construction / framing / write / flush errors, appended to the
     /// run's error sink by the caller rather than short-circuiting, matching
     /// the records-only Output path.
@@ -582,6 +586,11 @@ impl EnvelopeWriterDriver {
     /// `open_writer` means no writer is registered (a sibling already took
     /// it, or a dry run): the record is dropped, matching the records-only
     /// Output path's behavior when its writer registry slot is empty.
+    ///
+    /// Record counting is the caller's job (it bumps `records_written` /
+    /// `ok_count` unconditionally per record, exactly as the records-only
+    /// arm does), so a dropped record here still counts identically — that
+    /// is what keeps flag-on invariant against flag-off.
     fn on_record(&mut self, projected: &Record, open_writer: &mut WriterFactory<'_>) {
         if self.writer.is_none() {
             match open_writer(Arc::clone(projected.schema())) {
@@ -596,7 +605,6 @@ impl EnvelopeWriterDriver {
                 self.fire_begin(&doc_ctx);
             }
         }
-        self.records_written += 1;
         let writer = self.writer.as_mut().expect("writer opened above");
         if let Err(e) = writer.write_record(projected) {
             self.errors.push(e.into());
@@ -889,11 +897,14 @@ mod tests {
         }
         driver.finish();
         assert!(driver.errors.is_empty(), "probe writer never errors");
-        let written = driver.records_written;
         // Drop the driver (and the probe writer it owns, which holds a clone
         // of `log`) before reclaiming the sole `Arc`.
         drop(driver);
         let log = Arc::try_unwrap(log).unwrap().into_inner().unwrap();
+        // The driver no longer counts records (the dispatch caller does, to
+        // stay aligned with the records-only arm); derive the write count
+        // from the probe log instead.
+        let written = log.iter().filter(|l| l.starts_with("write:")).count() as u64;
         (log, written)
     }
 
@@ -974,6 +985,43 @@ mod tests {
             log,
             vec!["begin:deferred.csv", "write:1", "end:deferred.csv", "flush"],
             "deferred begin fires exactly once, before the first record",
+        );
+    }
+
+    #[test]
+    fn no_writer_slot_drops_records_without_error_and_never_counts() {
+        // The empty-writer-slot path (a dry run, or a sibling Output that
+        // already took the writer): `open_writer` yields `None`. The driver
+        // must drop each record silently — no hook, no write, no error — and
+        // carry no per-record counter of its own, so the dispatch caller's
+        // unconditional `records_written` / `ok_count` increments produce the
+        // exact same counts whether or not a writer materializes. That is what
+        // keeps the `reconstruct_envelope` flag transparent on the no-writer
+        // path: counters match the records-only arm byte-for-byte.
+        let a = doc("dry-run.csv");
+        let events = [
+            Event::Open(Arc::clone(&a)),
+            Event::Record(record(1, &a)),
+            Event::Record(record(2, &a)),
+            Event::Close(Arc::clone(&a)),
+        ];
+        let mut driver = EnvelopeWriterDriver::default();
+        for event in &events {
+            match event {
+                Event::Open(d) => driver.on_document_open(d),
+                Event::Close(d) => driver.on_document_close(d),
+                // No writer is ever registered for this Output.
+                Event::Record(rec) => driver.on_record(rec, &mut |_schema| None),
+            }
+        }
+        driver.finish();
+        assert!(
+            driver.errors.is_empty(),
+            "a missing writer slot is not an error — the records-only arm drops too",
+        );
+        assert!(
+            driver.writer.is_none(),
+            "no writer ever opened, so no framing or write was attempted",
         );
     }
 }
