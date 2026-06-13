@@ -1310,28 +1310,85 @@ mod tests {
         v
     }
 
+    /// Env flag distinguishing the re-exec'd child from the harness-launched
+    /// parent: absent in the parent (which re-execs), set in the child
+    /// (which runs the probe body). Its presence also breaks the otherwise
+    /// infinite re-exec loop.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    const MEMPROBE_ISOLATED_ENV: &str = "CLINKER_MEMPROBE_ISOLATED";
+
+    /// Runs `probe` in a child process where it is the sole test, so its
+    /// before/after memory samples bracket only its own allocation.
+    ///
+    /// The probes read a process-global counter (Windows `PrivateUsage`,
+    /// macOS `phys_footprint`) and assert a direction of change. Under
+    /// `cargo test`'s default multi-threaded harness, sibling test threads
+    /// in the same binary commit and free large buffers between the two
+    /// samples, moving the global figure independently of this probe's own
+    /// allocation and tripping the assertion at random (issue #394).
+    /// `#[serial]` is insufficient: it only orders `#[serial]`-tagged tests,
+    /// leaving every other test in the binary concurrent.
+    ///
+    /// On first entry (parent, env flag absent) this re-execs the test
+    /// binary filtered to `test_path` alone, with the flag set, then asserts
+    /// the child succeeded — surfacing the child's stderr (the real
+    /// assertion text) on failure. On the recursive entry (child, env flag
+    /// present) it runs `probe` and returns, letting libtest report the
+    /// result.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn run_isolated(test_path: &str, probe: impl FnOnce()) {
+        if std::env::var_os(MEMPROBE_ISOLATED_ENV).is_some() {
+            probe();
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test binary path must be readable");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", test_path, "--test-threads=1", "--nocapture"])
+            .env(MEMPROBE_ISOLATED_ENV, "1")
+            .output()
+            .expect("re-exec of the isolated memory probe must spawn");
+
+        assert!(
+            output.status.success(),
+            "isolated memory probe {test_path} failed in child process:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// On macOS, `rss_bytes()` reports `phys_footprint`, which rises when a
     /// large allocation is touched. A delta-threshold assertion would flake
     /// under harness churn (a sibling test thread can free more than this
     /// probe commits between samples), so the direction-of-change check is
     /// `after_alloc >= before` — a touched 64 MiB allocation never lowers
-    /// the footprint. Runs on the macOS CI runner.
+    /// the footprint.
+    ///
+    /// The probe runs in a child process via [`run_isolated`] so the two
+    /// samples bracket only its own allocation: `phys_footprint` is
+    /// process-global, and concurrent test threads freeing memory between
+    /// the samples would otherwise flake the assertion (issue #394). Runs on
+    /// the macOS CI runner.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_phys_footprint_rises_after_touched_alloc() {
-        let before = rss_bytes().expect("phys_footprint must be readable on macOS");
-        assert!(
-            before > 0,
-            "phys_footprint must be positive for a live process"
+        run_isolated(
+            "pipeline::memory::tests::macos_phys_footprint_rises_after_touched_alloc",
+            || {
+                let before = rss_bytes().expect("phys_footprint must be readable on macOS");
+                assert!(
+                    before > 0,
+                    "phys_footprint must be positive for a live process"
+                );
+                let buf = touch_pages(64 * 1024 * 1024);
+                let after_alloc = rss_bytes().expect("phys_footprint must be readable on macOS");
+                assert!(
+                    after_alloc >= before,
+                    "a touched 64 MiB allocation must not lower phys_footprint, \
+                     before={before} after_alloc={after_alloc}"
+                );
+                drop(buf);
+            },
         );
-        let buf = touch_pages(64 * 1024 * 1024);
-        let after_alloc = rss_bytes().expect("phys_footprint must be readable on macOS");
-        assert!(
-            after_alloc >= before,
-            "a touched 64 MiB allocation must not lower phys_footprint, \
-             before={before} after_alloc={after_alloc}"
-        );
-        drop(buf);
     }
 
     /// On Windows, `rss_bytes()` reports `PrivateUsage` (commit charge).
@@ -1341,28 +1398,39 @@ mod tests {
     /// lifetime. The assertion checks `after_alloc >= before` (commit
     /// charge never drops on a fresh touched allocation) and
     /// `after_free <= after_alloc` (releasing committed pages cannot raise
-    /// commit charge). Runs on the Windows CI runner.
+    /// commit charge).
+    ///
+    /// The probe runs in a child process via [`run_isolated`] so the three
+    /// samples bracket only its own allocation and free: `PrivateUsage` is
+    /// process-global, and concurrent test threads committing or freeing
+    /// memory between the samples would otherwise flake the assertions
+    /// (issue #394). Runs on the Windows CI runner.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_private_usage_tracks_commit_charge() {
-        let before = rss_bytes().expect("PrivateUsage must be readable on Windows");
-        assert!(
-            before > 0,
-            "PrivateUsage must be positive for a live process"
-        );
-        let buf = touch_pages(64 * 1024 * 1024);
-        let after_alloc = rss_bytes().expect("PrivateUsage must be readable on Windows");
-        assert!(
-            after_alloc >= before,
-            "a touched 64 MiB private allocation must raise commit charge, \
-             before={before} after_alloc={after_alloc}"
-        );
-        drop(buf);
-        let after_free = rss_bytes().expect("PrivateUsage must be readable on Windows");
-        assert!(
-            after_free <= after_alloc,
-            "freeing committed pages must not raise commit charge, \
-             after_alloc={after_alloc} after_free={after_free}"
+        run_isolated(
+            "pipeline::memory::tests::windows_private_usage_tracks_commit_charge",
+            || {
+                let before = rss_bytes().expect("PrivateUsage must be readable on Windows");
+                assert!(
+                    before > 0,
+                    "PrivateUsage must be positive for a live process"
+                );
+                let buf = touch_pages(64 * 1024 * 1024);
+                let after_alloc = rss_bytes().expect("PrivateUsage must be readable on Windows");
+                assert!(
+                    after_alloc >= before,
+                    "a touched 64 MiB private allocation must raise commit charge, \
+                     before={before} after_alloc={after_alloc}"
+                );
+                drop(buf);
+                let after_free = rss_bytes().expect("PrivateUsage must be readable on Windows");
+                assert!(
+                    after_free <= after_alloc,
+                    "freeing committed pages must not raise commit charge, \
+                     after_alloc={after_alloc} after_free={after_free}"
+                );
+            },
         );
     }
 
