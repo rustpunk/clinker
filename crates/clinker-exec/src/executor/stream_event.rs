@@ -76,6 +76,15 @@ impl Punctuation {
         self.doc_ctx.id()
     }
 
+    /// Source file the marked document belongs to. Every envelope level of
+    /// one file (the file-level document and each nested level) shares the
+    /// same `source_file` Arc, so this identifies the OUTERMOST (file /
+    /// interchange) document a nested-level boundary sits inside — the grain
+    /// the per-document DLQ rejects at.
+    pub fn source_file(&self) -> &Arc<str> {
+        self.doc_ctx.source_file()
+    }
+
     /// What boundary the punctuation marks.
     pub fn kind(&self) -> PunctuationKind {
         self.kind

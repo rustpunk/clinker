@@ -51,6 +51,17 @@ pub(crate) fn dispatch_output(
     if ctx.streaming_output_nodes.contains(&node_idx) {
         return Ok(());
     }
+    // Document-level DLQ short-circuit. When any source declares
+    // `dlq_granularity: document`, this Output's records are decided
+    // per-document: buffered until each `DocumentClose`, then flushed clean
+    // to the writer or rejected (trigger + collateral) to the DLQ. The
+    // driver consumes the INTERLEAVED event stream (records + closes in
+    // order), so this path reads the boundary the records-only `drain_split`
+    // below discards — an additive read of the same buffer, not a change to
+    // the records-vs-puncts split contract every other operator relies on.
+    if ctx.document_dlq.is_some() {
+        return dispatch_output_document_dlq(ctx, current_dag, node_idx, name);
+    }
     // Get input records: check own buffer first (Route
     // nodes store records at the successor's index), then
     // fall back to predecessor buffers.
@@ -285,6 +296,90 @@ pub(crate) fn dispatch_output(
     }
 
     Ok(())
+}
+
+/// Execute the `Output` arm under document-level DLQ. Drains this Output's
+/// input as the INTERLEAVED record + `DocumentClose` event stream and hands
+/// it to a [`crate::executor::document_dlq::DocumentDlqDriver`], which
+/// buffers each record per document and, at each close, flushes the
+/// document clean to the writer or rejects it (trigger + collateral) to the
+/// DLQ. Blocking at the document grain — a buffered record is not written
+/// until its close decides the document clean; peak memory is the
+/// concurrently-open documents, spillable under budget.
+fn dispatch_output_document_dlq(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+) -> Result<(), PipelineError> {
+    let events = drain_output_input_events(ctx, current_dag, node_idx)?;
+
+    if let Some(expected) = current_dag.graph[node_idx]
+        .expected_input_schema_in(current_dag)
+        .cloned()
+    {
+        let upstream_name = current_dag
+            .graph
+            .neighbors_directed(node_idx, Direction::Incoming)
+            .next()
+            .map(|i| current_dag.graph[i].name().to_string())
+            .unwrap_or_default();
+        for event in &events {
+            if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
+                check_input_schema(&expected, record.schema(), name, "output", &upstream_name)?;
+            }
+        }
+    }
+
+    let out_cfg = ctx
+        .output_configs
+        .iter()
+        .find(|o| o.name == *name)
+        .unwrap_or(ctx.primary_output);
+    let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
+    let driver =
+        crate::executor::document_dlq::DocumentDlqDriver::new(ctx, name, out_cfg, cxl_emit_names);
+    driver.run(ctx, events)
+}
+
+/// Drain this Output's input buffer as the INTERLEAVED `StreamEvent`
+/// stream, preserving record/`DocumentClose` ordering — the boundary the
+/// records-only `drain_split` path discards. Mirrors the predecessor-
+/// selection logic of the per-record path (own slot first, then the last-
+/// consumer predecessor drain, then a memory clone for multi-consumer
+/// fan-out), reading events rather than records so the document-DLQ driver
+/// can act on each close. Multi-consumer fan-out slots are never spilled
+/// (`node_buffer_spill_allowed` returns false for them), so the
+/// `clone_memory_only` branch never reaches a spilled buffer here.
+fn drain_output_input_events(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+) -> Result<Vec<crate::executor::stream_event::StreamEvent>, PipelineError> {
+    use crate::executor::stream_event::StreamEvent;
+
+    if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
+        return own_buf.drain().collect();
+    }
+    let predecessors: Vec<NodeIndex> = current_dag
+        .graph
+        .neighbors_directed(node_idx, Direction::Incoming)
+        .collect();
+    for p in predecessors {
+        let remaining_consumers = current_dag
+            .graph
+            .neighbors_directed(p, Direction::Outgoing)
+            .filter(|&succ| succ > node_idx)
+            .count();
+        if remaining_consumers == 0 {
+            if let Some(nb) = drain_node_buffer_slot(ctx, p) {
+                return nb.drain().collect();
+            }
+        } else if let Some(cloned) = ctx.node_buffers.get(&p).map(|nb| nb.clone_memory_only()) {
+            return Ok(cloned);
+        }
+    }
+    Ok(Vec::<StreamEvent>::new())
 }
 
 /// The Output node's resolved write target plus the run-scoped writer

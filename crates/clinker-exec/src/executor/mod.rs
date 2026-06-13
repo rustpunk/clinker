@@ -10,6 +10,7 @@ mod context;
 pub(crate) mod correlation_dispatch;
 pub(crate) mod dispatch;
 mod dlq;
+pub(crate) mod document_dlq;
 mod ingest;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
@@ -1162,6 +1163,28 @@ impl PipelineExecutor {
                 (None, 0)
             };
 
+        // Document-level DLQ state. `Some(..)` iff at least one source
+        // declares `dlq_granularity: document`; the set carries those
+        // sources' names so a record's policy is resolved from its
+        // engine-stamped `$source.name` at the Output / error site. Like
+        // correlation buffering, it disables the streaming fast-paths
+        // pipeline-wide (the per-document Output buffer needs the
+        // materialized `DocumentClose` punctuation the streaming
+        // short-circuits would consume out of band).
+        let any_document_dlq = config.any_source_has_document_dlq();
+        let document_dlq = if any_document_dlq {
+            let doc_sources: HashSet<Arc<str>> = source_configs
+                .iter()
+                .filter(|s| s.dlq_granularity == clinker_plan::config::DlqGranularity::Document)
+                .map(|s| Arc::from(s.name.as_str()))
+                .collect();
+            Some(crate::executor::document_dlq::DocumentDlqState::new(
+                doc_sources,
+            ))
+        } else {
+            None
+        };
+
         // Pre-seed each declared source's slot at `None` so the Source
         // dispatch arm can flip to `Some(n)` at receiver close.
         // [`MERGED_SOURCE_NAME`] gets its own slot; populated when
@@ -1219,7 +1242,7 @@ impl PipelineExecutor {
         let streaming_aggregate_ingest_edges: HashMap<
             petgraph::graph::NodeIndex,
             petgraph::graph::NodeIndex,
-        > = if config.any_source_has_correlation_key() {
+        > = if config.any_source_has_correlation_key() || any_document_dlq {
             HashMap::new()
         } else {
             clinker_plan::plan::execution::compute_streaming_aggregate_ingest_edges(
@@ -1241,7 +1264,7 @@ impl PipelineExecutor {
         let streaming_combine_probe_edges: HashMap<
             petgraph::graph::NodeIndex,
             petgraph::graph::NodeIndex,
-        > = if config.any_source_has_correlation_key() {
+        > = if config.any_source_has_correlation_key() || any_document_dlq {
             HashMap::new()
         } else {
             clinker_plan::plan::execution::compute_streaming_combine_probe_edges(
@@ -1398,6 +1421,7 @@ impl PipelineExecutor {
             memory_budget,
             correlation_buffers,
             correlation_max_group_buffer,
+            document_dlq,
             relaxed_aggregator_states: HashMap::new(),
             relaxed_aggregator_degrade: Vec::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
@@ -1541,10 +1565,21 @@ impl PipelineExecutor {
         // a failure, so swallow it here (the interruption is recorded in
         // `ctx.interrupted` and surfaced through the report) and let the
         // run finish draining. Every other walk error still propagates.
-        match walk_result {
-            Ok(()) => {}
-            Err(PipelineError::Interrupted) => {}
+        let walk_completed = match walk_result {
+            Ok(()) => true,
+            Err(PipelineError::Interrupted) => false,
             Err(other) => return Err(other),
+        };
+
+        // Document-level DLQ terminal sweep. The walk's Output arms already
+        // flushed-or-rejected every document whose close arrived or whose
+        // records reached an Output; this rejects the residue — documents
+        // marked failed upstream whose close was lost AND whose records were
+        // all suppressed before any Output — emitting their trigger entry
+        // once each. Skipped on an interrupted run, which is a graceful stop
+        // rather than a completed drain.
+        if walk_completed {
+            crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx)?;
         }
 
         // Top-scope teardown: the run has drained, so unregister every

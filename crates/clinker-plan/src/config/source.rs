@@ -70,6 +70,18 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<clinker_format::EnvelopeConfig>,
 
+    /// Granularity at which a record failure dead-letters under the
+    /// `continue` / `best_effort` error strategies: `record` (the default)
+    /// DLQs only the failing record and streams its siblings, while
+    /// `document` dead-letters the entire document any record of which
+    /// fails. Per-source because only a document-aware source carries an
+    /// envelope and document boundaries (see `envelope` above), so the
+    /// knob lives next to that declaration. A genuinely-optional new field
+    /// — `#[serde(default)]` selects `record` when omitted, preserving
+    /// every existing pipeline's behavior.
+    #[serde(default)]
+    pub dlq_granularity: DlqGranularity,
+
     /// `$doc.<section>.<field>` envelope paths a program downstream of
     /// THIS source actually references, collected at compile time by
     /// `cxl::analyzer::doc_paths` and attributed per source: a path lands
@@ -114,6 +126,32 @@ pub struct SourceConfig {
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// Per-source dead-letter granularity under `continue` / `best_effort`.
+///
+/// Selects whether a record failure dead-letters just the failing record
+/// or the whole document it belongs to. Has no effect under `fail_fast`,
+/// where the first failure aborts the run regardless. A pure policy enum —
+/// it carries no state and imposes no memory cost itself; the runtime cost
+/// of `Document` is the per-document record buffer the executor holds open
+/// only for currently-open documents (peak = concurrently-open documents,
+/// not total input), which spills to disk under memory pressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DlqGranularity {
+    /// Dead-letter only the failing record; its document's other records
+    /// stream through unaffected. The default — every pre-existing pipeline
+    /// behaves this way.
+    #[default]
+    Record,
+    /// Dead-letter the entire document any record of which fails. The
+    /// failing record becomes the root-cause DLQ entry (`trigger: true`,
+    /// original category); every sibling becomes a collateral entry
+    /// (`trigger: false`, `DocumentRejected` category). Each entry counts
+    /// toward the DLQ rate, so a rejected N-record document contributes N
+    /// to the rate denominator.
+    Document,
 }
 
 /// Event-time watermark declaration on a `SourceConfig`.

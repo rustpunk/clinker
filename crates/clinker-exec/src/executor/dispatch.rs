@@ -386,9 +386,27 @@ pub(crate) fn dispatch_transform_eval_error(
     if routed {
         return Ok(());
     }
-    let source_name = source_name_arc_of(&record);
     let triggering_field = eval_err.triggering_field.clone();
     let triggering_value = eval_err.triggering_value();
+    // Under `dlq_granularity: document`, a failure here condemns the whole
+    // document: mark it failed (capturing this record as the root cause)
+    // instead of dead-lettering only the failing record. The Output arm
+    // emits the trigger + collateral entries at the document's close.
+    let marked = crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
+        ctx,
+        &record,
+        row_num,
+        category,
+        eval_err.to_string(),
+        stage.clone(),
+        None,
+        triggering_field.clone(),
+        triggering_value.clone(),
+    );
+    if marked {
+        return Ok(());
+    }
+    let source_name = source_name_arc_of(&record);
     push_dlq(
         ctx,
         DlqEntry {
@@ -762,6 +780,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// buffering is disabled. Read by the Output arm before admitting
     /// a record into the buffer to detect overflow at admission time.
     pub(crate) correlation_max_group_buffer: u64,
+
+    /// Run-scoped document-level DLQ state. `Some` iff at least one source
+    /// declares `dlq_granularity: document` — the Output arm then drives a
+    /// per-document buffer (flush clean / reject dirty at each
+    /// `DocumentClose`, peak = concurrently-open documents, spillable under
+    /// budget), and upstream Transform / Route failures mark the failing
+    /// record's document here instead of pushing a per-record DLQ entry.
+    /// `None` otherwise; every record streams through per-record DLQ
+    /// semantics with zero overhead.
+    pub(crate) document_dlq: Option<crate::executor::document_dlq::DocumentDlqState>,
 
     /// Per-aggregate retained state for nodes whose `group_by` omits a
     /// correlation-key field. Populated by the Aggregate dispatch arm
