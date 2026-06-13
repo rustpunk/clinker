@@ -25,6 +25,49 @@ use crate::projection::project_output_from_record;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// Resolve the [`OutputConfig`](clinker_plan::config::OutputConfig) for the
+/// Output named `name`, falling back to the pipeline's primary output when no
+/// per-name entry exists. Borrows `ctx` immutably, so the caller resolves it
+/// before taking any `&mut ctx`.
+fn resolve_out_cfg<'a>(
+    ctx: &'a ExecutorContext<'_>,
+    name: &str,
+) -> &'a clinker_plan::config::OutputConfig {
+    ctx.output_configs
+        .iter()
+        .find(|o| o.name == *name)
+        .unwrap_or(ctx.primary_output)
+}
+
+/// The per-Output input-binding values all three Output dispatch arms derive
+/// from the plan before writing: the expected input schema (for the
+/// schema-check), the upstream node name (for E314 diagnostics), and the CXL
+/// emit names (for `include_unmapped: false` projection). Owned so the caller
+/// can hold them across the `&mut ctx` write phase.
+struct OutputInputs {
+    expected_input_schema: Option<Arc<clinker_record::Schema>>,
+    upstream_name: String,
+    cxl_emit_names: Vec<String>,
+}
+
+/// Derive the [`OutputInputs`] for `node_idx` from the plan. Shared by the
+/// records-only, document-DLQ, and envelope Output arms so the input-binding
+/// preamble lives in one place.
+fn resolve_output_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) -> OutputInputs {
+    OutputInputs {
+        expected_input_schema: current_dag.graph[node_idx]
+            .expected_input_schema_in(current_dag)
+            .cloned(),
+        upstream_name: current_dag
+            .graph
+            .neighbors_directed(node_idx, Direction::Incoming)
+            .next()
+            .map(|i| current_dag.graph[i].name().to_string())
+            .unwrap_or_default(),
+        cxl_emit_names: current_dag.graph[node_idx].cxl_emit_names_in(current_dag),
+    }
+}
+
 /// Execute the `Output` arm for `node_idx`: open the writer(s), map records
 /// onto the declared output schema (passing unmapped fields through when
 /// configured), and write — taking the per-record fan-out path for
@@ -70,13 +113,7 @@ pub(crate) fn dispatch_output(
     // records-only path's boundary-blind write loop. It buffers nothing: each
     // body record streams straight through `write_record` between the header
     // and footer, so a 1 GiB document flows at O(1-record).
-    if ctx
-        .output_configs
-        .iter()
-        .find(|o| o.name == *name)
-        .unwrap_or(ctx.primary_output)
-        .reconstruct_envelope
-    {
+    if resolve_out_cfg(ctx, name).reconstruct_envelope {
         return dispatch_output_envelope(ctx, current_dag, node_idx, name);
     }
     // Get input records: check own buffer first (Route
@@ -146,18 +183,14 @@ pub(crate) fn dispatch_output(
             found.unwrap_or_default()
         };
 
-    if let Some(expected) = current_dag.graph[node_idx]
-        .expected_input_schema_in(current_dag)
-        .cloned()
-    {
-        let upstream_name = current_dag
-            .graph
-            .neighbors_directed(node_idx, Direction::Incoming)
-            .next()
-            .map(|i| current_dag.graph[i].name().to_string())
-            .unwrap_or_default();
+    let OutputInputs {
+        expected_input_schema,
+        upstream_name,
+        cxl_emit_names,
+    } = resolve_output_inputs(current_dag, node_idx);
+    if let Some(expected) = expected_input_schema.as_ref() {
         for (record, _) in &input_records {
-            check_input_schema(&expected, record.schema(), name, "output", &upstream_name)?;
+            check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
         }
     }
 
@@ -223,16 +256,20 @@ pub(crate) fn dispatch_output(
     // reaching the writer, not every intermediate node
     // transition (Invariant 3).
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
+    // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
+    // `output_configs` / `primary_output`: this arm interleaves `out_cfg`'s
+    // borrow with `&mut ctx` on other fields (correlation buffers, writers,
+    // timers), which disjoint sub-field borrows permit but a whole-`ctx`
+    // helper borrow would not.
     let out_cfg = ctx
         .output_configs
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output);
 
-    // Compute the upstream node's CXL emit names once.
-    // `include_unmapped: false` consults this to drop upstream
-    // passthroughs the user did not explicitly emit.
-    let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
+    // `include_unmapped: false` consults the upstream CXL emit names (resolved
+    // in the preamble above) to drop upstream passthroughs the user did not
+    // explicitly emit.
     let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
         None
     } else {
@@ -331,29 +368,28 @@ fn dispatch_output_document_dlq(
 ) -> Result<(), PipelineError> {
     let events = drain_output_input_events(ctx, current_dag, node_idx)?;
 
-    if let Some(expected) = current_dag.graph[node_idx]
-        .expected_input_schema_in(current_dag)
-        .cloned()
-    {
-        let upstream_name = current_dag
-            .graph
-            .neighbors_directed(node_idx, Direction::Incoming)
-            .next()
-            .map(|i| current_dag.graph[i].name().to_string())
-            .unwrap_or_default();
+    let OutputInputs {
+        expected_input_schema,
+        upstream_name,
+        cxl_emit_names,
+    } = resolve_output_inputs(current_dag, node_idx);
+    if let Some(expected) = expected_input_schema.as_ref() {
         for event in &events {
             if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
-                check_input_schema(&expected, record.schema(), name, "output", &upstream_name)?;
+                check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
             }
         }
     }
 
+    // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
+    // `output_configs` / `primary_output`: the driver holds `out_cfg` across
+    // `run`, which takes `&mut ctx` — a whole-`ctx` helper borrow would
+    // conflict, but disjoint sub-field borrows coexist.
     let out_cfg = ctx
         .output_configs
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output);
-    let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
     let driver =
         crate::executor::document_dlq::DocumentDlqDriver::new(ctx, name, out_cfg, cxl_emit_names);
     driver.run(ctx, events)
@@ -385,15 +421,21 @@ fn drain_output_input_events(
 /// change in the record's `doc_ctx().source_file()` between consecutive
 /// records. Punctuations cannot drive this — the executor's buffers
 /// tail-clump all `DocumentClose` events after all records, so an
-/// interleaved boundary stream never reaches a terminal Output. Keying on
-/// `source_file` (rather than the raw `DocumentId`) makes nested-envelope
-/// levels — which mint fresh ids via `DocumentContext::child` but share the
-/// file's `source_file` Arc — frame at the OUTERMOST (file) grain.
+/// interleaved boundary stream never reaches a terminal Output.
+///
+/// The grain is FILE-LEVEL: boundaries key on `source_file`, so nested
+/// envelope levels (which mint fresh ids via `DocumentContext::child` but
+/// share the file's `source_file` Arc) frame as one document, and a file
+/// holding several messages (HL7 batch, EDIFACT/X12 interchange) frames as
+/// one document rather than one per message. With the writer hooks defaulting
+/// to no-ops this is byte-identical to today; per-message framing for
+/// multi-message formats is resolved when the format writers render the
+/// envelope (tracked at <https://github.com/rustpunk/clinker/issues/194>).
 ///
 /// Bounded-memory: this path buffers no records. It holds only the current
-/// document's `source_file` / context, so a multi-gigabyte document streams
-/// at O(1-record). The input drain is itself lazy — a spilled predecessor
-/// buffer streams from disk one record at a time rather than materializing.
+/// document's context, so a multi-gigabyte document streams at O(1-record).
+/// The input drain is itself lazy — a spilled predecessor buffer streams from
+/// disk one record at a time rather than materializing.
 ///
 /// Records with a non-concrete source file (the `<merged>` sentinel or an
 /// empty stamp — an in-pipeline synthesis or fan-in row that belongs to no
@@ -403,7 +445,10 @@ fn drain_output_input_events(
 /// # Errors
 ///
 /// Surfaces input-drain (spill-read), schema-check, writer-construction,
-/// `write_record`, framing, and flush errors as a [`PipelineError`].
+/// `write_record`, framing, and flush errors as a [`PipelineError`]. A
+/// schema-check failure fails fast like the sibling arms, but first surfaces
+/// any already-accumulated framing/write errors and flushes the open document
+/// so nothing in flight is lost.
 fn dispatch_output_envelope(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -412,22 +457,15 @@ fn dispatch_output_envelope(
 ) -> Result<(), PipelineError> {
     use crate::executor::stream_event::StreamEvent;
 
-    let expected_input_schema = current_dag.graph[node_idx]
-        .expected_input_schema_in(current_dag)
-        .cloned();
-    let upstream_name = current_dag
-        .graph
-        .neighbors_directed(node_idx, Direction::Incoming)
-        .next()
-        .map(|i| current_dag.graph[i].name().to_string())
-        .unwrap_or_default();
-    let out_cfg = ctx
-        .output_configs
-        .iter()
-        .find(|o| o.name == *name)
-        .unwrap_or(ctx.primary_output)
-        .clone();
-    let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
+    let OutputInputs {
+        expected_input_schema,
+        upstream_name,
+        cxl_emit_names,
+    } = resolve_output_inputs(current_dag, node_idx);
+    // Owned clone: the writer-factory closure and the projection both borrow
+    // `out_cfg` across the loop's `&mut ctx` phases, so it cannot stay a
+    // borrow of `ctx.output_configs`.
+    let out_cfg = resolve_out_cfg(ctx, name).clone();
     let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
         None
     } else {
@@ -442,10 +480,6 @@ fn dispatch_output_envelope(
     let events = drain_output_input_event_iter(ctx, current_dag, node_idx);
     let mut driver = EnvelopeWriterDriver::default();
 
-    // Schema-check errors join the driver's error sink (rather than `?`-ing
-    // out mid-loop, which would discard already-collected errors and skip the
-    // final flush), matching the records-only arm's collect-don't-discard
-    // error posture.
     for event in events {
         // Boundaries come from records, so punctuations are irrelevant here —
         // drop them exactly as the records-only `drain_split` path does.
@@ -457,8 +491,15 @@ fn dispatch_output_envelope(
             && let Err(e) =
                 check_input_schema(expected, record.schema(), name, "output", &upstream_name)
         {
-            driver.errors.push(e);
-            continue;
+            // Fail fast like the records-only / DLQ arms, but first close the
+            // open document and surface any framing/write errors accumulated
+            // so far — the in-flight footer and prior errors are not lost.
+            {
+                let _guard = ctx.write_timer.guard();
+                driver.finish();
+            }
+            ctx.output_errors.append(&mut driver.errors);
+            return Err(e);
         }
         let projected = {
             let _guard = ctx.projection_timer.guard();
@@ -581,15 +622,24 @@ impl EnvelopeWriterDriver {
     /// differs from the currently-open one. A non-concrete source file
     /// belongs to no document, so it neither closes the open document nor
     /// opens one — it streams through inside whatever framing is current.
+    ///
+    /// The same-document test is `Arc::ptr_eq` first (every record of a
+    /// document shares the document's `source_file` Arc — the ingest stamps it
+    /// once and `DocumentContext::child` clones the same Arc — so pointer
+    /// identity settles the common case without an O(path-length) string
+    /// compare on this per-record hot path), with a string-equality fallback
+    /// for the one case ptr identity does not survive: a document whose
+    /// records span two spill chunks of the input buffer, where each chunk's
+    /// `SpillReader` rebuilds a fresh (equal-valued) `source_file` Arc. Without
+    /// the fallback that document would be spuriously split mid-stream.
     fn maybe_cross_boundary(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
         let file = doc_ctx.source_file();
         if !crate::executor::document_dlq::is_concrete_file(file) {
             return;
         }
-        let same_doc = self
-            .open_doc
-            .as_ref()
-            .is_some_and(|open| open.source_file().as_ref() == file.as_ref());
+        let same_doc = self.open_doc.as_ref().is_some_and(|open| {
+            Arc::ptr_eq(open.source_file(), file) || open.source_file().as_ref() == file.as_ref()
+        });
         if same_doc {
             return;
         }
@@ -977,6 +1027,36 @@ mod tests {
                 "flush"
             ],
             "the last open document is closed at finish()",
+        );
+    }
+
+    #[test]
+    fn equal_but_distinct_source_file_arcs_do_not_split_a_document() {
+        // A document whose records span two input spill chunks carries a fresh
+        // (equal-valued) `source_file` Arc per chunk, because each chunk's
+        // `SpillReader` rebuilds the interning table. Pure `Arc::ptr_eq` would
+        // see two pointers and spuriously close + reopen the document
+        // mid-stream; the string-equality fallback keeps it framed as one.
+        // `doc()` mints a fresh Arc each call, so two `doc("split.csv")` model
+        // the cross-chunk rebuild.
+        let chunk1 = doc("split.csv");
+        let chunk2 = doc("split.csv");
+        assert!(
+            !Arc::ptr_eq(chunk1.source_file(), chunk2.source_file()),
+            "the two contexts must hold distinct (equal-valued) Arcs to model the split",
+        );
+        let records = vec![record(1, &chunk1), record(2, &chunk2)];
+        let (log, _written) = run_log(&records);
+        assert_eq!(
+            log,
+            vec![
+                "begin:split.csv",
+                "write:1",
+                "write:2",
+                "end:split.csv",
+                "flush"
+            ],
+            "a document split across spill chunks frames once, not once per chunk",
         );
     }
 

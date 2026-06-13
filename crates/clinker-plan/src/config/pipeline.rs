@@ -3157,10 +3157,16 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     //    own commit terminal, which the envelope arm bypasses — dirty groups
     //    would leak into the framed output and inflate `ok_count`.
     if config.any_output_reconstructs_envelope() {
+        // Source-level conflicts are pipeline-wide (any envelope Output is
+        // incompatible with them), so resolve them once. The per-output loop
+        // below names the offending output directly — no re-derivation.
+        let has_document_dlq = config.any_source_has_document_dlq();
+        let has_correlation_key = config.any_source_has_correlation_key();
         for output in config.output_configs() {
             if !output.reconstruct_envelope {
                 continue;
             }
+            let out = &output.name;
             let per_file_fanout = output.split.is_some()
                 || crate::config::path_template::PathTemplate::parse(&output.path)
                     .map(|t| t.has_per_record_tokens())
@@ -3174,38 +3180,27 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                      which is incompatible with routing each record to a file-keyed \
                      writer. Use a single output path without `split:`, or drop \
                      `reconstruct_envelope`",
-                    out = output.name,
                 )));
             }
-        }
-        if config.any_source_has_document_dlq() {
-            let out = config
-                .output_configs()
-                .find(|o| o.reconstruct_envelope)
-                .map(|o| o.name.as_str())
-                .unwrap_or("");
-            return Err(ConfigError::Validation(format!(
-                "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
-                 source declaring `dlq_granularity: document` — document-level \
-                 dead-lettering routes the Output through its own per-document buffer, \
-                 which takes precedence over envelope framing and silently leaves the \
-                 header/footer unwritten. Use `dlq_granularity: record`, or drop \
-                 `reconstruct_envelope`"
-            )));
-        }
-        if config.any_source_has_correlation_key() {
-            let out = config
-                .output_configs()
-                .find(|o| o.reconstruct_envelope)
-                .map(|o| o.name.as_str())
-                .unwrap_or("");
-            return Err(ConfigError::Validation(format!(
-                "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
-                 source declaring `correlation_key` — correlation buffering owns the \
-                 writes through its own commit stage, which envelope framing bypasses, so \
-                 dirty correlation groups would leak into the framed output and inflate \
-                 the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`"
-            )));
+            if has_document_dlq {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                     source declaring `dlq_granularity: document` — document-level \
+                     dead-lettering routes the Output through its own per-document buffer, \
+                     which takes precedence over envelope framing and silently leaves the \
+                     header/footer unwritten. Use `dlq_granularity: record`, or drop \
+                     `reconstruct_envelope`"
+                )));
+            }
+            if has_correlation_key {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                     source declaring `correlation_key` — correlation buffering owns the \
+                     writes through its own commit stage, which envelope framing bypasses, so \
+                     dirty correlation groups would leak into the framed output and inflate \
+                     the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`"
+                )));
+            }
         }
     }
 
