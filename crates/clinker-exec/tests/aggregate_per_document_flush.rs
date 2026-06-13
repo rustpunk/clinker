@@ -243,6 +243,150 @@ fn spilling_strategy_flushes_per_document_across_boundary() {
     }
 }
 
+/// Per-document identity must survive an UPSTREAM record spill, not just the
+/// Aggregate's own accumulator spill. A multi-document CSV source fans out
+/// through a Route whose materialized branch `node_buffers` spill records to
+/// disk under a 1 MiB budget (the RSS-soft predicate from
+/// `route_fanout_soft_spill.rs`), then those re-hydrated records feed a
+/// per-document `count(*)` Aggregate. If the document context were lost on
+/// the record-half spill round-trip, every post-spill record would re-hydrate
+/// to the SYNTHETIC document and the per-document flush would fold all
+/// documents into a single cross-document group set. The per-document counts
+/// holding across the spill is the end-to-end proof that `doc_ctx` survived.
+const UPSTREAM_SPILL_YAML: &str = r#"
+pipeline:
+  name: per_doc_upstream_spill
+  memory: { limit: "1M", backpressure: spill }
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - { name: category, type: string }
+        - { name: payload, type: string }
+  - type: route
+    name: split
+    input: events
+    config:
+      mode: exclusive
+      conditions:
+        keep: "true"
+      default: drop
+  - type: aggregate
+    name: by_category
+    input: split.keep
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+#[test]
+fn per_document_identity_survives_upstream_record_spill() {
+    // RSS-based spill predicate: with no RSS reading the upstream node_buffer
+    // never spills, so the record-half round-trip under test never fires.
+    // Skip rather than assert a false negative.
+    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
+        return;
+    }
+
+    // Two documents (one CSV file each). Document A: category x×400, y×200.
+    // Document B: category x×300. A wide `payload` column inflates per-row
+    // node_buffer charge so the Route branch slot crosses the RSS soft floor
+    // and spills its records through the inter-stage SpillWriter.
+    let wide = "p".repeat(64);
+    let mut doc_a = String::from("category,payload\n");
+    for _ in 0..400 {
+        doc_a.push_str(&format!("x,{wide}\n"));
+    }
+    for _ in 0..200 {
+        doc_a.push_str(&format!("y,{wide}\n"));
+    }
+    let mut doc_b = String::from("category,payload\n");
+    for _ in 0..300 {
+        doc_b.push_str(&format!("x,{wide}\n"));
+    }
+
+    let config = parse_config(UPSTREAM_SPILL_YAML).expect("parse upstream-spill pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile upstream-spill pipeline");
+
+    let slots = vec![
+        FileSlot::new(
+            PathBuf::from("a.csv"),
+            Box::new(Cursor::new(doc_a.into_bytes())),
+        ),
+        FileSlot::new(
+            PathBuf::from("b.csv"),
+            Box::new(Cursor::new(doc_b.into_bytes())),
+        ),
+    ];
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "events".to_string(),
+        clinker_exec::executor::SourceInput::Files(slots),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "e".to_string(),
+        batch_id: "b".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("run upstream-spill pipeline");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
+
+    // Fail loudly if the run stopped spilling — the test's whole point is to
+    // exercise the upstream record-spill round-trip, so a zero here means the
+    // assertion below would pass vacuously.
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "upstream node_buffer must have spilled records under the 1 MiB budget; \
+         cumulative_spill_bytes = {}",
+        report.cumulative_spill_bytes,
+    );
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    // Per-document flush: document A keeps x=400, y=200; document B keeps a
+    // SEPARATE x=300 — never a folded x=700 that a SYNTHETIC collapse would
+    // produce.
+    assert_eq!(
+        body,
+        vec![
+            "x,300".to_string(),
+            "x,400".to_string(),
+            "y,200".to_string()
+        ],
+        "each document's counts must stay attributed across the upstream record \
+         spill (x=400,y=200 for doc A; x=300 for doc B), with no cross-document \
+         fold into a synthetic document",
+    );
+}
+
 /// A fused `Source → Transform` feeding a strict hash Aggregate is
 /// certified for the streaming-ingest substrate: the aggregate drives
 /// `add_record` off a bounded channel rather than draining a charged

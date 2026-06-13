@@ -4,12 +4,26 @@
 //!
 //! ```text
 //! [tag:  format byte — 0x00 uncompressed, 0x01 LZ4 frame]
-//! [body: a stream of records, each prefixed by a 4-byte LE length and
-//!        encoded as a postcard-serialized `Record` (RecordPayload shape);
-//!        raw when the tag is 0x00, inside an LZ4 frame when 0x01]
+//! [body: a stream of frames, each prefixed by a 4-byte LE length covering a
+//!        1-byte discriminator plus the frame body; raw when the tag is 0x00,
+//!        inside an LZ4 frame when 0x01:
+//!          0x00 record pair  — postcard `RecordPayload`
+//!          0x01 context intern — postcard `DocumentContext`]
 //! [footer: magic u32 LE | version u16 LE | hash_bits u8 |
 //!          partition_id u16 LE | record_count u64 LE]
 //! ```
+//!
+//! Document envelope context is interned per file, mirroring the inter-stage
+//! [`SpillWriter`](crate::pipeline::spill::SpillWriter): the first record
+//! carrying a non-synthetic [`DocumentId`] is preceded by a one-time context
+//! frame, and every record frame carries only its `doc_id`. On read a
+//! `HashMap<DocumentId, Arc<DocumentContext>>` is built incrementally and each
+//! record clones the shared `Arc` — `O(distinct documents)` context frames and
+//! one `Arc` per document on reload, never per record. The synthetic document
+//! is never interned; a synthetic `doc_id` resolves to the process-wide
+//! synthetic singleton, and a non-synthetic `doc_id` with no interned context
+//! is a corrupt-file error. `record_count` in the footer counts record frames
+//! only — context frames are not records.
 //!
 //! The leading format tag records the workspace `[storage.spill] compress`
 //! decision (see [`clinker_plan::config::CompressMode`]) so the reader
@@ -27,9 +41,12 @@
 //!
 //! Reader path validates the footer magic and version, then opens a
 //! decode stream over the body (matching the format tag) and yields
-//! records via postcard. A 64MB per-record byte budget bounds reader
-//! allocations against malformed input.
+//! records via postcard. A per-frame byte cap
+//! ([`SPILL_MAX_FRAME_BYTES`](crate::pipeline::spill::SPILL_MAX_FRAME_BYTES),
+//! shared with the inter-stage spill reader) bounds reader allocations
+//! against a malformed length prefix on either frame kind.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,9 +54,12 @@ use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 
+use crate::pipeline::spill::SPILL_MAX_FRAME_BYTES;
 use clinker_plan::SpillError;
 use clinker_plan::error::PipelineError;
-use clinker_record::{Record, RecordPayload, Schema};
+use clinker_record::{
+    DocumentContext, DocumentId, Record, RecordPayload, Schema, synthetic_document_context,
+};
 
 /// On-disk format tag for an uncompressed grace spill body: the postcard
 /// record stream is written raw, with no LZ4 frame.
@@ -48,6 +68,14 @@ const FORMAT_TAG_UNCOMPRESSED: u8 = 0x00;
 const FORMAT_TAG_LZ4: u8 = 0x01;
 /// Byte length of the leading format tag.
 const TAG_SIZE: u64 = 1;
+
+/// Frame discriminator for a record pair: the body is a postcard
+/// [`RecordPayload`].
+const FRAME_RECORD_PAIR: u8 = 0x00;
+/// Frame discriminator for a document-context intern: the body is a postcard
+/// [`DocumentContext`], emitted on the first sight of a non-synthetic
+/// [`DocumentId`].
+const FRAME_CONTEXT_INTERN: u8 = 0x01;
 
 /// Record-stream sink for a grace spill body: either a raw buffered file
 /// writer (uncompressed) or an LZ4 frame encoder wrapping one. Mirrors the
@@ -186,13 +214,11 @@ pub(crate) fn grace_spill_error(e: GraceSpillError, node: &str, detail: &str) ->
 /// no string handling.
 pub(crate) const GRACE_SPILL_MAGIC: u32 = 0x434C_4B47;
 
-/// Format revision. Bump when the on-disk layout changes incompatibly.
-pub(crate) const GRACE_SPILL_VERSION: u16 = 1;
-
-/// Maximum single-record postcard byte length the reader will allocate
-/// for. Larger length prefixes are treated as corruption and surfaced as
-/// `io::Error` rather than driving a runaway allocation.
-pub(crate) const GRACE_SPILL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// Format revision. Bump when the on-disk layout changes incompatibly. The
+/// body now carries discriminator-tagged frames (record pair vs context
+/// intern) and per-document context interning, which the prior format did
+/// not, so a reader must reject the older layout outright.
+pub(crate) const GRACE_SPILL_VERSION: u16 = 2;
 
 /// Footer byte size: 4 (magic) + 2 (version) + 1 (hash_bits) +
 /// 2 (partition_id) + 8 (record_count) = 17 bytes.
@@ -215,16 +241,27 @@ pub(crate) struct SpillHeader {
 ///
 /// Owns a body sink — a raw buffered file writer or an LZ4 frame encoder
 /// over one, chosen from the resolved compression decision and recorded in
-/// the leading format tag. `write_record` postcard-encodes the record and
-/// emits a length-prefixed body chunk. `finish` finalizes the body, appends
-/// the raw footer, and returns the file path; the caller takes ownership of
-/// cleanup via the surrounding `tempfile::TempDir`.
+/// the leading format tag. `write_record` interns each new document's
+/// context once, then postcard-encodes the record and emits a
+/// discriminator-tagged, length-prefixed body frame. `finish` finalizes the
+/// body, appends the raw footer, and returns the file path; the caller takes
+/// ownership of cleanup via the surrounding `tempfile::TempDir`.
+///
+/// Memory model: streaming — frames are flushed one at a time. The only
+/// retained state is `seen_docs`, an `O(distinct documents)` set bounding
+/// context interning to one frame per document.
 pub(crate) struct GraceSpillWriter {
     sink: GraceSpillSink,
     path: PathBuf,
     hash_bits: u8,
     partition_id: u16,
+    /// Counts record-pair frames only; context-intern frames are not
+    /// records and are excluded from the footer's `record_count`.
     record_count: u64,
+    /// Documents already interned in this partition file, so each
+    /// non-synthetic [`DocumentId`] emits exactly one context frame
+    /// (`O(distinct documents)`), never one per record.
+    seen_docs: HashSet<DocumentId>,
 }
 
 impl GraceSpillWriter {
@@ -309,28 +346,49 @@ impl GraceSpillWriter {
             hash_bits,
             partition_id,
             record_count: 0,
+            seen_docs: HashSet::new(),
         })
     }
 
-    /// Append one record to the partition body.
-    pub(crate) fn write_record(&mut self, record: &Record) -> Result<(), GraceSpillError> {
-        let rv = record.record_var_pairs();
-        let payload = RecordPayload {
-            values: record.values().to_vec(),
-            record_vars: if rv.is_empty() { None } else { Some(rv) },
-        };
-        let bytes =
-            postcard::to_stdvec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| std::io::Error::other("grace spill: record exceeds u32 byte length"))?;
-        // Classify a write fault against the partition directory so an
-        // `ENOSPC` mid-stream surfaces as `DiskFull` (E321), not internal Io.
+    /// Write one discriminator-tagged, length-prefixed body frame: a 4-byte
+    /// LE length covering the 1-byte `discriminator` plus `body`, then the
+    /// discriminator, then the body. Classifies a write fault against the
+    /// partition directory so an `ENOSPC` mid-stream surfaces as `DiskFull`
+    /// (E321), not an internal `Io`.
+    fn write_frame(&mut self, discriminator: u8, body: &[u8]) -> Result<(), GraceSpillError> {
+        let len = u32::try_from(body.len() + 1)
+            .map_err(|_| std::io::Error::other("grace spill: frame exceeds u32 byte length"))?;
         if let Err(e) = self.sink.write_all(&len.to_le_bytes()) {
             return Err(self.classify_io(e));
         }
-        if let Err(e) = self.sink.write_all(&bytes) {
+        if let Err(e) = self.sink.write_all(&[discriminator]) {
             return Err(self.classify_io(e));
         }
+        if let Err(e) = self.sink.write_all(body) {
+            return Err(self.classify_io(e));
+        }
+        Ok(())
+    }
+
+    /// Append one record to the partition body.
+    ///
+    /// Emits the record's document context as a one-time intern frame the
+    /// first time its non-synthetic [`DocumentId`] is seen, before the
+    /// record frame, so the reader's table is populated before the record
+    /// references it. The synthetic document is never interned.
+    pub(crate) fn write_record(&mut self, record: &Record) -> Result<(), GraceSpillError> {
+        let doc_ctx = record.doc_ctx();
+        let doc_id = doc_ctx.id();
+        if doc_id != DocumentId::SYNTHETIC && self.seen_docs.insert(doc_id) {
+            let ctx_bytes = postcard::to_stdvec(doc_ctx.as_ref())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            self.write_frame(FRAME_CONTEXT_INTERN, &ctx_bytes)?;
+        }
+
+        let payload = RecordPayload::from_record(record);
+        let bytes =
+            postcard::to_stdvec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.write_frame(FRAME_RECORD_PAIR, &bytes)?;
         self.record_count += 1;
         Ok(())
     }
@@ -366,6 +424,7 @@ impl GraceSpillWriter {
             hash_bits,
             partition_id,
             record_count,
+            seen_docs: _,
         } = self;
         let mut file = sink.into_file().map_err(&classify)?;
         // Seek to current end and append footer; the body (raw or LZ4 frame)
@@ -389,12 +448,22 @@ impl GraceSpillWriter {
 /// Validates the footer magic + version on `open`, then dispatches the body
 /// source on the leading format tag (raw vs LZ4). Yields records via
 /// `Iterator` until either the body stream returns EOF or the recorded
-/// `record_count` is exhausted.
+/// `record_count` record frames are exhausted; context-intern frames are
+/// consumed in between to populate the per-document interning table.
+///
+/// Memory model: streaming — one frame is decoded per `next` call. The only
+/// retained state is `doc_table`, the per-file `DocumentId → Arc` table built
+/// from context frames (`O(distinct documents)`); each record clones its
+/// document's shared `Arc`.
 pub(crate) struct GraceSpillReader {
     source: GraceSpillSource,
     schema: Arc<Schema>,
     header: SpillHeader,
     records_read: u64,
+    /// Per-file envelope-context interning table, populated by context
+    /// frames and read by record frames so every record of a document
+    /// shares one `Arc`.
+    doc_table: HashMap<DocumentId, Arc<DocumentContext>>,
     len_buf: [u8; 4],
 }
 
@@ -467,12 +536,39 @@ impl GraceSpillReader {
             schema,
             header,
             records_read: 0,
+            doc_table: HashMap::new(),
             len_buf: [0u8; 4],
         })
     }
 
     pub(crate) fn header(&self) -> &SpillHeader {
         &self.header
+    }
+
+    /// Decode a context-intern frame into one shared `Arc<DocumentContext>`
+    /// and key it into the per-file table by the document's id.
+    fn intern_context(&mut self, body: &[u8]) -> std::io::Result<()> {
+        let ctx: DocumentContext =
+            postcard::from_bytes(body).map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.doc_table.insert(ctx.id(), Arc::new(ctx));
+        Ok(())
+    }
+
+    /// Reattach a decoded record's shared envelope context. A synthetic
+    /// `doc_id` resolves to the process-wide singleton; a non-synthetic
+    /// `doc_id` absent from the interning table is a corrupt-file error,
+    /// never a silent synthetic fallback.
+    fn doc_ctx_for(&self, doc_id: DocumentId) -> std::io::Result<Arc<DocumentContext>> {
+        if doc_id == DocumentId::SYNTHETIC {
+            Ok(synthetic_document_context())
+        } else {
+            self.doc_table.get(&doc_id).map(Arc::clone).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "grace spill: record references document {doc_id:?} with no interned \
+                     context frame; file is corrupt"
+                ))
+            })
+        }
     }
 }
 
@@ -483,36 +579,65 @@ impl Iterator for GraceSpillReader {
         if self.records_read >= self.header.record_count {
             return None;
         }
-        match self.source.read_exact(&mut self.len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Stream ended before the recorded record_count was
-                // reached — surface as an error rather than silently
-                // truncating, so callers don't lose rows on a corrupted
-                // partition file.
+        // Drive past context-intern frames — they populate the doc table but
+        // are not records — until a record-pair frame yields a `Record`.
+        loop {
+            match self.source.read_exact(&mut self.len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Stream ended before the recorded record_count was
+                    // reached — surface as an error rather than silently
+                    // truncating, so callers don't lose rows on a corrupted
+                    // partition file.
+                    return Some(Err(std::io::Error::other(format!(
+                        "grace spill: unexpected EOF after {} of {} records",
+                        self.records_read, self.header.record_count
+                    ))));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+            let len = u32::from_le_bytes(self.len_buf) as usize;
+            if len > SPILL_MAX_FRAME_BYTES {
                 return Some(Err(std::io::Error::other(format!(
-                    "grace spill: unexpected EOF after {} of {} records",
-                    self.records_read, self.header.record_count
+                    "grace spill: frame length {len} exceeds {SPILL_MAX_FRAME_BYTES} byte cap"
                 ))));
             }
-            Err(e) => return Some(Err(e)),
+            if len == 0 {
+                return Some(Err(std::io::Error::other(
+                    "grace spill: frame length 0 (missing discriminator); file is corrupt",
+                )));
+            }
+            let mut buf = vec![0u8; len];
+            if let Err(e) = self.source.read_exact(&mut buf) {
+                return Some(Err(e));
+            }
+            let (discriminator, body) = (buf[0], &buf[1..]);
+            match discriminator {
+                FRAME_CONTEXT_INTERN => {
+                    if let Err(e) = self.intern_context(body) {
+                        return Some(Err(e));
+                    }
+                    // Loop to the next frame.
+                }
+                FRAME_RECORD_PAIR => {
+                    let payload: RecordPayload = match postcard::from_bytes(body) {
+                        Ok(p) => p,
+                        Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
+                    };
+                    let doc_ctx = match self.doc_ctx_for(payload.doc_id) {
+                        Ok(c) => c,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    self.records_read += 1;
+                    return Some(Ok(payload.into_record(Arc::clone(&self.schema), doc_ctx)));
+                }
+                other => {
+                    return Some(Err(std::io::Error::other(format!(
+                        "grace spill: unknown frame discriminator {other:#04x}; file is corrupt"
+                    ))));
+                }
+            }
         }
-        let len = u32::from_le_bytes(self.len_buf) as usize;
-        if len > GRACE_SPILL_MAX_RECORD_BYTES {
-            return Some(Err(std::io::Error::other(format!(
-                "grace spill: record length {len} exceeds {GRACE_SPILL_MAX_RECORD_BYTES} byte cap"
-            ))));
-        }
-        let mut buf = vec![0u8; len];
-        if let Err(e) = self.source.read_exact(&mut buf) {
-            return Some(Err(e));
-        }
-        let payload: RecordPayload = match postcard::from_bytes(&buf) {
-            Ok(p) => p,
-            Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
-        };
-        self.records_read += 1;
-        Some(Ok(payload.into_record(Arc::clone(&self.schema))))
     }
 }
 
@@ -549,6 +674,7 @@ impl Read for BoundedRead {
 mod tests {
     use super::*;
     use clinker_record::Value;
+    use indexmap::IndexMap;
     use tempfile::TempDir;
 
     fn schema() -> Arc<Schema> {
@@ -560,6 +686,24 @@ mod tests {
             Arc::clone(s),
             vec![Value::Integer(id), Value::String(v.into())],
         )
+    }
+
+    /// Build a `DocumentContext` with a single `Head` section carrying a
+    /// nested `Value::Map`, exercising the recursive `Value` path through
+    /// the interned context frame.
+    fn doc_ctx(seed: i64, file: &str) -> Arc<DocumentContext> {
+        let mut head = IndexMap::new();
+        head.insert(
+            Box::from("batch_id"),
+            Value::String(format!("RUN-{seed:03}").into()),
+        );
+        let mut sections = IndexMap::new();
+        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
+        Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from(file),
+            sections,
+        ))
     }
 
     /// LZ4 frame magic number, little-endian `0x184D2204` — the four bytes a
@@ -776,5 +920,123 @@ mod tests {
                 .contains("became unavailable mid-run"),
             "{pipeline_err}"
         );
+    }
+
+    // A document's envelope context (id, nested-Map section, non-empty
+    // source_file) survives the grace spill round-trip under both body
+    // formats.
+    #[test]
+    fn grace_roundtrip_preserves_doc_ctx() {
+        for compress in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let s = schema();
+            let doc = doc_ctx(1, "claims/run-001.xml");
+            let mut w = GraceSpillWriter::new(dir.path(), 4, 0, compress).unwrap();
+            let mut rec = record(&s, 1, "a");
+            rec.set_doc_ctx(Arc::clone(&doc));
+            w.write_record(&rec).unwrap();
+            let (path, _) = w.finish().unwrap();
+
+            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            assert_eq!(
+                reader.header().record_count,
+                1,
+                "footer record_count counts record frames only (compress={compress})"
+            );
+            let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+            assert_eq!(recs.len(), 1, "compress={compress}");
+            let ctx = recs[0].doc_ctx();
+            assert_eq!(ctx.id(), doc.id(), "compress={compress}");
+            assert_eq!(ctx.source_file().as_ref(), "claims/run-001.xml");
+            assert_eq!(
+                ctx.get_section_field("Head", "batch_id"),
+                Some(Value::String("RUN-001".into())),
+                "compress={compress}"
+            );
+        }
+    }
+
+    // Every record of one document re-hydrates the SAME shared Arc — one
+    // allocation per document on reload.
+    #[test]
+    fn grace_shares_one_arc_per_document() {
+        let dir = TempDir::new().unwrap();
+        let s = schema();
+        let doc = doc_ctx(2, "batch.xml");
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
+        for i in 0..3 {
+            let mut rec = record(&s, i, "x");
+            rec.set_doc_ctx(Arc::clone(&doc));
+            w.write_record(&rec).unwrap();
+        }
+        let (path, _) = w.finish().unwrap();
+        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(recs.len(), 3);
+        let first = recs[0].doc_ctx();
+        for r in &recs[1..] {
+            assert!(
+                Arc::ptr_eq(first, r.doc_ctx()),
+                "all records of one document must share one re-hydrated Arc",
+            );
+        }
+    }
+
+    // A synthetic-context record interns no context frame and re-hydrates to
+    // the process-wide synthetic singleton.
+    #[test]
+    fn grace_synthetic_doc_ctx_roundtrips_as_synthetic() {
+        let dir = TempDir::new().unwrap();
+        let s = schema();
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
+        // record() leaves the default synthetic context attached.
+        w.write_record(&record(&s, 1, "syn")).unwrap();
+        let (path, _) = w.finish().unwrap();
+        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(recs.len(), 1);
+        assert!(
+            Arc::ptr_eq(recs[0].doc_ctx(), &synthetic_document_context()),
+            "synthetic doc_id must re-hydrate to the shared singleton",
+        );
+        assert_eq!(recs[0].doc_ctx().id(), DocumentId::SYNTHETIC);
+    }
+
+    // The interning table is O(distinct documents): K documents over N
+    // records emit exactly K context frames, and each document's records
+    // share one Arc while distinct documents get distinct Arcs.
+    #[test]
+    fn grace_interning_table_is_o_distinct_docs() {
+        let dir = TempDir::new().unwrap();
+        let s = schema();
+        const DOCS: i64 = 3;
+        const RECS_PER_DOC: usize = 10;
+        let docs: Vec<Arc<DocumentContext>> = (0..DOCS)
+            .map(|d| doc_ctx(d + 1, &format!("doc-{d}.xml")))
+            .collect();
+        let mut w = GraceSpillWriter::new(dir.path(), 4, 0, false).unwrap();
+        for doc in &docs {
+            for i in 0..RECS_PER_DOC {
+                let mut rec = record(&s, i as i64, "r");
+                rec.set_doc_ctx(Arc::clone(doc));
+                w.write_record(&rec).unwrap();
+            }
+        }
+        let (path, _) = w.finish().unwrap();
+        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        // Footer counts record frames only — context frames excluded.
+        assert_eq!(
+            reader.header().record_count as usize,
+            DOCS as usize * RECS_PER_DOC,
+        );
+        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(recs.len(), DOCS as usize * RECS_PER_DOC);
+        let doc_a = recs[0].doc_ctx();
+        let doc_b = recs[RECS_PER_DOC].doc_ctx();
+        assert!(
+            !Arc::ptr_eq(doc_a, doc_b),
+            "distinct docs get distinct Arcs"
+        );
+        assert!(Arc::ptr_eq(doc_a, recs[RECS_PER_DOC - 1].doc_ctx()));
     }
 }

@@ -1,4 +1,4 @@
-use crate::document_context::{DocumentContext, synthetic_document_context};
+use crate::document_context::{DocumentContext, DocumentId, synthetic_document_context};
 use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
@@ -47,9 +47,14 @@ pub struct Record {
 /// Wire payload for a [`Record`] in binary spill streams.
 ///
 /// Schema is not embedded — the spill stream writes the schema once in
-/// a header line, so each record body carries only positional values
-/// and optional per-record `$record.<key>` scoped variables. Callers
-/// reconstruct a full `Record` via [`RecordPayload::into_record`].
+/// a header line, so each record body carries only positional values,
+/// optional per-record `$record.<key>` scoped variables, and the
+/// [`DocumentId`] keying its envelope context. The full
+/// [`DocumentContext`] is **not** inlined per record: the spill writer
+/// interns one context frame per distinct document per file, and
+/// [`RecordPayload::into_record`] reattaches the shared `Arc` looked up
+/// by this `doc_id`. So the per-record cost is one `u64`, and reload
+/// memory is `O(distinct documents)`, never `O(records)`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecordPayload {
     /// Positional field values in schema column order.
@@ -57,34 +62,46 @@ pub struct RecordPayload {
     /// Per-record `$record.<key>` user-declared scoped variables, or
     /// `None` if the record has none.
     pub record_vars: Option<Vec<(Box<str>, Value)>>,
+    /// Identity of this record's envelope document. Keys the spill file's
+    /// per-document interning table on read; [`DocumentId::SYNTHETIC`] maps
+    /// to the process-wide synthetic context singleton.
+    pub doc_id: DocumentId,
 }
 
 impl RecordPayload {
-    /// Reconstruct a [`Record`] from this payload using a caller-supplied schema.
-    pub fn into_record(self, schema: Arc<Schema>) -> Record {
+    /// Capture a record's wire payload: its positional values, any
+    /// `$record.<key>` scoped variables, and its envelope [`DocumentId`].
+    ///
+    /// The schema and full document context are dropped here — the spill
+    /// stream writes the schema once in its header and interns the context
+    /// once per document — so a payload is exactly what each record body
+    /// must carry. Both spill encoders (the inter-stage `SpillWriter` and
+    /// the grace-hash twin) build their payload through this one place.
+    pub fn from_record(record: &Record) -> Self {
+        let rv = record.record_var_pairs();
+        RecordPayload {
+            values: record.values().to_vec(),
+            record_vars: if rv.is_empty() { None } else { Some(rv) },
+            doc_id: record.doc_ctx().id(),
+        }
+    }
+
+    /// Reconstruct a [`Record`] from this payload, attaching the
+    /// caller-supplied schema and the shared envelope context.
+    ///
+    /// `doc_ctx` is the single `Arc<DocumentContext>` the spill reader
+    /// re-hydrated for this payload's `doc_id`; every record of one
+    /// document clones that same `Arc` (refcount bump only, no per-record
+    /// context copy).
+    pub fn into_record(self, schema: Arc<Schema>, doc_ctx: Arc<DocumentContext>) -> Record {
         let mut record = Record::new(schema, self.values);
         if let Some(rv_pairs) = self.record_vars {
             for (k, v) in rv_pairs {
                 let _ = record.set_record_var(&k, v);
             }
         }
+        record.set_doc_ctx(doc_ctx);
         record
-    }
-}
-
-impl Serialize for Record {
-    /// Serializes this record as a [`RecordPayload`] (values + record_vars).
-    ///
-    /// The schema is not included in the wire output. Callers that need
-    /// schema information must write it separately (e.g., as a header line)
-    /// and supply it on deserialization via [`RecordPayload::into_record`].
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let rv = self.record_var_pairs();
-        RecordPayload {
-            values: self.values.clone(),
-            record_vars: if rv.is_empty() { None } else { Some(rv) },
-        }
-        .serialize(serializer)
     }
 }
 
@@ -387,6 +404,25 @@ mod tests {
             record_vars: _,
             doc_ctx: _,
         } = rec;
+    }
+
+    /// Structural assertion: `RecordPayload` carries exactly `values`,
+    /// `record_vars`, and `doc_id` — the wire shape of a spilled record.
+    /// `doc_id` (not the full context) keeps the per-record spill cost a
+    /// single `u64`; adding or renaming a field fails compilation, so a
+    /// silent widening of the per-record payload can't slip in.
+    #[test]
+    fn test_record_payload_struct_has_exactly_values_record_vars_doc_id() {
+        let payload = RecordPayload {
+            values: vec![Value::Null; 5],
+            record_vars: None,
+            doc_id: DocumentId::SYNTHETIC,
+        };
+        let RecordPayload {
+            values: _,
+            record_vars: _,
+            doc_id: _,
+        } = payload;
     }
 
     #[test]
