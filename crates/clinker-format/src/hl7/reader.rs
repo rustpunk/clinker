@@ -551,7 +551,9 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
-                EnvelopeExtract::XmlPath(_) | EnvelopeExtract::JsonPointer(_) => {
+                EnvelopeExtract::XmlPath(_)
+                | EnvelopeExtract::JsonPointer(_)
+                | EnvelopeExtract::RecordType(_) => {
                     return Err(FormatError::Hl7(format!(
                         "envelope section {name:?}: declared a non-`segment` extract against an \
                          HL7 source. Use `segment` (e.g. `extract: {{ segment: \"FHS\" }}`) for \

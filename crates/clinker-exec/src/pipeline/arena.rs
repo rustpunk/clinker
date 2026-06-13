@@ -32,7 +32,11 @@ impl Arena {
         }
     }
 
-    /// Create an Arena from pre-built parts (used by MultiRecordDispatcher).
+    /// Build an Arena directly from a schema and pre-projected records,
+    /// bypassing the streaming `build` path and its memory accounting.
+    ///
+    /// Used by benchmarks that need a populated Arena from synthetic
+    /// `MinimalRecord`s without driving a `FormatReader`.
     pub fn from_parts(schema: Arc<Schema>, records: Vec<MinimalRecord>) -> Self {
         Arena { schema, records }
     }

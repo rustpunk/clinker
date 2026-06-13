@@ -2,18 +2,34 @@ pub mod resolve;
 
 use std::path::Path;
 
-use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef, SchemaDefinition};
+use clinker_record::schema_def::{
+    Discriminator, FieldDef, RecordTypeDef, SchemaDefinition, StructureConstraint,
+};
 
-/// Resolved schema -- inherits merged, validated, ready for pipeline use.
+/// Resolved single-record schema -- inherits merged, validated, ready for
+/// pipeline use.
+///
+/// Multi-record flat files (header/trailer/body discrimination) resolve to
+/// [`ResolvedRecords`] instead: their discriminator-driven reader streams one
+/// `Record` per line on a static superset schema — see
+/// `clinker_format::multi_record`.
 #[derive(Debug, Clone)]
-pub enum ResolvedSchema {
-    SingleRecord {
-        fields: Vec<FieldDef>,
-    },
-    MultiRecord {
-        discriminator: Discriminator,
-        record_types: Vec<RecordTypeDef>,
-    },
+pub struct ResolvedSchema {
+    pub fields: Vec<FieldDef>,
+}
+
+/// Resolved multi-record schema -- per-record-type fields with `inherits:`
+/// merged and field constraints validated, plus the discriminator and any
+/// trailer structural constraints.
+///
+/// The reader consumes this directly: it never materializes a different
+/// physical schema per type, but each type's resolved `fields` drive the
+/// superset schema and per-field byte/column extraction.
+#[derive(Debug, Clone)]
+pub struct ResolvedRecords {
+    pub discriminator: Discriminator,
+    pub record_types: Vec<RecordTypeDef>,
+    pub structure: Vec<StructureConstraint>,
 }
 
 /// Schema subsystem errors.
@@ -55,50 +71,90 @@ pub fn load_schema(path: &Path) -> Result<SchemaDefinition, SchemaError> {
     Ok(def)
 }
 
-/// Resolve a SchemaDefinition: merge inherits, validate constraints,
-/// produce a pipeline-ready ResolvedSchema.
+/// Resolve a single-record [`SchemaDefinition`]: merge inherits, validate
+/// constraints, produce a pipeline-ready [`ResolvedSchema`].
+///
+/// # Errors
+///
+/// Returns [`SchemaError::Validation`] when the definition declares `records:`
+/// (multi-record flat files are read by the discriminator-driven
+/// `clinker_format::multi_record` reader, not resolved here), declares neither
+/// `fields:` nor `records:`, or carries an inherits/field-constraint violation.
 pub fn resolve_schema(def: SchemaDefinition) -> Result<ResolvedSchema, SchemaError> {
-    // Validate fields/records mutual exclusivity
+    // `fields:` and `records:` are mutually exclusive — one declares a single
+    // record type, the other declares many. Both present is a contradiction.
     if def.fields.is_some() && def.records.is_some() {
         return Err(SchemaError::Validation(
-            "schema cannot have both 'fields' and 'records' at the top level".into(),
+            "schema cannot declare both 'fields' (single-record) and 'records' \
+             (multi-record) at the top level"
+                .into(),
         ));
     }
-    if def.fields.is_none() && def.records.is_none() {
+    // Multi-record flat files do not flow through single-field resolution:
+    // route them to `resolve_records`. Reject a `records:` definition here so a
+    // misrouted multi-record schema fails with a precise message rather than
+    // silently losing its record types.
+    if def.records.is_some() {
         return Err(SchemaError::Validation(
-            "schema must have either 'fields' (single-record) or 'records' (multi-record)".into(),
+            "multi-record schema ('records:') is read by the discriminator-driven \
+             multi-record reader, not resolved as a single field list"
+                .into(),
         ));
     }
+    let defs = def.defs.as_ref();
+    let fields = def.fields.ok_or_else(|| {
+        SchemaError::Validation(
+            "schema must declare 'fields' (single-record) or 'records' (multi-record)".into(),
+        )
+    })?;
+    let resolved_fields = resolve_inherits(fields, defs)?;
+    validate_fields(&resolved_fields)?;
+    Ok(ResolvedSchema {
+        fields: resolved_fields,
+    })
+}
 
-    if let Some(records) = def.records {
-        // Multi-record path
-        let discriminator = def.discriminator.ok_or_else(|| {
-            SchemaError::Validation("multi-record schema requires a 'discriminator' section".into())
-        })?;
-
-        // Resolve inherits within each record type's fields
-        let defs = def.defs.as_ref();
-        let mut resolved_records = Vec::with_capacity(records.len());
-        for mut rt in records {
-            rt.fields = resolve_inherits(rt.fields, defs)?;
-            validate_fields(&rt.fields)?;
-            resolved_records.push(rt);
-        }
-
-        Ok(ResolvedSchema::MultiRecord {
-            discriminator,
-            record_types: resolved_records,
-        })
-    } else {
-        // Single-record path
-        let fields = def.fields.unwrap();
-        let defs = def.defs.as_ref();
-        let resolved_fields = resolve_inherits(fields, defs)?;
-        validate_fields(&resolved_fields)?;
-        Ok(ResolvedSchema::SingleRecord {
-            fields: resolved_fields,
-        })
+/// Resolve a multi-record [`SchemaDefinition`]: merge each record type's
+/// `inherits:` against `defs:`, validate every field's constraints, and carry
+/// the discriminator and trailer structural constraints through.
+///
+/// # Errors
+///
+/// Returns [`SchemaError::Validation`] when the definition declares both
+/// `fields:` and `records:`, omits the `discriminator:` block, declares no
+/// record types, or carries an inherits / field-constraint violation in any
+/// record type.
+pub fn resolve_records(def: SchemaDefinition) -> Result<ResolvedRecords, SchemaError> {
+    if def.fields.is_some() && def.records.is_some() {
+        return Err(SchemaError::Validation(
+            "schema cannot declare both 'fields' (single-record) and 'records' \
+             (multi-record) at the top level"
+                .into(),
+        ));
     }
+    let records = def.records.ok_or_else(|| {
+        SchemaError::Validation("multi-record schema must declare 'records'".into())
+    })?;
+    if records.is_empty() {
+        return Err(SchemaError::Validation(
+            "multi-record schema declares an empty 'records' list".into(),
+        ));
+    }
+    let discriminator = def.discriminator.ok_or_else(|| {
+        SchemaError::Validation("multi-record schema requires a 'discriminator' block".into())
+    })?;
+    let defs = def.defs.as_ref();
+    let mut resolved = Vec::with_capacity(records.len());
+    for mut rt in records {
+        rt.fields = resolve_inherits(rt.fields, defs)?;
+        validate_fields(&rt.fields)?;
+        resolved.push(rt);
+    }
+    Ok(ResolvedRecords {
+        discriminator,
+        record_types: resolved,
+        structure: def.structure.unwrap_or_default(),
+    })
 }
 
 /// Resolve `inherits:` references in a field list against `defs:` templates.
@@ -297,20 +353,16 @@ fields:
 "#;
         let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
-        match resolved {
-            ResolvedSchema::SingleRecord { fields } => {
-                assert_eq!(fields[0].name, "city");
-                assert_eq!(
-                    fields[0].field_type,
-                    Some(clinker_record::schema_def::FieldType::String)
-                );
-                assert_eq!(fields[0].width, Some(20));
-                assert_eq!(fields[0].trim, Some(true));
-                assert_eq!(fields[0].start, Some(0));
-                assert!(fields[0].inherits.is_none());
-            }
-            _ => panic!("expected SingleRecord"),
-        }
+        let fields = resolved.fields;
+        assert_eq!(fields[0].name, "city");
+        assert_eq!(
+            fields[0].field_type,
+            Some(clinker_record::schema_def::FieldType::String)
+        );
+        assert_eq!(fields[0].width, Some(20));
+        assert_eq!(fields[0].trim, Some(true));
+        assert_eq!(fields[0].start, Some(0));
+        assert!(fields[0].inherits.is_none());
     }
 
     #[test]
@@ -330,18 +382,14 @@ fields:
 "#;
         let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
-        match resolved {
-            ResolvedSchema::SingleRecord { fields } => {
-                // Field overrides template's type
-                assert_eq!(
-                    fields[0].field_type,
-                    Some(clinker_record::schema_def::FieldType::Float)
-                );
-                // Template's width preserved
-                assert_eq!(fields[0].width, Some(10));
-            }
-            _ => panic!("expected SingleRecord"),
-        }
+        let fields = resolved.fields;
+        // Field overrides template's type
+        assert_eq!(
+            fields[0].field_type,
+            Some(clinker_record::schema_def::FieldType::Float)
+        );
+        // Template's width preserved
+        assert_eq!(fields[0].width, Some(10));
     }
 
     #[test]
@@ -473,5 +521,135 @@ fields:
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("drop"), "error should mention drop: {msg}");
+    }
+
+    #[test]
+    fn test_schema_fields_and_records_both_present_rejected() {
+        let yaml = r#"
+fields:
+  - name: id
+    type: integer
+records:
+  - id: a
+    tag: A
+    fields:
+      - name: x
+        type: string
+discriminator: { field: x }
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let err = resolve_schema(def).unwrap_err();
+        assert!(
+            err.to_string().contains("both"),
+            "fields + records must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_records_merges_inherits_per_type() {
+        // A record-type field with `inherits:` must resolve against `defs:`,
+        // picking up the template's type and width — the validation the
+        // multi-record path previously dropped.
+        let yaml = r#"
+defs:
+  amount_field:
+    name: _t
+    type: integer
+    width: 9
+records:
+  - id: detail
+    tag: D
+    fields:
+      - name: amount
+        inherits: amount_field
+        start: 1
+discriminator: { start: 0, width: 1 }
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let resolved = resolve_records(def).unwrap();
+        let detail = &resolved.record_types[0];
+        let amount = &detail.fields[0];
+        assert_eq!(
+            amount.field_type,
+            Some(clinker_record::schema_def::FieldType::Integer),
+            "inherits must carry the template type"
+        );
+        assert_eq!(
+            amount.width,
+            Some(9),
+            "inherits must carry the template width"
+        );
+        assert!(amount.inherits.is_none(), "inherits is resolved away");
+    }
+
+    #[test]
+    fn test_resolve_records_requires_discriminator() {
+        let yaml = r#"
+records:
+  - id: a
+    tag: A
+    fields:
+      - name: x
+        type: string
+        start: 0
+        width: 3
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let err = resolve_records(def).unwrap_err();
+        assert!(
+            err.to_string().contains("discriminator"),
+            "missing discriminator must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_records_validates_width_end_exclusion() {
+        let yaml = r#"
+records:
+  - id: a
+    tag: A
+    fields:
+      - name: x
+        type: string
+        start: 0
+        width: 3
+        end: 3
+discriminator: { start: 0, width: 1 }
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let err = resolve_records(def).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "width + end must be rejected per record type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_records_carries_structure() {
+        let yaml = r#"
+records:
+  - id: detail
+    tag: D
+    fields:
+      - name: id
+        type: integer
+        start: 1
+        width: 5
+  - id: trailer
+    tag: T
+    fields:
+      - name: count
+        type: integer
+        start: 1
+        width: 5
+discriminator: { start: 0, width: 1 }
+structure:
+  - { record: trailer, count: count }
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let resolved = resolve_records(def).unwrap();
+        assert_eq!(resolved.record_types.len(), 2);
+        assert_eq!(resolved.structure.len(), 1);
+        assert_eq!(resolved.structure[0].record, "trailer");
     }
 }

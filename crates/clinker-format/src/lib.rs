@@ -8,6 +8,7 @@ pub mod error;
 pub mod fixed_width;
 pub mod hl7;
 pub mod json;
+pub mod multi_record;
 pub(crate) mod segment_tokenizer;
 pub mod source;
 pub mod splitting;

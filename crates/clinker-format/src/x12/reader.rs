@@ -481,7 +481,9 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
-                EnvelopeExtract::XmlPath(_) | EnvelopeExtract::JsonPointer(_) => {
+                EnvelopeExtract::XmlPath(_)
+                | EnvelopeExtract::JsonPointer(_)
+                | EnvelopeExtract::RecordType(_) => {
                     return Err(FormatError::X12(format!(
                         "envelope section {name:?}: declared a non-`segment` extract \
                          against an X12 source. Use `segment` (e.g. \

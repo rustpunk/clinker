@@ -529,11 +529,12 @@ impl FormatReader for XmlReader {
                          against an XML source. Use `xml_path` for XML envelope sections."
                     )));
                 }
-                EnvelopeExtract::Segment(_) => {
+                EnvelopeExtract::Segment(_) | EnvelopeExtract::RecordType(_) => {
                     return Err(FormatError::Xml(format!(
-                        "envelope section {name:?}: declared `segment` extract \
-                         against an XML source. The `segment` extract is for \
-                         flat-file formats (EDIFACT); use `xml_path` for XML."
+                        "envelope section {name:?}: declared a flat-file extract \
+                         (`segment` / `record_type`) against an XML source. Those \
+                         extracts are for flat-file formats (EDIFACT, multi-record \
+                         CSV / fixed-width); use `xml_path` for XML."
                     )));
                 }
             }

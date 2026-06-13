@@ -48,3 +48,69 @@ order **must** match the file's column order.
 Input columns the schema does not name are governed by the source's
 [`on_unmapped`](../formats/auto-widen.md) policy, the same as every other
 format.
+
+## Multi-record files (header / trailer / body)
+
+Some CSV exports interleave **multiple record types** in one file — a
+header row, many body rows, and a trailer row — each distinguished by a
+discriminator column. Declare these under `format_schema:` with a
+`discriminator:` and a `records:` list instead of the single top-level
+`schema:`. Each record type names its `tag` (the discriminator value
+that identifies it) and its own positional `fields:`; the discriminator
+field must sit at the same column in every type (usually the first).
+
+```yaml
+- type: source
+  name: payments
+  config:
+    name: payments
+    type: csv
+    path: "./data/payments.csv"
+    schema:                              # superset CXL types: record_type + every field
+      - { name: record_type, type: string }
+      - { name: batch_id, type: string }
+      - { name: id, type: int }
+      - { name: amount, type: int }
+      - { name: count, type: int }
+    format_schema:
+      discriminator: { field: record_type }   # the column carrying the type tag
+      records:
+        - { id: header,  tag: H, fields: [ { name: record_type }, { name: batch_id } ] }
+        - { id: detail,  tag: D, fields: [ { name: record_type }, { name: id, type: integer }, { name: amount, type: integer } ] }
+        - { id: trailer, tag: T, fields: [ { name: record_type }, { name: count, type: integer } ] }
+      structure:
+        - { record: trailer, count: count }    # validate T's count against the body count
+    envelope:
+      sections:
+        head:
+          extract: { record_type: H }          # the H row surfaces as $doc.head.*
+          fields:
+            batch_id: string
+```
+
+The reader streams **one record per line** on a single superset schema
+whose lead `record_type` column carries the matched type's `id`. A
+downstream [Route](../nodes/route.md) discriminates on that column.
+Rows of different record types may carry different column counts (ragged
+rows) — the reader validates the column count per record type, not
+file-wide. A textual column-header row is skipped when `has_header` is
+`true` (the default), so a leading `record_type,name,amount` line is not
+mistaken for a record of an unknown type. Each declared field honors its
+own `type` / `trim` / `pad`, the same as a single-record CSV field.
+
+- **Header rows** declared as an `envelope:` section via the
+  `record_type` extract surface as `$doc.<section>.*` and are excluded
+  from the body stream (see
+  [Envelopes & Document Context](../pipelines/envelope-and-doc-context.md)).
+- **Trailer rows** named by a `structure:` constraint are validated as
+  they stream — the declared `count` field is checked against the actual
+  body-record count at document close — and excluded from the body
+  stream. A declared trailer that never appears is an incomplete-document
+  error; a body row after the trailer is rejected as content past the
+  document close.
+- **Blank lines** (empty or whitespace-only, common after concatenation)
+  are skipped rather than parsed.
+- An **unknown discriminator value** (a tag no `records:` entry declares)
+  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
+  by default, or under `dlq_granularity: document` condemns the whole
+  file to the dead-letter sink and the run continues.
