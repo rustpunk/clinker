@@ -42,7 +42,10 @@ use indexmap::IndexMap;
 use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::hl7::RAW_FIELDS_KEY;
-use crate::hl7::tokenizer::{ParsedSegment, SegmentTokenizer, split_segment};
+use crate::hl7::field_split::Hl7FieldSplit;
+use crate::hl7::tokenizer::{
+    Delimiters, ParsedSegment, SegmentTokenizer, raw_field, split_segment,
+};
 use crate::traits::FormatReader;
 
 /// Default ceiling on the number of positional field columns the record
@@ -72,12 +75,20 @@ pub struct Hl7ReaderConfig {
     /// Number of positional `fNN` field columns on the record schema. A
     /// body segment with more data fields than this is rejected.
     pub max_fields: usize,
+    /// Opt-in composite-field splits. Each entry explodes one positional
+    /// field into per-repetition / per-component / per-sub-component
+    /// columns, replacing the verbatim `fNN` column with the structured
+    /// columns; the writer re-assembles the wire field from them. Empty by
+    /// default, so the positional model is byte-identical to today unless a
+    /// split is declared.
+    pub split_fields: Vec<Hl7FieldSplit>,
 }
 
 impl Default for Hl7ReaderConfig {
     fn default() -> Self {
         Self {
             max_fields: DEFAULT_MAX_FIELDS,
+            split_fields: Vec::new(),
         }
     }
 }
@@ -94,6 +105,11 @@ pub struct Hl7Reader<R: Read> {
     tokenizer: SegmentTokenizer<BufReader<R>>,
     schema: Arc<Schema>,
     max_fields: usize,
+    /// The ordered field-column layout: each positional field is either kept
+    /// verbatim as one `fNN` column or exploded into its split-leaf columns.
+    /// Built once from the config so `body_record` maps every segment the
+    /// same way.
+    field_layout: Vec<FieldGroup>,
     initialized: bool,
     /// The first segment, read during delimiter discovery and held until
     /// the body stream consumes it (an `MSH` is emitted, an `FHS`/`BHS`
@@ -122,6 +138,45 @@ pub struct Hl7Reader<R: Read> {
     done: bool,
 }
 
+/// One positional field's place in the record schema: kept verbatim as a
+/// single `fNN` column, or exploded into its split-leaf columns.
+///
+/// The layout is the single source of both the column list (for the schema)
+/// and the per-segment value mapping (in `body_record`), so the reader and
+/// its schema never disagree on which columns a split field contributes.
+enum FieldGroup {
+    /// A field kept whole at its 1-based wire position, as `fNN`.
+    Verbatim { position: usize },
+    /// A field exploded per its split declaration.
+    Split(Hl7FieldSplit),
+}
+
+impl FieldGroup {
+    /// The schema column names this group contributes, in column order.
+    fn column_names(&self) -> Vec<String> {
+        match self {
+            FieldGroup::Verbatim { position } => vec![positional_key(position - 1)],
+            FieldGroup::Split(split) => split.column_names(),
+        }
+    }
+}
+
+/// Build the ordered field-column layout from the field width and the split
+/// declarations: positions `1..=max_fields`, with each declared split
+/// replacing its verbatim `fNN` slot. A split naming a position outside the
+/// `max_fields` range is dropped here — the plan-config layer validates the
+/// in-range invariant with source spans before the reader is built.
+fn build_field_layout(max_fields: usize, splits: &[Hl7FieldSplit]) -> Vec<FieldGroup> {
+    let mut layout = Vec::with_capacity(max_fields);
+    for position in 1..=max_fields {
+        match splits.iter().find(|s| s.field_index == position) {
+            Some(split) => layout.push(FieldGroup::Split(*split)),
+            None => layout.push(FieldGroup::Verbatim { position }),
+        }
+    }
+    layout
+}
+
 /// Per-batch validation state for the batch currently open.
 struct OpenBatch {
     /// Count of messages (`MSH`) seen in this batch, checked against the
@@ -143,11 +198,13 @@ impl<R: Read> Hl7Reader<R> {
     /// configuration. Delimiter discovery and the first-segment read are
     /// deferred to the first call.
     pub fn new(reader: R, config: Hl7ReaderConfig) -> Self {
-        let schema = build_schema(config.max_fields);
+        let field_layout = build_field_layout(config.max_fields, &config.split_fields);
+        let schema = build_schema(&field_layout);
         Self {
             tokenizer: SegmentTokenizer::new(BufReader::new(reader)),
             schema,
             max_fields: config.max_fields,
+            field_layout,
             initialized: false,
             pending_segment: None,
             fhs_fields: Vec::new(),
@@ -232,7 +289,7 @@ impl<R: Read> Hl7Reader<R> {
                 "BTS" => self.close_batch(&segment)?,
                 "MSH" => {
                     self.open_message(&segment);
-                    let record = self.body_record(&segment)?;
+                    let record = self.body_record(&raw, &segment)?;
                     return Ok(Some(record));
                 }
                 _ => {
@@ -242,7 +299,7 @@ impl<R: Read> Hl7Reader<R> {
                             segment.tag
                         )));
                     }
-                    let record = self.body_record(&segment)?;
+                    let record = self.body_record(&raw, &segment)?;
                     return Ok(Some(record));
                 }
             }
@@ -383,10 +440,12 @@ impl<R: Read> Hl7Reader<R> {
 
     /// Map a parsed segment to a positional [`Record`] under the static
     /// schema. `seg_id`, `set_ref`, and `set_type` are stamped from the
-    /// open message; the data fields fill `f01..`. Absent trailing fields
-    /// stay `Value::Null`; a field count past `max_fields` errors with
-    /// guidance.
-    fn body_record(&self, segment: &ParsedSegment) -> Result<Record, FormatError> {
+    /// open message; the data fields follow the field layout — verbatim
+    /// fields fill one `fNN` column each, split fields explode into their
+    /// structured columns. Absent fields and leaves stay `Value::Null`; a
+    /// field count past `max_fields`, or a split field whose structure
+    /// overflows its declared width, errors with guidance.
+    fn body_record(&self, raw: &str, segment: &ParsedSegment) -> Result<Record, FormatError> {
         if segment.fields.len() > self.max_fields {
             return Err(FormatError::Hl7(format!(
                 "segment {:?} carries {} data fields, exceeding the configured max_fields of {}; \
@@ -400,18 +459,52 @@ impl<R: Read> Hl7Reader<R> {
             Some(msg) => (msg.control_id.clone(), msg.message_type.clone()),
             None => (String::new(), String::new()),
         };
+        let delims = self.tokenizer.delimiters();
 
-        let mut values: Vec<Value> = Vec::with_capacity(3 + self.max_fields);
+        let mut values: Vec<Value> = Vec::with_capacity(3 + self.schema.columns().len());
         values.push(Value::String(segment.tag.as_str().into()));
         values.push(string_or_null(&set_ref));
         values.push(string_or_null(&set_type));
-        for i in 0..self.max_fields {
-            match segment.fields.get(i) {
-                Some(f) => values.push(string_or_null(f)),
-                None => values.push(Value::Null),
-            }
+        for group in &self.field_layout {
+            self.push_field_group(raw, segment, group, &delims, &mut values)?;
         }
         Ok(Record::new(Arc::clone(&self.schema), values))
+    }
+
+    /// Append a field group's values to a record's value list: one cell for a
+    /// verbatim field (the decoded value, or `Null` when absent), or one cell
+    /// per leaf for a split field. A split reads the *raw* field text (re-cut
+    /// from the original segment string) so an escaped separator stays inside
+    /// its leaf rather than being mistaken for a structural boundary.
+    fn push_field_group(
+        &self,
+        raw: &str,
+        segment: &ParsedSegment,
+        group: &FieldGroup,
+        delims: &Delimiters,
+        values: &mut Vec<Value>,
+    ) -> Result<(), FormatError> {
+        match group {
+            FieldGroup::Verbatim { position } => match segment.fields.get(position - 1) {
+                Some(f) => values.push(string_or_null(f)),
+                None => values.push(Value::Null),
+            },
+            FieldGroup::Split(split) => {
+                let leaves = match raw_field(raw, delims, split.field_index) {
+                    Some(raw_text) => split.split_value(&raw_text, delims)?,
+                    // The split field is absent on this segment (a shorter
+                    // segment than the split position): every leaf is null.
+                    None => vec![None; split.column_count()],
+                };
+                for leaf in leaves {
+                    values.push(match leaf {
+                        Some(text) => string_or_null(&text),
+                        None => Value::Null,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -544,16 +637,20 @@ fn parse_optional_count(
     }
 }
 
-/// Build the static positional schema `[seg_id, set_ref, set_type,
-/// f01..f<max>]`. All columns are string-typed; field text is stored
-/// verbatim (escapes decoded) so the round-trip is lossless.
-fn build_schema(max_fields: usize) -> Arc<Schema> {
-    let mut columns: Vec<Box<str>> = Vec::with_capacity(3 + max_fields);
+/// Build the static positional schema `[seg_id, set_ref, set_type, <field
+/// columns>]` from the field layout. A verbatim field contributes one `fNN`
+/// column; a split field contributes its structured leaf columns in place of
+/// `fNN`. All columns are string-typed; field text is stored verbatim
+/// (escapes decoded) so the round-trip is lossless.
+fn build_schema(layout: &[FieldGroup]) -> Arc<Schema> {
+    let mut columns: Vec<Box<str>> = Vec::with_capacity(3 + layout.len());
     columns.push(Box::from("seg_id"));
     columns.push(Box::from("set_ref"));
     columns.push(Box::from("set_type"));
-    for i in 0..max_fields {
-        columns.push(positional_key(i).into_boxed_str());
+    for group in layout {
+        for name in group.column_names() {
+            columns.push(name.into_boxed_str());
+        }
     }
     Arc::new(Schema::new(columns))
 }
@@ -603,6 +700,37 @@ mod tests {
             out.push(rec);
         }
         out
+    }
+
+    fn reader_with_splits(
+        data: &str,
+        split_fields: Vec<Hl7FieldSplit>,
+    ) -> Hl7Reader<Cursor<Vec<u8>>> {
+        Hl7Reader::new(
+            Cursor::new(data.as_bytes().to_vec()),
+            Hl7ReaderConfig {
+                max_fields: DEFAULT_MAX_FIELDS,
+                split_fields,
+            },
+        )
+    }
+
+    fn collect_with_splits(data: &str, split_fields: Vec<Hl7FieldSplit>) -> Vec<Record> {
+        let mut r = reader_with_splits(data, split_fields);
+        let mut out = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            out.push(rec);
+        }
+        out
+    }
+
+    fn split(field_index: usize, reps: usize, comps: usize, subs: usize) -> Hl7FieldSplit {
+        Hl7FieldSplit {
+            field_index,
+            repetitions: reps,
+            components: comps,
+            subcomponents: subs,
+        }
     }
 
     #[test]
@@ -856,7 +984,10 @@ mod tests {
         let data = format!("{MSH}\rZZZ|a|b|c|d|e");
         let mut r = Hl7Reader::new(
             Cursor::new(data.into_bytes()),
-            Hl7ReaderConfig { max_fields: 2 },
+            Hl7ReaderConfig {
+                max_fields: 2,
+                split_fields: Vec::new(),
+            },
         );
         let err = loop {
             match r.next_record() {
@@ -866,6 +997,75 @@ mod tests {
             }
         };
         assert!(matches!(err, FormatError::Hl7(m) if m.contains("max_fields")));
+    }
+
+    #[test]
+    fn split_replaces_verbatim_column_with_components() {
+        // Splitting MSH-9 (f08) into two components exposes the message code
+        // and trigger event as separate columns; the verbatim `f08` is gone.
+        let recs = collect_with_splits(&adt_message(), vec![split(8, 1, 2, 1)]);
+        let msh = &recs[0];
+        assert_eq!(msh.get("f08_c1"), Some(&Value::String("ADT".into())));
+        assert_eq!(msh.get("f08_c2"), Some(&Value::String("A01".into())));
+        // The whole-field column is replaced by the split columns.
+        assert_eq!(msh.get("f08"), None);
+        // Neighboring fields are untouched and keep their verbatim columns.
+        assert_eq!(msh.get("f07"), Some(&Value::Null)); // MSH-8 empty
+        assert_eq!(msh.get("f09"), Some(&Value::String("MSG001".into())));
+    }
+
+    #[test]
+    fn split_applies_to_every_segment_positionally() {
+        // A split on f03 explodes field 3 of *every* segment, not just MSH.
+        // PID-3 here is `PATID^^^MRN`; EVN-3 is absent.
+        let recs = collect_with_splits(&adt_message(), vec![split(3, 1, 4, 1)]);
+        let pid = &recs[2];
+        assert_eq!(pid.get("f03_c1"), Some(&Value::String("PATID".into())));
+        assert_eq!(pid.get("f03_c2"), Some(&Value::Null)); // empty component
+        assert_eq!(pid.get("f03_c3"), Some(&Value::Null));
+        assert_eq!(pid.get("f03_c4"), Some(&Value::String("MRN".into())));
+        // EVN has no field 3 — every leaf is null.
+        let evn = &recs[1];
+        assert_eq!(evn.get("f03_c1"), Some(&Value::Null));
+        assert_eq!(evn.get("f03_c4"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn split_default_behavior_unchanged_without_declaration() {
+        // With no split declared, the field stays verbatim — byte-identical
+        // to the positional model.
+        let recs = collect(&adt_message());
+        assert_eq!(
+            recs[2].get("f03"),
+            Some(&Value::String("PATID^^^MRN".into()))
+        );
+    }
+
+    #[test]
+    fn split_component_overflow_errors() {
+        // f08 carries two components; declaring one is an overflow.
+        let mut r = reader_with_splits(&adt_message(), vec![split(8, 1, 1, 1)]);
+        let err = loop {
+            match r.next_record() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected component overflow"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, FormatError::Hl7(m) if m.contains("component")));
+    }
+
+    #[test]
+    fn split_on_escaped_separator_keeps_one_component() {
+        // A field carrying an escaped component separator (`\S\`) is one
+        // component of literal data, not two — the split must run on the raw
+        // bytes before the escape decodes to a `^`.
+        let data = format!("{MSH}\rOBX|1|TX|note||CODE\\S\\TEXT");
+        let recs = collect_with_splits(&data, vec![split(5, 1, 2, 1)]);
+        let obx = &recs[1];
+        // The whole escaped value decodes into one component.
+        assert_eq!(obx.get("f05_c1"), Some(&Value::String("CODE^TEXT".into())));
+        assert_eq!(obx.get("f05_c2"), Some(&Value::Null));
     }
 
     fn fhs_section(fields: &[(&str, EnvelopeFieldType)]) -> EnvelopeConfig {
@@ -1009,5 +1209,64 @@ mod tests {
             Some(&Value::String("PATID^^^MRN~ALT^^^MR".into()))
         );
         assert_eq!(recs2[2].get("f05"), Some(&Value::String("a|b".into())));
+    }
+
+    /// A split composite field must re-assemble byte-identically on write:
+    /// reader explodes the field into component columns, the writer rejoins
+    /// them on the discovered separator (verbatim, never escaped), and a
+    /// re-read reproduces the same components.
+    #[test]
+    fn split_field_reassembles_byte_identically_on_round_trip() {
+        use crate::hl7::writer::{Hl7Writer, Hl7WriterConfig};
+        use crate::traits::FormatWriter;
+
+        // Split MSH-9 (f08) into two components and PID-3 (f03) into four.
+        let splits = vec![split(8, 1, 2, 1), split(3, 1, 4, 1)];
+        let input = format!("{MSH}\rPID|1||PATID^^^MRN");
+
+        let body_recs = collect_with_splits(&input, splits.clone());
+        assert_eq!(body_recs.len(), 2); // MSH, PID
+        assert_eq!(
+            body_recs[0].get("f08_c1"),
+            Some(&Value::String("ADT".into()))
+        );
+        assert_eq!(
+            body_recs[0].get("f08_c2"),
+            Some(&Value::String("A01".into()))
+        );
+        assert_eq!(
+            body_recs[1].get("f03_c1"),
+            Some(&Value::String("PATID".into()))
+        );
+        assert_eq!(
+            body_recs[1].get("f03_c4"),
+            Some(&Value::String("MRN".into()))
+        );
+
+        // Re-emit: the writer re-assembles the split columns into the exact
+        // wire fields, separators verbatim.
+        let schema = reader_with_splits(&input, splits.clone()).schema().unwrap();
+        let out = {
+            let mut buf = Vec::new();
+            let mut w = Hl7Writer::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                Hl7WriterConfig::default(),
+            );
+            for rec in &body_recs {
+                w.write_record(rec).unwrap();
+            }
+            w.flush().unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        // MSH-9 and PID-3 are reconstructed byte-identically; no `\S\` escape.
+        assert!(out.contains("|ADT^A01|"), "MSH-9 reassembly wrong: {out}");
+        assert!(out.contains("PID|1||PATID^^^MRN\r"), "PID-3 wrong: {out}");
+        assert!(!out.contains("\\S\\"), "component separator escaped: {out}");
+
+        // Re-read with the same splits: the components come back identical.
+        let recs2 = collect_with_splits(&out, splits);
+        assert_eq!(recs2[1].get("f03_c4"), Some(&Value::String("MRN".into())));
+        assert_eq!(recs2[0].get("f08_c2"), Some(&Value::String("A01".into())));
     }
 }

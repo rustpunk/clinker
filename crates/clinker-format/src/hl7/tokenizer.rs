@@ -356,12 +356,35 @@ pub(crate) fn split_segment(raw: &str, delims: &Delimiters) -> ParsedSegment {
     ParsedSegment { tag, fields }
 }
 
+/// Return the *raw* (still-escaped) text of one data field by its 1-based
+/// wire position, or `None` when the segment has no such field.
+///
+/// Composite-field splitting consults this for the few split positions only:
+/// the split must run on the raw separators before [`decode_escapes`] turns
+/// an escaped `\S\` into a literal `^` that is data, not a component
+/// boundary. The common no-split path never calls it, so the verbatim
+/// positional decode pays nothing extra. The first part is the tag, so wire
+/// field `position` is part index `position` (the tag occupies index 0).
+pub(crate) fn raw_field(raw: &str, delims: &Delimiters, position: usize) -> Option<String> {
+    let field = delims.field;
+    raw.as_bytes()
+        .split(|&b| b == field)
+        .nth(position)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+}
+
 /// Decode HL7 `\X\` escape sequences in a field's bytes into their literal
 /// delimiter byte. A recognized sequence (`\F\ \S\ \T\ \R\ \E\`) is
 /// replaced with the byte it names; an unrecognized or unterminated escape
 /// run is kept verbatim, so application escapes (`\.br\`, `\Xdd..\`) and
 /// malformed input survive rather than silently dropping data.
-fn decode_escapes(bytes: &[u8], delims: &Delimiters) -> String {
+///
+/// Composite-field splitting splits the raw (still-escaped) field on the
+/// structural separators first, then decodes each leaf through this same
+/// function — so an escaped `\S\` (a literal `^` in data, not a component
+/// boundary) decodes to a `^` inside one leaf rather than wrongly splitting
+/// the field. Sharing this one decoder keeps the escape rules unforked.
+pub(crate) fn decode_escapes(bytes: &[u8], delims: &Delimiters) -> String {
     let escape = delims.escape;
     if !bytes.contains(&escape) {
         return String::from_utf8_lossy(bytes).into_owned();

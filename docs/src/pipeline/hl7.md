@@ -115,6 +115,72 @@ nodes:
         - { name: f01, type: string }
 ```
 
+## Component splitting (optional)
+
+By default a composite field rides inside one `fNN` column with its
+component (`^`), repetition (`~`), and sub-component (`&`) separators intact
+— the positional model deliberately works above component resolution. When
+you want component-level access (the message code `MSH-9.1` vs the trigger
+event `MSH-9.2`) without writing CXL string-splitting downstream, opt one or
+more fields into splitting with `split_fields`. The reader explodes the
+named field into structured columns, and an HL7 Output re-assembles the
+exact wire field from them, so an HL7→HL7 round-trip stays byte-identical.
+
+```yaml
+options:
+  split_fields:
+    - { field: f08, components: 2 }                       # MSH-9 → message code + trigger
+    - { field: f03, components: 5 }                       # PID-3 (CX) → its components
+    - { field: f04, components: 2, subcomponents: 3 }     # also expose sub-components
+    - { field: f13, components: 1, repetitions: 4 }       # repeating field → per-repetition
+```
+
+Each split fixes the column width on three structural axes: `components`
+(required, the `^` axis), `subcomponents` (default 1, the `&` axis), and
+`repetitions` (default 1, the `~` axis). The schema stays static — it never
+varies with per-record data. A field whose data carries more structure on
+any axis than the declaration reserves is rejected with guidance, the same
+posture as a `max_fields` overflow; raise the axis count or leave the field
+unsplit.
+
+The exploded columns name the path from the field down to a leaf with the
+axis letters `r`, `c`, `s`, all 1-based, eliding the default index (`1`) on
+the repetition and sub-component axes so the common component-only case
+stays clean:
+
+| Declaration                                | Columns for `f08`            |
+| ------------------------------------------ | ---------------------------- |
+| `components: 2`                            | `f08_c1`, `f08_c2`          |
+| `components: 1, subcomponents: 2`          | `f08_c1_s1`, `f08_c1_s2`    |
+| `components: 1, repetitions: 2`            | `f08_r1_c1`, `f08_r2_c1`    |
+
+The verbatim `fNN` column is replaced by the structured columns. Declare the
+exploded column names in the source `schema:` block (or rely on
+`on_unmapped`) the same way you would any other column:
+
+```yaml
+options:
+  split_fields:
+    - { field: f08, components: 2 }
+schema:
+  - { name: seg_id, type: string }
+  - { name: f08_c1, type: string }   # MSH-9.1 message code
+  - { name: f08_c2, type: string }   # MSH-9.2 trigger event
+```
+
+```cxl
+emit code    = f08_c1
+emit trigger = f08_c2
+```
+
+Splitting respects the escape rules: an escaped separator (e.g. `\S\`, a
+literal `^` in data) is **not** treated as a component boundary — the split
+runs on the raw bytes before the escape decodes, so the literal stays inside
+one component. On output the writer re-joins the leaves on the separators
+verbatim (never escaping `^`/`~`/`&`) and still escapes any field-separator,
+escape, or carriage-return byte inside a leaf, so the round-trip is
+byte-faithful.
+
 ## Envelope sections over the tiers
 
 The file header `FHS` is extractable as a file-level document envelope
@@ -174,8 +240,11 @@ stream, escaping any field data that carries a delimiter byte. Records map
 by the same positional columns (`seg_id`, `fNN`); trailing `null`/empty
 fields are trimmed so no fabricated delimiters appear, and a column the
 writer does not recognize is an error (project the record to the HL7
-columns first). The reader-stamped `set_ref`/`set_type` echoes and
-engine-internal `$`-namespaced columns are excluded automatically.
+columns first). Split-leaf columns (`f08_c1`, `f03_r2_c1_s3`) are recognized
+too — the writer groups them by field and re-assembles the wire value from
+the column names alone, so no output option is needed to round-trip a split
+source. The reader-stamped `set_ref`/`set_type` echoes and engine-internal
+`$`-namespaced columns are excluded automatically.
 
 ```yaml
 nodes:
@@ -220,10 +289,12 @@ no source `FHS` section to echo.
 
 - **Charset.** Field text is decoded as UTF-8. Non-UTF-8 messages are
   rejected explicitly rather than silently corrupted.
-- **Positional fields, not component trees.** Components, repetitions, and
-  sub-components ride inside one positional `fNN` field verbatim; the reader
-  decodes only the `\X\` delimiter escapes. Split a composite field with CXL
-  string operations downstream when component-level access is needed.
+- **Positional fields by default; opt-in component columns.** Components,
+  repetitions, and sub-components ride inside one positional `fNN` field
+  verbatim unless that field is named in `split_fields` (see *Component
+  splitting* above), in which case the reader explodes it into structured
+  columns and the writer re-assembles them. The reader always decodes the
+  `\X\` delimiter escapes regardless.
 - **HL7 v3 and FHIR are out of scope.** HL7 v3 is XML (use the `xml`
   format) and FHIR is JSON/REST (use the `json` format); this format
   handles HL7 v2.x pipe-and-hat encoding only.

@@ -579,4 +579,56 @@ pub struct Hl7InputOptions {
     /// guidance rather than silently truncated. Defaults to 64.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_fields: Option<usize>,
+    /// Opt-in composite-field splits. Each entry explodes one positional
+    /// field into per-component (and optionally per-sub-component /
+    /// per-repetition) columns, replacing the verbatim `fNN` column with the
+    /// structured columns; the writer re-assembles the wire field from them.
+    /// Absent by default, so the positional model is byte-identical to today
+    /// unless a split is declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_fields: Option<Vec<Hl7FieldSplitOption>>,
+}
+
+/// One opt-in HL7 composite-field split declaration.
+///
+/// Names the positional field to explode and the column width on each
+/// structural axis. The default index (1) on the repetition and
+/// sub-component axes is elided from the column names, so a component-only
+/// split yields clean `fNN_cC` columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hl7FieldSplitOption {
+    /// The positional field column to explode (`f08`). The wire position is
+    /// parsed from the `fNN` suffix.
+    pub field: String,
+    /// Number of component columns to expose (the `^` axis). At least 1.
+    pub components: usize,
+    /// Number of sub-component columns to expose per component (the `&`
+    /// axis). Defaults to 1 (no sub-component explosion).
+    #[serde(default = "one")]
+    pub subcomponents: usize,
+    /// Number of repetition columns to expose (the `~` axis). Defaults to 1
+    /// (no repetition explosion).
+    #[serde(default = "one")]
+    pub repetitions: usize,
+}
+
+impl Hl7FieldSplitOption {
+    /// Parse the 1-based wire field position from `field` (`f08` → 8), or
+    /// `None` when it is not an `f`-prefixed digit run or names position 0.
+    /// Config validation rejects a `None` before the reader is built.
+    pub fn field_position(&self) -> Option<usize> {
+        let rest = self.field.strip_prefix('f')?;
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let position: usize = rest.parse().ok()?;
+        (position >= 1).then_some(position)
+    }
+}
+
+/// Default axis width: a single column. Used by the optional
+/// `subcomponents` / `repetitions` split-declaration fields.
+fn one() -> usize {
+    1
 }
