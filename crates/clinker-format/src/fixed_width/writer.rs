@@ -1,8 +1,9 @@
 use std::io::Write;
 
 use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator, TruncationPolicy};
-use clinker_record::{Record, Value};
+use clinker_record::{DocumentContext, Record, Value};
 
+use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
@@ -10,12 +11,19 @@ use crate::traits::FormatWriter;
 #[derive(Clone)]
 pub struct FixedWidthWriterConfig {
     pub line_separator: LineSeparator,
+    /// Per-document envelope reconstruction. `None` (the default) renders no
+    /// framing. `Some` is set by the executor under `reconstruct_envelope:
+    /// true`. A computed footer record count is rejected at plan time (E346)
+    /// for fixed-width, so the spec the executor passes here never carries
+    /// `footer_record_count_field`.
+    pub envelope: Option<OutputEnvelopeSpec>,
 }
 
 impl Default for FixedWidthWriterConfig {
     fn default() -> Self {
         Self {
             line_separator: LineSeparator::Lf,
+            envelope: None,
         }
     }
 }
@@ -31,11 +39,19 @@ struct WriteField {
 
 /// Schema-driven fixed-width record writer.
 /// Type-aware truncation: numeric -> Error, string -> Warn (configurable per field).
+///
+/// Under `reconstruct_envelope`, `begin_document` emits the header section's
+/// field values as one leading line and `end_document` the footer's as one
+/// trailing line, each joined positionally in declared field order with the
+/// configured line separator. The body streams between them, so framing stays
+/// O(1-record).
 pub struct FixedWidthWriter<W: Write> {
     writer: W,
     fields: Vec<WriteField>,
     config: FixedWidthWriterConfig,
     truncation_warnings: Vec<String>,
+    /// Per-document envelope framer, present only when `config.envelope` is.
+    framer: Option<EnvelopeFramer>,
 }
 
 impl<W: Write> FixedWidthWriter<W> {
@@ -91,12 +107,42 @@ impl<W: Write> FixedWidthWriter<W> {
             })
             .collect::<Result<_, FormatError>>()?;
 
+        let framer = config
+            .envelope
+            .clone()
+            .and_then(OutputEnvelopeSpec::into_framer);
         Ok(Self {
             writer,
             fields: resolved,
             config,
             truncation_warnings: Vec::new(),
+            framer,
         })
+    }
+
+    /// Emit one envelope section as a single fixed-width line: the section's
+    /// field values (in declared order) concatenated, then the configured line
+    /// separator. Envelope sections carry no width schema, so values are
+    /// written unpadded — a header/trailer LINE round-trips, but not a
+    /// column-positioned one (that would need a width declaration the envelope
+    /// config does not carry). Called only for a section the document actually
+    /// carries (a missing section emits no line). A computed footer count is
+    /// rejected at plan time for fixed-width (E346).
+    fn write_section_line(
+        &mut self,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
+    ) -> Result<(), FormatError> {
+        let mut line = String::new();
+        for value in fields.values() {
+            line.push_str(&value_to_envelope_cell(value));
+        }
+        self.writer.write_all(line.as_bytes())?;
+        match self.config.line_separator {
+            LineSeparator::Lf => self.writer.write_all(b"\n")?,
+            LineSeparator::CrLf => self.writer.write_all(b"\r\n")?,
+            LineSeparator::None => {}
+        }
+        Ok(())
     }
 
     /// Get any truncation warnings emitted during writing.
@@ -215,11 +261,56 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
             LineSeparator::None => {} // no separator
         }
 
+        if let Some(framer) = self.framer.as_mut() {
+            framer.count_record();
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), FormatError> {
         self.writer.flush().map_err(FormatError::Io)
+    }
+
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(framer) = self.framer.as_mut() else {
+            return Ok(());
+        };
+        framer.begin();
+        // Clone the header fields out so the immutable framer borrow ends
+        // before the `&mut self` write below; `None` (document lacks the
+        // configured section) emits no header line.
+        let header = framer.header_fields(doc).cloned();
+        if let Some(fields) = header.as_ref() {
+            self.write_section_line(fields)?;
+        }
+        Ok(())
+    }
+
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(framer) = self.framer.as_ref() else {
+            return Ok(());
+        };
+        let footer = framer.footer_fields(doc).cloned();
+        if let Some(fields) = footer.as_ref() {
+            self.write_section_line(fields)?;
+        }
+        Ok(())
+    }
+}
+
+/// Stringify an envelope section value for a fixed-width header/trailer line.
+/// Envelope sections carry no width schema, so values are written as their
+/// natural string form (no padding); `Null` is the empty string.
+fn value_to_envelope_cell(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => s.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Date(d) => d.format("%Y%m%d").to_string(),
+        Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
+        Value::Array(_) | Value::Map(_) => String::new(),
     }
 }
 
@@ -499,5 +590,43 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
+
+    #[test]
+    fn fixed_width_envelope_emits_header_and_footer_lines() {
+        // A header line and a footer line bracket the body, each joining the
+        // section's field values (unpadded — envelope sections carry no width
+        // schema). A computed footer count is rejected at plan time for
+        // fixed-width (E346), so the spec here carries none.
+        let mut amount = field("amount");
+        amount.field_type = Some(FieldType::Integer);
+        amount.width = Some(5);
+        amount.justify = Some(Justify::Right);
+        amount.pad = Some("0".into());
+        let config = FixedWidthWriterConfig {
+            line_separator: LineSeparator::Lf,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: None,
+            }),
+        };
+        let doc = doc_with_sections(&[
+            ("Head", &[("tag", Value::String("HDR".into()))]),
+            ("Foot", &[("tag", Value::String("TRL".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = FixedWidthWriter::new(&mut buf, vec![amount], config).unwrap();
+            w.begin_document(&doc).unwrap();
+            w.write_record(&make_record(&["amount"], vec![Value::Integer(7)]))
+                .unwrap();
+            w.end_document(&doc).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "HDR\n00007\nTRL\n", "got: {out}");
     }
 }

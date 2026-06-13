@@ -52,6 +52,48 @@ impl DocumentId {
     pub const SYNTHETIC: Self = Self(0);
 }
 
+/// Identity of the per-outermost-logical-document **frame** a record belongs
+/// to — the grain at which the engine reconstructs an output envelope.
+///
+/// A frame is NOT always the innermost or the outermost envelope level: it is
+/// whichever level the source format treats as one logical document.
+///
+/// - X12 (ISA → GS → ST): the frame is the **interchange** (the file-level
+///   `ISA`). The `GS` functional group and `ST` transaction set
+///   [`DocumentContext::child`] levels INHERIT the interchange grain, so a
+///   whole interchange frames as one document.
+/// - HL7 (FHS → BHS → MSH): the frame is the **message**. Each `MSH` opens a
+///   fresh grain via [`DocumentContext::child_frame`], so a multi-message file
+///   frames once per message.
+/// - EDIFACT, CSV, JSON, XML, fixed-width: the file is the only level, so the
+///   frame is the file (one grain per file).
+///
+/// `Copy`/`Eq`/`Hash` so the envelope-writer boundary detector can key on it
+/// directly. Two contexts of the same frame (e.g. the `GS` and `ST` of one X12
+/// interchange) compare equal even though their own [`DocumentId`]s differ.
+///
+/// This is distinct from the document-DLQ's keying: the DLQ keys on
+/// `source_file` (the file grain), because a structural-count failure condemns
+/// a whole file. The two never co-execute — `reconstruct_envelope` and
+/// `dlq_granularity: document` are mutually exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DocumentGrain(DocumentId);
+
+impl DocumentGrain {
+    /// The grain shared by every record produced outside a real document
+    /// (Transform synthesis, fan-in merge rows, test fixtures) — the grain of
+    /// the [`DocumentId::SYNTHETIC`] context. Such records belong to no frame,
+    /// so callers treat this grain as "unframed".
+    pub const SYNTHETIC: Self = Self(DocumentId::SYNTHETIC);
+
+    /// The inner [`DocumentId`] this grain is identified by — the id of the
+    /// framing level (the X12 interchange, the HL7 message, or the file).
+    pub fn document_id(self) -> DocumentId {
+        self.0
+    }
+}
+
 /// Envelope context for one document.
 ///
 /// One per source file. The `sections` map holds every envelope section
@@ -65,6 +107,11 @@ impl DocumentId {
 #[derive(Debug)]
 pub struct DocumentContext {
     id: DocumentId,
+    /// The frame this context belongs to. A file-level context's grain is its
+    /// own [`DocumentId`]; a [`Self::child`] level inherits its parent's
+    /// grain; a [`Self::child_frame`] level mints a new grain from its own id.
+    /// See [`DocumentGrain`] for the per-format mapping.
+    grain: DocumentGrain,
     source_file: Arc<str>,
     sections: IndexMap<Box<str>, Value>,
 }
@@ -73,9 +120,14 @@ impl DocumentContext {
     /// Build a populated document context for a single source file.
     /// Called once per file by the source ingest path after the reader's
     /// envelope pre-scan returns the section map.
+    ///
+    /// The file-level document is its own frame: its [`grain`](Self::grain)
+    /// is derived from `id`. Nested levels inherit or re-mint this grain via
+    /// [`Self::child`] / [`Self::child_frame`].
     pub fn new(id: DocumentId, source_file: Arc<str>, sections: IndexMap<Box<str>, Value>) -> Self {
         Self {
             id,
+            grain: DocumentGrain(id),
             source_file,
             sections,
         }
@@ -84,6 +136,15 @@ impl DocumentContext {
     /// Opaque identity for dedup and per-document bucketing.
     pub fn id(&self) -> DocumentId {
         self.id
+    }
+
+    /// The frame this record belongs to — the grain at which output-envelope
+    /// reconstruction operates (the document-DLQ keys on `source_file`
+    /// instead; see [`DocumentGrain`]). Equal across every level of one frame
+    /// (e.g. an X12 interchange's `ISA`/`GS`/`ST` contexts all report the
+    /// interchange grain); distinct per HL7 message.
+    pub fn grain(&self) -> DocumentGrain {
+        self.grain
     }
 
     /// Originating source file path. Equal to `$source.file` for records
@@ -114,12 +175,35 @@ impl DocumentContext {
     /// — envelope payloads are small (a few fields per level), so the copy
     /// is O(declared sections), not O(body).
     pub fn child(&self, id: DocumentId, sections: IndexMap<Box<str>, Value>) -> Self {
+        self.child_inner(id, sections, self.grain)
+    }
+
+    /// Open a nested level that begins a NEW document frame.
+    ///
+    /// Identical to [`Self::child`] in section flattening and `source_file`
+    /// inheritance, but the new level's [`grain`](Self::grain) is minted from
+    /// its own `id` rather than inherited from the parent. Used for formats
+    /// whose framing document is a nested level repeated within one file:
+    /// each HL7 `MSH` message opens a fresh frame, so a multi-message file
+    /// reconstructs one output envelope per message, while still resolving the
+    /// enclosing `FHS`/`BHS` `$doc.*` sections through the flattened map.
+    pub fn child_frame(&self, id: DocumentId, sections: IndexMap<Box<str>, Value>) -> Self {
+        self.child_inner(id, sections, DocumentGrain(id))
+    }
+
+    fn child_inner(
+        &self,
+        id: DocumentId,
+        sections: IndexMap<Box<str>, Value>,
+        grain: DocumentGrain,
+    ) -> Self {
         let mut merged = self.sections.clone();
         for (name, payload) in sections {
             merged.insert(name, payload);
         }
         Self {
             id,
+            grain,
             source_file: Arc::clone(&self.source_file),
             sections: merged,
         }
@@ -139,6 +223,22 @@ impl DocumentContext {
             _ => None,
         }
     }
+
+    /// Borrow a whole section's ordered field map by name, for an output
+    /// writer reconstructing a per-document header/footer that echoes every
+    /// field of a `$doc` section in declared order.
+    ///
+    /// Returns `None` when the section is undeclared on this document or its
+    /// payload is not a [`Value::Map`] (the envelope config schema is always
+    /// `fields:`-shaped, so a non-Map payload means the reader emitted an
+    /// unexpected shape). The borrow is O(1) — no field is cloned; the writer
+    /// iterates the returned map in insertion order.
+    pub fn section_fields(&self, section: &str) -> Option<&IndexMap<Box<str>, Value>> {
+        match self.sections.get(section)? {
+            Value::Map(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 // ── Spill codec ─────────────────────────────────────────────────────────────
@@ -149,14 +249,17 @@ impl DocumentContext {
 // `Arc<str>` source file must collapse to its bytes on the wire and rebuild as
 // a fresh `Arc<str>` on read (the in-memory `Arc` identity does not — and need
 // not — survive the spill boundary; see the module-level note on per-document
-// re-hydration). The shape is a 3-tuple mirroring `Value::Map`'s pair-vec
+// re-hydration). The shape is a 4-tuple mirroring `Value::Map`'s pair-vec
 // encoding so section insertion order is preserved exactly:
-//   (DocumentId, source_file: &str, sections: Vec<(&str, &Value)>)
-// On read each `(String, Value)` pair re-inserts in order into a fresh
-// `IndexMap`, and the source file rebuilds via `Arc::from`.
+//   (DocumentId, DocumentGrain, source_file: &str, sections: Vec<(&str, &Value)>)
+// The `grain` rides the wire so a spilled record stays in the SAME envelope
+// frame it carried before spilling —
+// it is not re-derived from `id` on read, because a nested HL7 message frame's
+// grain differs from its own id. On read each `(String, Value)` pair re-inserts
+// in order into a fresh `IndexMap`, and the source file rebuilds via `Arc::from`.
 
 impl Serialize for DocumentContext {
-    /// Serializes this context as `(id, source_file, ordered section pairs)`.
+    /// Serializes this context as `(id, grain, source_file, ordered section pairs)`.
     ///
     /// Used only by the spill interning path, which writes one context frame
     /// per distinct document per file (`O(distinct documents)`, never
@@ -165,8 +268,9 @@ impl Serialize for DocumentContext {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let pairs: Vec<(&str, &Value)> =
             self.sections.iter().map(|(k, v)| (k.as_ref(), v)).collect();
-        let mut tup = serializer.serialize_tuple(3)?;
+        let mut tup = serializer.serialize_tuple(4)?;
         tup.serialize_element(&self.id)?;
+        tup.serialize_element(&self.grain)?;
         tup.serialize_element(self.source_file.as_ref())?;
         tup.serialize_element(&pairs)?;
         tup.end()
@@ -174,13 +278,14 @@ impl Serialize for DocumentContext {
 }
 
 impl<'de> Deserialize<'de> for DocumentContext {
-    /// Reconstructs a context from `(id, source_file, ordered section pairs)`.
+    /// Reconstructs a context from `(id, grain, source_file, ordered section pairs)`.
     ///
     /// Rebuilds the `source_file` as a fresh `Arc<str>` and re-inserts the
     /// section pairs into a new `IndexMap` in wire order, so a document's
     /// section ordering survives a spill round-trip. The rebuilt `Arc<str>`
     /// is a distinct allocation from the live ingest stream's — equality is
-    /// by content, not pointer identity.
+    /// by content, not pointer identity. The `grain` round-trips verbatim so
+    /// the record stays governed by the frame it spilled with.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ContextVisitor;
 
@@ -188,32 +293,39 @@ impl<'de> Deserialize<'de> for DocumentContext {
             type Value = DocumentContext;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a (DocumentId, source_file, sections) tuple")
+                write!(
+                    f,
+                    "a (DocumentId, DocumentGrain, source_file, sections) tuple"
+                )
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<DocumentContext, A::Error> {
                 let id: DocumentId = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-                let source_file: std::string::String = seq
+                let grain: DocumentGrain = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                let pairs: Vec<(std::string::String, Value)> = seq
+                let source_file: std::string::String = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let pairs: Vec<(std::string::String, Value)> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
                 let mut sections = IndexMap::with_capacity(pairs.len());
                 for (k, v) in pairs {
                     sections.insert(k.into_boxed_str(), v);
                 }
                 Ok(DocumentContext {
                     id,
+                    grain,
                     source_file: Arc::from(source_file.as_str()),
                     sections,
                 })
             }
         }
 
-        deserializer.deserialize_tuple(3, ContextVisitor)
+        deserializer.deserialize_tuple(4, ContextVisitor)
     }
 }
 
@@ -222,6 +334,7 @@ fn synthetic_storage() -> &'static Arc<DocumentContext> {
     SYNTHETIC.get_or_init(|| {
         Arc::new(DocumentContext {
             id: DocumentId::SYNTHETIC,
+            grain: DocumentGrain::SYNTHETIC,
             source_file: Arc::from(""),
             sections: IndexMap::new(),
         })
@@ -351,6 +464,64 @@ mod tests {
         );
         // The parent never gained the child's section.
         assert!(parent.get_section_field("group", "functional_id").is_none());
+
+        // X12 grain: a `child` level INHERITS the parent's frame grain, so a
+        // GS/ST level reports the interchange (ISA file-level) grain — one
+        // frame per interchange, not per transaction set.
+        assert_eq!(child.grain(), parent.grain());
+        assert_eq!(parent.grain().document_id(), parent.id());
+    }
+
+    #[test]
+    fn file_level_grain_is_its_own_id() {
+        // A file-level document (CSV/JSON/XML/fixed-width/EDIFACT and the X12
+        // ISA / HL7 FHS) is its own frame: grain == id.
+        let ctx = DocumentContext::new(DocumentId::next(), Arc::from("a.csv"), IndexMap::new());
+        assert_eq!(ctx.grain().document_id(), ctx.id());
+    }
+
+    #[test]
+    fn child_frame_mints_a_fresh_grain_per_level() {
+        // HL7 grain: each `MSH` message opens a fresh frame via `child_frame`,
+        // so two messages of one file get DISTINCT grains (one envelope frame
+        // per message) while still inheriting the file's `source_file` and any
+        // enclosing `$doc.*` sections.
+        let file: Arc<str> = Arc::from("messages.hl7");
+        let mut fhs = IndexMap::new();
+        fhs.insert(
+            Box::from("file_header"),
+            make_section(&[("sender", Value::String("LAB".into()))]),
+        );
+        let file_doc = DocumentContext::new(DocumentId::next(), Arc::clone(&file), fhs);
+
+        let msg1 = file_doc.child_frame(DocumentId::next(), IndexMap::new());
+        let msg2 = file_doc.child_frame(DocumentId::next(), IndexMap::new());
+
+        // Each message is its own frame.
+        assert_ne!(msg1.grain(), msg2.grain());
+        assert_eq!(msg1.grain().document_id(), msg1.id());
+        assert_eq!(msg2.grain().document_id(), msg2.id());
+        // And neither shares the file-level frame.
+        assert_ne!(msg1.grain(), file_doc.grain());
+        // Both still resolve the enclosing FHS section and share the file.
+        assert_eq!(
+            msg1.get_section_field("file_header", "sender"),
+            Some(Value::String("LAB".into()))
+        );
+        assert!(Arc::ptr_eq(msg1.source_file(), &file));
+        assert!(Arc::ptr_eq(msg2.source_file(), &file));
+    }
+
+    #[test]
+    fn grandchild_inherits_the_nearest_frame_grain() {
+        // A `child_frame` (HL7 message) followed by an ordinary `child`
+        // (a hypothetical sub-level) keeps the message's grain — `child`
+        // always inherits its parent's grain, wherever that frame began.
+        let file = DocumentContext::new(DocumentId::next(), Arc::from("f.hl7"), IndexMap::new());
+        let message = file.child_frame(DocumentId::next(), IndexMap::new());
+        let sub = message.child(DocumentId::next(), IndexMap::new());
+        assert_eq!(sub.grain(), message.grain());
+        assert_ne!(sub.grain(), file.grain());
     }
 
     #[test]
@@ -434,12 +605,28 @@ mod tests {
         );
         sections.insert(Box::from("m_section"), make_section(&[]));
         let id = DocumentId::next();
-        let ctx = DocumentContext::new(id, Arc::from("payments/run-001.xml"), sections);
+        // Model an HL7 message frame: build a file-level context, then a
+        // `child_frame` whose grain differs from its own id, so the round-trip
+        // proves the grain is carried verbatim (not re-derived from id).
+        let file_doc = DocumentContext::new(id, Arc::from("payments/run-001.xml"), IndexMap::new());
+        let ctx = file_doc.child_frame(DocumentId::next(), sections);
+        let expected_grain = ctx.grain();
+        let expected_id = ctx.id();
+        assert_ne!(
+            expected_grain.document_id(),
+            file_doc.id(),
+            "a child_frame's grain is its own id, distinct from the parent's"
+        );
 
         let bytes = postcard::to_stdvec(&ctx).unwrap();
         let back: DocumentContext = postcard::from_bytes(&bytes).unwrap();
 
-        assert_eq!(back.id(), id);
+        assert_eq!(back.id(), expected_id);
+        assert_eq!(
+            back.grain(),
+            expected_grain,
+            "grain round-trips verbatim, not re-derived from id"
+        );
         assert_eq!(back.source_file().as_ref(), "payments/run-001.xml");
         // Section names survive in insertion order, not sorted order.
         let names: Vec<&str> = back.sections.keys().map(|k| k.as_ref()).collect();

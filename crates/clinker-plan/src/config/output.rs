@@ -150,12 +150,66 @@ pub enum SplitOversizeGroupPolicy {
     Allow,
 }
 
+/// Per-document output-envelope reconstruction for the generic formats
+/// (CSV / JSON / XML / fixed-width).
+///
+/// Mirrors the EDI `*_from_doc` vocabulary: a named `$doc` section is echoed
+/// as the per-document HEADER before the body and another as the FOOTER after
+/// it, so a header/trailer-shaped source round-trips through a generic output.
+/// The footer may additionally carry a streaming-computed record count under
+/// a named field. Section names are arbitrary user-chosen identifiers — the
+/// engine reserves none; an unknown name is rejected at plan-validation time
+/// with diagnostic **E346**.
+///
+/// Bounded memory: the header is emitted on the document's first record and
+/// the footer on its close, with the body streamed one record at a time
+/// between them — no document's records are ever buffered. Active only when
+/// the Output also sets `reconstruct_envelope: true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutputEnvelopeConfig {
+    /// Name of the `$doc` section echoed as the per-document header, emitted
+    /// before the document's first body record. `None` writes no header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_from_doc: Option<String>,
+    /// Name of the `$doc` section echoed as the per-document footer, emitted
+    /// after the document's last body record. `None` writes no footer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_from_doc: Option<String>,
+    /// When set, the footer additionally carries the streaming-computed count
+    /// of body records written for the document, under this field name. The
+    /// count is maintained incrementally (one running integer), never by
+    /// buffering the body. Requires a `footer_from_doc` section to attach to.
+    /// Rejected with **E346** on a format that cannot inject a computed field
+    /// into its footer (fixed-width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer_record_count_field: Option<String>,
+}
+
+impl From<&OutputEnvelopeConfig> for clinker_format::OutputEnvelopeSpec {
+    /// Lower the plan config onto the format-local spec the writers consume.
+    /// The executor calls this only under `reconstruct_envelope: true`; the
+    /// resulting spec's `is_empty` / `into_framer` decide whether any framing
+    /// is rendered (so an empty config stays byte-identical to flag-off).
+    fn from(cfg: &OutputEnvelopeConfig) -> Self {
+        Self {
+            header_from_doc: cfg.header_from_doc.clone(),
+            footer_from_doc: cfg.footer_from_doc.clone(),
+            footer_record_count_field: cfg.footer_record_count_field.clone(),
+        }
+    }
+}
+
 /// CSV-specific output options.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CsvOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    /// Per-document envelope reconstruction (header/footer sections). Active
+    /// only with `reconstruct_envelope: true` on the Output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<OutputEnvelopeConfig>,
 }
 
 /// JSON-specific output options.
@@ -166,6 +220,13 @@ pub struct JsonOutputOptions {
     pub format: Option<JsonOutputFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pretty: Option<bool>,
+    /// Per-document envelope reconstruction. With this set and
+    /// `reconstruct_envelope: true`, the whole-stream array framing is
+    /// replaced by one JSON object per document: `{ "<header>": {...},
+    /// "body": [ ... ], "<footer>": {...} }`. Active only with
+    /// `reconstruct_envelope: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<OutputEnvelopeConfig>,
 }
 
 /// JSON output format mode.
@@ -185,6 +246,13 @@ pub struct XmlOutputOptions {
     pub root_element: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_element: Option<String>,
+    /// Per-document envelope reconstruction. With this set and
+    /// `reconstruct_envelope: true`, each document is wrapped in its own
+    /// `<record_element-doc>`-style frame carrying the header section, the
+    /// body records, and the footer section. Active only with
+    /// `reconstruct_envelope: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<OutputEnvelopeConfig>,
 }
 
 /// Fixed-width output options.
@@ -193,6 +261,15 @@ pub struct XmlOutputOptions {
 pub struct FixedWidthOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_separator: Option<LineSeparator>,
+    /// Per-document envelope reconstruction (header/footer rows). The header
+    /// section's fields are emitted as one leading line and the footer's as
+    /// one trailing line, joined positionally in declared field order. A
+    /// computed footer record count (`footer_record_count_field`) is rejected
+    /// at plan time with **E346** — a fixed-width line has no field to inject
+    /// a count into without a width declaration. Active only with
+    /// `reconstruct_envelope: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<OutputEnvelopeConfig>,
 }
 
 /// EDIFACT output options.

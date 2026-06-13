@@ -1,8 +1,9 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{DocumentContext, Record, Schema, Value};
 
+use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
@@ -17,6 +18,11 @@ pub struct CsvWriterConfig {
     /// default output unless the Output node opts in via
     /// `include_correlation_keys: true`.
     pub include_engine_stamped: bool,
+    /// Per-document envelope reconstruction. `None` (the default) renders no
+    /// framing and keeps the output byte-identical to the boundary-unaware
+    /// path. `Some` is set by the executor only when the Output declares
+    /// `reconstruct_envelope: true` with a non-empty envelope config.
+    pub envelope: Option<OutputEnvelopeSpec>,
 }
 
 impl Default for CsvWriterConfig {
@@ -25,6 +31,7 @@ impl Default for CsvWriterConfig {
             delimiter: b',',
             include_header: true,
             include_engine_stamped: false,
+            envelope: None,
         }
     }
 }
@@ -34,24 +41,60 @@ impl Default for CsvWriterConfig {
 /// Writes schema fields in schema order, then overflow fields in
 /// sorted key order (deterministic output). Header row is written
 /// on first `write_record()` call if `include_header` is true.
+///
+/// Under `reconstruct_envelope`, `begin_document` emits the header section's
+/// field values as one CSV row before the document's body, and `end_document`
+/// emits the footer section's values (plus the streaming record count) as one
+/// CSV row after it — no document is buffered, so framing stays O(1-record).
 pub struct CsvWriter<W: Write> {
     inner: csv::Writer<W>,
     schema: Arc<Schema>,
     config: CsvWriterConfig,
     header_written: bool,
+    /// Per-document envelope framer, present only when `config.envelope` is.
+    framer: Option<EnvelopeFramer>,
 }
 
 impl<W: Write> CsvWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: CsvWriterConfig) -> Self {
+        let framer = config
+            .envelope
+            .clone()
+            .and_then(OutputEnvelopeSpec::into_framer);
+        // Envelope header/footer rows carry a different field count than the
+        // body rows (a section's fields vs the record schema), so the writer
+        // must accept ragged records when framing is active. The non-envelope
+        // path keeps the strict equal-length default, preserving today's
+        // behavior and its UnequalLengths guard against schema drift.
         let inner = csv::WriterBuilder::new()
             .delimiter(config.delimiter)
+            .flexible(framer.is_some())
             .from_writer(writer);
         Self {
             inner,
             schema,
             config,
             header_written: false,
+            framer,
         }
+    }
+
+    /// Emit one envelope section's field values (in declared order) as a CSV
+    /// row, optionally appending a trailing computed-count cell.
+    fn write_section_row(
+        inner: &mut csv::Writer<W>,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
+        count: Option<(&str, i64)>,
+    ) -> Result<(), FormatError> {
+        let mut cells: Vec<String> = Vec::new();
+        for (name, value) in fields {
+            cells.push(value_to_csv_cell(name, value)?);
+        }
+        if let Some((_field, n)) = count {
+            cells.push(n.to_string());
+        }
+        inner.write_record(&cells)?;
+        Ok(())
     }
 
     /// Write a pre-captured header row, bypassing first-record discovery.
@@ -76,7 +119,12 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         // Header is built from the writer's pinned schema. Engine-stamped
         // columns (today: `$ck.<field>`) are stripped unless the Output
         // node opts in.
-        if self.config.include_header && !self.header_written {
+        //
+        // Under envelope framing the schema column-header row is SUPPRESSED:
+        // it would otherwise emit once, before the first document's envelope
+        // header row, giving documents inconsistent layouts (header row only
+        // on the first). The per-document envelope header section replaces it.
+        if self.config.include_header && !self.header_written && self.framer.is_none() {
             let header: Vec<&str> =
                 filtered_header_columns(&self.schema, self.config.include_engine_stamped);
             self.inner.write_record(&header)?;
@@ -95,11 +143,40 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         }
 
         self.inner.write_record(&fields)?;
+        if let Some(framer) = self.framer.as_mut() {
+            framer.count_record();
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), FormatError> {
         self.inner.flush()?;
+        Ok(())
+    }
+
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(framer) = self.framer.as_mut() else {
+            return Ok(());
+        };
+        framer.begin();
+        // Only emit a header row when the document actually carries the
+        // configured section — a missing section writes nothing.
+        if let Some(fields) = framer.header_fields(doc) {
+            Self::write_section_row(&mut self.inner, fields, None)?;
+        }
+        Ok(())
+    }
+
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(framer) = self.framer.as_ref() else {
+            return Ok(());
+        };
+        // Likewise the footer: emit only when the configured section is
+        // present; the computed count rides the present footer section.
+        if let Some(fields) = framer.footer_fields(doc) {
+            let count = framer.footer_count();
+            Self::write_section_row(&mut self.inner, fields, count)?;
+        }
         Ok(())
     }
 }
@@ -439,5 +516,66 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
+
+    #[test]
+    fn csv_envelope_frames_header_body_footer() {
+        let schema = make_schema(&["amount"]);
+        let config = CsvWriterConfig {
+            include_header: false,
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("A".into()))]),
+            ("Foot", &[("checksum", Value::String("SUM".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), config);
+            writer.begin_document(&doc).unwrap();
+            writer
+                .write_record(&make_record(&schema, vec![Value::Integer(10)]))
+                .unwrap();
+            writer
+                .write_record(&make_record(&schema, vec![Value::Integer(20)]))
+                .unwrap();
+            writer.end_document(&doc).unwrap();
+            writer.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "A\n10\n20\nSUM,2\n", "got: {out}");
+    }
+
+    #[test]
+    fn csv_envelope_off_is_byte_identical() {
+        // No envelope spec: begin/end_document are no-ops and the body is the
+        // plain CSV the boundary-unaware path produces.
+        let schema = make_schema(&["amount"]);
+        let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
+        let mut buf = Vec::new();
+        {
+            let mut writer = CsvWriter::new(
+                &mut buf,
+                Arc::clone(&schema),
+                CsvWriterConfig {
+                    include_header: false,
+                    ..Default::default()
+                },
+            );
+            writer.begin_document(&doc).unwrap();
+            writer
+                .write_record(&make_record(&schema, vec![Value::Integer(10)]))
+                .unwrap();
+            writer.end_document(&doc).unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "10\n");
     }
 }

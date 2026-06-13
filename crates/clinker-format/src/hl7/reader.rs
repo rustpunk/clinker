@@ -39,7 +39,9 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, coerce_section_fields};
+use crate::envelope::{
+    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole, coerce_section_fields,
+};
 use crate::error::FormatError;
 use crate::hl7::RAW_FIELDS_KEY;
 use crate::hl7::field_split::Hl7FieldSplit;
@@ -361,8 +363,12 @@ impl<R: Read> Hl7Reader<R> {
         }
         self.open_batch = Some(OpenBatch { message_count: 0 });
         self.batch_count += 1;
+        // A batch wraps messages but is not itself the framing document — the
+        // message is. So the batch level stays inside whatever frame is
+        // current (in practice the file), inheriting its grain.
         self.pending_events.push(EnvelopeEvent::OpenLevel {
             sections: positional_section("batch", &bhs.fields),
+            frame: FrameRole::Inherit,
         });
         Ok(())
     }
@@ -408,8 +414,13 @@ impl<R: Read> Hl7Reader<R> {
         if let Some(batch) = self.open_batch.as_mut() {
             batch.message_count += 1;
         }
+        // Each HL7 message IS a logical document: it opens a fresh frame, so a
+        // multi-message file reconstructs one output envelope per message and
+        // dead-letters per message rather than collapsing the whole file into
+        // one frame.
         self.pending_events.push(EnvelopeEvent::OpenLevel {
             sections: message_section(msh),
+            frame: FrameRole::NewFrame,
         });
         self.open_message = Some(OpenMessage {
             control_id,
@@ -816,7 +827,7 @@ mod tests {
         let mut r = reader(&adt_message());
         let _ = r.next_record().unwrap().unwrap();
         let events = r.take_envelope_events();
-        let EnvelopeEvent::OpenLevel { sections } = &events[0] else {
+        let EnvelopeEvent::OpenLevel { sections, .. } = &events[0] else {
             panic!("expected message OpenLevel");
         };
         let set = match sections.get("transaction_set").unwrap() {

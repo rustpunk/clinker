@@ -32,7 +32,8 @@ use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
 use crate::envelope::{
-    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, NestedEnvelopeSection, coerce_section_fields,
+    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole, NestedEnvelopeSection,
+    coerce_section_fields,
 };
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -285,8 +286,13 @@ impl<R: Read> X12Reader<R> {
         });
         self.group_count += 1;
         let sections = nested_sections(gs, self.group_section.as_ref(), DEFAULT_GROUP_SECTION)?;
-        self.pending_events
-            .push(EnvelopeEvent::OpenLevel { sections });
+        // A `GS` functional group stays inside the interchange frame — the
+        // X12 framing document is the `ISA` interchange, so its nested levels
+        // inherit the interchange grain.
+        self.pending_events.push(EnvelopeEvent::OpenLevel {
+            sections,
+            frame: FrameRole::Inherit,
+        });
         Ok(())
     }
 
@@ -351,8 +357,13 @@ impl<R: Read> X12Reader<R> {
             group.set_count += 1;
         }
         let sections = nested_sections(st, self.set_section.as_ref(), DEFAULT_SET_SECTION)?;
-        self.pending_events
-            .push(EnvelopeEvent::OpenLevel { sections });
+        // An `ST` transaction set also stays inside the interchange frame, so
+        // a whole `ISA..IEA` interchange reconstructs as one output envelope
+        // rather than one per transaction set.
+        self.pending_events.push(EnvelopeEvent::OpenLevel {
+            sections,
+            frame: FrameRole::Inherit,
+        });
         Ok(())
     }
 
@@ -746,7 +757,7 @@ mod tests {
         let mut r = reader(&data);
         let _ = r.next_record().unwrap().unwrap();
         let events = r.take_envelope_events();
-        let EnvelopeEvent::OpenLevel { sections } = &events[0] else {
+        let EnvelopeEvent::OpenLevel { sections, .. } = &events[0] else {
             panic!("expected group OpenLevel");
         };
         let group = match sections.get("functional_group").unwrap() {
@@ -763,7 +774,7 @@ mod tests {
         let mut r = reader(&data);
         let _ = r.next_record().unwrap().unwrap();
         let events = r.take_envelope_events();
-        let EnvelopeEvent::OpenLevel { sections } = &events[1] else {
+        let EnvelopeEvent::OpenLevel { sections, .. } = &events[1] else {
             panic!("expected set OpenLevel");
         };
         let set = match sections.get("transaction_set").unwrap() {
@@ -794,7 +805,7 @@ mod tests {
         r.take_envelope_events()
             .into_iter()
             .filter_map(|e| match e {
-                EnvelopeEvent::OpenLevel { sections } => Some(sections),
+                EnvelopeEvent::OpenLevel { sections, .. } => Some(sections),
                 EnvelopeEvent::CloseLevel => None,
             })
             .collect()

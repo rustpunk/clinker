@@ -28,7 +28,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract};
+use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole};
 use crate::error::FormatError;
 use crate::swift::tokenizer::{
     BlockTokenizer, ParsedBlock, ParsedBlock4Line, TEXT_BLOCK_ID, split_block4,
@@ -191,8 +191,13 @@ impl<R: Read> SwiftReader<R> {
             // records. Open it once, before the first record (or, for a
             // header-only message, immediately before the close) so the
             // driver's document stack always balances.
+            // A SWIFT MT message is itself the logical document, so its
+            // message level opens a fresh frame. One message per file today,
+            // so this matches the file grain; marking it `NewFrame` keeps the
+            // grain correct if a multi-message container is ever supported.
             self.pending_events.push(EnvelopeEvent::OpenLevel {
                 sections: IndexMap::new(),
+                frame: FrameRole::NewFrame,
             });
             self.level_open = true;
         }

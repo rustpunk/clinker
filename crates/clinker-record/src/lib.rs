@@ -21,7 +21,8 @@ pub use coercion::{
 };
 pub use counters::{PipelineCounters, RetractionCounters};
 pub use document_context::{
-    DocumentContext, DocumentId, synthetic_document_context, synthetic_document_context_ref,
+    DocumentContext, DocumentGrain, DocumentId, synthetic_document_context,
+    synthetic_document_context_ref,
 };
 pub use field_str::FieldStr;
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};

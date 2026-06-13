@@ -876,11 +876,73 @@ impl PipelineConfig {
                 }
             }
         }
-        let declared_doc_paths: HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>> =
+        let mut declared_doc_paths: HashMap<String, Vec<cxl::analyzer::doc_paths::DocPath>> =
             doc_paths_by_source
                 .into_iter()
                 .map(|(source, paths)| (source, paths.into_iter().collect()))
                 .collect();
+        // Output-envelope reconstruction is a SECOND consumer of `$doc`
+        // sections, beyond CXL `$doc.*` references: an Output's
+        // `header_from_doc` / `footer_from_doc` echoes a whole section, but it
+        // appears in no program, so the readers' path-pruned pre-scan would
+        // not extract it. Register each enveloped section's declared fields as
+        // doc paths against the source(s) feeding that Output, so the reader
+        // retains the section. The reader extracts the whole declared section
+        // once any of its fields is wanted, so one path per declared field is
+        // sufficient (and passes the E341 closed-schema check, since each
+        // field is real). A header/footer naming an undeclared section is
+        // rejected separately by E346 below, so an absent section here is fine.
+        {
+            let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+                .iter()
+                .map(|s| (s.name.as_str(), s))
+                .collect();
+            for output in self.output_configs() {
+                if !output.reconstruct_envelope {
+                    continue;
+                }
+                let Some((env_cfg, _)) = generic_output_envelope(&output.format) else {
+                    continue;
+                };
+                let sections: Vec<&str> = [
+                    env_cfg.header_from_doc.as_deref(),
+                    env_cfg.footer_from_doc.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if sections.is_empty() {
+                    continue;
+                }
+                let Some(feeding) = node_sources.get(&output.name) else {
+                    continue;
+                };
+                for source_name in feeding {
+                    let Some(source) = source_by_name.get(source_name.as_str()) else {
+                        continue;
+                    };
+                    let Some(envelope) = source.envelope.as_ref() else {
+                        continue;
+                    };
+                    let paths = declared_doc_paths.entry(source_name.clone()).or_default();
+                    for section_name in &sections {
+                        let Some(section) = envelope.sections.get(*section_name) else {
+                            continue;
+                        };
+                        for field in section.fields.keys() {
+                            let path = cxl::analyzer::doc_paths::DocPath {
+                                section: Box::from(*section_name),
+                                field: Box::from(field.as_str()),
+                                indices: Vec::new(),
+                            };
+                            if !paths.contains(&path) {
+                                paths.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // E341 — a `$doc.<section>.<field>` access must name a section and
         // field the feeding source's envelope actually declares. Without
         // this check a typo (`$doc.Summry.total` against a declared
@@ -2157,6 +2219,108 @@ fn envelope_schema_is_closed(format: &InputFormat) -> bool {
     matches!(format, InputFormat::Xml(_) | InputFormat::Json(_))
 }
 
+/// The output-envelope config of a generic-format Output (CSV / JSON / XML /
+/// fixed-width) paired with whether that format can carry a computed footer
+/// field, or `None` when the format declares no envelope config (or is an EDI
+/// format, which has its own per-format reconstruction vocabulary, not this
+/// generic one).
+///
+/// Used by the E346 check: a non-`None` result means the Output reconstructs a
+/// generic output envelope whose section names and computed footer must be
+/// validated. Fixed-width returns `false` for the computed-footer flag — its
+/// positional lines have no field to inject a count into.
+fn generic_output_envelope(
+    format: &OutputFormat,
+) -> Option<(&crate::config::OutputEnvelopeConfig, bool)> {
+    match format {
+        OutputFormat::Csv(opts) => opts.as_ref()?.envelope.as_ref().map(|e| (e, true)),
+        OutputFormat::Json(opts) => opts.as_ref()?.envelope.as_ref().map(|e| (e, true)),
+        OutputFormat::Xml(opts) => opts.as_ref()?.envelope.as_ref().map(|e| (e, true)),
+        OutputFormat::FixedWidth(opts) => opts.as_ref()?.envelope.as_ref().map(|e| (e, false)),
+        OutputFormat::Edifact(_)
+        | OutputFormat::X12(_)
+        | OutputFormat::Hl7(_)
+        | OutputFormat::Swift(_) => None,
+    }
+}
+
+/// The upstream lineage of an Output, as it bears on envelope reconstruction:
+/// the set of Source node names that feed it, and the name of the first
+/// document-lineage-stripping node found on any path to it (if any).
+///
+/// A node strips document lineage when it emits records with a synthetic /
+/// merged [`clinker_record::DocumentContext`] rather than carrying their
+/// originating document's context forward:
+///
+/// - `Aggregate` finalizes group rows through the merged eval context (even
+///   per-document aggregation finalizes through it), so every emitted row is
+///   synthetic-grained.
+/// - `Combine` fans several inputs into merged-lineage rows.
+/// - `Composition` is opaque at config-validation time (its body lives in a
+///   separate artifact, not in `config.nodes`), so its lineage cannot be
+///   proven preserved — treated conservatively as a stripper.
+///
+/// Such records reach an enveloped Output with a non-concrete `source_file`,
+/// which the envelope arm streams UNFRAMED. The plan-time guard (E347) uses
+/// `lineage_stripper` to reject the combination before it can emit malformed /
+/// misattributed framing; `feeding_sources` scopes the E346 section-name check
+/// to the sources whose documents this Output actually frames.
+struct OutputLineage {
+    feeding_sources: std::collections::BTreeSet<String>,
+    lineage_stripper: Option<String>,
+}
+
+/// Walk upstream from `output_name` over the config node graph, collecting the
+/// feeding sources and the first lineage-stripping node on any path. Cycle-safe
+/// via a visited set (cycles are rejected separately by the DAG-edge pass, so
+/// this only guards against re-traversal, never relies on acyclicity).
+fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLineage {
+    let by_name: HashMap<&str, &PipelineNode> = config
+        .nodes
+        .iter()
+        .map(|n| (n.value.name(), &n.value))
+        .collect();
+    let mut feeding_sources = std::collections::BTreeSet::new();
+    let mut lineage_stripper: Option<String> = None;
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = vec![output_name];
+    while let Some(node_name) = stack.pop() {
+        if !visited.insert(node_name) {
+            continue;
+        }
+        let Some(node) = by_name.get(node_name) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Source { .. } => {
+                feeding_sources.insert(node_name.to_string());
+            }
+            PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. }
+            | PipelineNode::Composition { .. } => {
+                // Record the first stripper found (deterministic by the
+                // declaration-order traversal seed), but keep walking so the
+                // feeding-source set stays complete for the E346 scoping.
+                if lineage_stripper.is_none() {
+                    lineage_stripper = Some(node_name.to_string());
+                }
+                for up in node.direct_input_names() {
+                    stack.push(up);
+                }
+            }
+            _ => {
+                for up in node.direct_input_names() {
+                    stack.push(up);
+                }
+            }
+        }
+    }
+    OutputLineage {
+        feeding_sources,
+        lineage_stripper,
+    }
+}
+
 /// A rejected `$doc` path against a closed envelope schema: the formatted
 /// diagnostic message plus its fix-it help text.
 struct UndeclaredDocPath {
@@ -3162,6 +3326,14 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         // below names the offending output directly — no re-derivation.
         let has_document_dlq = config.any_source_has_document_dlq();
         let has_correlation_key = config.any_source_has_correlation_key();
+        // E346 scopes its section-name check to the sources that actually FEED
+        // each Output (not the pipeline-wide union), so a header/footer naming
+        // a section declared only on a non-feeding source is rejected — that
+        // would otherwise emit a silently-empty header/footer.
+        let source_envelope_by_name: HashMap<&str, &crate::config::SourceConfig> = config
+            .source_configs()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
         for output in config.output_configs() {
             if !output.reconstruct_envelope {
                 continue;
@@ -3200,6 +3372,93 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                      dirty correlation groups would leak into the framed output and inflate \
                      the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`"
                 )));
+            }
+
+            // Trace this Output's upstream lineage once: the sources feeding it
+            // (for the E346 section-name scoping) and any document-lineage
+            // stripper on the path (for the guard just below).
+            let lineage = trace_output_lineage(config, out);
+
+            // A cross-document `Combine` / global-or-per-document `Aggregate` /
+            // opaque `Composition` upstream emits records with a synthetic
+            // (`<merged>`) document context, which the envelope arm streams
+            // UNFRAMED. For JSON that means body bytes outside any open
+            // document object — malformed JSON — and for every format it means
+            // silently dropped framing / a miscounted footer. Reject the
+            // combination at plan time rather than emit broken output.
+            if let Some(stripper) = lineage.lineage_stripper.as_deref() {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with an \
+                     upstream node ('{stripper}') that strips document lineage — a Combine, \
+                     Aggregate, or Composition emits records with no originating document, so \
+                     the per-document envelope cannot be framed around them (the framing arm \
+                     would stream them unframed, e.g. producing malformed JSON). Remove the \
+                     intervening node from this Output's path, or drop `reconstruct_envelope`"
+                )));
+            }
+
+            // E346: the output-envelope config (header/footer sections + a
+            // possible computed footer) must reference sections the FEEDING
+            // sources actually declare, and a computed footer count is
+            // unsupported on a format whose lines are positional (fixed-width).
+            // Only checked for an Output that reconstructs the envelope AND
+            // carries an envelope config; a flag-on Output with no envelope
+            // config frames nothing and is fine.
+            let Some((envelope_cfg, supports_computed_footer)) =
+                generic_output_envelope(&output.format)
+            else {
+                continue;
+            };
+            // Sections declared by THIS output's feeding sources only — a
+            // header/footer naming a section that exists solely on a
+            // non-feeding source would emit an empty header/footer silently,
+            // the exact failure E346 exists to catch.
+            let feeding_sections: std::collections::BTreeSet<&str> = lineage
+                .feeding_sources
+                .iter()
+                .filter_map(|s| source_envelope_by_name.get(s.as_str()))
+                .filter_map(|s| s.envelope.as_ref())
+                .flat_map(|e| e.sections.keys().map(|k| k.as_str()))
+                .collect();
+            for (role, section) in [
+                ("header_from_doc", envelope_cfg.header_from_doc.as_deref()),
+                ("footer_from_doc", envelope_cfg.footer_from_doc.as_deref()),
+            ] {
+                let Some(section) = section else { continue };
+                if !feeding_sections.contains(section) {
+                    let declared: Vec<&str> = feeding_sections.iter().copied().collect();
+                    return Err(ConfigError::Validation(format!(
+                        "[E346] output '{out}': envelope {role} references section \
+                         '{section}' which no source feeding this output declares an \
+                         `envelope:` section for. Sections declared by the feeding \
+                         source(s): {declared:?}. Name a declared section, or add the \
+                         section to a feeding source's `envelope:` config"
+                    )));
+                }
+            }
+            if envelope_cfg.footer_record_count_field.is_some() {
+                // A computed count is injected INTO the footer section, so it
+                // requires a `footer_from_doc` to attach to — a count-only
+                // footer has no section to ride and would otherwise be silently
+                // dropped (the writer emits a footer only when its section is
+                // present on the document).
+                if envelope_cfg.footer_from_doc.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "[E346] output '{out}': envelope `footer_record_count_field` requires \
+                         `footer_from_doc` — the computed record count is injected into the \
+                         footer section, so a footer section must be named for it to attach to. \
+                         Add `footer_from_doc`, or drop `footer_record_count_field`"
+                    )));
+                }
+                if !supports_computed_footer {
+                    return Err(ConfigError::Validation(format!(
+                        "[E346] output '{out}': envelope `footer_record_count_field` is not \
+                         supported for {} output — a fixed-width line has no field to inject a \
+                         computed count into without a width declaration. Drop \
+                         `footer_record_count_field`, or use a CSV / JSON / XML output",
+                        output.format.format_name()
+                    )));
+                }
             }
         }
     }
