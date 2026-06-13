@@ -2,10 +2,9 @@
 //! stage-label helpers shared between the executor (which constructs DLQ
 //! entries) and the CLI sink (which writes them out).
 
-/// All 12 DLQ error categories per spec §10.4.
-///
-/// Passed from the error site — no string matching. Each error path
-/// constructs the correct variant at the point of failure.
+/// DLQ error categories. Passed from the error site — no string
+/// matching. Each error path constructs the correct variant at the
+/// point of failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DlqErrorCategory {
     MissingRequiredField,
@@ -55,6 +54,14 @@ pub enum DlqErrorCategory {
     /// grace-hash, and sort-merge kernels all route an output-eval failure
     /// here under `Continue` / `BestEffort`.
     CombineOutputRow,
+    /// Two Reshape rules wrote the same field on the same correlation-
+    /// group row at runtime (a content-dependent collision the
+    /// compile-time static-overlap check could not prove). The whole
+    /// correlation group rolls back per `CorrelationCommit` semantics —
+    /// no synthesized or mutated rows from that group reach output.
+    /// Stage label `reshape:<node>:<rule_a>+<rule_b>` names the colliding
+    /// rule pair.
+    MutationConflict,
 }
 
 impl DlqErrorCategory {
@@ -72,8 +79,16 @@ impl DlqErrorCategory {
             Self::LateRecord => "late_record",
             Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
             Self::CombineOutputRow => "combine_output_row",
+            Self::MutationConflict => "mutation_conflict",
         }
     }
+}
+
+/// Stage label helper for Reshape mutation-conflict DLQ entries. Names
+/// the colliding rule pair so a reader scanning the DLQ can identify
+/// which two rules wrote the same field on the same row.
+pub fn stage_reshape_mutation_conflict(node: &str, rule_a: &str, rule_b: &str) -> String {
+    format!("reshape:{node}:{rule_a}+{rule_b}")
 }
 
 /// Stage label helper for aggregate-transform DLQ entries.
@@ -136,6 +151,18 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::CombineOutputRow.as_str(),
             "combine_output_row"
+        );
+        assert_eq!(
+            DlqErrorCategory::MutationConflict.as_str(),
+            "mutation_conflict"
+        );
+    }
+
+    #[test]
+    fn test_stage_reshape_mutation_conflict_helper() {
+        assert_eq!(
+            stage_reshape_mutation_conflict("backfill", "fix_a", "fix_b"),
+            "reshape:backfill:fix_a+fix_b"
         );
     }
 

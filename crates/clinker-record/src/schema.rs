@@ -93,6 +93,12 @@ pub enum FieldMetadata {
     /// (https://github.com/rustpunk/clinker/issues/61) to assign each
     /// record to its window(s).
     SourceEventTime,
+    /// Reshape audit-stamp column (`$meta.synthetic`,
+    /// `$meta.synthesized_by`, `$meta.mutated_by`). Engine-written per
+    /// Reshape output record so the provenance of a synthesized or
+    /// mutated row is queryable downstream while staying out of the
+    /// default writer surface — mirroring the `$ck.*` posture.
+    ReshapeAudit,
 }
 
 impl FieldMetadata {
@@ -139,6 +145,12 @@ impl FieldMetadata {
     /// per-record value did not parse.
     pub fn source_event_time() -> Self {
         Self::SourceEventTime
+    }
+
+    /// Marks this column as a Reshape audit stamp (`$meta.synthetic` /
+    /// `$meta.synthesized_by` / `$meta.mutated_by`).
+    pub fn reshape_audit() -> Self {
+        Self::ReshapeAudit
     }
 
     /// True for every variant. The presence of [`FieldMetadata`] on a

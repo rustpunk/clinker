@@ -1020,6 +1020,23 @@ fn compute_one(
             }
         }
 
+        PlanNode::Reshape { .. } => {
+            // Reshape re-orders rows within each group (`order_by`) and
+            // injects synthesized rows, so no parent ordering survives;
+            // downstream sees an unordered stream. Group identity is
+            // preserved — `partition_by` must cover every visible CK
+            // field — so the parent CK set flows through unchanged.
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: None,
+                    provenance: OrderingProvenance::NoOrdering,
+                },
+                partitioning: parent_partitioning(),
+                ck_set: preserve_parent_ck_set(),
+                ..NodeProperties::unordered_single()
+            }
+        }
+
         PlanNode::Combine {
             name, propagate_ck, ..
         } => {

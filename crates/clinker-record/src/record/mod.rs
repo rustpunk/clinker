@@ -272,7 +272,8 @@ impl Record {
                 Some(FieldMetadata::WidenedSidecar)
                 | Some(FieldMetadata::SourceFile)
                 | Some(FieldMetadata::SourceName)
-                | Some(FieldMetadata::SourceEventTime) => false,
+                | Some(FieldMetadata::SourceEventTime)
+                | Some(FieldMetadata::ReshapeAudit) => false,
                 Some(FieldMetadata::SourceCorrelation { .. })
                 | Some(FieldMetadata::AggregateGroupIndex { .. })
                 | None => true,

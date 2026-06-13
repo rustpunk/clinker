@@ -1366,6 +1366,9 @@ impl ExecutionPlanDag {
                 PlanNode::Combine { .. } => {
                     out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
                 }
+                PlanNode::Reshape { .. } => {
+                    out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
+                }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
@@ -1486,6 +1489,11 @@ impl ExecutionPlanDag {
                     // `display_name()` carries the strategy/drive/build
                     // and predicate-shape suffix.
                     out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Reshape { .. } => {
+                    // Sibling rendering: Reshape is a grouping operator;
+                    // it shares the `◇` glyph family with Aggregate.
+                    out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
