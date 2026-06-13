@@ -2,18 +2,18 @@ pub mod resolve;
 
 use std::path::Path;
 
-use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef, SchemaDefinition};
+use clinker_record::schema_def::{FieldDef, SchemaDefinition};
 
-/// Resolved schema -- inherits merged, validated, ready for pipeline use.
+/// Resolved single-record schema -- inherits merged, validated, ready for
+/// pipeline use.
+///
+/// Multi-record flat files (header/trailer/body discrimination) are NOT
+/// resolved through this type. Their discriminator-driven reader streams one
+/// `Record` per line on a static superset schema and never materializes a
+/// per-record-type field list — see `clinker_format::multi_record`.
 #[derive(Debug, Clone)]
-pub enum ResolvedSchema {
-    SingleRecord {
-        fields: Vec<FieldDef>,
-    },
-    MultiRecord {
-        discriminator: Discriminator,
-        record_types: Vec<RecordTypeDef>,
-    },
+pub struct ResolvedSchema {
+    pub fields: Vec<FieldDef>,
 }
 
 /// Schema subsystem errors.
@@ -55,50 +55,38 @@ pub fn load_schema(path: &Path) -> Result<SchemaDefinition, SchemaError> {
     Ok(def)
 }
 
-/// Resolve a SchemaDefinition: merge inherits, validate constraints,
-/// produce a pipeline-ready ResolvedSchema.
+/// Resolve a single-record [`SchemaDefinition`]: merge inherits, validate
+/// constraints, produce a pipeline-ready [`ResolvedSchema`].
+///
+/// # Errors
+///
+/// Returns [`SchemaError::Validation`] when the definition declares `records:`
+/// (multi-record flat files are read by the discriminator-driven
+/// `clinker_format::multi_record` reader, not resolved here), declares neither
+/// `fields:` nor `records:`, or carries an inherits/field-constraint violation.
 pub fn resolve_schema(def: SchemaDefinition) -> Result<ResolvedSchema, SchemaError> {
-    // Validate fields/records mutual exclusivity
-    if def.fields.is_some() && def.records.is_some() {
+    // Multi-record flat files do not flow through field resolution: their
+    // reader streams one record per line on a static superset schema. Reject
+    // a `records:` definition here so a misrouted multi-record schema fails
+    // with a precise message rather than silently losing its record types.
+    if def.records.is_some() {
         return Err(SchemaError::Validation(
-            "schema cannot have both 'fields' and 'records' at the top level".into(),
+            "multi-record schema ('records:') is read by the discriminator-driven \
+             multi-record reader, not resolved as a single field list"
+                .into(),
         ));
     }
-    if def.fields.is_none() && def.records.is_none() {
-        return Err(SchemaError::Validation(
-            "schema must have either 'fields' (single-record) or 'records' (multi-record)".into(),
-        ));
-    }
-
-    if let Some(records) = def.records {
-        // Multi-record path
-        let discriminator = def.discriminator.ok_or_else(|| {
-            SchemaError::Validation("multi-record schema requires a 'discriminator' section".into())
-        })?;
-
-        // Resolve inherits within each record type's fields
-        let defs = def.defs.as_ref();
-        let mut resolved_records = Vec::with_capacity(records.len());
-        for mut rt in records {
-            rt.fields = resolve_inherits(rt.fields, defs)?;
-            validate_fields(&rt.fields)?;
-            resolved_records.push(rt);
-        }
-
-        Ok(ResolvedSchema::MultiRecord {
-            discriminator,
-            record_types: resolved_records,
-        })
-    } else {
-        // Single-record path
-        let fields = def.fields.unwrap();
-        let defs = def.defs.as_ref();
-        let resolved_fields = resolve_inherits(fields, defs)?;
-        validate_fields(&resolved_fields)?;
-        Ok(ResolvedSchema::SingleRecord {
-            fields: resolved_fields,
-        })
-    }
+    let fields = def.fields.ok_or_else(|| {
+        SchemaError::Validation(
+            "schema must declare 'fields' (single-record) or 'records' (multi-record)".into(),
+        )
+    })?;
+    let defs = def.defs.as_ref();
+    let resolved_fields = resolve_inherits(fields, defs)?;
+    validate_fields(&resolved_fields)?;
+    Ok(ResolvedSchema {
+        fields: resolved_fields,
+    })
 }
 
 /// Resolve `inherits:` references in a field list against `defs:` templates.
@@ -297,20 +285,16 @@ fields:
 "#;
         let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
-        match resolved {
-            ResolvedSchema::SingleRecord { fields } => {
-                assert_eq!(fields[0].name, "city");
-                assert_eq!(
-                    fields[0].field_type,
-                    Some(clinker_record::schema_def::FieldType::String)
-                );
-                assert_eq!(fields[0].width, Some(20));
-                assert_eq!(fields[0].trim, Some(true));
-                assert_eq!(fields[0].start, Some(0));
-                assert!(fields[0].inherits.is_none());
-            }
-            _ => panic!("expected SingleRecord"),
-        }
+        let fields = resolved.fields;
+        assert_eq!(fields[0].name, "city");
+        assert_eq!(
+            fields[0].field_type,
+            Some(clinker_record::schema_def::FieldType::String)
+        );
+        assert_eq!(fields[0].width, Some(20));
+        assert_eq!(fields[0].trim, Some(true));
+        assert_eq!(fields[0].start, Some(0));
+        assert!(fields[0].inherits.is_none());
     }
 
     #[test]
@@ -330,18 +314,14 @@ fields:
 "#;
         let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
-        match resolved {
-            ResolvedSchema::SingleRecord { fields } => {
-                // Field overrides template's type
-                assert_eq!(
-                    fields[0].field_type,
-                    Some(clinker_record::schema_def::FieldType::Float)
-                );
-                // Template's width preserved
-                assert_eq!(fields[0].width, Some(10));
-            }
-            _ => panic!("expected SingleRecord"),
-        }
+        let fields = resolved.fields;
+        // Field overrides template's type
+        assert_eq!(
+            fields[0].field_type,
+            Some(clinker_record::schema_def::FieldType::Float)
+        );
+        // Template's width preserved
+        assert_eq!(fields[0].width, Some(10));
     }
 
     #[test]

@@ -110,6 +110,17 @@ pub enum EnvelopeExtract {
     /// are extractable; trailer segments that arrive after body streaming
     /// are validated by the reader, not exposed as envelope sections.
     Segment(String),
+    /// Multi-record flat-file record-type tag (CSV / fixed-width). The
+    /// named tag (e.g. `H` for a header row) identifies which of the
+    /// source's declared `records:` types carries this section's payload;
+    /// the multi-record reader resolves it from the file's bounded header
+    /// pre-scan and the matched row's named columns become the section's
+    /// `fields` map. Only a header-type tag the reader can reach before
+    /// body streaming is extractable as a `$doc` section; a trailer-type
+    /// tag arrives after the body it closes, so it is validated as it
+    /// streams (its declared count against the actual body count), not
+    /// surfaced here. YAML form: `extract: { record_type: H }`.
+    RecordType(String),
 }
 
 /// A user-declared section for a *nested* envelope level that has no

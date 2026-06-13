@@ -411,11 +411,12 @@ impl FormatReader for JsonReader {
                          against a JSON source. Use `json_pointer` for JSON envelope sections."
                     )));
                 }
-                EnvelopeExtract::Segment(_) => {
+                EnvelopeExtract::Segment(_) | EnvelopeExtract::RecordType(_) => {
                     return Err(FormatError::Json(format!(
-                        "envelope section {name:?}: declared `segment` extract \
-                         against a JSON source. The `segment` extract is for \
-                         flat-file formats (EDIFACT); use `json_pointer` for JSON."
+                        "envelope section {name:?}: declared a flat-file extract \
+                         (`segment` / `record_type`) against a JSON source. Those \
+                         extracts are for flat-file formats (EDIFACT, multi-record \
+                         CSV / fixed-width); use `json_pointer` for JSON."
                     )));
                 }
             };

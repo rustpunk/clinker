@@ -38,11 +38,25 @@ fn build_format_reader(
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     match &input.format {
         clinker_plan::config::InputFormat::Csv(opts) => {
-            let config = build_csv_reader_config(opts.as_ref());
-            Ok(Box::new(CsvReader::from_reader(
-                open_one_shot(&source)?,
-                config,
-            )))
+            // A CSV source declaring `records:` in its `format_schema` is a
+            // multi-record flat file: one row per line on a discriminator-
+            // driven superset schema. A plain CSV (or one with no
+            // `format_schema`) stays on the single-schema reader.
+            match multi_record_schema(input, "csv")? {
+                Some(def) => build_multi_record_reader(
+                    input,
+                    &def,
+                    MultiRecordKind::Csv(opts.as_ref()),
+                    open_one_shot(&source)?,
+                ),
+                None => {
+                    let config = build_csv_reader_config(opts.as_ref());
+                    Ok(Box::new(CsvReader::from_reader(
+                        open_one_shot(&source)?,
+                        config,
+                    )))
+                }
+            }
         }
         clinker_plan::config::InputFormat::Json(opts) => {
             let config = build_json_reader_config(
@@ -61,13 +75,26 @@ fn build_format_reader(
             Ok(Box::new(XmlReader::from_source(source, config)?))
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => {
-            let fields = extract_field_defs(input)?;
-            let config = build_fw_reader_config(opts.as_ref());
-            Ok(Box::new(FixedWidthReader::new(
-                open_one_shot(&source)?,
-                fields,
-                config,
-            )?))
+            // A fixed-width source declaring `records:` is a multi-record flat
+            // file (header/trailer/body byte-range discrimination); a `fields:`
+            // schema stays on the single-layout reader.
+            match multi_record_schema(input, "fixed-width")? {
+                Some(def) => build_multi_record_reader(
+                    input,
+                    &def,
+                    MultiRecordKind::FixedWidth(opts.as_ref()),
+                    open_one_shot(&source)?,
+                ),
+                None => {
+                    let fields = extract_field_defs(input)?;
+                    let config = build_fw_reader_config(opts.as_ref());
+                    Ok(Box::new(FixedWidthReader::new(
+                        open_one_shot(&source)?,
+                        fields,
+                        config,
+                    )?))
+                }
+            }
         }
         clinker_plan::config::InputFormat::Edifact(opts) => {
             let config = build_edifact_reader_config(opts.as_ref());
@@ -860,34 +887,165 @@ fn apply_envelope_events(
     Ok(())
 }
 
-/// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
+/// Load the format-layer [`SchemaDefinition`] a source declares under
+/// `format_schema`, resolving the inline or file-path form.
 ///
-/// Resolves `SchemaSource::Inline` or `SchemaSource::FilePath` to `Vec<FieldDef>`.
-/// Returns a config validation error if schema is `None` (fixed-width requires
-/// explicit schema with field definitions).
-fn extract_field_defs(
+/// Used by the CSV and fixed-width arms: a definition carrying `records:` /
+/// `discriminator:` routes to the multi-record reader, while a `fields:`
+/// definition stays single-record. Returns a config validation error when the
+/// source declares no `format_schema` (the formats that need one — fixed-width
+/// always, multi-record CSV — both require it).
+fn load_format_schema(
     input: &clinker_plan::config::SourceConfig,
-) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
+    format_label: &str,
+) -> Result<clinker_record::schema_def::SchemaDefinition, PipelineError> {
     let schema_source = input.schema.as_ref().ok_or_else(|| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            "fixed-width format requires explicit schema with field definitions".into(),
-        ))
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "{format_label} format requires an explicit `format_schema`"
+        )))
     })?;
-    let def = match schema_source {
-        clinker_plan::config::SchemaSource::Inline(def) => def.clone(),
+    match schema_source {
+        clinker_plan::config::SchemaSource::Inline(def) => Ok(def.clone()),
         clinker_plan::config::SchemaSource::FilePath(path) => {
             clinker_plan::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
                 PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                     "failed to load schema from '{path}': {e}",
                 )))
-            })?
+            })
         }
-    };
+    }
+}
+
+/// Return the source's format-layer schema when it declares multiple record
+/// types (`records:`), routing the source to the discriminator-driven
+/// multi-record reader; `None` when the source declares no `format_schema` or
+/// a single-record `fields:` definition (the single-schema reader path).
+fn multi_record_schema(
+    input: &clinker_plan::config::SourceConfig,
+    format_label: &str,
+) -> Result<Option<clinker_record::schema_def::SchemaDefinition>, PipelineError> {
+    if input.schema.is_none() {
+        return Ok(None);
+    }
+    let def = load_format_schema(input, format_label)?;
+    Ok(def.records.is_some().then_some(def))
+}
+
+/// Extract the single-record `Vec<FieldDef>` a fixed-width source declares.
+///
+/// # Errors
+///
+/// Returns a config validation error when the fixed-width source declares no
+/// `format_schema` or its definition carries no `fields:` list.
+fn extract_field_defs(
+    input: &clinker_plan::config::SourceConfig,
+) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
+    let def = load_format_schema(input, "fixed-width")?;
     def.fields.ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width schema must have 'fields' defined".into(),
         ))
     })
+}
+
+/// Build a multi-record flat-file reader (CSV or fixed-width) from a
+/// `records:` schema definition.
+///
+/// The `kind` selects the discriminator semantics: a fixed-width source reads
+/// the discriminator byte range and per-field byte ranges; a CSV source reads
+/// the discriminator column and positional per-type fields.
+///
+/// # Errors
+///
+/// Returns a config validation error when the definition omits its
+/// `discriminator:` block, or [`PipelineError::Compilation`] when the reader
+/// rejects the discriminator / record-type declarations.
+fn build_multi_record_reader(
+    input: &clinker_plan::config::SourceConfig,
+    def: &clinker_record::schema_def::SchemaDefinition,
+    kind: MultiRecordKind,
+    reader: Box<dyn Read + Send>,
+) -> Result<Box<dyn FormatReader>, PipelineError> {
+    let discriminator = def.discriminator.as_ref().ok_or_else(|| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            "multi-record `format_schema` requires a `discriminator` block".into(),
+        ))
+    })?;
+    let record_types = def.records.as_deref().unwrap_or_default();
+    let structure = def.structure.clone().unwrap_or_default();
+    // The header record-type tags are the `record_type` extracts the source's
+    // `envelope:` config declares. The reader learns them at construction so
+    // its bounded header pre-scan runs before any body record, and a header
+    // row is never misclassified as a body record (the driver calls
+    // `next_record` before `prepare_document`).
+    let header_tags = header_record_type_tags(input);
+    // A multi-record source with no DLQ strategy fails fast on an unknown
+    // discriminator value (E345). The document-DLQ seam routes the row to the
+    // dead-letter sink under a non-fail-fast strategy; that wiring lands with
+    // the per-record DLQ granularity work, so the reader defaults to fail-fast
+    // here, the strictest and safest posture for an undeclared tag.
+    let fail_fast = true;
+    let to_pipeline_err = |e: clinker_format::FormatError| PipelineError::Compilation {
+        transform_name: input.name.clone(),
+        messages: vec![format!("multi-record reader init error: {e}")],
+    };
+    let spec = clinker_format::multi_record::MultiRecordSpec {
+        discriminator,
+        record_types,
+        structure,
+        header_tags,
+        fail_fast,
+    };
+    let built: Box<dyn FormatReader> = match kind {
+        MultiRecordKind::FixedWidth(opts) => {
+            let cfg = build_fw_reader_config(opts);
+            Box::new(
+                clinker_format::multi_record::MultiRecordReader::new_fixed_width(
+                    reader,
+                    spec,
+                    cfg.line_separator,
+                )
+                .map_err(to_pipeline_err)?,
+            )
+        }
+        MultiRecordKind::Csv(opts) => {
+            let cfg = build_csv_reader_config(opts);
+            Box::new(
+                clinker_format::multi_record::MultiRecordReader::new_csv(
+                    reader,
+                    spec,
+                    cfg.delimiter,
+                    cfg.quote_char,
+                )
+                .map_err(to_pipeline_err)?,
+            )
+        }
+    };
+    Ok(built)
+}
+
+/// Collect the header record-type tags a source's `envelope:` config declares
+/// via `record_type` extracts. These name the header rows the multi-record
+/// reader captures in its bounded pre-scan and excludes from the body stream.
+fn header_record_type_tags(input: &clinker_plan::config::SourceConfig) -> Vec<String> {
+    let Some(envelope) = input.envelope.as_ref() else {
+        return Vec::new();
+    };
+    envelope
+        .sections
+        .values()
+        .filter_map(|section| match &section.extract {
+            clinker_format::EnvelopeExtract::RecordType(tag) => Some(tag.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Selects the multi-record reader backend and carries that format's input
+/// options through to the reader config builders.
+enum MultiRecordKind<'a> {
+    Csv(Option<&'a clinker_plan::config::CsvInputOptions>),
+    FixedWidth(Option<&'a clinker_plan::config::FixedWidthInputOptions>),
 }
 
 /// Build CSV reader config from optional CSV input options.

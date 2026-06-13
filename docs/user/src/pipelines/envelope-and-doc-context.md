@@ -140,13 +140,19 @@ Each section declares how the reader locates its payload:
 | EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
 | X12     | `segment`        | A service-segment tag — only `ISA` (GS/ST surface as nested levels) |
 | HL7 v2  | `segment`        | A header-segment tag — only `FHS` (BHS/MSH surface as nested levels) |
+| Multi-record CSV / fixed-width | `record_type` | A header record-type tag, e.g. `H` |
 
 Declaring an `xml_path` section against a JSON source (or vice versa),
-or a `segment` extract against XML/JSON, is a configuration error and
-fails fast when the source opens, rather than silently producing empty
-sections. CSV and fixed-width sources do not yet support envelope
-extraction; declaring envelope sections on those formats is a no-op
-today.
+a `segment` extract against XML/JSON, or a `record_type` extract against
+any format other than multi-record CSV / fixed-width is a configuration
+error and fails fast when the source opens, rather than silently
+producing empty sections.
+
+A **plain** (single-schema) CSV or fixed-width source carries no envelope
+— there is no header/trailer structure to extract, so declaring envelope
+sections on one is a no-op. The `record_type` extract applies only to a
+[multi-record](../formats/csv.md#multi-record-files-header--trailer--body)
+source, one declaring a `discriminator:` + `records:` block.
 
 ### Network (REST) sources carry no `$doc` context
 
@@ -182,6 +188,43 @@ failure: by default it aborts the run, and under a source's
 (see [Malformed envelopes](error-handling.md#malformed-envelopes-structural-validation)).
 A `segment` extract naming any tag other than `UNB` is rejected at startup. See
 [EDIFACT Format](../formats/edifact.md) for the full reference.
+
+### Multi-record `record_type` extract
+
+A [multi-record](../formats/csv.md#multi-record-files-header--trailer--body)
+CSV or fixed-width source — one that declares a `discriminator:` and a
+`records:` list — exposes a **header record type** as an envelope section
+through the `record_type` extract. The tag names which of the source's
+declared record types carries the section's payload; the matched header
+row's named fields become the section's fields.
+
+```yaml
+format_schema:
+  discriminator: { start: 0, width: 1 }
+  records:
+    - { id: header,  tag: H, fields: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+    - { id: detail,  tag: D, fields: [ { name: amount,   type: integer, start: 1, width: 9 } ] }
+    - { id: trailer, tag: T, fields: [ { name: count,    type: integer, start: 1, width: 9 } ] }
+  structure:
+    - { record: trailer, count: count }
+envelope:
+  sections:
+    head:
+      extract: { record_type: H }       # the H header row → $doc.head.*
+      fields:
+        batch_id: string
+```
+
+Only a **header** record type — one whose rows precede the body at the
+file head — is extractable as a `$doc` section; the reader captures the
+first such row in a bounded pre-scan and excludes it from the body
+stream. A **trailer** record type (one named by a `structure:`
+constraint) arrives after the body it closes, so it is **not** an
+envelope section — its declared `count` is validated against the streamed
+body count instead, the same structural-integrity check the EDI trailers
+use. See [CSV](../formats/csv.md#multi-record-files-header--trailer--body)
+and [Fixed-Width](../formats/fixed-width.md#multi-record-files-header--trailer--body)
+for the full reference.
 
 A JSON example:
 

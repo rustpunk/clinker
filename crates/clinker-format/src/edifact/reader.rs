@@ -386,7 +386,9 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
-                EnvelopeExtract::XmlPath(_) | EnvelopeExtract::JsonPointer(_) => {
+                EnvelopeExtract::XmlPath(_)
+                | EnvelopeExtract::JsonPointer(_)
+                | EnvelopeExtract::RecordType(_) => {
                     return Err(FormatError::Edifact(format!(
                         "envelope section {name:?}: declared a non-`segment` extract \
                          against an EDIFACT source. Use `segment` (e.g. \

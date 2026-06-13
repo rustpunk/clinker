@@ -144,6 +144,16 @@ impl FormatError {
         }
     }
 
+    /// Build a [`FormatError::StructuralCount`] for a multi-record flat-file
+    /// trailer count mismatch (a trailer record type's declared count against
+    /// the streamed body count).
+    pub fn multi_record_structural_count(message: impl Into<String>) -> Self {
+        Self::StructuralCount {
+            format: "multi-record",
+            message: message.into(),
+        }
+    }
+
     /// `true` for a [`FormatError::StructuralCount`] — the only class the
     /// executor reclassifies from run-aborting to document-DLQ under
     /// `dlq_granularity: document`. Every other variant keeps aborting.
