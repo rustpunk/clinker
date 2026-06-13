@@ -418,19 +418,17 @@ fn drain_output_input_events(
 ///
 /// Boundary detection is RECORD-driven, not punctuation-driven: every
 /// `Record` carries its `Arc<DocumentContext>`, and a document boundary is a
-/// change in the record's `doc_ctx().source_file()` between consecutive
-/// records. Punctuations cannot drive this — the executor's buffers
-/// tail-clump all `DocumentClose` events after all records, so an
-/// interleaved boundary stream never reaches a terminal Output.
+/// change in the record's `doc_ctx().grain()` between consecutive records.
+/// Punctuations cannot drive this — the executor's buffers tail-clump all
+/// `DocumentClose` events after all records, so an interleaved boundary stream
+/// never reaches a terminal Output.
 ///
-/// The grain is FILE-LEVEL: boundaries key on `source_file`, so nested
-/// envelope levels (which mint fresh ids via `DocumentContext::child` but
-/// share the file's `source_file` Arc) frame as one document, and a file
-/// holding several messages (HL7 batch, EDIFACT/X12 interchange) frames as
-/// one document rather than one per message. With the writer hooks defaulting
-/// to no-ops this is byte-identical to today; per-message framing for
-/// multi-message formats is resolved when the format writers render the
-/// envelope (tracked at <https://github.com/rustpunk/clinker/issues/194>).
+/// The grain is the per-document FRAME ([`clinker_record::DocumentGrain`]),
+/// the SAME grain the document-DLQ buckets at, so framing and dead-lettering
+/// agree. An X12 `GS`/`ST` inherits the interchange grain, so a whole
+/// `ISA..IEA` interchange frames as one envelope; an HL7 `MSH` opens a fresh
+/// grain, so a multi-message file frames once PER message; a flat file
+/// (CSV/JSON/XML/fixed-width/EDIFACT) is one grain per file.
 ///
 /// Bounded-memory: this path buffers no records. It holds only the current
 /// document's context, so a multi-gigabyte document streams at O(1-record).
@@ -578,12 +576,11 @@ struct EnvelopeWriterDriver {
 
 impl EnvelopeWriterDriver {
     /// Write one already-projected body record, framing per document. The
-    /// record's own `doc_ctx` drives boundary detection: when its
-    /// `source_file` differs from the currently-open document's, the prior
-    /// document ends (`end_document`) and the new one begins
-    /// (`begin_document`) before the record is written. Records whose
-    /// `source_file` is non-concrete (an in-pipeline synthesis / fan-in row)
-    /// stream through unframed.
+    /// record's own `doc_ctx` drives boundary detection: when its frame
+    /// `grain` differs from the currently-open document's, the prior document
+    /// ends (`end_document`) and the new one begins (`begin_document`) before
+    /// the record is written. Records whose `source_file` is non-concrete (an
+    /// in-pipeline synthesis / fan-in row) stream through unframed.
     ///
     /// Opens the writer lazily on the first record (via `open_writer`,
     /// deriving the schema from it). A `None` from `open_writer` means no
@@ -623,23 +620,25 @@ impl EnvelopeWriterDriver {
     /// belongs to no document, so it neither closes the open document nor
     /// opens one — it streams through inside whatever framing is current.
     ///
-    /// The same-document test is `Arc::ptr_eq` first (every record of a
-    /// document shares the document's `source_file` Arc — the ingest stamps it
-    /// once and `DocumentContext::child` clones the same Arc — so pointer
-    /// identity settles the common case without an O(path-length) string
-    /// compare on this per-record hot path), with a string-equality fallback
-    /// for the one case ptr identity does not survive: a document whose
-    /// records span two spill chunks of the input buffer, where each chunk's
-    /// `SpillReader` rebuilds a fresh (equal-valued) `source_file` Arc. Without
-    /// the fallback that document would be spuriously split mid-stream.
+    /// The same-document test compares the record's
+    /// [`grain`](clinker_record::DocumentContext::grain) against the open
+    /// document's. The grain is a `Copy` value identity (not a pointer), so it
+    /// is correct across an input-buffer spill boundary for free: a frame whose
+    /// records span two spill chunks rebuilds a fresh `source_file` Arc per
+    /// chunk, but the grain round-trips verbatim, so the frame is not
+    /// spuriously split mid-stream. Keying on grain rather than `source_file`
+    /// is what makes a multi-message HL7 file frame once per message (each
+    /// `MSH` is its own grain) while a nested X12 interchange still frames once
+    /// (its `GS`/`ST` levels inherit the interchange grain).
     fn maybe_cross_boundary(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
-        let file = doc_ctx.source_file();
-        if !crate::executor::document_dlq::is_concrete_file(file) {
+        if !crate::executor::document_dlq::is_concrete_file(doc_ctx.source_file()) {
             return;
         }
-        let same_doc = self.open_doc.as_ref().is_some_and(|open| {
-            Arc::ptr_eq(open.source_file(), file) || open.source_file().as_ref() == file.as_ref()
-        });
+        let grain = doc_ctx.grain();
+        let same_doc = self
+            .open_doc
+            .as_ref()
+            .is_some_and(|open| open.grain() == grain);
         if same_doc {
             return;
         }
@@ -984,13 +983,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_envelope_fires_only_at_outermost_pair() {
-        // One file, two envelope levels: the inner level mints a fresh
-        // `DocumentId` via `child` but SHARES the file's `source_file` Arc.
-        // Keying boundary detection on `source_file` (not the id) frames at
-        // the outermost (file) grain, so a record carrying the inner-level
-        // context still belongs to the one file document — begin/end fire
-        // exactly once.
+    fn nested_x12_interchange_fires_only_at_the_interchange_pair() {
+        // One X12 interchange, two nested levels: the inner level mints a
+        // fresh `DocumentId` via `child` but INHERITS the interchange grain.
+        // Keying boundary detection on the grain frames at the interchange, so
+        // a record carrying the inner (GS/ST) context still belongs to the one
+        // interchange document — begin/end fire exactly once for the whole
+        // `ISA..IEA`, not once per transaction set.
         let outer = doc("multi.x12");
         let inner = Arc::new(outer.child(DocumentId::next(), IndexMap::new()));
         let records = vec![record(1, &outer), record(2, &inner), record(3, &outer)];
@@ -1005,7 +1004,42 @@ mod tests {
                 "end:multi.x12",
                 "flush",
             ],
-            "begin/end fire once for the file, not per nested level",
+            "begin/end fire once for the interchange, not per nested level",
+        );
+        assert_eq!(written, 3);
+    }
+
+    #[test]
+    fn multi_message_hl7_file_frames_once_per_message() {
+        // One HL7 file, two messages: each `MSH` opens a fresh frame via
+        // `child_frame`, so the two message contexts share the file's
+        // `source_file` Arc but carry DISTINCT grains. Keying on grain frames
+        // ONCE PER MESSAGE — begin/end fire around each message's records —
+        // even though both messages live in one file. (Keying on `source_file`
+        // would collapse them into a single frame, the bug this fixes.)
+        let file: Arc<str> = Arc::from("messages.hl7");
+        let file_doc = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::clone(&file),
+            IndexMap::new(),
+        ));
+        let msg1 = Arc::new(file_doc.child_frame(DocumentId::next(), IndexMap::new()));
+        let msg2 = Arc::new(file_doc.child_frame(DocumentId::next(), IndexMap::new()));
+        let records = vec![record(1, &msg1), record(2, &msg1), record(3, &msg2)];
+        let (log, written) = run_log(&records);
+        assert_eq!(
+            log,
+            vec![
+                "begin:messages.hl7",
+                "write:1",
+                "write:2",
+                "end:messages.hl7",
+                "begin:messages.hl7",
+                "write:3",
+                "end:messages.hl7",
+                "flush",
+            ],
+            "begin/end fire once per HL7 message, not once for the whole file",
         );
         assert_eq!(written, 3);
     }
@@ -1031,19 +1065,26 @@ mod tests {
     }
 
     #[test]
-    fn equal_but_distinct_source_file_arcs_do_not_split_a_document() {
-        // A document whose records span two input spill chunks carries a fresh
-        // (equal-valued) `source_file` Arc per chunk, because each chunk's
-        // `SpillReader` rebuilds the interning table. Pure `Arc::ptr_eq` would
-        // see two pointers and spuriously close + reopen the document
-        // mid-stream; the string-equality fallback keeps it framed as one.
-        // `doc()` mints a fresh Arc each call, so two `doc("split.csv")` model
-        // the cross-chunk rebuild.
+    fn spilled_chunk_rebuild_does_not_split_a_document() {
+        // A document whose records span two input spill chunks has its
+        // `DocumentContext` rebuilt per chunk by the spill codec, producing a
+        // fresh `source_file` Arc but the SAME grain (the codec carries the
+        // grain verbatim). Keying boundary detection on the grain therefore
+        // keeps the frame intact across the spill boundary — a pure
+        // `Arc::ptr_eq` on `source_file` would spuriously split it. The
+        // postcard round-trip is exactly what the spill path does.
         let chunk1 = doc("split.csv");
-        let chunk2 = doc("split.csv");
+        let bytes = postcard::to_stdvec(chunk1.as_ref()).unwrap();
+        let rebuilt: DocumentContext = postcard::from_bytes(&bytes).unwrap();
+        let chunk2 = Arc::new(rebuilt);
         assert!(
             !Arc::ptr_eq(chunk1.source_file(), chunk2.source_file()),
-            "the two contexts must hold distinct (equal-valued) Arcs to model the split",
+            "the rebuilt context must hold a distinct `source_file` Arc to model the spill",
+        );
+        assert_eq!(
+            chunk1.grain(),
+            chunk2.grain(),
+            "but the grain survives the spill round-trip verbatim",
         );
         let records = vec![record(1, &chunk1), record(2, &chunk2)];
         let (log, _written) = run_log(&records);

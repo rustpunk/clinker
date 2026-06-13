@@ -20,7 +20,7 @@ pub mod xml;
 pub use counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 pub use doc_index::DocArenaIndex;
 pub use envelope::{
-    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
+    EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection, FrameRole,
     NestedEnvelopeSection,
 };
 pub use error::FormatError;

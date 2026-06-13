@@ -849,7 +849,7 @@ fn apply_envelope_events(
 ) -> Result<(), PipelineError> {
     for event in src_reader.take_envelope_events() {
         match event {
-            clinker_format::EnvelopeEvent::OpenLevel { sections } => {
+            clinker_format::EnvelopeEvent::OpenLevel { sections, frame } => {
                 // Open a fresh file-level document when none is open yet,
                 // or when the open stack belongs to a different file than
                 // this event — a trailing header-only interchange for a new
@@ -862,7 +862,15 @@ fn apply_envelope_events(
                     open_file_level_doc(src_cfg, stream, doc_stack, src_reader, file_arc)?;
                 }
                 let parent = doc_stack.last().expect("file-level document opened above");
-                let child = Arc::new(parent.child(clinker_record::DocumentId::next(), sections));
+                let id = clinker_record::DocumentId::next();
+                // `FrameRole::NewFrame` (an HL7 `MSH` message) begins its own
+                // output-envelope / document-DLQ frame via `child_frame`;
+                // `Inherit` (an X12 `GS`/`ST`) stays inside the enclosing
+                // interchange frame via `child`.
+                let child = Arc::new(match frame {
+                    clinker_format::FrameRole::NewFrame => parent.child_frame(id, sections),
+                    clinker_format::FrameRole::Inherit => parent.child(id, sections),
+                });
                 push_doc_punctuation(
                     stream,
                     crate::executor::stream_event::Punctuation::document_open(Arc::clone(&child)),
@@ -1345,7 +1353,10 @@ mod tests {
                         field.insert(Box::from("tag"), Value::String(name.into()));
                         let mut sections = IndexMap::new();
                         sections.insert(Box::from(name), Value::Map(Box::new(field)));
-                        self.pending.push(EnvelopeEvent::OpenLevel { sections });
+                        self.pending.push(EnvelopeEvent::OpenLevel {
+                            sections,
+                            frame: clinker_format::FrameRole::Inherit,
+                        });
                     }
                     Step::Close => self.pending.push(EnvelopeEvent::CloseLevel),
                     Step::Record(id) => {

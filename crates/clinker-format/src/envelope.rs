@@ -47,10 +47,38 @@ pub enum EnvelopeEvent {
     /// extracted for it (already coerced to their declared field types,
     /// keyed by user-declared section name). The driver opens a child
     /// document context whose sections layer over the enclosing levels.
-    OpenLevel { sections: IndexMap<Box<str>, Value> },
+    ///
+    /// `frame` tells the driver whether this level begins a new
+    /// output-envelope / document-DLQ frame (see [`FrameRole`]). Most nested
+    /// levels are [`FrameRole::Inherit`] (an X12 `GS`/`ST` stays inside the
+    /// interchange frame); a level the format treats as a self-contained
+    /// document — each HL7 `MSH` message — is [`FrameRole::NewFrame`].
+    OpenLevel {
+        sections: IndexMap<Box<str>, Value>,
+        frame: FrameRole,
+    },
     /// Leave the innermost open nested envelope level. The driver closes
     /// the matching document context.
     CloseLevel,
+}
+
+/// Whether a nested envelope level begins a fresh per-document frame — the
+/// grain at which the engine reconstructs an output envelope and dead-letters
+/// a whole document.
+///
+/// The frame is whichever level the format treats as one logical document:
+/// the X12 interchange (so its nested `GS`/`ST` levels `Inherit`), or each HL7
+/// message (so each `MSH` is a `NewFrame`). The driver maps `Inherit` to
+/// [`clinker_record::DocumentContext::child`] and `NewFrame` to
+/// [`clinker_record::DocumentContext::child_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRole {
+    /// Stay inside the enclosing frame — this level's records share the
+    /// enclosing document's grain (X12 `GS`/`ST` under one `ISA`).
+    Inherit,
+    /// Begin a new frame — this level is itself a logical document (an HL7
+    /// `MSH` message), so its records get a distinct grain.
+    NewFrame,
 }
 
 /// Configuration for one source's envelope sections.

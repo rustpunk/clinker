@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use clinker_format::{EnvelopeEvent, FormatError};
+use clinker_format::{EnvelopeEvent, FormatError, FrameRole};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
@@ -119,6 +119,7 @@ impl RecordSource for ScriptedReader {
                     self.current_file = Some(self.file_arc(file));
                     self.pending_events.push(EnvelopeEvent::OpenLevel {
                         sections: Self::section(name, tag_val),
+                        frame: FrameRole::Inherit,
                     });
                 }
                 Step::Close { file } => {
