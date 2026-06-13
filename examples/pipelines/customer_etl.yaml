@@ -1,5 +1,9 @@
 pipeline:
   name: customer_etl
+  vars:
+    # Lifetime-value cut for the "gold" tier. A channel overrides this per
+    # tenant via `vars.static.gold_threshold` (see channels/acme-corp/).
+    gold_threshold: { type: int, default: 10000 }
 
 nodes:
   - type: source
@@ -34,7 +38,7 @@ nodes:
     input: active_only
     config:
       cxl: |
-        emit tier = if lifetime_value.to_int() > 10000 then "gold" else "standard"
+        emit tier = if lifetime_value.to_int() > $vars.gold_threshold then "gold" else "standard"
 
   - type: output
     name: results

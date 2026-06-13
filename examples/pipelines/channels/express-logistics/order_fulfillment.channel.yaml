@@ -1,24 +1,17 @@
-_channel:
-  pipeline: order_fulfillment
-  description: >
-    Express Logistics channel applies premium express shipping rates
-    and adds a flat surcharge on all express orders.
+# Express Logistics channel for the order_fulfillment pipeline.
+#
+# Run with:  clinker run order_fulfillment.yaml \
+#              --channel channels/express-logistics/order_fulfillment.channel.yaml
+#
+# Express applies a steeper handling surcharge on urgent orders by overriding
+# the `express_surcharge` $vars entry. Logic stays in the base pipeline; the
+# channel only supplies a different value.
+channel:
+  name: express-logistics
+  target: ./order_fulfillment.yaml
 
-transformations:
-  base_rate:
-    cxl: |
-      emit base_shipping = if shipping_method == "express" then 3.75 else if shipping_method == "overnight" then 6.00 else 1.20
-    description: Express Logistics charges higher per-kg rates
-
-add_transformations:
-  - name: express_surcharge
-    after: total_shipping
-    description: Flat surcharge on express and overnight orders
-    cxl: |
-      emit shipping_cost = if shipping_method == "express" or shipping_method == "overnight" then shipping_cost + 8.99 else shipping_cost
-
-outputs:
-  fulfilled_orders:
-    path: ./output/express-logistics/fulfilled_orders.csv
-  priority_report:
-    path: ./output/express-logistics/priority_report.json
+vars:
+  static:
+    express_surcharge:
+      type: float
+      default: 12.99
