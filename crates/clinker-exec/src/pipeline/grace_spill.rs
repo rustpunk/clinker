@@ -41,8 +41,10 @@
 //!
 //! Reader path validates the footer magic and version, then opens a
 //! decode stream over the body (matching the format tag) and yields
-//! records via postcard. A 64MB per-record byte budget bounds reader
-//! allocations against malformed input.
+//! records via postcard. A per-frame byte cap
+//! ([`SPILL_MAX_FRAME_BYTES`](crate::pipeline::spill::SPILL_MAX_FRAME_BYTES),
+//! shared with the inter-stage spill reader) bounds reader allocations
+//! against a malformed length prefix on either frame kind.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -52,6 +54,7 @@ use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 
+use crate::pipeline::spill::SPILL_MAX_FRAME_BYTES;
 use clinker_plan::SpillError;
 use clinker_plan::error::PipelineError;
 use clinker_record::{
@@ -216,11 +219,6 @@ pub(crate) const GRACE_SPILL_MAGIC: u32 = 0x434C_4B47;
 /// intern) and per-document context interning, which the prior format did
 /// not, so a reader must reject the older layout outright.
 pub(crate) const GRACE_SPILL_VERSION: u16 = 2;
-
-/// Maximum single-record postcard byte length the reader will allocate
-/// for. Larger length prefixes are treated as corruption and surfaced as
-/// `io::Error` rather than driving a runaway allocation.
-pub(crate) const GRACE_SPILL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Footer byte size: 4 (magic) + 2 (version) + 1 (hash_bits) +
 /// 2 (partition_id) + 8 (record_count) = 17 bytes.
@@ -599,9 +597,9 @@ impl Iterator for GraceSpillReader {
                 Err(e) => return Some(Err(e)),
             }
             let len = u32::from_le_bytes(self.len_buf) as usize;
-            if len > GRACE_SPILL_MAX_RECORD_BYTES {
+            if len > SPILL_MAX_FRAME_BYTES {
                 return Some(Err(std::io::Error::other(format!(
-                    "grace spill: frame length {len} exceeds {GRACE_SPILL_MAX_RECORD_BYTES} byte cap"
+                    "grace spill: frame length {len} exceeds {SPILL_MAX_FRAME_BYTES} byte cap"
                 ))));
             }
             if len == 0 {

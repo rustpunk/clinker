@@ -79,6 +79,14 @@ const FRAME_RECORD_PAIR: u8 = 0x00;
 /// [`DocumentId`] in the stream.
 const FRAME_CONTEXT_INTERN: u8 = 0x01;
 
+/// Upper bound on a single spill frame's on-disk byte length. A length
+/// prefix exceeding this is treated as corruption and surfaced as a clean
+/// decode error *before* any allocation, so a garbage prefix can't drive an
+/// unbounded `vec![0u8; len]` and OOM the process. Applies to both frame
+/// kinds (record pair and context intern). The grace-hash spill reader
+/// shares this cap for parity.
+pub(crate) const SPILL_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Record-stream sink for a spill file: either a raw buffered writer
 /// (uncompressed) or an LZ4 frame encoder wrapping one. Both expose
 /// `io::Write` for the schema header and per-record bodies; the variant is
@@ -434,6 +442,16 @@ impl<P: DeserializeOwned> Iterator for SpillReader<P> {
                 return Some(Err(SpillError::InvalidSchema(
                     "spill frame length 0 (missing discriminator); file is corrupt".to_string(),
                 )));
+            }
+            if len > SPILL_MAX_FRAME_BYTES {
+                // A length prefix past the cap is corruption — reject before
+                // allocating `len` bytes so a garbage prefix can't OOM the
+                // process. Covers both the record-pair and context-intern
+                // frames, which share this read.
+                return Some(Err(SpillError::InvalidSchema(format!(
+                    "spill frame length {len} exceeds {SPILL_MAX_FRAME_BYTES} byte cap; \
+                     file is corrupt"
+                ))));
             }
             let mut buf = vec![0u8; len];
             if let Err(e) = self.source.read_exact(&mut buf) {
@@ -1048,6 +1066,67 @@ mod tests {
             ),
             other => panic!("expected InvalidSchema, got {other:?}"),
         }
+    }
+
+    // A garbage length prefix on either frame kind must be rejected as a
+    // clean decode error BEFORE the `vec![0u8; len]` allocation, so a
+    // corrupt prefix can't drive an unbounded allocation and OOM the
+    // process — the same cap the grace-hash reader enforces. The first body
+    // frame's 4-byte length prefix is overwritten with an over-cap value in
+    // place (no oversized buffer is materialized), then the reader must
+    // surface the cap error rather than attempting the allocation. Covers
+    // both the context-intern frame (doc-attached record opens with one) and
+    // the record-pair frame (synthetic record opens with one).
+    fn assert_over_cap_first_frame_rejected(spill_file: &SpillFile<()>, schema: &Arc<Schema>) {
+        let mut raw = std::fs::read(spill_file.path()).unwrap();
+        let nl = raw.iter().position(|&b| b == b'\n').unwrap();
+        // Overwrite the first body frame's 4-byte LE length prefix with an
+        // over-cap value. The cap check must fire on this prefix before any
+        // `vec![0u8; len]`, so the (absent) oversized body is never read.
+        let over_cap = (SPILL_MAX_FRAME_BYTES as u32) + 1;
+        raw[nl + 1..nl + 5].copy_from_slice(&over_cap.to_le_bytes());
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &raw).unwrap();
+        let err = decode_surgical(tmp.path(), schema).expect_err(
+            "an over-cap frame length prefix must be a decode error, not an allocation",
+        );
+        match err {
+            SpillError::InvalidSchema(msg) => assert!(
+                msg.contains("exceeds") && msg.contains("byte cap"),
+                "expected over-cap message, got: {msg}"
+            ),
+            other => panic!("expected InvalidSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spill_over_cap_context_frame_length_is_decode_error_not_oom() {
+        let schema = test_schema();
+        // A doc-attached record opens the body with a context-intern frame.
+        // Uncompressed so the first frame's length prefix sits at a fixed
+        // offset right after the JSON schema header line.
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut rec = make_record(&schema, "a", 1, true);
+        rec.set_doc_ctx(make_doc_ctx(5, "big.xml"));
+        writer.write_record(&rec).unwrap();
+        let spill_file = writer.finish().unwrap();
+        assert_over_cap_first_frame_rejected(&spill_file, &schema);
+    }
+
+    #[test]
+    fn spill_over_cap_record_frame_length_is_decode_error_not_oom() {
+        let schema = test_schema();
+        // A synthetic-context record interns no context frame, so the first
+        // body frame is the record pair.
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        writer
+            .write_record(&make_record(&schema, "a", 1, true))
+            .unwrap();
+        let spill_file = writer.finish().unwrap();
+        assert_over_cap_first_frame_rejected(&spill_file, &schema);
     }
 
     /// Count every length-prefixed frame in a finished spill file's body,
