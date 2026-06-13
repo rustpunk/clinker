@@ -31,8 +31,9 @@ pub use misra_gries::MisraGries;
 /// SplitMix64 passes BigCrush, so feeding it `0..n` gives the HLL
 /// register-index and leading-zero distributions their accuracy bounds are
 /// derived under — a weaker mixer leaves residual structure in the high
-/// bits and inflates the apparent error. Shared by the sketch test modules.
-#[cfg(test)]
+/// bits and inflates the apparent error. Also drives Reshape's skew-spill
+/// partition assignment, which feeds it a dense admission sequence and reads
+/// the high bits for bucket placement.
 pub(crate) fn splitmix64(i: u64) -> u64 {
     let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

@@ -16,7 +16,7 @@
 //! [`MemoryArbitrator`](crate::pipeline::memory::MemoryArbitrator): a
 //! registered [`ReshapeConsumer`] reports the live group-buffer bytes, and
 //! when the soft threshold trips the arm spills whole *input* records — not
-//! post-processed output rows — through a [`SpillWriter<u64>`], then re-runs
+//! post-processed output rows — through a [`SpillWriter`], then re-runs
 //! mutation and synthesis on the reloaded group at finalize.
 //!
 //! Spilling input records (rather than output rows) is load-bearing for two
@@ -30,11 +30,12 @@
 //! is exact.
 //!
 //! A single oversized group is spilled incrementally — partitioned by the
-//! upper bits of its arrival hash so successive spill waves evict slices of
-//! the one group rather than buffering it whole — while smaller groups stay
-//! resident under the byte budget. The consumer registers at priority `15`
-//! (between grace-hash and external sort) and cannot back-pressure: there is
-//! no upstream channel to gate once the predecessor has drained.
+//! upper bits of each record's admission sequence so successive spill waves
+//! evict slices of the one group rather than buffering it whole — while
+//! smaller groups stay resident under the byte budget. The consumer registers
+//! at priority `15` (between grace-hash and external sort) and cannot
+//! back-pressure: there is no upstream channel to gate once the predecessor
+//! has drained.
 //!
 //! # No-cascade contract
 //!
@@ -43,7 +44,6 @@
 //! the whole group is rolled back rather than silently order-dependent.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, Value};
@@ -332,6 +332,33 @@ fn run_reshape_grouped(
     Ok(())
 }
 
+/// One buffered input record plus the two `u64`s the spill round-trip must
+/// preserve: a Reshape-local admission sequence that orders the record within
+/// its group, and the upstream source row number the rule kernel needs for
+/// source attribution and DLQ row identity.
+///
+/// `seq` — not the source row number — is the ordering key. The source row
+/// number is unique only per source: a `Merge` of two sources forwards each
+/// source's row number without renumbering, so two records from different
+/// sources can share a row number and land in the same group. Sorting a
+/// reloaded group by the source row number would then reorder those records
+/// relative to a resident group. The Reshape-local sequence is assigned once
+/// per admitted record from a single monotonic counter, so it is globally
+/// unique across all sources and captures the true merged arrival order.
+struct BufferedRecord {
+    record: Record,
+    /// Reshape-local monotonic admission sequence; the within-group sort key.
+    seq: u64,
+    /// Upstream source row number, carried through for the rule kernel.
+    row_num: u64,
+}
+
+/// Spill payload for a buffered Reshape input record: the admission sequence
+/// and the source row number, both reconstructed on reload. `SpillWriter` is
+/// generic over the payload type, so this changes only what Reshape stores
+/// per record — not the shared spill envelope or `RecordPayload`.
+type ReshapeSpillPayload = (u64, u64);
+
 /// One group's buffered input records: a resident tail plus any slices
 /// already evicted to disk.
 ///
@@ -342,7 +369,7 @@ fn run_reshape_grouped(
 /// its newest arrivals stay resident until the next trip.
 struct ReshapeGroupState {
     /// Records still in memory for this group, in arrival order.
-    resident: Vec<(Record, u64)>,
+    resident: Vec<BufferedRecord>,
     /// Estimated heap bytes of `resident`, maintained incrementally so the
     /// buffer's running total never rescans the group.
     resident_bytes: usize,
@@ -353,9 +380,10 @@ struct ReshapeGroupState {
     /// OOMing on reload.
     spilled_bytes: usize,
     /// Input-record slices already written to disk, oldest first. Reloaded at
-    /// finalize and merged with `resident` back into arrival order (by row
-    /// number) so a spilled group emits identically to a resident one.
-    spilled: Vec<SpillFile<u64>>,
+    /// finalize and merged with `resident` back into arrival order (by the
+    /// admission sequence) so a spilled group emits identically to a resident
+    /// one.
+    spilled: Vec<SpillFile<ReshapeSpillPayload>>,
 }
 
 impl ReshapeGroupState {
@@ -374,9 +402,9 @@ impl ReshapeGroupState {
 /// Holds every drained input record grouped by `partition_by` in first-seen
 /// order. Under memory pressure it evicts whole resident groups to disk
 /// largest-first; a single group too large to fit on its own is sliced by
-/// the upper bits of each record's arrival hash so successive waves spill
-/// slices of the one group rather than buffering it whole. At finalize each
-/// group is streamed back — resident records plus reloaded spill slices in
+/// the upper bits of each record's admission sequence so successive waves
+/// spill slices of the one group rather than buffering it whole. At finalize
+/// each group is streamed back — resident records plus reloaded spill slices in
 /// arrival order — and the kernel runs unchanged.
 struct ReshapeGroupBuffer {
     /// Input schema every spill file stores and reloads against.
@@ -391,6 +419,10 @@ struct ReshapeGroupBuffer {
     /// Sum of every group's `resident_bytes`. Mirrored into the consumer
     /// handle so the arbitrator sees the live resident footprint.
     resident_bytes: usize,
+    /// Next Reshape-local admission sequence. Incremented once per admitted
+    /// record so the value stamped on each record is globally unique and
+    /// monotonic in true (merged) arrival order across every source.
+    next_seq: u64,
 }
 
 impl ReshapeGroupBuffer {
@@ -401,6 +433,7 @@ impl ReshapeGroupBuffer {
             group_order: Vec::new(),
             groups: HashMap::new(),
             resident_bytes: 0,
+            next_seq: 0,
         }
     }
 
@@ -409,15 +442,22 @@ impl ReshapeGroupBuffer {
         self.resident_bytes
     }
 
-    /// Admit one record into its group, recording first-seen order.
+    /// Admit one record into its group, stamping a Reshape-local admission
+    /// sequence and recording first-seen group order.
     fn push(&mut self, key: Vec<GroupByKey>, record: Record, row_num: u64) {
         let bytes = estimated_input_bytes(&record);
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let order = &mut self.group_order;
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
             ReshapeGroupState::new()
         });
-        state.resident.push((record, row_num));
+        state.resident.push(BufferedRecord {
+            record,
+            seq,
+            row_num,
+        });
         state.resident_bytes += bytes;
         self.resident_bytes += bytes;
     }
@@ -436,9 +476,9 @@ impl ReshapeGroupBuffer {
     /// Largest-resident-group-first matches the grace-hash Largest-Size
     /// victim policy: freeing the biggest holder reclaims the most headroom
     /// per spill. A single group whose resident tail alone still exceeds the
-    /// budget is sliced incrementally by arrival hash rather than buffered
-    /// whole — the cross-group resident peak stays bounded even under one
-    /// giant correlation group.
+    /// budget is sliced incrementally by admission sequence rather than
+    /// buffered whole — the cross-group resident peak stays bounded even under
+    /// one giant correlation group.
     ///
     /// The stop condition keys on `self.resident_bytes` rather than the
     /// arbitrator's `should_spill_self`: that poll reads the monotonic
@@ -523,8 +563,9 @@ impl ReshapeGroupBuffer {
     /// Slice one oversized group's resident tail across hash partitions,
     /// spilling enough partitions to bring the group's resident footprint
     /// under `soft`. The partition assignment uses the upper bits of each
-    /// record's arrival hash (independent of insertion order), so a single
-    /// giant group is evicted in fractions across successive waves.
+    /// record's admission sequence, so a single giant group is evicted in
+    /// fractions across successive waves and a duplicate-content group still
+    /// distributes evenly.
     fn spill_group_partitioned(
         &mut self,
         node_name: &str,
@@ -549,12 +590,20 @@ impl ReshapeGroupBuffer {
         let shift = 64 - bits;
 
         let n = 1usize << bits;
-        let mut buckets: Vec<Vec<(Record, u64)>> = (0..n).map(|_| Vec::new()).collect();
+        let mut buckets: Vec<Vec<BufferedRecord>> = (0..n).map(|_| Vec::new()).collect();
         let mut bucket_bytes: Vec<usize> = vec![0; n];
-        for (record, row_num) in resident {
-            let p = ((hash_partition_seed(&record, row_num) >> shift) as usize) & (n - 1);
-            bucket_bytes[p] += estimated_input_bytes(&record);
-            buckets[p].push((record, row_num));
+        for buffered in resident {
+            // Partition on the admission sequence via the SplitMix64 finalizer:
+            // the sequence is dense (`0, 1, 2, …`) so it varies only in its low
+            // bits, but the slicer reads the *upper* bits — the finalizer
+            // spreads that low-bit variation across the whole word so buckets
+            // fill evenly. The sequence is globally unique, so a group of
+            // duplicate-content records still distributes instead of collapsing
+            // into one bucket. Deterministic, so a record lands in the same
+            // bucket on every wave.
+            let p = ((crate::sketch::splitmix64(buffered.seq) >> shift) as usize) & (n - 1);
+            bucket_bytes[p] += estimated_input_bytes(&buffered.record);
+            buckets[p].push(buffered);
         }
 
         // Spill whole buckets, largest first, until the group's residual
@@ -564,7 +613,7 @@ impl ReshapeGroupBuffer {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&p| std::cmp::Reverse(bucket_bytes[p]));
         let mut remaining: usize = bucket_bytes.iter().sum();
-        let mut spilled_files: Vec<SpillFile<u64>> = Vec::new();
+        let mut spilled_files: Vec<SpillFile<ReshapeSpillPayload>> = Vec::new();
         for &p in &order {
             if remaining <= soft || buckets[p].is_empty() {
                 continue;
@@ -586,7 +635,7 @@ impl ReshapeGroupBuffer {
         // byte total is `remaining`) and record the freshly written slices.
         // The spilled fraction is `total_bytes - remaining`, accumulated into
         // the group's on-disk total for the finalize-budget guard.
-        let tail: Vec<(Record, u64)> = buckets.into_iter().flatten().collect();
+        let tail: Vec<BufferedRecord> = buckets.into_iter().flatten().collect();
         let spilled_now = total_bytes - remaining;
         let state = self
             .groups
@@ -612,11 +661,14 @@ impl ReshapeGroupBuffer {
     /// two-pass finalize could lift this.
     ///
     /// A spilled group's records arrive in spill-file then bucket order, not
-    /// arrival order, so the merged group is re-sorted by row number (the
-    /// `u64` payload is the source arrival index) — a spilled group then
-    /// emits identically to a resident one, which is essential because output
-    /// must not depend on the memory budget. The never-spilled fast path
-    /// keeps its already-ordered resident Vec untouched.
+    /// arrival order, so the merged group is re-sorted by the Reshape-local
+    /// admission sequence — a globally-unique, monotonic-in-arrival-order key
+    /// that survives a multi-source `Merge` where source row numbers collide.
+    /// A spilled group then emits identically to a resident one, which is
+    /// essential because output must not depend on the memory budget. The
+    /// never-spilled fast path keeps its already-ordered resident Vec
+    /// untouched. The returned tuples carry the source row number the rule
+    /// kernel needs; the admission sequence has done its job by reload.
     ///
     /// # Errors
     ///
@@ -645,44 +697,58 @@ impl ReshapeGroupBuffer {
 
         if state.spilled.is_empty() {
             // Fast path: never spilled, resident Vec already in arrival order.
-            return Ok(state.resident);
+            return Ok(state
+                .resident
+                .into_iter()
+                .map(|b| (b.record, b.row_num))
+                .collect());
         }
 
-        let mut group: Vec<(Record, u64)> = Vec::new();
+        let mut group: Vec<BufferedRecord> = Vec::new();
         for file in &state.spilled {
             let reader = file
                 .reader()
                 .map_err(|e| reshape_spill_error(node_name, e))?;
             for pair in reader {
-                group.push(pair.map_err(|e| reshape_spill_error(node_name, e))?);
+                let (record, (seq, row_num)) =
+                    pair.map_err(|e| reshape_spill_error(node_name, e))?;
+                group.push(BufferedRecord {
+                    record,
+                    seq,
+                    row_num,
+                });
             }
         }
         group.extend(state.resident);
         // Restore arrival order: spill round-trips reorder records by file and
-        // bucket, so a spilled group must be re-sorted by its source row
-        // number to emit identically to a resident group.
-        group.sort_by_key(|(_, row_num)| *row_num);
-        Ok(group)
+        // bucket, so a spilled group must be re-sorted by its admission
+        // sequence to emit identically to a resident group.
+        group.sort_by_key(|b| b.seq);
+        Ok(group.into_iter().map(|b| (b.record, b.row_num)).collect())
     }
 }
 
 /// Write one input-record slice to a fresh spill file, charging its on-disk
 /// byte size against the arbitrator's per-stage and pipeline-wide spill
 /// totals so `--explain` calibration and the disk-spill cap both see it.
+///
+/// Each record's payload carries its admission sequence (the reload sort key)
+/// and its source row number (for the rule kernel) so both survive the
+/// round-trip.
 fn write_spill_slice<'a>(
     node_name: &str,
     budget: &MemoryArbitrator,
     spill_root: &std::path::Path,
     input_schema: &Arc<Schema>,
     compress: bool,
-    records: impl Iterator<Item = &'a (Record, u64)>,
-) -> Result<SpillFile<u64>, PipelineError> {
-    let mut writer: SpillWriter<u64> =
+    records: impl Iterator<Item = &'a BufferedRecord>,
+) -> Result<SpillFile<ReshapeSpillPayload>, PipelineError> {
+    let mut writer: SpillWriter<ReshapeSpillPayload> =
         SpillWriter::new(Arc::clone(input_schema), Some(spill_root), compress)
             .map_err(|e| reshape_spill_error(node_name, e))?;
-    for (record, row_num) in records {
+    for buffered in records {
         writer
-            .write_pair(record, row_num)
+            .write_pair(&buffered.record, &(buffered.seq, buffered.row_num))
             .map_err(|e| reshape_spill_error(node_name, e))?;
     }
     let file = writer
@@ -694,47 +760,9 @@ fn write_spill_slice<'a>(
 }
 
 /// One input record's estimated buffered footprint: heap bytes plus the
-/// owning `Record` header and the `(Record, u64)` tuple overhead.
+/// owning [`BufferedRecord`] header overhead.
 fn estimated_input_bytes(record: &Record) -> usize {
-    record.estimated_heap_size() + std::mem::size_of::<(Record, u64)>()
-}
-
-/// Deterministic per-record hash used to slice one oversized group across
-/// partitions. Combines the record's values with its row number so two
-/// records with identical content still distribute across buckets, keeping a
-/// degenerate all-duplicate group from collapsing into a single partition.
-fn hash_partition_seed(record: &Record, row_num: u64) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for value in record.values() {
-        hash_value(value, &mut hasher);
-    }
-    row_num.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Fold one `Value` into `hasher`. `Float` hashes via its bit pattern (NaN
-/// included) so the function is total over every `Value` variant.
-fn hash_value(value: &Value, hasher: &mut impl Hasher) {
-    match value {
-        Value::Null => 0u8.hash(hasher),
-        Value::Bool(b) => b.hash(hasher),
-        Value::Integer(i) => i.hash(hasher),
-        Value::Float(f) => f.to_bits().hash(hasher),
-        Value::String(s) => s.as_str().hash(hasher),
-        Value::Date(d) => d.hash(hasher),
-        Value::DateTime(dt) => dt.hash(hasher),
-        Value::Array(arr) => {
-            for v in arr {
-                hash_value(v, hasher);
-            }
-        }
-        Value::Map(m) => {
-            for (k, v) in m.iter() {
-                k.hash(hasher);
-                hash_value(v, hasher);
-            }
-        }
-    }
+    record.estimated_heap_size() + std::mem::size_of::<BufferedRecord>()
 }
 
 /// Wrap a spill read/write fault from the Reshape group buffer as a hard

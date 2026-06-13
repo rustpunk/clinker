@@ -645,6 +645,165 @@ fn reshape_spill_preserves_within_group_arrival_order() {
     );
 }
 
+/// Two sources → Merge → Reshape on a shared partition key, parameterized on
+/// the memory budget. No `order_by`, so within-group emit order is the merged
+/// arrival order. Both sources number their rows from the same base, so a
+/// record from each source can share a source row number and land in the same
+/// reshape group — the case where ordering on the source row number (rather
+/// than a Reshape-local sequence) would reorder a spilled group.
+fn merge_reshape_pipeline(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: reshape_merge_spill
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - {{ name: account, type: string }}
+        - {{ name: tag, type: string }}
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - {{ name: account, type: string }}
+        - {{ name: tag, type: string }}
+  - type: merge
+    name: merged
+    inputs: [src_a, src_b]
+    config:
+      mode: concat
+  - type: reshape
+    name: backfill
+    input: merged
+    config:
+      partition_by: [account]
+      rules:
+        - name: never
+          when: "false"
+          mutate:
+            set:
+              tag: "tag"
+  - type: output
+    name: out
+    input: backfill
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// Run the two-source Merge → Reshape pipeline over the two CSV payloads,
+/// returning the run report and the rendered CSV output.
+fn run_merge_reshape(
+    yaml: &str,
+    csv_a: &str,
+    csv_b: &str,
+) -> (clinker_exec::executor::ExecutionReport, String) {
+    let config = parse_config(yaml).expect("merge-reshape pipeline must parse");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("merge-reshape pipeline must compile");
+
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "a.csv",
+                Box::new(std::io::Cursor::new(csv_a.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "b.csv",
+                Box::new(std::io::Cursor::new(csv_b.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "merge-reshape".to_string(),
+        batch_id: "merge-reshape".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("merge-reshape run");
+    let output = buf.as_string();
+    (report, output)
+}
+
+#[test]
+fn reshape_spill_preserves_arrival_order_across_merge() {
+    // Two sources feed one reshape group (`account == X`). Each source numbers
+    // its own rows from the same base, so record k from src_a and record k
+    // from src_b share a source row number. Ordering a spilled group on the
+    // source row number would tie those records and reorder them relative to a
+    // resident group; the Reshape-local admission sequence keeps the true
+    // merged arrival order across the spill round-trip.
+    //
+    // `tag` carries a per-source arrival index (a0,a1,… / b0,b1,…) so the
+    // output is order-sensitive. A tight budget forces the merged group to
+    // spill; an ample budget keeps it resident. The two outputs must match
+    // row-for-row.
+    let mut csv_a = String::from("account,tag\n");
+    let mut csv_b = String::from("account,tag\n");
+    for r in 0..60u32 {
+        csv_a.push_str(&format!("X,a{r:03}\n"));
+        csv_b.push_str(&format!("X,b{r:03}\n"));
+    }
+
+    // 36K hard / ≈29K soft. The single merged group (~30 KB) exceeds the soft
+    // threshold, so it partition-spills (the case that can reorder), yet still
+    // fits the finalize reload under the 36K hard limit.
+    let (spilled_report, spilled) =
+        run_merge_reshape(&merge_reshape_pipeline("36K"), &csv_a, &csv_b);
+    let (memory_report, in_memory) =
+        run_merge_reshape(&merge_reshape_pipeline("512M"), &csv_a, &csv_b);
+
+    assert!(
+        spilled_report.dlq_entries.is_empty(),
+        "no DLQ entries under spill: {:?}",
+        spilled_report.dlq_entries
+    );
+    assert!(
+        spilled_report.cumulative_spill_bytes > 0,
+        "the 36K budget must force the merged group to spill"
+    );
+    assert_eq!(
+        memory_report.cumulative_spill_bytes, 0,
+        "the 512M budget keeps the merged group resident"
+    );
+    // Row-for-row identity across the spill round-trip, for a group fed by two
+    // sources whose row numbers collide.
+    assert_eq!(
+        spilled, in_memory,
+        "a spilled merged group must emit byte-identical to the resident merged group"
+    );
+    // 120 rows total (60 per source), no synthesized rows (the rule never
+    // fires), header + 120 data lines.
+    let data_lines = spilled.lines().skip(1).filter(|l| !l.is_empty()).count();
+    assert_eq!(data_lines, 120, "all 120 merged rows survive: {spilled}");
+}
+
 #[test]
 fn reshape_skew_single_giant_group() {
     // One partition dwarfs the rest: employee-00000 holds 600 rows while 50
