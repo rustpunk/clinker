@@ -7,10 +7,18 @@
 //! trailer. The writer inverts the reader exactly — the reader strips the
 //! structural separators (braces, the leading `:`, the `-}` trailer, the
 //! line breaks) and keeps every other byte; the writer re-adds exactly those
-//! separators and nothing else. Block-4 free text is opaque, so values are
-//! written with **zero** escaping, making the reader → writer → reader
-//! round-trip byte-faithful even for values that carry `{`, `}`, or a
-//! mid-line `-}` as literal data.
+//! separators and nothing else. Block-4 free text is opaque and has no escape
+//! mechanism, so values are written verbatim, making the
+//! reader → writer → reader round-trip byte-faithful even for values that
+//! carry `{`, `}`, or a mid-line `-}` as literal data.
+//!
+//! Verbatim emission is faithful for any value the reader can produce. The
+//! few shapes that unescaped block-4 text cannot represent — a folded
+//! continuation line beginning with the line-anchored `-}` terminator or with
+//! a `:` tag marker — only arise when a value is built from arbitrary records
+//! (CSV/JSON → Transform → SWIFT), never from the reader. Rather than emit
+//! silently-corrupt output, the writer rejects such a value with a clear
+//! error (see `reject_unrepresentable_value`).
 //!
 //! Record columns map by name: `block`, `tag`, `value`. Only `tag`/`value`
 //! become block-4 lines; `block` is the constant `4` discriminator (a record
@@ -246,15 +254,18 @@ impl<W: Write> SwiftWriter<W> {
     /// Re-emit one block-4 record as a `:tag:value\r\n` line. A record whose
     /// `block` column is not the constant `4` is rejected — service blocks
     /// ride the document context, never the record stream. The value is
-    /// written verbatim (interior continuation breaks, blank lines, braces,
-    /// and mid-line `-}` reproduced as data), since block-4 free text is
-    /// opaque.
+    /// written verbatim — interior braces and a mid-line `-}` reproduce as
+    /// data — *unless* the shape is unrepresentable in unescaped block-4 free
+    /// text (see [`reject_unrepresentable_value`]), in which case the record
+    /// is rejected rather than emitted as silently-corrupt output.
     ///
     /// # Errors
     ///
     /// Returns [`FormatError::Swift`] when the record carries no `tag`, a
-    /// `block` value other than `4`, or [`FormatError::UnserializableMapValue`]
-    /// when `tag`/`value` hold a `Value::Map`/`Value::Array`.
+    /// `block` value other than `4`, a `value` whose continuation line begins
+    /// with the block terminator (`-}`) or a tag marker (`:`), or
+    /// [`FormatError::UnserializableMapValue`] when `tag`/`value` hold a
+    /// `Value::Map`/`Value::Array`.
     fn write_body_record(&mut self, record: &Record) -> Result<(), FormatError> {
         let values = record.values();
 
@@ -292,6 +303,7 @@ impl<W: Write> SwiftWriter<W> {
             Some(v) => value_to_field(v, "value")?,
             None => String::new(),
         };
+        reject_unrepresentable_value(&tag, &value)?;
 
         self.writer.write_all(b":").map_err(FormatError::Io)?;
         self.writer
@@ -347,6 +359,49 @@ impl<W: Write + Send> FormatWriter for SwiftWriter<W> {
         self.writer.flush().map_err(FormatError::Io)?;
         Ok(())
     }
+}
+
+/// Reject a block-4 value whose folded continuation lines cannot be framed
+/// faithfully in unescaped block-4 free text.
+///
+/// Block 4 has no escape mechanism, so the writer emits values verbatim. A
+/// value written as `:tag:value\r\n` splits back on its interior `\n` line
+/// breaks on re-read: each continuation line (a line after the first, which
+/// rides directly after `:tag:`) becomes its own physical block-4 line. A
+/// continuation line that begins with `-}` re-reads as the line-anchored
+/// block-4 terminator (closing the block early — truncation), and one that
+/// begins with `:` re-reads as a spurious new `:tag:` field. The reader can
+/// never *produce* such a value, so a reader → writer round-trip is safe; but
+/// a value built from arbitrary records (CSV/JSON → Transform → SWIFT) can,
+/// and emitting it verbatim would write silently-corrupt output. Fail loud
+/// instead.
+///
+/// The first line of the value is exempt: it is preceded by the `:tag:`
+/// marker on the wire, so it can never be mistaken for a fresh tag or the
+/// terminator.
+///
+/// # Errors
+///
+/// Returns [`FormatError::Swift`] naming the offending continuation line.
+fn reject_unrepresentable_value(tag: &str, value: &str) -> Result<(), FormatError> {
+    for line in value.split('\n').skip(1) {
+        let starts_with_trailer = line.starts_with("-}");
+        if starts_with_trailer || line.starts_with(':') {
+            let marker = if starts_with_trailer {
+                "the block terminator `-}`"
+            } else {
+                "a tag marker `:`"
+            };
+            return Err(FormatError::Swift(format!(
+                "SWIFT block-4 field `:{tag}:` has a continuation line {line:?} beginning with \
+                 {marker}. Block-4 free text has no escape mechanism, so a value line that starts \
+                 with `-}}` (the block terminator) or `:` (a field-tag marker) cannot be written \
+                 back faithfully — it would re-read as an early block close or a spurious field. \
+                 Rewrite the value so no continuation line begins with `-}}` or `:`."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Render a `Value` to SWIFT field text. `Null` renders as the empty string;
@@ -569,6 +624,58 @@ mod tests {
         let rec = record(&s, "", "20", "REF");
         let out = write_all(SwiftWriterConfig::default(), &[rec], &s);
         assert!(out.contains(":20:REF\r\n"), "{out}");
+    }
+
+    #[test]
+    fn continuation_line_starting_with_trailer_errors() {
+        // A folded continuation line beginning with the line-anchored `-}`
+        // would re-read as an early block close — unrepresentable in
+        // unescaped block-4 text, so the writer fails loud rather than
+        // emitting truncated output. Such a value can only come from an
+        // arbitrary-record source, never the reader.
+        let s = schema();
+        let rec = record(&s, "4", "77E", "LINE1\n-}EVIL");
+        let mut buf = Vec::new();
+        let mut w = SwiftWriter::new(
+            Cursor::new(&mut buf),
+            Arc::clone(&s),
+            SwiftWriterConfig::default(),
+        );
+        let err = w.write_record(&rec).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Swift(m) if m.contains("block terminator")),
+            "expected a block-terminator rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_line_starting_with_tag_marker_errors() {
+        // A folded continuation line beginning with `:` would re-read as a
+        // spurious new `:tag:` field — unrepresentable, so reject it.
+        let s = schema();
+        let rec = record(&s, "4", "86", "NARRATIVE\n:99:NOTAFIELD");
+        let mut buf = Vec::new();
+        let mut w = SwiftWriter::new(
+            Cursor::new(&mut buf),
+            Arc::clone(&s),
+            SwiftWriterConfig::default(),
+        );
+        let err = w.write_record(&rec).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Swift(m) if m.contains("tag marker")),
+            "expected a tag-marker rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn first_value_line_may_start_with_marker() {
+        // The first line of the value rides directly after the `:tag:` marker
+        // on the wire, so it can begin with `:` or `-}` without ambiguity —
+        // only *continuation* lines (after a fold) are constrained.
+        let s = schema();
+        let rec = record(&s, "4", "20", ":STARTSWITHCOLON");
+        let out = write_all(SwiftWriterConfig::default(), &[rec], &s);
+        assert!(out.contains(":20::STARTSWITHCOLON\r\n"), "{out}");
     }
 
     #[test]

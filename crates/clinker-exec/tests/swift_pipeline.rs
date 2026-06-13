@@ -8,9 +8,10 @@
 //! clean drain; (4) a malformed message (unbalanced brace / missing `-}`
 //! trailer) surfaces as a clean run failure rather than a panic; (5) a
 //! SWIFT → SWIFT → SWIFT round-trip re-frames the block structure and
-//! reproduces every field value byte-faithfully (interior braces, mid-line
-//! `-}`, folded continuations, and interior blank lines survive); (6) the
-//! `swift`+`split` combination is rejected at config time (diagnostic `E342`).
+//! reproduces every field value byte-faithfully through the writer's executor
+//! path — multi-line continuation values, interior braces, mid-line `-}`, and
+//! interior blank lines all survive; (6) the `swift`+`split` combination is
+//! rejected at config time (diagnostic `E342`).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -483,6 +484,82 @@ fn swift_mt940_repeated_tags_round_trip() {
     );
 }
 
+/// Read a SWIFT message through the reader and collect its block-4
+/// `(tag, value)` field stream, with each value's folded continuation breaks
+/// intact. Used to assert value faithfulness through a round-trip.
+fn read_swift_fields(data: &str) -> Vec<(String, Option<String>)> {
+    use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
+    use clinker_format::traits::FormatReader;
+    use clinker_record::Value;
+    let mut r = SwiftReader::new(
+        Cursor::new(data.as_bytes().to_vec()),
+        SwiftReaderConfig::default(),
+    );
+    let mut out = Vec::new();
+    while let Some(rec) = r.next_record().unwrap() {
+        let tag = match rec.get("tag") {
+            Some(Value::String(s)) => s.to_string(),
+            other => panic!("unexpected tag: {other:?}"),
+        };
+        let value = match rec.get("value") {
+            Some(Value::String(s)) => Some(s.to_string()),
+            Some(Value::Null) | None => None,
+            other => panic!("unexpected value: {other:?}"),
+        };
+        out.push((tag, value));
+    }
+    out
+}
+
+#[test]
+fn swift_round_trip_preserves_multiline_values_through_writer() {
+    // The tag-column round-trip tests use fixtures with no folded continuation
+    // values, so value faithfulness through the SWIFT WRITER's executor path
+    // is otherwise unverified. This fixture carries a multi-line `:50K:`
+    // ordering-customer block and a `:77E:` narrative with an interior blank
+    // line, both of which fold continuation breaks into one value. Round-trip
+    // SWIFT -> SWIFT through the executor, then re-read the writer's output and
+    // assert every (tag, value) — values included — survives byte-faithfully.
+    let fixture = "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}\
+        {4:\r\n:20:REF12345\r\n:32A:240101USD1000,00\r\n\
+        :50K:/12345678\r\nJOHN DOE\r\n123 MAIN ST\r\n\
+        :77E:NARRATIVE LINE ONE\r\n\r\nNARRATIVE LINE THREE\r\n-}";
+
+    let (swift_out, _csv) = swift_to_swift_then_csv(
+        fixture,
+        &[
+            ("basic", 1, "basic_header_from_doc"),
+            ("app", 2, "app_header_from_doc"),
+        ],
+    );
+
+    let original = read_swift_fields(fixture);
+    let reconstructed = read_swift_fields(&swift_out);
+    assert_eq!(
+        original, reconstructed,
+        "value stream not byte-faithful through the writer pipeline"
+    );
+
+    // Spot-check that the multi-line values specifically survived, not just
+    // the single-line ones — the folded continuation breaks are the point.
+    assert_eq!(
+        original
+            .iter()
+            .find(|(t, _)| t == "50K")
+            .and_then(|(_, v)| v.as_deref()),
+        Some("/12345678\nJOHN DOE\n123 MAIN ST"),
+        "multi-line :50K: value lost: {original:?}"
+    );
+    assert_eq!(
+        original
+            .iter()
+            .find(|(t, _)| t == "77E")
+            .and_then(|(_, v)| v.as_deref()),
+        Some("NARRATIVE LINE ONE\n\nNARRATIVE LINE THREE"),
+        "interior-blank-line :77E: value lost: {original:?}"
+    );
+}
+
 #[test]
 fn swift_interior_block4_braces_dashes_blanks_round_trip() {
     // The load-bearing faithfulness test: a value carrying an interior brace
@@ -499,34 +576,8 @@ fn swift_interior_block4_braces_dashes_blanks_round_trip() {
     let (swift_out, _csv) =
         swift_to_swift_then_csv(fixture, &[("basic", 1, "basic_header_from_doc")]);
 
-    // Read both the original fixture and the reconstructed output through the
-    // reader and compare their (tag, value) streams field-for-field.
-    let read_fields = |data: &str| -> Vec<(String, Option<String>)> {
-        use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
-        use clinker_format::traits::FormatReader;
-        use clinker_record::Value;
-        let mut r = SwiftReader::new(
-            Cursor::new(data.as_bytes().to_vec()),
-            SwiftReaderConfig::default(),
-        );
-        let mut out = Vec::new();
-        while let Some(rec) = r.next_record().unwrap() {
-            let tag = match rec.get("tag") {
-                Some(Value::String(s)) => s.to_string(),
-                other => panic!("unexpected tag: {other:?}"),
-            };
-            let value = match rec.get("value") {
-                Some(Value::String(s)) => Some(s.to_string()),
-                Some(Value::Null) | None => None,
-                other => panic!("unexpected value: {other:?}"),
-            };
-            out.push((tag, value));
-        }
-        out
-    };
-
-    let original = read_fields(fixture);
-    let reconstructed = read_fields(&swift_out);
+    let original = read_swift_fields(fixture);
+    let reconstructed = read_swift_fields(&swift_out);
     assert_eq!(
         original, reconstructed,
         "field stream not byte-faithful after round-trip"

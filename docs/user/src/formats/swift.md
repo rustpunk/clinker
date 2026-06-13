@@ -210,6 +210,25 @@ omitted. The `_from_doc` echo reads the block body verbatim from the section's
 source's service blocks (declared as `segment` envelope sections) round-trip
 unchanged when their section names are passed back to the writer here.
 
+The document context that carries the `$doc` sections rides on each body
+record, so the `*_from_doc` echoes require at least one block-4 record to
+read from. A document with **zero** block-4 records emits a valid empty
+message — `{4:` immediately closed by `-}` — wrapped only by the
+**literal-configured** service blocks (`basic_header`, `app_header`,
+`user_header`, `trailer`); the `*_from_doc` echoes are skipped because no
+record carries the document context. Use the literal options when a
+zero-record output must still emit its service blocks.
+
+Block-4 free text has no escape mechanism, so values are written verbatim.
+Almost any value round-trips faithfully, but two shapes are unrepresentable
+when the value is built from arbitrary records (CSV/JSON → Transform →
+SWIFT): a value whose continuation line — a line after a folded line break —
+begins with the block terminator `-}` (which would re-read as an early block
+close) or with a `:` tag marker (which would re-read as a spurious field).
+The writer rejects such a value with a clear error rather than emitting
+silently-corrupt output. Values read from a SWIFT source can never take these
+shapes, so a read → write → read round-trip is always safe.
+
 A SWIFT MT message is a single indivisible envelope, so a `swift` output
 cannot be combined with a byte-limit `split:` block — the pairing is rejected
 at config-validation time (diagnostic `E342`).
