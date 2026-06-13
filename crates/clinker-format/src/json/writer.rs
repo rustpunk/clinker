@@ -72,16 +72,15 @@ pub struct JsonWriter<W: Write> {
 }
 
 /// Per-document-object framing state for the envelope reframe. Tracks the
-/// running framer (header/footer sections + record count), how many document
-/// objects have been emitted (for the outer-array comma in `array` mode), and
-/// whether the current document's body array has any record yet (for the
-/// body-array comma). Holds no body record — bounded memory.
+/// running framer (header/footer sections + the body record count, which also
+/// drives the body-array comma), whether ANY document object has been emitted
+/// (for the outer-array comma in `array` mode), and whether a document object
+/// is currently open. Holds no body record — bounded memory.
 struct EnvelopeState {
     framer: EnvelopeFramer,
-    /// Document objects emitted so far this stream.
-    docs_written: u64,
-    /// Records appended to the currently-open document's body array.
-    body_in_doc: u64,
+    /// Whether at least one document object has been emitted this stream —
+    /// drives the outer-array `[\n` vs `,\n` separator in `array` mode.
+    any_doc_written: bool,
     /// Whether a document object is currently open (between begin/end).
     doc_open: bool,
 }
@@ -91,11 +90,10 @@ impl<W: Write> JsonWriter<W> {
         let envelope = config
             .envelope
             .clone()
-            .filter(|s| !s.is_empty())
-            .map(|spec| EnvelopeState {
-                framer: EnvelopeFramer::new(spec),
-                docs_written: 0,
-                body_in_doc: 0,
+            .and_then(OutputEnvelopeSpec::into_framer)
+            .map(|framer| EnvelopeState {
+                framer,
+                any_doc_written: false,
                 doc_open: false,
             });
         Self {
@@ -149,15 +147,13 @@ impl<W: Write> JsonWriter<W> {
     /// section (envelope sections are small typed metadata, not body records),
     /// so the round-trip stays faithful regardless of `preserve_nulls`.
     fn section_object(
-        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
     ) -> serde_json::Value {
         use serde_json::{Map, Value as Jv};
         let mut obj = Map::new();
-        if let Some(fields) = fields {
-            for (name, value) in fields {
-                obj.insert(name.to_string(), clinker_to_json(value));
-            }
+        for (name, value) in fields {
+            obj.insert(name.to_string(), clinker_to_json(value));
         }
         if let Some((field, n)) = count {
             obj.insert(field.to_string(), Jv::Number(n.into()));
@@ -166,7 +162,18 @@ impl<W: Write> JsonWriter<W> {
     }
 
     /// Append one body record to the currently-open document object's `body`
-    /// array, comma-separating from prior body records.
+    /// array, comma-separating from prior body records (off the framer's
+    /// running record count, so there is no duplicate counter).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Json`] when NO document object is open — a record
+    /// reached an enveloped JSON writer without a `begin_document` (a record
+    /// with no originating document, e.g. a `<merged>` fan-in / aggregate row).
+    /// The plan-time guard (E347) rejects the pipeline shapes that produce
+    /// such records upstream of an enveloped Output, so this is a defense-in-
+    /// depth safety net: it raises a clean error rather than writing record
+    /// bytes outside any `{...,"body":[` object (which would be malformed JSON).
     fn write_enveloped_record(&mut self, record: &Record) -> Result<(), FormatError> {
         let json_val = self.record_to_json(record);
         let serialized = self.serialize_value(&json_val)?;
@@ -174,13 +181,19 @@ impl<W: Write> JsonWriter<W> {
             .envelope
             .as_mut()
             .expect("write_enveloped_record only called with an envelope state");
-        if env.body_in_doc > 0 {
+        if !env.doc_open {
+            return Err(FormatError::Json(
+                "enveloped JSON output received a record with no open document — a record \
+                 with no originating document (a fan-in / aggregate row) cannot be framed"
+                    .to_string(),
+            ));
+        }
+        if env.framer.record_count() > 0 {
             self.writer.write_all(b",").map_err(FormatError::Io)?;
         }
         self.writer
             .write_all(serialized.as_bytes())
             .map_err(FormatError::Io)?;
-        env.body_in_doc += 1;
         env.framer.count_record();
         Ok(())
     }
@@ -232,7 +245,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             // matching the non-enveloped empty shape.
             Some(env) => {
                 if let JsonOutputMode::Array = self.config.format {
-                    if env.docs_written > 0 {
+                    if env.any_doc_written {
                         self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
                     } else {
                         self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
@@ -258,22 +271,25 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             return Ok(());
         };
         env.framer.begin();
+        // Build the optional header object only when the document carries the
+        // configured section (a missing section emits no `"header"` key).
         let header = env
             .framer
-            .has_header()
-            .then(|| Self::section_object(env.framer.header_fields(doc), None));
+            .header_fields(doc)
+            .map(|fields| Self::section_object(fields, None));
+        let any_doc_written = env.any_doc_written;
         // Outer framing between document objects: `[\n` / `,\n` (array) or a
         // newline separator (ndjson).
         match self.config.format {
             JsonOutputMode::Array => {
-                if env.docs_written == 0 {
-                    self.writer.write_all(b"[\n").map_err(FormatError::Io)?;
-                } else {
+                if any_doc_written {
                     self.writer.write_all(b",\n").map_err(FormatError::Io)?;
+                } else {
+                    self.writer.write_all(b"[\n").map_err(FormatError::Io)?;
                 }
             }
             JsonOutputMode::Ndjson => {
-                if env.docs_written > 0 {
+                if any_doc_written {
                     self.writer.write_all(b"\n").map_err(FormatError::Io)?;
                 }
             }
@@ -294,10 +310,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
         self.writer
             .write_all(b"\"body\":[")
             .map_err(FormatError::Io)?;
-        // Re-borrow to reset the body counter (the `header` build dropped the
-        // earlier mutable borrow).
         if let Some(env) = self.envelope.as_mut() {
-            env.body_in_doc = 0;
             env.doc_open = true;
         }
         Ok(())
@@ -309,15 +322,16 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
         }
         // Close the body array.
         self.writer.write_all(b"]").map_err(FormatError::Io)?;
-        // Emit the optional footer (section fields + computed count).
+        // Emit the optional footer only when the document carries the
+        // configured footer section (the computed count rides it).
         let footer = {
             let env = self
                 .envelope
                 .as_ref()
                 .expect("doc_open implies an envelope state");
-            env.framer.has_footer().then(|| {
-                Self::section_object(env.framer.footer_fields(doc), env.framer.footer_count())
-            })
+            env.framer
+                .footer_fields(doc)
+                .map(|fields| Self::section_object(fields, env.framer.footer_count()))
         };
         if let Some(footer) = footer {
             let s = self.serialize_value(&footer)?;
@@ -331,7 +345,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
         // Close the document object.
         self.writer.write_all(b"}").map_err(FormatError::Io)?;
         if let Some(env) = self.envelope.as_mut() {
-            env.docs_written += 1;
+            env.any_doc_written = true;
             env.doc_open = false;
         }
         Ok(())
@@ -548,27 +562,40 @@ mod tests {
         assert_eq!(r2.get("age"), Some(&Value::Integer(25)));
     }
 
-    use clinker_record::{DocumentContext, DocumentId};
-    use indexmap::IndexMap;
-
-    fn doc_with_sections(sections: &[(&str, &[(&str, Value)])]) -> Arc<DocumentContext> {
-        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
-        for (name, fields) in sections {
-            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
-            for (k, v) in *fields {
-                inner.insert(Box::from(*k), v.clone());
-            }
-            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
-        }
-        Arc::new(DocumentContext::new(
-            DocumentId::next(),
-            std::sync::Arc::from("f.json"),
-            map,
-        ))
-    }
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     fn amount_record(schema: &Arc<Schema>, n: i64) -> Record {
         Record::new(Arc::clone(schema), vec![Value::Integer(n)])
+    }
+
+    #[test]
+    fn json_envelope_record_with_no_open_document_errors_cleanly() {
+        // Defense-in-depth: the plan-time E347 guard rejects pipelines that
+        // route lineage-stripped (`<merged>`) records into an enveloped JSON
+        // Output, so `begin_document` always fires first in production. If one
+        // ever reached here without an open document, the writer must raise a
+        // clean error rather than emit record bytes outside any `body` array
+        // (which would be malformed JSON).
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Array,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        // No begin_document — write straight into the envelope writer.
+        let err = w.write_record(&amount_record(&schema, 1)).unwrap_err();
+        match err {
+            FormatError::Json(msg) => assert!(
+                msg.contains("no open document"),
+                "expected the no-open-document message, got: {msg}"
+            ),
+            other => panic!("expected FormatError::Json, got {other:?}"),
+        }
     }
 
     #[test]

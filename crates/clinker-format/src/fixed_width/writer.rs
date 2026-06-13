@@ -110,8 +110,7 @@ impl<W: Write> FixedWidthWriter<W> {
         let framer = config
             .envelope
             .clone()
-            .filter(|s| !s.is_empty())
-            .map(EnvelopeFramer::new);
+            .and_then(OutputEnvelopeSpec::into_framer);
         Ok(Self {
             writer,
             fields: resolved,
@@ -126,17 +125,16 @@ impl<W: Write> FixedWidthWriter<W> {
     /// separator. Envelope sections carry no width schema, so values are
     /// written unpadded — a header/trailer LINE round-trips, but not a
     /// column-positioned one (that would need a width declaration the envelope
-    /// config does not carry). A computed footer count is rejected at plan
-    /// time for fixed-width (E346), so `count` is always `None` here.
+    /// config does not carry). Called only for a section the document actually
+    /// carries (a missing section emits no line). A computed footer count is
+    /// rejected at plan time for fixed-width (E346).
     fn write_section_line(
         &mut self,
-        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
     ) -> Result<(), FormatError> {
         let mut line = String::new();
-        if let Some(fields) = fields {
-            for value in fields.values() {
-                line.push_str(&value_to_envelope_cell(value));
-            }
+        for value in fields.values() {
+            line.push_str(&value_to_envelope_cell(value));
         }
         self.writer.write_all(line.as_bytes())?;
         match self.config.line_separator {
@@ -278,12 +276,12 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
             return Ok(());
         };
         framer.begin();
-        let has_header = framer.has_header();
         // Clone the header fields out so the immutable framer borrow ends
-        // before the `&mut self` write below.
+        // before the `&mut self` write below; `None` (document lacks the
+        // configured section) emits no header line.
         let header = framer.header_fields(doc).cloned();
-        if has_header {
-            self.write_section_line(header.as_ref())?;
+        if let Some(fields) = header.as_ref() {
+            self.write_section_line(fields)?;
         }
         Ok(())
     }
@@ -292,10 +290,9 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         let Some(framer) = self.framer.as_ref() else {
             return Ok(());
         };
-        let has_footer = framer.has_footer();
         let footer = framer.footer_fields(doc).cloned();
-        if has_footer {
-            self.write_section_line(footer.as_ref())?;
+        if let Some(fields) = footer.as_ref() {
+            self.write_section_line(fields)?;
         }
         Ok(())
     }
@@ -595,24 +592,7 @@ mod tests {
         }
     }
 
-    fn doc_with_sections(
-        sections: &[(&str, &[(&str, Value)])],
-    ) -> std::sync::Arc<clinker_record::DocumentContext> {
-        use indexmap::IndexMap;
-        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
-        for (name, fields) in sections {
-            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
-            for (k, v) in *fields {
-                inner.insert(Box::from(*k), v.clone());
-            }
-            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
-        }
-        std::sync::Arc::new(clinker_record::DocumentContext::new(
-            clinker_record::DocumentId::next(),
-            std::sync::Arc::from("f.txt"),
-            map,
-        ))
-    }
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     #[test]
     fn fixed_width_envelope_emits_header_and_footer_lines() {

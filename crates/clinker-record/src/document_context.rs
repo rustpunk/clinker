@@ -53,8 +53,7 @@ impl DocumentId {
 }
 
 /// Identity of the per-outermost-logical-document **frame** a record belongs
-/// to — the grain at which the engine reconstructs an output envelope and
-/// dead-letters a whole document.
+/// to — the grain at which the engine reconstructs an output envelope.
 ///
 /// A frame is NOT always the innermost or the outermost envelope level: it is
 /// whichever level the source format treats as one logical document.
@@ -69,10 +68,14 @@ impl DocumentId {
 /// - EDIFACT, CSV, JSON, XML, fixed-width: the file is the only level, so the
 ///   frame is the file (one grain per file).
 ///
-/// `Copy`/`Eq`/`Hash` so both the envelope-writer boundary detector and the
-/// document-DLQ bucket map key on it directly. Two contexts of the same frame
-/// (e.g. the `GS` and `ST` of one X12 interchange) compare equal even though
-/// their own [`DocumentId`]s differ.
+/// `Copy`/`Eq`/`Hash` so the envelope-writer boundary detector can key on it
+/// directly. Two contexts of the same frame (e.g. the `GS` and `ST` of one X12
+/// interchange) compare equal even though their own [`DocumentId`]s differ.
+///
+/// This is distinct from the document-DLQ's keying: the DLQ keys on
+/// `source_file` (the file grain), because a structural-count failure condemns
+/// a whole file. The two never co-execute — `reconstruct_envelope` and
+/// `dlq_granularity: document` are mutually exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DocumentGrain(DocumentId);
@@ -136,9 +139,10 @@ impl DocumentContext {
     }
 
     /// The frame this record belongs to — the grain at which output-envelope
-    /// reconstruction and document-level dead-lettering operate. Equal across
-    /// every level of one frame (e.g. an X12 interchange's `ISA`/`GS`/`ST`
-    /// contexts all report the interchange grain); distinct per HL7 message.
+    /// reconstruction operates (the document-DLQ keys on `source_file`
+    /// instead; see [`DocumentGrain`]). Equal across every level of one frame
+    /// (e.g. an X12 interchange's `ISA`/`GS`/`ST` contexts all report the
+    /// interchange grain); distinct per HL7 message.
     pub fn grain(&self) -> DocumentGrain {
         self.grain
     }
@@ -181,9 +185,8 @@ impl DocumentContext {
     /// its own `id` rather than inherited from the parent. Used for formats
     /// whose framing document is a nested level repeated within one file:
     /// each HL7 `MSH` message opens a fresh frame, so a multi-message file
-    /// frames once per message (its output envelope and document-DLQ verdict
-    /// are per message), while still resolving the enclosing `FHS`/`BHS`
-    /// `$doc.*` sections through the flattened map.
+    /// reconstructs one output envelope per message, while still resolving the
+    /// enclosing `FHS`/`BHS` `$doc.*` sections through the flattened map.
     pub fn child_frame(&self, id: DocumentId, sections: IndexMap<Box<str>, Value>) -> Self {
         self.child_inner(id, sections, DocumentGrain(id))
     }
@@ -249,8 +252,8 @@ impl DocumentContext {
 // re-hydration). The shape is a 4-tuple mirroring `Value::Map`'s pair-vec
 // encoding so section insertion order is preserved exactly:
 //   (DocumentId, DocumentGrain, source_file: &str, sections: Vec<(&str, &Value)>)
-// The `grain` rides the wire so a spilled record stays governed by the SAME
-// frame (envelope reconstruction / document-DLQ) it carried before spilling —
+// The `grain` rides the wire so a spilled record stays in the SAME envelope
+// frame it carried before spilling —
 // it is not re-derived from `id` on read, because a nested HL7 message frame's
 // grain differs from its own id. On read each `(String, Value)` pair re-inserts
 // in order into a fresh `IndexMap`, and the source file rebuilds via `Arc::from`.

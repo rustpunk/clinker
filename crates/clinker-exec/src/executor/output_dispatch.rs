@@ -109,10 +109,10 @@ pub(crate) fn dispatch_output(
     // `reconstruct_envelope: true`, its writer's `begin_document` /
     // `end_document` framing must fire around each document's records. This
     // arm detects document boundaries from each record's `doc_ctx`
-    // (a change in `source_file` between consecutive records) rather than the
-    // records-only path's boundary-blind write loop. It buffers nothing: each
-    // body record streams straight through `write_record` between the header
-    // and footer, so a 1 GiB document flows at O(1-record).
+    // (a change in the per-frame `grain()` between consecutive records) rather
+    // than the records-only path's boundary-blind write loop. It buffers
+    // nothing: each body record streams straight through `write_record`
+    // between the header and footer, so a 1 GiB document flows at O(1-record).
     if resolve_out_cfg(ctx, name).reconstruct_envelope {
         return dispatch_output_envelope(ctx, current_dag, node_idx, name);
     }
@@ -423,12 +423,19 @@ fn drain_output_input_events(
 /// `DocumentClose` events after all records, so an interleaved boundary stream
 /// never reaches a terminal Output.
 ///
-/// The grain is the per-document FRAME ([`clinker_record::DocumentGrain`]),
-/// the SAME grain the document-DLQ buckets at, so framing and dead-lettering
-/// agree. An X12 `GS`/`ST` inherits the interchange grain, so a whole
-/// `ISA..IEA` interchange frames as one envelope; an HL7 `MSH` opens a fresh
-/// grain, so a multi-message file frames once PER message; a flat file
+/// The grain is the per-document FRAME ([`clinker_record::DocumentGrain`]). An
+/// X12 `GS`/`ST` inherits the interchange grain, so a whole `ISA..IEA`
+/// interchange frames as one envelope; an HL7 `MSH` opens a fresh grain, so a
+/// multi-message file frames once PER message; a flat file
 /// (CSV/JSON/XML/fixed-width/EDIFACT) is one grain per file.
+///
+/// This per-frame grain is DELIBERATELY distinct from the document-DLQ's
+/// keying, which stays at the file grain (`source_file`): an HL7 `BTS`/`FTS`
+/// batch/file count mismatch is a whole-file structural failure, so the DLQ
+/// must condemn the whole file, not one message. Framing and dead-lettering
+/// therefore use different grains and never co-execute — `reconstruct_envelope`
+/// and `dlq_granularity: document` are mutually exclusive (rejected by E347),
+/// so no record is ever both DLQ-bucketed and envelope-framed.
 ///
 /// Bounded-memory: this path buffers no records. It holds only the current
 /// document's context, so a multi-gigabyte document streams at O(1-record).

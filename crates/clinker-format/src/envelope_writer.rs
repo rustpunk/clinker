@@ -43,6 +43,17 @@ impl OutputEnvelopeSpec {
             && self.footer_from_doc.is_none()
             && self.footer_record_count_field.is_none()
     }
+
+    /// Consume this spec into an [`EnvelopeFramer`], or `None` when the spec is
+    /// empty (no framing). The four generic writers call this on their
+    /// `config.envelope` to build their per-document framer in one step.
+    pub fn into_framer(self) -> Option<EnvelopeFramer> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(EnvelopeFramer::new(self))
+        }
+    }
 }
 
 /// Per-document envelope state held by a writer across the document's body.
@@ -80,8 +91,17 @@ impl EnvelopeFramer {
         self.record_count = self.record_count.saturating_add(1);
     }
 
+    /// Body records counted for the currently-open document so far. The JSON
+    /// writer uses this to decide the body-array comma (drive off the same
+    /// counter rather than a duplicate field).
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
     /// The header section's ordered fields for `doc`, or `None` when no header
-    /// is configured or the named section is absent from this document.
+    /// is configured OR the named section is absent from this document.
+    /// Writers render the header iff this is `Some`, so a document missing the
+    /// configured section emits NO header (rather than a blank one).
     pub fn header_fields<'a>(
         &self,
         doc: &'a DocumentContext,
@@ -93,10 +113,15 @@ impl EnvelopeFramer {
     }
 
     /// The footer section's ordered fields for `doc`, or `None` when no footer
-    /// is configured or the named section is absent. The streaming-computed
-    /// count (if `footer_record_count_field` is set) is appended SEPARATELY by
-    /// [`Self::footer_count`] so a writer renders both without cloning the
-    /// section map.
+    /// is configured OR the named section is absent from this document. As with
+    /// the header, writers render the footer iff this is `Some`. The
+    /// streaming-computed count (if `footer_record_count_field` is set) is
+    /// appended SEPARATELY by [`Self::footer_count`], so a writer renders both
+    /// without cloning the section map.
+    ///
+    /// `footer_record_count_field` requires `footer_from_doc` (enforced at plan
+    /// time by E346), so a configured count always rides a present footer
+    /// section — there is no count-only footer.
     pub fn footer_fields<'a>(
         &self,
         doc: &'a DocumentContext,
@@ -116,18 +141,30 @@ impl EnvelopeFramer {
             .as_deref()
             .map(|field| (field, self.record_count as i64))
     }
+}
 
-    /// Whether a footer should be emitted at all — either a named section is
-    /// configured, or a computed count is (a count with no section still
-    /// emits a footer carrying just the count).
-    pub fn has_footer(&self) -> bool {
-        self.spec.footer_from_doc.is_some() || self.spec.footer_record_count_field.is_some()
+/// Build a [`DocumentContext`] carrying the named sections (each a map of
+/// scalar fields), for the envelope-writer unit tests across the four generic
+/// writers. The `source_file` is a fixed placeholder — these tests exercise
+/// section rendering, not file grain. Shared here so the four writer test
+/// modules do not each re-define it.
+#[cfg(test)]
+pub(crate) fn test_doc_with_sections(
+    sections: &[(&str, &[(&str, Value)])],
+) -> std::sync::Arc<DocumentContext> {
+    let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
+    for (name, fields) in sections {
+        let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
+        for (k, v) in *fields {
+            inner.insert(Box::from(*k), v.clone());
+        }
+        map.insert(Box::from(*name), Value::Map(Box::new(inner)));
     }
-
-    /// Whether a header section is configured.
-    pub fn has_header(&self) -> bool {
-        self.spec.header_from_doc.is_some()
-    }
+    std::sync::Arc::new(DocumentContext::new(
+        clinker_record::DocumentId::next(),
+        std::sync::Arc::from("test.doc"),
+        map,
+    ))
 }
 
 #[cfg(test)]
@@ -166,8 +203,8 @@ mod tests {
         let fields = framer.header_fields(&doc).expect("header section present");
         let names: Vec<&str> = fields.keys().map(|k| k.as_ref()).collect();
         assert_eq!(names, vec!["batch_id", "run_date"]);
-        assert!(framer.has_header());
-        assert!(!framer.has_footer());
+        // No footer configured → footer_fields resolves None regardless of doc.
+        assert!(framer.footer_fields(&doc).is_none());
     }
 
     #[test]
@@ -191,12 +228,13 @@ mod tests {
         framer.count_record();
         framer.count_record();
         framer.count_record();
+        assert_eq!(framer.record_count(), 3);
         assert_eq!(framer.footer_count(), Some(("count", 3)));
         // A new document resets the counter.
         framer.begin();
         framer.count_record();
+        assert_eq!(framer.record_count(), 1);
         assert_eq!(framer.footer_count(), Some(("count", 1)));
-        assert!(framer.has_footer());
     }
 
     #[test]

@@ -225,15 +225,8 @@ fn resolve_envelope_spec(
     if !reconstruct_envelope {
         return None;
     }
-    let cfg = cfg?;
-    if cfg.is_empty() {
-        return None;
-    }
-    Some(clinker_format::OutputEnvelopeSpec {
-        header_from_doc: cfg.header_from_doc.clone(),
-        footer_from_doc: cfg.footer_from_doc.clone(),
-        footer_record_count_field: cfg.footer_record_count_field.clone(),
-    })
+    let spec = clinker_format::OutputEnvelopeSpec::from(cfg?);
+    (!spec.is_empty()).then_some(spec)
 }
 
 fn build_writer_factory(

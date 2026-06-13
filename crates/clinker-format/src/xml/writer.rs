@@ -65,8 +65,7 @@ impl<W: Write> XmlWriter<W> {
         let framer = config
             .envelope
             .clone()
-            .filter(|s| !s.is_empty())
-            .map(EnvelopeFramer::new);
+            .and_then(OutputEnvelopeSpec::into_framer);
         Self {
             writer: XmlEmitter::new(writer),
             _schema: schema,
@@ -78,19 +77,18 @@ impl<W: Write> XmlWriter<W> {
 
     /// Emit a `<wrapper>…</wrapper>` element whose children are the section's
     /// fields rendered as nested elements (reusing the dotted-name expansion),
-    /// optionally appending a `<count_field>N</count_field>` child. A section
-    /// with no fields and no count emits an empty `<wrapper/>`.
+    /// optionally appending a `<count_field>N</count_field>` child. Called only
+    /// for a section the document actually carries (a missing section emits no
+    /// wrapper at all).
     fn write_section_element(
         &mut self,
         wrapper: &str,
-        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<(), FormatError> {
         let mut pairs: Vec<(&str, &Value)> = Vec::new();
-        if let Some(fields) = fields {
-            for (name, value) in fields {
-                pairs.push((name.as_ref(), value));
-            }
+        for (name, value) in fields {
+            pairs.push((name.as_ref(), value));
         }
         // The computed count is held as an owned Value so it can be borrowed
         // into the same pair list the section fields use.
@@ -224,18 +222,17 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
-        // Reset the per-document counter and emit the header element.
-        let (has_header, header_owned) = {
+        // Reset the per-document counter and clone the header section's fields
+        // out (so the immutable framer borrow ends before the `&mut self`
+        // write below). `None` when the document lacks the configured section
+        // — then no `<header>` is emitted.
+        let header_owned: Option<indexmap::IndexMap<Box<str>, Value>> = {
             let framer = self.framer.as_mut().expect("framer checked above");
             framer.begin();
-            // Clone the header section's fields out so the immutable borrow of
-            // `framer` ends before the `&mut self` write below.
-            let owned: Option<indexmap::IndexMap<Box<str>, Value>> =
-                framer.header_fields(doc).cloned();
-            (framer.has_header(), owned)
+            framer.header_fields(doc).cloned()
         };
-        if has_header {
-            self.write_section_element("header", header_owned.as_ref(), None)?;
+        if let Some(fields) = header_owned.as_ref() {
+            self.write_section_element("header", fields, None)?;
         }
         Ok(())
     }
@@ -244,15 +241,16 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         let Some(framer) = self.framer.as_ref() else {
             return Ok(());
         };
-        let has_footer = framer.has_footer();
+        // `None` when the document lacks the configured footer section — then
+        // no `<footer>` is emitted (the count rides the present section only).
         let footer_owned: Option<indexmap::IndexMap<Box<str>, Value>> =
             framer.footer_fields(doc).cloned();
         let count_owned: Option<(String, i64)> = framer
             .footer_count()
             .map(|(field, n)| (field.to_string(), n));
-        if has_footer {
+        if let Some(fields) = footer_owned.as_ref() {
             let count_ref = count_owned.as_ref().map(|(f, n)| (f.as_str(), *n));
-            self.write_section_element("footer", footer_owned.as_ref(), count_ref)?;
+            self.write_section_element("footer", fields, count_ref)?;
         }
         let end = BytesEnd::new("Document");
         self.writer
@@ -584,24 +582,7 @@ mod tests {
         }
     }
 
-    fn doc_with_sections(
-        sections: &[(&str, &[(&str, Value)])],
-    ) -> Arc<clinker_record::DocumentContext> {
-        use indexmap::IndexMap;
-        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
-        for (name, fields) in sections {
-            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
-            for (k, v) in *fields {
-                inner.insert(Box::from(*k), v.clone());
-            }
-            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
-        }
-        Arc::new(clinker_record::DocumentContext::new(
-            clinker_record::DocumentId::next(),
-            Arc::from("f.xml"),
-            map,
-        ))
-    }
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     #[test]
     fn xml_envelope_wraps_each_document_with_header_and_footer() {

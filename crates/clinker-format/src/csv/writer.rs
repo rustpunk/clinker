@@ -60,8 +60,7 @@ impl<W: Write> CsvWriter<W> {
         let framer = config
             .envelope
             .clone()
-            .filter(|s| !s.is_empty())
-            .map(EnvelopeFramer::new);
+            .and_then(OutputEnvelopeSpec::into_framer);
         // Envelope header/footer rows carry a different field count than the
         // body rows (a section's fields vs the record schema), so the writer
         // must accept ragged records when framing is active. The non-envelope
@@ -84,14 +83,12 @@ impl<W: Write> CsvWriter<W> {
     /// row, optionally appending a trailing computed-count cell.
     fn write_section_row(
         inner: &mut csv::Writer<W>,
-        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<(), FormatError> {
         let mut cells: Vec<String> = Vec::new();
-        if let Some(fields) = fields {
-            for (name, value) in fields {
-                cells.push(value_to_csv_cell(name, value)?);
-            }
+        for (name, value) in fields {
+            cells.push(value_to_csv_cell(name, value)?);
         }
         if let Some((_field, n)) = count {
             cells.push(n.to_string());
@@ -122,7 +119,12 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         // Header is built from the writer's pinned schema. Engine-stamped
         // columns (today: `$ck.<field>`) are stripped unless the Output
         // node opts in.
-        if self.config.include_header && !self.header_written {
+        //
+        // Under envelope framing the schema column-header row is SUPPRESSED:
+        // it would otherwise emit once, before the first document's envelope
+        // header row, giving documents inconsistent layouts (header row only
+        // on the first). The per-document envelope header section replaces it.
+        if self.config.include_header && !self.header_written && self.framer.is_none() {
             let header: Vec<&str> =
                 filtered_header_columns(&self.schema, self.config.include_engine_stamped);
             self.inner.write_record(&header)?;
@@ -157,9 +159,10 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             return Ok(());
         };
         framer.begin();
-        if framer.has_header() {
-            let header = framer.header_fields(doc);
-            Self::write_section_row(&mut self.inner, header, None)?;
+        // Only emit a header row when the document actually carries the
+        // configured section — a missing section writes nothing.
+        if let Some(fields) = framer.header_fields(doc) {
+            Self::write_section_row(&mut self.inner, fields, None)?;
         }
         Ok(())
     }
@@ -168,10 +171,11 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         let Some(framer) = self.framer.as_ref() else {
             return Ok(());
         };
-        if framer.has_footer() {
-            let footer = framer.footer_fields(doc);
+        // Likewise the footer: emit only when the configured section is
+        // present; the computed count rides the present footer section.
+        if let Some(fields) = framer.footer_fields(doc) {
             let count = framer.footer_count();
-            Self::write_section_row(&mut self.inner, footer, count)?;
+            Self::write_section_row(&mut self.inner, fields, count)?;
         }
         Ok(())
     }
@@ -514,24 +518,7 @@ mod tests {
         }
     }
 
-    fn doc_with_sections(
-        sections: &[(&str, &[(&str, Value)])],
-    ) -> std::sync::Arc<clinker_record::DocumentContext> {
-        use indexmap::IndexMap;
-        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
-        for (name, fields) in sections {
-            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
-            for (k, v) in *fields {
-                inner.insert(Box::from(*k), v.clone());
-            }
-            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
-        }
-        std::sync::Arc::new(clinker_record::DocumentContext::new(
-            clinker_record::DocumentId::next(),
-            Arc::from("f.csv"),
-            map,
-        ))
-    }
+    use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     #[test]
     fn csv_envelope_frames_header_body_footer() {

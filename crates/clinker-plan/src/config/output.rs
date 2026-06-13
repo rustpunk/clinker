@@ -186,13 +186,17 @@ pub struct OutputEnvelopeConfig {
     pub footer_record_count_field: Option<String>,
 }
 
-impl OutputEnvelopeConfig {
-    /// `true` when no header, footer, or computed footer field is declared —
-    /// the writer renders no framing at all.
-    pub fn is_empty(&self) -> bool {
-        self.header_from_doc.is_none()
-            && self.footer_from_doc.is_none()
-            && self.footer_record_count_field.is_none()
+impl From<&OutputEnvelopeConfig> for clinker_format::OutputEnvelopeSpec {
+    /// Lower the plan config onto the format-local spec the writers consume.
+    /// The executor calls this only under `reconstruct_envelope: true`; the
+    /// resulting spec's `is_empty` / `into_framer` decide whether any framing
+    /// is rendered (so an empty config stays byte-identical to flag-off).
+    fn from(cfg: &OutputEnvelopeConfig) -> Self {
+        Self {
+            header_from_doc: cfg.header_from_doc.clone(),
+            footer_from_doc: cfg.footer_from_doc.clone(),
+            footer_record_count_field: cfg.footer_record_count_field.clone(),
+        }
     }
 }
 

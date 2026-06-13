@@ -2244,6 +2244,83 @@ fn generic_output_envelope(
     }
 }
 
+/// The upstream lineage of an Output, as it bears on envelope reconstruction:
+/// the set of Source node names that feed it, and the name of the first
+/// document-lineage-stripping node found on any path to it (if any).
+///
+/// A node strips document lineage when it emits records with a synthetic /
+/// merged [`clinker_record::DocumentContext`] rather than carrying their
+/// originating document's context forward:
+///
+/// - `Aggregate` finalizes group rows through the merged eval context (even
+///   per-document aggregation finalizes through it), so every emitted row is
+///   synthetic-grained.
+/// - `Combine` fans several inputs into merged-lineage rows.
+/// - `Composition` is opaque at config-validation time (its body lives in a
+///   separate artifact, not in `config.nodes`), so its lineage cannot be
+///   proven preserved — treated conservatively as a stripper.
+///
+/// Such records reach an enveloped Output with a non-concrete `source_file`,
+/// which the envelope arm streams UNFRAMED. The plan-time guard (E347) uses
+/// `lineage_stripper` to reject the combination before it can emit malformed /
+/// misattributed framing; `feeding_sources` scopes the E346 section-name check
+/// to the sources whose documents this Output actually frames.
+struct OutputLineage {
+    feeding_sources: std::collections::BTreeSet<String>,
+    lineage_stripper: Option<String>,
+}
+
+/// Walk upstream from `output_name` over the config node graph, collecting the
+/// feeding sources and the first lineage-stripping node on any path. Cycle-safe
+/// via a visited set (cycles are rejected separately by the DAG-edge pass, so
+/// this only guards against re-traversal, never relies on acyclicity).
+fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLineage {
+    let by_name: HashMap<&str, &PipelineNode> = config
+        .nodes
+        .iter()
+        .map(|n| (n.value.name(), &n.value))
+        .collect();
+    let mut feeding_sources = std::collections::BTreeSet::new();
+    let mut lineage_stripper: Option<String> = None;
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = vec![output_name];
+    while let Some(node_name) = stack.pop() {
+        if !visited.insert(node_name) {
+            continue;
+        }
+        let Some(node) = by_name.get(node_name) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Source { .. } => {
+                feeding_sources.insert(node_name.to_string());
+            }
+            PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. }
+            | PipelineNode::Composition { .. } => {
+                // Record the first stripper found (deterministic by the
+                // declaration-order traversal seed), but keep walking so the
+                // feeding-source set stays complete for the E346 scoping.
+                if lineage_stripper.is_none() {
+                    lineage_stripper = Some(node_name.to_string());
+                }
+                for up in node.direct_input_names() {
+                    stack.push(up);
+                }
+            }
+            _ => {
+                for up in node.direct_input_names() {
+                    stack.push(up);
+                }
+            }
+        }
+    }
+    OutputLineage {
+        feeding_sources,
+        lineage_stripper,
+    }
+}
+
 /// A rejected `$doc` path against a closed envelope schema: the formatted
 /// diagnostic message plus its fix-it help text.
 struct UndeclaredDocPath {
@@ -3249,14 +3326,13 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         // below names the offending output directly — no re-derivation.
         let has_document_dlq = config.any_source_has_document_dlq();
         let has_correlation_key = config.any_source_has_correlation_key();
-        // Every `$doc` section name any source declares, for the E346
-        // unknown-section check. Section names are user-defined and shared
-        // across the pipeline, so an envelope header/footer may reference any
-        // section any source extracts.
-        let declared_envelope_sections: std::collections::HashSet<String> = config
+        // E346 scopes its section-name check to the sources that actually FEED
+        // each Output (not the pipeline-wide union), so a header/footer naming
+        // a section declared only on a non-feeding source is rejected — that
+        // would otherwise emit a silently-empty header/footer.
+        let source_envelope_by_name: HashMap<&str, &crate::config::SourceConfig> = config
             .source_configs()
-            .filter_map(|s| s.envelope.as_ref())
-            .flat_map(|e| e.sections.keys().cloned())
+            .map(|s| (s.name.as_str(), s))
             .collect();
         for output in config.output_configs() {
             if !output.reconstruct_envelope {
@@ -3298,45 +3374,91 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 )));
             }
 
+            // Trace this Output's upstream lineage once: the sources feeding it
+            // (for the E346 section-name scoping) and any document-lineage
+            // stripper on the path (for the guard just below).
+            let lineage = trace_output_lineage(config, out);
+
+            // A cross-document `Combine` / global-or-per-document `Aggregate` /
+            // opaque `Composition` upstream emits records with a synthetic
+            // (`<merged>`) document context, which the envelope arm streams
+            // UNFRAMED. For JSON that means body bytes outside any open
+            // document object — malformed JSON — and for every format it means
+            // silently dropped framing / a miscounted footer. Reject the
+            // combination at plan time rather than emit broken output.
+            if let Some(stripper) = lineage.lineage_stripper.as_deref() {
+                return Err(ConfigError::Validation(format!(
+                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with an \
+                     upstream node ('{stripper}') that strips document lineage — a Combine, \
+                     Aggregate, or Composition emits records with no originating document, so \
+                     the per-document envelope cannot be framed around them (the framing arm \
+                     would stream them unframed, e.g. producing malformed JSON). Remove the \
+                     intervening node from this Output's path, or drop `reconstruct_envelope`"
+                )));
+            }
+
             // E346: the output-envelope config (header/footer sections + a
-            // possible computed footer) must reference sections the sources
-            // actually declare, and a computed footer count is unsupported on
-            // a format whose lines are positional (fixed-width). Only checked
-            // for an Output that reconstructs the envelope AND carries an
-            // envelope config; a flag-on Output with no envelope config frames
-            // nothing and is fine.
+            // possible computed footer) must reference sections the FEEDING
+            // sources actually declare, and a computed footer count is
+            // unsupported on a format whose lines are positional (fixed-width).
+            // Only checked for an Output that reconstructs the envelope AND
+            // carries an envelope config; a flag-on Output with no envelope
+            // config frames nothing and is fine.
             let Some((envelope_cfg, supports_computed_footer)) =
                 generic_output_envelope(&output.format)
             else {
                 continue;
             };
+            // Sections declared by THIS output's feeding sources only — a
+            // header/footer naming a section that exists solely on a
+            // non-feeding source would emit an empty header/footer silently,
+            // the exact failure E346 exists to catch.
+            let feeding_sections: std::collections::BTreeSet<&str> = lineage
+                .feeding_sources
+                .iter()
+                .filter_map(|s| source_envelope_by_name.get(s.as_str()))
+                .filter_map(|s| s.envelope.as_ref())
+                .flat_map(|e| e.sections.keys().map(|k| k.as_str()))
+                .collect();
             for (role, section) in [
                 ("header_from_doc", envelope_cfg.header_from_doc.as_deref()),
                 ("footer_from_doc", envelope_cfg.footer_from_doc.as_deref()),
             ] {
                 let Some(section) = section else { continue };
-                if !declared_envelope_sections.contains(section) {
-                    let mut declared: Vec<&str> = declared_envelope_sections
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect();
-                    declared.sort_unstable();
+                if !feeding_sections.contains(section) {
+                    let declared: Vec<&str> = feeding_sections.iter().copied().collect();
                     return Err(ConfigError::Validation(format!(
                         "[E346] output '{out}': envelope {role} references section \
-                         '{section}' which no source declares an `envelope:` section for. \
-                         Declared sections across all sources: {declared:?}. Name a declared \
-                         section, or add the section to a source's `envelope:` config"
+                         '{section}' which no source feeding this output declares an \
+                         `envelope:` section for. Sections declared by the feeding \
+                         source(s): {declared:?}. Name a declared section, or add the \
+                         section to a feeding source's `envelope:` config"
                     )));
                 }
             }
-            if envelope_cfg.footer_record_count_field.is_some() && !supports_computed_footer {
-                return Err(ConfigError::Validation(format!(
-                    "[E346] output '{out}': envelope `footer_record_count_field` is not \
-                     supported for {} output — a fixed-width line has no field to inject a \
-                     computed count into without a width declaration. Drop \
-                     `footer_record_count_field`, or use a CSV / JSON / XML output",
-                    output.format.format_name()
-                )));
+            if envelope_cfg.footer_record_count_field.is_some() {
+                // A computed count is injected INTO the footer section, so it
+                // requires a `footer_from_doc` to attach to — a count-only
+                // footer has no section to ride and would otherwise be silently
+                // dropped (the writer emits a footer only when its section is
+                // present on the document).
+                if envelope_cfg.footer_from_doc.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "[E346] output '{out}': envelope `footer_record_count_field` requires \
+                         `footer_from_doc` — the computed record count is injected into the \
+                         footer section, so a footer section must be named for it to attach to. \
+                         Add `footer_from_doc`, or drop `footer_record_count_field`"
+                    )));
+                }
+                if !supports_computed_footer {
+                    return Err(ConfigError::Validation(format!(
+                        "[E346] output '{out}': envelope `footer_record_count_field` is not \
+                         supported for {} output — a fixed-width line has no field to inject a \
+                         computed count into without a width declaration. Drop \
+                         `footer_record_count_field`, or use a CSV / JSON / XML output",
+                        output.format.format_name()
+                    )));
+                }
             }
         }
     }
