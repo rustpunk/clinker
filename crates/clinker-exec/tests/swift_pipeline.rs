@@ -1,4 +1,4 @@
-//! End-to-end SWIFT MT ingestion.
+//! End-to-end SWIFT MT ingestion and emission.
 //!
 //! Covers: (1) a SWIFT source surfaces its service blocks (1/2/3/5) as
 //! file-level `$doc` envelope sections on every block-4 body record, proving
@@ -6,7 +6,11 @@
 //! block-4 `:tag:value` line streams as one `[block, tag, value]` record;
 //! (3) a header-only message still produces a balanced document level with a
 //! clean drain; (4) a malformed message (unbalanced brace / missing `-}`
-//! trailer) surfaces as a clean run failure rather than a panic.
+//! trailer) surfaces as a clean run failure rather than a panic; (5) a
+//! SWIFT → SWIFT → SWIFT round-trip re-frames the block structure and
+//! reproduces every field value byte-faithfully (interior braces, mid-line
+//! `-}`, folded continuations, and interior blank lines survive); (6) the
+//! `swift`+`split` combination is rejected at config time (diagnostic `E342`).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -333,6 +337,254 @@ nodes:
         err.contains("truncated") || err.contains("SWIFT"),
         "error should name the SWIFT block failure: {err}"
     );
+}
+
+/// Build a SWIFT source → SWIFT output round-trip pipeline that declares an
+/// envelope section per service block the fixture carries and echoes each one
+/// back through the writer's matching `*_from_doc` option. Only the blocks the
+/// message actually carries are declared — the reader's pre-scan rejects a
+/// section over an absent block, so a fixture without (say) block 2 must not
+/// declare an `app` section.
+fn swift_round_trip_yaml(blocks: &[(&str, u8, &str)]) -> String {
+    let mut sections = String::new();
+    let mut options = String::new();
+    for (section, block_id, option) in blocks {
+        sections.push_str(&format!(
+            "          {section}:\n            extract: {{ segment: \"{block_id}\" }}\n"
+        ));
+        options.push_str(&format!("        {option}: {section}\n"));
+    }
+    format!(
+        r#"
+pipeline:
+  name: swift_round_trip
+nodes:
+  - type: source
+    name: message
+    config:
+      name: message
+      type: swift
+      glob: ./*.swift
+      envelope:
+        sections:
+{sections}      schema:
+        - {{ name: block, type: string }}
+        - {{ name: tag, type: string }}
+        - {{ name: value, type: string }}
+  - type: output
+    name: out
+    input: message
+    config:
+      name: out
+      type: swift
+      path: out.swift
+      options:
+{options}"#
+    )
+}
+
+/// Feed a SWIFT message through SWIFT → SWIFT (block-structure reconstruction)
+/// using the given per-block section/option mapping, then re-read the
+/// reconstructed output through SWIFT → CSV, returning the reconstructed SWIFT
+/// bytes and the `block,tag,value` CSV rows so a test can assert the field
+/// stream round-trips in order.
+fn swift_to_swift_then_csv(fixture: &str, blocks: &[(&str, u8, &str)]) -> (String, String) {
+    let yaml = swift_round_trip_yaml(blocks);
+    let (_report, swift_out) =
+        run(&yaml, "message", fixture, "in.swift", "out").expect("swift -> swift round-trip");
+
+    let csv_yaml = r#"
+pipeline:
+  name: swift_to_csv
+nodes:
+  - type: source
+    name: message
+    config:
+      name: message
+      type: swift
+      glob: ./*.swift
+      schema:
+        - { name: block, type: string }
+        - { name: tag, type: string }
+        - { name: value, type: string }
+  - type: output
+    name: out
+    input: message
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_header: false
+"#;
+    let (_report, csv_out) = run(csv_yaml, "message", &swift_out, "rt.swift", "out")
+        .expect("reconstructed swift -> csv");
+    (swift_out, csv_out)
+}
+
+/// Extract the `tag` column (CSV field index 1 of `block,tag,value`) from each
+/// re-read body row, in order.
+fn csv_tag_column(csv_out: &str) -> Vec<&str> {
+    csv_out
+        .lines()
+        .map(|l| l.split(',').nth(1).unwrap_or(""))
+        .collect()
+}
+
+#[test]
+fn swift_round_trip_reparses_identically() {
+    // The reconstructed output re-frames the full envelope in order, and the
+    // re-read tag stream matches the source's block-4 fields exactly.
+    let (swift_out, csv_out) = swift_to_swift_then_csv(
+        &mt103(),
+        &[
+            ("basic", 1, "basic_header_from_doc"),
+            ("app", 2, "app_header_from_doc"),
+            ("user", 3, "user_header_from_doc"),
+            ("trailer", 5, "trailer_from_doc"),
+        ],
+    );
+
+    // Service blocks re-framed in order: {1:}{2:}{3:{108:}} then block 4,
+    // then {5:}. Block 3's nested sub-block re-emits byte-for-byte.
+    assert!(
+        swift_out.starts_with(
+            "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}{3:{108:MSGREF12345}}{4:\r\n"
+        ),
+        "envelope framing wrong: {swift_out:?}"
+    );
+    assert!(
+        swift_out.ends_with("-}{5:{CHK:1234567890AB}}"),
+        "trailer framing wrong: {swift_out:?}"
+    );
+
+    // The re-read tag column round-trips in order.
+    assert_eq!(
+        csv_tag_column(&csv_out),
+        vec!["20", "23B", "32A"],
+        "csv was: {csv_out}"
+    );
+}
+
+#[test]
+fn swift_mt940_repeated_tags_round_trip() {
+    // Repeated :61:/:86: statement lines re-emit in arrival order; the re-read
+    // tag stream preserves both repeats. MT940 carries only blocks 1 and 2.
+    let (_swift_out, csv_out) = swift_to_swift_then_csv(
+        &mt940(),
+        &[
+            ("basic", 1, "basic_header_from_doc"),
+            ("app", 2, "app_header_from_doc"),
+        ],
+    );
+    assert_eq!(
+        csv_tag_column(&csv_out),
+        vec!["20", "25", "28C", "60F", "61", "86", "61", "86", "62F"],
+        "csv was: {csv_out}"
+    );
+}
+
+#[test]
+fn swift_interior_block4_braces_dashes_blanks_round_trip() {
+    // The load-bearing faithfulness test: a value carrying an interior brace
+    // (`:79:A{B`), a mid-line `-}` (`:79:SEE-}NOTE`), and an interior blank
+    // line in a `:77E:` value must all reproduce byte-identically on re-read.
+    // Block-4 free text is opaque, so the writer escapes nothing and the
+    // reader re-parses each value unchanged.
+    let fixture = "{1:F01BANKBEBBAXXX0000000000}\
+        {4:\r\n:79:A{B\r\n:79:SEE-}NOTE\r\n:77E:LINE1\r\n\r\nLINE3\r\n:86:PLAIN\r\n-}";
+
+    // Round-trip SWIFT -> SWIFT, then read the reconstructed output back
+    // through a SWIFT reader and assert each value is byte-identical to the
+    // value the original reader produced. The fixture carries only block 1.
+    let (swift_out, _csv) =
+        swift_to_swift_then_csv(fixture, &[("basic", 1, "basic_header_from_doc")]);
+
+    // Read both the original fixture and the reconstructed output through the
+    // reader and compare their (tag, value) streams field-for-field.
+    let read_fields = |data: &str| -> Vec<(String, Option<String>)> {
+        use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
+        use clinker_format::traits::FormatReader;
+        use clinker_record::Value;
+        let mut r = SwiftReader::new(
+            Cursor::new(data.as_bytes().to_vec()),
+            SwiftReaderConfig::default(),
+        );
+        let mut out = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            let tag = match rec.get("tag") {
+                Some(Value::String(s)) => s.to_string(),
+                other => panic!("unexpected tag: {other:?}"),
+            };
+            let value = match rec.get("value") {
+                Some(Value::String(s)) => Some(s.to_string()),
+                Some(Value::Null) | None => None,
+                other => panic!("unexpected value: {other:?}"),
+            };
+            out.push((tag, value));
+        }
+        out
+    };
+
+    let original = read_fields(fixture);
+    let reconstructed = read_fields(&swift_out);
+    assert_eq!(
+        original, reconstructed,
+        "field stream not byte-faithful after round-trip"
+    );
+
+    // Spot-check the load-bearing values survive verbatim.
+    assert!(
+        original
+            .iter()
+            .any(|(t, v)| t == "79" && v.as_deref() == Some("SEE-}NOTE")),
+        "mid-line dash-brace value missing: {original:?}"
+    );
+    assert!(
+        original
+            .iter()
+            .any(|(t, v)| t == "77E" && v.as_deref() == Some("LINE1\n\nLINE3")),
+        "interior blank line value missing: {original:?}"
+    );
+    assert!(
+        original
+            .iter()
+            .any(|(t, v)| t == "79" && v.as_deref() == Some("A{B")),
+        "interior brace value missing: {original:?}"
+    );
+}
+
+#[test]
+fn swift_output_with_split_is_rejected_at_config_time() {
+    // A SWIFT MT message is one indivisible brace-balanced envelope; byte-limit
+    // splitting would finalize block 4 mid-stream. The combination must fail
+    // config validation, not run and emit a corrupt message.
+    let yaml = r#"
+pipeline:
+  name: swift_split
+nodes:
+  - type: source
+    name: message
+    config:
+      name: message
+      type: swift
+      glob: ./*.swift
+      schema:
+        - { name: block, type: string }
+        - { name: tag, type: string }
+        - { name: value, type: string }
+  - type: output
+    name: out
+    input: message
+    config:
+      name: out
+      type: swift
+      path: out.swift
+      split:
+        max_bytes: 1024
+"#;
+    let err = parse_config(yaml).expect_err("swift + split must fail config validation");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("E342"), "expected E342 diagnostic, got: {msg}");
 }
 
 #[test]

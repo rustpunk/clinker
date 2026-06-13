@@ -33,6 +33,10 @@ use crate::error::FormatError;
 use crate::swift::tokenizer::{
     BlockTokenizer, ParsedBlock, ParsedBlock4Line, TEXT_BLOCK_ID, split_block4,
 };
+use crate::swift::{
+    BODY_FIELD, DEFAULT_APP_HEADER_SECTION, DEFAULT_BASIC_HEADER_SECTION, DEFAULT_TRAILER_SECTION,
+    DEFAULT_USER_HEADER_SECTION,
+};
 use crate::traits::FormatReader;
 
 /// Default ceiling on the number of block-4 field lines a single message may
@@ -40,26 +44,6 @@ use crate::traits::FormatReader;
 /// guidance rather than streaming an unbounded body. A real MT message is
 /// well under this; the cap exists only as a corruption guard.
 const DEFAULT_MAX_FIELDS: usize = 10_000;
-
-/// The default `$doc` section name for the basic header (block 1) when the
-/// source declares no `envelope:` mapping for it. User-chosen names override
-/// it; the engine reserves none — this is a stable label, not a keyword.
-const DEFAULT_BASIC_HEADER_SECTION: &str = "basic_header";
-
-/// The default `$doc` section name for the application header (block 2).
-const DEFAULT_APP_HEADER_SECTION: &str = "app_header";
-
-/// The default `$doc` section name for the user header (block 3).
-const DEFAULT_USER_HEADER_SECTION: &str = "user_header";
-
-/// The default `$doc` section name for the trailer (block 5).
-const DEFAULT_TRAILER_SECTION: &str = "trailer";
-
-/// The `body` field name a service block's verbatim text surfaces under
-/// inside its `$doc` section. SWIFT service blocks carry free-form text (a
-/// header string, nested `{sub:tag}` blocks), so the whole block body is one
-/// addressable field rather than positional elements.
-const BODY_FIELD: &str = "body";
 
 /// Configuration for the SWIFT reader.
 pub struct SwiftReaderConfig {

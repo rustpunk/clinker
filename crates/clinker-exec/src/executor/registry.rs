@@ -14,6 +14,7 @@ use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConf
 use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
+use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
 use clinker_format::traits::FormatWriter;
 use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
@@ -159,6 +160,21 @@ fn build_hl7_writer_config(
         file_header_from_doc: opts.and_then(|o| o.file_header_from_doc.clone()),
         batch_header: opts.and_then(|o| o.batch_header.clone()),
         segment_newline: opts.and_then(|o| o.segment_newline).unwrap_or(true),
+    }
+}
+
+fn build_swift_writer_config(
+    opts: Option<&clinker_plan::config::SwiftOutputOptions>,
+) -> SwiftWriterConfig {
+    SwiftWriterConfig {
+        basic_header: opts.and_then(|o| o.basic_header.clone()),
+        basic_header_from_doc: opts.and_then(|o| o.basic_header_from_doc.clone()),
+        app_header: opts.and_then(|o| o.app_header.clone()),
+        app_header_from_doc: opts.and_then(|o| o.app_header_from_doc.clone()),
+        user_header: opts.and_then(|o| o.user_header.clone()),
+        user_header_from_doc: opts.and_then(|o| o.user_header_from_doc.clone()),
+        trailer: opts.and_then(|o| o.trailer.clone()),
+        trailer_from_doc: opts.and_then(|o| o.trailer_from_doc.clone()),
     }
 }
 
@@ -315,6 +331,16 @@ fn build_writer_factory(
                     counting_writer,
                     schema,
                     hl7_config.clone(),
+                )))
+            })
+        }
+        OutputFormat::Swift(opts) => {
+            let swift_config = build_swift_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(SwiftWriter::new(
+                    counting_writer,
+                    schema,
+                    swift_config.clone(),
                 )))
             })
         }

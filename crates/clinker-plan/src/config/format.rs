@@ -56,6 +56,7 @@ impl OutputFormat {
             OutputFormat::Edifact(_) => "edifact",
             OutputFormat::X12(_) => "x12",
             OutputFormat::Hl7(_) => "hl7",
+            OutputFormat::Swift(_) => "swift",
         }
     }
 }
@@ -71,6 +72,7 @@ pub enum OutputFormat {
     Edifact(Option<EdifactOutputOptions>),
     X12(Option<X12OutputOptions>),
     Hl7(Option<Hl7OutputOptions>),
+    Swift(Option<SwiftOutputOptions>),
 }
 
 /// Supported format types.
