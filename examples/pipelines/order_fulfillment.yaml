@@ -1,8 +1,11 @@
 pipeline:
   name: order_fulfillment
   vars:
+    # Per-tenant knobs. Channels override these via `vars.static.*`
+    # (see channels/express-logistics/ and channels/warehouse-west/).
     express_surcharge: { type: float, default: 5.99 }
-    high_value_threshold: { type: int, default: 500 }
+    high_value_threshold: { type: float, default: 500.0 }
+    region: { type: string, default: "central" }
 
 nodes:
   - type: source
@@ -74,11 +77,13 @@ nodes:
 
   - type: transform
     name: route_priority
-    description: Compute route field for downstream routing (priority_report vs fulfilled_orders)
+    description: Route urgent/high-value orders, stamp region + handling fee
     input: product_lookup
     config:
       cxl: |
-        emit _route = if priority_level == "urgent" or priority_level == "high" then "priority_report" else "fulfilled_orders"
+        emit _route = if priority_level == "urgent" or priority_level == "high" or line_total >= $vars.high_value_threshold then "priority_report" else "fulfilled_orders"
+        emit handling_fee = if priority_level == "urgent" then $vars.express_surcharge else 0.0
+        emit region = $vars.region
 
   - type: output
     name: fulfilled_orders
