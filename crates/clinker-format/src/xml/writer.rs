@@ -1,5 +1,11 @@
 //! XML writer with configurable root/record elements, dotted field expansion
 //! to nested elements, null handling, and proper escaping.
+//!
+//! Under `reconstruct_envelope`, each document is wrapped in a `<Document>`
+//! element inside the root: `begin_document` opens `<Document>` and emits the
+//! header section as a `<header>` element; the body `<Record>` elements stream
+//! between; `end_document` emits a `<footer>` element (section fields plus the
+//! streaming record count) and closes `</Document>`. No document is buffered.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -7,8 +13,9 @@ use std::sync::Arc;
 use quick_xml::Writer as XmlEmitter;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{DocumentContext, Record, Schema, Value};
 
+use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
@@ -21,6 +28,11 @@ pub struct XmlWriterConfig {
     /// snapshots) emit as nested elements. Defaults to `false` so
     /// engine-internal namespaces stay out of the XML output.
     pub include_engine_stamped: bool,
+    /// Per-document envelope reconstruction. `None` (the default) keeps the
+    /// flat `<Root><Record/>…</Root>` output byte-identical. `Some` is set by
+    /// the executor under `reconstruct_envelope: true` and wraps each document
+    /// in a `<Document>` frame with header/footer elements.
+    pub envelope: Option<OutputEnvelopeSpec>,
 }
 
 impl Default for XmlWriterConfig {
@@ -30,6 +42,7 @@ impl Default for XmlWriterConfig {
             record_element: "Record".into(),
             preserve_nulls: false,
             include_engine_stamped: false,
+            envelope: None,
         }
     }
 }
@@ -43,16 +56,59 @@ pub struct XmlWriter<W: Write> {
     _schema: Arc<Schema>,
     config: XmlWriterConfig,
     header_written: bool,
+    /// Per-document envelope framer, present only when `config.envelope` is.
+    framer: Option<EnvelopeFramer>,
 }
 
 impl<W: Write> XmlWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: XmlWriterConfig) -> Self {
+        let framer = config
+            .envelope
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(EnvelopeFramer::new);
         Self {
             writer: XmlEmitter::new(writer),
             _schema: schema,
             config,
             header_written: false,
+            framer,
         }
+    }
+
+    /// Emit a `<wrapper>…</wrapper>` element whose children are the section's
+    /// fields rendered as nested elements (reusing the dotted-name expansion),
+    /// optionally appending a `<count_field>N</count_field>` child. A section
+    /// with no fields and no count emits an empty `<wrapper/>`.
+    fn write_section_element(
+        &mut self,
+        wrapper: &str,
+        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        count: Option<(&str, i64)>,
+    ) -> Result<(), FormatError> {
+        let mut pairs: Vec<(&str, &Value)> = Vec::new();
+        if let Some(fields) = fields {
+            for (name, value) in fields {
+                pairs.push((name.as_ref(), value));
+            }
+        }
+        // The computed count is held as an owned Value so it can be borrowed
+        // into the same pair list the section fields use.
+        let count_value = count.map(|(field, n)| (field, Value::Integer(n)));
+        if let Some((field, ref v)) = count_value {
+            pairs.push((field, v));
+        }
+        let tree = build_field_tree(&pairs, self.config.preserve_nulls)?;
+        let start = BytesStart::new(wrapper);
+        self.writer
+            .write_event(Event::Start(start))
+            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        self.write_field_tree(&tree)?;
+        let end = BytesEnd::new(wrapper);
+        self.writer
+            .write_event(Event::End(end))
+            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        Ok(())
     }
 
     fn write_header(&mut self) -> Result<(), FormatError> {
@@ -141,6 +197,9 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
             .write_event(Event::End(end))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
 
+        if let Some(framer) = self.framer.as_mut() {
+            framer.count_record();
+        }
         Ok(())
     }
 
@@ -151,6 +210,54 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
             .write_event(Event::End(end))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
         self.writer.get_mut().flush().map_err(FormatError::Io)?;
+        Ok(())
+    }
+
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        if self.framer.is_none() {
+            return Ok(());
+        }
+        // Ensure the root element is open before the first document.
+        self.write_header()?;
+        // Open the per-document wrapper.
+        let start = BytesStart::new("Document");
+        self.writer
+            .write_event(Event::Start(start))
+            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        // Reset the per-document counter and emit the header element.
+        let (has_header, header_owned) = {
+            let framer = self.framer.as_mut().expect("framer checked above");
+            framer.begin();
+            // Clone the header section's fields out so the immutable borrow of
+            // `framer` ends before the `&mut self` write below.
+            let owned: Option<indexmap::IndexMap<Box<str>, Value>> =
+                framer.header_fields(doc).cloned();
+            (framer.has_header(), owned)
+        };
+        if has_header {
+            self.write_section_element("header", header_owned.as_ref(), None)?;
+        }
+        Ok(())
+    }
+
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(framer) = self.framer.as_ref() else {
+            return Ok(());
+        };
+        let has_footer = framer.has_footer();
+        let footer_owned: Option<indexmap::IndexMap<Box<str>, Value>> =
+            framer.footer_fields(doc).cloned();
+        let count_owned: Option<(String, i64)> = framer
+            .footer_count()
+            .map(|(field, n)| (field.to_string(), n));
+        if has_footer {
+            let count_ref = count_owned.as_ref().map(|(f, n)| (f.as_str(), *n));
+            self.write_section_element("footer", footer_owned.as_ref(), count_ref)?;
+        }
+        let end = BytesEnd::new("Document");
+        self.writer
+            .write_event(Event::End(end))
+            .map_err(|e| FormatError::Xml(e.to_string()))?;
         Ok(())
     }
 }
@@ -475,5 +582,74 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    fn doc_with_sections(
+        sections: &[(&str, &[(&str, Value)])],
+    ) -> Arc<clinker_record::DocumentContext> {
+        use indexmap::IndexMap;
+        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
+        for (name, fields) in sections {
+            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
+            for (k, v) in *fields {
+                inner.insert(Box::from(*k), v.clone());
+            }
+            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
+        }
+        Arc::new(clinker_record::DocumentContext::new(
+            clinker_record::DocumentId::next(),
+            Arc::from("f.xml"),
+            map,
+        ))
+    }
+
+    #[test]
+    fn xml_envelope_wraps_each_document_with_header_and_footer() {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = XmlWriterConfig {
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("A".into()))]),
+            ("Foot", &[("checksum", Value::String("SUM".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc).unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+                .unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(20)]))
+                .unwrap();
+            w.end_document(&doc).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        // Each document is a <Document> with a <header>, the body <Record>s,
+        // and a <footer> carrying the section field plus the computed count.
+        assert!(out.contains("<Document>"), "got: {out}");
+        assert!(
+            out.contains("<header><batch_id>A</batch_id></header>"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("<Record><amount>10</amount></Record>"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("<footer><checksum>SUM</checksum><count>2</count></footer>"),
+            "got: {out}"
+        );
+        assert!(out.contains("</Document>"), "got: {out}");
+        // The whole thing is valid XML wrapped in the root.
+        assert!(
+            out.contains("<Root>") && out.contains("</Root>"),
+            "got: {out}"
+        );
     }
 }

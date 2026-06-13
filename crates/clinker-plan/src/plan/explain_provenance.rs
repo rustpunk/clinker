@@ -237,6 +237,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E343" => Some(include_str!("../../../../docs/explain/E343.md")),
         "E344" => Some(include_str!("../../../../docs/explain/E344.md")),
         "E345" => Some(include_str!("../../../../docs/explain/E345.md")),
+        "E346" => Some(include_str!("../../../../docs/explain/E346.md")),
         "E347" => Some(include_str!("../../../../docs/explain/E347.md")),
         "E323" => Some(include_str!("../../../../docs/explain/E323.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
@@ -462,7 +463,7 @@ mod tests {
             "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
             "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323", "E330", "E331",
             "E332", "E333", "E334", "E335", "E336", "E337", "E338", "E339", "E340", "E341", "E342",
-            "E343", "E344", "E345", "E347", "E15Y", "W101", "W302", "W305", "W306",
+            "E343", "E344", "E345", "E346", "E347", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

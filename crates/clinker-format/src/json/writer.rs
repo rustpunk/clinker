@@ -1,11 +1,21 @@
 //! JSON writer supporting array mode, NDJSON mode, pretty-printing,
 //! and null omission. Implements `FormatWriter`.
+//!
+//! Under `reconstruct_envelope` the whole-stream array framing is REPLACED by
+//! per-document object framing: each enveloped document becomes one JSON
+//! object `{ "<header>": {...}, "body": [ ... ], "<footer>": {...} }`, with the
+//! header/footer keys named by the source's `$doc` sections and the footer
+//! optionally carrying a streaming record count. Multiple documents in one
+//! stream are each individually framed — wrapped in an outer array in `array`
+//! mode, or one object per line in `ndjson` mode. The body array streams one
+//! record at a time, so no document is ever buffered.
 
 use std::io::Write;
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{DocumentContext, Record, Schema, Value};
 
+use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
@@ -28,6 +38,11 @@ pub struct JsonWriterConfig {
     /// snapshots) appear as keys in the emitted JSON object. Defaults
     /// to `false` to keep engine-internal namespaces out of output.
     pub include_engine_stamped: bool,
+    /// Per-document envelope reconstruction. `None` (the default) keeps the
+    /// whole-stream array / NDJSON framing byte-identical to today. `Some` is
+    /// set by the executor only under `reconstruct_envelope: true` and
+    /// reframes the output to one object per document.
+    pub envelope: Option<OutputEnvelopeSpec>,
 }
 
 impl Default for JsonWriterConfig {
@@ -37,6 +52,7 @@ impl Default for JsonWriterConfig {
             pretty: false,
             preserve_nulls: false,
             include_engine_stamped: false,
+            envelope: None,
         }
     }
 }
@@ -50,15 +66,44 @@ pub struct JsonWriter<W: Write> {
     _schema: Arc<Schema>,
     config: JsonWriterConfig,
     records_written: u64,
+    /// Per-document envelope framer + state machine, present only when
+    /// `config.envelope` is. Drives the per-document-object reframe.
+    envelope: Option<EnvelopeState>,
+}
+
+/// Per-document-object framing state for the envelope reframe. Tracks the
+/// running framer (header/footer sections + record count), how many document
+/// objects have been emitted (for the outer-array comma in `array` mode), and
+/// whether the current document's body array has any record yet (for the
+/// body-array comma). Holds no body record — bounded memory.
+struct EnvelopeState {
+    framer: EnvelopeFramer,
+    /// Document objects emitted so far this stream.
+    docs_written: u64,
+    /// Records appended to the currently-open document's body array.
+    body_in_doc: u64,
+    /// Whether a document object is currently open (between begin/end).
+    doc_open: bool,
 }
 
 impl<W: Write> JsonWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: JsonWriterConfig) -> Self {
+        let envelope = config
+            .envelope
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|spec| EnvelopeState {
+                framer: EnvelopeFramer::new(spec),
+                docs_written: 0,
+                body_in_doc: 0,
+                doc_open: false,
+            });
         Self {
             writer,
             _schema: schema,
             config,
             records_written: 0,
+            envelope,
         }
     }
 
@@ -87,18 +132,72 @@ impl<W: Write> JsonWriter<W> {
         }
         Jv::Object(obj)
     }
+
+    /// Serialize a JSON value with the configured pretty/compact mode.
+    fn serialize_value(&self, value: &serde_json::Value) -> Result<String, FormatError> {
+        let s = if self.config.pretty {
+            serde_json::to_string_pretty(value)
+        } else {
+            serde_json::to_string(value)
+        }
+        .map_err(|e| FormatError::Json(e.to_string()))?;
+        Ok(s)
+    }
+
+    /// Build a JSON object from an envelope section's ordered fields, plus an
+    /// optional trailing computed-count entry. `null` is always emitted for a
+    /// section (envelope sections are small typed metadata, not body records),
+    /// so the round-trip stays faithful regardless of `preserve_nulls`.
+    fn section_object(
+        fields: Option<&indexmap::IndexMap<Box<str>, Value>>,
+        count: Option<(&str, i64)>,
+    ) -> serde_json::Value {
+        use serde_json::{Map, Value as Jv};
+        let mut obj = Map::new();
+        if let Some(fields) = fields {
+            for (name, value) in fields {
+                obj.insert(name.to_string(), clinker_to_json(value));
+            }
+        }
+        if let Some((field, n)) = count {
+            obj.insert(field.to_string(), Jv::Number(n.into()));
+        }
+        Jv::Object(obj)
+    }
+
+    /// Append one body record to the currently-open document object's `body`
+    /// array, comma-separating from prior body records.
+    fn write_enveloped_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        let json_val = self.record_to_json(record);
+        let serialized = self.serialize_value(&json_val)?;
+        let env = self
+            .envelope
+            .as_mut()
+            .expect("write_enveloped_record only called with an envelope state");
+        if env.body_in_doc > 0 {
+            self.writer.write_all(b",").map_err(FormatError::Io)?;
+        }
+        self.writer
+            .write_all(serialized.as_bytes())
+            .map_err(FormatError::Io)?;
+        env.body_in_doc += 1;
+        env.framer.count_record();
+        Ok(())
+    }
 }
 
 impl<W: Write + Send> FormatWriter for JsonWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        let json_val = self.record_to_json(record);
-
-        let serialized = if self.config.pretty {
-            serde_json::to_string_pretty(&json_val)
-        } else {
-            serde_json::to_string(&json_val)
+        // Envelope mode: append to the open document object's `body` array.
+        // A document is always open here (the dispatch arm fires
+        // `begin_document` before the first record), so this never writes a
+        // stray top-level record.
+        if self.envelope.is_some() {
+            return self.write_enveloped_record(record);
         }
-        .map_err(|e| FormatError::Json(e.to_string()))?;
+
+        let json_val = self.record_to_json(record);
+        let serialized = self.serialize_value(&json_val)?;
 
         match self.config.format {
             JsonOutputMode::Array => {
@@ -126,14 +225,115 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
     }
 
     fn flush(&mut self) -> Result<(), FormatError> {
-        if let JsonOutputMode::Array = self.config.format {
-            if self.records_written > 0 {
-                self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
-            } else {
-                self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
+        match self.envelope.as_ref() {
+            // Envelope mode: in `array` mode the per-document objects are
+            // wrapped in an outer array, closed here; `ndjson` mode needs no
+            // wrapper. An empty stream emits `[]` (array) / nothing (ndjson),
+            // matching the non-enveloped empty shape.
+            Some(env) => {
+                if let JsonOutputMode::Array = self.config.format {
+                    if env.docs_written > 0 {
+                        self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
+                    } else {
+                        self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
+                    }
+                }
+            }
+            None => {
+                if let JsonOutputMode::Array = self.config.format {
+                    if self.records_written > 0 {
+                        self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
+                    } else {
+                        self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
+                    }
+                }
             }
         }
         self.writer.flush().map_err(FormatError::Io)?;
+        Ok(())
+    }
+
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        let Some(env) = self.envelope.as_mut() else {
+            return Ok(());
+        };
+        env.framer.begin();
+        let header = env
+            .framer
+            .has_header()
+            .then(|| Self::section_object(env.framer.header_fields(doc), None));
+        // Outer framing between document objects: `[\n` / `,\n` (array) or a
+        // newline separator (ndjson).
+        match self.config.format {
+            JsonOutputMode::Array => {
+                if env.docs_written == 0 {
+                    self.writer.write_all(b"[\n").map_err(FormatError::Io)?;
+                } else {
+                    self.writer.write_all(b",\n").map_err(FormatError::Io)?;
+                }
+            }
+            JsonOutputMode::Ndjson => {
+                if env.docs_written > 0 {
+                    self.writer.write_all(b"\n").map_err(FormatError::Io)?;
+                }
+            }
+        }
+        // Open the document object, emit the optional header, open the body
+        // array. The body's records stream in via `write_record`.
+        self.writer.write_all(b"{").map_err(FormatError::Io)?;
+        if let Some(header) = header {
+            let s = self.serialize_value(&header)?;
+            self.writer
+                .write_all(b"\"header\":")
+                .map_err(FormatError::Io)?;
+            self.writer
+                .write_all(s.as_bytes())
+                .map_err(FormatError::Io)?;
+            self.writer.write_all(b",").map_err(FormatError::Io)?;
+        }
+        self.writer
+            .write_all(b"\"body\":[")
+            .map_err(FormatError::Io)?;
+        // Re-borrow to reset the body counter (the `header` build dropped the
+        // earlier mutable borrow).
+        if let Some(env) = self.envelope.as_mut() {
+            env.body_in_doc = 0;
+            env.doc_open = true;
+        }
+        Ok(())
+    }
+
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        if self.envelope.as_ref().is_none_or(|e| !e.doc_open) {
+            return Ok(());
+        }
+        // Close the body array.
+        self.writer.write_all(b"]").map_err(FormatError::Io)?;
+        // Emit the optional footer (section fields + computed count).
+        let footer = {
+            let env = self
+                .envelope
+                .as_ref()
+                .expect("doc_open implies an envelope state");
+            env.framer.has_footer().then(|| {
+                Self::section_object(env.framer.footer_fields(doc), env.framer.footer_count())
+            })
+        };
+        if let Some(footer) = footer {
+            let s = self.serialize_value(&footer)?;
+            self.writer
+                .write_all(b",\"footer\":")
+                .map_err(FormatError::Io)?;
+            self.writer
+                .write_all(s.as_bytes())
+                .map_err(FormatError::Io)?;
+        }
+        // Close the document object.
+        self.writer.write_all(b"}").map_err(FormatError::Io)?;
+        if let Some(env) = self.envelope.as_mut() {
+            env.docs_written += 1;
+            env.doc_open = false;
+        }
         Ok(())
     }
 }
@@ -346,5 +546,122 @@ mod tests {
         assert_eq!(r1.get("active"), Some(&Value::Bool(true)));
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
         assert_eq!(r2.get("age"), Some(&Value::Integer(25)));
+    }
+
+    use clinker_record::{DocumentContext, DocumentId};
+    use indexmap::IndexMap;
+
+    fn doc_with_sections(sections: &[(&str, &[(&str, Value)])]) -> Arc<DocumentContext> {
+        let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
+        for (name, fields) in sections {
+            let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
+            for (k, v) in *fields {
+                inner.insert(Box::from(*k), v.clone());
+            }
+            map.insert(Box::from(*name), Value::Map(Box::new(inner)));
+        }
+        Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            std::sync::Arc::from("f.json"),
+            map,
+        ))
+    }
+
+    fn amount_record(schema: &Arc<Schema>, n: i64) -> Record {
+        Record::new(Arc::clone(schema), vec![Value::Integer(n)])
+    }
+
+    #[test]
+    fn json_envelope_array_mode_frames_each_document_as_an_object() {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Array,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc_a = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("A".into()))]),
+            ("Foot", &[("checksum", Value::String("SUM-A".into()))]),
+        ]);
+        let doc_b = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("B".into()))]),
+            ("Foot", &[("checksum", Value::String("SUM-B".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc_a).unwrap();
+            w.write_record(&amount_record(&schema, 10)).unwrap();
+            w.write_record(&amount_record(&schema, 20)).unwrap();
+            w.end_document(&doc_a).unwrap();
+            w.begin_document(&doc_b).unwrap();
+            w.write_record(&amount_record(&schema, 30)).unwrap();
+            w.end_document(&doc_b).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        // Valid JSON: an outer array of two document objects.
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON array");
+        let arr = parsed.as_array().expect("outer array");
+        assert_eq!(arr.len(), 2, "one object per document: {out}");
+        assert_eq!(arr[0]["header"]["batch_id"], "A");
+        assert_eq!(
+            arr[0]["body"],
+            serde_json::json!([{"amount":10},{"amount":20}])
+        );
+        assert_eq!(arr[0]["footer"]["checksum"], "SUM-A");
+        assert_eq!(arr[0]["footer"]["count"], 2);
+        assert_eq!(arr[1]["header"]["batch_id"], "B");
+        assert_eq!(arr[1]["footer"]["count"], 1, "count resets per document");
+    }
+
+    #[test]
+    fn json_envelope_ndjson_mode_one_document_object_per_line() {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc_a = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
+        let doc_b = doc_with_sections(&[("Head", &[("batch_id", Value::String("B".into()))])]);
+        let mut buf = Vec::new();
+        {
+            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc_a).unwrap();
+            w.write_record(&amount_record(&schema, 10)).unwrap();
+            w.end_document(&doc_a).unwrap();
+            w.begin_document(&doc_b).unwrap();
+            w.write_record(&amount_record(&schema, 20)).unwrap();
+            w.end_document(&doc_b).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one document object per line: {out}");
+        let d0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(d0["header"]["batch_id"], "A");
+        assert_eq!(d0["body"], serde_json::json!([{"amount":10}]));
+    }
+
+    #[test]
+    fn json_envelope_off_is_byte_identical() {
+        // No envelope spec: array framing is the plain whole-stream array.
+        let schema = test_schema();
+        let records = vec![make_record(&schema, "Alice", 30, true)];
+        let baseline = write_records(JsonWriterConfig::default(), &records, &schema);
+        let parsed: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        assert!(
+            parsed.as_array().unwrap()[0]["body"].is_null(),
+            "no per-doc body key"
+        );
+        assert_eq!(parsed.as_array().unwrap()[0]["name"], "Alice");
     }
 }

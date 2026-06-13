@@ -220,6 +220,22 @@ impl DocumentContext {
             _ => None,
         }
     }
+
+    /// Borrow a whole section's ordered field map by name, for an output
+    /// writer reconstructing a per-document header/footer that echoes every
+    /// field of a `$doc` section in declared order.
+    ///
+    /// Returns `None` when the section is undeclared on this document or its
+    /// payload is not a [`Value::Map`] (the envelope config schema is always
+    /// `fields:`-shaped, so a non-Map payload means the reader emitted an
+    /// unexpected shape). The borrow is O(1) — no field is cloned; the writer
+    /// iterates the returned map in insertion order.
+    pub fn section_fields(&self, section: &str) -> Option<&IndexMap<Box<str>, Value>> {
+        match self.sections.get(section)? {
+            Value::Map(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 // ── Spill codec ─────────────────────────────────────────────────────────────

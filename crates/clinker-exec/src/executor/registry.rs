@@ -213,17 +213,45 @@ fn extract_output_field_defs(
 /// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
 /// and subsequent calls replay the captured header via `write_preset_header`.
 /// For fixed-width, the factory captures pre-resolved `FieldDef`s from the output schema.
+/// Map the plan's `OutputEnvelopeConfig` onto the format-local
+/// `OutputEnvelopeSpec` the writers consume, but only when the Output declares
+/// `reconstruct_envelope: true`. Returns `None` (no framing) when the flag is
+/// off, no envelope config is declared, or the declared config is empty — so
+/// the flag-off path stays byte-identical.
+fn resolve_envelope_spec(
+    reconstruct_envelope: bool,
+    cfg: Option<&clinker_plan::config::OutputEnvelopeConfig>,
+) -> Option<clinker_format::OutputEnvelopeSpec> {
+    if !reconstruct_envelope {
+        return None;
+    }
+    let cfg = cfg?;
+    if cfg.is_empty() {
+        return None;
+    }
+    Some(clinker_format::OutputEnvelopeSpec {
+        header_from_doc: cfg.header_from_doc.clone(),
+        footer_from_doc: cfg.footer_from_doc.clone(),
+        footer_record_count_field: cfg.footer_record_count_field.clone(),
+    })
+}
+
 fn build_writer_factory(
     format: &OutputFormat,
     include_header: Option<bool>,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
     include_engine_stamped: bool,
+    reconstruct_envelope: bool,
 ) -> WriterFactory {
     match format {
         OutputFormat::Csv(opts) => {
             let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header);
             csv_config.include_engine_stamped = include_engine_stamped;
+            csv_config.envelope = resolve_envelope_spec(
+                reconstruct_envelope,
+                opts.as_ref().and_then(|o| o.envelope.as_ref()),
+            );
             if repeat_header {
                 let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
                 let call_count = Arc::new(AtomicU32::new(0));
@@ -260,6 +288,10 @@ fn build_writer_factory(
         OutputFormat::Json(opts) => {
             let mut json_config = build_json_writer_config(opts.as_ref());
             json_config.include_engine_stamped = include_engine_stamped;
+            json_config.envelope = resolve_envelope_spec(
+                reconstruct_envelope,
+                opts.as_ref().and_then(|o| o.envelope.as_ref()),
+            );
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(JsonWriter::new(
                     counting_writer,
@@ -271,6 +303,10 @@ fn build_writer_factory(
         OutputFormat::Xml(opts) => {
             let mut xml_config = build_xml_writer_config(opts.as_ref());
             xml_config.include_engine_stamped = include_engine_stamped;
+            xml_config.envelope = resolve_envelope_spec(
+                reconstruct_envelope,
+                opts.as_ref().and_then(|o| o.envelope.as_ref()),
+            );
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(XmlWriter::new(
                     counting_writer,
@@ -280,7 +316,11 @@ fn build_writer_factory(
             })
         }
         OutputFormat::FixedWidth(opts) => {
-            let fw_config = build_fw_writer_config(opts.as_ref());
+            let mut fw_config = build_fw_writer_config(opts.as_ref());
+            fw_config.envelope = resolve_envelope_spec(
+                reconstruct_envelope,
+                opts.as_ref().and_then(|o| o.envelope.as_ref()),
+            );
             let fields = field_defs.expect(
                 "fixed-width writer factory requires field_defs — \
                  build_format_writer must validate schema before calling",
@@ -370,6 +410,7 @@ pub(crate) fn build_format_writer(
         repeat_header,
         field_defs,
         output.include_correlation_keys,
+        output.reconstruct_envelope,
     );
 
     if let Some(ref split) = output.split {
