@@ -237,6 +237,17 @@ impl PipelineConfig {
         self.source_bodies().any(|b| b.correlation_key.is_some())
     }
 
+    /// Whether any source declares `dlq_granularity: document`. Drives the
+    /// runtime document-DLQ buffer setup and gates the streaming fast-paths
+    /// off pipeline-wide, mirroring `any_source_has_correlation_key` —
+    /// per-document buffering at the Output arm needs the materialized
+    /// `DocumentClose` punctuation the streaming-Output / streaming-ingest
+    /// short-circuits would otherwise consume out of band.
+    pub fn any_source_has_document_dlq(&self) -> bool {
+        self.source_configs()
+            .any(|s| s.dlq_granularity == DlqGranularity::Document)
+    }
+
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
@@ -3037,6 +3048,37 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                  remove the `split` block or choose a splittable format",
                 name = output.name,
             )));
+        }
+    }
+
+    // Document-level DLQ cannot coexist with per-source-file fan-out output.
+    // Under `dlq_granularity: document` the engine buffers each document and
+    // decides flush-vs-reject at its boundary, opening ONE writer for the
+    // Output; a per-source-file fan-out (`{source_file}` / `{source_path}`
+    // in the path template over a multi-file source) instead routes each
+    // record to a writer keyed by its own file. The two writer models are
+    // mutually exclusive — a buffered-then-flushed document cannot also be
+    // streamed per-record to a file-keyed writer — so reject the
+    // combination up front rather than silently dropping every clean
+    // document (the fan-out writer registry is keyed differently than the
+    // single writer the document buffer flushes to).
+    if config.any_source_has_document_dlq() {
+        for output in config.output_configs() {
+            let Ok(template) = crate::config::path_template::PathTemplate::parse(&output.path)
+            else {
+                continue;
+            };
+            if template.has_per_record_tokens() {
+                return Err(ConfigError::Validation(format!(
+                    "[E343] output '{name}': a per-source-file output template \
+                     (`{{source_file}}` / `{{source_path}}`) cannot be combined with a \
+                     source declaring `dlq_granularity: document` — document-level \
+                     dead-lettering buffers each document and flushes it to a single \
+                     writer, which is incompatible with per-record file fan-out; use a \
+                     single output path, or set `dlq_granularity: record`",
+                    name = output.name,
+                )));
+            }
         }
     }
 

@@ -456,6 +456,7 @@ mod tests {
             files: None,
             watermark: None,
             envelope: None,
+            dlq_granularity: crate::config::DlqGranularity::Record,
             declared_doc_paths: Vec::new(),
             schema: None,
             schema_overrides: None,

@@ -84,6 +84,7 @@
 //! | `E340`      | error    | A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time |
 //! | `E341`      | error    | A `$doc.<section>.<field>` access names an envelope section or field a feeding XML/JSON source does not declare |
 //! | `E342`      | error    | `swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope) |
+//! | `E343`      | error    | A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out) |
 
 use crate::span::{FileId, Span};
 

@@ -27,6 +27,17 @@ pub enum DlqErrorCategory {
     /// One entry per group with `trigger: true` plus collaterals for the
     /// other buffered records of the same group.
     GroupSizeExceeded,
+    /// Collateral entry emitted for a non-failing record in a document the
+    /// engine dead-lettered because some other record (or, in a later
+    /// build, an envelope/checksum validation) failed under a source's
+    /// `dlq_granularity: document` policy. The sibling root-cause entry
+    /// carries `trigger: true` and the original failure category; every
+    /// other record of the same document carries `trigger: false` and this
+    /// category. Each collateral counts toward the DLQ rate denominator —
+    /// a rejected N-record document contributes N entries — mirroring the
+    /// `Correlated` collateral precedent. Emitted only by the per-document
+    /// reject path in the Output dispatch arm.
+    DocumentRejected,
     /// Record arrived at a time-windowed aggregate after the window
     /// covering its event-time had already closed
     /// (`window_end + allowed_lateness < min_across_sources`). Routed
@@ -76,6 +87,7 @@ impl DlqErrorCategory {
             Self::AggregateFinalize => "aggregate_finalize",
             Self::Correlated => "correlated",
             Self::GroupSizeExceeded => "group_size_exceeded",
+            Self::DocumentRejected => "document_rejected",
             Self::LateRecord => "late_record",
             Self::ExpansionLimitExceeded => "expansion_limit_exceeded",
             Self::CombineOutputRow => "combine_output_row",
@@ -142,6 +154,10 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::GroupSizeExceeded.as_str(),
             "group_size_exceeded"
+        );
+        assert_eq!(
+            DlqErrorCategory::DocumentRejected.as_str(),
+            "document_rejected"
         );
         assert_eq!(DlqErrorCategory::LateRecord.as_str(), "late_record");
         assert_eq!(

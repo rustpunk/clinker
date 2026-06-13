@@ -184,10 +184,26 @@ pub(crate) fn dispatch_route(
                         stage.clone(),
                         None,
                     );
-                    if !routed {
+                    let triggering_field = route_err.triggering_field.clone();
+                    let triggering_value = route_err.triggering_value();
+                    // Under `dlq_granularity: document`, a route-eval failure
+                    // condemns the whole document — mark it failed (capturing
+                    // this record as the root cause) so the Output emits the
+                    // trigger + collateral entries at the document's close.
+                    let marked = !routed
+                        && crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
+                            ctx,
+                            &record,
+                            rn,
+                            clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            route_err.to_string(),
+                            stage.clone(),
+                            None,
+                            triggering_field.clone(),
+                            triggering_value.clone(),
+                        );
+                    if !routed && !marked {
                         let source_name = source_name_arc_of(&record);
-                        let triggering_field = route_err.triggering_field.clone();
-                        let triggering_value = route_err.triggering_value();
                         push_dlq(
                             ctx,
                             DlqEntry {

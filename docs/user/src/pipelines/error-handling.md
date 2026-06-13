@@ -90,6 +90,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `aggregate_finalize` | An aggregate function failed during finalization |
 | `correlated` | A non-failing record was DLQ'd as collateral because another record in its correlation group failed |
 | `group_size_exceeded` | A correlation-key group exceeded the configured `max_group_buffer` limit |
+| `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
 | `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` / `best_effort` across every Combine join mode; `fail_fast` propagates the eval error |
@@ -135,6 +136,41 @@ Limit the number of records buffered per correlation group:
 ```
 
 Groups exceeding this limit are DLQ'd entirely with a `group_size_exceeded` summary entry.
+
+### Document-level DLQ
+
+By default a record failure dead-letters only that record (`dlq_granularity: record`). A source can instead reject the **entire document** any record of which fails, by declaring the granularity per source:
+
+```yaml
+nodes:
+  - type: source
+    name: claims
+    config:
+      name: claims
+      type: x12
+      glob: ./claims/*.edi
+      dlq_granularity: document   # record (default) | document
+```
+
+Under `dlq_granularity: document` and the `continue` / `best_effort` strategies, when any record of a document fails:
+
+- the failing record becomes the **root-cause** DLQ entry (`_cxl_dlq_trigger = true`, carrying its original error category);
+- every other record of the same document becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`);
+- **no** record of that document reaches the success sink.
+
+Clean documents in the same run stream through untouched, and records from sibling sources still on the default `record` granularity keep per-record semantics — the policy is per source.
+
+This is the document-shaped analogue of [correlation keys](#correlation-key): use it when partial processing of a document (an EDI interchange, a batch file with a header/trailer) is worse than rejecting the whole document. Unlike correlation keys, which group across files by a key value, document-level DLQ scopes rejection to a single document's records.
+
+**Document grain.** The document is the **outermost** level — the source file. For a flat format (CSV, JSON, plain XML) each input file is one document. For a nested-envelope format (an X12 `ISA → GS → ST` interchange, an EDIFACT `UNB → UNG → UNH`) the document is the whole **interchange / file**, not an inner functional group or transaction set: a failure anywhere in the interchange rejects the entire interchange, including the transaction sets that validated cleanly. Reject the inner-level grain instead by partitioning the input so each interchange is its own file is not currently offered — the grain is fixed at the file.
+
+**DLQ rate.** Every emitted entry — the trigger and each collateral — counts toward the DLQ-rate denominator the [type error threshold](#type-error-threshold) circuit breaker measures, matching the correlated-collateral precedent. A rejected 1000-record document contributes 1000 entries, so size any `type_error_threshold` with whole-document rejection in mind.
+
+**Memory.** The engine buffers each open document's records until its boundary, then flushes the document clean to the sink or rejects it and drops the buffer. Peak memory scales with the **concurrently-open** documents, not the total input; a single very large document spills its buffer to disk under the run's memory budget rather than holding everything in RAM. See [Streaming vs blocking](../ops/streaming-vs-blocking.md) for the spill model.
+
+**Output restriction.** Document-level DLQ flushes each whole document to a single output writer, so it cannot be combined with a [per-source-file output](../nodes/output.md) (a `{source_file}` / `{source_path}` path template over a multi-file source). The two are rejected together at compile time (E343); use a single output path, or set `dlq_granularity: record` if per-file output is the requirement.
+
+**Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
 
 ## Exit codes
 

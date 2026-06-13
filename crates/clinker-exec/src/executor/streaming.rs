@@ -63,7 +63,11 @@ pub(super) fn compute_streaming_output_specs(
 
     // Pipeline-wide correlation buffering disables streaming for every
     // Output — the CorrelationCommit terminal owns the actual writes.
-    if config.any_source_has_correlation_key() {
+    // Document-level DLQ disables it for the same structural reason: the
+    // per-document Output buffer flushes or rejects each document at its
+    // materialized `DocumentClose`, which a streaming-Output thread would
+    // consume out of band before the buffer could decide the document.
+    if config.any_source_has_correlation_key() || config.any_source_has_document_dlq() {
         return Vec::new();
     }
 
