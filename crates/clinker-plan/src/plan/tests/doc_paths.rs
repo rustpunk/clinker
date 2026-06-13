@@ -444,8 +444,16 @@ fn test_segment_format_out_of_range_positional_element_aborts_with_e348() {
 
 #[test]
 fn test_segment_format_in_range_positional_element_compiles() {
-    // `e32` is exactly at the X12 default `max_elements` of 32 — the
-    // last reachable element, so it must compile (boundary check).
+    // `e32` is exactly at the X12 default `max_elements` of 32 — the body
+    // segment's element ceiling, so it must compile (boundary check).
+    //
+    // NOTE: this exercises the LOOSE body-segment bound, not a tight
+    // per-segment guarantee. A real `ST` transaction-set header carries
+    // only ~3 elements, so `$doc.transaction_set.e32` would resolve null at
+    // run time — yet it compiles, because the precise per-segment header
+    // arity is not known at plan time (and the reader itself caps only the
+    // body element count). Tightening to per-segment arity is tracked at
+    // https://github.com/rustpunk/clinker/issues/558.
     compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.e32")
         .expect("the boundary positional element must compile");
 }

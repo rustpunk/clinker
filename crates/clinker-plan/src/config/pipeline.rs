@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::yaml::Spanned;
+// Default `fNN`/`eNN` ceilings each reader enforces, referenced by the HL7
+// split-field reachability check and the `$doc` positional-bound validation
+// so the planner's bounds cannot drift from the reader's own constants.
+use clinker_format::HL7_DEFAULT_MAX_FIELDS;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -889,55 +893,63 @@ impl PipelineConfig {
         // doc paths against the source(s) feeding that Output, so the reader
         // retains the section. The reader extracts the whole declared section
         // once any of its fields is wanted, so one path per declared field is
-        // sufficient (and passes the E341 closed-schema check, since each
-        // field is real). A header/footer naming an undeclared section is
-        // rejected separately by E346 below, so an absent section here is fine.
-        {
-            let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
-                .iter()
-                .map(|s| (s.name.as_str(), s))
-                .collect();
-            for output in self.output_configs() {
-                if !output.reconstruct_envelope {
-                    continue;
-                }
-                let Some((env_cfg, _)) = generic_output_envelope(&output.format) else {
+        // sufficient.
+        //
+        // These registered paths drive the reader's path-pruned extraction
+        // (consumed at the `declared_doc_paths` stamp below); they do NOT
+        // flow through the `doc_schema_for` / E341/E348 validation pass,
+        // which iterates `doc_path_set.by_node` (the CXL `$doc.*` refs) and
+        // never sees this register map. A header/footer naming an undeclared
+        // section is rejected separately by E346 below, so an absent section
+        // here is fine.
+        //
+        // `source_by_name` is shared by this register block and the
+        // E341/E348/E349 validation pass below — one index over the source
+        // configs serves both.
+        let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+        for output in self.output_configs() {
+            if !output.reconstruct_envelope {
+                continue;
+            }
+            let Some((env_cfg, _)) = generic_output_envelope(&output.format) else {
+                continue;
+            };
+            let sections: Vec<&str> = [
+                env_cfg.header_from_doc.as_deref(),
+                env_cfg.footer_from_doc.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if sections.is_empty() {
+                continue;
+            }
+            let Some(feeding) = node_sources.get(&output.name) else {
+                continue;
+            };
+            for source_name in feeding {
+                let Some(source) = source_by_name.get(source_name.as_str()) else {
                     continue;
                 };
-                let sections: Vec<&str> = [
-                    env_cfg.header_from_doc.as_deref(),
-                    env_cfg.footer_from_doc.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                if sections.is_empty() {
-                    continue;
-                }
-                let Some(feeding) = node_sources.get(&output.name) else {
+                let Some(envelope) = source.envelope.as_ref() else {
                     continue;
                 };
-                for source_name in feeding {
-                    let Some(source) = source_by_name.get(source_name.as_str()) else {
+                let paths = declared_doc_paths.entry(source_name.clone()).or_default();
+                for section_name in &sections {
+                    let Some(section) = envelope.sections.get(*section_name) else {
                         continue;
                     };
-                    let Some(envelope) = source.envelope.as_ref() else {
-                        continue;
-                    };
-                    let paths = declared_doc_paths.entry(source_name.clone()).or_default();
-                    for section_name in &sections {
-                        let Some(section) = envelope.sections.get(*section_name) else {
-                            continue;
+                    for field in section.fields.keys() {
+                        let path = cxl::analyzer::doc_paths::DocPath {
+                            section: Box::from(*section_name),
+                            field: Box::from(field.as_str()),
+                            indices: Vec::new(),
                         };
-                        for field in section.fields.keys() {
-                            let path = cxl::analyzer::doc_paths::DocPath {
-                                section: Box::from(*section_name),
-                                field: Box::from(field.as_str()),
-                                indices: Vec::new(),
-                            };
-                            if !paths.contains(&path) {
-                                paths.push(path);
-                            }
+                        if !paths.contains(&path) {
+                            paths.push(path);
                         }
                     }
                 }
@@ -965,9 +977,14 @@ impl PipelineConfig {
         //   positional element is caught without false-positiving on a
         //   legitimate wire path.
         // - Unvalidated: CSV, fixed-width, SWIFT (see `doc_schema_for`).
-        let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+        //
+        // `doc_schema_for` is keyed once per source here, not rebuilt on
+        // every (path × node × source) iteration of the loop below — a
+        // `SegmentPositional` schema allocates its synthesized-section
+        // vector, so recomputing it per reference would be wasteful.
+        let doc_schema_by_source: HashMap<&str, DocSchema> = source_configs
             .iter()
-            .map(|s| (s.name.as_str(), s))
+            .map(|s| (s.name.as_str(), doc_schema_for(s)))
             .collect();
         // E349 — a `rest` source that declares an `envelope:` block. The
         // declaration is always inert (a REST pull buffers no document), so
@@ -1026,12 +1043,12 @@ impl PipelineConfig {
                         diags.push(rest_doc_access_diagnostic(&source.name, doc_path, primary));
                         continue;
                     }
-                    let problem = match doc_schema_for(source) {
-                        DocSchema::Closed => closed_doc_path_problem(source, doc_path),
-                        DocSchema::SegmentPositional(schema) => {
-                            segment_positional_doc_path_problem(source, &schema, doc_path)
+                    let problem = match doc_schema_by_source.get(source_name.as_str()) {
+                        Some(DocSchema::Closed) => closed_doc_path_problem(source, doc_path),
+                        Some(DocSchema::SegmentPositional(schema)) => {
+                            segment_positional_doc_path_problem(source, schema, doc_path)
                         }
-                        DocSchema::Unvalidated => None,
+                        Some(DocSchema::Unvalidated) | None => None,
                     };
                     let Some(problem) = problem else {
                         continue;
@@ -2423,10 +2440,21 @@ struct SegmentPositionalSchema {
     /// Positional field-name prefix: `e` for X12/EDIFACT element columns
     /// (`e01`…), `f` for HL7 field columns (`f01`…).
     positional_prefix: char,
-    /// 1-based upper bound on a positional element/field, mirroring the
-    /// reader's `max_elements` / `max_fields` (a segment carrying more is
-    /// rejected at read time, so a `$doc` reference past it can never
-    /// resolve).
+    /// 1-based upper bound on a positional element/field, set to the
+    /// reader's body-segment ceiling (`max_elements` / `max_fields`).
+    ///
+    /// This is a LOOSE bound, not a tight per-segment guarantee. The
+    /// synthesized nested levels are keyed by the *header* segment's actual
+    /// arity (an X12 `ST` carries ~3 elements, a `GS` ~8; an HL7 `MSH`/`BHS`
+    /// likewise has a fixed-ish field count), but that precise per-segment
+    /// arity is not known at plan time — and the readers themselves do not
+    /// enforce it (they cap only the body-segment element/field count). So
+    /// positional validation catches an unknown section name and a
+    /// grossly-out-of-range element (past the body max), but a mid-range
+    /// positional typo on a short header segment — e.g. `$doc.transaction_set.e20`
+    /// on a 3-element `ST` — passes here and still resolves null at run
+    /// time. Tightening to per-segment arity is tracked as a follow-up
+    /// (see `doc_schema_for`).
     max_positional: usize,
 }
 
@@ -2449,12 +2477,14 @@ enum SynthesizedFields {
     /// `set_section.fields`). The reader coerces and serves ONLY these
     /// fields, so the section is closed to them — an undeclared name (even
     /// an in-range positional one) resolves null.
+    ///
+    /// Owned `Vec<String>` rather than a borrow of the source's `IndexMap`:
+    /// the `DocSchema` is cached once per source and a borrow would thread a
+    /// lifetime through the cache and every helper signature, for a linear
+    /// scan over a handful of declared field names. Membership is checked
+    /// with `.iter().any(..)` — O(declared fields), trivially small.
     Declared(Vec<String>),
 }
-
-/// Default `eNN` element count for X12 and EDIFACT when `max_elements` is
-/// unset, matching each reader's `DEFAULT_MAX_ELEMENTS`.
-const EDI_DEFAULT_MAX_ELEMENTS: usize = 32;
 
 /// Build a synthesized nested section from an optional user-declared nested
 /// schema: a declared schema closes the section to its declared field
@@ -2478,6 +2508,12 @@ fn synthesized_section(
 /// Classify how a source's `$doc` references are validated, from its
 /// format. The REST transport is checked by the caller before this is
 /// consulted, so this maps purely on `InputFormat`.
+///
+/// The positional bound is the reader's body-segment ceiling, not the
+/// header segment's precise arity (see [`SegmentPositionalSchema`]). A
+/// tighter per-segment-arity bound — to catch a mid-range positional typo
+/// on a short header segment — is tracked at
+/// <https://github.com/rustpunk/clinker/issues/558>.
 fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
     match &source.format {
         InputFormat::Xml(_) | InputFormat::Json(_) => DocSchema::Closed,
@@ -2497,7 +2533,7 @@ fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
                 positional_prefix: 'e',
                 max_positional: opts
                     .and_then(|o| o.max_elements)
-                    .unwrap_or(EDI_DEFAULT_MAX_ELEMENTS),
+                    .unwrap_or(clinker_format::X12_DEFAULT_MAX_ELEMENTS),
             })
         }
         InputFormat::Edifact(opts) => DocSchema::SegmentPositional(SegmentPositionalSchema {
@@ -2509,7 +2545,7 @@ fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
             max_positional: opts
                 .as_ref()
                 .and_then(|o| o.max_elements)
-                .unwrap_or(EDI_DEFAULT_MAX_ELEMENTS),
+                .unwrap_or(clinker_format::EDIFACT_DEFAULT_MAX_ELEMENTS),
         }),
         InputFormat::Hl7(opts) => DocSchema::SegmentPositional(SegmentPositionalSchema {
             // HL7's `batch` (BHS) and `transaction_set` (MSH) levels always
@@ -4020,11 +4056,6 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
 
     Ok(())
 }
-
-/// Default `fNN` column count for an HL7 source when `max_fields` is unset,
-/// matching the reader's documented default. A split field must name a
-/// position within this range to be reachable.
-const HL7_DEFAULT_MAX_FIELDS: usize = 64;
 
 /// Validate an HL7 source's `split_fields` declarations: each names a
 /// reachable positional field (`fNN`, `1 <= N <= max_fields`) with at least

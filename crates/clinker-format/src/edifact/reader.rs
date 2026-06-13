@@ -31,7 +31,11 @@ use crate::traits::FormatReader;
 /// Default ceiling on the number of positional element columns the
 /// record schema exposes. A segment carrying more data elements than
 /// this errors with guidance rather than silently truncating.
-const DEFAULT_MAX_ELEMENTS: usize = 32;
+///
+/// Public so the planner's `$doc` positional-element validation can bound
+/// against the same ceiling the reader enforces, rather than duplicating
+/// the literal (which would silently drift if either changed).
+pub const DEFAULT_MAX_ELEMENTS: usize = 32;
 
 /// Configuration for the EDIFACT reader.
 pub struct EdifactReaderConfig {
