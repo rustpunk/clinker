@@ -112,6 +112,34 @@ pub enum EnvelopeExtract {
     Segment(String),
 }
 
+/// A user-declared section for a *nested* envelope level that has no
+/// pre-scan declaration point.
+///
+/// The file-level envelope (X12 `ISA`, EDIFACT `UNB`, HL7 `FHS`) is
+/// declared through [`EnvelopeSection`] before body streaming, because a
+/// bounded header pre-scan resolves it. The nested tiers — X12's `GS`
+/// functional group and `ST` transaction set — exist only mid-file, so a
+/// reader cannot resolve them at pre-scan time and instead names them when
+/// it crosses each boundary. This carries the author's chosen section
+/// name and the typed `fields` schema the reader coerces the level's
+/// positional elements into, so `$doc.<name>.<field>` exposes typed,
+/// addressable fields instead of untyped positional `eNN` strings. The
+/// `extract` rule is implied by the level (the GS or ST segment), so only
+/// the name and field schema are declared.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NestedEnvelopeSection {
+    /// The section name `$doc.<name>.<field>` resolves under for this
+    /// level. User-chosen — the engine reserves none.
+    pub name: String,
+    /// Typed field schema, keyed by the level's positional element name
+    /// (`e01`, `e02`, …). Drives the runtime coercion of each declared
+    /// element to its type; undeclared elements are dropped from the
+    /// typed view (the section schema is the contract).
+    #[serde(default)]
+    pub fields: IndexMap<String, EnvelopeFieldType>,
+}
+
 /// Field type vocabulary mirrored from CXL's typechecker — small
 /// closed set sufficient for envelope-section authoring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
