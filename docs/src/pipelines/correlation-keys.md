@@ -407,6 +407,6 @@ To investigate DLQ collaterals: every collateral entry's `category` is `correlat
 ## See also
 
 - [Error Handling & DLQ](error-handling.md) -- general DLQ configuration, fail-fast vs continue, type-error thresholds.
-- [Aggregate Nodes](aggregate.md) -- group-by semantics and the strategy hint.
-- [Combine Nodes](combine.md) -- driver selection and match modes.
-- [Output Nodes](output.md) -- `include_correlation_keys` and other field-control flags.
+- [Aggregate Nodes](../nodes/aggregate.md) -- group-by semantics and the strategy hint.
+- [Combine Nodes](../nodes/combine.md) -- driver selection and match modes.
+- [Output Nodes](../nodes/output.md) -- `include_correlation_keys` and other field-control flags.

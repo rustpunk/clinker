@@ -118,7 +118,7 @@ If a single input record's `emit each` block produces more than `max_expansion` 
 - **Lower** (e.g. `100`, `1000`) when input arrays are bounded by a known business rule and you want hostile or malformed input to surface as a DLQ entry rather than as a flood of downstream records.
 - **Higher** (e.g. `100000`, `1000000`) when legitimate input carries large arrays -- for example, an order with a long line-item list or an event carrying a per-second pricing curve.
 
-The DLQ category `expansion_limit_exceeded` is distinct from generic CXL evaluation failures, so DLQ-side filters and metrics can target expansion runaway specifically. See [Error Handling & DLQ](error-handling.md) for the wider DLQ contract.
+The DLQ category `expansion_limit_exceeded` is distinct from generic CXL evaluation failures, so DLQ-side filters and metrics can target expansion runaway specifically. See [Error Handling & DLQ](../pipelines/error-handling.md) for the wider DLQ contract.
 
 ## Batch size (`batch_size`)
 

@@ -8,7 +8,7 @@ The pieces involved:
 - [Array methods](../cxl/builtins-array.md) (`filter`, `map`) for in-place transformation.
 - Bracket-index access (`it["sku"]`) for reading fields off each map element.
 - [`emit each`](../cxl/emit-each.md) for fan-out.
-- The Output node's [`include_unmapped`](../pipeline/output.md#unmapped-input-field-passthrough) flag for controlling which fields reach the sink.
+- The Output node's [`include_unmapped`](../nodes/output.md#unmapped-input-field-passthrough) flag for controlling which fields reach the sink.
 
 ## Input data
 
@@ -126,7 +126,7 @@ Order O-1's three input items collapse to two output records (the `sku=c` line w
 
 **`include_unmapped: false`.** The default Output policy is to pass every unmapped input field through. Here we set it to `false` so the order-level `items` array (carried through from the source), the `item_count` projection, and the intermediate `kept` array (used only as the fan-out source) do not leak into the per-line output. The `exclude: [items, kept]` list provides a belt-and-suspenders defense against future renaming.
 
-**`max_expansion: 10000`.** Caps how many output records a single input order may produce. The default is `10000`; we set it explicitly here so the value is visible in the YAML. Orders with arrays larger than the cap route to the DLQ with category `expansion_limit_exceeded` (see [Transform Nodes -> Expansion Cap](../pipeline/transform.md#expansion-cap-max_expansion)).
+**`max_expansion: 10000`.** Caps how many output records a single input order may produce. The default is `10000`; we set it explicitly here so the value is visible in the YAML. Orders with arrays larger than the cap route to the DLQ with category `expansion_limit_exceeded` (see [Transform Nodes -> Expansion Cap](../nodes/transform.md#expansion-cap-max_expansion)).
 
 ## Variations
 
@@ -160,5 +160,5 @@ The first `set` overwrites the SKU of the first item; the second writes `ship.re
 - [Map Methods](../cxl/builtins-map.md) -- `keys`, `values`, `merge`, `set`, `remove_field`, `unset`.
 - [Nested Paths](../cxl/nested-paths.md) -- bracket-index and dotted-path navigation.
 - [Emit Each](../cxl/emit-each.md) -- the fan-out statement.
-- [Transform Nodes](../pipeline/transform.md) -- `max_expansion` and DLQ routing.
-- [Output Nodes](../pipeline/output.md) -- `include_unmapped` and field control.
+- [Transform Nodes](../nodes/transform.md) -- `max_expansion` and DLQ routing.
+- [Output Nodes](../nodes/output.md) -- `include_unmapped` and field control.

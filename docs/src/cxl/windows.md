@@ -249,4 +249,4 @@ This computes per-store running averages and totals over the partition's history
 
 When a window sits downstream of a relaxed-CK aggregate whose dropped correlation-key fields overlap the window's `group_by`, the planner switches the window from streaming-emit to buffer-mode. The window operator stores per-partition raw row buffers until commit; on retraction, it reruns the configured `$window.*` evaluation over `partition − retracted_rows` and emits per-output deltas through the replay phase.
 
-All 13 window functions are covered uniformly by wholesale recompute. The [operator-by-operator retraction cost reference](../pipeline/correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator memory ceilings; `clinker run --explain` reports the live per-window detail.
+All 13 window functions are covered uniformly by wholesale recompute. The [operator-by-operator retraction cost reference](../pipelines/correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator memory ceilings; `clinker run --explain` reports the live per-window detail.

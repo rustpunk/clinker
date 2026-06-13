@@ -14,7 +14,7 @@ Output nodes write processed records to files. They are the terminal nodes of a 
     path: "./output/result.csv"
 ```
 
-The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, or `hl7`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; the `hl7` writer re-emits HL7 v2 segments and optionally wraps them in batch/file envelopes. See [EDIFACT Format](edifact.md), [X12 Format](x12.md), and [HL7 v2 Format](hl7.md).
+The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, or `hl7`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; the `hl7` writer re-emits HL7 v2 segments and optionally wraps them in batch/file envelopes. See [EDIFACT Format](../formats/edifact.md), [X12 Format](../formats/x12.md), and [HL7 v2 Format](../formats/hl7.md).
 
 ## Field control
 
@@ -34,7 +34,7 @@ When `false`, only fields named by an `emit` statement in the upstream transform
 
 The default flipped from `false` to `true` in a recent release (see [issue #90](https://github.com/rustpunk/clinker/issues/90)). Pipelines that relied on the previous behavior -- where output records contained only the fields explicitly emitted upstream -- must now set `include_unmapped: false` explicitly to restore that shape.
 
-The flag composes independently with `include_correlation_keys: true` -- see below. See [Auto-Widen & Schema Drift -> Output controls](auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
+The flag composes independently with `include_correlation_keys: true` -- see below. See [Auto-Widen & Schema Drift -> Output controls](../formats/auto-widen.md#output-controls) for the full specification, cross-format flow examples, and the writer-rejection contract for `Value::Map` payloads.
 
 #### Worked example
 
@@ -59,7 +59,7 @@ With `include_unmapped: true` (the default), each output record carries `order_i
 
 When the pipeline declares `error_handling.correlation_key: <field>`, the engine adds shadow columns named `$ck.<field>` to the schema. These shadow columns preserve correlation-group identity through transforms that may rewrite the user-declared field. They are an internal engine namespace and are stripped from output by default.
 
-Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](correlation-keys.md) for the full lifecycle.
+Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](../pipelines/correlation-keys.md) for the full lifecycle.
 
 `include_correlation_keys` does **not** surface the `$widened` sidecar -- `include_unmapped` is the separate flag for that. The two are independent: each, both, or neither can be set.
 
@@ -67,7 +67,7 @@ Set `include_correlation_keys: true` to surface the shadow columns in the writer
 
 CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers refuse records carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. JSON serializes `Value::Map` natively as a nested object.
 
-The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
+The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`. See [Auto-Widen & Schema Drift -> Writer rejection](../formats/auto-widen.md#writer-rejection-of-valuemap-payloads) for the rejection contract and remediation routes.
 
 ### Field mapping
 
@@ -195,7 +195,7 @@ service character. The `UNB` header comes from `interchange` (literal
 elements) or `interchange_from_doc` (echoed from a `$doc` section). An
 interchange is a single envelope, so an `edifact` output cannot be
 combined with a `split:` block — the combination is rejected at
-config-validation time (`E323`). See [EDIFACT Format](edifact.md) for the
+config-validation time (`E323`). See [EDIFACT Format](../formats/edifact.md) for the
 full option reference, the record schema, and the round-trip semantics.
 
 ### HL7 v2
@@ -222,7 +222,7 @@ messages in an `FHS..FTS` file or `BHS..BTS` batch and recomputes the
 closing `BTS`/`FTS` counts. A batch/file envelope is a single structure, so
 an `hl7` output cannot be combined with a `split:` block — the combination
 is rejected at config-validation time (`E339`). See
-[HL7 v2 Format](hl7.md) for the full option reference, the record schema,
+[HL7 v2 Format](../formats/hl7.md) for the full option reference, the record schema,
 the MSH off-by-one, and the round-trip semantics.
 
 ## Sort order

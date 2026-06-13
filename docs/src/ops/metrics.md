@@ -102,7 +102,7 @@ orchestrator's counters: `groups_recomputed`, `partitions_dispatched`,
 `synthetic_ck_columns_emitted_total`, `synthetic_ck_fanout_lookups_total`,
 and `synthetic_ck_fanout_rows_expanded_total`. Every field is `0` on
 strict pipelines and on relaxed pipelines that never trigger a retraction.
-See [Correlation Keys](../pipeline/correlation-keys.md) for the underlying
+See [Correlation Keys](../pipelines/correlation-keys.md) for the underlying
 mechanism.
 
 ## Collecting metrics

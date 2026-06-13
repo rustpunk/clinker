@@ -142,6 +142,6 @@ processes files of any size under its memory ceiling.
 
 - [Key Concepts](concepts.md) -- understand the building blocks of Clinker
   pipelines
-- [Pipeline YAML Structure](../pipeline/structure.md) -- full reference for
+- [Pipeline YAML Structure](../pipelines/structure.md) -- full reference for
   pipeline configuration
 - [CXL Overview](../cxl/overview.md) -- learn the expression language in depth

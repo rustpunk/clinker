@@ -101,7 +101,7 @@ id,name,department,salary,level,salary_band
 
 **Match expressions.** The `match` block evaluates conditions top to bottom and returns the value of the first matching arm. The `_` wildcard is the default case and must appear last.
 
-**Error handling.** The `fail_fast` strategy aborts the pipeline on the first record error. For production pipelines processing dirty data, consider `dead_letter_queue` instead -- see [Error Handling & DLQ](../pipeline/error-handling.md).
+**Error handling.** The `fail_fast` strategy aborts the pipeline on the first record error. For production pipelines processing dirty data, consider `dead_letter_queue` instead -- see [Error Handling & DLQ](../pipelines/error-handling.md).
 
 ## Variations
 

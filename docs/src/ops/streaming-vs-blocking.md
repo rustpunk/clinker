@@ -27,7 +27,7 @@ Each of these requires the producer to feed exactly one downstream consumer and 
 
 - **Every `Output`**. A sink writes records to its configured writer and never buffers a whole stage.
 
-Document-boundary punctuations (`DocumentOpen` / `DocumentClose`, the signals behind [`$doc.*`](../pipeline/envelope-and-doc-context.md)) flow inline with records through streaming stages, preserving their order: a document's close always trails the document's last record, even when the document's records span several batches.
+Document-boundary punctuations (`DocumentOpen` / `DocumentClose`, the signals behind [`$doc.*`](../pipelines/envelope-and-doc-context.md)) flow inline with records through streaming stages, preserving their order: a document's close always trails the document's last record, even when the document's records span several batches.
 
 ### Streaming into an Aggregate
 
@@ -71,4 +71,4 @@ aggregation.dept_totals:
 
 ## Tuning the batch size
 
-The number of events handed downstream per batch is set by [`pipeline.batch_size`](memory.md#streaming-batch-size-batch_size) (default 2048), with an optional [per-transform override](../pipeline/transform.md#batch-size-batch_size). For a fused streaming stage — the only kind whose footprint *is* one batch — smaller batches lower its in-flight footprint at the cost of more per-batch bookkeeping; larger batches do the reverse. For the other streaming stages the batch size sets only the in-flight slice handed across the channel; the producer's own result is built in full regardless, so `batch_size` does not cap their footprint. The batch size changes only the memory *profile* of streaming handoffs — never their output, and never the behavior of blocking stages.
+The number of events handed downstream per batch is set by [`pipeline.batch_size`](memory.md#streaming-batch-size-batch_size) (default 2048), with an optional [per-transform override](../nodes/transform.md#batch-size-batch_size). For a fused streaming stage — the only kind whose footprint *is* one batch — smaller batches lower its in-flight footprint at the cost of more per-batch bookkeeping; larger batches do the reverse. For the other streaming stages the batch size sets only the in-flight slice handed across the channel; the producer's own result is built in full regardless, so `batch_size` does not cap their footprint. The batch size changes only the memory *profile* of streaming handoffs — never their output, and never the behavior of blocking stages.

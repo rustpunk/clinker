@@ -9,28 +9,39 @@
 - [Your First Pipeline](getting-started/first-pipeline.md)
 - [Key Concepts](getting-started/concepts.md)
 
-# Pipeline Reference
+# Pipelines
 
-- [Pipeline YAML Structure](pipeline/structure.md)
-- [Source Nodes](pipeline/source.md)
-- [EDIFACT Format](pipeline/edifact.md)
-- [X12 Format](pipeline/x12.md)
-- [HL7 v2 Format](pipeline/hl7.md)
-- [Network Sources (REST)](pipeline/source-network.md)
-- [Auto-Widen & Schema Drift](pipeline/auto-widen.md)
-- [Transform Nodes](pipeline/transform.md)
-- [Aggregate Nodes](pipeline/aggregate.md)
-- [Route Nodes](pipeline/route.md)
-- [Merge Nodes](pipeline/merge.md)
-- [Combine Nodes](pipeline/combine.md)
-- [Reshape Nodes](pipeline/reshape.md)
-- [Output Nodes](pipeline/output.md)
-- [Error Handling & DLQ](pipeline/error-handling.md)
-- [Correlation Keys](pipeline/correlation-keys.md)
-- [Pipeline Variables](pipeline/variables.md)
-- [Document Envelope Context](pipeline/envelope-and-doc-context.md)
-- [Channels](pipeline/channels.md)
-- [Compositions](pipeline/compositions.md)
+- [Pipeline YAML Structure](pipelines/structure.md)
+- [Pipeline Variables](pipelines/variables.md)
+- [Channels](pipelines/channels.md)
+- [Compositions](pipelines/compositions.md)
+- [Correlation Keys](pipelines/correlation-keys.md)
+- [Document Envelope Context](pipelines/envelope-and-doc-context.md)
+- [Error Handling & DLQ](pipelines/error-handling.md)
+
+# Nodes
+
+- [Node Taxonomy](nodes/index.md)
+- [Source Nodes](nodes/source.md)
+- [Transform Nodes](nodes/transform.md)
+- [Route Nodes](nodes/route.md)
+- [Merge Nodes](nodes/merge.md)
+- [Combine Nodes](nodes/combine.md)
+- [Aggregate Nodes](nodes/aggregate.md)
+- [Reshape Nodes](nodes/reshape.md)
+- [Output Nodes](nodes/output.md)
+
+# Source Formats
+
+- [CSV Format](formats/csv.md)
+- [JSON Format](formats/json.md)
+- [XML Format](formats/xml.md)
+- [Fixed-Width Format](formats/fixed-width.md)
+- [EDIFACT Format](formats/edifact.md)
+- [X12 Format](formats/x12.md)
+- [HL7 v2 Format](formats/hl7.md)
+- [Network Sources (REST)](formats/source-network.md)
+- [Auto-Widen & Schema Drift](formats/auto-widen.md)
 
 # CXL Language Guide
 

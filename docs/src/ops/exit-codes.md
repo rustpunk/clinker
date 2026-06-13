@@ -107,9 +107,9 @@ pipeline. The codes below cover the event-time watermark and
 time-windowed aggregate surface
 ([issue #61](https://github.com/rustpunk/clinker/issues/61));
 related code sets live in
-[Pipeline Variables](../pipeline/variables.md),
-[Channels](../pipeline/channels.md), and
-[Correlation Keys](../pipeline/correlation-keys.md).
+[Pipeline Variables](../pipelines/variables.md),
+[Channels](../pipelines/channels.md), and
+[Correlation Keys](../pipelines/correlation-keys.md).
 
 | Code | Trigger | Remediation |
 |------|---------|-------------|
@@ -117,8 +117,8 @@ related code sets live in
 | **E155** | A source declares `watermark.column: <col>` and the column exists, but its declared CXL type is not `date_time` or `date`. | Change the column's `type:` to `date_time` or `date`, or point `watermark.column` at a column that already has one of those types. |
 | **E156** | An aggregate declares `time_window:` but at least one upstream-reachable source does not declare `watermark.column`. | Add `watermark: { column: <event-time-column> }` to each listed source, or remove `time_window:` from the aggregate. Without a watermark on every upstream source, `min_across_sources` never advances past `None` and the window can never close. |
 
-See [Source Nodes → Watermarks](../pipeline/source.md#watermarks)
-and [Aggregate Nodes → Time-windowed aggregates](../pipeline/aggregate.md#time-windowed-aggregates)
+See [Source Nodes → Watermarks](../nodes/source.md#watermarks)
+and [Aggregate Nodes → Time-windowed aggregates](../nodes/aggregate.md#time-windowed-aggregates)
 for the field semantics each code is enforcing.
 
 ### DLQ category: LateRecord

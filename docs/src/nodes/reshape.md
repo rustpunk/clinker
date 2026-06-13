@@ -96,7 +96,7 @@ To sequence dependent transformations, chain two Reshape nodes in the DAG so the
 
 If two rules write the **same field** on the **same row**, that is a mutation conflict. Some conflicts are caught at compile time when the rules' selectors statically overlap; content-dependent collisions that cannot be proven at compile time are caught at runtime.
 
-A runtime conflict routes a dead-letter-queue entry under the `mutation_conflict` category, and the **whole correlation group rolls back** — none of that group's mutated or synthesized rows reach the output. The DLQ entry's stage label is `reshape:<node>:<rule_a>+<rule_b>`, naming the colliding rule pair. See [Error Handling & DLQ](error-handling.md).
+A runtime conflict routes a dead-letter-queue entry under the `mutation_conflict` category, and the **whole correlation group rolls back** — none of that group's mutated or synthesized rows reach the output. The DLQ entry's stage label is `reshape:<node>:<rule_a>+<rule_b>`, naming the colliding rule pair. See [Error Handling & DLQ](../pipelines/error-handling.md).
 
 ## Audit stamps
 

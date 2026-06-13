@@ -148,7 +148,7 @@ nodes:
     config: { group_by: [category], cxl: "..." }
 ```
 
-See [Envelopes & Document Context](../pipeline/envelope-and-doc-context.md#per-document-aggregation)
+See [Envelopes & Document Context](../pipelines/envelope-and-doc-context.md#per-document-aggregation)
 for the boundary rules across every `Merge` mode and `Combine` strategy.
 
 ### Strategy selection
@@ -249,8 +249,8 @@ Omit `group_by` to aggregate all records into a single output row:
 ## Time-windowed rollups
 
 When the grouping dimension is *event-time bucket*, declare a
-[`watermark:`](../pipeline/source.md#watermarks) on every source
-and a [`time_window:`](../pipeline/aggregate.md#time-windowed-aggregates)
+[`watermark:`](../nodes/source.md#watermarks) on every source
+and a [`time_window:`](../nodes/aggregate.md#time-windowed-aggregates)
 on the aggregate. Three patterns cover the common shapes; all three
 ship as runnable pipelines under `examples/pipelines/`.
 

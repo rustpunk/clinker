@@ -106,7 +106,7 @@ The source type rule is slightly wider than plain `emit each`: a statically-`nul
 
 ## Output schema
 
-The body's `emit` statements define the output record's field set, the same way `emit` does in a regular transform body. Fields the body does not emit fall under the Output node's `include_unmapped` policy (see [Output Nodes](../pipeline/output.md#unmapped-input-field-passthrough)).
+The body's `emit` statements define the output record's field set, the same way `emit` does in a regular transform body. Fields the body does not emit fall under the Output node's `include_unmapped` policy (see [Output Nodes](../nodes/output.md#unmapped-input-field-passthrough)).
 
 Fields written by the body shadow same-named fields on the originating input record.
 
@@ -142,12 +142,12 @@ Within the body, `let`, `emit`, `trace`, and nested `emit each` / `emit each ...
 
 To bound fan-out, every transform body carries a `max_expansion` cap on the cumulative records `emit each` may produce from a single original input record. The cap is **cumulative across all nesting levels**: every leaf record a nested fan-out produces charges against one shared budget, so nesting cannot multiply past the cap undetected. If the cap is exceeded, the originating record routes to the DLQ with category `expansion_limit_exceeded` instead of producing a truncated or unbounded result. The default cap is 10000.
 
-See [Transform Nodes -> Expansion Cap](../pipeline/transform.md#expansion-cap-max_expansion) for the YAML field and tuning guidance.
+See [Transform Nodes -> Expansion Cap](../nodes/transform.md#expansion-cap-max_expansion) for the YAML field and tuning guidance.
 
 ## See also
 
 - [Closures](closures.md) -- closures bind a similar `it` parameter inside method calls.
 - [Array Methods](builtins-array.md) -- `flat_map` is the in-expression cousin of `emit each`.
 - [Nested Paths](nested-paths.md) -- bracket-index access on the body binding.
-- [Transform Nodes](../pipeline/transform.md) -- the `max_expansion` cap and DLQ routing.
-- [Error Handling & DLQ](../pipeline/error-handling.md) -- DLQ category semantics.
+- [Transform Nodes](../nodes/transform.md) -- the `max_expansion` cap and DLQ routing.
+- [Error Handling & DLQ](../pipelines/error-handling.md) -- DLQ category semantics.

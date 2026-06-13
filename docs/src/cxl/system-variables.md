@@ -64,10 +64,10 @@ emit ts = $source.event_time
 ```
 
 `$source.event_time` is the column a
-[time-windowed aggregate](../pipeline/aggregate.md#time-windowed-aggregates)
+[time-windowed aggregate](../nodes/aggregate.md#time-windowed-aggregates)
 reads to assign records to windows. It is only populated for
 records from a source that declares
-[`watermark:`](../pipeline/source.md#watermarks) — otherwise it
+[`watermark:`](../nodes/source.md#watermarks) — otherwise it
 holds `Null`.
 
 ## $vars.* -- User-defined variables
@@ -94,7 +94,7 @@ emit tax = amount * $vars.tax_rate
 emit currency = $vars.output_currency
 ```
 
-Variables provide a clean way to externalize configuration from CXL logic. Combined with [channels](../pipeline/channels.md), different variable sets can parameterize the same pipeline for different environments or clients.
+Variables provide a clean way to externalize configuration from CXL logic. Combined with [channels](../pipelines/channels.md), different variable sets can parameterize the same pipeline for different environments or clients.
 
 ## $record.* -- Per-record scoped state
 
@@ -125,7 +125,7 @@ filter $record.quality == "ok"
 emit audit_quality = $record.quality
 ```
 
-See [Scoped Variables](../pipeline/variables.md) for the full declaration model and the pipeline / source / record lifetimes.
+See [Scoped Variables](../pipelines/variables.md) for the full declaration model and the pipeline / source / record lifetimes.
 
 ## now -- Current time
 

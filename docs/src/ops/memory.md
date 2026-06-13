@@ -92,7 +92,7 @@ pipeline:
   batch_size: 1024          # optional; default 2048
 ```
 
-A per-transform override is available on a Transform's `config.batch_size` (see [Transform Nodes](../pipeline/transform.md#batch-size-batch_size)); it takes precedence over the pipeline value for that one stage. A `batch_size` of `0` is rejected at config load. The knob affects only the memory *profile* of streaming stages, never their output — blocking stages (sort, hash Aggregate, Combine build side) ignore it and continue to fully materialize. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the full model.
+A per-transform override is available on a Transform's `config.batch_size` (see [Transform Nodes](../nodes/transform.md#batch-size-batch_size)); it takes precedence over the pipeline value for that one stage. A `batch_size` of `0` is rejected at config load. The knob affects only the memory *profile* of streaming stages, never their output — blocking stages (sort, hash Aggregate, Combine build side) ignore it and continue to fully materialize. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the full model.
 
 ## How it works
 

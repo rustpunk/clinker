@@ -308,4 +308,4 @@ Build-side inputs are materialized in memory as hash tables keyed by the equi co
 
 ## Document boundaries
 
-When the driver carries document boundaries -- a `glob:` source where each file is its own document -- the Combine forwards those boundaries to its output, so a per-document `Aggregate` after the join rolls up per driver document. See [Combine -- Document boundaries](../pipeline/combine.md#document-boundaries).
+When the driver carries document boundaries -- a `glob:` source where each file is its own document -- the Combine forwards those boundaries to its output, so a per-document `Aggregate` after the join rolls up per driver document. See [Combine -- Document boundaries](../nodes/combine.md#document-boundaries).

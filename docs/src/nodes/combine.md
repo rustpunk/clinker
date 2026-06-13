@@ -245,7 +245,7 @@ Combine declares which correlation-key columns its output rows carry via the req
 - `all` -- output schema carries every input's `$ck.<field>` columns; the runtime copies build-side values onto each output row alongside the body's `emit` columns. Use when the build side carries CK fields downstream operators need to read.
 - `named: [<field>, ...]` -- explicit subset, intersected with what's actually present upstream. Use to project a multi-field CK down to a single field after a join.
 
-Driver wins on a name collision: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value. See the [Correlation-key combine interaction](correlation-keys.md#combine-interaction) reference for match-mode interaction details (especially `match: collect`, where the propagated slot is single-valued and the array column preserves full lineage).
+Driver wins on a name collision: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value. See the [Correlation-key combine interaction](../pipelines/correlation-keys.md#combine-interaction) reference for match-mode interaction details (especially `match: collect`, where the propagated slot is single-valued and the array column preserves full lineage).
 
 `propagate_ck` is required on every combine; pipelines without an explicit value fail to compile. Existing pipelines migrate by adding `propagate_ck: driver`, which is bit-for-bit equivalent to today's behavior.
 
@@ -255,7 +255,7 @@ Build-side inputs are materialized in memory as hash tables keyed by the equi co
 
 ## Document boundaries
 
-A Combine forwards reconciled document boundaries to its output on **every** strategy -- the inline hash build-probe, IEJoin, grace-hash, sort-merge, and the streaming-probe path. So a per-document `Aggregate` downstream of a join flushes per document: a driver source that carries several documents (a `glob:` over monthly files, say) produces one roll-up per driver document after the join, not one fold spanning all of them. A document that spans both join inputs (the same document carried on the driver and the build side) opens and closes exactly once downstream -- the boundary is reconciled, never double-fired. See [Document Context & Envelopes](envelope-and-doc-context.md) for the per-document aggregation model.
+A Combine forwards reconciled document boundaries to its output on **every** strategy -- the inline hash build-probe, IEJoin, grace-hash, sort-merge, and the streaming-probe path. So a per-document `Aggregate` downstream of a join flushes per document: a driver source that carries several documents (a `glob:` over monthly files, say) produces one roll-up per driver document after the join, not one fold spanning all of them. A document that spans both join inputs (the same document carried on the driver and the build side) opens and closes exactly once downstream -- the boundary is reconciled, never double-fired. See [Document Context & Envelopes](../pipelines/envelope-and-doc-context.md) for the per-document aggregation model.
 
 ## Complete example
 

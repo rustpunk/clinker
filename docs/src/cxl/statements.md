@@ -110,7 +110,7 @@ Read it downstream via the same namespace:
 filter $record.quality_flag == "ok"
 ```
 
-See [Scoped Variables](../pipeline/variables.md) for the declaration model and the three scopes' lifetimes.
+See [Scoped Variables](../pipelines/variables.md) for the declaration model and the three scopes' lifetimes.
 
 ## trace
 

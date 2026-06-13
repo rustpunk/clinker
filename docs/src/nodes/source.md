@@ -98,114 +98,23 @@ A `file` transport requires **exactly one** file matcher (`path`, `glob`, `regex
 
 ## Format types
 
-The `type:` field inside `config:` selects the on-disk format. Supported values: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`.
+The `type:` field inside `config:` selects the on-disk format. Each format
+has its own reference page covering its options and decoding model:
 
-The `edifact` format reads UN/EDIFACT interchanges; it has its own
-reference page covering the segment-record schema, delimiter discovery,
-envelope sections, and control-count validation. See
-[EDIFACT Format](edifact.md). Its one input option is `max_elements`
-(default 32) — the number of positional `eNN` element columns on the
-record schema; a segment with more data elements than that is rejected
-rather than truncated.
+| `type:` | Format | Reference |
+|---------|--------|-----------|
+| `csv` | Delimited text (RFC 4180) | [CSV Format](../formats/csv.md) |
+| `json` | Array / NDJSON / wrapper object | [JSON Format](../formats/json.md) |
+| `xml` | XPath-selected record elements | [XML Format](../formats/xml.md) |
+| `fixed_width` | Column-positioned legacy extracts | [Fixed-Width Format](../formats/fixed-width.md) |
+| `edifact` | UN/EDIFACT interchanges | [EDIFACT Format](../formats/edifact.md) |
+| `x12` | ANSI ASC X12 interchanges | [X12 Format](../formats/x12.md) |
+| `hl7` | HL7 v2.x pipe-and-hat messages | [HL7 v2 Format](../formats/hl7.md) |
 
-The `x12` format reads ANSI ASC X12 interchanges with their three-tier
-`ISA..IEA` → `GS..GE` → `ST..SE` envelope, surfacing all three tiers as
-nested `$doc` sections. It shares the same `max_elements` input option and
-has its own reference page. See [X12 Format](x12.md).
-
-The `hl7` format reads HL7 v2.x pipe-and-hat messages with MSH-driven
-delimiter discovery and optional batch/file (`BHS..BTS`, `FHS..FTS`)
-envelopes that surface as nested `$doc` levels. Its input option is
-`max_fields` (default 64) — the number of positional `fNN` field columns on
-the record schema. See [HL7 v2 Format](hl7.md).
-
-### CSV
-
-```yaml
-- type: source
-  name: orders
-  config:
-    name: orders
-    type: csv
-    path: "./data/orders.csv"
-    schema:
-      - { name: order_id, type: int }
-      - { name: customer_id, type: int }
-      - { name: amount, type: float }
-      - { name: order_date, type: date }
-    options:
-      delimiter: ","         # Default: ","
-      quote_char: "\""       # Default: "\""
-      has_header: true        # Default: true
-      encoding: "utf-8"      # Default: "utf-8"
-```
-
-All CSV options are optional. With no `options:` block, Clinker uses standard RFC 4180 defaults.
-
-### JSON
-
-```yaml
-- type: source
-  name: events
-  config:
-    name: events
-    type: json
-    path: "./data/events.json"
-    schema:
-      - { name: event_id, type: string }
-      - { name: timestamp, type: date_time }
-      - { name: payload, type: string }
-    options:
-      format: ndjson          # array | ndjson | object (auto-detect if omitted)
-      record_path: "$.data"   # JSONPath to records array
-```
-
-- `array` -- the file is a single JSON array of objects.
-- `ndjson` -- one JSON object per line (newline-delimited JSON).
-- `object` -- single top-level object; use `record_path` to locate the records array within it.
-
-If `format` is omitted, Clinker auto-detects based on file content.
-
-### XML
-
-```yaml
-- type: source
-  name: catalog
-  config:
-    name: catalog
-    type: xml
-    path: "./data/catalog.xml"
-    schema:
-      - { name: product_id, type: int }
-      - { name: name, type: string }
-      - { name: price, type: float }
-    options:
-      record_path: "//product"          # XPath to record elements
-      attribute_prefix: "@"             # Prefix for XML attribute fields
-      namespace_handling: strip         # strip | qualify
-```
-
-- `strip` (default) -- removes namespace prefixes from element and attribute names.
-- `qualify` -- preserves namespace-qualified names.
-
-### Fixed-width
-
-```yaml
-- type: source
-  name: legacy_data
-  config:
-    name: legacy_data
-    type: fixed_width
-    path: "./data/mainframe.dat"
-    schema:
-      - { name: account_id, type: string }
-      - { name: balance, type: float }
-      - { name: status_code, type: string }
-    options:
-      line_separator: crlf    # Line ending style
-```
-
-Fixed-width sources require a separate format schema (`.schema.yaml` file) that defines field positions, widths, and padding. The `schema:` on the source body declares CXL types for compile-time checking; the format schema defines the physical layout.
+The same `schema:` rules apply regardless of format: the reader maps each
+decoded record onto the declared schema, and undeclared input fields fall
+under the [`on_unmapped`](#on_unmapped--undeclared-input-fields) policy
+below.
 
 ## `on_unmapped` — undeclared input fields
 
@@ -225,7 +134,7 @@ The per-source `on_unmapped` policy decides what to do with input fields the sou
       - { name: amount, type: numeric }
 ```
 
-See [Auto-Widen & Schema Drift](auto-widen.md) for the full
+See [Auto-Widen & Schema Drift](../formats/auto-widen.md) for the full
 specification: the `$widened` sidecar absorber design, propagation
 rules per downstream node type, the `include_unmapped` Output flag,
 **E315** merge-policy mismatch, and fixed-width inertness.

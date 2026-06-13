@@ -118,7 +118,7 @@ stream with only the header pre-read, so trailer segments (`UNT`, `UNZ`)
 that arrive after the body are **not** envelope sections — their control
 counts are validated inline by the reader instead. A `segment` extract
 naming any tag other than `UNB` is rejected at startup. See
-[EDIFACT Format](edifact.md) for the full reference.
+[EDIFACT Format](../formats/edifact.md) for the full reference.
 
 A JSON example:
 
@@ -239,7 +239,7 @@ another. EDI X12 is the canonical example and the first format that
 implements this: an **interchange** (ISA/IEA) contains one or more
 **functional groups** (GS/GE), each containing one or more **transaction
 sets** (ST/SE), each containing the records. A single file can carry
-multiple interchanges back to back. See [X12 Format](x12.md) for the full
+multiple interchanges back to back. See [X12 Format](../formats/x12.md) for the full
 reference.
 
 HL7 v2 is the second multi-level format: an optional **file** (`FHS`/`FTS`)
@@ -249,7 +249,7 @@ onto the same nested levels — the `FHS` file header is a declared
 `segment: "FHS"` section, while the `BHS` batch and the `MSH` message
 surface automatically as the reader-supplied sections `batch` and
 `transaction_set`. Every tier is optional, so a bare `MSH`-led file simply
-opens one message level. See [HL7 v2 Format](hl7.md) for the full reference.
+opens one message level. See [HL7 v2 Format](../formats/hl7.md) for the full reference.
 
 A reader for such a format opens and closes each nested level as it
 crosses the corresponding envelope boundary mid-file. Each level
@@ -299,7 +299,7 @@ options:
 
 Omit a level's declaration and it falls back to its reader-supplied
 default name keyed by untyped positional `eNN` strings. See
-[X12 Format](x12.md#naming-and-typing-the-nested-levels) for the full
+[X12 Format](../formats/x12.md#naming-and-typing-the-nested-levels) for the full
 reference.
 
 Boundaries nest correctly through the pipeline: each level opens before
