@@ -99,7 +99,7 @@ Within a run, stateless operators (Transform, Route, most Combine probe-side wor
 2. **Finite jobs.** No daemon mode, no service surface, no infinite event loop. `clinker run` invokes, drains, exits with a status code.
 3. **Single process forever.** One invocation = one OS process. Parallelism happens inside the process via `std::thread` and Rayon. No worker-process pools, no multi-machine sharding, no network shuffle, no cluster manager. Scale by adding cores / RAM / disk to one host (DuckDB / Polars / Kettle model). If a host genuinely can't fit the work, partition the input by file or key and run multiple `clinker` invocations from a shell script.
 
-`docs/src/non-goals.md` is the user-facing version of this list; keep it in sync when these commitments change. Architectural proposals that violate any of the three pillars should be rejected at the design-review stage, not just at the implementation-review stage.
+`docs/user/src/non-goals.md` is the user-facing version of this list; keep it in sync when these commitments change. Architectural proposals that violate any of the three pillars should be rejected at the design-review stage, not just at the implementation-review stage.
 
 ### Crate dependency layers (bottom → top)
 

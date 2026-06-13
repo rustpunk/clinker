@@ -5,5 +5,7 @@ language = "en"
 src = "src"
 
 [output.html]
+# Shared theme one level up (docs/theme), also used by the engine book.
+theme = "../theme"
 default-theme = "enamel"
 preferred-dark-theme = "blueprint"
