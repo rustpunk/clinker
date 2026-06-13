@@ -82,9 +82,11 @@
 //! | `E338`      | error    | `x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope) |
 //! | `E339`      | error    | `hl7` output combined with byte-limit `split` (a batch/file envelope is one indivisible FHS..FTS structure) |
 //! | `E340`      | error    | A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time |
-//! | `E341`      | error    | A `$doc.<section>.<field>` access names an envelope section or field a feeding XML/JSON source does not declare |
+//! | `E341`      | error    | A `$doc.<section>.<field>` access names an envelope section or field a feeding closed-schema source (XML / JSON) does not declare |
 //! | `E342`      | error    | `swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope) |
 //! | `E343`      | error    | A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out) |
+//! | `E348`      | error    | A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields` |
+//! | `E349`      | error    | A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve |
 
 use crate::span::{FileId, Span};
 

@@ -158,11 +158,18 @@ source, one declaring a `discriminator:` + `records:` block.
 
 A `rest` source pulls its records page by page over paginated HTTP — it
 has no single buffered document with head and tail sections, so it
-carries no envelope context. Any `$doc.<section>.<field>` read against a
-REST source resolves to `null`, even when the source declares an
-`envelope:` block. Envelope sections are a file-document concept; pull
-the document-level metadata into record fields through the API's own
-response shape (`record_path`, `array_paths`) instead.
+carries no envelope context. Envelope sections are a file-document
+concept, so the compiler **rejects** them on a REST source rather than
+letting them silently resolve to `null`:
+
+- Declaring an `envelope:` block on a `rest` source is an error (`E349`) —
+  the declaration would be inert.
+- Reading `$doc.<section>.<field>` from a node fed by a `rest` source is an
+  error (`E349`) — the access can never resolve.
+
+Pull the document-level metadata into record fields through the API's own
+response shape (`record_path`, `array_paths`) instead, so the value travels
+as a normal field rather than as document-envelope context.
 
 ### EDIFACT `segment` extract
 
@@ -271,22 +278,43 @@ follows the same missing-value convention as `$source.*` and
 simply absent from the context; any `$doc.<missing_section>.<field>`
 resolves to `null`.
 
-## Declared-path validation (XML and JSON)
+## Declared-path validation
 
-For XML and JSON sources, the `envelope:` block is the complete schema:
-the reader extracts exactly the sections and fields it declares. So a
-`$doc.<section>.<field>` reference that names a section the source does
-not declare — or a field the declared section does not declare — is
-almost always a typo (`$doc.Summry.total` against a declared `Summary`),
-and would otherwise resolve silently to `null`. clinker rejects it at
-compile time with error `E341`, pointing at the node that made the
-reference. Run `clinker explain --code E341` for the full write-up.
+Every `$doc.<section>.<field>` reference is cross-checked at compile time
+against the schema the feeding source's reader will actually serve. A
+reference that can never resolve — almost always a typo — is rejected at
+compile time, pointing at the node that made it, rather than resolving
+silently to `null`. How the path is checked depends on the source:
 
-Segment- and positional-based formats (X12, EDIFACT, HL7, fixed-width)
-synthesize extra envelope levels and positional fields beyond what the
-config declares — an X12 reader exposes `$doc.functional_group.*` and
-`$doc.transaction_set.*` the config never names — so their `$doc` paths
-are not checked this way.
+**Closed-schema sources (XML, JSON)** — the `envelope:` block is the
+complete schema: the reader extracts exactly the sections and fields it
+declares. A reference naming a section the source does not declare, or a
+field the declared section does not declare, is rejected with error `E341`
+(`$doc.Summry.total` against a declared `Summary`). Run
+`clinker explain --code E341` for the full write-up.
+
+**Segment/positional sources (X12, EDIFACT, HL7)** — the file-level header
+(`ISA`/`UNB`/`FHS`) is declared through `envelope:` and is closed, but the
+reader *also* synthesizes nested envelope levels the config never names —
+X12's `functional_group` / `transaction_set`, HL7's `batch` /
+`transaction_set` — keyed by positional `eNN` / `fNN` elements bounded by
+the source's `max_elements` / `max_fields`. A `$doc` path is checked
+against that synthesized vocabulary plus any section/field you declared, so
+a legitimate wire-derived path (`$doc.functional_group.e06`) is accepted
+while a misspelled section (`$doc.functonal_group.e06`) or an out-of-range
+positional element (`$doc.transaction_set.e99`) is rejected with error
+`E348`. Run `clinker explain --code E348` for the full write-up.
+
+**REST sources** carry no document and reject `$doc` outright — see
+[Network (REST) sources carry no `$doc` context](#network-rest-sources-carry-no-doc-context)
+above (`E349`).
+
+CSV, fixed-width, and SWIFT MT sources are not statically checked. A plain
+flat file synthesizes no `$doc` sections; a multi-record flat file's
+`record_type` sections are author-declared but their served vocabulary is
+not reconstructed at this layer; and SWIFT serves declared sections under
+user-chosen *or* default block labels — none fits the closed or positional
+model cleanly.
 
 ## Indexed `$doc` access
 
