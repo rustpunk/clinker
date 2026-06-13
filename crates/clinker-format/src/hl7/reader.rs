@@ -53,7 +53,11 @@ use crate::traits::FormatReader;
 /// Default ceiling on the number of positional field columns the record
 /// schema exposes. A segment carrying more data fields than this errors
 /// with guidance rather than silently truncating.
-const DEFAULT_MAX_FIELDS: usize = 64;
+///
+/// Public so the planner's `$doc` positional-field validation can bound
+/// against the same ceiling the reader enforces, rather than duplicating
+/// the literal (which would silently drift if either changed).
+pub const DEFAULT_MAX_FIELDS: usize = 64;
 
 /// The envelope segment tag `prepare_document` can extract as a `$doc`
 /// section. Only the file header `FHS` is resolvable from the bounded

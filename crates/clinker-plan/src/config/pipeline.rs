@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::yaml::Spanned;
+// Default `fNN`/`eNN` ceilings each reader enforces, referenced by the HL7
+// split-field reachability check and the `$doc` positional-bound validation
+// so the planner's bounds cannot drift from the reader's own constants.
+use clinker_format::HL7_DEFAULT_MAX_FIELDS;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -889,80 +893,135 @@ impl PipelineConfig {
         // doc paths against the source(s) feeding that Output, so the reader
         // retains the section. The reader extracts the whole declared section
         // once any of its fields is wanted, so one path per declared field is
-        // sufficient (and passes the E341 closed-schema check, since each
-        // field is real). A header/footer naming an undeclared section is
-        // rejected separately by E346 below, so an absent section here is fine.
-        {
-            let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
-                .iter()
-                .map(|s| (s.name.as_str(), s))
-                .collect();
-            for output in self.output_configs() {
-                if !output.reconstruct_envelope {
-                    continue;
-                }
-                let Some((env_cfg, _)) = generic_output_envelope(&output.format) else {
+        // sufficient.
+        //
+        // These registered paths drive the reader's path-pruned extraction
+        // (consumed at the `declared_doc_paths` stamp below); they do NOT
+        // flow through the `doc_schema_for` / E341/E348 validation pass,
+        // which iterates `doc_path_set.by_node` (the CXL `$doc.*` refs) and
+        // never sees this register map. A header/footer naming an undeclared
+        // section is rejected separately by E346 below, so an absent section
+        // here is fine.
+        //
+        // `source_by_name` is shared by this register block and the
+        // E341/E348/E349 validation pass below — one index over the source
+        // configs serves both.
+        let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+        for output in self.output_configs() {
+            if !output.reconstruct_envelope {
+                continue;
+            }
+            let Some((env_cfg, _)) = generic_output_envelope(&output.format) else {
+                continue;
+            };
+            let sections: Vec<&str> = [
+                env_cfg.header_from_doc.as_deref(),
+                env_cfg.footer_from_doc.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if sections.is_empty() {
+                continue;
+            }
+            let Some(feeding) = node_sources.get(&output.name) else {
+                continue;
+            };
+            for source_name in feeding {
+                let Some(source) = source_by_name.get(source_name.as_str()) else {
                     continue;
                 };
-                let sections: Vec<&str> = [
-                    env_cfg.header_from_doc.as_deref(),
-                    env_cfg.footer_from_doc.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                if sections.is_empty() {
-                    continue;
-                }
-                let Some(feeding) = node_sources.get(&output.name) else {
+                let Some(envelope) = source.envelope.as_ref() else {
                     continue;
                 };
-                for source_name in feeding {
-                    let Some(source) = source_by_name.get(source_name.as_str()) else {
+                let paths = declared_doc_paths.entry(source_name.clone()).or_default();
+                for section_name in &sections {
+                    let Some(section) = envelope.sections.get(*section_name) else {
                         continue;
                     };
-                    let Some(envelope) = source.envelope.as_ref() else {
-                        continue;
-                    };
-                    let paths = declared_doc_paths.entry(source_name.clone()).or_default();
-                    for section_name in &sections {
-                        let Some(section) = envelope.sections.get(*section_name) else {
-                            continue;
+                    for field in section.fields.keys() {
+                        let path = cxl::analyzer::doc_paths::DocPath {
+                            section: Box::from(*section_name),
+                            field: Box::from(field.as_str()),
+                            indices: Vec::new(),
                         };
-                        for field in section.fields.keys() {
-                            let path = cxl::analyzer::doc_paths::DocPath {
-                                section: Box::from(*section_name),
-                                field: Box::from(field.as_str()),
-                                indices: Vec::new(),
-                            };
-                            if !paths.contains(&path) {
-                                paths.push(path);
-                            }
+                        if !paths.contains(&path) {
+                            paths.push(path);
                         }
                     }
                 }
             }
         }
-        // E341 — a `$doc.<section>.<field>` access must name a section and
-        // field the feeding source's envelope actually declares. Without
-        // this check a typo (`$doc.Summry.total` against a declared
-        // `Summary`) compiles silently and resolves to `Value::Null` at
-        // run time; the cxl typechecker cannot catch it because `$doc.*`
-        // types as `Any` with no envelope context in scope.
+        // Cross-check every referenced `$doc.<section>.<field>` against the
+        // schema the feeding source's reader will actually serve. Without
+        // this a typo (`$doc.Summry.total` against a declared `Summary`)
+        // compiles silently and resolves to `Value::Null` at run time; the
+        // cxl typechecker cannot catch it because `$doc.*` types as `Any`
+        // with no envelope context in scope. The schema differs by source:
         //
-        // Only XML and JSON sources are validated: their reader extracts
-        // exactly the declared sections, each with exactly the declared
-        // fields, so the `EnvelopeConfig` is the authoritative closed
-        // schema. Segment- and positional-based formats (X12, EDIFACT,
-        // HL7, fixed-width) synthesize multi-level sections and positional
-        // fields beyond the declared config — e.g. an X12 reader exposes
-        // `$doc.functional_group.*` and `$doc.transaction_set.*` the config
-        // never names — so a closed-schema check would false-positive on
-        // them and is skipped.
-        let source_by_name: HashMap<&str, &crate::config::SourceConfig> = source_configs
+        // - REST transport (E349): a `rest` source buffers no document, so
+        //   any `$doc` access against it can never resolve — rejected
+        //   outright regardless of declared format.
+        // - Closed (E341): XML/JSON readers serve exactly the declared
+        //   `envelope:` sections/fields. The declaration is the
+        //   authoritative closed schema, so an omitted path is a genuine
+        //   typo.
+        // - Segment/positional (E348): X12/EDIFACT/HL7 synthesize nested
+        //   levels (`functional_group`/`transaction_set`/`batch`) keyed by
+        //   positional `eNN`/`fNN` elements beyond the declared header. A
+        //   path is checked against that known synthesized vocabulary plus
+        //   any user-declared section/field, so a typo or out-of-range
+        //   positional element is caught without false-positiving on a
+        //   legitimate wire path.
+        // - Unvalidated: CSV, fixed-width, SWIFT (see `doc_schema_for`).
+        //
+        // `doc_schema_for` is keyed once per source here, not rebuilt on
+        // every (path × node × source) iteration of the loop below — a
+        // `SegmentPositional` schema allocates its synthesized-section
+        // vector, so recomputing it per reference would be wasteful.
+        let doc_schema_by_source: HashMap<&str, DocSchema> = source_configs
             .iter()
-            .map(|s| (s.name.as_str(), s))
+            .map(|s| (s.name.as_str(), doc_schema_for(s)))
             .collect();
+        // E349 — a `rest` source that declares an `envelope:` block. The
+        // declaration is always inert (a REST pull buffers no document), so
+        // reject it even when no downstream node reads `$doc` from the
+        // source. The per-`$doc`-access E349 below covers the complementary
+        // case: a `$doc` read against a REST source that declared no
+        // envelope.
+        for source in &source_configs {
+            if let SourceTransport::Rest(_) = source.transport
+                && source.envelope.is_some()
+            {
+                let primary = doc_node_line
+                    .get(source.name.as_str())
+                    .map(|&line| Span::line_only(line))
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E349",
+                        format!(
+                            "the rest source '{}' declares an `envelope:` block, but a rest \
+                             source pulls records page by page over HTTP and buffers no \
+                             document — the declared sections are inert and every \
+                             `$doc.<section>.<field>` against this source resolves to null",
+                            source.name
+                        ),
+                        LabeledSpan::primary(primary, String::new()),
+                    )
+                    .with_help(
+                        "remove the `envelope:` block from this rest source; envelope \
+                         sections are a file-document concept. Pull document-level metadata \
+                         into record fields through the API's response shape (`record_path`, \
+                         `array_paths`) instead"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
             for node_name in ref_nodes {
                 let Some(sources) = node_sources.get(node_name) else {
@@ -972,19 +1031,31 @@ impl PipelineConfig {
                     let Some(source) = source_by_name.get(source_name.as_str()) else {
                         continue;
                     };
-                    if !envelope_schema_is_closed(&source.format) {
-                        continue;
-                    }
-                    let Some(problem) = undeclared_doc_path_problem(source, doc_path) else {
-                        continue;
-                    };
                     let primary = match doc_node_line.get(node_name.as_str()) {
                         Some(&line) => Span::line_only(line),
                         None => Span::SYNTHETIC,
                     };
+                    // A REST source has no buffered document; a `$doc`
+                    // access against it can never resolve. Reject before
+                    // the format-shaped schema check, which does not model
+                    // the transport.
+                    if let SourceTransport::Rest(_) = source.transport {
+                        diags.push(rest_doc_access_diagnostic(&source.name, doc_path, primary));
+                        continue;
+                    }
+                    let problem = match doc_schema_by_source.get(source_name.as_str()) {
+                        Some(DocSchema::Closed) => closed_doc_path_problem(source, doc_path),
+                        Some(DocSchema::SegmentPositional(schema)) => {
+                            segment_positional_doc_path_problem(source, schema, doc_path)
+                        }
+                        Some(DocSchema::Unvalidated) | None => None,
+                    };
+                    let Some(problem) = problem else {
+                        continue;
+                    };
                     diags.push(
                         Diagnostic::error(
-                            "E341",
+                            problem.code,
                             problem.message,
                             LabeledSpan::primary(primary, String::new()),
                         )
@@ -993,7 +1064,10 @@ impl PipelineConfig {
                 }
             }
         }
-        if diags.iter().any(|d| d.code == "E341") {
+        if diags
+            .iter()
+            .any(|d| d.code == "E341" || d.code == "E348" || d.code == "E349")
+        {
             return Err(diags);
         }
         // Keep an analysis-by-name index so we can surface the analysis
@@ -2204,19 +2278,49 @@ fn resolve_all_input_references(
     }
 }
 
-/// Whether a source format's `EnvelopeConfig` is the complete, closed set
-/// of `$doc` sections and fields the reader can supply.
+/// How a source's `$doc.<section>.<field>` references are validated at
+/// compile time, derived from the source's transport and format.
 ///
-/// XML and JSON readers extract exactly the declared sections, each with
-/// exactly the declared fields, so a used `$doc` path naming anything the
-/// config omits is a genuine typo. Segment- and positional-based formats
-/// (X12, EDIFACT, HL7, fixed-width) synthesize multi-level envelope
-/// sections and positional fields beyond the declared config — an X12
-/// reader exposes `$doc.functional_group.*` / `$doc.transaction_set.*`
-/// the config never names — so their envelope is open and the closed-set
-/// `$doc` validation is skipped for them.
-fn envelope_schema_is_closed(format: &InputFormat) -> bool {
-    matches!(format, InputFormat::Xml(_) | InputFormat::Json(_))
+/// A `$doc` access carries no envelope context the cxl typechecker can see,
+/// so the planner cross-checks each referenced path against the schema the
+/// feeding source's reader will actually serve. That schema differs by
+/// format family:
+///
+/// - **Closed** (XML, JSON): the reader serves exactly the sections and
+///   fields the `envelope:` block declares — the declaration is the
+///   complete schema, so a path naming anything it omits is a genuine typo
+///   (`E341`).
+/// - **Segment/positional** (X12, EDIFACT, HL7): the file-level header
+///   (`ISA`/`UNB`/`FHS`) is declared through `envelope:` and is closed, but
+///   the reader *also* synthesizes nested envelope levels the config never
+///   names — X12's `functional_group`/`transaction_set`, HL7's
+///   `batch`/`transaction_set` — keyed by positional `eNN`/`fNN` elements
+///   bounded by the format's `max_elements`/`max_fields`. A `$doc` path is
+///   validated against that known synthesized vocabulary plus any
+///   user-declared section/field, so a typo (`$doc.functonal_group.e06`)
+///   or an out-of-range positional element (`$doc.transaction_set.e99`) is
+///   caught (`E348`) without false-positiving on a legitimate wire path.
+/// - **Unvalidated** (CSV, fixed-width, SWIFT): not statically checked. A
+///   plain flat file synthesizes no `$doc` sections (a `$doc` read against
+///   one is inert but harmless), a multi-record flat file's `record_type`
+///   sections are author-declared but the section vocabulary the reader
+///   serves is not statically reconstructible here without resolving the
+///   `format_schema`, and SWIFT serves declared sections under user-chosen
+///   *or* stable default block labels — none fits the closed or positional
+///   model cleanly, so each is left unchecked rather than risk a false
+///   positive.
+///
+/// REST sources are handled before this classification: a `rest` transport
+/// buffers no document, so any `$doc` access against one can never resolve
+/// and is rejected outright (`E349`), regardless of the declared format.
+enum DocSchema {
+    /// Validate against the declared `envelope:` block alone.
+    Closed,
+    /// Validate against the format's synthesized section/positional-element
+    /// vocabulary plus any user-declared section/field.
+    SegmentPositional(SegmentPositionalSchema),
+    /// Not statically validated (CSV, fixed-width, SWIFT).
+    Unvalidated,
 }
 
 /// The output-envelope config of a generic-format Output (CSV / JSON / XML /
@@ -2321,24 +2425,174 @@ fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLin
     }
 }
 
-/// A rejected `$doc` path against a closed envelope schema: the formatted
-/// diagnostic message plus its fix-it help text.
-struct UndeclaredDocPath {
+/// The synthesized `$doc` vocabulary of a segment/positional format: the
+/// nested sections its reader produces beyond the declared `envelope:`
+/// block, the positional-element prefix, and the per-element bound.
+struct SegmentPositionalSchema {
+    /// Nested sections the reader synthesizes for this source, in addition
+    /// to any the user declares under `envelope.sections`. For X12 these are
+    /// the (possibly user-renamed) functional-group / transaction-set
+    /// levels; for HL7 the fixed `batch` / `transaction_set`; EDIFACT
+    /// synthesizes none beyond the declared `UNB` interchange. Each carries
+    /// how its fields are keyed (positional `eNN`/`fNN`, or a user-declared
+    /// typed nested schema).
+    synthesized_sections: Vec<SynthesizedSection>,
+    /// Positional field-name prefix: `e` for X12/EDIFACT element columns
+    /// (`e01`…), `f` for HL7 field columns (`f01`…).
+    positional_prefix: char,
+    /// 1-based upper bound on a positional element/field, set to the
+    /// reader's body-segment ceiling (`max_elements` / `max_fields`).
+    ///
+    /// This is a LOOSE bound, not a tight per-segment guarantee. The
+    /// synthesized nested levels are keyed by the *header* segment's actual
+    /// arity (an X12 `ST` carries ~3 elements, a `GS` ~8; an HL7 `MSH`/`BHS`
+    /// likewise has a fixed-ish field count), but that precise per-segment
+    /// arity is not known at plan time — and the readers themselves do not
+    /// enforce it (they cap only the body-segment element/field count). So
+    /// positional validation catches an unknown section name and a
+    /// grossly-out-of-range element (past the body max), but a mid-range
+    /// positional typo on a short header segment — e.g. `$doc.transaction_set.e20`
+    /// on a 3-element `ST` — passes here and still resolves null at run
+    /// time. Tightening to per-segment arity is tracked as a follow-up
+    /// (see `doc_schema_for`).
+    max_positional: usize,
+}
+
+/// One synthesized nested section and the set of fields its reader serves.
+struct SynthesizedSection {
+    /// Section name `$doc.<name>.<field>` resolves under.
+    name: String,
+    /// How the section's fields are keyed. A default-keyed level exposes
+    /// every positional element up to the bound; a level given a typed
+    /// nested schema (X12 `group_section` / `set_section`) exposes ONLY its
+    /// declared fields, exactly as a declared file-level section does.
+    fields: SynthesizedFields,
+}
+
+/// How a synthesized nested section's fields are keyed.
+enum SynthesizedFields {
+    /// Default positional keying: every `<prefix>NN`, `1 <= N <= bound`.
+    Positional,
+    /// A user-declared typed schema (X12 `group_section.fields` /
+    /// `set_section.fields`). The reader coerces and serves ONLY these
+    /// fields, so the section is closed to them — an undeclared name (even
+    /// an in-range positional one) resolves null.
+    ///
+    /// Owned `Vec<String>` rather than a borrow of the source's `IndexMap`:
+    /// the `DocSchema` is cached once per source and a borrow would thread a
+    /// lifetime through the cache and every helper signature, for a linear
+    /// scan over a handful of declared field names. Membership is checked
+    /// with `.iter().any(..)` — O(declared fields), trivially small.
+    Declared(Vec<String>),
+}
+
+/// Build a synthesized nested section from an optional user-declared nested
+/// schema: a declared schema closes the section to its declared field
+/// names, an absent one keeps the default positional keying.
+fn synthesized_section(
+    default_name: &str,
+    declared: Option<&clinker_format::NestedEnvelopeSection>,
+) -> SynthesizedSection {
+    match declared {
+        Some(s) => SynthesizedSection {
+            name: s.name.clone(),
+            fields: SynthesizedFields::Declared(s.fields.keys().cloned().collect()),
+        },
+        None => SynthesizedSection {
+            name: default_name.to_string(),
+            fields: SynthesizedFields::Positional,
+        },
+    }
+}
+
+/// Classify how a source's `$doc` references are validated, from its
+/// format. The REST transport is checked by the caller before this is
+/// consulted, so this maps purely on `InputFormat`.
+///
+/// The positional bound is the reader's body-segment ceiling, not the
+/// header segment's precise arity (see [`SegmentPositionalSchema`]). A
+/// tighter per-segment-arity bound — to catch a mid-range positional typo
+/// on a short header segment — is tracked at
+/// <https://github.com/rustpunk/clinker/issues/558>.
+fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
+    match &source.format {
+        InputFormat::Xml(_) | InputFormat::Json(_) => DocSchema::Closed,
+        InputFormat::X12(opts) => {
+            let opts = opts.as_ref();
+            DocSchema::SegmentPositional(SegmentPositionalSchema {
+                synthesized_sections: vec![
+                    synthesized_section(
+                        "functional_group",
+                        opts.and_then(|o| o.group_section.as_ref()),
+                    ),
+                    synthesized_section(
+                        "transaction_set",
+                        opts.and_then(|o| o.set_section.as_ref()),
+                    ),
+                ],
+                positional_prefix: 'e',
+                max_positional: opts
+                    .and_then(|o| o.max_elements)
+                    .unwrap_or(clinker_format::X12_DEFAULT_MAX_ELEMENTS),
+            })
+        }
+        InputFormat::Edifact(opts) => DocSchema::SegmentPositional(SegmentPositionalSchema {
+            // A single UNB..UNZ interchange synthesizes no nested level; the
+            // declared `UNB` section is the only one, so the synthesized set
+            // is empty and a non-`UNB`-declared section name is a typo.
+            synthesized_sections: Vec::new(),
+            positional_prefix: 'e',
+            max_positional: opts
+                .as_ref()
+                .and_then(|o| o.max_elements)
+                .unwrap_or(clinker_format::EDIFACT_DEFAULT_MAX_ELEMENTS),
+        }),
+        InputFormat::Hl7(opts) => DocSchema::SegmentPositional(SegmentPositionalSchema {
+            // HL7's `batch` (BHS) and `transaction_set` (MSH) levels always
+            // surface their whole header verbatim as positional `fNN`
+            // columns — they carry no user-declared typed schema.
+            synthesized_sections: vec![
+                SynthesizedSection {
+                    name: "batch".to_string(),
+                    fields: SynthesizedFields::Positional,
+                },
+                SynthesizedSection {
+                    name: "transaction_set".to_string(),
+                    fields: SynthesizedFields::Positional,
+                },
+            ],
+            positional_prefix: 'f',
+            max_positional: opts
+                .as_ref()
+                .and_then(|o| o.max_fields)
+                .unwrap_or(HL7_DEFAULT_MAX_FIELDS),
+        }),
+        InputFormat::Csv(_) | InputFormat::FixedWidth(_) | InputFormat::Swift(_) => {
+            DocSchema::Unvalidated
+        }
+    }
+}
+
+/// A rejected `$doc` path: the diagnostic code, formatted message, and
+/// fix-it help text. The code distinguishes a closed-schema rejection
+/// (`E341`) from a segment/positional one (`E348`).
+struct DocPathProblem {
+    code: &'static str,
     message: String,
     help: String,
 }
 
 /// Check one `$doc.<section>.<field>` path against a source's declared
-/// envelope, returning the diagnostic content when the path names an
+/// closed envelope, returning the diagnostic content when the path names an
 /// undeclared section or an undeclared field within a declared section.
 ///
 /// Returns `None` when the path is fully declared. The caller has already
 /// confirmed the source's format carries a closed envelope schema, so an
 /// absent `envelope:` block means every `$doc` path is undeclared.
-fn undeclared_doc_path_problem(
+fn closed_doc_path_problem(
     source: &crate::config::SourceConfig,
     doc_path: &cxl::analyzer::doc_paths::DocPath,
-) -> Option<UndeclaredDocPath> {
+) -> Option<DocPathProblem> {
     let section_name = &*doc_path.section;
     let field_name = &*doc_path.field;
     let source_name = &source.name;
@@ -2347,7 +2601,8 @@ fn undeclared_doc_path_problem(
         .as_ref()
         .and_then(|env| env.sections.get(section_name));
     match section {
-        None => Some(UndeclaredDocPath {
+        None => Some(DocPathProblem {
+            code: "E341",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references envelope section \
                  '{section_name}', but source '{source_name}' declares no such section"
@@ -2359,7 +2614,8 @@ fn undeclared_doc_path_problem(
                  `envelope.sections` exactly"
             ),
         }),
-        Some(section) if !section.fields.contains_key(field_name) => Some(UndeclaredDocPath {
+        Some(section) if !section.fields.contains_key(field_name) => Some(DocPathProblem {
+            code: "E341",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references field '{field_name}' in \
                  envelope section '{section_name}', but source '{source_name}' declares no \
@@ -2372,6 +2628,244 @@ fn undeclared_doc_path_problem(
         }),
         Some(_) => None,
     }
+}
+
+/// Check one `$doc.<section>.<field>` path against a segment/positional
+/// format's synthesized vocabulary plus any user-declared section/field.
+///
+/// A path's section must be either a user-declared `envelope.sections` key
+/// (the closed file-level header — `ISA`/`UNB`/`FHS`) or one the reader
+/// synthesizes for this format (X12/HL7 nested levels). The field check
+/// then depends on the section kind:
+///
+/// - a **declared file-level section** is closed to its declared fields
+///   (the reader serves only those);
+/// - a **synthesized positional level** serves every `<prefix>NN`,
+///   `1 <= N <= bound`;
+/// - a **synthesized level given a typed nested schema** (X12
+///   `group_section` / `set_section`) is closed to its declared fields.
+///
+/// Returns the `E348` diagnostic content for a section outside the known
+/// set, or a field that section's reader will not serve.
+fn segment_positional_doc_path_problem(
+    source: &crate::config::SourceConfig,
+    schema: &SegmentPositionalSchema,
+    doc_path: &cxl::analyzer::doc_paths::DocPath,
+) -> Option<DocPathProblem> {
+    let section_name = &*doc_path.section;
+    let field_name = &*doc_path.field;
+    let source_name = &source.name;
+    let format = source.format.format_name();
+
+    let declared_section = source
+        .envelope
+        .as_ref()
+        .and_then(|env| env.sections.get(section_name));
+    let synthesized = schema
+        .synthesized_sections
+        .iter()
+        .find(|s| s.name == section_name);
+
+    // Unknown section — neither a declared file-level section nor one the
+    // reader synthesizes.
+    if declared_section.is_none() && synthesized.is_none() {
+        let mut known: Vec<String> = source
+            .envelope
+            .as_ref()
+            .map(|env| env.sections.keys().cloned().collect())
+            .unwrap_or_default();
+        known.extend(schema.synthesized_sections.iter().map(|s| s.name.clone()));
+        let known_list = if known.is_empty() {
+            String::from("(none)")
+        } else {
+            known.join(", ")
+        };
+        return Some(DocPathProblem {
+            code: "E348",
+            message: format!(
+                "`$doc.{section_name}.{field_name}` references envelope section \
+                 '{section_name}', but the {format} source '{source_name}' synthesizes no \
+                 such section"
+            ),
+            help: format!(
+                "name a section this {format} source exposes ({known_list}), declare \
+                 '{section_name}' under the source's `envelope.sections`, or correct the \
+                 spelling. Section names are case-sensitive"
+            ),
+        });
+    }
+
+    // A declared file-level section (`ISA`/`UNB`/`FHS`) is closed: the
+    // reader serves only its declared fields.
+    if let Some(section) = declared_section {
+        if section.fields.contains_key(field_name) {
+            return None;
+        }
+        return Some(undeclared_field_in_closed_section(
+            source_name,
+            format,
+            section_name,
+            field_name,
+            "`envelope.sections`",
+        ));
+    }
+
+    // A synthesized nested level: closed to its declared schema if it has
+    // one, else keyed by positional elements up to the bound. `synthesized`
+    // is `Some` here — the both-`None` case returned above, and the
+    // `declared_section` case returned just above — but match it rather than
+    // unwrap so the exhaustive path is explicit.
+    match synthesized.map(|s| &s.fields) {
+        Some(SynthesizedFields::Declared(fields)) => {
+            if fields.iter().any(|f| f == field_name) {
+                return None;
+            }
+            Some(undeclared_field_in_closed_section(
+                source_name,
+                format,
+                section_name,
+                field_name,
+                "the level's `fields` schema",
+            ))
+        }
+        Some(SynthesizedFields::Positional) => positional_field_problem(
+            source_name,
+            format,
+            section_name,
+            field_name,
+            schema.positional_prefix,
+            schema.max_positional,
+        ),
+        None => None,
+    }
+}
+
+/// `E348` for a field a closed section (a declared file-level section, or a
+/// synthesized level given a typed schema) does not declare.
+fn undeclared_field_in_closed_section(
+    source_name: &str,
+    format: &str,
+    section_name: &str,
+    field_name: &str,
+    declared_under: &str,
+) -> DocPathProblem {
+    DocPathProblem {
+        code: "E348",
+        message: format!(
+            "`$doc.{section_name}.{field_name}` references field '{field_name}' in section \
+             '{section_name}', but the {format} source '{source_name}' declares no such field \
+             in that section"
+        ),
+        help: format!(
+            "add '{field_name}' to that section's field schema ({declared_under}), or correct \
+             the name to a declared field. Field names are case-sensitive"
+        ),
+    }
+}
+
+/// Validate a field against a positionally-keyed synthesized level: it must
+/// be `<prefix>NN` with `1 <= N <= max_positional`. Returns `None` when in
+/// range, else the `E348` content for an out-of-range or non-positional
+/// field.
+fn positional_field_problem(
+    source_name: &str,
+    format: &str,
+    section_name: &str,
+    field_name: &str,
+    prefix: char,
+    max_positional: usize,
+) -> Option<DocPathProblem> {
+    match positional_element_index(field_name, prefix) {
+        Some(n) if n >= 1 && n <= max_positional => None,
+        Some(_) => Some(DocPathProblem {
+            code: "E348",
+            message: format!(
+                "`$doc.{section_name}.{field_name}` references positional element \
+                 '{field_name}', but the {format} source '{source_name}' exposes only \
+                 '{prefix}01'..'{prefix}{max:02}' on section '{section_name}' (its \
+                 configured {bound_opt} is {max})",
+                max = max_positional,
+                bound_opt = positional_bound_option(prefix),
+            ),
+            help: format!(
+                "reference a positional element within range, or raise the source's \
+                 `{bound_opt}` if the wire segment genuinely carries that many",
+                bound_opt = positional_bound_option(prefix),
+            ),
+        }),
+        None => Some(DocPathProblem {
+            code: "E348",
+            message: format!(
+                "`$doc.{section_name}.{field_name}` references field '{field_name}' on section \
+                 '{section_name}', but the {format} source '{source_name}' exposes that \
+                 section's wire data only as positional elements \
+                 ('{prefix}01'..'{prefix}{max:02}')",
+                max = max_positional,
+            ),
+            help: format!(
+                "reference a positional element ('{prefix}NN'), or declare '{field_name}' under \
+                 a typed nested-section schema for this level. Field names are case-sensitive"
+            ),
+        }),
+    }
+}
+
+/// Parse a positional element/field name into its 1-based index, or `None`
+/// when it does not match the EXACT column name the reader emits.
+///
+/// The readers key positional columns as `format!("{prefix}{:02}", i + 1)`
+/// — zero-padded to a minimum of two digits (`e01`, `f09`, `e32`, `e100`).
+/// A `$doc` access resolves by the literal field identifier, so only that
+/// canonical spelling resolves at run time: `$doc.s.e7` looks up a `e7`
+/// column that does not exist (the reader emits `e07`) and would silently
+/// yield null. We therefore accept a name only when it round-trips to the
+/// canonical key — rejecting `e7` (→ `e07`) and `e007` (→ `e07`) so the
+/// near-miss is caught rather than passing compile and resolving null.
+fn positional_element_index(field: &str, prefix: char) -> Option<usize> {
+    let rest = field.strip_prefix(prefix)?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = rest.parse().ok()?;
+    (field == format!("{prefix}{n:02}")).then_some(n)
+}
+
+/// The source-option name that bounds the positional element/field count
+/// for a given prefix, used in `E348` help text.
+fn positional_bound_option(prefix: char) -> &'static str {
+    match prefix {
+        'f' => "max_fields",
+        _ => "max_elements",
+    }
+}
+
+/// Build the `E349` diagnostic for a `$doc` access attributed to a REST
+/// source. A `rest` transport pulls records page by page over HTTP and
+/// buffers no single document, so it carries no envelope context — the
+/// access would resolve to `Value::Null` at run time with no signal.
+fn rest_doc_access_diagnostic(
+    source_name: &str,
+    doc_path: &cxl::analyzer::doc_paths::DocPath,
+    primary: clinker_core_types::span::Span,
+) -> clinker_core_types::Diagnostic {
+    use clinker_core_types::{Diagnostic, LabeledSpan};
+    let section = &*doc_path.section;
+    let field = &*doc_path.field;
+    Diagnostic::error(
+        "E349",
+        format!(
+            "`$doc.{section}.{field}` reads document-envelope context from the rest source \
+             '{source_name}', but a rest source pulls records page by page over HTTP and \
+             buffers no document — the access can never resolve and would silently yield null"
+        ),
+        LabeledSpan::primary(primary, String::new()),
+    )
+    .with_help(
+        "remove the `$doc` access; a rest source has no document envelope. Pull \
+         document-level metadata into record fields through the API's response shape \
+         (`record_path`, `array_paths`) instead"
+            .to_string(),
+    )
 }
 
 /// Map every CXL-bearing node name — top-level and composition-body — to
@@ -3562,11 +4056,6 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
 
     Ok(())
 }
-
-/// Default `fNN` column count for an HL7 source when `max_fields` is unset,
-/// matching the reader's documented default. A split field must name a
-/// position within this range to be reachable.
-const HL7_DEFAULT_MAX_FIELDS: usize = 64;
 
 /// Validate an HL7 source's `split_fields` declarations: each names a
 /// reachable positional field (`fNN`, `1 <= N <= max_fields`) with at least

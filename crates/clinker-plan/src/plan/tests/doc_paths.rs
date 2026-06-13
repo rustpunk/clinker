@@ -8,6 +8,7 @@
 //! feeding it (never the pipeline-wide union), and a `$doc` access
 //! indexed by a non-literal aborts the compile with E340.
 
+use clinker_core_types::Diagnostic;
 use cxl::analyzer::doc_paths::{DocIndex, DocPath};
 
 use crate::config::{CompileContext, parse_config};
@@ -339,16 +340,16 @@ fn test_declared_doc_path_does_not_trip_e341() {
     assert!(source_doc_paths(&plan, "payments").contains(&path("Summary", "total", vec![])));
 }
 
-#[test]
-fn test_undeclared_doc_path_against_segment_format_is_not_validated() {
-    // X12 (and the other segment/positional formats) synthesize envelope
-    // levels beyond the declared config — `$doc.functional_group.*` and
-    // `$doc.transaction_set.*` are reader-derived, not config-declared. The
-    // closed-schema E341 check must NOT fire for these, or every multi-level
-    // EDI pipeline would be rejected.
-    let yaml = r#"
+/// Compile an X12 pipeline whose source declares an `ISA` interchange
+/// envelope section (`e13: string`) and a transform body supplied by the
+/// caller. Returns the compile result so a test can assert success or
+/// inspect diagnostics. The X12 reader synthesizes `functional_group` and
+/// `transaction_set` levels keyed positionally beyond the declared header.
+fn compile_x12(transform_cxl: &str) -> Result<crate::plan::CompiledPlan, Vec<Diagnostic>> {
+    let mut yaml = String::from(
+        r#"
 pipeline:
-  name: x12_doc_open
+  name: x12_doc_validate
 nodes:
   - type: source
     name: interchange
@@ -369,25 +370,344 @@ nodes:
     input: interchange
     config:
       cxl: |
-        emit seg = seg_id
-        emit gs06 = $doc.functional_group.e06
-        emit st02 = $doc.transaction_set.e02
-  - type: output
-    name: out
-    input: t0
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#;
-    let config = parse_config(yaml).expect("parse x12 pipeline");
-    let result = config.compile(&CompileContext::default());
-    if let Err(err) = &result {
+"#,
+    );
+    for line in transform_cxl.lines() {
+        yaml.push_str(&format!("        {line}\n"));
+    }
+    yaml.push_str(
+        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+    );
+    let config = parse_config(&yaml).expect("parse x12 pipeline");
+    config.compile(&CompileContext::default())
+}
+
+#[test]
+fn test_segment_format_legitimate_wire_paths_compile() {
+    // X12 synthesizes `functional_group` / `transaction_set` levels keyed
+    // by positional `eNN` elements beyond the declared `ISA` header. A
+    // reference to a synthesized section with an in-range positional
+    // element is a legitimate wire path and must NOT trip any `$doc`
+    // diagnostic — a false positive here would reject every multi-level
+    // EDI pipeline.
+    let plan = compile_x12(
+        "emit seg = seg_id\n\
+         emit isa13 = $doc.interchange.e13\n\
+         emit gs06 = $doc.functional_group.e06\n\
+         emit st02 = $doc.transaction_set.e02",
+    )
+    .expect("legitimate X12 wire paths must compile");
+    // Sanity: the declared-header path still surfaces onto the source set.
+    assert!(source_doc_paths(&plan, "interchange").contains(&path("interchange", "e13", vec![])));
+}
+
+#[test]
+fn test_segment_format_misspelled_section_aborts_with_e348() {
+    // `functonal_group` misspells the synthesized `functional_group`
+    // section. A segment-format `$doc` typo must now be caught with E348
+    // (the contract changed from "not validated" — this is #481).
+    let err = compile_x12("emit seg = seg_id\nemit gs06 = $doc.functonal_group.e06")
+        .expect_err("a misspelled synthesized section must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E348")
+        .unwrap_or_else(|| panic!("expected an E348 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("functonal_group"),
+        "E348 message must name the undeclared section: {}",
+        diag.message
+    );
+    assert!(
+        diag.primary.span.synthetic_line_number().is_some(),
+        "E348 primary span must carry the referencing node's source line"
+    );
+    assert!(diag.help.is_some(), "E348 must carry help text");
+}
+
+#[test]
+fn test_segment_format_out_of_range_positional_element_aborts_with_e348() {
+    // `e99` is past the X12 default `max_elements` of 32, so the reader can
+    // never serve it — a typo that resolves null at run time. E348 catches
+    // the positional-bound case.
+    let err = compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.e99")
+        .expect_err("an out-of-range positional element must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E348")
+        .unwrap_or_else(|| panic!("expected an E348 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("e99") && diag.message.contains("32"),
+        "E348 message must name the offending element and the bound: {}",
+        diag.message
+    );
+}
+
+#[test]
+fn test_segment_format_in_range_positional_element_compiles() {
+    // `e32` is exactly at the X12 default `max_elements` of 32 — the body
+    // segment's element ceiling, so it must compile (boundary check).
+    //
+    // NOTE: this exercises the LOOSE body-segment bound, not a tight
+    // per-segment guarantee. A real `ST` transaction-set header carries
+    // only ~3 elements, so `$doc.transaction_set.e32` would resolve null at
+    // run time — yet it compiles, because the precise per-segment header
+    // arity is not known at plan time (and the reader itself caps only the
+    // body element count). Tightening to per-segment arity is tracked at
+    // https://github.com/rustpunk/clinker/issues/558.
+    compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.e32")
+        .expect("the boundary positional element must compile");
+}
+
+#[test]
+fn test_segment_format_unpadded_positional_element_aborts_with_e348() {
+    // The reader keys columns zero-padded (`e07`), and a `$doc` access
+    // resolves by the literal identifier. `$doc.transaction_set.e7` would
+    // look up a non-existent `e7` column and resolve null — a near-miss
+    // that must be caught, not accepted as in-range. The canonical `e07`
+    // compiles; the unpadded `e7` trips E348.
+    compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.e07")
+        .expect("the canonical zero-padded element must compile");
+    let err = compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.e7")
+        .expect_err("an unpadded positional element must fail to compile");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic for the unpadded element, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_segment_format_non_positional_field_aborts_with_e348() {
+    // A non-`eNN` field name on a synthesized positional section names no
+    // declared field and no positional element — a typo. E348 catches it.
+    let err = compile_x12("emit seg = seg_id\nemit st = $doc.transaction_set.amount")
+        .expect_err("a non-positional field on a positional section must fail");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_segment_format_declared_header_section_is_closed() {
+    // The declared file-level `ISA` interchange section is CLOSED — the
+    // reader serves only its declared fields (`e13: string`), coercing
+    // nothing else. So an undeclared field is a typo even when it LOOKS
+    // like an in-range positional element (`e14`): the reader never serves
+    // it, and it would resolve null. Both `e14` (in-range positional but
+    // undeclared) and `zzz` (neither) must trip E348 — a false negative
+    // here would let a null-resolving path compile.
+    for field in ["e14", "zzz"] {
+        let cxl = format!("emit seg = seg_id\nemit isa = $doc.interchange.{field}");
+        let err = compile_x12(&cxl)
+            .err()
+            .unwrap_or_else(|| panic!("`$doc.interchange.{field}` should fail to compile"));
         assert!(
-            err.iter().all(|d| d.code != "E341"),
-            "segment-format `$doc` paths must not trip E341, got: {err:?}"
+            err.iter().any(|d| d.code == "E348"),
+            "an undeclared field on the closed ISA section must trip E348 ({field}): {err:?}"
         );
     }
+}
+
+#[test]
+fn test_hl7_synthesized_sections_and_positional_bound() {
+    // HL7 synthesizes `batch` / `transaction_set` keyed by `fNN` fields
+    // bounded by `max_fields` (default 64). A legitimate `fNN` compiles; a
+    // misspelled section trips E348.
+    fn compile_hl7(transform_cxl: &str) -> Result<crate::plan::CompiledPlan, Vec<Diagnostic>> {
+        let mut yaml = String::from(
+            r#"
+pipeline:
+  name: hl7_doc_validate
+nodes:
+  - type: source
+    name: msgs
+    config:
+      name: msgs
+      type: hl7
+      path: msgs.hl7
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: t0
+    input: msgs
+    config:
+      cxl: |
+"#,
+        );
+        for line in transform_cxl.lines() {
+            yaml.push_str(&format!("        {line}\n"));
+        }
+        yaml.push_str(
+            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        );
+        let config = parse_config(&yaml).expect("parse hl7 pipeline");
+        config.compile(&CompileContext::default())
+    }
+
+    compile_hl7("emit seg = seg_id\nemit msh = $doc.transaction_set.f09")
+        .expect("a legitimate HL7 fNN path must compile");
+
+    let err = compile_hl7("emit seg = seg_id\nemit b = $doc.batchh.f01")
+        .expect_err("a misspelled HL7 section must fail");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_x12_typed_nested_group_section_is_closed_to_declared_fields() {
+    // When the source gives the `GS` level a typed nested schema
+    // (`group_section`), the reader renames the level and serves ONLY its
+    // declared fields — the default positional `eNN` keying no longer
+    // applies. So the level is closed: a declared field compiles, a field
+    // it does not declare (even an in-range positional one) trips E348, and
+    // the OLD default name `functional_group` no longer exists.
+    fn compile(transform_cxl: &str) -> Result<crate::plan::CompiledPlan, Vec<Diagnostic>> {
+        let mut yaml = String::from(
+            r#"
+pipeline:
+  name: x12_group_section
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      path: po.x12
+      options:
+        group_section:
+          name: grp
+          fields:
+            e06: string
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: t0
+    input: interchange
+    config:
+      cxl: |
+"#,
+        );
+        for line in transform_cxl.lines() {
+            yaml.push_str(&format!("        {line}\n"));
+        }
+        yaml.push_str(
+            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        );
+        let config = parse_config(&yaml).expect("parse x12 group_section pipeline");
+        config.compile(&CompileContext::default())
+    }
+
+    // The declared nested field resolves under the renamed section.
+    compile("emit seg = seg_id\nemit g = $doc.grp.e06")
+        .expect("a declared nested field on the renamed group section must compile");
+
+    // An undeclared in-range positional element on the now-closed level is
+    // a typo — the reader serves only `e06`.
+    let err = compile("emit seg = seg_id\nemit g = $doc.grp.e07")
+        .expect_err("an undeclared field on the typed nested section must fail");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic for the undeclared nested field, got: {err:?}"
+    );
+
+    // The default name no longer exists once the level is renamed.
+    let err = compile("emit seg = seg_id\nemit g = $doc.functional_group.e06")
+        .expect_err("the default section name must not exist after a rename");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic for the stale default name, got: {err:?}"
+    );
+}
+
+/// Compile a JSON pipeline whose source uses the `rest` transport, with an
+/// optional `envelope:` block and a transform body supplied by the caller.
+fn compile_rest(
+    with_envelope: bool,
+    transform_cxl: &str,
+) -> Result<crate::plan::CompiledPlan, Vec<Diagnostic>> {
+    let envelope_block = if with_envelope {
+        "      envelope:\n        sections:\n          Head:\n            extract: { json_pointer: \"/Head\" }\n            fields:\n              batch_id: string\n"
+    } else {
+        ""
+    };
+    let mut yaml = format!(
+        r#"
+pipeline:
+  name: rest_doc_validate
+nodes:
+  - type: source
+    name: api
+    config:
+      name: api
+      type: json
+      transport:
+        kind: rest
+        url: https://api.example.com/v1/records
+        max_pages: 25
+      options:
+        record_path: records
+{envelope_block}      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: t0
+    input: api
+    config:
+      cxl: |
+"#,
+    );
+    for line in transform_cxl.lines() {
+        yaml.push_str(&format!("        {line}\n"));
+    }
+    yaml.push_str(
+        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+    );
+    let config = parse_config(&yaml).expect("parse rest pipeline");
+    config.compile(&CompileContext::default())
+}
+
+#[test]
+fn test_rest_doc_access_aborts_with_e349() {
+    // A `$doc` read against a REST source (no envelope declared) can never
+    // resolve — a REST pull buffers no document. E349 rejects it (#507).
+    let err = compile_rest(false, "emit amount = amount\nemit b = $doc.Head.batch_id")
+        .expect_err("a `$doc` read against a rest source must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E349")
+        .unwrap_or_else(|| panic!("expected an E349 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("rest source") && diag.message.contains("batch_id"),
+        "E349 message must name the rest source and the access: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E349 must carry help text");
+}
+
+#[test]
+fn test_rest_envelope_declaration_aborts_with_e349() {
+    // Declaring an `envelope:` block on a REST source is inert and rejected
+    // even when no downstream node reads `$doc` from it (#507).
+    let err = compile_rest(true, "emit amount = amount")
+        .expect_err("an `envelope:` block on a rest source must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E349")
+        .unwrap_or_else(|| panic!("expected an E349 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("envelope") && diag.message.contains("inert"),
+        "E349 message must explain the inert envelope: {}",
+        diag.message
+    );
+}
+
+#[test]
+fn test_rest_without_doc_or_envelope_compiles() {
+    // A REST source that neither declares an envelope nor is read via `$doc`
+    // is unaffected — the guard fires only on an actual `$doc`/envelope use.
+    compile_rest(false, "emit amount = amount + 1")
+        .expect("a plain rest source with no `$doc` use must compile");
 }
 
 #[test]
