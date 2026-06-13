@@ -15,6 +15,7 @@
 
 use std::io::{BufRead, Read};
 
+use crate::edifact::charset::Charset;
 use crate::error::FormatError;
 use crate::segment_tokenizer::{
     SegmentFraming, TrailingSegment, read_raw_segment, skip_inter_segment_whitespace,
@@ -60,24 +61,31 @@ impl Delimiters {
 
 /// Streaming EDIFACT segment reader.
 ///
-/// Wraps a buffered source and yields one raw segment string at a time
+/// Wraps a buffered source and yields one decoded segment string at a time
 /// (terminator stripped, inter-segment CR/LF whitespace stripped). The
 /// delimiters are discovered once from the optional `UNA` prefix on the
-/// first read.
+/// first read. Element text is decoded through the active [`Charset`], which
+/// starts on the byte-total bootstrap repertoire so the `UNB` decodes before
+/// its in-band syntax identifier is known; the reader re-arms it via
+/// [`Self::set_charset`] once that identifier is parsed.
 pub(crate) struct SegmentTokenizer<R: Read> {
     reader: R,
     delimiters: Delimiters,
+    charset: Charset,
     initialized: bool,
 }
 
 impl<R: BufRead> SegmentTokenizer<R> {
     /// Build a tokenizer over a buffered source. Delimiter discovery is
     /// deferred to the first [`Self::next_segment`] call so the `UNA`
-    /// scan and the first segment read share one pass.
+    /// scan and the first segment read share one pass. Decoding starts on
+    /// the bootstrap charset so the `UNB` — which names the body repertoire
+    /// in-band — can itself be decoded before that repertoire is known.
     pub(crate) fn new(reader: R) -> Self {
         Self {
             reader,
             delimiters: Delimiters::level_a(),
+            charset: Charset::Bootstrap,
             initialized: false,
         }
     }
@@ -86,6 +94,13 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// any `UNA` prefix).
     pub(crate) fn delimiters(&self) -> Delimiters {
         self.delimiters
+    }
+
+    /// Re-arm the decoding charset, called by the reader once it has parsed
+    /// the `UNB` syntax identifier so every subsequent segment decodes
+    /// through the negotiated repertoire.
+    pub(crate) fn set_charset(&mut self, charset: Charset) {
+        self.charset = charset;
     }
 
     /// Resolve the optional `UNA` prefix. Peeks the first bytes of the
@@ -140,13 +155,22 @@ impl<R: BufRead> SegmentTokenizer<R> {
         }
     }
 
-    /// Read the next raw segment (terminator-delimited), or `None` at
-    /// clean end of stream.
+    /// Read the next segment (terminator-delimited) and decode it through
+    /// the active [`Charset`], or `None` at clean end of stream.
     ///
     /// The terminator byte is consumed but not returned. A release char
     /// immediately before a terminator escapes it (the terminator is
     /// then literal data, not a boundary). CR/LF between segments is
-    /// dropped; CR/LF inside an element is preserved.
+    /// dropped; CR/LF inside an element is preserved. The raw segment bytes
+    /// are decoded once here (the shared framing layer that read them never
+    /// interprets bytes), so the in-band repertoire is honored without
+    /// touching segment framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Edifact`] when the segment bytes are not valid
+    /// in the active charset — a high byte under an ASCII repertoire, or
+    /// invalid UTF-8 under UNOY.
     pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
         self.initialize()?;
         skip_inter_segment_whitespace(&mut self.reader)?;
@@ -172,12 +196,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
             None => return Ok(None),
         };
 
-        let text = String::from_utf8(raw).map_err(|e| {
-            FormatError::Edifact(format!(
-                "segment is not valid UTF-8: {e}. Non-UTF-8 charsets \
-                 (UNOA/UNOB/Latin-1 high bytes) are not supported"
-            ))
-        })?;
+        let text = self.charset.decode(raw)?;
         Ok(Some(text))
     }
 }
@@ -387,5 +406,55 @@ mod tests {
         let mut t = tok(b"UNA:+");
         let err = t.next_segment().unwrap_err();
         assert!(matches!(err, FormatError::Edifact(msg) if msg.contains("UNA")));
+    }
+
+    #[test]
+    fn bootstrap_decodes_unb_with_high_byte_in_a_later_element() {
+        // The bootstrap charset must not break on a high byte before the
+        // syntax identifier is known: a UNB carrying a Latin-1 byte 0xE9 in
+        // a sender field still decodes (the tag/syntax id are ASCII).
+        let mut data = b"UNB+UNOC:3+Caf".to_vec();
+        data.push(0xE9);
+        data.push(b'\'');
+        let mut t = SegmentTokenizer::new(Cursor::new(data));
+        let first = t.next_segment().unwrap().unwrap();
+        assert_eq!(first, "UNB+UNOC:3+Café");
+    }
+
+    #[test]
+    fn rearmed_latin1_decodes_high_byte_body_segment() {
+        // After the UNB is decoded under the bootstrap charset, re-arming to
+        // Latin-1 (as the reader does once it parses UNOC) lets a body
+        // segment carrying a Latin-1 high byte decode correctly.
+        let mut body = b"NAD+BY+Caf".to_vec();
+        body.push(0xE9);
+        body.push(b'\'');
+        let mut full = b"UNB+UNOC:3+S+R'".to_vec();
+        full.extend_from_slice(&body);
+        let mut t = SegmentTokenizer::new(Cursor::new(full));
+        let unb = t.next_segment().unwrap().unwrap();
+        assert_eq!(unb, "UNB+UNOC:3+S+R");
+        // The reader re-arms here, between segment 1 (UNB) and segment 2.
+        t.set_charset(Charset::Latin1);
+        let nad = t.next_segment().unwrap().unwrap();
+        let parsed = split_segment(&nad, &t.delimiters());
+        assert_eq!(parsed.tag, "NAD");
+        assert_eq!(parsed.elements, vec!["BY".to_string(), "Café".to_string()]);
+    }
+
+    #[test]
+    fn high_byte_body_segment_rejected_under_ascii_charset() {
+        // The same body bytes under a UNOA/UNOB ASCII repertoire fail loud
+        // rather than silently reinterpreting the high byte.
+        let mut body = b"NAD+BY+Caf".to_vec();
+        body.push(0xE9);
+        body.push(b'\'');
+        let mut full = b"UNB+UNOA:1+S+R'".to_vec();
+        full.extend_from_slice(&body);
+        let mut t = SegmentTokenizer::new(Cursor::new(full));
+        let _ = t.next_segment().unwrap().unwrap(); // UNB under bootstrap
+        t.set_charset(Charset::Ascii);
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::Edifact(m) if m.contains("ASCII")));
     }
 }
