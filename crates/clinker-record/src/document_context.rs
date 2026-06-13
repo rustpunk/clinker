@@ -9,8 +9,7 @@
 //! body record: one column per declared section, each value the section's
 //! `Value::Map` payload. One [`Arc<Schema>`] backs the envelope, so the ambient
 //! `$doc` view (this module) and any node-input view a downstream consolidation
-//! node takes (via [`DocumentContext::envelope_record`]) borrow the SAME record
-//! rather than a re-encoding.
+//! node takes borrow the SAME record rather than a re-encoding.
 //!
 //! Section names are arbitrary user-chosen identifiers declared in the
 //! source's envelope config (no reserved names — `Head`, `Foot`,
@@ -116,8 +115,8 @@ impl DocumentGrain {
 ///
 /// The whole record is held behind ONE [`Arc<Schema>`]: the ambient `$doc`
 /// resolver reads it through [`DocumentContext::get_section_field`], and a
-/// downstream consolidation node borrows the same record via
-/// [`DocumentContext::envelope_record`] — neither re-encodes it.
+/// downstream consolidation node borrows the same record (via a crate-internal
+/// accessor that goes public with the Envelope node) — neither re-encodes it.
 #[derive(Debug, Clone)]
 pub struct EnvelopeRecord {
     schema: Arc<Schema>,
@@ -277,7 +276,10 @@ impl DocumentContext {
     /// The same single [`Arc<Schema>`] backs both this borrow and the ambient
     /// `$doc` resolution path ([`Self::get_section_field`] reads through it),
     /// so there is exactly one in-memory encoding of the envelope per document.
-    pub fn envelope_record(&self) -> &EnvelopeRecord {
+    ///
+    /// Crate-internal for now: the only cross-crate consumer is the Envelope
+    /// node, which lands separately; the public accessor lands with it.
+    fn envelope_record(&self) -> &EnvelopeRecord {
         &self.envelope
     }
 

@@ -33,18 +33,18 @@ use crate::error::FormatError;
 /// incrementally against `max_index_bytes`; the cap fires mid-build
 /// (before OOM), not post-hoc.
 pub struct DocArenaIndex {
-    /// Declared section names, in first-seen order. A reader's pre-scan
-    /// consults [`Self::wants_section`] before descending into a section,
-    /// so an undeclared section is skipped without materializing it.
-    wanted_sections: Vec<Box<str>>,
-    /// Field-level retention per section, consulted by [`Self::wants_field`]
-    /// so a reader coerces only the fields some program actually reads.
-    /// A section maps to `Some(set)` when every path into it names a concrete
-    /// field — only those fields are retained. It maps to `None` (retain all
-    /// fields) when any path references the whole section (empty field) or
-    /// reaches in by index, since an index selects an element of the
-    /// already-retained subtree and a whole-section reference needs every
-    /// field. Absent from the map ⇒ no path wants the section at all.
+    /// Field-level retention per section, in first-seen order. Its key set is
+    /// the declared section set: a reader's pre-scan consults
+    /// [`Self::wants_section`] (an O(1) key lookup here) before descending into
+    /// a section, so an undeclared section is skipped without materializing it,
+    /// and consults [`Self::wants_field`] so a reader coerces only the fields
+    /// some program actually reads. A section maps to `Some(set)` when every
+    /// path into it names a concrete field — only those fields are retained. It
+    /// maps to `None` (retain all fields) when any path references the whole
+    /// section (empty field) or reaches in by index, since an index selects an
+    /// element of the already-retained subtree and a whole-section reference
+    /// needs every field. Absent from the map ⇒ no path wants the section at
+    /// all.
     wanted_fields: IndexMap<Box<str>, Option<Vec<Box<str>>>>,
     /// Retained section subtrees, keyed by section name in insertion
     /// order. One entry per inserted section.
@@ -65,15 +65,8 @@ impl DocArenaIndex {
     /// sections. `max_index_bytes` caps total retained bytes; the cap is
     /// checked incrementally in [`Self::insert`].
     pub fn new(declared: &[DocPath], max_index_bytes: Option<usize>) -> Self {
-        let mut wanted_sections: Vec<Box<str>> = Vec::new();
         let mut wanted_fields: IndexMap<Box<str>, Option<Vec<Box<str>>>> = IndexMap::new();
         for path in declared {
-            if !wanted_sections
-                .iter()
-                .any(|s| s.as_ref() == path.section.as_ref())
-            {
-                wanted_sections.push(path.section.clone());
-            }
             // A whole-section reference (empty field) or any indexed reference
             // promotes the section to retain-all (`None`); a concrete field
             // adds to the section's set unless the section is already
@@ -90,7 +83,6 @@ impl DocArenaIndex {
             }
         }
         DocArenaIndex {
-            wanted_sections,
             wanted_fields,
             sections: IndexMap::new(),
             retained_bytes: 0,
@@ -101,14 +93,15 @@ impl DocArenaIndex {
     /// `true` when no path was declared — the reader's pre-scan can skip
     /// the document entirely.
     pub fn is_empty(&self) -> bool {
-        self.wanted_sections.is_empty()
+        self.wanted_fields.is_empty()
     }
 
     /// `true` when some declared path references `section` — the reader
     /// descends into the section; otherwise it skips the section without
-    /// materializing its subtree.
+    /// materializing its subtree. O(1): the declared section set is exactly
+    /// the `wanted_fields` key set.
     pub fn wants_section(&self, section: &str) -> bool {
-        self.wanted_sections.iter().any(|s| s.as_ref() == section)
+        self.wanted_fields.contains_key(section)
     }
 
     /// `true` when some declared path reads `field` of `section` — the reader
