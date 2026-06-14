@@ -1616,3 +1616,314 @@ nodes:
         "the rejection still names the trailer port specifically, got: {msg}"
     );
 }
+
+// ─── Declarative header/footer synthesis (orthogonal to the strategy) ────────
+//
+// An Envelope node may synthesize a fresh header (scalar CXL) and footer
+// (streaming aggregate CXL over the framed body) per output document. Synthesis
+// layers on top of EITHER strategy: under `concat` one document carries the
+// merged-body footer count; under `preserve` each document carries its own
+// grain's count. The synthesized sections render through the existing
+// `header_from_doc` / `footer_from_doc` writer path.
+
+/// A synthesis pipeline: source → body Transform → Envelope (with `header:` +
+/// `footer:` synthesis) → Output. `strategy` selects `concat` or `preserve`;
+/// `footer_field` is the single footer `field: <CXL aggregate>` line under the
+/// `interchange` section (e.g. `"record_count: count()"` or `"total: sum(id)"`).
+/// Keeping the footer to one field per pipeline keeps the rendered footer a
+/// single-cell row that [`synthesis_stats`] parses unambiguously.
+///
+/// The source declares two envelope sections so the writer's `header_from_doc:
+/// preamble` / `footer_from_doc: interchange` pass the feeding-source section-
+/// name check; the synthesized sections supply their runtime values.
+fn synthesis_pipeline(strategy: &str, footer_field: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: envelope_synth
+  vars:
+    sender_id: {{ type: string, default: "ACME" }}
+nodes:
+  - type: source
+    name: edi
+    config:
+      name: edi
+      type: csv
+      path: placeholder.csv
+      envelope:
+        sections:
+          preamble:
+            extract: {{ record_type: P }}
+            fields:
+              sender: string
+          interchange:
+            extract: {{ record_type: H }}
+            fields:
+              tag: string
+      schema:
+        - {{ name: id, type: int }}
+  - type: transform
+    name: body
+    input: edi
+    config:
+      cxl: |
+        emit id = id
+  - type: envelope
+    name: framed
+    body: body
+    config:
+      strategy: {strategy}
+      header:
+        preamble:
+          sender: $vars.sender_id
+      footer:
+        interchange:
+          {footer_field}
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      reconstruct_envelope: true
+      options:
+        envelope:
+          header_from_doc: preamble
+          footer_from_doc: interchange
+"#
+    )
+}
+
+/// Run a synthesis pipeline over a scripted step list, returning the written
+/// CSV bytes. `footer_field` is the single `field: <aggregate>` footer line.
+fn run_synthesis(strategy: &str, footer_field: &str, steps: Vec<Step>) -> String {
+    let mut config =
+        clinker_plan::config::parse_config(&synthesis_pipeline(strategy, footer_field))
+            .expect("parse synthesis pipeline");
+    for spanned in &mut config.nodes {
+        if let clinker_plan::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
+        {
+            body.source.path = None;
+        }
+    }
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile synthesis pipeline");
+
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "edi".to_string(),
+        SourceInput::Records(Box::new(ScriptedReader::new(steps))),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams {
+            execution_id: "synth-exec".to_string(),
+            batch_id: "synth-batch".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("drive synthesis pipeline");
+    buf.as_string()
+}
+
+/// Parse a synthesized-envelope CSV into `(header_senders, footer_counts)`.
+///
+/// The writer emits, per framed document: a header section row (the synthesized
+/// `preamble.sender` — a single non-numeric cell), then the body `id` rows (each
+/// a single numeric cell, the `id` column header suppressed under framing), then
+/// a footer section row (the synthesized `interchange.record_count` — a single
+/// numeric cell). A header row therefore opens a document and closes the
+/// previous document's numeric run; the LAST numeric cell of that run is the
+/// footer count (it follows every body row), and the remaining numerics are body
+/// ids. This recovers both synthesized values per document by emission order
+/// alone — no value-collision assumption.
+fn synthesis_stats(csv: &str) -> (Vec<String>, Vec<i64>) {
+    let mut headers: Vec<String> = Vec::new();
+    let mut footers: Vec<i64> = Vec::new();
+    let mut numeric_run: Vec<i64> = Vec::new();
+    // The final numeric of a document's run is its footer count; flush it when
+    // the next header opens (or at EOF).
+    fn flush(run: &mut Vec<i64>, footers: &mut Vec<i64>) {
+        if let Some(footer) = run.pop() {
+            footers.push(footer);
+        }
+        run.clear();
+    }
+    for line in csv.lines() {
+        let cells: Vec<&str> = line.split(',').collect();
+        match cells.as_slice() {
+            // A header row's lone cell is the non-numeric sender id; it opens a
+            // new document and closes the prior document's numeric run.
+            [only] if only.parse::<i64>().is_err() && !only.is_empty() => {
+                flush(&mut numeric_run, &mut footers);
+                headers.push((*only).to_string());
+            }
+            // A body id or the footer count — both single numeric cells.
+            [only] => {
+                if let Ok(n) = only.parse::<i64>() {
+                    numeric_run.push(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut numeric_run, &mut footers);
+    (headers, footers)
+}
+
+#[test]
+fn concat_synthesis_emits_one_footer_with_the_merged_body_count() {
+    // Two body documents (3 + 1 = 4 rows) sharing one header, so concat folds
+    // them without an E350 multi-header conflict. Under `concat` they collapse
+    // to ONE framed document, so the synthesized footer carries the SINGLE
+    // merged count (4) and the synthesized header renders `$vars.sender_id` once.
+    let mut steps = concat_doc("a.x12", "ISA", &[1, 2, 3]);
+    steps.extend(concat_doc("b.x12", "ISA", &[4]));
+
+    let csv = run_synthesis("concat", "record_count: count()", steps);
+    let (headers, footers) = synthesis_stats(&csv);
+    assert_eq!(
+        headers,
+        vec!["ACME".to_string()],
+        "concat synthesizes one header carrying the $vars-derived sender: {csv}"
+    );
+    assert_eq!(
+        footers,
+        vec![4],
+        "concat synthesizes one footer whose record_count is the merged body count: {csv}"
+    );
+}
+
+#[test]
+fn preserve_synthesis_emits_a_per_grain_footer_count() {
+    // The SAME two body documents under `preserve` stay separate, so each frames
+    // its own document with its OWN synthesized footer count (3, then 1) and its
+    // own synthesized header. This is the #574 acceptance differential: the same
+    // `footer: count()` yields one merged count under concat and per-grain counts
+    // under preserve.
+    let mut steps = concat_doc("a.x12", "ISA-A", &[1, 2, 3]);
+    steps.extend(concat_doc("b.x12", "ISA-B", &[4]));
+
+    let csv = run_synthesis("preserve", "record_count: count()", steps);
+    let (headers, footers) = synthesis_stats(&csv);
+    assert_eq!(
+        headers,
+        vec!["ACME".to_string(), "ACME".to_string()],
+        "preserve synthesizes one header per grain, each carrying the sender: {csv}"
+    );
+    assert_eq!(
+        footers,
+        vec![3, 1],
+        "preserve synthesizes a per-grain footer count (3 then 1), not a merged 4: {csv}"
+    );
+}
+
+#[test]
+fn synthesis_count_differs_between_concat_and_preserve() {
+    // The headline differential, asserted directly: one merged count vs two
+    // per-grain counts over the SAME body and the SAME `footer: count()`.
+    let steps = || {
+        let mut s = concat_doc("a.x12", "ISA", &[1, 2, 3]);
+        s.extend(concat_doc("b.x12", "ISA", &[4]));
+        s
+    };
+    let (_, concat_counts) =
+        synthesis_stats(&run_synthesis("concat", "record_count: count()", steps()));
+    let (_, preserve_counts) =
+        synthesis_stats(&run_synthesis("preserve", "record_count: count()", steps()));
+    assert_eq!(concat_counts, vec![4], "concat → one merged count");
+    assert_eq!(preserve_counts, vec![3, 1], "preserve → per-grain counts");
+    assert_ne!(
+        concat_counts, preserve_counts,
+        "synthesis is orthogonal to the strategy: the strategy decides the grain \
+         cardinality, so the same footer aggregate differs across the two"
+    );
+}
+
+// ─── Field-arg footer aggregates: the BindingArg::Field(idx) value path ──────
+//
+// `count()` folds through the `BindingArg::Wildcard` path (it ignores the row
+// value). A `sum(id)` / `min(id)` / `max(id)` footer instead folds through
+// `BindingArg::Field(idx)`, where `idx` is the compile-time field index
+// `extract_aggregates` resolves against the body input schema and the runtime
+// reads as `record.values()[idx]`. These tests fold a field aggregate over
+// KNOWN body ids and assert the EXACT rendered numeric value, so a compile-time
+// index misaligned with the runtime `record.values()` layout fails loudly here
+// — the gap a count-only suite would pass straight through.
+
+#[test]
+fn concat_synthesis_field_sum_renders_the_exact_merged_total() {
+    // ids [1,2,3] + [4] under concat → one document. `sum(id)` reads each
+    // record's `id` column through the Field path; the footer must render the
+    // exact merged total 10 (= 1+2+3+4), distinct from every body id so a
+    // wrong-column read could not coincidentally match.
+    let mut steps = concat_doc("a.x12", "ISA", &[1, 2, 3]);
+    steps.extend(concat_doc("b.x12", "ISA", &[4]));
+
+    let csv = run_synthesis("concat", "total: sum(id)", steps);
+    let (_, footers) = synthesis_stats(&csv);
+    assert_eq!(
+        footers,
+        vec![10],
+        "concat sum(id) folds the Field path over the merged body to 1+2+3+4=10: {csv}"
+    );
+}
+
+#[test]
+fn preserve_synthesis_field_sum_renders_the_per_grain_total() {
+    // The SAME body under preserve → two documents, each summing its OWN grain's
+    // ids through the Field path: grain A = 1+2+3 = 6, grain B = 4. A merged 10
+    // (or a swapped 4/6) would fail — proving the per-grain Field fold keys on
+    // the right records AND reads the right column.
+    let mut steps = concat_doc("a.x12", "ISA-A", &[1, 2, 3]);
+    steps.extend(concat_doc("b.x12", "ISA-B", &[4]));
+
+    let csv = run_synthesis("preserve", "total: sum(id)", steps);
+    let (_, footers) = synthesis_stats(&csv);
+    assert_eq!(
+        footers,
+        vec![6, 4],
+        "preserve sum(id) folds the Field path per grain to [6, 4], not a merged 10: {csv}"
+    );
+}
+
+#[test]
+fn concat_synthesis_field_min_and_max_render_the_exact_extremes() {
+    // min(id) and max(id) over [10,2,30,4] under concat must render 2 and 30 —
+    // the Field path feeds each `id` value into the Min / Max accumulator. Using
+    // unsorted ids whose extremes are interior values (not the first or last
+    // body row) makes a "reads the wrong slot" or "keeps the first/last seen"
+    // bug fail loudly.
+    let min_csv = run_synthesis("concat", "lowest: min(id)", {
+        let mut s = concat_doc("a.x12", "ISA", &[10, 2, 30]);
+        s.extend(concat_doc("b.x12", "ISA", &[4]));
+        s
+    });
+    let (_, min_footers) = synthesis_stats(&min_csv);
+    assert_eq!(
+        min_footers,
+        vec![2],
+        "concat min(id) folds the Field path to the true minimum 2: {min_csv}"
+    );
+
+    let max_csv = run_synthesis("concat", "highest: max(id)", {
+        let mut s = concat_doc("a.x12", "ISA", &[10, 2, 30]);
+        s.extend(concat_doc("b.x12", "ISA", &[4]));
+        s
+    });
+    let (_, max_footers) = synthesis_stats(&max_csv);
+    assert_eq!(
+        max_footers,
+        vec![30],
+        "concat max(id) folds the Field path to the true maximum 30: {max_csv}"
+    );
+}

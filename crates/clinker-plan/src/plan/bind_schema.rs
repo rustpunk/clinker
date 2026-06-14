@@ -131,6 +131,14 @@ pub struct CompileArtifacts {
     /// body typecheck (or the collect-mode path, which has no body)
     /// surface an empty map here.
     pub combine_resolved_columns: HashMap<String, crate::plan::execution::ResolvedColumnMap>,
+    /// Compiled declarative header/footer synthesis per Envelope node, keyed
+    /// by node name. Populated during binding (where the body input `Row` is
+    /// in scope) for every Envelope that declares a `config.header:` or
+    /// `config.footer:` map; consumed at lowering to attach the spec to
+    /// `PlanNode::Envelope.synthesis`. An Envelope declaring neither is absent
+    /// from this map and lowers with `synthesis: None`.
+    pub envelope_synthesis:
+        HashMap<String, Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
     /// Monotonic counter for fresh tail-variable IDs allocated during
     /// row-polymorphic propagation (composition input-port binding).
     /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
@@ -2059,10 +2067,31 @@ fn bind_schema_inner(
             // ambient `$doc` view, not the record schema. A wired `header:` port
             // replaces the framing header (not the record schema), so binding
             // reads only the body input for the output row here.
-            PipelineNode::Envelope { header, .. } => {
+            PipelineNode::Envelope { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.body.value, schema_by_name) {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
+                    // Compile declarative header/footer synthesis against the
+                    // body input `Row` (the Envelope's output row, since it does
+                    // not widen). Header scalars typecheck in `Row` mode and may
+                    // not reference a body column (E353); footer aggregates
+                    // typecheck in `GroupBy` mode with an empty group_by and must
+                    // be in the streaming allow-list (E354). Errors push onto
+                    // `diags` and the node lowers without a synthesis spec.
+                    if (!config.header.is_empty() || !config.footer.is_empty())
+                        && let Some(synthesis) = compile_envelope_synthesis(
+                            &name,
+                            config,
+                            &row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                            diags,
+                        )
+                    {
+                        artifacts
+                            .envelope_synthesis
+                            .insert(name.clone(), Arc::new(synthesis));
+                    }
                     artifacts
                         .typed
                         .insert(name, Arc::new(synthetic_typed_program(row)));
@@ -3433,6 +3462,344 @@ fn typecheck_cxl(
                 LabeledSpan::primary(span, String::new()),
             )
         })
+}
+
+/// Compile an Envelope node's declarative header/footer synthesis against the
+/// body input `Row` (the Envelope's output row, since it does not widen).
+///
+/// Returns `Some(spec)` when at least one section compiled cleanly; `None` when
+/// every declared section failed compilation (all errors already pushed onto
+/// `diags`). A section that fails to compile is dropped and its diagnostic is
+/// emitted, so a present spec carries only the sections the executor can run.
+///
+/// # Header sections
+///
+/// Each field is typechecked in [`AggregateMode::Row`] as a synthetic
+/// `emit <field> = <expr>` program (all of a section's fields in one program,
+/// so they share the typed side-tables). The header is emitted before any body
+/// record streams, so a body-column reference is meaningless — any
+/// [`Expr::FieldRef`] / [`Expr::QualifiedFieldRef`] in a header expression is
+/// rejected with **E353**.
+///
+/// # Footer sections
+///
+/// Each field is typechecked in [`AggregateMode::GroupBy`] with an empty
+/// group_by (the per-document grouping is external) and extracted via
+/// [`cxl::plan::extract_aggregates`]. Every binding must be in the streaming
+/// allow-list — `count` / `sum` / `avg` / `min` / `max`, the O(1)
+/// distributive/algebraic set — with a bare-field or `*` argument; a holistic
+/// aggregate (`collect`, `any`, `weighted_avg`) or a composed/two-arg argument
+/// is rejected with **E354**. Holistic functions that are not CXL functions at
+/// all (`median`, `mode`) already fail typechecking as unknown functions.
+#[allow(clippy::result_large_err)]
+fn compile_envelope_synthesis(
+    name: &str,
+    config: &crate::config::pipeline_node::EnvelopeBody,
+    body_row: &Row,
+    span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<crate::plan::envelope_synthesis::EnvelopeSynthesis> {
+    use crate::plan::envelope_synthesis::{
+        EnvelopeSynthesis, SynthesizedFooterSection, SynthesizedHeaderSection,
+    };
+
+    let mut header_sections: Vec<SynthesizedHeaderSection> = Vec::new();
+    for (section, fields) in &config.header {
+        if let Some(compiled) =
+            compile_header_section(name, section, fields, body_row, span, scoped_vars, diags)
+        {
+            header_sections.push(compiled);
+        }
+    }
+
+    let mut footer_sections: Vec<SynthesizedFooterSection> = Vec::new();
+    for (section, fields) in &config.footer {
+        if let Some(compiled) =
+            compile_footer_section(name, section, fields, body_row, span, scoped_vars, diags)
+        {
+            footer_sections.push(compiled);
+        }
+    }
+
+    let synthesis = EnvelopeSynthesis {
+        header: header_sections,
+        footer: footer_sections,
+    };
+    if synthesis.is_empty() {
+        None
+    } else {
+        Some(synthesis)
+    }
+}
+
+/// Compile one header section: typecheck all its fields together as a `Row`-mode
+/// program, then reject any body-column reference with E353. Returns `None` (and
+/// pushes a diagnostic) on a typecheck failure or an E353 rejection.
+#[allow(clippy::result_large_err)]
+fn compile_header_section(
+    name: &str,
+    section: &str,
+    fields: &IndexMap<String, crate::yaml::CxlSource>,
+    body_row: &Row,
+    span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<crate::plan::envelope_synthesis::SynthesizedHeaderSection> {
+    use crate::plan::envelope_synthesis::SynthesizedHeaderSection;
+
+    // One synthetic program per section: `emit <field> = <expr>` per field, in
+    // declaration order, so they typecheck together and share side-tables.
+    let mut program = String::new();
+    for (field, expr) in fields {
+        program.push_str("emit ");
+        program.push_str(field);
+        program.push_str(" = ");
+        program.push_str(expr.as_ref());
+        program.push('\n');
+    }
+
+    let typed = match typecheck_cxl(
+        &format!("{name}:header.{section}"),
+        &program,
+        body_row,
+        AggregateMode::Row,
+        span,
+        scoped_vars,
+    ) {
+        Ok(t) => t,
+        Err(d) => {
+            diags.push(d);
+            return None;
+        }
+    };
+
+    // Pair each field's typed emit expression by output name. A header field
+    // expression that references a body column is rejected: the header is
+    // emitted before the body streams, so a body value is not yet knowable.
+    let mut field_exprs: Vec<(Box<str>, Expr)> = Vec::new();
+    let mut rejected = false;
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |field, expr| {
+        if let Some(bad) = first_body_field_ref(expr) {
+            diags.push(
+                Diagnostic::error(
+                    "E353",
+                    format!(
+                        "envelope {name:?} header section {section:?} field {field:?} references \
+                         body column {bad:?} — the header is emitted before the body streams, so \
+                         it may read only $vars / $source / $pipeline / $doc, never a body field"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "compute the value from a document-open-knowable input ($vars / $source / \
+                     $pipeline / $doc), or move a body-derived value into a footer aggregate",
+                ),
+            );
+            rejected = true;
+        }
+        field_exprs.push((Box::from(field), expr.clone()));
+    });
+
+    if rejected {
+        return None;
+    }
+
+    Some(SynthesizedHeaderSection {
+        section: section.to_string(),
+        typed: Arc::new(typed),
+        fields: field_exprs,
+    })
+}
+
+/// The name of the first body-column reference reachable from `expr`, or `None`
+/// when the expression reads only document-open-knowable inputs ($-namespaces).
+/// A bare [`Expr::FieldRef`] is a body column; a [`Expr::QualifiedFieldRef`]'s
+/// dotted path is reported joined. `$source` / `$doc` / `$vars` / `$pipeline`
+/// accesses are NOT field references and pass.
+fn first_body_field_ref(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::FieldRef { name, .. } => Some(name.to_string()),
+        Expr::QualifiedFieldRef { parts, .. } => Some(
+            parts
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            first_body_field_ref(lhs).or_else(|| first_body_field_ref(rhs))
+        }
+        Expr::Unary { operand, .. } => first_body_field_ref(operand),
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => first_body_field_ref(condition)
+            .or_else(|| first_body_field_ref(then_branch))
+            .or_else(|| else_branch.as_deref().and_then(first_body_field_ref)),
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => first_body_field_ref(receiver).or_else(|| first_body_field_ref(index)),
+        Expr::MethodCall { receiver, args, .. } => {
+            first_body_field_ref(receiver).or_else(|| args.iter().find_map(first_body_field_ref))
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            args.iter().find_map(first_body_field_ref)
+        }
+        Expr::Match { subject, arms, .. } => subject
+            .as_deref()
+            .and_then(first_body_field_ref)
+            .or_else(|| {
+                arms.iter().find_map(|arm| {
+                    first_body_field_ref(&arm.pattern).or_else(|| first_body_field_ref(&arm.body))
+                })
+            }),
+        Expr::Closure { body, .. } => first_body_field_ref(body),
+        Expr::Literal { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => None,
+    }
+}
+
+/// Compile one footer section: typecheck its fields as a `GroupBy`-mode program
+/// with an empty group_by, extract the aggregates, then reject any binding
+/// outside the streaming allow-list (or with a composed argument) with E354.
+/// Returns `None` (and pushes a diagnostic) on any failure.
+#[allow(clippy::result_large_err)]
+fn compile_footer_section(
+    name: &str,
+    section: &str,
+    fields: &IndexMap<String, crate::yaml::CxlSource>,
+    body_row: &Row,
+    span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<crate::plan::envelope_synthesis::SynthesizedFooterSection> {
+    use clinker_record::accumulator::AggregateType;
+    use cxl::plan::BindingArg;
+
+    use crate::plan::envelope_synthesis::SynthesizedFooterSection;
+
+    let mut program = String::new();
+    for (field, expr) in fields {
+        program.push_str("emit ");
+        program.push_str(field);
+        program.push_str(" = ");
+        program.push_str(expr.as_ref());
+        program.push('\n');
+    }
+
+    let typed = match typecheck_cxl(
+        &format!("{name}:footer.{section}"),
+        &program,
+        body_row,
+        AggregateMode::GroupBy {
+            group_by_fields: HashSet::new(),
+        },
+        span,
+        scoped_vars,
+    ) {
+        Ok(t) => t,
+        Err(d) => {
+            diags.push(d);
+            return None;
+        }
+    };
+
+    let input_schema: Vec<String> = body_row
+        .field_names()
+        .map(|qf| qf.name.to_string())
+        .collect();
+    let compiled = match cxl::plan::extract_aggregates(&typed, &[], &input_schema) {
+        Ok(c) => c,
+        Err(errs) => {
+            for e in errs {
+                diags.push(Diagnostic::error(
+                    "E354",
+                    format!(
+                        "envelope {name:?} footer section {section:?}: aggregate extraction \
+                         failed: {}",
+                        e.message
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+            }
+            return None;
+        }
+    };
+
+    // Every binding must be a streaming distributive/algebraic aggregate over a
+    // bare field or `*`. Holistic / non-O(1) aggregates and composed (multi-arg
+    // or expression) arguments are not supported by the streaming footer fold.
+    let mut rejected = false;
+    for binding in &compiled.bindings {
+        let allowed_type = matches!(
+            binding.acc_type,
+            AggregateType::Count { .. }
+                | AggregateType::Sum
+                | AggregateType::Avg
+                | AggregateType::Min
+                | AggregateType::Max
+        );
+        if !allowed_type {
+            diags.push(
+                Diagnostic::error(
+                    "E354",
+                    format!(
+                        "envelope {name:?} footer section {section:?} uses aggregate {} \
+                         ({:?}), which is not a streaming footer aggregate — a footer fold \
+                         supports only count / sum / avg / min / max",
+                        binding.output_name, binding.acc_type
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "rewrite the footer with a count / sum / avg / min / max aggregate, or \
+                     compute a holistic value in an upstream Aggregate node",
+                ),
+            );
+            rejected = true;
+            continue;
+        }
+        if !matches!(binding.arg, BindingArg::Field(_) | BindingArg::Wildcard) {
+            diags.push(
+                Diagnostic::error(
+                    "E354",
+                    format!(
+                        "envelope {name:?} footer section {section:?} aggregate {} takes a \
+                         composed or multi-argument expression — a footer fold supports only a \
+                         bare field or `*` argument (count() / count(*) / sum(amount) / min(x))",
+                        binding.output_name
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(
+                    "project the composed value in an upstream Transform, then aggregate the \
+                     resulting bare column in the footer",
+                ),
+            );
+            rejected = true;
+        }
+    }
+
+    if rejected {
+        return None;
+    }
+
+    Some(SynthesizedFooterSection {
+        section: section.to_string(),
+        compiled: Arc::new(compiled),
+    })
 }
 
 /// Propagate an upstream row through a Transform node: start with all

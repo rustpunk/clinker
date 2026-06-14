@@ -3479,6 +3479,11 @@ pub(crate) fn lower_node_to_plan_node(
                     }
                 })
                 .unwrap_or_default();
+            // The compiled header/footer synthesis (when the node declared a
+            // `config.header:` / `config.footer:` map) was built during binding
+            // against the body input row and stashed in `CompileArtifacts`;
+            // attach it here. Absent → the node synthesizes nothing.
+            let synthesis = artifacts.envelope_synthesis.get(name).map(Arc::clone);
             Some(crate::plan::execution::PlanNode::Envelope {
                 name: name.to_string(),
                 span,
@@ -3486,6 +3491,7 @@ pub(crate) fn lower_node_to_plan_node(
                 header_input,
                 header_upstream: None,
                 output_schema: schema_from_bound(name),
+                synthesis,
             })
         }
     }

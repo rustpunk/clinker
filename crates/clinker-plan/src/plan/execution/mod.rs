@@ -264,6 +264,14 @@ pub enum PlanNode {
         /// not widen). Populated by `bind_schema`.
         #[serde(skip)]
         output_schema: Arc<Schema>,
+        /// Compiled declarative header/footer synthesis. `Some` iff the node
+        /// declared a `config.header:` or `config.footer:` map; the executor
+        /// then stamps the synthesized sections into each output document's
+        /// `EnvelopeRecord`. `None` when neither is declared. Holds non-serde
+        /// CXL artifacts (`Expr` / `TypedProgram` / `CompiledAggregate`), so it
+        /// is reconstructed at compile and never shipped through `--explain`.
+        #[serde(skip)]
+        synthesis: Option<Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
     },
     /// Planner-synthesized sort enforcer.
     ///

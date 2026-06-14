@@ -3,6 +3,7 @@ pub mod combine;
 pub mod compiled;
 pub mod composition_body;
 pub mod deferred_region;
+pub mod envelope_synthesis;
 pub mod execution;
 pub mod explain_provenance;
 pub mod extraction;

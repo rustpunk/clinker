@@ -1323,17 +1323,47 @@ pub struct RouteBody {
     pub default: String,
 }
 
-/// Envelope variant body. `body:` / `header:` / `trailer:` inputs live on
-/// [`EnvelopeHeader`], not here — this carries only the framing strategy.
+/// Envelope variant body. The `body:` / `header:` / `trailer:` input *ports*
+/// live on [`EnvelopeHeader`], not here — this carries the framing strategy and
+/// the optional declarative header/footer synthesis maps.
+///
+/// `header` / `footer` are **orthogonal** to `strategy`: the strategy is the
+/// document-cardinality axis (`preserve` = one document per body grain,
+/// `concat` = one consolidated document), while synthesis layers on top of
+/// either. So `footer: { interchange: { record_count: count() } }` emits the
+/// per-grain count under `preserve` and the single merged count under `concat`.
+///
+/// Both maps are keyed `section -> field -> CXL expression`. The section name is
+/// user-defined (it is the `EnvelopeRecord` section a downstream writer renders
+/// via `header_from_doc` / `footer_from_doc`); the inner [`IndexMap`] preserves
+/// field declaration order, which is the rendered cell order. The inner `header`
+/// field map here is distinct from the wired `header:` input port on
+/// [`EnvelopeHeader`] — a different key at a different nesting level.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct EnvelopeBody {
     #[serde(default)]
     pub strategy: EnvelopeStrategy,
+    /// Declarative header synthesis: `section -> field -> scalar CXL`. Each
+    /// expression is evaluated once per output document at its open, over
+    /// document-open-knowable inputs (`$vars` / `$source` / `$pipeline` / the
+    /// ambient `$doc.*` envelope). Body-field references are rejected at compile
+    /// time — the header is emitted before the body streams.
+    #[serde(default)]
+    pub header: IndexMap<String, IndexMap<String, CxlSource>>,
+    /// Declarative footer synthesis: `section -> field -> aggregate CXL`. Each
+    /// expression folds the document's body records as a streaming
+    /// distributive/algebraic reduction (`count` / `sum` / `avg` / `min` /
+    /// `max`), maintained as an O(1) accumulator per open grain and emitted at
+    /// the grain's close. Holistic and non-O(1) reductions are rejected at
+    /// compile time.
+    #[serde(default)]
+    pub footer: IndexMap<String, IndexMap<String, CxlSource>>,
 }
 
-/// Envelope framing strategy. The synthesizing (header-folding) strategies
-/// are additive variants in later slices.
+/// Envelope framing strategy — the document-cardinality axis. Declarative
+/// header/footer synthesis ([`EnvelopeBody::header`] / [`EnvelopeBody::footer`])
+/// layers on top of either variant.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeStrategy {
@@ -2745,5 +2775,98 @@ nodes:
                 && msg.contains("not yet supported"),
             "error must explain the not-yet-supported trailer wiring, got: {msg}"
         );
+    }
+
+    #[test]
+    fn envelope_footer_synthesis_parses_section_keyed() {
+        // A `footer:` map is section-keyed (section -> field -> aggregate CXL).
+        // The inner IndexMap must preserve declaration order, which is the
+        // rendered cell order.
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    config:\n      \
+             strategy: concat\n      footer:\n        interchange:\n          \
+             record_count: count()\n          total: sum(amount)\n",
+        );
+        let config: PipelineConfig =
+            crate::yaml::from_str(&yaml).expect("parse footer-synthesis envelope");
+        let (_, body) = envelope_of(&config);
+        assert_eq!(body.strategy, EnvelopeStrategy::Concat);
+        assert!(body.header.is_empty(), "no header synthesis declared");
+        let interchange = body
+            .footer
+            .get("interchange")
+            .expect("footer carries the `interchange` section");
+        let fields: Vec<(&str, &str)> = interchange
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_ref()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("record_count", "count()"), ("total", "sum(amount)")],
+            "footer fields preserve declaration order as rendered cell order"
+        );
+    }
+
+    #[test]
+    fn envelope_header_synthesis_parses_section_keyed() {
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    config:\n      \
+             strategy: preserve\n      header:\n        interchange:\n          \
+             sender: $vars.sender_id\n",
+        );
+        let config: PipelineConfig =
+            crate::yaml::from_str(&yaml).expect("parse header-synthesis envelope");
+        let (_, body) = envelope_of(&config);
+        assert!(body.footer.is_empty(), "no footer synthesis declared");
+        let interchange = body
+            .header
+            .get("interchange")
+            .expect("header carries the `interchange` section");
+        assert_eq!(
+            interchange.get("sender").map(|c| c.as_ref()),
+            Some("$vars.sender_id"),
+            "header field carries its scalar CXL source"
+        );
+    }
+
+    #[test]
+    fn envelope_synthesis_round_trips_through_serialize() {
+        // The header/footer maps survive a serialize → re-parse round trip.
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    config:\n      \
+             strategy: concat\n      header:\n        head:\n          \
+             who: $vars.sender_id\n      footer:\n        foot:\n          n: count()\n",
+        );
+        let config: PipelineConfig = crate::yaml::from_str(&yaml).expect("parse");
+        let envelope = config
+            .nodes
+            .iter()
+            .find(|n| matches!(n.value, PipelineNode::Envelope { .. }))
+            .expect("envelope node present");
+        let json = serde_json::to_value(&envelope.value).expect("serialize envelope node");
+        let reparsed: PipelineNode =
+            serde_json::from_value(json).expect("re-parse serialized envelope node");
+        match reparsed {
+            PipelineNode::Envelope { config, .. } => {
+                assert_eq!(config.strategy, EnvelopeStrategy::Concat);
+                assert_eq!(
+                    config
+                        .header
+                        .get("head")
+                        .and_then(|s| s.get("who"))
+                        .map(|c| c.as_ref()),
+                    Some("$vars.sender_id")
+                );
+                assert_eq!(
+                    config
+                        .footer
+                        .get("foot")
+                        .and_then(|s| s.get("n"))
+                        .map(|c| c.as_ref()),
+                    Some("count()")
+                );
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
     }
 }

@@ -2,7 +2,7 @@
 
 Envelope nodes frame a body stream into per-document documents. An Envelope is a discrete, composable stage you can place after **any** operator — a Transform, a Merge, a Combine, or an Aggregate — to declare "from here on, treat the records as belonging to framed documents." It mirrors the message/EDI/XML envelope-wrapper pattern (the Enterprise Integration Patterns *Envelope Wrapper*, XProc's `p:wrap-sequence`): the body is the payload, and the envelope is the document boundary around it.
 
-This page documents the `preserve` and `concat` strategies. The synthesizing (header-folding) strategies arrive in later releases.
+This page documents the `preserve` and `concat` framing strategies and the orthogonal `header:` / `footer:` synthesis that layers on top of either.
 
 ## Basic structure
 
@@ -127,7 +127,54 @@ upstream, or add a header-folding strategy that declares which header the
 consolidated document keeps.
 ```
 
-To resolve a conflict, either keep the documents separate with `preserve`, make the headers identical upstream (project them to the same sections and values), or — in a later release — declare a header-folding strategy that states which header the consolidated document keeps.
+To resolve a conflict, either keep the documents separate with `preserve`, make the headers identical upstream (project them to the same sections and values), or use `header:` synthesis (below) to regenerate a fresh consolidated header that does not depend on the source headers agreeing.
+
+## Synthesizing a header and footer
+
+`header:` and `footer:` are **orthogonal** to the framing strategy. The strategy decides *how many* output documents there are (`preserve` = one per body grain, `concat` = one consolidated); synthesis decides *what header and footer each of those documents carries*. The node computes a fresh header (declarative scalar expressions) and footer (streaming aggregates over the framed body) **per output document**, stamps them as named sections into the document's envelope, and the same `header_from_doc` / `footer_from_doc` writer path renders them.
+
+Both maps are keyed `section -> field -> CXL expression`. The section name is user-chosen — it is the envelope section a downstream [Output](output.md) renders via `header_from_doc` / `footer_from_doc`. The inner field map preserves declaration order, which is the rendered cell order. A synthesized section **overrides** an existing same-named section on the document (a regenerate); other sections ride through untouched.
+
+```yaml
+- type: envelope
+  name: framed
+  body: merged
+  config:
+    strategy: concat            # or preserve — synthesis works the same on either
+    header:                     # section -> field -> scalar CXL
+      interchange:
+        sender: $vars.sender_id
+        created: $pipeline.run_date
+    footer:                     # section -> field -> aggregate CXL
+      interchange:
+        record_count: count()
+        total: sum(amount)
+```
+
+### Header fields: evaluated once at document open
+
+A `header:` field is a scalar expression evaluated **once per output document, before the body streams**. It may read only inputs known at document open — pipeline configuration (`$vars`), per-document provenance (`$source`), pipeline-scope state (`$pipeline`), and the ambient envelope (`$doc.*`). It may **not** read a body column, because there is no "current body record" when the header is emitted; a body-column reference is rejected at compile time with **E353** (run `clinker explain --code E353`). Put body-derived values in a footer aggregate instead.
+
+### Footer fields: streaming aggregates over the body
+
+A `footer:` field folds the document's body records into a footer value at the document's close. The fold is an **O(1) accumulator per open document**, so it supports exactly the streaming distributive/algebraic aggregates over a **bare field or `*`**:
+
+| Aggregate | Example |
+|-----------|---------|
+| `count` | `count()`, `count(*)` |
+| `sum` | `sum(amount)` |
+| `avg` | `avg(amount)` |
+| `min` | `min(amount)` |
+| `max` | `max(amount)` |
+
+Anything else is rejected at compile time. A holistic or unbounded aggregate (`collect`, `any`, `weighted_avg`) or a composed/multi-argument aggregate (`sum(amount * 1.1)`, `weighted_avg(value, weight)`) raises **E354** (run `clinker explain --code E354`); a non-aggregate function (`median`, `mode`) fails earlier as an unknown function. Project a composed value in an upstream Transform, or compute a holistic value in an upstream Aggregate, then aggregate the bare column here.
+
+### Synthesis is orthogonal: the same footer differs across strategies
+
+Because the strategy sets the grain cardinality, the **same** `footer: { interchange: { record_count: count() } }` produces a different result on each strategy over the same body:
+
+- Under `strategy: preserve`, each body document frames its own output document, so each footer's `record_count` is **that document's** body count.
+- Under `strategy: concat`, the whole body collapses to one document, so the single footer's `record_count` is the **merged** body count.
 
 ## Placement
 
@@ -157,3 +204,5 @@ Placing the Envelope **after** a Combine or Aggregate is the intended use: it de
 Both strategies re-park the body into the node's own buffer slot, which the engine's memory arbitrator governs and spills to disk under pressure — so neither strategy is bounded by total input size held in RAM.
 
 `preserve` is a transparent framing pass-through: it forwards records and their document boundaries unchanged. `concat` additionally re-stamps each record onto the one consolidated document context and replaces the per-document boundaries with a single open/close pair; the header consolidation it does first groups the body records by document — one document's worth of body records shares one grain and one header — so it does one pass over the records to collect the distinct headers, comparing only one envelope per document (the work is bounded by the number of documents, not the number of body rows).
+
+`header:` / `footer:` synthesis adds, on top of the materialized body, one O(1) accumulator per footer field per open document — every allowed footer aggregate (`count` / `sum` / `avg` / `min` / `max`) holds a fixed-size state regardless of how many body rows it folds. So a document's footer state is independent of its body-row count, and synthesis stays within the node's bounded-memory model.
