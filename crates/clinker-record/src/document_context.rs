@@ -245,28 +245,27 @@ impl EnvelopeRecord {
 
     /// Compare two section payloads ignoring engine-injected `$`-prefixed keys.
     ///
-    /// Two `Value::Map` payloads agree when their non-`$` entries are equal as
-    /// a key→value set (order-independent, since [`Value`] map equality is by
-    /// key). A non-map payload (a malformed reader emission) is compared by
-    /// strict equality — there are no keys to filter, so the literal value must
-    /// match.
+    /// Two `Value::Map` payloads agree when their non-`$` top-level entries are
+    /// equal as a key→value set: the same set of non-`$` keys, each mapping to
+    /// an equal [`Value`]. The comparison is by keyed lookup, so it is
+    /// order-independent and allocation-free — no clone or sort. Only top-level
+    /// keys are filtered; a `$`-prefixed key nested inside a field value is
+    /// compared structurally, which is sound because readers inject their
+    /// engine shadow (`$raw`) at the section-payload root, never nested. A
+    /// non-map payload (a malformed reader emission) is compared by strict
+    /// equality — there are no keys to filter.
     fn section_payload_eq(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Map(am), Value::Map(bm)) => {
-                let user = |m: &IndexMap<Box<str>, Value>| -> Vec<(Box<str>, Value)> {
-                    m.iter()
-                        .filter(|(k, _)| !k.starts_with('$'))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
+                let user_key_count = |m: &IndexMap<Box<str>, Value>| {
+                    m.keys().filter(|k| !k.starts_with('$')).count()
                 };
-                let mut left = user(am);
-                let mut right = user(bm);
-                if left.len() != right.len() {
+                if user_key_count(am) != user_key_count(bm) {
                     return false;
                 }
-                left.sort_by(|x, y| x.0.cmp(&y.0));
-                right.sort_by(|x, y| x.0.cmp(&y.0));
-                left == right
+                am.iter()
+                    .filter(|(k, _)| !k.starts_with('$'))
+                    .all(|(k, v)| bm.get(&**k) == Some(v))
             }
             (a, b) => a == b,
         }
@@ -307,12 +306,13 @@ impl EnvelopeRecord {
 /// `body`) the readers carry, so two headers that agree on every user-visible
 /// field but differ in preserved raw bytes compare distinct.
 ///
-/// This is deliberately strict: the spill codec round-trips an envelope through
-/// postcard and the spill tests assert the rebuilt record equals the original
-/// down to its `$raw` bytes, which only holds under structural equality. For
-/// the *semantic* "do these name the same header" question — which must ignore
-/// the engine keys so two files differing only in a control number fold — use
-/// [`EnvelopeRecord::same_header`] instead.
+/// This is deliberately strict — it includes the engine-injected keys, so a
+/// spill round-trip that altered the preserved `$raw` bytes would be observable
+/// under whole-record equality. The strict-vs-semantic distinction is pinned by
+/// the `same_header` unit tests, which assert a record pair that `same_header`
+/// folds is still `!=` here. For the *semantic* "do these name the same header"
+/// question — which must ignore the engine keys so two files differing only in
+/// a control number fold — use [`EnvelopeRecord::same_header`] instead.
 ///
 /// Hand-written rather than derived because [`Schema`] has no `PartialEq`.
 impl PartialEq for EnvelopeRecord {
