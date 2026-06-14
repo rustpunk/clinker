@@ -53,12 +53,13 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
 };
+use crate::executor::envelope::distinct_body_headers;
 use crate::executor::node_buffer::DrainedEvents;
 use crate::executor::stream_event::{Punctuation, PunctuationKind};
 use clinker_plan::config::pipeline_node::EnvelopeStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
-use clinker_record::{DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord, Record};
+use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record};
 
 /// Execute the `Envelope` arm for `node_idx`. Drains the body predecessor and
 /// re-parks the framed body into this node's own `node_buffers` slot.
@@ -156,24 +157,12 @@ fn consolidate(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Fold the body grains' headers down to the distinct non-empty set, in one
-    // pass over the records: the first record of each grain is that output
-    // document, and its envelope is the document's header. The grain set bounds
-    // the work — O(records) hashset probes plus an O(grains²) `PartialEq` dedup
-    // (`EnvelopeRecord` is not `Hash`), both bounded by the document count.
-    let mut seen_grains: std::collections::HashSet<DocumentGrain> =
-        std::collections::HashSet::new();
-    let mut distinct_headers: Vec<&EnvelopeRecord> = Vec::new();
-    for (record, _) in &records {
-        let doc = record.doc_ctx();
-        if !seen_grains.insert(doc.grain()) {
-            continue;
-        }
-        let env = doc.envelope_record();
-        if !env.is_empty() && !distinct_headers.contains(&env) {
-            distinct_headers.push(env);
-        }
-    }
+    // Fold the body grains' headers down to the distinct non-empty set. Headers
+    // are deduped by `same_header`, so two documents that agree on every
+    // user-visible field fold to one even when their engine-preserved `$raw`
+    // bytes differ (e.g. an X12 `ISA` control number) — a structural compare
+    // would split them and wrongly raise E350.
+    let distinct_headers = distinct_body_headers(&records);
 
     if distinct_headers.len() >= 2 {
         return Err(PipelineError::EnvelopeMultiHeaderConflict {
@@ -182,10 +171,13 @@ fn consolidate(
         });
     }
 
-    let consolidated_header = match distinct_headers.first() {
-        Some(env) => (*env).clone(),
-        None => EnvelopeRecord::empty(),
-    };
+    // The consolidated document keeps the FIRST header's full `EnvelopeRecord`
+    // (engine keys included), so a reconstruct-envelope writer rebuilds from the
+    // first document's raw bytes.
+    let consolidated_header = distinct_headers
+        .into_iter()
+        .next()
+        .unwrap_or_else(EnvelopeRecord::empty);
 
     // The consolidated document inherits the first incoming document's source
     // file as its representative identity, preferring the first `DocumentOpen`.

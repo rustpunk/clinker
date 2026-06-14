@@ -56,6 +56,17 @@ enum Step {
         tag_val: &'static str,
         frame: FrameRole,
     },
+    /// Open a frame whose section carries the same user `tag` field PLUS an
+    /// engine-injected `$raw` key (an X12-style raw element shadow). The `raw`
+    /// value distinguishes two otherwise-identical headers, modeling the
+    /// interchange-control-number drift `same_header` must ignore.
+    OpenWithRaw {
+        file: &'static str,
+        name: &'static str,
+        tag_val: &'static str,
+        raw: &'static str,
+        frame: FrameRole,
+    },
     OpenHeaderless {
         file: &'static str,
         frame: FrameRole,
@@ -104,6 +115,18 @@ impl ScriptedReader {
         sections.insert(Box::from(name), Value::Map(Box::new(field)));
         sections
     }
+
+    /// Like [`Self::section`], but the section payload also carries an engine-
+    /// injected `$raw` key (the `$`-sigil convention the X12/EDIFACT/HL7 readers
+    /// use to stash lossless raw bytes alongside the user fields).
+    fn section_with_raw(name: &str, tag_val: &str, raw: &str) -> IndexMap<Box<str>, Value> {
+        let mut field = IndexMap::new();
+        field.insert(Box::from("tag"), Value::String(tag_val.into()));
+        field.insert(Box::from("$raw"), Value::String(raw.into()));
+        let mut sections = IndexMap::new();
+        sections.insert(Box::from(name), Value::Map(Box::new(field)));
+        sections
+    }
 }
 
 impl RecordSource for ScriptedReader {
@@ -123,6 +146,19 @@ impl RecordSource for ScriptedReader {
                     self.current_file = Some(self.file_arc(file));
                     self.pending_events.push(EnvelopeEvent::OpenLevel {
                         sections: Self::section(name, tag_val),
+                        frame,
+                    });
+                }
+                Step::OpenWithRaw {
+                    file,
+                    name,
+                    tag_val,
+                    raw,
+                    frame,
+                } => {
+                    self.current_file = Some(self.file_arc(file));
+                    self.pending_events.push(EnvelopeEvent::OpenLevel {
+                        sections: Self::section_with_raw(name, tag_val, raw),
                         frame,
                     });
                 }
@@ -790,6 +826,30 @@ fn concat_doc(file: &'static str, tag_val: &'static str, ids: &[i64]) -> Vec<Ste
     steps
 }
 
+/// One `NewFrame` document whose header carries `tag_val` AND an engine-injected
+/// `$raw` value, plus `id` body rows. Two such documents with the same `tag_val`
+/// but different `raw` model two files from one trading partner that differ only
+/// in an interchange control number stashed in the preserved raw bytes.
+fn concat_doc_with_raw(
+    file: &'static str,
+    tag_val: &'static str,
+    raw: &'static str,
+    ids: &[i64],
+) -> Vec<Step> {
+    let mut steps = vec![Step::OpenWithRaw {
+        file,
+        name: "interchange",
+        tag_val,
+        raw,
+        frame: FrameRole::NewFrame,
+    }];
+    for &id in ids {
+        steps.push(Step::Record { file, id });
+    }
+    steps.push(Step::Close { file });
+    steps
+}
+
 /// One genuinely headerless `NewFrame` document carrying `id` rows.
 fn concat_headerless_doc(file: &'static str, ids: &[i64]) -> Vec<Step> {
     let mut steps = vec![Step::OpenHeaderless {
@@ -948,6 +1008,62 @@ fn concat_two_distinct_headers_is_e350_conflict() {
         }
         other => panic!("expected the multi-header conflict variant, got: {other:?}"),
     }
+}
+
+#[test]
+fn concat_headers_differing_only_in_engine_raw_fold_without_conflict() {
+    // Two documents whose `interchange` headers agree on every user field
+    // (`tag = PARTNER`) but differ in the engine-preserved `$raw` bytes — the
+    // X12 interchange-control-number footgun. A structural compare would split
+    // them and raise E350; folding by header identity (ignoring the `$`-prefixed
+    // engine key) consolidates them into ONE document with no conflict. This
+    // would have tripped E350 before headers were compared by identity.
+    let mut steps = concat_doc_with_raw("a.x12", "PARTNER", "ISA*...*000000001", &[1, 2]);
+    steps.extend(concat_doc_with_raw(
+        "b.x12",
+        "PARTNER",
+        "ISA*...*000000002",
+        &[3],
+    ));
+
+    let csv =
+        run_concat(steps).expect("headers differing only in engine $raw must fold, not conflict");
+
+    // The footer-from-doc renders BOTH the user `tag` field and the engine
+    // `$raw` field, so this section's footer is a two-cell row (`tag,$raw`) —
+    // unlike the single-field sections `footer_stats` is tuned for. Count the
+    // footer rows directly: the body rows are `id,PARTNER` (numeric first cell),
+    // the lone footer is `PARTNER,<raw>` (non-numeric first cell).
+    let body_rows: Vec<&str> = csv
+        .lines()
+        .filter(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            c.first().is_some_and(|first| first.parse::<i64>().is_ok())
+        })
+        .collect();
+    let footer_rows: Vec<&str> = csv
+        .lines()
+        .filter(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            c.len() == 2 && c[0] == "PARTNER"
+        })
+        .collect();
+    assert_eq!(
+        footer_rows.len(),
+        1,
+        "headers differing only in $raw fold to ONE consolidated document (one footer): {csv}"
+    );
+    assert_eq!(
+        body_rows.len(),
+        3,
+        "all three body rows land under the one consolidated document: {csv}"
+    );
+    // The consolidated document keeps the FIRST document's full header, so its
+    // footer carries the first document's `$raw` (000000001), never the second's.
+    assert_eq!(
+        footer_rows[0], "PARTNER,ISA*...*000000001",
+        "the consolidated header is the FIRST document's full EnvelopeRecord, $raw included: {csv}"
+    );
 }
 
 #[test]
