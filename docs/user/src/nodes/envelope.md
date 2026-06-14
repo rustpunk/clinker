@@ -75,11 +75,13 @@ Re-stamping changes only the **framing** (the grain) and the ambient `$doc.*` vi
 
 ### The consolidated header, and the two-headers conflict
 
-One consolidated document can carry only **one** envelope header. `concat` derives it from the incoming documents' headers:
+One consolidated document can carry only **one** envelope header. `concat` derives it from the headers of the documents that contribute body records, taking one header per document:
 
 - **Every header agrees** (or there is only one) → the consolidated document carries that **common header**.
 - **No document carries a header** → the consolidated document is **headerless**.
 - **A headed document and a headerless document** → the single header wins; the headerless document coexists with it (no conflict).
+
+Only documents that contribute body records take part: a document that carries a header but no body records frames nothing once consolidated, so it never enters the comparison. Header identity is **structural** — two documents share a header when they declare the same sections, in the same order, with the same field values (including any raw content the reader preserves). Two files that differ only in an embedded control number therefore count as distinct headers.
 
 When the body carries **two or more distinct non-empty headers**, `concat` refuses to silently keep one and drop the rest. The run fails with **E350** (run `clinker explain --code E350` for the full write-up):
 

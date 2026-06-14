@@ -2053,11 +2053,12 @@ fn bind_schema_inner(
                     );
                 }
             }
-            // Envelope adopts the body input's schema verbatim — it does not
-            // widen (the `preserve` strategy passes body records through
-            // unchanged). The optional `header:` / `trailer:` ports are
-            // rejected when wired at `validate_config`, so binding reads only
-            // the body input here.
+            // Envelope adopts the body input's schema verbatim — neither
+            // strategy widens it: `preserve` passes body records through
+            // unchanged, and `concat` changes only the framing grain and the
+            // ambient `$doc` view, not the record schema. The optional
+            // `header:` / `trailer:` ports are rejected when wired at
+            // `validate_config`, so binding reads only the body input here.
             PipelineNode::Envelope { header, .. } => {
                 if let Some(upstream) = upstream_schema(&header.body.value, schema_by_name) {
                     let row = upstream.clone();

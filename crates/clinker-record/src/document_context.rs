@@ -212,15 +212,21 @@ impl EnvelopeRecord {
 }
 
 /// Two envelopes are equal when they declare the same section names in the
-/// same order AND carry the same positional payloads.
+/// same order and each section's payload compares equal.
 ///
-/// Hand-written rather than derived because [`Schema`] has no `PartialEq`:
-/// the comparison reaches into `schema.columns()` (a `[Box<str>]`) and the
-/// parallel `sections` (a `[Value]`), both of which compare. Concat's
-/// multi-header consolidation guard uses this to fold a body's per-document
-/// headers down to the distinct set: two documents whose headers compare
-/// equal share one common header; two distinct non-empty headers under one
-/// consolidated document are the conflict it rejects.
+/// The section-name list (`schema.columns()`, a `[Box<str>]`) is compared
+/// positionally, so the same sections in a different declared order are
+/// *distinct* headers. Each section's payload is a [`Value::Map`], whose
+/// equality is by key — field order within a section does not matter — but the
+/// payload includes any engine-injected keys (`$raw`, the SWIFT synthetic
+/// `body`) the readers carry, so two headers that agree on every user-visible
+/// field but differ in preserved raw bytes compare distinct.
+///
+/// Hand-written rather than derived because [`Schema`] has no `PartialEq`.
+/// Concat's multi-header consolidation guard uses this to fold a body's
+/// per-document headers down to the distinct set: two documents whose headers
+/// compare equal share one common header; two distinct non-empty headers under
+/// one consolidated document are the conflict it rejects.
 impl PartialEq for EnvelopeRecord {
     fn eq(&self, other: &Self) -> bool {
         self.schema.columns() == other.schema.columns() && self.sections == other.sections
