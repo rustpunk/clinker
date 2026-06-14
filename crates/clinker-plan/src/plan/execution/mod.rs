@@ -219,16 +219,20 @@ pub enum PlanNode {
         #[serde(skip)]
         output_schema: Arc<Schema>,
     },
-    /// Frames a body stream into per-document documents.
+    /// Frames a body stream into documents. Single-input, single-output.
     ///
-    /// Streaming single-output pass-through. With the `Preserve` strategy
-    /// every body record flows through with its document context and grain
-    /// unchanged, and the document-boundary punctuations are forwarded
-    /// verbatim — so a downstream Output frames byte-identically to today's
-    /// per-document framing. The node does not widen: its output schema is
-    /// the body input's schema. A wired header/trailer port is rejected at
-    /// plan validation this release, so the executor resolves the single body
-    /// predecessor topologically rather than carrying named port references.
+    /// `Preserve` is a transparent framing stage: every body record flows
+    /// through with its document context and grain unchanged and the
+    /// document-boundary punctuations are forwarded verbatim, so a downstream
+    /// Output frames byte-identically to today's per-document framing.
+    /// `Concat` consolidates: it drains the whole body, folds the per-document
+    /// headers to one, re-stamps every record onto a single consolidated
+    /// document context, and re-frames with one open/close pair — so a
+    /// multi-document body writes as one document. Neither strategy widens:
+    /// the output schema is the body input's schema. A wired header/trailer
+    /// port is rejected at plan validation this release, so the executor
+    /// resolves the single body predecessor topologically rather than carrying
+    /// named port references.
     Envelope {
         name: String,
         #[serde(skip)]
@@ -745,6 +749,7 @@ impl PlanNode {
             PlanNode::Envelope { name, strategy, .. } => {
                 let s = match strategy {
                     crate::config::pipeline_node::EnvelopeStrategy::Preserve => "preserve",
+                    crate::config::pipeline_node::EnvelopeStrategy::Concat => "concat",
                 };
                 format!("[envelope:{s}] {name}")
             }

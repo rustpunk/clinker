@@ -193,6 +193,18 @@ pub enum PipelineError {
         combine: String,
         driver_row: u64,
     },
+    /// E350 — an Envelope node with the `concat` strategy collapsed a
+    /// multi-document body into one framed document, but the body carried
+    /// two or more distinct non-empty envelope headers. One consolidated
+    /// document can frame only one header, so emitting it would silently
+    /// drop every header but one. Rather than shadow, concat rejects: the
+    /// run needs a header-folding strategy (e.g. choose one, regenerate, or
+    /// merge) to declare which header wins. `envelope` names the node.
+    /// Always aborts the run.
+    EnvelopeMultiHeaderConflict {
+        envelope: String,
+        header_count: usize,
+    },
     /// E320 — the cumulative on-disk size of the run's spill files crossed
     /// the configured `storage.spill.disk_cap_bytes` quota. Deliberately
     /// distinct from E310 (`MemoryBudgetExceeded`): a run can sit well
@@ -372,6 +384,19 @@ impl fmt::Display for PipelineError {
                 f,
                 "E319 combine '{combine}': on_miss: error — no matching build row \
                  for driver row {driver_row}"
+            ),
+            Self::EnvelopeMultiHeaderConflict {
+                envelope,
+                header_count,
+            } => write!(
+                f,
+                "E350 envelope '{envelope}': concat collapses the body into one \
+                 framed document, but the body carried {header_count} distinct \
+                 non-empty envelope headers — one document can frame only one \
+                 header, so concat will not silently drop the rest. Make the \
+                 headers identical upstream, or add a header-folding strategy \
+                 that declares which header the consolidated document keeps. \
+                 See: clinker explain --code E350"
             ),
             Self::SpillCapExceeded {
                 node,

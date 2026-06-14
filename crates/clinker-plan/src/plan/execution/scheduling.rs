@@ -1057,10 +1057,14 @@ fn compute_one(
         }
 
         PlanNode::Envelope { name, .. } => {
-            // Envelope `preserve` re-parks body records in drained order with
-            // their grains unchanged — it neither reorders, repartitions, nor
-            // transforms CK visibility — so the parent's ordering, partitioning,
-            // and CK set all flow through. Provenance is rewritten to point at
+            // Both Envelope strategies re-park body records in drained order and
+            // touch only the document grain / framing: `preserve` leaves each
+            // record's grain untouched, while `concat` re-stamps every record
+            // onto one consolidated grain. Neither reorders, repartitions, nor
+            // transforms CK visibility, and this model tracks sort-order,
+            // partitioning, and CK set — not the grain — so a grain/framing
+            // change is invisible to it and the parent's properties flow through
+            // unchanged for either strategy. Provenance is rewritten to point at
             // this node so explain can chain through, matching Route / Output.
             let parent = match parents.first() {
                 Some(p) => p,

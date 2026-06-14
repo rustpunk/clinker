@@ -154,6 +154,14 @@ impl EnvelopeRecord {
         }
     }
 
+    /// `true` when this envelope declares no sections — the headerless
+    /// envelope an empty-body document or a synthetic context carries.
+    /// Concat treats a headerless document as carrying no common header,
+    /// so empties coexist with a single real header without conflicting.
+    pub fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+
     /// The payload `Value` for a named section, or `None` when the section is
     /// undeclared on this envelope.
     fn section_value(&self, section: &str) -> Option<&Value> {
@@ -200,6 +208,28 @@ impl EnvelopeRecord {
             merged.insert(name.clone(), payload);
         }
         EnvelopeRecord::from_sections(merged)
+    }
+}
+
+/// Two envelopes are equal when they declare the same section names in the
+/// same order and each section's payload compares equal.
+///
+/// The section-name list (`schema.columns()`, a `[Box<str>]`) is compared
+/// positionally, so the same sections in a different declared order are
+/// *distinct* headers. Each section's payload is a [`Value::Map`], whose
+/// equality is by key — field order within a section does not matter — but the
+/// payload includes any engine-injected keys (`$raw`, the SWIFT synthetic
+/// `body`) the readers carry, so two headers that agree on every user-visible
+/// field but differ in preserved raw bytes compare distinct.
+///
+/// Hand-written rather than derived because [`Schema`] has no `PartialEq`.
+/// Concat's multi-header consolidation guard uses this to fold a body's
+/// per-document headers down to the distinct set: two documents whose headers
+/// compare equal share one common header; two distinct non-empty headers under
+/// one consolidated document are the conflict it rejects.
+impl PartialEq for EnvelopeRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema.columns() == other.schema.columns() && self.sections == other.sections
     }
 }
 
@@ -277,9 +307,10 @@ impl DocumentContext {
     /// `$doc` resolution path ([`Self::get_section_field`] reads through it),
     /// so there is exactly one in-memory encoding of the envelope per document.
     ///
-    /// Crate-internal for now: the only cross-crate consumer is the Envelope
-    /// node, which lands separately; the public accessor lands with it.
-    fn envelope_record(&self) -> &EnvelopeRecord {
+    /// The cross-crate consumer is the Envelope node's `concat` strategy: it
+    /// reads each incoming document's envelope to fold a body's per-document
+    /// headers down to one consolidated header (or reject a clash).
+    pub fn envelope_record(&self) -> &EnvelopeRecord {
         &self.envelope
     }
 
