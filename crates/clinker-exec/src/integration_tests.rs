@@ -71,7 +71,8 @@ mod tests {
                 | PipelineError::CompositionBodyError { .. }
                 | PipelineError::MemoryBudgetExceeded { .. }
                 | PipelineError::UnsatisfiableMemoryBudget { .. }
-                | PipelineError::CombineMissingMatch { .. },
+                | PipelineError::CombineMissingMatch { .. }
+                | PipelineError::EnvelopeMultiHeaderConflict { .. },
             ) => 1,
             Err(
                 PipelineError::Eval(_)

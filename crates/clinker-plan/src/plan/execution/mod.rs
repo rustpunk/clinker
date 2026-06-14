@@ -745,6 +745,7 @@ impl PlanNode {
             PlanNode::Envelope { name, strategy, .. } => {
                 let s = match strategy {
                     crate::config::pipeline_node::EnvelopeStrategy::Preserve => "preserve",
+                    crate::config::pipeline_node::EnvelopeStrategy::Concat => "concat",
                 };
                 format!("[envelope:{s}] {name}")
             }

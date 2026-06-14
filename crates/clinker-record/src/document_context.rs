@@ -154,6 +154,14 @@ impl EnvelopeRecord {
         }
     }
 
+    /// `true` when this envelope declares no sections — the headerless
+    /// envelope an empty-body document or a synthetic context carries.
+    /// Concat treats a headerless document as carrying no common header,
+    /// so empties coexist with a single real header without conflicting.
+    pub fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+
     /// The payload `Value` for a named section, or `None` when the section is
     /// undeclared on this envelope.
     fn section_value(&self, section: &str) -> Option<&Value> {
@@ -200,6 +208,22 @@ impl EnvelopeRecord {
             merged.insert(name.clone(), payload);
         }
         EnvelopeRecord::from_sections(merged)
+    }
+}
+
+/// Two envelopes are equal when they declare the same section names in the
+/// same order AND carry the same positional payloads.
+///
+/// Hand-written rather than derived because [`Schema`] has no `PartialEq`:
+/// the comparison reaches into `schema.columns()` (a `[Box<str>]`) and the
+/// parallel `sections` (a `[Value]`), both of which compare. Concat's
+/// multi-header consolidation guard uses this to fold a body's per-document
+/// headers down to the distinct set: two documents whose headers compare
+/// equal share one common header; two distinct non-empty headers under one
+/// consolidated document are the conflict it rejects.
+impl PartialEq for EnvelopeRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema.columns() == other.schema.columns() && self.sections == other.sections
     }
 }
 
@@ -277,9 +301,10 @@ impl DocumentContext {
     /// `$doc` resolution path ([`Self::get_section_field`] reads through it),
     /// so there is exactly one in-memory encoding of the envelope per document.
     ///
-    /// Crate-internal for now: the only cross-crate consumer is the Envelope
-    /// node, which lands separately; the public accessor lands with it.
-    fn envelope_record(&self) -> &EnvelopeRecord {
+    /// The cross-crate consumer is the Envelope node's `concat` strategy: it
+    /// reads each incoming document's envelope to fold a body's per-document
+    /// headers down to one consolidated header (or reject a clash).
+    pub fn envelope_record(&self) -> &EnvelopeRecord {
         &self.envelope
     }
 

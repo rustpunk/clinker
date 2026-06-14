@@ -1332,8 +1332,8 @@ pub struct EnvelopeBody {
     pub strategy: EnvelopeStrategy,
 }
 
-/// Envelope framing strategy. This slice ships `preserve`; the consolidation
-/// (`concat`) and synthesizing strategies are additive variants in later slices.
+/// Envelope framing strategy. The synthesizing (header-folding) strategies
+/// are additive variants in later slices.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeStrategy {
@@ -1342,6 +1342,13 @@ pub enum EnvelopeStrategy {
     /// their document context and grain unchanged.
     #[default]
     Preserve,
+    /// Collapse a multi-document body into ONE framed document: every body
+    /// record is re-stamped onto a single consolidated document context, so
+    /// the body opens and closes exactly once. The consolidated document
+    /// carries the body's common envelope header when every header agrees
+    /// (headerless documents coexist); two distinct non-empty headers under
+    /// the one document is rejected at runtime rather than silently shadowed.
+    Concat,
 }
 
 /// Merge variant body. `inputs:` lives on `MergeHeader`, not here.
@@ -2582,6 +2589,21 @@ nodes:
         assert!(header.header.is_none(), "no header port wired");
         assert!(header.trailer.is_none(), "no trailer port wired");
         assert_eq!(body.strategy, EnvelopeStrategy::Preserve);
+    }
+
+    #[test]
+    fn envelope_concat_parses_strategy() {
+        // `strategy: concat` selects the consolidation strategy — distinct
+        // from the `preserve` default — so a clash here would surface as the
+        // wrong framing arm at runtime.
+        let yaml = pipeline_with_envelope(
+            "  - type: envelope\n    name: framed\n    body: body\n    \
+             config: { strategy: concat }\n",
+        );
+        let config: PipelineConfig =
+            crate::yaml::from_str(&yaml).expect("parse concat-strategy envelope");
+        let (_, body) = envelope_of(&config);
+        assert_eq!(body.strategy, EnvelopeStrategy::Concat);
     }
 
     #[test]

@@ -138,6 +138,15 @@ impl Punctuation {
         self.doc_ctx.id()
     }
 
+    /// The full envelope context of the document this punctuation marks.
+    /// The Envelope node's `concat` strategy reads each `DocumentOpen`'s
+    /// context to fold a body's per-document headers into one consolidated
+    /// header — the punctuations are authoritative because they cover an
+    /// empty-body document a record scan would miss.
+    pub fn doc_ctx(&self) -> &Arc<DocumentContext> {
+        &self.doc_ctx
+    }
+
     /// Source file the marked document belongs to. Every envelope level of
     /// one file (the file-level document and each nested level) shares the
     /// same `source_file` Arc, so this identifies the OUTERMOST (file /
