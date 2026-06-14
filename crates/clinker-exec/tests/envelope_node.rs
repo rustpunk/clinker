@@ -1360,3 +1360,259 @@ fn concat_envelope_merges_all_files_into_one_aggregate_flush() {
         "concat and preserve must differ — concat merged the document framing",
     );
 }
+
+// ─── Wired `header:` port (transform-in-place header replacement) ────────
+//
+// A wired `header:` port replaces each body grain's ambient envelope with the
+// matching header record, attached by grain. These tests cover the plan-level
+// wiring (the header input resolves to its predecessor), the end-to-end error
+// path (a header grounded to no body grain aborts the whole run with E351), and
+// the still-rejected `trailer:` port. The grain-matched replacement itself is
+// proved by the `replace_headers_by_grain` unit tests in `envelope_dispatch`,
+// which control grains directly — two independent sources cannot share a grain.
+
+/// A two-source pipeline: a body source and a separate header source, each
+/// transformed and wired into an Envelope node as `body:` / `header:`.
+fn header_port_pipeline() -> String {
+    r#"
+pipeline:
+  name: envelope_header_port
+nodes:
+  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: csv
+      path: body.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: hdr_src
+    config:
+      name: hdr_src
+      type: csv
+      path: hdr.csv
+      schema:
+        - { name: id, type: int }
+  - type: transform
+    name: body
+    input: body_src
+    config:
+      cxl: "emit id = id"
+  - type: transform
+    name: hdr
+    input: hdr_src
+    config:
+      cxl: "emit id = id"
+  - type: envelope
+    name: framed
+    body: body
+    header: hdr
+    config: { strategy: preserve }
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    .to_string()
+}
+
+#[test]
+fn wired_header_resolves_to_its_predecessor() {
+    // The Envelope's `header_input` lowers to the producer name `hdr`, and the
+    // resolution post-pass stamps `header_upstream` with that producer's
+    // NodeIndex — distinct from the body predecessor. Without resolution the
+    // executor cannot tell the two predecessors apart.
+    use clinker_plan::plan::execution::PlanNode;
+
+    let config = clinker_plan::config::parse_config(&header_port_pipeline())
+        .expect("a wired header port parses and validates");
+    let compiled = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("a wired header port compiles");
+    let graph = &compiled.dag().graph;
+
+    let envelope_idx = graph
+        .node_indices()
+        .find(|&i| matches!(&graph[i], PlanNode::Envelope { .. }))
+        .expect("the plan has an Envelope node");
+
+    let PlanNode::Envelope {
+        header_input,
+        header_upstream,
+        ..
+    } = &graph[envelope_idx]
+    else {
+        unreachable!("located by the Envelope match above");
+    };
+    assert_eq!(
+        header_input, "hdr",
+        "the wired header producer name lowers onto the plan node"
+    );
+    let resolved = header_upstream.expect("the wired header resolves to a predecessor NodeIndex");
+    assert_eq!(
+        graph[resolved].name(),
+        "hdr",
+        "header_upstream points at the header producer, not the body"
+    );
+
+    // The header predecessor is genuinely one of the two incoming neighbors,
+    // and the OTHER one is the body — the discriminator the executor relies on.
+    let preds: Vec<_> = graph
+        .neighbors_directed(envelope_idx, petgraph::Direction::Incoming)
+        .collect();
+    assert_eq!(preds.len(), 2, "a wired header gives the Envelope 2 inputs");
+    assert!(
+        preds.contains(&resolved),
+        "the resolved header predecessor is an incoming neighbor"
+    );
+    let body_pred = preds
+        .iter()
+        .find(|&&p| p != resolved)
+        .expect("a distinct body predecessor remains");
+    assert_eq!(
+        graph[*body_pred].name(),
+        "body",
+        "the non-header predecessor is the body producer"
+    );
+}
+
+#[test]
+fn wired_header_grain_unmatched_to_body_is_e351_end_to_end() {
+    // Two independent sources mint independent document grains, so the header
+    // records ground to grains the body never carries. Driven through the full
+    // executor, the run aborts with E351 — proving the wired header is drained
+    // and attach-by-grain runs end to end, not just in isolation.
+    let mut config =
+        clinker_plan::config::parse_config(&header_port_pipeline()).expect("parse header pipeline");
+    for spanned in &mut config.nodes {
+        if let clinker_plan::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
+        {
+            body.source.path = None;
+        }
+    }
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile header pipeline");
+
+    // One body document (file b.csv) and one header document (file h.csv).
+    let body_steps = vec![
+        Step::Open {
+            file: "b.csv",
+            name: "interchange",
+            tag_val: "BODY",
+            frame: FrameRole::NewFrame,
+        },
+        Step::Record {
+            file: "b.csv",
+            id: 1,
+        },
+        Step::Close { file: "b.csv" },
+    ];
+    let hdr_steps = vec![
+        Step::Open {
+            file: "h.csv",
+            name: "interchange",
+            tag_val: "HEADER",
+            frame: FrameRole::NewFrame,
+        },
+        Step::Record {
+            file: "h.csv",
+            id: 9,
+        },
+        Step::Close { file: "h.csv" },
+    ];
+
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "body_src".to_string(),
+            SourceInput::Records(Box::new(ScriptedReader::new(body_steps))),
+        ),
+        (
+            "hdr_src".to_string(),
+            SourceInput::Records(Box::new(ScriptedReader::new(hdr_steps))),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    let err = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams {
+            execution_id: "hdr-exec".to_string(),
+            batch_id: "hdr-batch".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect_err("a header grounded to no body grain must abort the run");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("E351"),
+        "the unmatched-grain abort pins E351 end to end, got: {msg}"
+    );
+    match err {
+        clinker_plan::error::PipelineError::EnvelopeHeaderGrainUnmatched { envelope, .. } => {
+            assert_eq!(envelope, "framed", "the diagnostic names the Envelope node");
+        }
+        other => panic!("expected EnvelopeHeaderGrainUnmatched, got: {other:?}"),
+    }
+}
+
+#[test]
+fn wired_trailer_is_rejected_at_validation() {
+    // `trailer:` has no draining path yet, so a wired value is still a config
+    // error — narrowed from the prior header+trailer rejection to trailer only.
+    let yaml = r#"
+pipeline:
+  name: envelope_trailer
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: int }
+  - type: transform
+    name: body
+    input: src
+    config:
+      cxl: "emit id = id"
+  - type: transform
+    name: tail
+    input: src
+    config:
+      cxl: "emit id = id"
+  - type: envelope
+    name: framed
+    body: body
+    trailer: tail
+    config: { strategy: preserve }
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = clinker_plan::config::parse_config(yaml)
+        .expect_err("a wired trailer port is still rejected at validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("envelope node 'framed'")
+            && msg.contains("`trailer`")
+            && msg.contains("not yet supported"),
+        "the rejection still names the trailer port specifically, got: {msg}"
+    );
+}

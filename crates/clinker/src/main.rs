@@ -322,7 +322,9 @@ fn main() -> ExitCode {
                         | PipelineError::MemoryBudgetExceeded { .. }
                         | PipelineError::UnsatisfiableMemoryBudget { .. }
                         | PipelineError::CombineMissingMatch { .. }
-                        | PipelineError::EnvelopeMultiHeaderConflict { .. } => ExitCode::from(1),
+                        | PipelineError::EnvelopeMultiHeaderConflict { .. }
+                        | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
+                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. } => ExitCode::from(1),
                         // Disk-cap exceedance (E320) is a resource-exhaustion
                         // halt — the run filled its configured spill budget.
                         // Group it with the other infrastructure failures

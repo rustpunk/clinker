@@ -205,6 +205,36 @@ pub enum PipelineError {
         envelope: String,
         header_count: usize,
     },
+    /// E351 — an Envelope node with a wired `header:` port received a header
+    /// record whose document grain matches no in-flight body grain (or is the
+    /// synthetic / ungrounded grain a Transform stamps onto an in-pipeline-
+    /// synthesized record). The node attaches a header to a body strictly by
+    /// grain, so it cannot place a header that grounds to no body document —
+    /// doing so would either drop the header or mis-frame an unrelated document.
+    /// The fix is to carry the body's grain forward onto the header record: a
+    /// grain-preserving Transform of the source's promoted header keeps it, and
+    /// a replacement from a different source establishes it via a business-key
+    /// join against the body. `envelope` names the node; `grain` is the
+    /// offending header record's grain rendered for the diagnostic. Always
+    /// aborts the run.
+    EnvelopeHeaderGrainUnmatched {
+        envelope: String,
+        grain: String,
+    },
+    /// E352 — an Envelope node with a wired `header:` port received two or more
+    /// header records carrying the SAME body document grain. The node attaches
+    /// exactly one header per document grain, so a second header on a grain is
+    /// ambiguous: keeping last-write-wins would silently drop the earlier header
+    /// (data loss), and the node has no fold rule to reconcile them. The fix is
+    /// to deduplicate the header stream to one record per grain upstream — an
+    /// Aggregate or distinct keyed on the grain's business key, or a Transform
+    /// that emits a single rewritten header per source document. `envelope`
+    /// names the node; `grain` is the offending duplicated grain rendered for
+    /// the diagnostic. Always aborts the run.
+    EnvelopeHeaderMultipleForGrain {
+        envelope: String,
+        grain: String,
+    },
     /// E320 — the cumulative on-disk size of the run's spill files crossed
     /// the configured `storage.spill.disk_cap_bytes` quota. Deliberately
     /// distinct from E310 (`MemoryBudgetExceeded`): a run can sit well
@@ -397,6 +427,28 @@ impl fmt::Display for PipelineError {
                  headers identical upstream, or add a header-folding strategy \
                  that declares which header the consolidated document keeps. \
                  See: clinker explain --code E350"
+            ),
+            Self::EnvelopeHeaderGrainUnmatched { envelope, grain } => write!(
+                f,
+                "E351 envelope '{envelope}': a wired header record carries document \
+                 grain {grain}, which matches no in-flight body grain (or is a \
+                 synthetic / ungrounded grain). The node attaches a header to a body \
+                 strictly by grain, so it cannot place a header that grounds to no \
+                 body document. Carry the body's grain onto the header record — a \
+                 grain-preserving transform of the source's promoted header keeps it, \
+                 or a business-key join against the body establishes it. \
+                 See: clinker explain --code E351"
+            ),
+            Self::EnvelopeHeaderMultipleForGrain { envelope, grain } => write!(
+                f,
+                "E352 envelope '{envelope}': the wired header input carries two or \
+                 more records for document grain {grain} — exactly one header \
+                 record per document grain is required. The node attaches one \
+                 header per grain and has no rule to fold a second, so it will not \
+                 silently drop one. Deduplicate the header stream to one record \
+                 per grain upstream (an aggregate or distinct on the grain's \
+                 business key, or a transform that emits a single rewritten header \
+                 per source document). See: clinker explain --code E352"
             ),
             Self::SpillCapExceeded {
                 node,
