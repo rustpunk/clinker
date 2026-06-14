@@ -19,7 +19,10 @@ pub use composition::*;
 pub use dag::*;
 pub use enforcer::*;
 pub use explain::*;
-pub use graph_util::{compute_init_phase_node_set, single_predecessor};
+pub(crate) use graph_util::resolve_envelope_header_upstreams_in_graph;
+pub use graph_util::{
+    compute_init_phase_node_set, resolve_envelope_header_upstreams, single_predecessor,
+};
 pub use streaming_class::{
     StreamClass, certify_streaming_edge, classify_stream_nodes,
     compute_merge_interleave_fused_sources, compute_streaming_aggregate_ingest_edges,
@@ -229,15 +232,34 @@ pub enum PlanNode {
     /// headers to one, re-stamps every record onto a single consolidated
     /// document context, and re-frames with one open/close pair — so a
     /// multi-document body writes as one document. Neither strategy widens:
-    /// the output schema is the body input's schema. A wired header/trailer
-    /// port is rejected at plan validation this release, so the executor
-    /// resolves the single body predecessor topologically rather than carrying
-    /// named port references.
+    /// the output schema is the body input's schema.
+    ///
+    /// A wired `header:` port replaces each body grain's ambient envelope with a
+    /// matched header record carried on the same grain (transform-in-place header
+    /// replacement). `header_input` names that port's producer (empty when no
+    /// header is wired); `header_upstream` is its resolved predecessor
+    /// `NodeIndex`, so the executor distinguishes the header predecessor from the
+    /// body predecessor without re-deriving from input names. A wired `trailer:`
+    /// port stays rejected at plan validation this release.
     Envelope {
         name: String,
         #[serde(skip)]
         span: Span,
         strategy: crate::config::pipeline_node::EnvelopeStrategy,
+        /// Producer name of the wired `header:` port (with any `.port` suffix
+        /// retained as authored). Empty string when no header is wired, in which
+        /// case the node frames with each body grain's own ambient envelope.
+        /// Populated at lowering from the node's `header:` reference.
+        header_input: String,
+        /// `NodeIndex` of the wired header predecessor, resolved from
+        /// `header_input` against the Envelope's incoming neighbors during the
+        /// `resolve_envelope_header_upstreams` post-pass (mirroring Combine's
+        /// `driving_upstream` resolution, including the correlation-sort-prefix
+        /// alias). `None` when no header is wired or before the post-pass runs;
+        /// the executor reads it to drain the header stream separately from the
+        /// body stream.
+        #[serde(skip)]
+        header_upstream: Option<petgraph::graph::NodeIndex>,
         /// Output schema, adopted verbatim from the body input (Envelope does
         /// not widen). Populated by `bind_schema`.
         #[serde(skip)]

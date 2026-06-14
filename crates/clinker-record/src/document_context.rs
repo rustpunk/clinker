@@ -448,6 +448,27 @@ impl DocumentContext {
         }
     }
 
+    /// Build a context that keeps this document's framing identity — its
+    /// [`id`](Self::id), [`grain`](Self::grain), and [`source_file`](Self::source_file) —
+    /// but replaces its envelope wholesale with `envelope`.
+    ///
+    /// This is the transform-in-place header-replacement primitive: the
+    /// Envelope node's wired `header:` port frames each body grain with a
+    /// grain-matched replacement header, swapping the ambient header without
+    /// re-framing the document (the grain, the output-envelope reconstruction
+    /// key, is preserved exactly). Distinct from [`Self::child`] /
+    /// [`Self::child_frame`], which open a NESTED level and MERGE sections onto
+    /// the ancestry under a fresh id; this neither nests nor merges — it
+    /// overwrites the header on the same frame.
+    pub fn with_replaced_envelope(&self, envelope: EnvelopeRecord) -> Self {
+        Self {
+            id: self.id,
+            grain: self.grain,
+            source_file: Arc::clone(&self.source_file),
+            envelope,
+        }
+    }
+
     /// Resolve `$doc.<section>.<field>` by chained lookup. Returns
     /// `None` if either the section is undeclared on this document or
     /// the field is missing from the section's payload. CXL eval maps

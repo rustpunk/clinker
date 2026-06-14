@@ -1972,6 +1972,16 @@ impl PipelineConfig {
             self.pipeline.memory.limit.as_deref(),
         );
 
+        // Envelope header-port resolution post-pass. Runs after every DAG edge
+        // is built and correlation Sorts are spliced, so a wired `header:` port
+        // resolves to its predecessor `NodeIndex` (the executor reads it to
+        // drain the header stream separately from the body). Composition body
+        // mini-DAGs hold their own Envelope nodes, so sweep them too.
+        crate::plan::execution::resolve_envelope_header_upstreams(&mut dag);
+        for body in artifacts.composition_bodies.values_mut() {
+            crate::plan::execution::resolve_envelope_header_upstreams_in_graph(&mut body.graph);
+        }
+
         // Per-node input-volume byte estimates. Runs last among the
         // property passes so the resolved aggregation/combine strategies
         // are visible (blocking-ness is read from the same arbitration
@@ -3450,15 +3460,31 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(name),
             })
         }
-        // Envelope lowers to a single-output pass-through carrying the framing
-        // strategy and the body's (unchanged) output schema. A missing typed
-        // entry means bind_schema could not resolve the body input — skip.
-        PipelineNode::Envelope { config, .. } => {
+        // Envelope lowers carrying the framing strategy, the body's (unchanged)
+        // output schema, and — when a `header:` port is wired — the producer
+        // name of that header stream. The resolved `header_upstream` NodeIndex
+        // stays `None` here because the DAG edges (and any spliced correlation
+        // Sort) do not exist until after lowering; the
+        // `resolve_envelope_header_upstreams` post-pass fills it. A missing
+        // typed entry means bind_schema could not resolve the body input — skip.
+        PipelineNode::Envelope { header, config } => {
             artifacts.typed.get(name)?;
+            let header_input = header
+                .header
+                .as_ref()
+                .map(|h| match &h.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .unwrap_or_default();
             Some(crate::plan::execution::PlanNode::Envelope {
                 name: name.to_string(),
                 span,
                 strategy: config.strategy,
+                header_input,
+                header_upstream: None,
                 output_schema: schema_from_bound(name),
             })
         }
@@ -3995,27 +4021,21 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
-    // Reject a wired `header:` / `trailer:` port on an Envelope node. The
-    // `preserve` strategy frames each body record with the body's own ambient
-    // envelope and reads no second stream, so an explicit header/trailer input
-    // would silently do nothing. A later release wires them; until then a wired
-    // value is a clear configuration error rather than a no-op.
+    // Reject a wired `trailer:` port on an Envelope node. A wired `header:` is
+    // now a real port (it replaces each body grain's ambient envelope with a
+    // grain-matched header record), but `trailer:` has no draining path yet, so
+    // a wired value would silently do nothing. The undeclared-producer case for
+    // a wired `header:` is caught earlier by the unified input-reference pass
+    // (E004), exactly as for any other consumer input.
     for spanned in &config.nodes {
-        if let PipelineNode::Envelope { header, .. } = &spanned.value {
-            let wired = if header.header.is_some() {
-                Some("header")
-            } else if header.trailer.is_some() {
-                Some("trailer")
-            } else {
-                None
-            };
-            if let Some(port) = wired {
-                return Err(ConfigError::Validation(format!(
-                    "envelope node '{}': explicit `{port}` input wiring is not yet supported — \
-                     omit it to frame with the body's own envelope",
-                    header.name
-                )));
-            }
+        if let PipelineNode::Envelope { header, .. } = &spanned.value
+            && header.trailer.is_some()
+        {
+            return Err(ConfigError::Validation(format!(
+                "envelope node '{}': explicit `trailer` input wiring is not yet supported — \
+                 omit it to frame with the body's own envelope",
+                header.name
+            )));
         }
     }
 

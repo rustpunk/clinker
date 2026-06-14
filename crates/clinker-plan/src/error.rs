@@ -205,6 +205,22 @@ pub enum PipelineError {
         envelope: String,
         header_count: usize,
     },
+    /// E351 — an Envelope node with a wired `header:` port received a header
+    /// record whose document grain matches no in-flight body grain (or is the
+    /// synthetic / ungrounded grain a Transform stamps onto an in-pipeline-
+    /// synthesized record). The node attaches a header to a body strictly by
+    /// grain, so it cannot place a header that grounds to no body document —
+    /// doing so would either drop the header or mis-frame an unrelated document.
+    /// The fix is to carry the body's grain forward onto the header record: a
+    /// grain-preserving Transform of the source's promoted header keeps it, and
+    /// a replacement from a different source establishes it via a business-key
+    /// join against the body. `envelope` names the node; `grain` is the
+    /// offending header record's grain rendered for the diagnostic. Always
+    /// aborts the run.
+    EnvelopeHeaderGrainUnmatched {
+        envelope: String,
+        grain: String,
+    },
     /// E320 — the cumulative on-disk size of the run's spill files crossed
     /// the configured `storage.spill.disk_cap_bytes` quota. Deliberately
     /// distinct from E310 (`MemoryBudgetExceeded`): a run can sit well
@@ -397,6 +413,17 @@ impl fmt::Display for PipelineError {
                  headers identical upstream, or add a header-folding strategy \
                  that declares which header the consolidated document keeps. \
                  See: clinker explain --code E350"
+            ),
+            Self::EnvelopeHeaderGrainUnmatched { envelope, grain } => write!(
+                f,
+                "E351 envelope '{envelope}': a wired header record carries document \
+                 grain {grain}, which matches no in-flight body grain (or is a \
+                 synthetic / ungrounded grain). The node attaches a header to a body \
+                 strictly by grain, so it cannot place a header that grounds to no \
+                 body document. Carry the body's grain onto the header record — a \
+                 grain-preserving transform of the source's promoted header keeps it, \
+                 or a business-key join against the body establishes it. \
+                 See: clinker explain --code E351"
             ),
             Self::SpillCapExceeded {
                 node,

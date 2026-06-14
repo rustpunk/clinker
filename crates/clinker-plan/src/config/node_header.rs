@@ -234,17 +234,18 @@ impl Serialize for CombineHeader {
 /// Header for envelope nodes — a required `body:` input plus two optional
 /// `header:` / `trailer:` ports.
 ///
-/// The `body:` stream is the records the node frames into documents; the
-/// `header:` and `trailer:` ports name streams whose records prepend / append
-/// to each framed document. This slice accepts both optional ports in the YAML
-/// shape but rejects a *wired* value at plan validation — the `preserve`
-/// strategy frames each body record with the body's own ambient envelope and
-/// reads no second stream. A later release wires them.
+/// The `body:` stream is the records the node frames into documents. A wired
+/// `header:` port is a 1-row-per-grain header stream whose records **replace**
+/// each body document's ambient envelope, matched by [`DocumentGrain`]
+/// (transform-in-place header replacement). The `trailer:` port has no draining
+/// path yet — a wired value is rejected at plan validation this release.
 ///
 /// Each input reference carries a [`Spanned`] wrapper so a diagnostic on an
 /// undeclared upstream can point at the exact YAML line/column. The
 /// `Serialize` impl is hand-rolled to drop the spans and skip the two unset
 /// optional ports, so the YAML round-trip shape is unchanged.
+///
+/// [`DocumentGrain`]: clinker_record::DocumentGrain
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvelopeHeader {
@@ -253,11 +254,12 @@ pub struct EnvelopeHeader {
     pub description: Option<String>,
     /// The records this node frames into documents. Required.
     pub body: Spanned<NodeInput>,
-    /// Optional header-record stream. Accepted in config; a wired value is
-    /// rejected at plan validation this release (its draining lands later).
+    /// Optional header-record stream. A wired value replaces each body grain's
+    /// ambient envelope with the matching header record, attached by grain.
     #[serde(default)]
     pub header: Option<Spanned<NodeInput>>,
-    /// Optional trailer-record stream. Same not-yet-wired status as `header`.
+    /// Optional trailer-record stream. Rejected when wired this release — its
+    /// draining path lands later.
     #[serde(default)]
     pub trailer: Option<Spanned<NodeInput>>,
     #[serde(default, rename = "_notes")]

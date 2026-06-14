@@ -16,22 +16,46 @@ This page documents the `preserve` and `concat` strategies. The synthesizing (he
 
 The node reads its `body:` input and emits the same records, framed per document. A downstream [Output](output.md) with `reconstruct_envelope: true` then writes one framed document per body grain.
 
-## Inputs: `body`, and the not-yet-wired `header` / `trailer`
+## Inputs: `body`, the wired `header`, and the not-yet-wired `trailer`
 
 | Input | Required | Status |
 |-------|----------|--------|
 | `body` | yes | The records to frame into documents. |
-| `header` | no | A stream whose records prepend to each framed document. **Accepted in config but not yet wired** — a wired value is rejected at plan validation this release. |
-| `trailer` | no | A stream whose records append to each framed document. Same not-yet-wired status. |
+| `header` | no | A 1-row-per-grain header stream. A wired value **replaces** each body document's header with the matching header record, attached by document grain. |
+| `trailer` | no | A stream whose records append to each framed document. **Accepted in config but not yet wired** — a wired value is rejected at plan validation this release. |
 
-Wiring an explicit `header:` or `trailer:` input is rejected with a clear "not yet supported" message:
+When you omit `header:`, an Envelope frames each body record using the body's own **ambient envelope** — the document context every record already carries from its source.
+
+### Wiring a `header:` port replaces the document's header
+
+A wired `header:` input is a second stream carrying one header record per document, each on the **same document grain** as the body it frames. The node attaches a header to a body strictly **by grain**, so the header record reaching it must carry the body's grain — and the node then **replaces** that document's ambient header with the wired header record (the framing grain is preserved; only the header changes). This is *transform-in-place* header replacement: rewrite a header's values upstream — for example, override a batch id or stamp a run date — and frame the body with the rewritten header instead of the source's original.
+
+```yaml
+nodes:
+  # `rewrite_header` rewrites the source header's values while keeping each
+  # record's grain, so the rewritten header still grounds to its body document.
+  - type: envelope
+    name: framed
+    body: payments
+    header: rewrite_header
+    config: { strategy: preserve }
+```
+
+The header record must carry a body document's grain. A grain-preserving Transform of the source's promoted header keeps it; a replacement from a different source establishes it via a business-key join against the body. A header record whose grain matches **no** in-flight body document (or carries the synthetic, ungrounded grain a Transform stamps onto a record it builds from scratch) cannot be placed, so the run fails with **E351** (run `clinker explain --code E351` for the full write-up):
 
 ```
-envelope node 'framed': explicit `header` input wiring is not yet supported —
+envelope 'framed': a wired header record carries document grain <grain>, which
+matches no in-flight body grain (or is a synthetic / ungrounded grain). The node
+attaches a header to a body strictly by grain, so it cannot place a header that
+grounds to no body document.
+```
+
+A wired `trailer:` input is still rejected this release with a clear "not yet supported" message:
+
+```
+envelope node 'framed': explicit `trailer` input wiring is not yet supported —
 omit it to frame with the body's own envelope
 ```
-
-Until those ports are wired, an Envelope frames each body record using the body's own **ambient envelope** — the document context every record already carries from its source — rather than a second input stream.
 
 ## `strategy: preserve`
 

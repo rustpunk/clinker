@@ -153,12 +153,12 @@ pub enum PipelineNode {
     /// Combine / Aggregate), mirroring the message/EDI/XML envelope-wrapper
     /// prior art.
     ///
-    /// This slice ships the `preserve` strategy only — one framed document per
-    /// body grain, byte-identical to today's per-document framing. The body
-    /// records pass through with their document context and grain unchanged;
-    /// the optional `header:` / `trailer:` ports are accepted in config but a
-    /// wired value is rejected at plan validation until a later release wires
-    /// them.
+    /// The `preserve` strategy frames one document per body grain (byte-
+    /// identical to per-document framing); `concat` collapses a multi-document
+    /// body into one. A wired `header:` port replaces each body grain's ambient
+    /// envelope with a grain-matched header record (transform-in-place header
+    /// replacement); the `trailer:` port is accepted in config but rejected when
+    /// wired at plan validation until a later release wires it.
     Envelope {
         #[serde(flatten)]
         header: EnvelopeHeader,
@@ -2685,22 +2685,48 @@ nodes:
     }
 
     #[test]
-    fn envelope_rejects_wired_header_port() {
-        // A wired `header:` is accepted by the YAML shape but rejected at plan
-        // validation this release — `preserve` reads only the body's own
-        // ambient envelope. Pin the not-yet-supported message.
-        let yaml = pipeline_with_envelope(
-            "  - type: envelope\n    name: framed\n    body: body\n    header: body\n    \
-             config: { strategy: preserve }\n",
+    fn envelope_accepts_wired_header_port() {
+        // A wired `header:` is now a real port — it replaces each body grain's
+        // ambient envelope with a grain-matched header record — so validation
+        // must accept it and the parsed `EnvelopeHeader` must carry the wired
+        // reference. The header producer is a distinct transform off the source.
+        let yaml = format!(
+            r#"
+pipeline:
+  name: envelope_cfg
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: id, type: int }}
+  - type: transform
+    name: body
+    input: src
+    config:
+      cxl: "emit id = id"
+  - type: transform
+    name: hdr
+    input: src
+    config:
+      cxl: "emit id = id"
+{}"#,
+            "  - type: envelope\n    name: framed\n    body: body\n    header: hdr\n    \
+             config: { strategy: preserve }\n"
         );
-        let err = crate::config::parse_config(&yaml)
-            .expect_err("a wired header port must be rejected at validation");
-        let msg = err.to_string();
+        let config = crate::config::parse_config(&yaml)
+            .expect("a wired header port must pass validation now that it is a real port");
+        let (header, _) = envelope_of(&config);
         assert!(
-            msg.contains("envelope node 'framed'")
-                && msg.contains("`header`")
-                && msg.contains("not yet supported"),
-            "error must explain the not-yet-supported header wiring, got: {msg}"
+            matches!(&header.header, Some(h) if h.value.name() == "hdr"),
+            "the wired header reference must survive parse as `hdr`"
+        );
+        assert!(
+            header.trailer.is_none(),
+            "no trailer was wired in this fixture"
         );
     }
 
