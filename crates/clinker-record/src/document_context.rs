@@ -79,6 +79,11 @@ impl DocumentId {
 /// directly. Two contexts of the same frame (e.g. the `GS` and `ST` of one X12
 /// interchange) compare equal even though their own [`DocumentId`]s differ.
 ///
+/// One grain is one output document: the Envelope node's consolidation
+/// strategies group a materialized body by grain to derive its set of headers
+/// (the first record of each grain carries that document's header), so the
+/// grain is the join key between "a record" and "the document it frames into".
+///
 /// This is distinct from the document-DLQ's keying: the DLQ keys on
 /// `source_file` (the file grain), because a structural-count failure condemns
 /// a whole file. The two never co-execute — `reconstruct_envelope` and
@@ -117,6 +122,13 @@ impl DocumentGrain {
 /// resolver reads it through [`DocumentContext::get_section_field`], and a
 /// downstream consolidation node borrows the same record (via a crate-internal
 /// accessor that goes public with the Envelope node) — neither re-encodes it.
+///
+/// Two equality relations apply, for two different questions. [`PartialEq`] is
+/// literal/structural — engine keys included — and backs the spill round-trip.
+/// [`Self::same_header`] is semantic header identity: it excludes the
+/// `$`-prefixed engine keys so two headers that agree on every user-visible
+/// field fold even when their preserved raw bytes differ (e.g. an X12 `ISA`
+/// control number).
 #[derive(Debug, Clone)]
 pub struct EnvelopeRecord {
     schema: Arc<Schema>,
@@ -188,6 +200,78 @@ impl EnvelopeRecord {
         }
     }
 
+    /// Two envelopes name the same sections (positionally) and every section's
+    /// payload agrees on all *user-visible* fields — the semantic
+    /// header-identity relation, as distinct from the literal structural
+    /// [`PartialEq`].
+    ///
+    /// Why this differs from `PartialEq`: readers stash engine-internal keys
+    /// alongside the user-declared fields inside a section payload so a writer
+    /// can reconstruct the original bytes losslessly. The X12 / EDIFACT / HL7
+    /// readers carry a `$raw` element list under each header section, and that
+    /// list embeds interchange control numbers and timestamps that legitimately
+    /// vary between two files from the same trading partner. Under `PartialEq`
+    /// those two headers compare distinct — the bytes differ — so concat's
+    /// consolidation guard would reject them as a multi-header conflict even
+    /// though every addressable header field matches. `same_header` excludes
+    /// those engine keys so the two fold to one header.
+    ///
+    /// Exclusion rule: a `$`-prefixed key in a section payload is engine-
+    /// injected (the `$`-sigil system-namespace convention, matching CXL's
+    /// `$pipeline.*` / `$doc.*` and the readers' `$raw`) and is ignored on both
+    /// sides. User-declared section fields never start with `$`, so the rule
+    /// excludes exactly the reader-internal shadow and nothing a user authored.
+    ///
+    /// Section names are still compared positionally (the same sections in a
+    /// different declared order are distinct headers) and section fields by key
+    /// (field order within a section does not matter), exactly as `PartialEq`
+    /// does — `same_header` differs from `PartialEq` only in dropping the
+    /// `$`-prefixed keys before comparing each section's payload.
+    ///
+    /// When two headers are `same_header`-equal but differ in an excluded key,
+    /// the caller keeps ONE of the two full [`EnvelopeRecord`]s (engine keys
+    /// included) as the consolidated document's representative — concat keeps
+    /// the first document's, so the consolidated output reconstructs from the
+    /// first document's `$raw`.
+    pub fn same_header(&self, other: &EnvelopeRecord) -> bool {
+        if self.schema.columns() != other.schema.columns() {
+            return false;
+        }
+        self.sections
+            .iter()
+            .zip(other.sections.iter())
+            .all(|(a, b)| Self::section_payload_eq(a, b))
+    }
+
+    /// Compare two section payloads ignoring engine-injected `$`-prefixed keys.
+    ///
+    /// Two `Value::Map` payloads agree when their non-`$` entries are equal as
+    /// a key→value set (order-independent, since [`Value`] map equality is by
+    /// key). A non-map payload (a malformed reader emission) is compared by
+    /// strict equality — there are no keys to filter, so the literal value must
+    /// match.
+    fn section_payload_eq(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Map(am), Value::Map(bm)) => {
+                let user = |m: &IndexMap<Box<str>, Value>| -> Vec<(Box<str>, Value)> {
+                    m.iter()
+                        .filter(|(k, _)| !k.starts_with('$'))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                };
+                let mut left = user(am);
+                let mut right = user(bm);
+                if left.len() != right.len() {
+                    return false;
+                }
+                left.sort_by(|x, y| x.0.cmp(&y.0));
+                right.sort_by(|x, y| x.0.cmp(&y.0));
+                left == right
+            }
+            (a, b) => a == b,
+        }
+    }
+
     /// Build a child envelope: this record's columns unioned with `child`'s,
     /// `child` shadowing on a same-name collision (innermost-wins). A colliding
     /// section keeps the ancestor's column position but takes the child's
@@ -211,8 +295,9 @@ impl EnvelopeRecord {
     }
 }
 
-/// Two envelopes are equal when they declare the same section names in the
-/// same order and each section's payload compares equal.
+/// Literal, structural equality: two envelopes are equal when they declare the
+/// same section names in the same order and each section's payload compares
+/// byte-for-byte equal — engine-injected keys included.
 ///
 /// The section-name list (`schema.columns()`, a `[Box<str>]`) is compared
 /// positionally, so the same sections in a different declared order are
@@ -222,11 +307,14 @@ impl EnvelopeRecord {
 /// `body`) the readers carry, so two headers that agree on every user-visible
 /// field but differ in preserved raw bytes compare distinct.
 ///
+/// This is deliberately strict: the spill codec round-trips an envelope through
+/// postcard and the spill tests assert the rebuilt record equals the original
+/// down to its `$raw` bytes, which only holds under structural equality. For
+/// the *semantic* "do these name the same header" question — which must ignore
+/// the engine keys so two files differing only in a control number fold — use
+/// [`EnvelopeRecord::same_header`] instead.
+///
 /// Hand-written rather than derived because [`Schema`] has no `PartialEq`.
-/// Concat's multi-header consolidation guard uses this to fold a body's
-/// per-document headers down to the distinct set: two documents whose headers
-/// compare equal share one common header; two distinct non-empty headers under
-/// one consolidated document are the conflict it rejects.
 impl PartialEq for EnvelopeRecord {
     fn eq(&self, other: &Self) -> bool {
         self.schema.columns() == other.schema.columns() && self.sections == other.sections
@@ -777,6 +865,149 @@ mod tests {
             ),
             other => panic!("expected Value::Map, got {other:?}"),
         }
+    }
+
+    fn section_with(fields: &[(&str, Value)]) -> Value {
+        make_section(fields)
+    }
+
+    #[test]
+    fn same_header_ignores_dollar_prefixed_engine_keys() {
+        // Two X12-style headers identical in every user field but differing in
+        // the engine-preserved `$raw` element list (one carries an interchange
+        // control number, the other does not). `same_header` must fold them;
+        // `PartialEq` must still split them — the spill round-trip depends on
+        // the strict relation.
+        let mut a = IndexMap::new();
+        a.insert(
+            Box::from("interchange"),
+            section_with(&[
+                ("sender", Value::String("ACME".into())),
+                (
+                    "$raw",
+                    Value::Array(vec![Value::String("ISA*00*...*000000001".into())]),
+                ),
+            ]),
+        );
+        let mut b = IndexMap::new();
+        b.insert(
+            Box::from("interchange"),
+            section_with(&[
+                ("sender", Value::String("ACME".into())),
+                (
+                    "$raw",
+                    Value::Array(vec![Value::String("ISA*00*...*000000002".into())]),
+                ),
+            ]),
+        );
+        let ea = envelope(a);
+        let eb = envelope(b);
+
+        assert!(
+            ea.same_header(&eb),
+            "headers agreeing on every user field fold despite differing $raw"
+        );
+        assert!(
+            eb.same_header(&ea),
+            "same_header is symmetric over the $raw difference"
+        );
+        assert_ne!(
+            ea, eb,
+            "PartialEq stays strict: the differing $raw makes the records structurally distinct"
+        );
+    }
+
+    #[test]
+    fn same_header_distinguishes_sections_in_different_declared_order() {
+        // Same two sections, declared in a different order — positionally
+        // distinct headers, so `same_header` is FALSE.
+        let mut a = IndexMap::new();
+        a.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
+        a.insert(Box::from("foot"), section_with(&[("k", Value::Integer(2))]));
+        let mut b = IndexMap::new();
+        b.insert(Box::from("foot"), section_with(&[("k", Value::Integer(2))]));
+        b.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
+
+        assert!(
+            !envelope(a).same_header(&envelope(b)),
+            "the same sections in a different declared order are distinct headers"
+        );
+    }
+
+    #[test]
+    fn same_header_ignores_field_order_within_a_section() {
+        // Same section with the SAME user fields in a different order →
+        // `same_header` TRUE (field order within a section does not matter).
+        let mut a = IndexMap::new();
+        a.insert(
+            Box::from("head"),
+            section_with(&[("x", Value::Integer(1)), ("y", Value::String("v".into()))]),
+        );
+        let mut b = IndexMap::new();
+        b.insert(
+            Box::from("head"),
+            section_with(&[("y", Value::String("v".into())), ("x", Value::Integer(1))]),
+        );
+
+        assert!(
+            envelope(a).same_header(&envelope(b)),
+            "field order within a section is irrelevant to header identity"
+        );
+    }
+
+    #[test]
+    fn same_header_distinguishes_differing_user_fields() {
+        // A real user-field difference (not an engine key) must split headers,
+        // proving the exclusion rule does not over-fold.
+        let mut a = IndexMap::new();
+        a.insert(
+            Box::from("head"),
+            section_with(&[("sender", Value::String("ACME".into()))]),
+        );
+        let mut b = IndexMap::new();
+        b.insert(
+            Box::from("head"),
+            section_with(&[("sender", Value::String("OTHER".into()))]),
+        );
+
+        assert!(
+            !envelope(a).same_header(&envelope(b)),
+            "a differing user field makes two headers distinct"
+        );
+    }
+
+    #[test]
+    fn same_header_swift_body_field_is_compared_not_excluded() {
+        // The SWIFT `body` key is NOT `$`-prefixed: it is the sole, user-
+        // addressable field of a service-block section, so it is compared, not
+        // excluded. Two SWIFT-style headers with different `body` content are
+        // distinct — the exclusion rule covers only the `$raw` shadow.
+        let mut a = IndexMap::new();
+        a.insert(
+            Box::from("basic_header"),
+            section_with(&[("body", Value::String("F01BANKBEBB".into()))]),
+        );
+        let mut b = IndexMap::new();
+        b.insert(
+            Box::from("basic_header"),
+            section_with(&[("body", Value::String("F01OTHERBANK".into()))]),
+        );
+
+        assert!(
+            !envelope(a).same_header(&envelope(b)),
+            "the user-addressable SWIFT `body` field is compared, not excluded"
+        );
+    }
+
+    #[test]
+    fn same_header_empty_envelopes_are_equal() {
+        assert!(EnvelopeRecord::empty().same_header(&EnvelopeRecord::empty()));
+        let mut a = IndexMap::new();
+        a.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
+        assert!(
+            !envelope(a).same_header(&EnvelopeRecord::empty()),
+            "a non-empty header is not the same header as the empty envelope"
+        );
     }
 
     #[test]
