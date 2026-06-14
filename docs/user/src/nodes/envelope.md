@@ -50,6 +50,16 @@ attaches a header to a body strictly by grain, so it cannot place a header that
 grounds to no body document.
 ```
 
+Exactly **one** header record may carry each body document's grain. When the wired header stream carries **two or more** records on the same grain, the node has no rule to fold a second header onto an already-framed document, so it refuses to silently keep one and drop the rest. The run fails with **E352** (run `clinker explain --code E352` for the full write-up):
+
+```
+envelope 'framed': the wired header input carries two or more records for
+document grain <grain> — exactly one header record per document grain is
+required.
+```
+
+Deduplicate the header stream to one record per grain upstream — an aggregate or distinct on the grain's business key, or a Transform that emits a single rewritten header per source document.
+
 A wired `trailer:` input is still rejected this release with a clear "not yet supported" message:
 
 ```

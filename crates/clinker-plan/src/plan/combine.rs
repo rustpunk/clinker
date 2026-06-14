@@ -928,11 +928,10 @@ pub(crate) fn select_combine_strategies_in_graph(
                 graph
                     .neighbors_directed(idx, petgraph::Direction::Incoming)
                     .find(|&p| {
-                        let pname = graph[p].name();
-                        pname == driver_name.as_ref()
-                            || pname
-                                .strip_prefix(crate::plan::execution::CORRELATION_SORT_PREFIX)
-                                .is_some_and(|stripped| stripped == driver_name.as_ref())
+                        crate::plan::execution::matches_upstream_name(
+                            graph[p].name(),
+                            driver_name.as_ref(),
+                        )
                     })
             });
 

@@ -28,6 +28,23 @@ pub const CORRELATION_SORT_PREFIX: &str = "__correlation_sort_";
 /// User node names matching this prefix are rejected at compile time.
 pub const CORRELATION_COMMIT_PREFIX: &str = "__correlation_commit_";
 
+/// Match a predecessor node's name against a producer `target` name, treating a
+/// [`CORRELATION_SORT_PREFIX`]-prefixed Sort as an alias for the source it was
+/// spliced behind.
+///
+/// `inject_correlation_sort` splices a synthetic `__correlation_sort_<source>`
+/// Sort between a source and its consumers; the suffix is the original source
+/// name. An input named for that source therefore matches either the source
+/// directly or the splice alias. Shared by Combine driver resolution and Envelope
+/// header-port resolution, which both find a wired input among incoming neighbors
+/// by name.
+pub fn matches_upstream_name(node_name: &str, target: &str) -> bool {
+    node_name == target
+        || node_name
+            .strip_prefix(CORRELATION_SORT_PREFIX)
+            .is_some_and(|stripped| stripped == target)
+}
+
 impl ExecutionPlanDag {
     /// Enforcer-sort insertion.
     ///

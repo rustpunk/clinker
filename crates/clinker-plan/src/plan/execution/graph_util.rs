@@ -1,7 +1,7 @@
 //! Plan-graph lookups over a compiled [`ExecutionPlanDag`] shared by the
 //! planner's strategy-selection passes and the runtime dispatch.
 
-use super::{CORRELATION_SORT_PREFIX, ExecutionPlanDag, PlanNode};
+use super::{ExecutionPlanDag, PlanNode, matches_upstream_name};
 use crate::error::PipelineError;
 use petgraph::Direction;
 
@@ -129,13 +129,7 @@ pub(crate) fn resolve_envelope_header_upstreams_in_graph(
 
         let resolved = graph
             .neighbors_directed(idx, Direction::Incoming)
-            .find(|&p| {
-                let pname = graph[p].name();
-                pname == target
-                    || pname
-                        .strip_prefix(CORRELATION_SORT_PREFIX)
-                        .is_some_and(|stripped| stripped == target)
-            });
+            .find(|&p| matches_upstream_name(graph[p].name(), &target));
 
         if let PlanNode::Envelope {
             header_upstream, ..

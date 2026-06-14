@@ -88,6 +88,10 @@ use clinker_record::{DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord,
 /// Returns [`PipelineError::EnvelopeHeaderGrainUnmatched`] (E351) when a wired
 /// header record carries a grain that grounds to no in-flight body grain (or is
 /// the synthetic / ungrounded grain), so the node cannot place it by grain.
+///
+/// Returns [`PipelineError::EnvelopeHeaderMultipleForGrain`] (E352) when the
+/// wired header stream carries two or more records for one body grain — exactly
+/// one header record per document grain is required.
 pub(crate) fn dispatch_envelope(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -132,6 +136,10 @@ pub(crate) fn dispatch_envelope(
     // per-strategy step, so `preserve` forwards the replaced headers verbatim
     // and `concat` folds them — the replacement is strategy-independent.
     if let Some(header_pred) = header_pred {
+        // The header stream's own punctuations are intentionally dropped: the
+        // body's punctuations drive output framing, and the header is a
+        // 1-row-per-grain metadata stream whose document boundaries are not part
+        // of the framed body.
         let (header_records, _header_puncts) = match drain_node_buffer_slot(ctx, header_pred) {
             Some(nb) => nb.drain_split()?,
             None => (Vec::new(), Vec::new()),
@@ -245,7 +253,9 @@ fn body_predecessor_excluding(
 /// ambient envelope.
 ///
 /// Records re-stamped onto the same grain share one `Arc<DocumentContext>`, so
-/// the replacement allocates one context per replaced grain, not per record.
+/// the replacement allocates one context per replaced grain, not per record. The
+/// header `EnvelopeRecord` is cloned exactly once per grain — when that single
+/// shared context is built — never copied into an intermediate map.
 ///
 /// # Errors
 ///
@@ -253,6 +263,10 @@ fn body_predecessor_excluding(
 /// record carries the synthetic grain (an ungrounded, in-pipeline-synthesized
 /// record) or a grain that matches no in-flight body document — the node cannot
 /// place a header that grounds to no body.
+///
+/// Returns [`PipelineError::EnvelopeHeaderMultipleForGrain`] (E352) when two or
+/// more header records carry the SAME body grain — exactly one header record per
+/// document grain is required, so a second is silent data loss, not a fold.
 fn replace_headers_by_grain(
     name: &str,
     body: &mut [(Record, u64)],
@@ -267,12 +281,16 @@ fn replace_headers_by_grain(
     let body_grains: std::collections::HashSet<DocumentGrain> =
         body.iter().map(|(r, _)| r.doc_ctx().grain()).collect();
 
-    // Map each body grain to its replacement header record. Reject a header
-    // whose grain grounds to no body document (E351). A header carrying the
-    // synthetic grain is rejected by the same membership test — the synthetic
-    // grain identifies no source document, so it is never a body grain.
-    let mut header_by_grain: HashMap<DocumentGrain, EnvelopeRecord> = HashMap::new();
-    for (header, _) in header_records {
+    // Index each body grain to its replacement header record (by position in
+    // `header_records`, so the envelope is not cloned here — it is cloned once,
+    // later, into the single shared context per grain). Reject a header whose
+    // grain grounds to no body document (E351); the synthetic grain fails the
+    // same membership test, as it names no source document. Reject a SECOND
+    // header on a grain already mapped (E352): one header per grain is the
+    // node's locked invariant, and last-write-wins would silently drop the
+    // first header.
+    let mut header_idx_by_grain: HashMap<DocumentGrain, usize> = HashMap::new();
+    for (pos, (header, _)) in header_records.iter().enumerate() {
         let grain = header.doc_ctx().grain();
         if !body_grains.contains(&grain) {
             return Err(PipelineError::EnvelopeHeaderGrainUnmatched {
@@ -280,19 +298,26 @@ fn replace_headers_by_grain(
                 grain: format!("{:?}", grain.document_id()),
             });
         }
-        header_by_grain.insert(grain, header.doc_ctx().envelope_record().clone());
+        if header_idx_by_grain.insert(grain, pos).is_some() {
+            return Err(PipelineError::EnvelopeHeaderMultipleForGrain {
+                envelope: name.to_string(),
+                grain: format!("{:?}", grain.document_id()),
+            });
+        }
     }
 
     // Re-stamp each matched body record with a context carrying the replacement
     // header on the same grain. Cache one rebuilt `Arc<DocumentContext>` per
-    // grain so records of a grain share it (a refcount bump, not a re-build).
+    // grain so records of a grain share it (a refcount bump, not a re-build);
+    // the header envelope is cloned exactly once, into that shared context.
     let mut rebuilt: HashMap<DocumentGrain, Arc<DocumentContext>> = HashMap::new();
     for (record, _) in body.iter_mut() {
         let grain = record.doc_ctx().grain();
-        let Some(replacement) = header_by_grain.get(&grain) else {
+        let Some(&header_pos) = header_idx_by_grain.get(&grain) else {
             continue;
         };
         let ctx = rebuilt.entry(grain).or_insert_with(|| {
+            let replacement = header_records[header_pos].0.doc_ctx().envelope_record();
             Arc::new(record.doc_ctx().with_replaced_envelope(replacement.clone()))
         });
         record.set_doc_ctx(Arc::clone(ctx));
@@ -599,6 +624,44 @@ mod tests {
         assert!(
             matches!(err, PipelineError::EnvelopeHeaderGrainUnmatched { .. }),
             "a synthetic grain is rejected as ungrounded: {err}"
+        );
+    }
+
+    #[test]
+    fn two_headers_on_one_grain_is_e352() {
+        // The wired header stream carries TWO records on grain A — a duplicate
+        // header for one body document. The node attaches exactly one header per
+        // grain and has no fold rule for a second, so it aborts with E352 rather
+        // than silently last-write-wins (which would drop the first header). Pin
+        // the code AND the variant payload.
+        let ctx_a = doc_ctx("a.x12", "ORIG-A");
+        let mut body = vec![(body_record(&ctx_a, 1), 0)];
+        let headers = vec![
+            (header_record(&ctx_a, header_envelope("REWRITE-1")), 0),
+            (header_record(&ctx_a, header_envelope("REWRITE-2")), 1),
+        ];
+
+        let err = replace_headers_by_grain("framed", &mut body, &headers)
+            .expect_err("two headers on one grain must abort");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E352"),
+            "the duplicate-header abort pins diagnostic code E352, got: {msg}"
+        );
+        match err {
+            PipelineError::EnvelopeHeaderMultipleForGrain { envelope, grain } => {
+                assert_eq!(envelope, "framed", "the diagnostic names the node");
+                let expected = format!("{:?}", ctx_a.grain().document_id());
+                assert_eq!(grain, expected, "the payload carries the duplicated grain");
+            }
+            other => panic!("expected EnvelopeHeaderMultipleForGrain, got: {other:?}"),
+        }
+
+        // The body is left untouched on the error path (no partial replacement).
+        assert_eq!(
+            batch_id_of(&body[0].0),
+            Some(Value::String("ORIG-A".into())),
+            "a rejected header stream leaves the body's ambient header intact"
         );
     }
 

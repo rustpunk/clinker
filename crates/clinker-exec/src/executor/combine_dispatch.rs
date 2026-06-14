@@ -183,16 +183,7 @@ pub(crate) fn dispatch_combine(
         .neighbors_directed(node_idx, Direction::Incoming)
         .collect();
     let predecessor_matches = |p: NodeIndex, target: &str| -> bool {
-        let pname = current_dag.graph[p].name();
-        if pname == target {
-            return true;
-        }
-        if let Some(stripped) =
-            pname.strip_prefix(clinker_plan::plan::execution::CORRELATION_SORT_PREFIX)
-        {
-            return stripped == target;
-        }
-        false
+        clinker_plan::plan::execution::matches_upstream_name(current_dag.graph[p].name(), target)
     };
     let driver_pred = predecessors
         .iter()
