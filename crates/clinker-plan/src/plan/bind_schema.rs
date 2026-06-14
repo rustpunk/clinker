@@ -2053,6 +2053,20 @@ fn bind_schema_inner(
                     );
                 }
             }
+            // Envelope adopts the body input's schema verbatim — it does not
+            // widen (the `preserve` strategy passes body records through
+            // unchanged). The optional `header:` / `trailer:` ports are
+            // rejected when wired at `validate_config`, so binding reads only
+            // the body input here.
+            PipelineNode::Envelope { header, .. } => {
+                if let Some(upstream) = upstream_schema(&header.body.value, schema_by_name) {
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                }
+            }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
             //
             // Combine compile runs as a single pass in `bind_combine`.
@@ -2529,6 +2543,20 @@ fn bind_composition(
                     wire(&r, None);
                 }
             }
+            PipelineNode::Envelope { header, .. } => {
+                let refs = std::iter::once(&header.body)
+                    .chain(header.header.iter())
+                    .chain(header.trailer.iter());
+                for ni in refs {
+                    let r = match &ni.value {
+                        crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                        crate::config::node_header::NodeInput::Port { node, port } => {
+                            format!("{node}.{port}")
+                        }
+                    };
+                    wire(&r, None);
+                }
+            }
         }
     }
 
@@ -2615,6 +2643,16 @@ fn bind_composition(
             PipelineNode::Combine { header, .. } => header
                 .input
                 .values()
+                .map(|ni| match &ni.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+            PipelineNode::Envelope { header, .. } => std::iter::once(&header.body)
+                .chain(header.header.iter())
+                .chain(header.trailer.iter())
                 .map(|ni| match &ni.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {

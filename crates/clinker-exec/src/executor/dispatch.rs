@@ -2749,6 +2749,15 @@ pub(crate) fn dispatch_plan_node(
             crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)?;
         }
 
+        PlanNode::Envelope { .. } => {
+            crate::executor::envelope_dispatch::dispatch_envelope(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            )?;
+        }
+
         PlanNode::Composition { .. } => {
             crate::executor::composition_dispatch::dispatch_composition(
                 ctx,

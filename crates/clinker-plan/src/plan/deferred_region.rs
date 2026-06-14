@@ -1016,8 +1016,11 @@ fn propagate_through_node_for_body(node: &PlanNode, set: &mut HashSet<String>) {
             // tighten this but only matters once a runtime consumer
             // exists.
         }
-        PlanNode::Merge { .. } | PlanNode::Sort { .. } | PlanNode::CorrelationCommit { .. } => {
-            // Passthrough.
+        PlanNode::Merge { .. }
+        | PlanNode::Sort { .. }
+        | PlanNode::Envelope { .. }
+        | PlanNode::CorrelationCommit { .. } => {
+            // Passthrough — body columns flow through unchanged.
         }
         PlanNode::Aggregation {
             config, compiled, ..

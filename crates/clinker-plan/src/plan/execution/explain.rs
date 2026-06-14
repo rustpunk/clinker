@@ -1382,6 +1382,7 @@ impl ExecutionPlanDag {
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
+                | PlanNode::Envelope { .. }
                 | PlanNode::Output { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }
@@ -1519,6 +1520,7 @@ impl ExecutionPlanDag {
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
+                | PlanNode::Envelope { .. }
                 | PlanNode::Output { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }

@@ -30,6 +30,7 @@
 - [Aggregate Nodes](nodes/aggregate.md)
 - [Reshape Nodes](nodes/reshape.md)
 - [Cull Nodes](nodes/cull.md)
+- [Envelope Nodes](nodes/envelope.md)
 - [Output Nodes](nodes/output.md)
 
 # Source Formats

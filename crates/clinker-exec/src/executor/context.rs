@@ -155,6 +155,12 @@ fn arcs_reachable_from(
                     stack.push(upstream.value.name().to_string());
                 }
             }
+            PipelineNode::Envelope { header, .. } => {
+                stack.push(header.body.value.name().to_string());
+                for inp in [&header.header, &header.trailer].into_iter().flatten() {
+                    stack.push(inp.value.name().to_string());
+                }
+            }
             other => {
                 if let Some(input) = other.input_node_name() {
                     stack.push(input.to_string());
@@ -163,4 +169,59 @@ fn arcs_reachable_from(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pipeline `src(in.csv) -> body(transform) -> framed(envelope) -> m(merge)`.
+    /// The Merge consumes the Envelope's output. The qualified-source arc map
+    /// keys the Merge input by the upstream node name (`framed`) and must
+    /// resolve it to the body source's path — which requires the arc walk to
+    /// descend *through* the Envelope to its body, then to the Source. With the
+    /// Envelope arm absent the walk stops at `framed` (its `input_node_name()`
+    /// is `None`, a multi-port node) and yields no arcs, leaving `framed`
+    /// absent from the map entirely.
+    #[test]
+    fn arc_walk_descends_through_envelope_to_body_source() {
+        let yaml = r#"
+pipeline:
+  name: envelope_arc_walk
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: int }
+  - type: transform
+    name: body
+    input: src
+    config:
+      cxl: "emit id = id"
+  - type: envelope
+    name: framed
+    body: body
+    config: { strategy: preserve }
+  - type: merge
+    name: m
+    inputs: [framed]
+"#;
+        let config: PipelineConfig =
+            clinker_plan::yaml::from_str(yaml).expect("parse envelope arc-walk pipeline");
+
+        let arcs = compute_source_input_arcs(&config);
+        let merge_input = arcs
+            .get("framed")
+            .expect("Merge input `framed` must resolve through the Envelope to a source path");
+        let paths: Vec<&str> = merge_input.iter().map(|a| a.as_ref()).collect();
+        assert_eq!(
+            paths,
+            vec!["in.csv"],
+            "arc walk must descend through the Envelope to the body source `in.csv`"
+        );
+    }
 }

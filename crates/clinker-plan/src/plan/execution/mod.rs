@@ -219,6 +219,26 @@ pub enum PlanNode {
         #[serde(skip)]
         output_schema: Arc<Schema>,
     },
+    /// Frames a body stream into per-document documents.
+    ///
+    /// Streaming single-output pass-through. With the `Preserve` strategy
+    /// every body record flows through with its document context and grain
+    /// unchanged, and the document-boundary punctuations are forwarded
+    /// verbatim — so a downstream Output frames byte-identically to today's
+    /// per-document framing. The node does not widen: its output schema is
+    /// the body input's schema. A wired header/trailer port is rejected at
+    /// plan validation this release, so the executor resolves the single body
+    /// predecessor topologically rather than carrying named port references.
+    Envelope {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        strategy: crate::config::pipeline_node::EnvelopeStrategy,
+        /// Output schema, adopted verbatim from the body input (Envelope does
+        /// not widen). Populated by `bind_schema`.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
+    },
     /// Planner-synthesized sort enforcer.
     ///
     /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
@@ -455,6 +475,7 @@ impl PlanNode {
             | PlanNode::Output { name, .. }
             | PlanNode::Reshape { name, .. }
             | PlanNode::Cull { name, .. }
+            | PlanNode::Envelope { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
             | PlanNode::Composition { name, .. }
@@ -474,6 +495,7 @@ impl PlanNode {
             | PlanNode::Output { span, .. }
             | PlanNode::Reshape { span, .. }
             | PlanNode::Cull { span, .. }
+            | PlanNode::Envelope { span, .. }
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
             | PlanNode::Composition { span, .. }
@@ -520,6 +542,7 @@ impl PlanNode {
             | PlanNode::Composition { output_schema, .. }
             | PlanNode::Reshape { output_schema, .. }
             | PlanNode::Cull { output_schema, .. }
+            | PlanNode::Envelope { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => output_schema
                 .columns()
                 .iter()
@@ -556,6 +579,7 @@ impl PlanNode {
             | PlanNode::Composition { output_schema, .. }
             | PlanNode::Reshape { output_schema, .. }
             | PlanNode::Cull { output_schema, .. }
+            | PlanNode::Envelope { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
             PlanNode::Route { .. }
             | PlanNode::Output { .. }
@@ -646,6 +670,7 @@ impl PlanNode {
             PlanNode::CorrelationCommit { .. } => "correlation_commit",
             PlanNode::Reshape { .. } => "reshape",
             PlanNode::Cull { .. } => "cull",
+            PlanNode::Envelope { .. } => "envelope",
         }
     }
 
@@ -717,6 +742,12 @@ impl PlanNode {
                 )
             }
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
+            PlanNode::Envelope { name, strategy, .. } => {
+                let s = match strategy {
+                    crate::config::pipeline_node::EnvelopeStrategy::Preserve => "preserve",
+                };
+                format!("[envelope:{s}] {name}")
+            }
             PlanNode::Aggregation { name, strategy, .. } => {
                 let s = match strategy {
                     AggregateStrategy::Hash => "hash",
@@ -959,13 +990,16 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
             can_back_pressure: false,
         },
         // Stateless or sink stages register no spillable consumer:
-        // Transform / Route / Merge stream record-at-a-time, Output is a
-        // sink, Composition is a structural wrapper whose body nodes
-        // carry their own classes, and CorrelationCommit's group buffer
-        // is bounded by `max_group_buffer` rather than the arbitrator.
+        // Transform / Route / Merge stream record-at-a-time, Envelope passes
+        // body records through unchanged (its NodeBuffer slot carries its own
+        // arbitrator wrapper, not a stage consumer), Output is a sink,
+        // Composition is a structural wrapper whose body nodes carry their own
+        // classes, and CorrelationCommit's group buffer is bounded by
+        // `max_group_buffer` rather than the arbitrator.
         PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
+        | PlanNode::Envelope { .. }
         | PlanNode::Output { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => ArbitrationClass {
@@ -1031,10 +1065,13 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
         // the budget and re-splits on reload, so it writes real spill files
         // and must appear in the disk-spill projection surfaces.
         PlanNode::Cull { .. } => true,
+        // Envelope passes body records through unchanged and registers no
+        // spillable consumer, so it never writes spill files.
         PlanNode::Source { .. }
         | PlanNode::Transform { .. }
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
+        | PlanNode::Envelope { .. }
         | PlanNode::Output { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => false,

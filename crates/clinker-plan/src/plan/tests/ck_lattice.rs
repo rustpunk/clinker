@@ -956,20 +956,7 @@ fn assert_every_node_has_properties(plan: &crate::plan::execution::ExecutionPlan
             plan.node_properties.contains_key(&idx),
             "node {} ({}) has no NodeProperties entry",
             plan.graph[idx].name(),
-            match &plan.graph[idx] {
-                PlanNode::Source { .. } => "source",
-                PlanNode::Transform { .. } => "transform",
-                PlanNode::Sort { .. } => "sort",
-                PlanNode::Aggregation { .. } => "aggregation",
-                PlanNode::Route { .. } => "route",
-                PlanNode::Merge { .. } => "merge",
-                PlanNode::Combine { .. } => "combine",
-                PlanNode::Output { .. } => "output",
-                PlanNode::Reshape { .. } => "reshape",
-                PlanNode::Cull { .. } => "cull",
-                PlanNode::Composition { .. } => "composition",
-                PlanNode::CorrelationCommit { .. } => "correlation_commit",
-            }
+            plan.graph[idx].type_tag(),
         );
     }
 }

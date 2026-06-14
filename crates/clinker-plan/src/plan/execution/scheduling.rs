@@ -1056,6 +1056,34 @@ fn compute_one(
             }
         }
 
+        PlanNode::Envelope { name, .. } => {
+            // Envelope `preserve` re-parks body records in drained order with
+            // their grains unchanged — it neither reorders, repartitions, nor
+            // transforms CK visibility — so the parent's ordering, partitioning,
+            // and CK set all flow through. Provenance is rewritten to point at
+            // this node so explain can chain through, matching Route / Output.
+            let parent = match parents.first() {
+                Some(p) => p,
+                None => return NodeProperties::unordered_single(),
+            };
+            let provenance = if parent.ordering.sort_order.is_some() {
+                OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                }
+            } else {
+                parent.ordering.provenance.clone()
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: parent.ordering.sort_order.clone(),
+                    provenance,
+                },
+                partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
+                ..NodeProperties::unordered_single()
+            }
+        }
+
         PlanNode::Combine {
             name, propagate_ck, ..
         } => {
