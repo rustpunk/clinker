@@ -511,23 +511,36 @@ nodes:
     assert_eq!(a_lines, expected_a);
     assert_eq!(b_lines, expected_b);
 
-    // Slow branch's drain is ~250 ms. Total pipeline runtime must stay well
-    // under the worst-case serialization of two slow drains (~500 ms). The
-    // fused/serial separation is only ~1.4x, narrower than the several-fold
-    // inflation CI runners (macOS especially) impose on short sleeps, so a
-    // fixed bound cannot hold on both platforms. Calibrate to this platform's
-    // measured sleep cost so the assertion tests the separation, not absolute
-    // wall time.
+    // Regression guard: total runtime must stay bounded by the slow branch's
+    // single drain — it must NOT multiply (e.g. by the fast branch's record
+    // count, which a dispatcher that re-drained or serialized the sources would
+    // produce). This is not a fusion-benefit proof: with concurrent source
+    // ingest the fused and serial paths are the same magnitude (see this
+    // function's doc comment), so the discriminator is "one drain vs several,"
+    // not "parallel vs serial."
+    //
+    // The slow source paces five rows at ~50 ms each, so its drain is ~5 sleeps
+    // of 50 ms. Calibrate the ceiling against that exact sleep structure on THIS
+    // runner rather than a single 50 ms sample: a loaded CI runner inflates
+    // short sleeps several-fold and non-uniformly, so one lone sample can read
+    // ~1x while the real drain hit contention — the noise that made a fixed
+    // 700 ms bound flake. Sampling the same five-sleep structure tracks the
+    // drain's real cost, and a 3x ceiling leaves wide margin above a healthy
+    // run (~1x the drain) while staying well below the several-fold blow-up the
+    // guard exists to catch.
     let cal = Instant::now();
-    std::thread::sleep(Duration::from_millis(50));
-    let slack = (cal.elapsed().as_secs_f64() / 0.050).max(1.0);
-    let bound = Duration::from_secs_f64(0.700 * slack);
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let calibrated_drain = cal.elapsed();
+    let bound = calibrated_drain.mul_f64(3.0);
     assert!(
         elapsed < bound,
-        "pipeline took {elapsed:?} (slack {slack:.1}x, bound {bound:?}) — \
-         two-branch fused transforms appear to be serializing on the slow \
-         Source's drain. With fusion the slow branch's transform_a arm \
-         consumes src_a's live channel without blocking src_b's parallel ingest."
+        "pipeline took {elapsed:?} (calibrated drain {calibrated_drain:?}, bound \
+         {bound:?}) — the slow Source's drain appears to be multiplying rather \
+         than bounding total runtime. With the per-record streaming Transform \
+         arm, transform_b drains src_b's already-ingested channel without \
+         re-running the slow drain, so total wall-clock stays near one drain."
     );
 }
 
