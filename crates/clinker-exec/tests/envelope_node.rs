@@ -803,6 +803,45 @@ fn concat_headerless_doc(file: &'static str, ids: &[i64]) -> Vec<Step> {
     steps
 }
 
+/// One nested X12-style interchange: ISA → GS → ST, three `Inherit` levels each
+/// carrying a DISTINCT `interchange` section value, then `id` body rows, then
+/// three closes. Every level inherits the interchange grain, so the whole
+/// `ISA..IEA` is ONE body grain — one output document — whose body records carry
+/// the innermost fully-merged envelope (`tag` = the ST value, innermost wins).
+///
+/// Ingest mints one `DocumentOpen` per level, so this single interchange emits
+/// three cumulative non-empty open-envelopes — the shape that wrongly tripped
+/// the multi-header guard when it counted per-level opens instead of body grains.
+fn nested_x12_interchange_doc(file: &'static str, ids: &[i64]) -> Vec<Step> {
+    let mut steps = vec![
+        Step::Open {
+            file,
+            name: "interchange",
+            tag_val: "ISA-LEVEL",
+            frame: FrameRole::Inherit,
+        },
+        Step::Open {
+            file,
+            name: "interchange",
+            tag_val: "GS-LEVEL",
+            frame: FrameRole::Inherit,
+        },
+        Step::Open {
+            file,
+            name: "interchange",
+            tag_val: "ST-LEVEL",
+            frame: FrameRole::Inherit,
+        },
+    ];
+    for &id in ids {
+        steps.push(Step::Record { file, id });
+    }
+    steps.push(Step::Close { file }); // ST
+    steps.push(Step::Close { file }); // GS
+    steps.push(Step::Close { file }); // ISA
+    steps
+}
+
 #[test]
 fn concat_carries_a_common_non_empty_header() {
     // Two documents with IDENTICAL non-empty headers (`tag = COMMON`). Concat
@@ -895,12 +934,249 @@ fn concat_two_distinct_headers_is_e350_conflict() {
         msg.contains("E350"),
         "the multi-header conflict pins diagnostic code E350, got: {msg}"
     );
+    // Destructure rather than `matches!`: the reported `header_count` is the
+    // load-bearing payload (it names how many distinct headers clashed), so a
+    // bug that fired the variant with the wrong count must fail here.
+    match err {
+        clinker_plan::error::PipelineError::EnvelopeMultiHeaderConflict {
+            header_count, ..
+        } => {
+            assert_eq!(
+                header_count, 2,
+                "two distinct headers (ISA-A, ISA-B) → header_count == 2"
+            );
+        }
+        other => panic!("expected the multi-header conflict variant, got: {other:?}"),
+    }
+}
+
+#[test]
+fn concat_nested_x12_interchange_is_one_header_not_per_level_conflict() {
+    // A single nested X12-style interchange: ISA → GS → ST, three `Inherit`
+    // levels. Ingest mints one `DocumentOpen` per level, so this ONE interchange
+    // emits three distinct cumulative open-envelopes — but it is one body grain,
+    // one output document, with one header (the innermost, fully-merged
+    // envelope). Deriving the header set from per-level opens would count three
+    // and fire E350 on a perfectly valid single interchange; deriving it from
+    // the body grains counts one and succeeds. This is the regression guard.
+    let steps = nested_x12_interchange_doc("claim.x12", &[10, 11]);
+
+    let csv =
+        run_concat(steps).expect("a single nested interchange must not trip the header guard");
+    let (frames, counts) = footer_stats(&csv);
+    assert_eq!(
+        frames, 1,
+        "nested ISA/GS/ST is ONE consolidated document, not a multi-header conflict: {csv}"
+    );
+    assert_eq!(
+        counts,
+        vec![2],
+        "both body rows under the one consolidated interchange: {csv}"
+    );
+
+    // The carried header resolves on every body row: `$doc.interchange.tag`
+    // (emitted AFTER the Envelope) is the innermost level's value — innermost
+    // shadows ancestor on the merged envelope.
+    let doc_tags: Vec<&str> = csv
+        .lines()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            (c.len() == 2 && c[0].parse::<i64>().is_ok()).then(|| c[1])
+        })
+        .collect();
+    assert_eq!(
+        doc_tags,
+        vec!["ST-LEVEL", "ST-LEVEL"],
+        "the consolidated header is the innermost fully-merged envelope: {csv}"
+    );
+}
+
+#[test]
+fn concat_three_documents_same_header_is_one_document_no_conflict() {
+    // Three documents, all with the SAME non-empty header (`tag = SHARED`).
+    // Three equal headers fold to one common header — concat must NOT flag a
+    // conflict and must frame exactly one consolidated document. Guards the
+    // dedup against a false-positive (e.g. counting documents instead of
+    // distinct headers).
+    let mut steps = concat_doc("a.x12", "SHARED", &[1]);
+    steps.extend(concat_doc("b.x12", "SHARED", &[2, 3]));
+    steps.extend(concat_doc("c.x12", "SHARED", &[4]));
+
+    let csv = run_concat(steps).expect("three identical headers fold without conflict");
+    let (frames, counts) = footer_stats(&csv);
+    assert_eq!(
+        frames, 1,
+        "three identical headers → one consolidated document: {csv}"
+    );
+    assert_eq!(
+        counts,
+        vec![4],
+        "all four body rows under the one document: {csv}"
+    );
+    let doc_tags: Vec<&str> = csv
+        .lines()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            (c.len() == 2 && c[0].parse::<i64>().is_ok()).then(|| c[1])
+        })
+        .collect();
+    assert_eq!(
+        doc_tags,
+        vec!["SHARED", "SHARED", "SHARED", "SHARED"],
+        "the single common header is carried onto every re-stamped body row: {csv}"
+    );
+}
+
+#[test]
+fn concat_single_document_carries_its_header() {
+    // One document in → one consolidated document out, header carried. The
+    // degenerate case: concat over a single document is a no-op on framing
+    // (still one document) and must not lose the header.
+    let steps = concat_doc("solo.x12", "SOLO", &[7, 8, 9]);
+
+    let csv = run_concat(steps).expect("single-document concat succeeds");
+    let (frames, counts) = footer_stats(&csv);
+    assert_eq!(frames, 1, "one document in → one document out: {csv}");
+    assert_eq!(counts, vec![3], "all three body rows framed once: {csv}");
+    let doc_tags: Vec<&str> = csv
+        .lines()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            (c.len() == 2 && c[0].parse::<i64>().is_ok()).then(|| c[1])
+        })
+        .collect();
+    assert_eq!(
+        doc_tags,
+        vec!["SOLO", "SOLO", "SOLO"],
+        "the lone document's header is carried through concat: {csv}"
+    );
+}
+
+#[test]
+fn concat_empty_body_emits_no_document() {
+    // An empty body (no records, no envelope events) frames nothing — concat
+    // opens no document, so the writer renders only its column header and no
+    // body or footer rows.
+    let csv = run_concat(Vec::new()).expect("empty body succeeds");
+    let (frames, counts) = footer_stats(&csv);
+    assert_eq!(frames, 0, "an empty body emits no framed document: {csv:?}");
     assert!(
-        matches!(
-            err,
-            clinker_plan::error::PipelineError::EnvelopeMultiHeaderConflict { .. }
-        ),
-        "the error is the multi-header conflict variant, got: {err:?}"
+        counts.is_empty(),
+        "no per-document body counts for an empty body: {csv:?}"
+    );
+}
+
+// ─── Concat provenance: per-record `$source.file` survives consolidation ─────
+
+/// A concat pipeline that emits `$source.file` as an output column, to prove the
+/// re-stamp does not clobber it. The body Transform carries `$source.file`
+/// through; the Envelope consolidates; the post-envelope Output writes it. Unlike
+/// `concat_pipeline`, this does NOT reconstruct an envelope footer — the
+/// assertion is purely on the per-record tail column.
+fn concat_provenance_pipeline() -> String {
+    r#"
+pipeline:
+  name: envelope_concat_provenance
+nodes:
+  - type: source
+    name: edi
+    config:
+      name: edi
+      type: csv
+      path: placeholder.csv
+      schema:
+        - { name: id, type: int }
+  - type: transform
+    name: tag
+    input: edi
+    config:
+      cxl: |
+        emit id = id
+        emit src_file = $source.file
+  - type: envelope
+    name: framed
+    body: tag
+    config: { strategy: concat }
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#
+    .to_string()
+}
+
+/// Run the provenance pipeline over a scripted step list, returning the written
+/// CSV bytes.
+fn run_concat_provenance(steps: Vec<Step>) -> String {
+    let mut config = clinker_plan::config::parse_config(&concat_provenance_pipeline())
+        .expect("parse concat provenance pipeline");
+    for spanned in &mut config.nodes {
+        if let clinker_plan::config::PipelineNode::Source { config: body, .. } = &mut spanned.value
+        {
+            body.source.path = None;
+        }
+    }
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile concat provenance pipeline");
+
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "edi".to_string(),
+        SourceInput::Records(Box::new(ScriptedReader::new(steps))),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams {
+            execution_id: "concat-prov-exec".to_string(),
+            batch_id: "concat-prov-batch".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("drive concat provenance pipeline");
+    buf.as_string()
+}
+
+#[test]
+fn concat_preserves_per_record_source_file() {
+    // Two documents from DIFFERENT source files but the SAME header (so no
+    // header conflict — the focus is provenance, not the guard). Concat re-stamps
+    // the document context onto one consolidated grain, but `$source.file` is a
+    // real tail column stamped at ingest — the re-stamp must not touch it. Each
+    // record must still carry its ORIGINAL source file after consolidation.
+    let mut steps = concat_doc("alpha.x12", "SHARED", &[1, 2]);
+    steps.extend(concat_doc("beta.x12", "SHARED", &[3]));
+
+    let csv = run_concat_provenance(steps);
+    let lines: Vec<&str> = csv.lines().collect();
+    // Header `id,src_file` then three body rows in ingest order.
+    let header = lines.first().expect("output has a header line");
+    assert!(
+        header.starts_with("id,src_file"),
+        "expected an id,src_file header, got: {csv}"
+    );
+    let body: Vec<(&str, &str)> = lines[1..]
+        .iter()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            (c.len() == 2 && c[0].parse::<i64>().is_ok()).then(|| (c[0], c[1]))
+        })
+        .collect();
+    assert_eq!(
+        body,
+        vec![("1", "alpha.x12"), ("2", "alpha.x12"), ("3", "beta.x12")],
+        "each record keeps its original `$source.file` across consolidation: {csv}"
     );
 }
 

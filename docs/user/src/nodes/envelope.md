@@ -81,7 +81,7 @@ One consolidated document can carry only **one** envelope header. `concat` deriv
 - **No document carries a header** → the consolidated document is **headerless**.
 - **A headed document and a headerless document** → the single header wins; the headerless document coexists with it (no conflict).
 
-When the body carries **two or more distinct non-empty headers**, `concat` refuses to silently keep one and drop the rest. The run fails with [**E350**](../../../explain/E350.md):
+When the body carries **two or more distinct non-empty headers**, `concat` refuses to silently keep one and drop the rest. The run fails with **E350** (run `clinker explain --code E350` for the full write-up):
 
 ```
 envelope 'framed': concat collapses the body into one framed document, but the
@@ -120,4 +120,4 @@ Placing the Envelope **after** a Combine or Aggregate is the intended use: it de
 
 Both strategies re-park the body into the node's own buffer slot, which the engine's memory arbitrator governs and spills to disk under pressure — so neither strategy is bounded by total input size held in RAM.
 
-`preserve` is a transparent framing pass-through: it forwards records and their document boundaries unchanged. `concat` additionally re-stamps each record onto the one consolidated document context and replaces the per-document boundaries with a single open/close pair; the header consolidation it does first is `O(documents)`, not `O(records)`, because it inspects only each document's open boundary, not the body rows.
+`preserve` is a transparent framing pass-through: it forwards records and their document boundaries unchanged. `concat` additionally re-stamps each record onto the one consolidated document context and replaces the per-document boundaries with a single open/close pair; the header consolidation it does first groups the body records by document — one document's worth of body records shares one grain and one header — so it does one pass over the records to collect the distinct headers, comparing only one envelope per document (the work is bounded by the number of documents, not the number of body rows).
