@@ -157,6 +157,20 @@ impl EnvelopeRecord {
         }
     }
 
+    /// Iterate the envelope's sections in declared order as `(name, payload)`
+    /// pairs — the section name list paired positionally with the payloads.
+    ///
+    /// Used by the Envelope node's header/footer synthesis to merge fresh
+    /// synthesized sections onto an existing envelope: the merge re-emits the
+    /// untouched sections in order, then overlays the synthesized ones by name.
+    pub fn sections(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.schema
+            .columns()
+            .iter()
+            .map(|c| c.as_ref())
+            .zip(self.sections.iter())
+    }
+
     /// The empty envelope: no sections, so every `$doc.*` resolves `None`.
     /// Used for synthetic / zero-body contexts.
     pub fn empty() -> Self {

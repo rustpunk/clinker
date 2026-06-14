@@ -2000,7 +2000,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 return Err(format!(
                     "unknown diagnostic code '{code}'. Valid codes: E101-E108, E150b-E150e, \
-                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E347, \
+                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E354, \
                      W101/W302/W305/W306"
                 )
                 .into());

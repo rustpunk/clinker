@@ -151,6 +151,22 @@ impl Punctuation {
     pub fn kind(&self) -> PunctuationKind {
         self.kind
     }
+
+    /// The document context this punctuation marks. The Envelope node's
+    /// header/footer synthesis reads it to match a boundary to the rebuilt
+    /// per-grain context after stamping synthesized sections.
+    pub(crate) fn doc_ctx(&self) -> &Arc<DocumentContext> {
+        &self.doc_ctx
+    }
+
+    /// Rebuild this punctuation on a different document context, preserving its
+    /// kind and any structural-reject payload. Used by the Envelope node's
+    /// synthesis step to re-stamp a boundary onto the context carrying the
+    /// freshly synthesized header/footer sections, keeping the stream
+    /// internally consistent for any non-Output downstream consumer.
+    pub(crate) fn with_doc_ctx(self, doc_ctx: Arc<DocumentContext>) -> Self {
+        Self { doc_ctx, ..self }
+    }
 }
 
 /// Inline channel/buffer payload — either a body record or a document

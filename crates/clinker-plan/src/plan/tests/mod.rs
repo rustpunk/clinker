@@ -5,6 +5,7 @@ mod dag;
 mod dedup_node_rooted;
 mod deferred_region;
 mod doc_paths;
+mod envelope_synthesis;
 mod explain_buffer_class;
 mod explain_polish;
 mod plan_time_window_root;

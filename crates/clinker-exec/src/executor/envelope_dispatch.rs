@@ -57,6 +57,7 @@ use std::sync::Arc;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
+use crate::aggregation::{AggregateEvalScope, eval_expr_in_agg_scope};
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
 };
@@ -65,8 +66,12 @@ use crate::executor::node_buffer::DrainedEvents;
 use crate::executor::stream_event::{Punctuation, PunctuationKind};
 use clinker_plan::config::pipeline_node::EnvelopeStrategy;
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::envelope_synthesis::EnvelopeSynthesis;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
-use clinker_record::{DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord, Record};
+use clinker_record::accumulator::AccumulatorEnum;
+use clinker_record::{DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord, Record, Value};
+use cxl::plan::BindingArg;
+use indexmap::IndexMap;
 
 /// Execute the `Envelope` arm for `node_idx`. Drains the body predecessor and
 /// re-parks the framed body into this node's own `node_buffers` slot.
@@ -103,6 +108,7 @@ pub(crate) fn dispatch_envelope(
         strategy,
         ref header_input,
         header_upstream,
+        ref synthesis,
         ..
     } = *node
     else {
@@ -155,7 +161,7 @@ pub(crate) fn dispatch_envelope(
     // slot, so writing to `node_idx` is exactly where each successor looks (the
     // Transform/Sort linear-producer convention, not the Route/Cull
     // per-successor fork).
-    let (records, puncts) = match strategy {
+    let (mut records, mut puncts) = match strategy {
         EnvelopeStrategy::Preserve => {
             // Leave each record's grain untouched (header replacement, when
             // wired, preserved the grain) and forward the body's punctuations
@@ -164,6 +170,16 @@ pub(crate) fn dispatch_envelope(
         }
         EnvelopeStrategy::Concat => consolidate(name, records, puncts)?,
     };
+
+    // Declarative header/footer synthesis layers on top of either strategy: it
+    // groups the framed body by document grain (one grain per output document —
+    // exactly one after concat, one per body document after preserve) and per
+    // grain stamps the synthesized header/footer sections into the document's
+    // envelope, then re-stamps the grain's records and punctuations onto the
+    // rebuilt context. Skipped when the node declares no synthesis.
+    if let Some(synthesis) = synthesis {
+        synthesize_sections(ctx, name, synthesis, &mut records, &mut puncts)?;
+    }
 
     let nb = admit_node_buffer(
         ctx,
@@ -420,6 +436,253 @@ fn consolidate(
     ];
 
     Ok((records, framing))
+}
+
+/// Stamp the node's synthesized header/footer sections into each output
+/// document's envelope, then re-stamp the document's records and boundary
+/// punctuations onto the rebuilt context.
+///
+/// Groups the framed `records` by [`DocumentGrain`] in first-seen order — one
+/// grain is one output document (exactly one after `concat`, one per body
+/// document after `preserve`). Per grain it folds the footer aggregates over
+/// the grain's records, evaluates the header scalars against the grain's first
+/// record (so `$source.*` / `$doc.*` ground), merges the synthesized sections
+/// into the grain's current envelope (a synthesized section overrides an
+/// existing same-named section; untouched sections ride through), and rebuilds
+/// ONE shared `Arc<DocumentContext>` per grain on the SAME grain via
+/// [`DocumentContext::with_replaced_envelope`]. Every record of the grain is
+/// re-stamped to that shared context (a refcount bump, not a rebuild), and each
+/// boundary punctuation is re-stamped to the rebuilt context for its grain.
+///
+/// # Memory model
+///
+/// Bounded by the already-materialized body plus `O(grains × footer-fields)`
+/// accumulators held only for the duration of one grain's fold — every footer
+/// aggregate in the allow-list is an O(1) accumulator, so the footer state per
+/// document is independent of its body-row count. No new unbounded state.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] when a footer accumulator's finalize overflows or a
+/// header / footer residual fails to evaluate — both surface as an Internal
+/// engine error naming the node, since the expressions were typechecked and
+/// allow-list-validated at compile time.
+fn synthesize_sections(
+    ctx: &ExecutorContext<'_>,
+    name: &str,
+    synthesis: &EnvelopeSynthesis,
+    records: &mut [(Record, u64)],
+    puncts: &mut [Punctuation],
+) -> Result<(), PipelineError> {
+    // Group record indices by grain, preserving first-seen order so the rebuilt
+    // contexts (and any downstream observation order) follow body order.
+    let mut grain_order: Vec<DocumentGrain> = Vec::new();
+    let mut indices_by_grain: HashMap<DocumentGrain, Vec<usize>> = HashMap::new();
+    for (i, (record, _)) in records.iter().enumerate() {
+        let grain = record.doc_ctx().grain();
+        indices_by_grain
+            .entry(grain)
+            .or_insert_with(|| {
+                grain_order.push(grain);
+                Vec::new()
+            })
+            .push(i);
+    }
+
+    // One rebuilt context per grain, shared by every record/punct of the grain.
+    let mut rebuilt: HashMap<DocumentGrain, Arc<DocumentContext>> = HashMap::new();
+    for grain in &grain_order {
+        let indices = &indices_by_grain[grain];
+        // The grain's first record grounds the header eval context and seeds the
+        // base envelope the synthesized sections merge onto.
+        let first_idx = indices[0];
+        let base_envelope = records[first_idx].0.doc_ctx().envelope_record().clone();
+
+        let mut synthesized: IndexMap<Box<str>, Value> = IndexMap::new();
+        // Footer first, header second — declaration order within each is
+        // preserved by the spec's section vectors; a header section and a footer
+        // section never share a name in practice, and if they did the header
+        // (evaluated second) would win, matching the "header overrides" read.
+        for section in &synthesis.footer {
+            let payload = fold_footer_section(name, section, records, indices)?;
+            synthesized.insert(Box::from(section.section.as_str()), payload);
+        }
+        for section in &synthesis.header {
+            let payload = eval_header_section(
+                ctx,
+                name,
+                section,
+                &records[first_idx].0,
+                records[first_idx].1,
+            )?;
+            synthesized.insert(Box::from(section.section.as_str()), payload);
+        }
+
+        let merged = merge_envelope_sections(&base_envelope, synthesized);
+        let new_ctx = Arc::new(
+            records[first_idx]
+                .0
+                .doc_ctx()
+                .with_replaced_envelope(merged),
+        );
+        rebuilt.insert(*grain, Arc::clone(&new_ctx));
+
+        for &idx in indices {
+            records[idx].0.set_doc_ctx(Arc::clone(&new_ctx));
+        }
+    }
+
+    // Re-stamp boundary punctuations onto the rebuilt context for their grain.
+    // The Output writer frames off RECORD context, not punctuations, but a
+    // non-Output downstream consumer reads boundaries, so keep them consistent.
+    for punct in puncts.iter_mut() {
+        let grain = punct.doc_ctx().grain();
+        if let Some(new_ctx) = rebuilt.get(&grain) {
+            *punct = punct.clone().with_doc_ctx(Arc::clone(new_ctx));
+        }
+    }
+
+    Ok(())
+}
+
+/// Fold one footer section's streaming aggregates over a grain's records and
+/// emit the section payload (`Value::Map` of `field -> value`) in field order.
+///
+/// Builds one [`AccumulatorEnum`] per binding, adds each grain record's binding
+/// value (a bare field value, or `Null` for `count(*)`), finalizes the slots,
+/// and evaluates each compiled emit residual in an empty-key aggregate scope.
+fn fold_footer_section(
+    name: &str,
+    section: &clinker_plan::plan::envelope_synthesis::SynthesizedFooterSection,
+    records: &[(Record, u64)],
+    indices: &[usize],
+) -> Result<Value, PipelineError> {
+    let compiled = &section.compiled;
+    let mut accs: Vec<AccumulatorEnum> = compiled
+        .bindings
+        .iter()
+        .map(|b| AccumulatorEnum::for_type(&b.acc_type))
+        .collect();
+
+    for &idx in indices {
+        let record = &records[idx].0;
+        for (binding, acc) in compiled.bindings.iter().zip(accs.iter_mut()) {
+            // Footer args are bare-field or `*` only (enforced at compile via
+            // E354), so the value is a direct column read or `Null` for the
+            // wildcard count.
+            let value = match &binding.arg {
+                BindingArg::Field(field_idx) => record
+                    .values()
+                    .get(*field_idx as usize)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                BindingArg::Wildcard => Value::Null,
+                // Unreachable: the compile-time allow-list rejects composed args.
+                BindingArg::Expr(_) | BindingArg::Pair(_, _) => {
+                    return Err(PipelineError::Internal {
+                        op: "envelope",
+                        node: name.to_string(),
+                        detail: format!(
+                            "footer section {:?} carries a composed aggregate argument that the \
+                             allow-list should have rejected at compile",
+                            section.section
+                        ),
+                    });
+                }
+            };
+            acc.add(&value);
+        }
+    }
+
+    let slots: Vec<Value> = accs
+        .iter()
+        .enumerate()
+        .map(|(i, acc)| {
+            acc.finalize().map_err(|e| PipelineError::Internal {
+                op: "envelope",
+                node: name.to_string(),
+                detail: format!(
+                    "footer section {:?} aggregate {} finalize failed: {e}",
+                    section.section, compiled.bindings[i].output_name
+                ),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let scope = AggregateEvalScope {
+        key: &[],
+        slots: &slots,
+    };
+    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(compiled.emits.len());
+    for emit in &compiled.emits {
+        let value = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(|e| {
+            PipelineError::Internal {
+                op: "envelope",
+                node: name.to_string(),
+                detail: format!(
+                    "footer section {:?} field {} residual eval failed: {e}",
+                    section.section, emit.output_name
+                ),
+            }
+        })?;
+        fields.insert(Box::from(emit.output_name.as_ref()), value);
+    }
+    Ok(Value::Map(Box::new(fields)))
+}
+
+/// Evaluate one header section's scalar fields against the grain's first record
+/// and emit the section payload (`Value::Map` of `field -> value`) in field
+/// order.
+///
+/// The header evaluates against the first record only to ground `$source.*` /
+/// `$doc.*`; body-column references are rejected at compile (E353), so the
+/// record's columns are never read.
+fn eval_header_section(
+    ctx: &ExecutorContext<'_>,
+    name: &str,
+    section: &clinker_plan::plan::envelope_synthesis::SynthesizedHeaderSection,
+    record: &Record,
+    row_num: u64,
+) -> Result<Value, PipelineError> {
+    let source_file = crate::executor::dispatch::source_file_arc_of(record);
+    let source_name = crate::executor::dispatch::source_name_arc_of(record);
+    let eval_ctx = ctx.eval_ctx_for_record(&source_file, &source_name, row_num, record.doc_ctx());
+
+    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(section.fields.len());
+    for (field, expr) in &section.fields {
+        let scalar = cxl::eval::compile_scalar(&section.typed, expr);
+        let value = scalar
+            .eval(&eval_ctx, record)
+            .map_err(|e| PipelineError::Internal {
+                op: "envelope",
+                node: name.to_string(),
+                detail: format!(
+                    "header section {:?} field {field:?} eval failed: {e}",
+                    section.section
+                ),
+            })?;
+        fields.insert(field.clone(), value);
+    }
+    Ok(Value::Map(Box::new(fields)))
+}
+
+/// Merge synthesized sections onto a base envelope by name: every base section
+/// rides through in declared order, then each synthesized section overrides an
+/// existing same-named section in place (keeping the base position) or appends
+/// after the base sections — the regenerate semantics for header/footer
+/// synthesis.
+fn merge_envelope_sections(
+    base: &EnvelopeRecord,
+    synthesized: IndexMap<Box<str>, Value>,
+) -> EnvelopeRecord {
+    let mut merged: IndexMap<Box<str>, Value> = IndexMap::new();
+    for (section_name, payload) in base.sections() {
+        merged.insert(Box::from(section_name), payload.clone());
+    }
+    for (section_name, payload) in synthesized {
+        merged.insert(section_name, payload);
+    }
+    EnvelopeRecord::from_sections(merged)
 }
 
 #[cfg(test)]
