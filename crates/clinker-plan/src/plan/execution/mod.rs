@@ -226,23 +226,14 @@ pub enum PlanNode {
     /// unchanged, and the document-boundary punctuations are forwarded
     /// verbatim — so a downstream Output frames byte-identically to today's
     /// per-document framing. The node does not widen: its output schema is
-    /// the body input's schema. `header_input` / `trailer_input` are the
-    /// optional port references; a wired value is rejected at plan validation
-    /// this release, so the executor resolves only the single body predecessor.
+    /// the body input's schema. A wired header/trailer port is rejected at
+    /// plan validation this release, so the executor resolves the single body
+    /// predecessor topologically rather than carrying named port references.
     Envelope {
         name: String,
         #[serde(skip)]
         span: Span,
         strategy: crate::config::pipeline_node::EnvelopeStrategy,
-        /// Name of the body input node (the framed stream).
-        body_input: String,
-        /// Optional header-port input node name. `None` this release (a wired
-        /// value is rejected at validation); carried for the later wiring slice.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        header_input: Option<String>,
-        /// Optional trailer-port input node name. Same not-yet-wired status.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        trailer_input: Option<String>,
         /// Output schema, adopted verbatim from the body input (Envelope does
         /// not widen). Populated by `bind_schema`.
         #[serde(skip)]

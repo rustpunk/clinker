@@ -17,11 +17,12 @@
 //!
 //! # Memory model
 //!
-//! Streaming pass-through: the drained body is re-parked into a `NodeBuffer`
-//! whose own arbitrator wrapper provides the memory bound, so the resident
-//! peak is the concurrently-open frames' records — identical to a Cull or
-//! Merge re-park, never the whole input at once. The node registers no
-//! spillable stage consumer of its own.
+//! The node drains the body predecessor's full `NodeBuffer` and materializes
+//! it into its own `NodeBuffer` slot — the same re-park model as Cull and
+//! Merge. The slot's arbitrator wrapper provides the memory bound (it spills
+//! the slot when the budget trips), so the resident set is the slot's records,
+//! not an incrementally-streamed subset. The node registers no spillable stage
+//! consumer of its own.
 
 use petgraph::graph::NodeIndex;
 

@@ -3453,15 +3453,12 @@ pub(crate) fn lower_node_to_plan_node(
         // Envelope lowers to a single-output pass-through carrying the framing
         // strategy and the body's (unchanged) output schema. A missing typed
         // entry means bind_schema could not resolve the body input — skip.
-        PipelineNode::Envelope { header, config } => {
+        PipelineNode::Envelope { config, .. } => {
             artifacts.typed.get(name)?;
             Some(crate::plan::execution::PlanNode::Envelope {
                 name: name.to_string(),
                 span,
                 strategy: config.strategy,
-                body_input: header.body.value.name().to_string(),
-                header_input: header.header.as_ref().map(|i| i.value.name().to_string()),
-                trailer_input: header.trailer.as_ref().map(|i| i.value.name().to_string()),
                 output_schema: schema_from_bound(name),
             })
         }
