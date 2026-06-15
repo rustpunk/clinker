@@ -1,0 +1,62 @@
+name: Agent Issue Close Label Cleanup
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: agent-issue-labels-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove live agent routing labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const removeExact = new Set([
+              "agent-ready",
+              "agent-investigate",
+              "blocked",
+              "needs-context",
+              "needs-decision",
+              "needs-maintainer-review",
+              "needs-splitting",
+              "not-agent-ready",
+            ]);
+            const removePrefixes = ["agent-mode:"];
+
+            const labels = context.payload.issue.labels ?? [];
+            const names = labels
+              .map((label) => (typeof label === "string" ? label : label.name))
+              .filter(Boolean);
+
+            const toRemove = names.filter((name) => {
+              return (
+                removeExact.has(name) ||
+                removePrefixes.some((prefix) => name.startsWith(prefix))
+              );
+            });
+
+            for (const name of toRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name,
+                });
+                core.info(`Removed label: ${name}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Label already absent: ${name}`);
+                  continue;
+                }
+                throw error;
+              }
+            }

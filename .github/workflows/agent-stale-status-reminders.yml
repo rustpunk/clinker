@@ -1,0 +1,224 @@
+name: Agent Stale Status Reminders
+
+on:
+  schedule:
+    - cron: "41 14 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report stale items without commenting"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      stale_days:
+        description: "Days without issue/PR or Project item updates before reminder"
+        required: true
+        default: "7"
+      cooldown_days:
+        description: "Minimum days between bot reminders on the same item"
+        required: true
+        default: "7"
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on stale Agent Running / PR Open items
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const projectNumber = 2;
+            const dryRun = context.eventName === "workflow_dispatch"
+              ? core.getInput("dry_run") !== "false"
+              : false;
+            const staleDays = Number(core.getInput("stale_days") || 7);
+            const cooldownDays = Number(core.getInput("cooldown_days") || 7);
+            const marker = "<!-- agent-stale-status-reminder -->";
+            const now = Date.now();
+            const staleMs = staleDays * 24 * 60 * 60 * 1000;
+            const cooldownMs = cooldownDays * 24 * 60 * 60 * 1000;
+
+            const query = `
+              query($owner:String!, $number:Int!, $after:String) {
+                user(login:$owner) {
+                  projectV2(number:$number) {
+                    title
+                    items(first:100, after:$after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        updatedAt
+                        content {
+                          __typename
+                          ... on Issue {
+                            number
+                            title
+                            url
+                            state
+                            updatedAt
+                          }
+                          ... on PullRequest {
+                            number
+                            title
+                            url
+                            state
+                            merged
+                            updatedAt
+                          }
+                        }
+                        fieldValues(first:30) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              field {
+                                ... on ProjectV2FieldCommon { name }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            const items = [];
+            let after = null;
+            let projectTitle = "";
+            try {
+              do {
+                const data = await github.graphql(query, { owner, number: projectNumber, after });
+                const project = data.user?.projectV2;
+                if (!project) {
+                  core.warning(`Project ${owner}/${projectNumber} was not visible to this token.`);
+                  await core.summary
+                    .addRaw(`# Agent Stale Status Reminders\n\nProject was not visible to this token.\n`)
+                    .write();
+                  return;
+                }
+                projectTitle = project.title;
+                items.push(...project.items.nodes);
+                after = project.items.pageInfo.hasNextPage
+                  ? project.items.pageInfo.endCursor
+                  : null;
+              } while (after);
+            } catch (error) {
+              core.warning(`Project query failed: ${error.message}`);
+              await core.summary
+                .addRaw(`# Agent Stale Status Reminders\n\nProject query failed: ${error.message}\n`)
+                .write();
+              return;
+            }
+
+            function statusOf(item) {
+              for (const value of item.fieldValues.nodes) {
+                if (value.field?.name === "Status") {
+                  return value.name;
+                }
+              }
+              return "";
+            }
+
+            function latestUpdate(item) {
+              const times = [Date.parse(item.updatedAt)];
+              if (item.content?.updatedAt) {
+                times.push(Date.parse(item.content.updatedAt));
+              }
+              return Math.max(...times.filter((time) => Number.isFinite(time)));
+            }
+
+            async function recentlyReminded(number) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: number,
+                per_page: 100,
+              });
+              return comments.some((comment) => {
+                return (
+                  comment.body?.includes(marker) &&
+                  now - Date.parse(comment.created_at) < cooldownMs
+                );
+              });
+            }
+
+            const stale = [];
+            for (const item of items) {
+              const status = statusOf(item);
+              if (!["Agent Running", "PR Open"].includes(status)) {
+                continue;
+              }
+              const content = item.content;
+              if (!content || !["Issue", "PullRequest"].includes(content.__typename)) {
+                continue;
+              }
+              if (content.__typename === "Issue" && content.state !== "OPEN") {
+                continue;
+              }
+              if (content.__typename === "PullRequest" && content.state !== "OPEN") {
+                continue;
+              }
+              const updatedAt = latestUpdate(item);
+              if (now - updatedAt < staleMs) {
+                continue;
+              }
+              stale.push({
+                number: content.number,
+                title: content.title,
+                url: content.url,
+                status,
+                typename: content.__typename,
+                updatedAt,
+              });
+            }
+
+            const commented = [];
+            const skippedCooldown = [];
+            for (const item of stale) {
+              if (await recentlyReminded(item.number)) {
+                skippedCooldown.push(item);
+                continue;
+              }
+              if (!dryRun) {
+                const days = Math.floor((now - item.updatedAt) / (24 * 60 * 60 * 1000));
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: item.number,
+                  body: `${marker}\nThis item has been in Project status \`${item.status}\` without visible updates for about ${days} day(s). Please post a status update, move it to the next workflow state, or clear any blocker. This reminder does not change labels or Project fields.`,
+                });
+              }
+              commented.push(item);
+            }
+
+            let summary = `# Agent Stale Status Reminders\n\n`;
+            summary += `Project: ${projectTitle || `${owner}/${projectNumber}`}\n\n`;
+            summary += `Mode: ${dryRun ? "dry run" : "comment"}\n\n`;
+            summary += `Stale items found: ${stale.length}\n\n`;
+            if (commented.length > 0) {
+              summary += `Commented / would comment:\n`;
+              for (const item of commented) {
+                summary += `- [#${item.number} ${item.title}](${item.url}) (${item.status})\n`;
+              }
+              summary += `\n`;
+            }
+            if (skippedCooldown.length > 0) {
+              summary += `Skipped due to reminder cooldown:\n`;
+              for (const item of skippedCooldown) {
+                summary += `- [#${item.number} ${item.title}](${item.url}) (${item.status})\n`;
+              }
+            }
+            if (stale.length === 0) {
+              summary += "No stale Agent Running or PR Open items.\n";
+            }
+            await core.summary.addRaw(summary).write();

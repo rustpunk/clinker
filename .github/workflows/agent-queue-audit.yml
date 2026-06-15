@@ -1,0 +1,145 @@
+name: Agent Queue Audit
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      fail_on_findings:
+        description: "Fail the run when queue audit findings are present"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  issues: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit agent-ready issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failOnFindings =
+              context.eventName === "workflow_dispatch" &&
+              core.getInput("fail_on_findings") === "true";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const query = `repo:${owner}/${repo} is:issue is:open label:agent-ready`;
+            const ready = await github.paginate(github.rest.search.issuesAndPullRequests, {
+              q: query,
+              per_page: 100,
+            });
+
+            const findings = [];
+            const conflictingLabels = new Set([
+              "blocked",
+              "needs-context",
+              "needs-decision",
+              "needs-maintainer-review",
+              "needs-splitting",
+              "not-agent-ready",
+            ]);
+
+            function bodyHasAcceptance(body) {
+              return /acceptance criteria/i.test(body) || /done when/i.test(body);
+            }
+
+            function bodyHasVerification(body) {
+              return /verification|test command|cargo test|git diff --check/i.test(body);
+            }
+
+            function blockedByRefs(body) {
+              const lines = body.split(/\r?\n/);
+              const collected = [];
+              let inBlock = false;
+              for (const line of lines) {
+                if (/^\s*Blocked by:\s*/i.test(line)) {
+                  inBlock = true;
+                  collected.push(line);
+                  continue;
+                }
+                if (!inBlock) {
+                  continue;
+                }
+                if (/^\s*$/.test(line)) {
+                  break;
+                }
+                if (/^\s*[-*]\s+/.test(line) || /^\s*#\d+/.test(line)) {
+                  collected.push(line);
+                  continue;
+                }
+                break;
+              }
+              const block = collected.join("\n");
+              const refs = new Set();
+              for (const match of block.matchAll(/#(\d+)/g)) {
+                refs.add(Number(match[1]));
+              }
+              return [...refs];
+            }
+
+            async function openIssueRefs(numbers) {
+              const open = [];
+              for (const number of numbers) {
+                const issue = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: number,
+                });
+                if (issue.data.state === "open") {
+                  open.push(number);
+                }
+              }
+              return open;
+            }
+
+            for (const item of ready) {
+              const labels = item.labels.map((label) =>
+                typeof label === "string" ? label : label.name,
+              );
+              const itemFindings = [];
+              const conflicts = labels.filter((label) => conflictingLabels.has(label));
+              if (conflicts.length > 0) {
+                itemFindings.push(`conflicting labels: ${conflicts.join(", ")}`);
+              }
+              if (!bodyHasAcceptance(item.body ?? "")) {
+                itemFindings.push("missing visible acceptance criteria");
+              }
+              if (!bodyHasVerification(item.body ?? "")) {
+                itemFindings.push("missing visible verification command/evidence");
+              }
+              const blockedBy = blockedByRefs(item.body ?? "");
+              const openBlockers = await openIssueRefs(blockedBy);
+              if (openBlockers.length > 0) {
+                itemFindings.push(`open Blocked by refs: ${openBlockers.map((n) => `#${n}`).join(", ")}`);
+              }
+              if (itemFindings.length > 0) {
+                findings.push({ number: item.number, title: item.title, url: item.html_url, itemFindings });
+              }
+            }
+
+            let summary = `# Agent Queue Audit\n\n`;
+            summary += `Query: \`${query}\`\n\n`;
+            summary += `Open agent-ready issues checked: ${ready.length}\n\n`;
+            if (findings.length === 0) {
+              summary += `No findings.\n`;
+            } else {
+              summary += `Findings: ${findings.length}\n\n`;
+              for (const finding of findings) {
+                summary += `- [#${finding.number} ${finding.title}](${finding.url})\n`;
+                for (const detail of finding.itemFindings) {
+                  summary += `  - ${detail}\n`;
+                }
+              }
+            }
+            await core.summary.addRaw(summary).write();
+
+            if (findings.length > 0 && failOnFindings) {
+              core.setFailed(`Agent Queue Audit found ${findings.length} issue(s) needing attention.`);
+            }

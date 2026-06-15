@@ -61,6 +61,29 @@ Use built-in automations lightly:
 Do not automate `Agent Ready`. Readiness depends on scope, blockers,
 acceptance criteria, verification, and decision gates.
 
+The repository also carries issue-label cleanup workflows:
+
+- Closed issues remove live agent-routing labels such as `agent-ready`,
+  `needs-*`, `blocked`, and `agent-mode:*`.
+- Reopened issues remove stale ready/mode labels and, when those labels exist,
+  add `not-agent-ready` and `needs-context`.
+
+These workflows intentionally do not restore `Agent Ready`; a reopened issue
+must go back through grounding before it can re-enter the Agent Queue.
+
+Additional operational workflows provide lightweight checks without replacing
+human routing:
+
+- Agent Queue Audit reports `agent-ready` issues that still show conflicting
+  labels, missing acceptance/verification text, or open `Blocked by:` refs.
+- Agent PR Merged Closeout Audit checks that merged PRs close their linked
+  issue, that live routing labels are gone, and that Project status is `Done`
+  when Project data is visible to the workflow token.
+- Agent Label Sync is manual and dry-run by default; it creates or updates the
+  workflow label set.
+- Agent Stale Status Reminders comments on stale `Agent Running` / `PR Open`
+  Project items after a cooldown. It does not change labels or Project fields.
+
 ## What Goes In The Project
 
 Add every open issue and PR that participates in delivery flow to the active

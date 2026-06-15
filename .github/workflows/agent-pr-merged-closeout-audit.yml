@@ -1,0 +1,170 @@
+name: Agent PR Merged Closeout Audit
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: "Pull request number to audit"
+        required: true
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  audit:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit closeout state
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.eventName === "workflow_dispatch"
+              ? Number(core.getInput("pull_request"))
+              : context.payload.pull_request.number;
+            const liveRoutingLabels = new Set([
+              "agent-ready",
+              "agent-investigate",
+              "blocked",
+              "needs-context",
+              "needs-decision",
+              "needs-maintainer-review",
+              "needs-splitting",
+              "not-agent-ready",
+            ]);
+
+            const query = `
+              query($owner:String!, $repo:String!, $number:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  pullRequest(number:$number) {
+                    number
+                    title
+                    url
+                    state
+                    merged
+                    closingIssuesReferences(first:20) {
+                      nodes {
+                        number
+                        title
+                        url
+                        state
+                        labels(first:50) {
+                          nodes { name }
+                        }
+                        projectItems(first:20) {
+                          nodes {
+                            fieldValues(first:30) {
+                              nodes {
+                                ... on ProjectV2ItemFieldSingleSelectValue {
+                                  name
+                                  field {
+                                    ... on ProjectV2FieldCommon { name }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            let data;
+            try {
+              data = await github.graphql(query, { owner, repo, number: prNumber });
+            } catch (error) {
+              core.warning(`Project-aware closeout query failed: ${error.message}`);
+              const fallback = await github.graphql(`
+                query($owner:String!, $repo:String!, $number:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    pullRequest(number:$number) {
+                      number
+                      title
+                      url
+                      state
+                      merged
+                      closingIssuesReferences(first:20) {
+                        nodes {
+                          number
+                          title
+                          url
+                          state
+                          labels(first:50) { nodes { name } }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number: prNumber },
+              );
+              data = fallback;
+            }
+
+            const pr = data.repository.pullRequest;
+            const issues = pr.closingIssuesReferences.nodes;
+            const findings = [];
+
+            if (issues.length === 0) {
+              findings.push("no closing issue reference found");
+            }
+
+            for (const issue of issues) {
+              const issueFindings = [];
+              if (issue.state !== "CLOSED") {
+                issueFindings.push("issue is not closed");
+              }
+
+              const labels = issue.labels.nodes.map((label) => label.name);
+              const staleLabels = labels.filter(
+                (label) => liveRoutingLabels.has(label) || label.startsWith("agent-mode:"),
+              );
+              if (staleLabels.length > 0) {
+                issueFindings.push(`live routing labels still present: ${staleLabels.join(", ")}`);
+              }
+
+              const projectItems = issue.projectItems?.nodes ?? [];
+              if (projectItems.length === 0) {
+                issueFindings.push("project item/status not visible to this token");
+              } else {
+                const statuses = [];
+                for (const item of projectItems) {
+                  for (const value of item.fieldValues.nodes) {
+                    if (value.field?.name === "Status") {
+                      statuses.push(value.name);
+                    }
+                  }
+                }
+                if (!statuses.includes("Done")) {
+                  issueFindings.push(
+                    statuses.length > 0
+                      ? `project status is ${statuses.join(", ")}, expected Done`
+                      : "project status field not visible to this token",
+                  );
+                }
+              }
+
+              if (issueFindings.length > 0) {
+                findings.push(`[#${issue.number} ${issue.title}](${issue.url}): ${issueFindings.join("; ")}`);
+              }
+            }
+
+            let summary = `# Agent PR Merged Closeout Audit\n\n`;
+            summary += `PR: [#${pr.number} ${pr.title}](${pr.url})\n\n`;
+            if (findings.length === 0) {
+              summary += "No findings.\n";
+            } else {
+              summary += "Findings:\n";
+              for (const finding of findings) {
+                summary += `- ${finding}\n`;
+                core.warning(finding);
+              }
+            }
+            await core.summary.addRaw(summary).write();

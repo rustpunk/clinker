@@ -1,0 +1,81 @@
+name: Agent Issue Reopened Routing
+
+on:
+  issues:
+    types: [reopened]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: agent-issue-labels-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  reset-routing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark reopened issue for grounding
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const removeExact = new Set(["agent-ready", "agent-investigate"]);
+            const removePrefixes = ["agent-mode:"];
+            const addNames = ["not-agent-ready", "needs-context"];
+
+            const issueLabels = context.payload.issue.labels ?? [];
+            const current = new Set(
+              issueLabels
+                .map((label) => (typeof label === "string" ? label : label.name))
+                .filter(Boolean),
+            );
+
+            const toRemove = [...current].filter((name) => {
+              return (
+                removeExact.has(name) ||
+                removePrefixes.some((prefix) => name.startsWith(prefix))
+              );
+            });
+
+            for (const name of toRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name,
+                });
+                current.delete(name);
+                core.info(`Removed label: ${name}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Label already absent: ${name}`);
+                  current.delete(name);
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            const repoLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+            const available = new Set(repoLabels.map((label) => label.name));
+            const toAdd = addNames.filter(
+              (name) => available.has(name) && !current.has(name),
+            );
+
+            if (toAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: toAdd,
+              });
+              core.info(`Added labels: ${toAdd.join(", ")}`);
+            }
