@@ -270,15 +270,27 @@ Status: **Inferred.** This session did not run Criterion benchmark measurements.
 
 ## 12. Commands Codex Should Run Before Claiming Success
 
-For documentation-only changes:
+For AI onboarding docs-only changes under `docs/ai/`:
 
 ```bash
-cargo fmt --all --check
+git diff --check
+```
+
+Status: **Verified.** AI docs are not currently an mdBook, so this is the
+smallest relevant gate unless the edit changes commands, links into generated
+books, or user/engine docs.
+
+For user or engine mdBook documentation changes, run the relevant book build:
+
+```bash
 mdbook build docs/user -d /tmp/clinker-mdbook-user
 mdbook build docs/engine -d /tmp/clinker-mdbook-engine
 ```
 
-Status: **Verified.** Run the mdBook command relevant to the docs changed; run both if shared docs/theme or cross-book docs changed.
+Status: **Verified.** Run the mdBook command relevant to the docs changed; run
+both if shared docs/theme or cross-book docs changed. `cargo fmt --all --check`
+is not required for pure Markdown edits unless Rust source or generated Rust
+docs are touched.
 
 For Rust code changes:
 

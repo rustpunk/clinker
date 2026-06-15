@@ -159,12 +159,14 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 ## Dependency Rules
 
-- The workspace has a pure-Rust policy. `deny.toml` bans `cmake`, and root
-  `Cargo.toml` comments explain choices such as `blake3` with `pure` and
-  `ureq` with `rustls` to avoid C/native TLS toolchains in Clinker crates.
-- Do not introduce `openssl`, `native-tls`, `cmake`, C build dependencies, or
-  equivalent transitive requirements without explicit architectural approval and
-  corresponding `cargo deny` updates.
+- The workspace dependency policy is to avoid adding new native toolchain
+  requirements without review. `deny.toml` bans `cmake`, and root `Cargo.toml`
+  comments explain choices such as `blake3` with `pure` and `ureq` with
+  `rustls` to avoid OpenSSL/native-tls and extra C build steps in Clinker
+  crates.
+- Do not introduce `openssl`, `native-tls`, `cmake`, new C build requirements,
+  or equivalent transitive requirements without explicit architectural approval
+  and corresponding `cargo deny` updates.
 - `cargo deny` treats yanked crates as denied and all unmaintained advisories as
   findings. Existing ignored RustSec advisories are documented as Dioxus desktop
   transitive dependencies; current crate-map notes suggest Dioxus/Kiln

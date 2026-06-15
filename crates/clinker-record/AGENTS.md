@@ -103,7 +103,8 @@ For Rust source changes, also run the relevant workspace gates from the root
 
 ## Unclear / ask human
 
-- `docs/ai/90_CRATE_AGENT_PLAN.md` marked this local file as probably unnecessary unless broad data-model work begins; keep this file narrowly scoped to record/value/schema risks.
+- Keep this file narrowly scoped to record/value/schema risks and avoid
+  duplicating the root onboarding docs.
 - `PipelineCounters::ok_count` currently deduplicates by source row number and can undercount multi-source row-number collisions; confirm the intended globally unique source-row stamp before changing counter semantics.
 
 ## Evidence

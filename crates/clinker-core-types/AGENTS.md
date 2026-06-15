@@ -92,7 +92,8 @@ planner/executor/channel tests that consume the changed API.
 
 ## Unclear / ask human
 
-- `docs/ai/90_CRATE_AGENT_PLAN.md` marked this local file as probably unnecessary because the crate is small and already well documented; keep guidance short and boundary-focused.
+- Keep this file short and boundary-focused because this crate is small leaf
+  vocabulary.
 - Direct source use of the declared `miette` dependency is weak in this crate; verify intent before documenting it as essential or removing it.
 
 ## Evidence

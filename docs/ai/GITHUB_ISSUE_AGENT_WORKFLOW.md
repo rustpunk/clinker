@@ -33,6 +33,19 @@ Use these workflow labels when available:
 
 Prefer existing `crate:*` labels over generic area labels. Generic frontend/backend labels are less useful in this repository than crate ownership.
 
+If the repository contains `scripts/sync-agent-labels.sh`, use it to create or
+update workflow labels:
+
+```bash
+scripts/sync-agent-labels.sh --repo rustpunk/clinker
+```
+
+Preview changes without writing to GitHub:
+
+```bash
+scripts/sync-agent-labels.sh --repo rustpunk/clinker --dry-run
+```
+
 ## Sizing
 
 - `agent-size:S`: direct fix, docs task, or focused test task.

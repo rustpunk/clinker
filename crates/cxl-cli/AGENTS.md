@@ -98,7 +98,8 @@ For language semantics changes, also run the relevant `crates/cxl` checks.
 
 ## Unclear / ask human
 
-- `docs/ai/90_CRATE_AGENT_PLAN.md` marked this local file as probably unnecessary because this binary is thin over `cxl`; keep local guidance focused on CLI behavior.
+- Keep this local guidance focused on CLI behavior. CXL language semantics
+  belong primarily in `crates/cxl/AGENTS.md` and the `cxl` crate.
 - `docs/user/src/cxl/cxl-cli.md` shows multiple `-e` flags, but `Command::Eval.expr` is `Option<String>`. Decide whether docs are stale or CLI should support repeated `-e`.
 - `json_to_value` maps nested JSON objects to `Value::Null`, while the user docs do not clearly document object handling for `--record`.
 

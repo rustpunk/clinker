@@ -34,6 +34,21 @@ Validate this page against:
 - Validate architecture claims against source, manifests, tests, and examples.
 - Update `docs/ai/80_OPEN_QUESTIONS.md` rather than guessing when a term or rule is unclear.
 
+## Index
+
+- `00_READ_THIS_FIRST.md`: entry point, reading order, evidence labels, and documentation update map.
+- `10_ARCHITECTURE.md`: architecture overview and subsystem boundaries.
+- `20_CRATE_MAP.md`: current workspace crate roles and dependency direction.
+- `30_DESIGN_RULES.md`: architecture, dependency, config, and review rules.
+- `40_COMMON_PATTERNS.md`: repeated implementation patterns and local conventions.
+- `50_TESTING_AND_COMMANDS.md`: canonical command guide.
+- `60_PERFORMANCE_NOTES.md`: hot paths, memory-sensitive code, and benchmark entry points.
+- `70_GLOSSARY.md`: project-specific terms.
+- `80_OPEN_QUESTIONS.md`: unresolved uncertainty for human review.
+- `90_CRATE_AGENT_PLAN.md`: crate-level `AGENTS.md` inventory and ownership map.
+- `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow.
+- `AI_CHANGELOG.md`: lightweight AI documentation history and decision notes.
+
 ## Human Review Notes
 
 - Confirm whether this README should stay human-review-scaffolded or become the reviewed index for `docs/ai/`.

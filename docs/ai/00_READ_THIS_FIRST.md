@@ -143,8 +143,11 @@ git diff --check
 - [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md): unresolved
   architecture, documentation, API, and testing questions for human review.
 - [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md): planning notes for
-  where crate-level `AGENTS.md` files are useful and what guidance they should
-  contain.
+  existing crate-level `AGENTS.md` coverage, remaining gaps, and guidance
+  ownership.
+- [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](GITHUB_ISSUE_AGENT_WORKFLOW.md):
+  issue triage, splitting, labels, decision gates, and close protocol for
+  GitHub-issue-driven agent work.
 - [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md): lightweight history of AI
   documentation, source-backed architecture facts, and decisions or inferences
   future agents should know.
@@ -191,6 +194,8 @@ current uncertainties are:
   node count, or unclear envelope/document-context examples.
 - Transport docs need alignment around implemented file and finite REST support
   versus SQL cursor wording.
+- `cxl-cli` docs/manifest wording needs alignment around repeated `-e`
+  examples and whether a REPL is actually implemented.
 - The `clinker-format -> cxl` dependency edge is current, but whether it is a
   permanent layering rule remains open.
 - Some public planner/CXL symbols may be exposed without a clear stability

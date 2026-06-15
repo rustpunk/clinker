@@ -256,19 +256,21 @@ evidence.
   if intentionally reserved.
 - Priority: Medium
 
-### 13. Should `cxl-cli` support repeated `-e` expressions?
+### 13. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned?
 
 - Question: Are user docs showing multiple `-e` flags correct, or should the
-  docs be corrected to match `Command::Eval.expr: Option<String>`?
-- Why it matters: Repeated expression examples can mislead users and future
-  tests. If repeated `-e` is intended, the CLI type and evaluation/output
-  semantics need to change deliberately.
+  docs be corrected to match `Command::Eval.expr: Option<String>`? Should the
+  `cxl-cli` manifest description continue saying "REPL" when source currently
+  exposes only `check`, `eval`, and `fmt` subcommands?
+- Why it matters: Repeated expression examples and REPL wording can mislead
+  users and future tests. If repeated `-e` or REPL behavior is intended, the CLI
+  type and evaluation/output semantics need to change deliberately.
 - Files/modules involved: `crates/cxl-cli/AGENTS.md`,
-  `crates/cxl-cli/src/main.rs`, `docs/user/src/cxl/cxl-cli.md`,
-  `docs/ai/20_CRATE_MAP.md`.
+  `crates/cxl-cli/Cargo.toml`, `crates/cxl-cli/src/main.rs`,
+  `docs/user/src/cxl/cxl-cli.md`, `docs/ai/20_CRATE_MAP.md`.
 - Suggested way to resolve it: Decide the intended CLI behavior. Either update
-  docs to one expression, or change the Clap field to accept repeated values and
-  add tests for ordering and JSON output.
+  docs/manifest wording to one expression and no REPL, or change the Clap field
+  and CLI implementation to support the promised behavior with tests.
 - Priority: Medium
 
 ### 14. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`?
@@ -508,19 +510,19 @@ evidence.
   `30_DESIGN_RULES.md` or label them explicitly as local patterns.
 - Priority: Low
 
-### 28. Should AI onboarding placeholders be completed or explicitly marked as scaffolding?
+### 28. Which AI onboarding docs should remain review scaffolds versus reviewed indexes?
 
-- Question: Should placeholder sections in `00_READ_THIS_FIRST.md` and
-  `AI_CHANGELOG.md` be filled now, or should they remain obvious scaffolding
-  until human review?
-- Why it matters: Future agents start from these docs. Empty placeholders can
-  hide missing onboarding guidance or make the docs look less authoritative
-  than intended.
-- Files/modules involved: `docs/ai/00_READ_THIS_FIRST.md`,
-  `docs/ai/AI_CHANGELOG.md`, `docs/ai/README.md`, `AGENTS.md`.
-- Suggested way to resolve it: Ask maintainers whether AI docs are ready for a
-  human-reviewed pass. Fill the placeholders with source-backed guidance or
-  mark the files as intentionally skeletal.
+- Question: Should `docs/ai/README.md`, `docs/ai/AI_CHANGELOG.md`, and any
+  other AI onboarding files remain marked as AI-generated review scaffolds, or
+  should maintainers mark some of them as reviewed canonical indexes?
+- Why it matters: Future agents start from these docs. A file can be useful
+  while still requiring human review, but the status should be explicit rather
+  than implied by old placeholder wording.
+- Files/modules involved: `docs/ai/README.md`, `docs/ai/AI_CHANGELOG.md`,
+  `docs/ai/00_READ_THIS_FIRST.md`, `AGENTS.md`.
+- Suggested way to resolve it: Ask maintainers which AI docs are ready for a
+  reviewed pass. Mark reviewed files clearly, and keep remaining scaffolded
+  files explicitly labeled as AI-generated notes requiring validation.
 - Priority: Low
 
 ### 29. Should docs-only AI changes have a renderer or link-check gate beyond `git diff --check`?

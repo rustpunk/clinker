@@ -50,7 +50,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - No normal workspace dependency cycle was found in `cargo metadata --no-deps` or `cargo tree --workspace --depth 1`.
 - `clinker-exec` has an optional normal dependency on `clinker-bench-support` for `bench-alloc` (`crates/clinker-exec/Cargo.toml`). That may be intentional for allocation measurement, but future agents should avoid letting benchmark helpers leak into default runtime code.
 - `clinker-net` depends on `clinker-exec` to implement `RecordSource` (`crates/clinker-net/src/lib.rs`; `clinker_exec::source::RecordSource`). This couples network source readers to executor source traits; it appears deliberate but means network transport is not a low-level IO crate.
-- Release CI still builds `--package clinker-kiln` via `dx`, and the root workspace dependency list still includes `dioxus`, but `clinker-kiln` was extracted from this repo, renamed to `klinx`, and now lives in a separate repository. This project currently has zero intended dependencies on Kiln/Klinx or Dioxus; treat those references as stale cleanup targets, not active architecture (`.github/workflows/release.yml`; `Cargo.toml`).
+- Release CI still builds `--package clinker-kiln` via `dx`, and the root workspace dependency list still includes `dioxus`. No current `clinker-kiln` workspace package was found in `cargo metadata`, so treat remaining Kiln/Klinx/Dioxus references as uncertain editor-related surface area, not active runtime architecture, until maintainers classify them (`.github/workflows/release.yml`; `Cargo.toml`; `docs/ai/80_OPEN_QUESTIONS.md`).
 
 ## Crates
 
@@ -194,7 +194,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Internal dependencies: `clinker-plan`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `ahash`; `tempfile` for dev tests.
 - Known tests/examples/benches: unit tests in `parse.rs`, `discovery.rs`, and `validate.rs`; schema examples/fixtures under `examples/pipelines/retract-demo/*.schema.yaml`.
-- Confidence: Medium. The crate docs mention sharing with `clinker-kiln`; per project owner clarification, Kiln was extracted and renamed to `klinx` in a separate repository, so that note is stale relative to this workspace.
+- Confidence: Medium. The crate docs mention sharing with `clinker-kiln`, but no current `clinker-kiln` workspace package was found in `cargo metadata`; whether that wording is stale, compatibility-specific, or should become generic editor/API language is tracked as an open question.
 - Evidence: `crates/clinker-schema/src/lib.rs`; public symbols `build_workspace_schema_index`, `parse_schema`, `parse_schema_file`, `validate_pipeline`, `SourceSchema`, and `SchemaIndex`.
 
 ### clinker-bench-support
@@ -241,11 +241,11 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - YAML examples live under `examples/pipelines/` and include runnable pipeline configs, data, channels, compositions, baseline test configs, and README files for per-source CK and retract demos.
 - Benchmark pipeline configs live under `benches/pipelines/` and are grouped by `combine`, `cxl_ops`, `execution_mode`, `features`, `format`, `realistic`, and `scale`; `future/` configs are explicitly skipped by `clinker-bench-support::discover_pipeline_configs`.
 - CI runs `cargo fmt --all --check`, two Clippy passes (`cargo clippy --workspace -- -D warnings` and `cargo clippy --workspace --all-targets -- -D warnings`), `cargo test --workspace`, bench compile/smoke checks, native Windows/macOS tests, selected cross-target checks, and `cargo deny` (`.github/workflows/ci.yml`).
-- Release workflow builds CLI tools `clinker` and `cxl-cli`, then attempts `dx build --release --package clinker-kiln --desktop` (`.github/workflows/release.yml`). Per project owner clarification, Kiln was extracted and renamed to `klinx` in its own repository; this workflow path is stale for the current project.
+- Release workflow builds CLI tools `clinker` and `cxl-cli`, then attempts `dx build --release --package clinker-kiln --desktop` (`.github/workflows/release.yml`). No current `clinker-kiln` workspace package was found in `cargo metadata`; treat the workflow path as unresolved until maintainers classify the remaining editor-related release surface.
 
 ## Open Questions
 
-- Remove stale Kiln/Klinx/Dioxus references in a future sprint: `.github/workflows/release.yml` still installs Dioxus CLI and builds `clinker-kiln`, and root `Cargo.toml` still lists `dioxus`, but this project should have zero dependencies on Kiln/Klinx/Dioxus.
+- Open Question: classify remaining Kiln/Klinx/Dioxus references. `.github/workflows/release.yml` still installs Dioxus CLI and builds `clinker-kiln`, and root `Cargo.toml` still lists `dioxus`, but no current `clinker-kiln` workspace package was found in `cargo metadata`.
 - Should `clinker-schema` remain separate and dependent on `clinker-plan`, or should schema discovery/validation live in planning long term?
 - Is `clinker-format -> cxl` an intended permanent layering rule, or should CXL-aware envelope/extraction behavior move into planning/execution?
 - Is the optional `clinker-exec -> clinker-bench-support` edge for `bench-alloc` acceptable as long as it remains feature-gated, or should allocation instrumentation move elsewhere?

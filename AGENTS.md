@@ -42,23 +42,14 @@ Treat older docs as secondary context when they conflict with current code.
 
 ## Commands
 
-Before claiming success, run the smallest relevant gate. For docs-only changes:
+Before claiming success, run the smallest relevant gate from
+[docs/ai/50_TESTING_AND_COMMANDS.md](docs/ai/50_TESTING_AND_COMMANDS.md).
+Use targeted `cargo test -p <crate>` while iterating, then broaden validation
+when the change crosses crate boundaries.
 
-```bash
-git diff --check
-```
-
-For Rust source changes:
-
-```bash
-cargo fmt --all --check
-cargo check --workspace --locked --offline
-cargo clippy --workspace --locked --offline -- -D warnings
-cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-ulimit -n 4096 && cargo test --workspace --locked --offline
-```
-
-Use targeted `cargo test -p <crate>` while iterating. See [docs/ai/50_TESTING_AND_COMMANDS.md](docs/ai/50_TESTING_AND_COMMANDS.md) for mdBook, rustdoc, cargo-deny, benches, and caveats.
+For docs-only AI onboarding edits, the current smallest gate is
+`git diff --check`. See the command guide for mdBook, rustdoc, cargo-deny,
+bench, socket, and file-descriptor caveats.
 
 ## Safety Rules
 
