@@ -1,0 +1,209 @@
+name: Agent Task
+description: Create a Claude Code / Codex-ready autonomous work packet
+title: "[Agent]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for work intended for Claude Code, Codex, or another coding agent.
+
+        A good autonomous agent issue is atomic but meaningful:
+        - One primary outcome
+        - One branch / one PR or commit set
+        - Clear scope boundaries
+        - Clear acceptance criteria
+        - Clear verification steps
+        - A close condition the agent can verify and report with evidence
+
+        If this issue is too broad, make it a milestone or parent issue and split it.
+
+  - type: dropdown
+    id: agent_mode
+    attributes:
+      label: Agent mode
+      description: What should the agent do?
+      options:
+        - Implement - make changes, verify, and close when criteria pass
+        - Plan first - inspect and plan before editing
+        - Investigate only - no code changes
+        - Fix CI/tests
+        - Review existing PR
+        - Refactor bounded area
+        - Docs/tests only
+    validations:
+      required: true
+  - type: dropdown
+    id: agent_size
+    attributes:
+      label: Agent issue size
+      description: Choose the smallest accurate size.
+      options:
+        - S - straightforward, low-risk, directly implementable
+        - M - normal agent task, one bounded PR
+        - L - complex but still one outcome, plan-first required
+        - XL - too broad; split into milestone/sub-issues
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should be true when this issue is complete?
+      placeholder: |
+        Example:
+        The output writer rejects a multi-document structured-format body with a clear diagnostic instead of silently merging documents.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Give the agent enough context to start in the right place.
+      placeholder: |
+        Relevant background:
+        - Related issue/PR:
+        - Related docs/design:
+        - Relevant files/components:
+        - Known constraints:
+        - Prior decisions:
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current behavior
+      description: For bugs or refactors, describe what happens today.
+      placeholder: |
+        Current behavior:
+        - What happens now?
+        - Where does it happen?
+        - Who is affected?
+        - Error messages/logs/screenshots:
+    validations:
+      required: false
+
+  - type: textarea
+    id: desired_behavior
+    attributes:
+      label: Desired behavior
+      description: Describe the target behavior in observable terms.
+      placeholder: |
+        Desired behavior:
+        - What should happen instead?
+        - What should not change?
+        - What edge cases matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries
+      description: Define what the agent may and may not change.
+      value: |
+        In scope:
+        -
+
+        Out of scope:
+        -
+
+        Do not change:
+        - Public API contracts unless explicitly listed
+        - Dependencies unless explicitly approved
+        - Async/runtime architecture unless explicitly listed
+        - Unrelated docs, fixtures, or formatting
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: Use checkboxes. These are the agent's definition of done.
+      placeholder: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification steps
+      description: Commands, manual checks, or artifacts that prove the issue is done.
+      value: |
+        Required commands:
+        - git diff --check
+
+        Targeted tests/checks:
+        -
+
+        Expected result:
+        -
+
+        If tests cannot be run, explain why and what was checked instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk level
+      description: Estimate blast radius and verification depth.
+      options:
+        - Low - localized docs/tests or narrow implementation
+        - Medium - shared behavior or cross-crate behavior
+        - High - architecture, data correctness, memory, security, or dependencies
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and blockers
+      description: List issues, PRs, decisions, credentials, services, or environments required.
+      value: |
+        Blocked by:
+        - None / #...
+
+        Unblocks:
+        - None / #...
+
+        Decision/blocker handling:
+        - Can the agent decide this within existing architecture rules? Yes / No
+        - If no, create/link a decision issue and do not implement speculative behavior.
+        - If `Blocked by` contains an open issue, unmerged PR, unresolved Decision Gate, missing credential, or external condition, this issue is not agent-ready.
+    validations:
+      required: false
+
+  - type: textarea
+    id: agent_instructions
+    attributes:
+      label: Agent instructions
+      description: Task-specific instructions for Claude Code, Codex, or another coding agent.
+      value: |
+        Agent instructions:
+        - Read the issue, comments, linked issues/PRs, AGENTS.md, and referenced files before editing.
+        - Treat this issue as the work contract. Do not expand scope beyond it.
+        - If outcome, scope, or verification is missing, do not guess. Add a short comment explaining what is missing and apply the appropriate routing label.
+        - If this issue is XL or contains multiple independent outcomes, split it into atomic issues before implementation.
+        - Keep changes minimal and within scope.
+        - Prefer existing project patterns over new abstractions.
+        - Add or update tests when behavior changes.
+        - Update docs/examples if public behavior, config, diagnostics, commands, or architecture change.
+        - Run the verification steps listed above.
+        - If validation cannot run, explain why and what was checked instead.
+        - Before requesting review, run a post-implementation follow-up check: compare acceptance criteria against the diff, scan for scope creep or shortcut signatures, and capture follow-up issues/comments for deferred work.
+        - Fix tiny in-scope follow-up edits only when they are obvious and verifiable. Defer broader cleanup, new feature work, test behavior changes, and design questions to follow-up issues or comments.
+        - If implementation changes are made, open or link a PR that closes this exact issue.
+        - Add new follow-up issues and linked PRs to the active GitHub Project. If project update permissions are unavailable, leave a comment requesting Project triage.
+        - Before requesting review or closing, leave a final comment with: summary, files/crates touched, acceptance criteria status, tests/checks run, skipped checks and why, post-implementation follow-up results, risks/rollback notes, and follow-up issues created.
+        - Do not merge the PR by default; leave it for maintainer review and merge unless a maintainer explicitly instructs otherwise.
+        - Do not manually close an implementation issue if the linked PR should close it on merge.
+        - Close the issue only when all acceptance criteria, verification requirements, and maintainer review/merge requirements are satisfied.
+    validations:
+      required: true

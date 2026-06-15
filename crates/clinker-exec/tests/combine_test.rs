@@ -1140,7 +1140,7 @@ mod tests {
     /// Gate: serialized `ExecutionPlanDag` JSON for a 2-input equi
     /// combine surfaces the planner-selected strategy, the chosen
     /// driving input, the build-side inputs, and the decomposed
-    /// predicate shape. This is the contract Kiln's canvas consumes
+    /// predicate shape. This is the contract structured explain consumers use
     /// via `clinker explain --format json`.
     #[test]
     fn test_combine_explain_shows_strategy() {
@@ -3050,7 +3050,7 @@ nodes:
     /// its `NodeProperties`. Hash-build/probe (and IEJoin, grace hash) do
     /// not preserve driving-input order; the property-derivation pass
     /// must mark the combine as destructive so downstream streaming-agg
-    /// eligibility, `--explain`, and Kiln canvas overlays can chain
+    /// eligibility, `--explain`, and structured overlays can chain
     /// through. Resolves Phase Combine §OQ-6 and drill D12.
     ///
     /// Uses `two_input_equi.yaml` (combine 'enriched' over sources

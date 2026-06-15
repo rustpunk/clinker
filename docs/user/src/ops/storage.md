@@ -280,7 +280,7 @@ Cap headroom: 5000000000 bytes free (5000000000 estimated of 10000000000 cap, 50
 
 ### Machine-readable form — `--explain json`
 
-`clinker run --explain json` emits the whole plan as JSON for tooling (the Kiln
+`clinker run --explain json` emits the whole plan as JSON for tooling (the
 canvas, dashboards, CI gates). The same storage observability the text form
 prints lives under a structured `storage_summary` object, so a consumer reads
 per-stage spill estimates and the cap / staging summary without re-parsing

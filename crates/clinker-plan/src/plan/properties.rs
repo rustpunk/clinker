@@ -7,7 +7,7 @@
 //! - streaming aggregation qualification
 //! - correlated DLQ sort-order lookup
 //! - `--explain` text and JSON rendering
-//! - Kiln canvas edge overlays
+//! - structured edge overlays
 //!
 //! The pass runs in topo order so each node's properties are derived from
 //! its already-populated parents. Provenance is recorded on every node so
@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 /// Computed once after transform compilation, stored on
 /// [`ExecutionPlanDag`](crate::plan::execution::ExecutionPlanDag), consumed
 /// by streaming-agg selection, correlated DLQ, `--explain` rendering,
-/// and Kiln canvas edge overlays.
+/// and structured edge overlays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeProperties {
     pub ordering: Ordering,
@@ -141,7 +141,7 @@ pub enum Confidence {
 
 /// Provenance explaining how a node's `Ordering` was derived.
 ///
-/// Every variant identifies the node responsible so `--explain` and Kiln
+/// Every variant identifies the node responsible so `--explain` and tooling
 /// canvas can render an intelligible chain back to the input declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderingProvenance {
@@ -295,7 +295,7 @@ impl NodeProperties {
 ///
 /// The walker is also reused to populate
 /// `PlanNode::Aggregation::fallback_reason` when `Auto` resolves to `Hash`
-/// because eligibility was `HashFallback`, so Kiln canvas hover tooltips
+/// because eligibility was `HashFallback`, so hover tooltips
 /// share a single source of truth with compile errors.
 ///
 /// Pure formatting — no I/O. Confidence-aware caret style is a

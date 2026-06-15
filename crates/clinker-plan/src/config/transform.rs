@@ -128,7 +128,7 @@ pub enum LogLevel {
 
 /// Lightweight read-only view over a transform-like node
 /// (`Transform`, `Aggregate`, `Route`) yielded by
-/// [`PipelineConfig::transform_views`]. Carries the fields the Kiln IDE
+/// [`PipelineConfig::transform_views`]. Carries the fields external tooling
 /// and schema-validation passes need; callers that need variant-specific
 /// bodies (`TransformBody`, `AggregateBody`, etc.) should walk
 /// [`PipelineConfig::nodes`] directly.

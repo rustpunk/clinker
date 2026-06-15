@@ -58,7 +58,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 arc-swap = "1.9"
 static_assertions = "1"
-dioxus = { version = "=0.7.4" }
 rfd = "0.15"
 # `pure` is misleadingly named: on blake3 1.x it does NOT mean scalar. It
 # compiles the SSE2/SSE4.1/AVX2 paths as Rust `std::arch` intrinsics and

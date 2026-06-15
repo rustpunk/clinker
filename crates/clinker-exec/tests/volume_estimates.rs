@@ -30,7 +30,7 @@ use std::path::Path;
 /// JSON `--explain` carries the two predictions under
 /// `node_properties.<name>`. The struct field names round-trip verbatim
 /// (no serde rename), and the values match the in-struct predictions for a
-/// sized fixture — so a JSON consumer (Kiln canvas, third-party tooling)
+/// sized fixture — so a JSON consumer or third-party tooling
 /// reads the same numbers the scheduler weighed.
 #[test]
 fn json_explain_surfaces_predictions() {

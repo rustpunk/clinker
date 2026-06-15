@@ -58,7 +58,7 @@ pub struct ProvenanceLayer {
 /// A config value together with its full provenance chain.
 ///
 /// Inspired by figment's `Metadata` model. The `won` flag is Clinker's
-/// addition — it makes the winning layer explicit for the Kiln inspector
+/// addition — it makes the winning layer explicit for tooling inspectors
 /// panel without requiring the inspector to re-run priority logic.
 ///
 /// The provenance chain is bounded at 4 entries (one per [`LayerKind`]).

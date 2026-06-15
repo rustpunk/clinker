@@ -129,7 +129,7 @@ Using `inputs:` on a non-merge node (or `input:` on a merge node) is caught at p
 Every node type supports these optional fields:
 
 - **`description:`** -- human-readable text for documentation. Ignored by the engine.
-- **`_notes:`** -- arbitrary metadata (JSON object). Ignored by the engine, used by the Kiln IDE for visual annotations and inspector panels.
+- **`_notes:`** -- arbitrary metadata (JSON object). Ignored by the engine and available to external tooling.
 
 ```yaml
 - type: transform

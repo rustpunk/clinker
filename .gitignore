@@ -5,6 +5,8 @@
 lancedb/
 docs/internal/
 docs/book/
+!docs/ai/
+!docs/ai/**
 target/
 bench-data/
 examples/pipelines/output/

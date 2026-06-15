@@ -1094,7 +1094,7 @@ fn compute_one(
             // Combine always destroys parent ordering: hash-build/probe
             // (and IEJoin, grace hash) do not preserve driving-input
             // order. Emit `DestroyedByCombine { Proven }` so downstream
-            // streaming-agg eligibility / `--explain` / Kiln overlays
+            // streaming-agg eligibility / `--explain` / structured overlays
             // can chain through and suggest "add a sort step between
             // `{combine}` and `{consumer}`". Resolves Phase Combine
             // §OQ-6 and drill D12.

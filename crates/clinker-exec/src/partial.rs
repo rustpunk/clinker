@@ -1,4 +1,4 @@
-//! Per-item fallback parser for graceful degradation (Kiln IDE).
+//! Per-item fallback parser for graceful degradation in external tooling.
 //!
 //! Walks the unified `nodes:` array directly. Sources and outputs
 //! deserialize into `SourceConfig`/`OutputConfig` via the Body wrappers;
@@ -15,7 +15,7 @@ pub enum PartialItem<T> {
     Err { index: usize, message: String },
 }
 
-/// Kiln IDE partial view of a transform-like node (Transform, Aggregate,
+/// Partial view of a transform-like node (Transform, Aggregate,
 /// Route). Only the fields the canvas renders are populated.
 #[derive(Debug, Clone)]
 pub struct PartialTransform {

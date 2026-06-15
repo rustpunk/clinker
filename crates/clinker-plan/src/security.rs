@@ -68,10 +68,10 @@ impl AsRef<Path> for ValidatedPath {
 /// scoped to. Callers should pass:
 ///
 /// - **CLI / on-disk pipeline:** the directory containing the YAML file.
-/// - **Kiln IDE unsaved buffers:** `std::env::current_dir()`. Unsaved Kiln
-///   buffers have no on-disk path yet, so the IDE uses the current working
-///   directory as the security root. **Never** pass `/` (that would validate
-///   everything against the filesystem root).
+/// - **Unsaved buffers:** `std::env::current_dir()`. Unsaved buffers have no
+///   on-disk path yet, so tooling uses the current working directory as the
+///   security root. **Never** pass `/` (that would validate everything against
+///   the filesystem root).
 ///
 /// # Errors
 ///
@@ -493,13 +493,12 @@ mod tests {
     #[test]
     fn test_source_db_load_requires_validated_path() {}
 
-    // ── Kiln unsaved-buffer convention ────────────────────────────
+    // ── Unsaved-buffer convention ─────────────────────────────────
 
     #[test]
-    fn test_kiln_unsaved_buffer_uses_cwd_base() {
-        // Kiln convention: when a buffer has no on-disk path, the IDE passes
-        // `std::env::current_dir()` as the base_dir. This test exercises the
-        // documented convention against a real relative path under cwd.
+    fn test_unsaved_buffer_uses_cwd_base() {
+        // When a buffer has no on-disk path, tooling passes
+        // `std::env::current_dir()` as the base_dir.
         let dir = tempfile::tempdir().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -510,7 +509,7 @@ mod tests {
         };
         // Always restore cwd, even if the assertion below fails.
         std::env::set_current_dir(&original_cwd).unwrap();
-        let vp = result.expect("kiln-style validation must succeed");
+        let vp = result.expect("unsaved-buffer validation must succeed");
         assert!(vp.as_path().ends_with("sibling.yaml"));
     }
 

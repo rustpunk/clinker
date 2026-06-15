@@ -1,0 +1,112 @@
+name: Agent Decision Gate
+description: Resolve a bounded architecture or design decision before implementation
+title: "[Decision]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when implementation depends on a design or architecture choice.
+
+        The agent may decide only within existing repository architecture, dependency, safety, and documentation rules. If no option satisfies those constraints, create/link a blocker and do not implement speculative behavior.
+
+        Decision Gates resolve choices. Implementation should usually happen in linked Agent Task issues after the decision is recorded.
+
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision needed
+      description: State the exact question to resolve.
+      placeholder: |
+        Should generated EDI envelopes introduce a durable cross-run sequence store, or is generated envelope control-number state out of scope?
+    validations:
+      required: true
+
+  - type: textarea
+    id: why_gate
+    attributes:
+      label: Why this is a gate
+      description: Explain what implementation must not proceed until this is answered.
+      placeholder: |
+        This gates implementation because:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: authority
+    attributes:
+      label: Decision authority
+      description: Define whether the agent can decide or must create/link a blocker.
+      value: |
+        The agent may choose among options if the choice preserves:
+        - Existing architecture rules
+        - Bounded-memory behavior
+        - Crate layering
+        - Public docs/tests consistency
+        - Dependency policy
+
+        If no option satisfies those constraints, create/link a blocker and do not implement.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence to inspect
+      description: Source, docs, tests, examples, related issues, or PRs.
+      placeholder: |
+        Source:
+        - crates/...
+
+        Docs:
+        - docs/...
+
+        Related:
+        - #
+    validations:
+      required: true
+
+  - type: textarea
+    id: options
+    attributes:
+      label: Options
+      description: List concrete options with tradeoffs.
+      value: |
+        Option A:
+        - Pros:
+        - Cons:
+        - Validation impact:
+
+        Option B:
+        - Pros:
+        - Cons:
+        - Validation impact:
+    validations:
+      required: true
+
+  - type: dropdown
+    id: implementation_scope
+    attributes:
+      label: Primary output
+      description: What should happen after the decision?
+      options:
+        - Record the decision only
+        - Create implementation issue(s)
+        - Update docs/non-goals/open questions
+    validations:
+      required: true
+
+  - type: textarea
+    id: closure
+    attributes:
+      label: Closure requirements
+      description: What the final decision comment must include.
+      value: |
+        Before closing, leave a final comment with:
+        - Chosen option
+        - Rejected options
+        - Source evidence
+        - Docs updated, if any
+        - Follow-up issue links, if implementation remains
+    validations:
+      required: true
