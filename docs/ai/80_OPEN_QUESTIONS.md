@@ -49,6 +49,18 @@ Existing files under `docs/*` and `notebooklm-sources/*` may be stale. Treat the
   - Evidence: `docs/ai/20_CRATE_MAP.md` says Kiln was extracted and renamed to Klinx in another repository, but local files still contain Kiln references such as `_notes` comments, `examples/pipelines/kiln.toml`, release workflow/root dependency references noted by the crate map, and explain JSON comments for Kiln consumers.
   - Why it matters: The glossary can only mark Kiln/Klinx as historical/currently external with Medium confidence until maintainers decide which references are active compatibility surface versus stale cleanup.
 
+- **Should `clinker-exec` continue re-entering compilation from `CompiledPlan::config()` during runs?**
+  - Evidence: `PipelineExecutor::run_plan_with_readers_writers` requires `&CompiledPlan`, but `crates/clinker-exec/src/executor/mod.rs` forwards through `plan.config()` into `run_with_readers_writers`; `docs/ai/10_ARCHITECTURE.md` also notes this nuance.
+  - Why it matters: Future agents should preserve the public compiled-plan boundary, but should not assume the stored `ExecutionPlanDag` is the only runtime input unless maintainers confirm or the implementation changes.
+
+- **Is the optional `clinker-exec -> clinker-bench-support` `bench-alloc` edge acceptable long term?**
+  - Evidence: `crates/clinker-exec/Cargo.toml` has optional `clinker-bench-support` behind `bench-alloc`, and `docs/ai/20_CRATE_MAP.md` flags this as intentional-looking but suspicious coupling.
+  - Why it matters: Crate-level guidance can require the edge to stay feature-gated, but broader architecture guidance should confirm whether allocation instrumentation belongs there or elsewhere.
+
+- **How broad should composition resource support become beyond implemented file resources?**
+  - Evidence: `clinker-plan` owns `ResourceDecl`, `ResourceKind`, `Resource`, and composition resource parsing, but `docs/ai/40_COMMON_PATTERNS.md` says evidence currently shows only file resources and validation is still partly stubbed.
+  - Why it matters: Future agents should not document or implement broader resource support by inference; maintainers should confirm the intended resource model before agents expand it.
+
 - **Are channel files only an edge-layer concern, or can lower crates own channel-adjacent concepts?**
   - Evidence: `clinker-channel` owns binding/overlay/staging-copy code, while `clinker-plan` owns channel identity in `CompiledPlan` and composition/resource declarations.
   - Why it matters: The glossary links channels to several crates, but crate-boundary docs should clarify ownership before future agents move code.
