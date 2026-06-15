@@ -114,14 +114,6 @@ diagnostics, planning behavior, explain output, or architecture:
 - `docs/ai/*.md`, especially architecture, crate map, design rules, common patterns, testing, and open questions
 - Relevant `examples/pipelines/*.yaml`, `examples/pipelines/compositions/*.comp.yaml`, and `benches/pipelines/**/*.yaml`
 
-## Unclear / ask human
-
-Use `docs/ai/80_OPEN_QUESTIONS.md` as the consolidated open-question list.
-Relevant entries for this crate include the permanent status of
-`clinker-format -> cxl`, stale `clinker-core` / Kiln / Klinx wording, current
-node-doc drift, and composition resource support beyond implemented file
-resources.
-
 ## Evidence
 
 - `crates/clinker-plan/Cargo.toml`

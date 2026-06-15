@@ -117,14 +117,6 @@ Update these when changing related behavior:
 - Relevant `examples/pipelines/*.yaml` or channel examples
 - `docs/ai/10_ARCHITECTURE.md`, `docs/ai/20_CRATE_MAP.md`, `docs/ai/30_DESIGN_RULES.md`, `docs/ai/50_TESTING_AND_COMMANDS.md`, `docs/ai/80_OPEN_QUESTIONS.md`
 
-## Unclear / ask human
-
-- Hypothesis: `--memory-limit`, `--error-threshold`, `--dry-run-output`, `--quiet`, and `--rules-path` appear parsed/tested but not clearly threaded into the run path. Verify before documenting them as active behavior.
-- `ExplainArgs::channel` exists, but `run_explain` does not appear to apply it. `clinker run --explain` does apply channel overlays.
-- CLI long help still mentions older "inputs, outputs, field mappings" wording. Current architecture says unified `nodes:` is the active shape.
-- `ExplainFormat::Json` mentions Kiln canvas consumption; AI docs flag Kiln/Klinx references as stale or external.
-- Production-path `expect("compile")` and `expect("pipeline has at least one source")` rely on planner assumptions that should be reviewed before copying.
-
 ## Evidence
 
 - `crates/clinker/Cargo.toml`

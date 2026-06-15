@@ -89,12 +89,6 @@ Update these when changing related behavior:
 - `docs/ai/50_TESTING_AND_COMMANDS.md` if socket/test behavior changes
 - `docs/ai/80_OPEN_QUESTIONS.md`
 
-## Unclear / ask human
-
-- Should `clinker-net` remain coupled to `clinker-exec::source::RecordSource`, or should source traits move later?
-- Should docs/manifests mention SQL cursors before implementation exists, or mark that language explicitly as roadmap?
-- Should `docs/user/src/nodes/source.md` be updated from "only file transport" to the current file-or-REST transport model?
-
 ## Evidence
 
 - `crates/clinker-net/Cargo.toml`

@@ -115,12 +115,6 @@ or public format APIs:
 - Relevant `examples/pipelines/**` and `benches/pipelines/format/**`
 - `docs/ai/*.md`, especially crate map, design rules, common patterns, testing, and open questions
 
-## Unclear / ask human
-
-- Is the `clinker-format -> cxl` dependency intended permanently, or should doc-path analysis move elsewhere?
-- Hypothesis: broad non-UTF-8 or charset expansion beyond current format-specific handling needs human review before implementation or docs.
-- Hypothesis: older internal format notes may be historical; verify against current source before using them as guidance.
-
 ## Evidence
 
 - `crates/clinker-format/Cargo.toml`

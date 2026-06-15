@@ -119,13 +119,6 @@ executor APIs:
 - `docs/ai/*.md` when architecture, commands, crate boundaries, or invariants change
 - Relevant examples and fixtures under `examples/pipelines/` and `crates/clinker-exec/tests/fixtures/`
 
-## Unclear / ask human
-
-Use `docs/ai/80_OPEN_QUESTIONS.md` as the consolidated open-question list.
-Relevant entries for this crate include current `CompiledPlan` reuse semantics,
-the feature-gated `bench-alloc` edge, and SQL cursor wording without current
-implementation evidence.
-
 ## Evidence
 
 - `crates/clinker-exec/Cargo.toml`

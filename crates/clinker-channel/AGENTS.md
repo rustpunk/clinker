@@ -94,12 +94,6 @@ Update these when changing related behavior:
 - `examples/pipelines/channels/*/*.channel.yaml` and nearby pipeline examples
 - `docs/ai/20_CRATE_MAP.md`, `docs/ai/30_DESIGN_RULES.md`, `docs/ai/40_COMMON_PATTERNS.md`, `docs/ai/80_OPEN_QUESTIONS.md`
 
-## Unclear / ask human
-
-- Should pipeline-target channel config keys eventually validate against compiled-plan provenance/declarations? Current composition-target validation is stronger than pipeline-target validation.
-- Are channel `resources.default` / `resources.fixed` meant to become applied overlays, or are they reserved for future work?
-- Should channel var diagnostic codes `E109`, `E110`, and `E111` get dedicated `docs/explain/` pages, or remain documented only in user channel/variable docs?
-
 ## Evidence
 
 - `crates/clinker-channel/src/lib.rs`

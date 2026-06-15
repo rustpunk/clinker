@@ -113,12 +113,6 @@ behavior:
 - Relevant `examples/pipelines/*.yaml` and `benches/pipelines/cxl_ops/*.yaml`
 - `docs/ai/*.md`, especially crate map, design rules, common patterns, testing, and open questions
 
-## Unclear / ask human
-
-- `docs/ai/80_OPEN_QUESTIONS.md` still asks for the intended expansion of "CXL"; do not make acronym wording canonical from secondary docs alone.
-- Hypothesis: `resolve::HashMapResolver` remains public mainly for tests and compatibility after moving the implementation to `clinker-record`.
-- Hypothesis: `cxl` should continue to own `typecheck::Row` because `typecheck/row.rs` says this preserves the `clinker-plan -> cxl` dependency direction.
-
 ## Evidence
 
 - `crates/cxl/Cargo.toml`
