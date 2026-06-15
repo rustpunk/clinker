@@ -125,6 +125,14 @@ Existing files under `docs/*` and `notebooklm-sources/*` may be stale. Treat the
   - Evidence: `crates/clinker/src/main.rs` parses and tests flags such as `--memory-limit`, `--error-threshold`, `--dry-run-output`, `--quiet`, and `--rules-path`, but this crate-agent pass did not find clear use of those fields in the run path beyond parsing/helper tests.
   - Why it matters: User-facing CLI docs should not promise behavior that the binary does not implement, and future agents should verify wiring before changing related docs.
 
+- **Should `cxl-cli` support repeated `-e` expressions or should the docs be corrected?**
+  - Evidence: `docs/user/src/cxl/cxl-cli.md` shows commands such as `cxl eval -e 'emit a = 1' -e 'emit b = "two"'`, while `crates/cxl-cli/src/main.rs` stores `Command::Eval.expr` as `Option<String>`.
+  - Why it matters: Future agents should not copy repeated-`-e` examples into tests or docs until the intended CLI behavior is confirmed.
+
+- **Should `cxl-cli --record` preserve nested JSON objects as `Value::Map` or document that objects become `Null`?**
+  - Evidence: `crates/cxl-cli/src/main.rs` maps `serde_json::Value::Object(_)` to `Value::Null` in `json_to_value`, while `docs/user/src/cxl/cxl-cli.md` documents direct JSON mappings for null, bool, numbers, strings, and arrays but does not clearly call out object handling.
+  - Why it matters: `clinker-record::Value` has a `Map` variant, so silently nulling nested objects may be intentional v1 scope or documentation drift; examples and user docs should match the implementation.
+
 - **Should `clinker explain --channel` apply channel overlays?**
   - Evidence: `crates/clinker/src/main.rs` defines `ExplainArgs::channel` and help text for `clinker explain ... --channel`, while `run_explain` should be checked against the `run` path where `apply_channel_overlay` is invoked before explain output.
   - Why it matters: Explain output may differ depending on invocation path unless channel handling is intentionally scoped.
@@ -164,6 +172,10 @@ Existing files under `docs/*` and `notebooklm-sources/*` may be stale. Treat the
 - **Should broad non-UTF-8 or charset support be documented or expanded?**
   - Evidence: `docs/user/src/formats/x12.md` documents an `encoding` option with UTF-8 / ISO-8859-1 behavior, while other format docs and source files such as `docs/user/src/formats/hl7.md`, `docs/user/src/formats/swift.md`, and `crates/clinker-format/src/hl7/tokenizer.rs` reject non-UTF-8 message text.
   - Why it matters: Format docs should not promise encoding support beyond implemented reader/writer behavior.
+
+- **Should `PipelineCounters::ok_count` get a globally unique source-row identity?**
+  - Evidence: `crates/clinker-record/src/counters.rs` says `ok_count` deduplication uses each record's `row_num`, and that row-number collisions across sources may undercount distinct inputs pending a globally unique source-row stamp.
+  - Why it matters: Counter semantics are user-visible through metrics and CXL `$pipeline` counters; future agents should not change or document multi-source success counts without confirming the intended identity model.
 
 - **Which older internal format notes are historical versus current guidance?**
   - Evidence: Older docs under `docs/internal/` and `notebooklm-sources/` may describe historical format behavior, while `docs/ai/00_READ_THIS_FIRST.md` says existing docs are secondary and must be validated against source before reuse.
