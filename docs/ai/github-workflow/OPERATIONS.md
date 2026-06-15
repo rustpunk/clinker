@@ -61,6 +61,16 @@ Use built-in automations lightly:
 Do not automate `Agent Ready`. Readiness depends on scope, blockers,
 acceptance criteria, verification, and decision gates.
 
+The repository also carries issue-label cleanup workflows:
+
+- Closed issues remove live agent-routing labels such as `agent-ready`,
+  `needs-*`, `blocked`, and `agent-mode:*`.
+- Reopened issues remove stale ready/mode labels and, when those labels exist,
+  add `not-agent-ready` and `needs-context`.
+
+These workflows intentionally do not restore `Agent Ready`; a reopened issue
+must go back through grounding before it can re-enter the Agent Queue.
+
 ## What Goes In The Project
 
 Add every open issue and PR that participates in delivery flow to the active
