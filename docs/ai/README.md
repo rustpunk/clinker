@@ -41,5 +41,7 @@ Validate this page against:
 - `70_GLOSSARY.md`: project-specific terms.
 - `80_OPEN_QUESTIONS.md`: unresolved uncertainty.
 - `90_CRATE_AGENT_PLAN.md`: crate-level `AGENTS.md` inventory and ownership map.
-- `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow.
+- `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow entry point.
+- `github-workflow/`: focused workflow slices for planning, grounding,
+  decisions, implementation, review, and operations.
 - `AI_CHANGELOG.md`: lightweight AI documentation history and decision notes.

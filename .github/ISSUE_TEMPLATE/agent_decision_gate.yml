@@ -9,6 +9,8 @@ body:
 
         The agent may decide only within existing repository architecture, dependency, safety, and documentation rules. If no option satisfies those constraints, create/link a blocker and do not implement speculative behavior.
 
+        Decision Gates resolve choices. Implementation should usually happen in linked Agent Task issues after the decision is recorded.
+
   - type: textarea
     id: decision
     attributes:
@@ -90,7 +92,6 @@ body:
       options:
         - Record the decision only
         - Create implementation issue(s)
-        - Implement the chosen option in this issue
         - Update docs/non-goals/open questions
     validations:
       required: true

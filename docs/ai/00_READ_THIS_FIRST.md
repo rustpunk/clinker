@@ -139,8 +139,8 @@ git diff --check
   existing crate-level `AGENTS.md` coverage, remaining gaps, and guidance
   ownership.
 - [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](GITHUB_ISSUE_AGENT_WORKFLOW.md):
-  issue triage, splitting, labels, decision gates, and close protocol for
-  GitHub-issue-driven agent work.
+  entry point for GitHub-issue-driven agent work, with links to focused
+  workflow slices under `docs/ai/github-workflow/`.
 - [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md): lightweight history of AI
   documentation, source-backed architecture facts, and decisions or inferences
   future agents should know.

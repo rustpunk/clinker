@@ -1,103 +1,109 @@
 # GitHub Issue Agent Workflow
 
-Purpose: Define how autonomous coding agents create, triage, split, work, and close GitHub issues for this repository.
+Purpose: Define the entry point and routing rules for GitHub-issue-driven
+agent work in this repository.
 
-Use this workflow only when the task involves GitHub issues, milestones, labels, sub-issues, or autonomous issue closure.
+Use this workflow when a task involves GitHub issues, milestones, labels,
+sub-issues, pull requests, project status, or autonomous issue closure.
 
-## Agent-Ready Issues
+The core rule is that implementation is not the default workflow. Planning,
+grounding, decisions, implementation, and review are separate modes with
+different permissions and exit criteria.
 
-Issues labeled or written for agents are executable work contracts for Claude Code, Codex, or another coding agent. Human review is not assumed in the normal loop.
+## Which File To Read
 
-An agent-ready issue must have:
+Read only the workflow slice that matches the work:
 
-- one primary outcome
-- clear scope and out-of-scope boundaries
-- relevant context or source pointers
-- acceptance criteria
-- verification commands
-- a close condition the agent can verify without asking
+- Planning or milestone setup:
+  [github-workflow/PLANNING.md](github-workflow/PLANNING.md)
+- Vague, stale, broad, or under-specified issues:
+  [github-workflow/GROUNDING.md](github-workflow/GROUNDING.md)
+- Product, architecture, dependency, public API, schema, auth, security, memory,
+  or compatibility choices:
+  [github-workflow/DECISIONS.md](github-workflow/DECISIONS.md)
+- Agent implementation work:
+  [github-workflow/IMPLEMENTATION.md](github-workflow/IMPLEMENTATION.md)
+- PR review, merge readiness, or review bottlenecks:
+  [github-workflow/REVIEW.md](github-workflow/REVIEW.md)
+- Labels, project status, sizing, WIP limits, and failure controls:
+  [github-workflow/OPERATIONS.md](github-workflow/OPERATIONS.md)
 
-Agents may implement, test, document, create follow-up issues, and close agent-ready issues when the close criteria are satisfied.
+An implementation agent usually needs this file,
+[github-workflow/IMPLEMENTATION.md](github-workflow/IMPLEMENTATION.md), and
+[github-workflow/REVIEW.md](github-workflow/REVIEW.md). It does not need
+milestone planning details unless the issue asks for planning or splitting.
 
-One agent should normally work one implementation issue at a time. A second issue is acceptable only when it is docs-only, tests-only, or touches clearly non-overlapping files.
+## Operating Model
 
-## Labels
+Use this hierarchy:
 
-Use these workflow labels when available:
+```text
+Milestone
+  -> planning and scope container
 
-- `agent-ready`, `agent-plan-first`, `agent-investigate`
-- `needs-context`, `needs-decision`, `needs-splitting`, `not-agent-ready`, `blocked`
-- `agent-size:S`, `agent-size:M`, `agent-size:L`, `agent-size:XL`
-- `agent-mode:investigate`, `agent-mode:implement`, `agent-mode:fix-ci`, `agent-mode:review`, `agent-mode:docs-tests`, `agent-mode:split`, `agent-mode:decision`
-- `risk:low`, `risk:medium`, `risk:high`
+Readiness Review issue
+  -> turns vague work into agent-ready work, a decision gate, a split, or a blocker
 
-Prefer existing `crate:*` labels over generic area labels. Generic frontend/backend labels are less useful in this repository than crate ownership.
+Decision Gate issue
+  -> resolves a bounded architecture/product choice before implementation
 
-If the repository contains `scripts/sync-agent-labels.sh`, use it to create or
-update workflow labels:
+Agent Task issue
+  -> one autonomous implementation packet
 
-```bash
-scripts/sync-agent-labels.sh --repo rustpunk/clinker
+Pull Request
+  -> evidence that the Agent Task is complete
 ```
 
-Preview changes without writing to GitHub:
+Agents own bounded work packets through implementation, verification, and PR
+evidence. In this public-contribution repository, agents must not merge PRs by
+default; leave PRs for maintainer review and merge unless a maintainer
+explicitly instructs otherwise.
 
-```bash
-scripts/sync-agent-labels.sh --repo rustpunk/clinker --dry-run
-```
+## Work Item Types
 
-## Sizing
+- **Milestone:** larger goal or release container with goal, non-goals, exit
+  criteria, linked decision gates, and a short ready queue.
+- **Readiness Review:** investigation-only issue used when the work is vague,
+  stale, broad, or missing acceptance criteria.
+- **Decision Gate:** bounded decision issue used before implementation when a
+  product, architecture, dependency, API, security, schema, memory, or
+  compatibility choice is unresolved.
+- **Agent Task:** implementation-ready work packet with one outcome, clear
+  boundaries, observable acceptance criteria, and verification commands.
+- **Pull Request:** proposed evidence that one Agent Task is complete.
 
-- `agent-size:S`: direct fix, docs task, or focused test task.
-- `agent-size:M`: normal autonomous implementation issue; one bounded PR or commit set.
-- `agent-size:L`: one outcome but complex; plan first before editing.
-- `agent-size:XL`: not agent-ready; split into atomic issues or convert into a milestone/epic tracker.
+## Routing Rules
 
-## Vague Issues
+- Do not assign a whole milestone to an agent. Select ready issues from the
+  milestone instead.
+- Agents may implement only `Agent Task` issues with `Status = Agent Ready`.
+- Route vague, stale, broad, or under-specified work through Readiness Review.
+- Route unresolved product, architecture, dependency, public API, schema, auth,
+  security, memory, or compatibility choices through Decision Gate.
+- Split `agent-size:XL` or multi-outcome work before implementation.
+- Track sequence dependencies in issue links and the project board; blocked
+  issues are not agent-ready.
+- Add workflow-relevant issues and PRs to the active GitHub Project, defaulting
+  new items to `Intake` until routed.
+- One Agent Task should normally produce one PR.
+- One PR should normally close one Agent Task.
+- Agents must not merge PRs by default; leave PRs for maintainer review and
+  merge unless a maintainer explicitly instructs otherwise.
 
-When an issue lacks clear scope, acceptance criteria, or verification, the agent should first perform an Issue Readiness Review as a comment or issue.
+## Stop Conditions
 
-After the review, the agent may:
+Stop implementation and route the issue when:
 
-- proceed if missing details can be safely inferred from code, tests, docs, and architecture rules
-- split the issue into smaller linked issues
-- convert the issue into a milestone/epic tracker
-- create a decision/blocker issue if implementation would cross an architecture, dependency, security, credential, or product-behavior boundary
-
-The agent must not implement speculative behavior when the expected behavior is not derivable from repository evidence.
-
-## Split Protocol
-
-If an issue is too broad, split it before implementation.
-
-Close the parent only when it has been converted into linked atomic issues, or leave it open as an epic/milestone tracker.
-
-Use GitHub's native sub-issues API for umbrella/sub-issue relationships instead of markdown task-list checkboxes in parent issue bodies.
-
-## Block Protocol
-
-Create or link a decision/blocker issue instead of implementing when completion requires:
-
-- new dependencies or cargo-deny exceptions not already approved
-- async runtimes, daemon/service behavior, distributed execution, or unbounded streams
-- credentials or external services not available to the agent
-- security-sensitive access or policy choices
-- product behavior that cannot be derived from repository evidence
-- architecture changes that conflict with `AGENTS.md` or `docs/ai/30_DESIGN_RULES.md`
-
-## Decision Gates
-
-For bounded architecture or design questions, use the Agent Decision Gate issue form.
-
-The agent may choose among options if the choice preserves:
-
-- existing architecture rules
-- bounded-memory behavior
-- crate layering
-- public docs/tests consistency
-- dependency policy
-
-If no option satisfies those constraints, create or link a blocker and do not implement.
+- the issue is blocked by an open prerequisite issue, decision, PR, or external
+  condition
+- acceptance criteria cannot be satisfied as written
+- verification cannot be run and no substitute evidence is possible
+- the issue requires an unapproved dependency
+- the issue requires a public API, schema, auth, security, product, memory, or
+  architecture decision
+- the issue contains multiple independent outcomes
+- tests fail for reasons unrelated to the change
+- the implementation would require broad unrelated refactoring
 
 ## Close Protocol
 
@@ -105,8 +111,12 @@ Before closing an agent issue, leave a final comment with:
 
 - summary of behavior changed
 - files/crates touched
+- acceptance criteria status
 - tests/checks run
 - skipped checks and why
+- risks or rollback notes
 - follow-up issues created
 
-Close the issue only when all acceptance criteria and verification requirements are satisfied.
+Close the issue only when all acceptance criteria, verification requirements,
+and maintainer review/merge requirements are satisfied. If a linked PR closes
+the issue on merge, do not manually close the issue first.

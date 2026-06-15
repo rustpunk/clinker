@@ -13,7 +13,7 @@ body:
         - Clear scope boundaries
         - Clear acceptance criteria
         - Clear verification steps
-        - A close condition the agent can verify without human review
+        - A close condition the agent can verify and report with evidence
 
         If this issue is too broad, make it a milestone or parent issue and split it.
 
@@ -168,14 +168,15 @@ body:
       description: List issues, PRs, decisions, credentials, services, or environments required.
       value: |
         Blocked by:
-        -
+        - None / #...
 
-        Depends on:
-        -
+        Unblocks:
+        - None / #...
 
         Decision/blocker handling:
         - Can the agent decide this within existing architecture rules? Yes / No
         - If no, create/link a decision issue and do not implement speculative behavior.
+        - If `Blocked by` contains an open issue, unmerged PR, unresolved Decision Gate, missing credential, or external condition, this issue is not agent-ready.
     validations:
       required: false
 
@@ -196,7 +197,13 @@ body:
         - Update docs/examples if public behavior, config, diagnostics, commands, or architecture change.
         - Run the verification steps listed above.
         - If validation cannot run, explain why and what was checked instead.
-        - Before closing, leave a final comment with: summary, files/crates touched, tests/checks run, skipped checks and why, and follow-up issues created.
-        - Close the issue only when all acceptance criteria and verification requirements are satisfied.
+        - Before requesting review, run a post-implementation follow-up check: compare acceptance criteria against the diff, scan for scope creep or shortcut signatures, and capture follow-up issues/comments for deferred work.
+        - Fix tiny in-scope follow-up edits only when they are obvious and verifiable. Defer broader cleanup, new feature work, test behavior changes, and design questions to follow-up issues or comments.
+        - If implementation changes are made, open or link a PR that closes this exact issue.
+        - Add new follow-up issues and linked PRs to the active GitHub Project. If project update permissions are unavailable, leave a comment requesting Project triage.
+        - Before requesting review or closing, leave a final comment with: summary, files/crates touched, acceptance criteria status, tests/checks run, skipped checks and why, post-implementation follow-up results, risks/rollback notes, and follow-up issues created.
+        - Do not merge the PR by default; leave it for maintainer review and merge unless a maintainer explicitly instructs otherwise.
+        - Do not manually close an implementation issue if the linked PR should close it on merge.
+        - Close the issue only when all acceptance criteria, verification requirements, and maintainer review/merge requirements are satisfied.
     validations:
       required: true

@@ -87,6 +87,15 @@ For creating, triaging, splitting, or closing GitHub issues, follow [docs/ai/GIT
 
 Use that workflow only when the task involves GitHub issues, milestones, labels, sub-issues, or autonomous issue closure.
 
+Agent workflow policy:
+
+- Milestones are planning containers, not implementation issues.
+- Agents may implement only scoped Agent Task issues marked `agent-ready`.
+- Route vague, stale, broad, or under-specified work through a Readiness Review.
+- Route unresolved product, architecture, dependency, public API, schema, auth, security, memory, or compatibility choices through a Decision Gate.
+- One Agent Task should normally produce one PR, and one PR should close one Agent Task.
+- Agents must not merge PRs by default; leave PRs for maintainer review and merge unless a maintainer explicitly instructs otherwise.
+
 ## Definition Of Done
 
 - Code/docs match the requested scope.

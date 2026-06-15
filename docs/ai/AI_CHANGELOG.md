@@ -37,6 +37,53 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-06-15: GitHub Issue Agent Workflow Defined
+
+Type: AI workflow documentation update.
+
+Summary: Split the GitHub issue workflow into a short routing entry point plus
+focused workflow slices for milestone planning, readiness reviews, decision
+gates, implementation, pull request review/merge, operations, WIP limits, and
+failure controls.
+
+What this entry can say factually:
+
+- Agent implementation is now documented as gated on scoped Agent Task issues
+  marked `agent-ready`.
+- Vague, stale, broad, or under-specified work routes through Readiness Review
+  before implementation.
+- Product, architecture, dependency, public API, schema, auth, security, memory,
+  or compatibility ambiguity routes through Decision Gate before
+  implementation.
+- Agent-authored PRs are documented as evidence for one Agent Task.
+- Agents must not merge PRs by default; in this public-contribution repository,
+  maintainers review and merge unless they explicitly instruct otherwise.
+- Sequence dependencies are tracked with `Blocked by:` / `Unblocks:` issue
+  blocks, project status, and project ordering. Blocked issues are excluded from
+  `Agent Ready`.
+- GitHub Projects are documented as flow boards only; stale projects should be
+  archived or rebuilt, and the active Project should expose focused queue,
+  grounding, decision, review, milestone, and decision-register views.
+- Workflow-relevant issues and PRs are expected to be added to the active
+  Project and default to `Status = Intake` until routed.
+- Implementation agents now have a post-implementation follow-up check to
+  compare acceptance criteria against the diff, scan for shortcut/scope-creep
+  signatures, and capture deferred findings as comments or follow-up issues.
+- Implementation agents are pointed at the implementation and review slices
+  instead of the full planning workflow.
+
+Changed files:
+
+- [AGENTS.md](../../AGENTS.md)
+- [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](GITHUB_ISSUE_AGENT_WORKFLOW.md)
+- [docs/ai/github-workflow/PLANNING.md](github-workflow/PLANNING.md)
+- [docs/ai/github-workflow/GROUNDING.md](github-workflow/GROUNDING.md)
+- [docs/ai/github-workflow/DECISIONS.md](github-workflow/DECISIONS.md)
+- [docs/ai/github-workflow/IMPLEMENTATION.md](github-workflow/IMPLEMENTATION.md)
+- [docs/ai/github-workflow/REVIEW.md](github-workflow/REVIEW.md)
+- [docs/ai/github-workflow/OPERATIONS.md](github-workflow/OPERATIONS.md)
+- [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md)
+
 ### 2026-06-15: Initial AI Documentation Set Recorded
 
 Type: AI documentation creation.
