@@ -65,6 +65,7 @@ use crate::executor::dispatch::{
 };
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::stream_event::StreamEvent;
+use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};
 use crate::projection::project_output_from_record;
 use clinker_plan::config::OutputConfig;
@@ -327,6 +328,7 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     batch_size: usize,
     ok_count: u64,
     records_written: u64,
+    structured_guard: StructuredOutputDocumentGuard,
 }
 
 impl<'cfg> DocumentDlqDriver<'cfg> {
@@ -357,6 +359,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             batch_size: ctx.batch_size,
             ok_count: 0,
             records_written: 0,
+            structured_guard: StructuredOutputDocumentGuard::new(&out_cfg.format),
         }
     }
 
@@ -475,6 +478,14 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         // drains directly.)
         for item in drain_records_in_arrival_order(buffer) {
             let (record, row_num) = item?;
+            if let Err(err) = self
+                .structured_guard
+                .observe(&self.output_name, record.doc_ctx())
+            {
+                ctx.output_errors.push(err);
+                self.arbitrator.unregister_consumer(consumer_id);
+                return Ok(());
+            }
             projected.push(project_output_from_record(
                 &record,
                 self.out_cfg,
@@ -497,6 +508,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
     /// source (or in-pipeline synthesis) routes to a document-DLQ Output,
     /// and for a late record arriving after its file already flushed clean.
     fn write_through(&mut self, ctx: &mut ExecutorContext<'_>, record: Record, row_num: u64) {
+        if let Err(err) = self
+            .structured_guard
+            .observe(&self.output_name, record.doc_ctx())
+        {
+            ctx.output_errors.push(err);
+            return;
+        }
         let projected =
             project_output_from_record(&record, self.out_cfg, self.cxl_emit_names.as_deref());
         if ctx.ok_source_rows.insert(row_num) {

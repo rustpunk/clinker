@@ -20,6 +20,7 @@ use crate::executor::dispatch::{
     CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
     push_write_error, source_name_arc_of,
 };
+use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
@@ -346,7 +347,7 @@ fn flush_clean_records_to_writers(
     ctx: &mut ExecutorContext<'_>,
     per_output: std::collections::BTreeMap<String, Vec<CorrelationRecordSlot>>,
 ) -> Result<(), PipelineError> {
-    for (output_name, slots) in per_output {
+    'outputs: for (output_name, slots) in per_output {
         if slots.is_empty() {
             continue;
         }
@@ -355,6 +356,13 @@ fn flush_clean_records_to_writers(
             .iter()
             .find(|o| o.name == output_name)
             .unwrap_or(ctx.primary_output);
+        let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
+        for slot in &slots {
+            if let Err(err) = structured_guard.observe(&output_name, slot.projected.doc_ctx()) {
+                ctx.output_errors.push(err);
+                continue 'outputs;
+            }
+        }
         let output_schema = Arc::clone(slots[0].projected.schema());
 
         let Some(raw_writer) = ctx.writers.remove(&output_name) else {

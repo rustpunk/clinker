@@ -32,6 +32,7 @@ pub mod spill_purge;
 pub mod storage_validate;
 pub(crate) mod stream_event;
 mod streaming;
+pub(crate) mod structured_output_guard;
 pub(crate) mod time_window;
 pub(crate) mod transform;
 pub(crate) mod transform_dispatch;

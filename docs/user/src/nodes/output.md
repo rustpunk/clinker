@@ -14,7 +14,9 @@ Output nodes write processed records to files. They are the terminal nodes of a 
     path: "./output/result.csv"
 ```
 
-The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, or `hl7`. The `edifact` and `x12` writers reconstruct their EDI interchange envelopes around emitted records; the `hl7` writer re-emits HL7 v2 segments and optionally wraps them in batch/file envelopes. See [EDIFACT Format](../formats/edifact.md), [X12 Format](../formats/x12.md), and [HL7 v2 Format](../formats/hl7.md).
+The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`, or `swift`. The `edifact`, `x12`, and `swift` writers reconstruct one interchange/message envelope around emitted records; the `hl7` writer re-emits HL7 v2 segments and optionally wraps them in batch/file envelopes. See [EDIFACT Format](../formats/edifact.md), [X12 Format](../formats/x12.md), [HL7 v2 Format](../formats/hl7.md), and [SWIFT MT Format](../formats/swift.md).
+
+Structured single-writer outputs (`edifact`, `x12`, `hl7`, and `swift`) accept one concrete document grain per output file. A multi-file source or multi-input merge feeding one of these outputs is rejected instead of being silently written as one merged envelope. To write multiple structured documents, consolidate them deliberately with an Envelope node first or route each document to a separate output path.
 
 ## Field control
 

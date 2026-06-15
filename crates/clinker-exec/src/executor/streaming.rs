@@ -23,6 +23,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::certify_streaming_edge;
 
 use super::stream_event::{Punctuation, StreamEvent};
+use super::structured_output_guard::StructuredOutputDocumentGuard;
 use super::{WriterRegistry, build_format_writer, dispatch, stage_metrics};
 
 /// Identify fused producer → single `Output` chains eligible for
@@ -320,10 +321,12 @@ struct OutputStreamConsumer {
     writer: Option<Box<dyn FormatWriter>>,
     /// Holds the raw sink until the first record triggers the lazy build.
     raw_writer_slot: Option<Box<dyn Write + Send>>,
+    structured_guard: StructuredOutputDocumentGuard,
 }
 
 impl OutputStreamConsumer {
     fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingOutputSpec) -> Self {
+        let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
         Self {
             spec,
             out: StreamingOutputTaskOutput {
@@ -340,6 +343,7 @@ impl OutputStreamConsumer {
             )),
             writer: None,
             raw_writer_slot: Some(raw_writer),
+            structured_guard,
         }
     }
 }
@@ -365,6 +369,14 @@ impl StreamingConsumer for OutputStreamConsumer {
         {
             self.out.errors.push(err);
             return ControlFlow::Continue(());
+        }
+
+        if let Err(err) = self
+            .structured_guard
+            .observe(&self.spec.output_name, record.doc_ctx())
+        {
+            self.out.errors.push(err);
+            return ControlFlow::Break(());
         }
 
         let projected = {

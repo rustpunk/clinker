@@ -20,6 +20,9 @@ use crate::executor::dispatch::{
     push_write_error, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
+use crate::executor::structured_output_guard::{
+    StructuredOutputDocumentGuard, structured_output_format,
+};
 use crate::executor::{build_format_writer, stage_metrics};
 use crate::projection::project_output_from_record;
 use clinker_plan::error::PipelineError;
@@ -216,6 +219,53 @@ pub(crate) fn dispatch_output(
         buffered = Vec::new();
         unbuffered = input_records;
     }
+
+    // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
+    // `output_configs` / `primary_output`: this arm interleaves `out_cfg`'s
+    // borrow with `&mut ctx` on other fields (correlation buffers, writers,
+    // timers), which disjoint sub-field borrows permit but a whole-`ctx`
+    // helper borrow would not.
+    let out_cfg = ctx
+        .output_configs
+        .iter()
+        .find(|o| o.name == *name)
+        .unwrap_or(ctx.primary_output);
+    if !unbuffered.is_empty() && structured_output_format(&out_cfg.format).is_some() {
+        if ctx.fan_out_writers.contains_key(name) {
+            let mut guards: HashMap<Arc<str>, StructuredOutputDocumentGuard> = HashMap::new();
+            for (record, _) in &unbuffered {
+                let Some(file_path) = source_file_path_of(record) else {
+                    continue;
+                };
+                let file_arc: Arc<str> = Arc::from(file_path);
+                let guard = guards
+                    .entry(file_arc)
+                    .or_insert_with(|| StructuredOutputDocumentGuard::new(&out_cfg.format));
+                if let Err(err) = guard.observe(name, record.doc_ctx()) {
+                    ctx.output_errors.push(err);
+                    return Ok(());
+                }
+            }
+        } else {
+            let mut guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
+            for (record, _) in &unbuffered {
+                if let Err(err) = guard.observe(name, record.doc_ctx()) {
+                    ctx.output_errors.push(err);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // `include_unmapped: false` consults the upstream CXL emit names (resolved
+    // in the preamble above) to drop upstream passthroughs the user did not
+    // explicitly emit.
+    let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
+        None
+    } else {
+        Some(&cxl_emit_names)
+    };
+
     // Counter semantics:
     //
     // * `records_written` increments per WRITE — under
@@ -256,26 +306,6 @@ pub(crate) fn dispatch_output(
     // reaching the writer, not every intermediate node
     // transition (Invariant 3).
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-    // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
-    // `output_configs` / `primary_output`: this arm interleaves `out_cfg`'s
-    // borrow with `&mut ctx` on other fields (correlation buffers, writers,
-    // timers), which disjoint sub-field borrows permit but a whole-`ctx`
-    // helper borrow would not.
-    let out_cfg = ctx
-        .output_configs
-        .iter()
-        .find(|o| o.name == *name)
-        .unwrap_or(ctx.primary_output);
-
-    // `include_unmapped: false` consults the upstream CXL emit names (resolved
-    // in the preamble above) to drop upstream passthroughs the user did not
-    // explicitly emit.
-    let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
-        None
-    } else {
-        Some(&cxl_emit_names)
-    };
-
     // Buffer non-null-key records. Project once, push slot.
     // Overflow check fires the moment a group's record count
     // exceeds the configured cap; subsequent records of the
@@ -484,6 +514,7 @@ fn dispatch_output_envelope(
 
     let events = drain_output_input_event_iter(ctx, current_dag, node_idx);
     let mut driver = EnvelopeWriterDriver::default();
+    let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
 
     for event in events {
         // Boundaries come from records, so punctuations are irrelevant here —
@@ -505,6 +536,15 @@ fn dispatch_output_envelope(
             }
             ctx.output_errors.append(&mut driver.errors);
             return Err(e);
+        }
+        if let Err(err) = structured_guard.observe(name, record.doc_ctx()) {
+            {
+                let _guard = ctx.write_timer.guard();
+                driver.finish();
+            }
+            ctx.output_errors.append(&mut driver.errors);
+            ctx.output_errors.push(err);
+            return Ok(());
         }
         let projected = {
             let _guard = ctx.projection_timer.guard();
