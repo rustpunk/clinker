@@ -51,8 +51,9 @@ resurfaces them, fixes trivial ones in place, files the rest. Skip it
 and the work is silently lost.
 
 (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and
-`aarch64-apple-darwin` for `clinker-core`; cross-compile setup is
-optional locally.)
+`aarch64-apple-darwin` for `clinker-exec`, `clinker-plan`,
+`clinker-schema`, `clinker-channel`, and `cxl-cli`; cross-compile setup
+is optional locally.)
 
 ## Build & test commands
 
@@ -60,8 +61,8 @@ optional locally.)
 cargo build --workspace          # Build all crates
 cargo test --workspace           # Run all tests
 cargo test -p cxl                # Test a single crate
-cargo test -p clinker-core -- node_taxonomy  # Run tests matching a pattern
-cargo bench -p clinker-core      # arena, parallel, pipeline, sort, window, combine, combine_grace_hash, combine_iejoin, combine_nary_3input, composition, deferred_buffer_pruning, provenance
+cargo test -p clinker-exec -- node_taxonomy  # Run tests matching a pattern
+cargo bench -p clinker-exec      # arena, parallel, pipeline, sort, window, combine, combine_grace_hash, combine_iejoin, combine_nary_3input, composition, deferred_buffer_pruning, provenance
 cargo bench -p cxl               # CXL benchmarks (eval, parse)
 cargo bench -p clinker-benchmarks # Cross-crate harness (e2e_matrix, e2e_xlarge)
 cargo deny check                 # License/ban/advisory audit (pure Rust policy)
@@ -69,7 +70,7 @@ cargo deny check                 # License/ban/advisory audit (pure Rust policy)
 
 ## Running the binaries
 
-The workspace ships three user-facing binaries:
+The workspace ships two user-facing binaries:
 
 ```bash
 # Pipeline engine — execute, dry-run, or explain a pipeline
@@ -106,7 +107,9 @@ Within a run, stateless operators (Transform, Route, most Combine probe-side wor
 ```
 Applications:   clinker (CLI)  |  cxl-cli (REPL)
                      ↓                ↓
-Orchestration:  clinker-core (DAG planner + executor)
+Orchestration:  clinker-plan (config parsing + DAG planning)
+                clinker-exec (DAG executor)
+                clinker-net (finite-pull network sources)
                 clinker-channel (workspace/channel mgmt)
                 clinker-schema (source .schema.yaml validation)
                      ↓
@@ -119,12 +122,12 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
                 clinker-benchmarks (cross-crate benchmark harness)
 ```
 
-11 workspace crates total. The bench crates are siblings — not part of the runtime layer.
+13 workspace crates total. The bench crates are siblings — not part of the runtime layer.
 
 ### Key design decisions
 
 - **CXL is NOT SQL.** It's a custom ETL DSL. Boolean operators are `and`/`or`/`not`, not `&&`/`||`. System namespaces use `$` prefix (`$pipeline.*`, `$window.*`, `$meta.*`).
-- **Unified node taxonomy.** Pipelines use a single `nodes:` list. Variants (defined in `crates/clinker-core/src/config/pipeline_node.rs`):
+- **Unified node taxonomy.** Pipelines use a single `nodes:` list. Variants (defined in `crates/clinker-plan/src/config/pipeline_node.rs`):
   - `Source` — input reader bound to a `.schema.yaml`
   - `Transform` — record-level CXL projection / filter / lookup (1×1 table)
   - `Aggregate` — grouped or windowed reduction
@@ -140,7 +143,7 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
 - **Compile-time CXL typechecking.** `TypedProgram` output from type inference; schema propagation across the DAG at plan time.
 - **Memory-aware aggregation.** Hash aggregation with disk spill; streaming aggregation when sort order permits; RSS tracking with soft/hard limits.
 - **Pure Rust policy.** `deny.toml` bans cmake; no C build dependencies in clinker crates (Dioxus/GTK transitive deps are exempted via skip).
-- **Multi-tenant via channels.** One pipeline + multiple channels override variables/defaults. A `clinker.toml` at the workspace root anchors discovery for `clinker-channel` and `clinker-core`; channel files (`*.channel.yaml`) layer over the base pipeline.
+- **Multi-tenant via channels.** One pipeline + multiple channels override variables/defaults. A `clinker.toml` at the workspace root anchors discovery for `clinker-channel`, `clinker-plan`, and `clinker-exec`; channel files (`*.channel.yaml`) layer over the base pipeline.
 
 ### Locked decisions
 
@@ -237,7 +240,7 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 
 ### Testing patterns
 
-- Integration tests in `crates/clinker-core/tests/` use YAML fixture pipelines from `tests/fixtures/`.
+- Integration tests live mostly in `crates/clinker-exec/tests/`, with CLI tests in `crates/clinker/tests/` and focused crate tests under each crate's `tests/` directory. Shared runtime fixtures live under `crates/clinker-exec/tests/fixtures/`.
 - Snapshot tests use `insta` (in `pre_lift_baselines.rs` and elsewhere).
 - `clinker-bench-support` crate provides deterministic `RecordFactory` and payload generators for benchmarks.
 - Example pipelines live in `examples/pipelines/` with sample data in `examples/pipelines/data/`.
