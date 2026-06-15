@@ -110,14 +110,6 @@ pub fn discover_pipelines(
             if has_schema_stem(&path) {
                 return false;
             }
-            // Exclude kiln.toml companion files
-            let is_kiln_meta = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| name.starts_with(".kiln"));
-            if is_kiln_meta {
-                return false;
-            }
             // Exclude if inside schema or template dirs
             if path.starts_with(&schema_path) || path.starts_with(&templates_path) {
                 return false;

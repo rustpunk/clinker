@@ -3,7 +3,7 @@
 //! All schema issues are **warnings** (never errors). Schema validation helps,
 //! it doesn't block. Missing schemas or unlinked pipelines produce no warnings.
 //!
-//! Spec: clinker-kiln-search-schemas-templates-addendum.md §S3.5, §S3.6.
+//! Pipeline/schema validation helpers.
 
 use std::collections::HashSet;
 use std::path::Path;

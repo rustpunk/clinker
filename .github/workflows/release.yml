@@ -31,10 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
-
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91"
@@ -44,15 +40,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install Dioxus CLI
-        run: cargo install dioxus-cli --locked
-
       - name: Build CLI tools
         run: cargo build --release --target ${{ matrix.target }} -p clinker -p cxl-cli
-
-      - name: Build Kiln (via dx)
-        shell: bash
-        run: dx build --release --package clinker-kiln --desktop
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -73,18 +62,6 @@ jobs:
             fi
           done
 
-          # Kiln from dx build output
-          # Linux: target/dx/clinker-kiln/release/linux/app
-          # macOS: target/dx/clinker-kiln/release/macos/ClinkerKiln.app
-          for dx_out in target/dx/clinker-kiln/release/linux/app target/dx/clinker-kiln/release/macos; do
-            if [ -d "$dx_out" ]; then
-              archive="clinker-kiln-${tag}-${target}.tar.gz"
-              tar czf "${staging}/${archive}" -C "$dx_out" .
-              echo "Packaged ${archive}"
-              break
-            fi
-          done
-
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -101,14 +78,6 @@ jobs:
               Compress-Archive -Path $src -DestinationPath $archive
               Write-Host "Packaged ${archive}"
             }
-          }
-
-          # Kiln from dx build output: target\dx\clinker-kiln\release\windows\app
-          $dxOut = "target\dx\clinker-kiln\release\windows\app"
-          if (Test-Path $dxOut) {
-            $archive = "artifacts\clinker-kiln-${tag}-${target}.zip"
-            Compress-Archive -Path "$dxOut\*" -DestinationPath $archive
-            Write-Host "Packaged ${archive}"
           }
 
       - name: Upload artifacts

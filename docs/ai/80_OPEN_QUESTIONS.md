@@ -1,13 +1,7 @@
 # AI Onboarding: Open Questions
 
 Purpose: Track unresolved documentation, architecture, API-stability, and
-testing questions for human review before future agents treat them as facts.
-
-## Status
-
-AI-generated cleanup requiring human review. This pass reviewed every file under
-`docs/ai/` and all current `AGENTS.md` files found by `rg --files -g
-'AGENTS.md'`.
+testing questions before future agents treat them as facts.
 
 ## Source Evidence
 
@@ -27,29 +21,7 @@ evidence.
 
 ## High Priority
 
-### 1. Should all Kiln, Klinx, Dioxus, and `clinker-kiln` references be removed, or are some compatibility surfaces still active?
-
-- Question: Which remaining Kiln/Klinx/Dioxus references are stale cleanup
-  targets, and which, if any, must stay as compatibility language for external
-  tools?
-- Why it matters: Current AI docs say there is no active editor crate in this
-  repo, but release workflow, root dependency notes, schema docs, examples, and
-  explain/help wording still mention the old editor stack. Agents need a clear
-  rule before deleting references or documenting them as current architecture.
-- Files/modules involved: `docs/ai/10_ARCHITECTURE.md`,
-  `docs/ai/20_CRATE_MAP.md`, `docs/ai/30_DESIGN_RULES.md`,
-  `docs/ai/70_GLOSSARY.md`, `docs/ai/90_CRATE_AGENT_PLAN.md`,
-  `crates/clinker/AGENTS.md`, `crates/clinker-schema/AGENTS.md`,
-  `.github/workflows/release.yml`, `Cargo.toml`,
-  `crates/clinker-schema/src/lib.rs`, `crates/clinker/src/main.rs`,
-  `examples/pipelines/kiln.toml`.
-- Suggested way to resolve it: Ask maintainers to classify each reference as
-  remove, rename to generic external/editor wording, or keep as intentional
-  compatibility. Then update release CI, root dependency comments, user/engine
-  docs, AI docs, and examples in one cleanup.
-- Priority: High
-
-### 2. Should executor runs consume the stored `CompiledPlan` DAG directly, or is re-entering compilation through `CompiledPlan::config()` intentional?
+### 1. Should executor runs consume the stored `CompiledPlan` DAG directly, or is re-entering compilation through `CompiledPlan::config()` intentional?
 
 - Question: Is `PipelineExecutor::run_plan_with_readers_writers` expected to
   execute the stored `CompiledPlan` artifacts directly, or is the current
@@ -68,7 +40,7 @@ evidence.
   document the deliberate recompile step with its invariants.
 - Priority: High
 
-### 3. Should channel `resources.default` and `resources.fixed` be implemented, rejected, or documented as reserved?
+### 2. Should channel `resources.default` and `resources.fixed` be implemented, rejected, or documented as reserved?
 
 - Question: What is the intended behavior for parsed channel resource overlay
   fields when `apply_channel_overlay` currently applies config and var layers
@@ -90,7 +62,7 @@ evidence.
   fields and document them as reserved.
 - Priority: High
 
-### 4. Should pipeline-target channel config keys be validated before overlay application?
+### 3. Should pipeline-target channel config keys be validated before overlay application?
 
 - Question: Is deferred validation for pipeline-targeting channel config keys
   intentional, or should pipeline targets get validation comparable to
@@ -109,7 +81,7 @@ evidence.
   the exact point where invalid overlays fail.
 - Priority: High
 
-### 5. What is the intended boundary between `clinker-schema` and `clinker-plan`?
+### 4. What is the intended boundary between `clinker-schema` and `clinker-plan`?
 
 - Question: Should `clinker-schema` remain an advisory edge/authoring crate, or
   should schema discovery and validation move into the planner's compile-time
@@ -128,7 +100,7 @@ evidence.
   add parser-backed validation and planner tests.
 - Priority: High
 
-### 6. How complete should `clinker-schema` discovery and validation be?
+### 5. How complete should `clinker-schema` discovery and validation be?
 
 - Question: Should `extract_schema_refs`, include/exclude glob behavior, format
   matching, and CXL field validation become YAML/parser-backed, or is the
@@ -147,7 +119,7 @@ evidence.
   heuristics with structured YAML/CXL parsing and expand warning coverage.
 - Priority: High
 
-### 7. Should user-facing docs be updated to the unified `nodes:` shape and all current node types?
+### 6. Should user-facing docs be updated to the unified `nodes:` shape and all current node types?
 
 - Question: Which older user/engine docs still describe retired
   `inputs:` / `outputs:` / `transformations:` shapes or "eight node types",
@@ -165,7 +137,7 @@ evidence.
   feasible so future changes do not drift.
 - Priority: High
 
-### 8. Should source-node docs and transport docs mention REST as implemented, and SQL cursors as roadmap only?
+### 7. Should source-node docs and transport docs mention REST as implemented, and SQL cursors as roadmap only?
 
 - Question: Should `source` documentation say current transports are file and
   finite REST, while SQL cursor wording is future or unsupported?
@@ -185,7 +157,7 @@ evidence.
 
 ## Medium Priority
 
-### 9. Is `clinker-format -> cxl` a permanent layering rule?
+### 8. Is `clinker-format -> cxl` a permanent layering rule?
 
 - Question: Should `clinker-format` continue depending on `cxl` for
   doc-path-aware envelope/extraction behavior, or should CXL-aware logic move
@@ -202,7 +174,7 @@ evidence.
   `clinker-format`; if not, plan a refactor boundary and tests.
 - Priority: Medium
 
-### 10. How broad should composition resource support become beyond file resources?
+### 9. How broad should composition resource support become beyond file resources?
 
 - Question: Are composition resources intended to stay file-only for now, or is
   a broader typed resource model planned?
@@ -220,7 +192,7 @@ evidence.
   model first and update channel/resource overlay semantics at the same time.
 - Priority: Medium
 
-### 11. Which planner and CXL public APIs are stable user-facing API versus internal exposed surface?
+### 10. Which planner and CXL public APIs are stable user-facing API versus internal exposed surface?
 
 - Question: Should public symbols such as `cxl::resolve::HashMapResolver`,
   `cxl::typecheck::Row`, and legacy `clinker_plan::config::route::RouteConfig`
@@ -240,7 +212,7 @@ evidence.
   tests only for the promised surface.
 - Priority: Medium
 
-### 12. Are parsed CLI flags that appear weakly wired intentional placeholders or documentation drift?
+### 11. Are parsed CLI flags that appear weakly wired intentional placeholders or documentation drift?
 
 - Question: Which `clinker run` flags are fully implemented runtime behavior,
   and which are parse-only, test-only, or future placeholders?
@@ -256,7 +228,7 @@ evidence.
   if intentionally reserved.
 - Priority: Medium
 
-### 13. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned?
+### 12. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned?
 
 - Question: Are user docs showing multiple `-e` flags correct, or should the
   docs be corrected to match `Command::Eval.expr: Option<String>`? Should the
@@ -273,7 +245,7 @@ evidence.
   and CLI implementation to support the promised behavior with tests.
 - Priority: Medium
 
-### 14. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`?
+### 13. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`?
 
 - Question: Is mapping nested JSON objects to `Value::Null` in `json_to_value`
   intentional v1 scope, or should objects become `Value::Map`?
@@ -287,7 +259,7 @@ evidence.
   tests for nested objects and update CXL CLI docs to match the chosen behavior.
 - Priority: Medium
 
-### 15. Should `PipelineCounters::ok_count` use a globally unique source-row identity?
+### 14. Should `PipelineCounters::ok_count` use a globally unique source-row identity?
 
 - Question: Should successful-record deduplication use source plus row identity
   instead of `row_num` alone?
@@ -304,7 +276,7 @@ evidence.
   counts.
 - Priority: Medium
 
-### 16. Is the optional `clinker-exec -> clinker-bench-support` `bench-alloc` edge acceptable long term?
+### 15. Is the optional `clinker-exec -> clinker-bench-support` `bench-alloc` edge acceptable long term?
 
 - Question: Should allocation instrumentation remain as a feature-gated normal
   dependency edge from executor to benchmark support, or move elsewhere?
@@ -323,7 +295,7 @@ evidence.
   practical. If not, move allocation hooks into a lower or benchmark-only crate.
 - Priority: Medium
 
-### 17. Which benchmark identifiers, cache keys, generated formats, and CI JSON fields are compatibility surfaces?
+### 16. Which benchmark identifiers, cache keys, generated formats, and CI JSON fields are compatibility surfaces?
 
 - Question: Are `Scale` labels, `FieldKind`/`DataFormat` discriminants,
   `BenchDataCache` hash inputs, unsupported generated formats, and
@@ -344,7 +316,7 @@ evidence.
   depend on it.
 - Priority: Medium
 
-### 18. Should direct `serde_saphyr::from_str` calls in tests be allowed exceptions?
+### 17. Should direct `serde_saphyr::from_str` calls in tests be allowed exceptions?
 
 - Question: Is direct use of `serde_saphyr::from_str` in tests an approved
   test-local exception to the YAML chokepoint rule, or should all tests use
@@ -361,7 +333,7 @@ evidence.
   `rg`-based check or review rule.
 - Priority: Medium
 
-### 19. Should diagnostic code pages exist for channel variable overlay errors?
+### 18. Should diagnostic code pages exist for channel variable overlay errors?
 
 - Question: Should `E109`, `E110`, and `E111` get dedicated `docs/explain/`
   pages and lookup coverage?
@@ -379,7 +351,7 @@ evidence.
   codes are intentionally not lookup-backed.
 - Priority: Medium
 
-### 20. What charset and non-UTF-8 support is actually promised by format docs?
+### 19. What charset and non-UTF-8 support is actually promised by format docs?
 
 - Question: Should only X12 document ISO-8859-1 behavior, while HL7/SWIFT/other
   formats remain UTF-8 only, or is broader charset support planned?
@@ -395,7 +367,7 @@ evidence.
   acceptance/rejection tests for non-UTF-8 cases and update docs to match.
 - Priority: Medium
 
-### 21. Which envelope and document-context docs are canonical?
+### 20. Which envelope and document-context docs are canonical?
 
 - Question: Should older envelope/document examples using retired shapes be
   modernized or explicitly marked historical?
@@ -411,7 +383,7 @@ evidence.
   to unified `nodes:` syntax, and add example or docs tests if practical.
 - Priority: Medium
 
-### 22. Should `CROSS_RECORD_TRANSFORMS_PLAN.md` be marked historical or active?
+### 21. Should `CROSS_RECORD_TRANSFORMS_PLAN.md` be marked historical or active?
 
 - Question: Is `CROSS_RECORD_TRANSFORMS_PLAN.md` obsolete planning history, or
   does it still contain active design guidance?
@@ -432,7 +404,7 @@ evidence.
 
 ## Low Priority
 
-### 23. What is the intended expansion of "CXL"?
+### 22. What is the intended expansion of "CXL"?
 
 - Question: Should docs expand the acronym "CXL", or should they define it
   only by behavior as Clinker's expression language?
@@ -446,7 +418,7 @@ evidence.
   none exists, add a note that CXL is a name, not an expanded acronym.
 - Priority: Low
 
-### 24. Is `reserve/` definitively only a crates.io name-reservation package?
+### 23. Is `reserve/` definitively only a crates.io name-reservation package?
 
 - Question: Does `reserve/` have any active release workflow or maintenance
   role beyond reserving the `clinker` crate name?
@@ -460,7 +432,7 @@ evidence.
   Add a short status note in `reserve/README.md` or AI docs.
 - Priority: Low
 
-### 25. Are weakly used declared dependencies intentional compatibility hooks or cleanup debt?
+### 24. Are weakly used declared dependencies intentional compatibility hooks or cleanup debt?
 
 - Question: Should declared dependencies with weak current source use, such as
   `miette` in `clinker-core-types` / `cxl-cli` and some `clinker-schema`
@@ -476,7 +448,7 @@ evidence.
   intent, and either remove unused dependencies or document why they are kept.
 - Priority: Low
 
-### 26. Is `tokio` reserved dependency surface or stale workspace debt?
+### 25. Is `tokio` reserved dependency surface or stale workspace debt?
 
 - Question: Why does the workspace include `tokio` when AI docs say current
   core execution and REST transport are synchronous and source search found no
@@ -492,7 +464,7 @@ evidence.
   async-runtime guidance.
 - Priority: Low
 
-### 27. Which weakly inferred AI common-pattern notes should become project rules?
+### 26. Which weakly inferred AI common-pattern notes should become project rules?
 
 - Question: Should notes such as "DAG dispatcher, not ECS" and project-wide
   `SchemaBuilder` preference be promoted from observed patterns to reviewed
@@ -510,22 +482,7 @@ evidence.
   `30_DESIGN_RULES.md` or label them explicitly as local patterns.
 - Priority: Low
 
-### 28. Which AI onboarding docs should remain review scaffolds versus reviewed indexes?
-
-- Question: Should `docs/ai/README.md`, `docs/ai/AI_CHANGELOG.md`, and any
-  other AI onboarding files remain marked as AI-generated review scaffolds, or
-  should maintainers mark some of them as reviewed canonical indexes?
-- Why it matters: Future agents start from these docs. A file can be useful
-  while still requiring human review, but the status should be explicit rather
-  than implied by old placeholder wording.
-- Files/modules involved: `docs/ai/README.md`, `docs/ai/AI_CHANGELOG.md`,
-  `docs/ai/00_READ_THIS_FIRST.md`, `AGENTS.md`.
-- Suggested way to resolve it: Ask maintainers which AI docs are ready for a
-  reviewed pass. Mark reviewed files clearly, and keep remaining scaffolded
-  files explicitly labeled as AI-generated notes requiring validation.
-- Priority: Low
-
-### 29. Should docs-only AI changes have a renderer or link-check gate beyond `git diff --check`?
+### 27. Should docs-only AI changes have a renderer or link-check gate beyond `git diff --check`?
 
 - Question: Is `git diff --check` sufficient for AI docs, or should docs-only
   changes also run mdBook builds, Markdown rendering checks, or link checks?
@@ -537,18 +494,4 @@ evidence.
 - Suggested way to resolve it: Decide the docs-only validation policy for
   `docs/ai`. Update `50_TESTING_AND_COMMANDS.md` and root `AGENTS.md` if a
   renderer or link checker becomes required.
-- Priority: Low
-
-### 30. Should AI docs use "Klinx" anywhere beyond stale/external reference notes?
-
-- Question: Should the extracted editor be named in AI docs, or should all
-  current guidance avoid the external project name except when explaining stale
-  local references?
-- Why it matters: Mentioning an external successor can make it look like an
-  active dependency or integration target in this repo.
-- Files/modules involved: `docs/ai/20_CRATE_MAP.md`,
-  `docs/ai/30_DESIGN_RULES.md`, `docs/ai/70_GLOSSARY.md`,
-  `docs/ai/80_OPEN_QUESTIONS.md`, `crates/clinker/AGENTS.md`.
-- Suggested way to resolve it: Ask maintainers for preferred wording. Update
-  glossary and architecture docs to use only approved current terminology.
 - Priority: Low

@@ -2,10 +2,6 @@
 
 Purpose: Define repository-specific terms that AI agents should validate before using them in explanations or code review.
 
-## Status
-
-This is an AI-generated initial draft requiring human review.
-
 ## Source Evidence
 
 Validate this page against:
@@ -30,8 +26,6 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 | Node port | A named output branch or input endpoint referenced as `node.port`; used by route branches, cull side outputs, and composition/envelope wiring. | `docs/user/src/getting-started/concepts.md`; `docs/user/src/nodes/route.md`; `docs/user/src/nodes/cull.md`; `crates/clinker-plan/src/plan/execution/mod.rs` | route, removed_to, body, header | High |
 | Channel | A `.channel.yaml` binding that targets a pipeline or composition and overlays declared config/variable defaults for a tenant, environment, or business unit. | `crates/clinker-channel/src/lib.rs`; `docs/user/src/pipelines/channels.md`; `examples/pipelines/channels/*.channel.yaml` | ChannelBinding, channel target, overlay, scoped vars | High |
 | Composition | A reusable pipeline fragment declared in `.comp.yaml` and invoked by a `composition` node with config, port, and resource bindings. | `docs/user/src/pipelines/compositions.md`; `examples/pipelines/compositions/*.comp.yaml`; `crates/clinker-plan/src/config/composition/` | CompositionBodyId, BoundBody, resources | High |
-| Kiln | Historical IDE/workspace metadata name still present in `_notes`, `examples/pipelines/kiln.toml`, release workflow text, and comments. Whether remaining references are stale, compatibility-specific, or active external/editor surface is unresolved. | `docs/ai/20_CRATE_MAP.md`; `docs/ai/80_OPEN_QUESTIONS.md`; `examples/pipelines/kiln.toml`; `crates/clinker-plan/src/config/pipeline.rs` | Klinx, `_notes`, stale references | Medium |
-| Klinx | External successor/editor name mentioned in AI docs while tracking stale Kiln/Dioxus references. It is not a current workspace crate, and whether AI docs should use the name beyond stale-reference notes is an open question. | `docs/ai/20_CRATE_MAP.md`; `docs/ai/80_OPEN_QUESTIONS.md` | Kiln, Dioxus, stale CI | Low |
 
 ## Primary Code Evidence
 
@@ -178,7 +172,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 | `ConsumerHandle` | Memory-arbitrator handle used by runtime consumers to report bytes and react to pause/spill signals. | `crates/clinker-exec/src/pipeline/memory.rs`; `docs/ai/40_COMMON_PATTERNS.md` | MemoryConsumer, MemoryArbitrator | High |
 | `StageMetrics` | Per-stage timing/RSS/CPU/IO/spill/heap-delta metrics collection surface. | `crates/clinker-exec/src/executor/stage_metrics.rs`; `docs/ai/60_PERFORMANCE_NOTES.md`; `docs/user/src/ops/metrics.md` | ExecutionMetrics, MetricsConfig | High |
 | Metrics spool | Per-run JSON metrics output directory later swept by `clinker metrics collect` into an archive. | `crates/clinker-plan/src/config/pipeline.rs`; `crates/clinker/src/main.rs`; `docs/user/src/ops/metrics.md` | MetricsConfig, StageMetrics | High |
-| `clinker.toml` | Workspace-level TOML config file, currently modeled for storage spill/staging settings. | `crates/clinker-plan/src/config/storage.rs`; `examples/pipelines/clinker.toml`; `examples/pipelines/kiln.toml` | StorageConfig, workspace | High |
+| `clinker.toml` | Workspace-level TOML config file, currently modeled for storage spill/staging settings. | `crates/clinker-plan/src/config/storage.rs`; `examples/pipelines/clinker.toml` | StorageConfig, workspace | High |
 | Staging | Optional copy of matched source files to local disk before execution, with content-addressed files, manifests, and locks. | `crates/clinker-plan/src/config/storage.rs`; `crates/clinker-channel/src/staging_copy.rs`; `docs/engine/src/storage-internals.md` | SourceStager, StagingPolicy, manifest | High |
 | Staging manifest | Sidecar JSON file recording staged source identity, size, mtime, BLAKE3 hash, and stage time; commit marker for a trusted staged copy. | `docs/engine/src/storage-internals.md`; `crates/clinker-channel/src/staging_copy.rs` | `.staged`, `.manifest.json`, BLAKE3 | High |
 | `SourceStager` | Channel crate type that performs staging-copy behavior consumed by runtime setup. | `crates/clinker-channel/src/lib.rs`; `crates/clinker-channel/src/staging_copy.rs`; `crates/clinker-channel/tests/staging_reuse_concurrent.rs` | StagingPolicy, staging manifest | High |
@@ -233,7 +227,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 | `OutputEnvelopeSpec` | Format-local spec consumed by output envelope framing writers. | `crates/clinker-format/src/envelope_writer.rs`; `crates/clinker-plan/src/config/output.rs` | EnvelopeFramer, reconstruct_envelope | High |
 | `EnvelopeFramer` | Writer-side helper for reconstructing envelope header/footer around output documents. | `crates/clinker-format/src/envelope_writer.rs`; `crates/clinker-format/src/lib.rs` | OutputEnvelopeSpec, begin_document | High |
 
-## Human Review Notes
+## Review Notes
 
 - The glossary intentionally avoids generic Rust terms unless Clinker gives them a project-specific role.
 - `docs/user/src/getting-started/concepts.md` still says "eight node types"; current `PipelineNode` code has eleven variants. See `docs/ai/80_OPEN_QUESTIONS.md`.

@@ -1087,7 +1087,7 @@ impl StreamingAggregator<MergeState> {
 
 impl<Op: AccumulatorOp> StreamingAggregator<Op> {
     /// Debug-inspect accessor used by the structural O(1) memory test
-    /// and by the Kiln debugger's streaming-agg state overlay. Returns
+    /// and by streaming-aggregate state overlays. Returns
     /// 1 when a per-group state is currently open
     /// (between key boundaries), 0 when no group is open (before the
     /// first record or immediately after a flush).

@@ -41,8 +41,7 @@ fastrand = { workspace = true }
 clinker-bench-support = { workspace = true, optional = true }
 
 # ctrlc installs a process-wide OS signal handler; it has no wasm32
-# backend, so the SIGINT/SIGTERM wiring is native-only. The wasm (web
-# Kiln) build leaves shutdown signaling a compile-time no-op.
+# backend, so the SIGINT/SIGTERM wiring is native-only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ctrlc = { version = "3", features = ["termination"] }
 
@@ -123,4 +122,3 @@ harness = false
 [[bench]]
 name = "spill_compression"
 harness = false
-

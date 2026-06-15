@@ -1116,7 +1116,7 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
 /// DAG-based execution plan — replaces ExecutionPlan.
 ///
 /// The single source of truth for pipeline topology and execution strategy.
-/// Custom Serialize emits flat node-list JSON for Kiln consumption.
+/// Custom Serialize emits flat node-list JSON for tooling consumption.
 #[derive(Debug, Clone)]
 pub struct ExecutionPlanDag {
     /// petgraph DAG of PlanNode/PlanEdge.

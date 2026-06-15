@@ -81,7 +81,7 @@ pub struct OutputConfig {
     pub reconstruct_envelope: bool,
     #[serde(flatten)]
     pub format: OutputFormat,
-    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    /// External tooling metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
 }

@@ -3,13 +3,6 @@
 Purpose: Identify repeated implementation and documentation patterns that AI
 agents should verify and reuse when making future changes.
 
-## Status
-
-AI-generated initial draft requiring human review. Claims below were checked
-against current source files, manifests, tests, examples, and safe local
-commands. Treat older docs as secondary context unless re-validated against
-code.
-
 ## Source Evidence
 
 Validate this page against:
@@ -492,7 +485,7 @@ project-wide conventions without more support.
    `crates/clinker-exec/src/executor/stage_metrics.rs`;
    `crates/clinker-exec/Cargo.toml`.
 
-## Human Review Notes
+## Review Notes
 
 - Confirm whether the "DAG dispatcher, not ECS" wording matches project
   owner terminology.

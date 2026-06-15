@@ -2,14 +2,6 @@
 
 Purpose: Collect design constraints and review rules that AI agents must validate before changing behavior.
 
-## Status
-
-AI-generated initial draft requiring human review. Claims below were checked
-against current manifests, CI, and source files, not only against older docs.
-`CLAUDE.md` and `docs/engine/src/architecture.md` still mention an older
-`clinker-core` crate layout; treat those portions as stale unless re-verified
-against current `Cargo.toml` and `crates/*`.
-
 ## Source Evidence
 
 Validate this page against:
@@ -168,10 +160,8 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
   or equivalent transitive requirements without explicit architectural approval
   and corresponding `cargo deny` updates.
 - `cargo deny` treats yanked crates as denied and all unmaintained advisories as
-  findings. Existing ignored RustSec advisories are documented as Dioxus desktop
-  transitive dependencies; current crate-map notes suggest Dioxus/Kiln
-  references may be stale, so do not copy those exemptions into new design
-  decisions without re-checking.
+  findings. Do not add new ignore entries without documenting the reason and
+  confirming the affected dependency remains in the active workspace graph.
 - Keep benchmark/test helper dependencies out of default runtime code.
   `clinker-exec` has an optional `clinker-bench-support` edge for
   `bench-alloc`; do not let benchmark helpers leak into default execution
@@ -182,8 +172,8 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 ## Documentation Rules
 
-- Treat AI onboarding docs as review scaffolds until human-reviewed. Validate
-  claims against code, manifests, tests, examples, and safe local commands.
+- Validate AI onboarding claims against code, manifests, tests, examples, and
+  safe local commands.
 - Prefer evidence anchors over intent claims. Name files, modules, traits,
   functions, variants, tests, and commands that support a rule.
 - Separate verified facts from hypotheses and stale references. Current example:
@@ -219,10 +209,8 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
   are part of the design contract for explain output, node taxonomy, combine
   behavior, and user-visible diagnostics.
 
-## Human Review Notes
+## Review Notes
 
-- Confirm whether stale Dioxus/Kiln references in CI, root dependencies, and
-  older docs should remain documented as exemptions or be removed.
 - Confirm whether the direct `serde_saphyr::from_str` call in
   `crates/clinker-exec/tests/composition_binding_test.rs` is intentionally
   test-local, or whether a future cleanup should route even that through

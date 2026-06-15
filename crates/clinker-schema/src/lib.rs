@@ -1,8 +1,7 @@
 //! Source schema parsing, indexing, and validation for Clinker pipelines.
 //!
 //! This crate owns `.schema.yaml` file parsing, schema discovery, field
-//! indexing, and pipeline validation against linked schemas. It is shared
-//! between `clinker-kiln` (IDE) and `clinker` (CLI).
+//! indexing, and pipeline validation against linked schemas.
 
 pub mod discovery;
 pub mod model;

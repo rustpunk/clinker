@@ -10,13 +10,6 @@ before claiming success.
 These docs help future sessions regain repository context without relying on
 old chat history. They do not replace source review.
 
-## Status
-
-The files under `docs/ai/` are AI-generated onboarding documentation and still
-require human review where marked. Treat them as durable working notes backed
-by source evidence, not as authority over current code, manifests, tests, or
-examples.
-
 Use these evidence labels consistently:
 
 - **Verified:** Checked against current source, manifests, tests, examples, CI,
@@ -141,7 +134,7 @@ git diff --check
 - [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md): repository-specific terms for
   product, crates, pipeline nodes, CXL, execution, formats, and storage.
 - [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md): unresolved
-  architecture, documentation, API, and testing questions for human review.
+  architecture, documentation, API, and testing questions.
 - [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md): planning notes for
   existing crate-level `AGENTS.md` coverage, remaining gaps, and guidance
   ownership.
@@ -154,8 +147,7 @@ git diff --check
 
 ## Missing or incomplete docs
 
-No expected `docs/ai/` file from this index was missing during this pass. Some
-AI docs still mark themselves as requiring human review, and
+No expected `docs/ai/` file from this index was missing during this pass.
 [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) tracks areas where source,
 docs, or intended behavior need clarification.
 
@@ -181,8 +173,6 @@ The full list is in
 [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md). The most important
 current uncertainties are:
 
-- Remaining Kiln, Klinx, Dioxus, and `clinker-kiln` references may be stale,
-  but maintainers need to classify which references to remove, rename, or keep.
 - `PipelineExecutor::run_plan_with_readers_writers` accepts `CompiledPlan`, but
   the intended relationship between the stored DAG and runtime recompilation
   needs confirmation.

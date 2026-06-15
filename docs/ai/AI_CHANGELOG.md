@@ -8,10 +8,6 @@ or inferred at a point in time, links to evidence, and calls out uncertainty.
 Do not treat an entry as a human decision unless it explicitly says so and links
 to supporting evidence.
 
-## Status
-
-AI-generated initial version requiring human review.
-
 No git history was used for this initial entry. The entry is based on the
 current working tree docs and source references listed below.
 
@@ -54,8 +50,6 @@ What this entry can say factually:
   single-process, finite-batch DAG executor for ETL-style jobs.
 - The docs separate verified facts, hypotheses, stale references, and open
   questions.
-- The initial AI docs themselves are marked as AI-generated drafts requiring
-  human review.
 
 What this entry does not claim:
 
@@ -98,17 +92,12 @@ changes.
 - `clinker-net` currently adapts finite REST sources into executor
   `RecordSource` inputs. This means network transport is integrated at the
   executor-source boundary, not isolated as a pure low-level IO crate.
-- AI docs and older docs mention stale or uncertain Kiln/Klinx/Dioxus-related
-  surfaces. Current AI docs say the active workspace should not be treated as an
-  editor application without fresh evidence.
 
 ## Major Unresolved Questions
 
 For the full list, see [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md).
 The highest-impact questions from the initial documentation pass are:
 
-- Which remaining Kiln, Klinx, Dioxus, and `clinker-kiln` references are stale,
-  and which, if any, are intentional compatibility language?
 - Should `PipelineExecutor::run_plan_with_readers_writers` consume the stored
   `CompiledPlan` DAG directly, or is re-entering compilation through
   `CompiledPlan::config()` intentional?

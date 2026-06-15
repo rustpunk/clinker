@@ -3,12 +3,6 @@
 Purpose: Track the current crate-level `AGENTS.md` coverage, guidance
 ownership, and remaining local-agent-doc gaps.
 
-## Status
-
-AI-generated inventory requiring human review. Validate this page against
-current `crates/*/AGENTS.md`, manifests, source structure, tests, and
-`docs/ai/80_OPEN_QUESTIONS.md` before changing local agent guidance.
-
 This file is not a historical decision record. It should describe the current
 state of crate-level guidance and point to open questions when intent is
 unclear.
@@ -58,14 +52,12 @@ Every current workspace crate has a crate-level `AGENTS.md` file:
 - Crate-level `AGENTS.md`: local invariants, common mistakes, touched docs,
   and focused validation commands for that crate.
 
-## Open Questions Affecting Local Guides
+## Uncertainty Affecting Local Guides
 
 Keep unresolved uncertainty in `docs/ai/80_OPEN_QUESTIONS.md`, not in vague
 local guidance. Current high-impact questions affecting crate-local docs
 include:
 
-- Kiln/Klinx/Dioxus references and whether they are stale cleanup targets,
-  compatibility wording, or active external/editor surfaces.
 - Whether executor runs should consume the stored `CompiledPlan` DAG directly
   or whether re-entering compilation through `CompiledPlan::config()` is
   intentional.

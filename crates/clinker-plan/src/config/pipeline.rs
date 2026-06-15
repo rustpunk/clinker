@@ -25,7 +25,7 @@ pub struct PipelineConfig {
     pub nodes: Vec<Spanned<PipelineNode>>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
-    /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
+    /// External tooling metadata: pipeline-level notes. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
     /// BLAKE3 hash of the post-env-var-interpolated source YAML bytes.
@@ -273,7 +273,7 @@ impl PipelineConfig {
 
     /// Public iterator over transform-like nodes (Transform + Aggregate +
     /// Route), yielding a lightweight [`TransformView`] with the minimum
-    /// surface the Kiln IDE + schema validation need. Merge nodes are
+    /// surface external tooling and schema validation need. Merge nodes are
     /// deliberately excluded — they have no CXL body or description.
     pub fn transform_views(&self) -> impl Iterator<Item = TransformView<'_>> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
@@ -3054,7 +3054,7 @@ fn build_node_source_sets(
 /// from the already-computed analyzer report / window configs;
 /// body-node callers in `bind_composition` use
 /// [`LoweringCtx::default`] (all fields `None`/empty), which falls back
-/// to minimal placeholder lowering suitable for Kiln drill-in
+/// to minimal placeholder lowering suitable for drill-in
 /// inspection. Body nodes are not executed directly — the top-level
 /// DAG produced by `compile_with_diagnostics` is the single source of
 /// truth for runtime planning.
@@ -3182,7 +3182,7 @@ pub(crate) fn lower_node_to_plan_node(
             // analyzer report + window config + dedup'd indices. Body-node
             // callers (`bind_composition`) pass the default ctx, which
             // collapses all of the below to the unified-diagnostic placeholder
-            // shape — this is fine for Kiln drill-in inspection; body
+            // shape — this is fine for drill-in inspection; body
             // nodes never execute through this DAG.
             let (parallelism_class, execution_reqs, window_index, partition_lookup) =
                 if let Some(analysis) = ctx.analysis {

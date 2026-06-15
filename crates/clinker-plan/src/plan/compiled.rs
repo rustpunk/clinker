@@ -72,7 +72,7 @@ impl CompiledPlan {
     /// Look up a composition body by its ID.
     ///
     /// Returns the `BoundBody` containing the composition's expanded nodes,
-    /// bound schemas, and port rows. Used by Kiln for drill-in rendering.
+    /// bound schemas, and port rows. Used by tooling for drill-in rendering.
     pub fn body_of(&self, id: CompositionBodyId) -> Option<&BoundBody> {
         self.artifacts.body_of(id)
     }
@@ -86,7 +86,7 @@ impl CompiledPlan {
     }
 
     /// Side-table of provenance-tracked config values for composition nodes.
-    /// Populated during `bind_schema`; consumed by the Kiln inspector and
+    /// Populated during `bind_schema`; consumed by tooling inspectors and
     /// channel overlay.
     pub fn provenance(&self) -> &ProvenanceDb {
         &self.artifacts.provenance

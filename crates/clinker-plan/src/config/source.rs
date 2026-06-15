@@ -123,7 +123,7 @@ pub struct SourceConfig {
     pub transport: SourceTransport,
     #[serde(flatten)]
     pub format: InputFormat,
-    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    /// External tooling metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
 }
@@ -585,7 +585,7 @@ impl SourceConfig {
         self.path.as_deref().unwrap_or("")
     }
 
-    /// Human-readable target description for diagnostics and Kiln display.
+    /// Human-readable target description for diagnostics and tooling display.
     /// Reflects the active matcher (`path` / `glob` / `regex` / `paths`).
     pub fn display_target(&self) -> String {
         if let Some(p) = self.path.as_deref() {

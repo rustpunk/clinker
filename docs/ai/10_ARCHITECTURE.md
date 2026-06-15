@@ -2,10 +2,6 @@
 
 Purpose: Give a senior Rust engineer or AI coding agent a practical, source-backed architecture overview before changing Clinker.
 
-## Status
-
-AI-generated architecture overview requiring human review. Claims below were checked against current manifests, source modules, tests, examples, and `docs/ai/20_CRATE_MAP.md`. Older docs may be stale; this page separates verified facts from hypotheses and points to concrete evidence.
-
 ## Source Evidence
 
 Primary evidence used for this pass:
@@ -25,7 +21,7 @@ Verified facts:
 - Pipelines are YAML documents using a unified top-level `nodes:` list. `PipelineConfig` has `nodes: Vec<Spanned<PipelineNode>>`, and comments say legacy top-level `inputs:` / `outputs:` / `transformations:` are rejected by serde.
 - The executable workload is finite batch-style pipeline execution. `RecordSource::next_record` is explicitly finite by contract, `clinker-net` describes REST as a finite-pull source with `max_pages` / `max_records`, and `PipelineExecutor` says no async runtime is required.
 - CXL is the per-record expression language layer. The `cxl` crate exposes parser, resolver, typechecker, analyzer, aggregate extraction, and evaluator modules; plan and exec compile and evaluate CXL-bearing nodes.
-- Clinker is not currently an editor application in this repository. Editor-facing surfaces appear to be data/API outputs such as `ExplainFormat::Json`, `CompiledPlan::provenance`, `CompiledPlan::typed_output_row`, and `clinker-schema`. Local docs and comments still mention Kiln/Klinx in places, but `docs/ai/20_CRATE_MAP.md` flags those references as stale or external.
+- Clinker is not currently an editor application in this repository. Tooling-facing surfaces appear to be data/API outputs such as `ExplainFormat::Json`, `CompiledPlan::provenance`, `CompiledPlan::typed_output_row`, and `clinker-schema`.
 
 Hypothesis:
 
@@ -214,10 +210,8 @@ These are supported by current code structure or source comments:
 
 ## Areas Of Uncertainty
 
-- The long-term status of stale Kiln/Klinx/Dioxus references is unresolved. Current workspace code has no active editor crate, but several comments and docs still mention Kiln/Klinx consumers.
 - `clinker-format -> cxl` is a current dependency edge, apparently for CXL-aware envelope/extraction behavior, but `20_CRATE_MAP.md` flags whether this is intended as a permanent layering rule.
 - `clinker-net -> clinker-exec` is current and deliberate for `RecordSource`, but it means network transport is an executor integration crate rather than a low-level IO layer.
 - `PipelineExecutor::run_plan_with_readers_writers` requires `CompiledPlan`, yet the run body currently re-enters compilation through the embedded config. Future changes around plan reuse should inspect this carefully before assuming the stored DAG is the sole runtime input.
-- `clinker-schema` docs still say it is shared with `clinker-kiln`; whether that wording should become generic editor/API language is a maintainer decision.
 - The repo has `tokio` in workspace dependencies, but core execution is synchronous. It is unclear whether `tokio` is reserved for external/editor tooling or stale dependency surface.
 - `reserve/` appears to be a crates.io name-reservation package, not runtime code, but this is inferred from local files.

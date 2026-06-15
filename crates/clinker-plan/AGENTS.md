@@ -83,7 +83,7 @@ type/device detection.
 - Adding permissive `serde(default)` or compatibility shims for retired config shapes without explicit approval.
 - Treating REST/network transport behavior or runtime memory arbitration as planner-owned.
 - Making composition resources stringly typed or claiming non-file resource support beyond implementation evidence.
-- Copying stale `clinker-core`, Kiln, Klinx, or Dioxus wording from older docs without checking current source.
+- Copying stale `clinker-core` wording from older docs without checking current source.
 
 ## Local commands
 

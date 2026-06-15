@@ -64,7 +64,7 @@ Current dependencies are intentional unless a change is approved: workspace crat
 - Do not route production YAML parsing around `clinker_plan::yaml`.
 - Do not add benchmark/test helper dependencies to default CLI runtime behavior.
 - Do not move planner or executor/operator logic into this binary.
-- Treat Kiln/Klinx/Dioxus references as stale or compatibility-specific unless a maintainer confirms otherwise.
+- Treat editor-tooling references as stale unless current source or a maintainer confirms otherwise.
 
 ## Important invariants
 

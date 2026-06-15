@@ -14,8 +14,6 @@ Status labels:
 - **Verified:** `cargo`, `rustc`, and `rustfmt` were available from `~/.cargo/bin`.
 - **Verified:** `cargo-deny` was available and `cargo deny check` passed outside the filesystem sandbox.
 - **Verified:** `mdbook` was available and both mdBook projects built successfully.
-- **Verified:** `dx` was available, but no current `clinker-kiln` workspace package was found in `cargo metadata`.
-- **Inferred:** Linux CI installs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, and `libxdo-dev`. These are release/Dioxus desktop dependencies, not required for the verified Rust workspace build in this session.
 - **Inferred:** There is no root `Makefile`, `justfile`, `package.json`, `trunk.toml`, Vite config, Netlify config, or Vercel config in the discovered workspace.
 
 ## 2. Basic Build Command
@@ -327,7 +325,6 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 - **Expensive:** `cargo bench ...` runs real Criterion measurements and should be reserved for performance-sensitive changes.
 - **Expensive:** `cargo test -- --ignored` includes at least one XML generator test that reports generating about 600 MB.
 - **Environment-dependent:** cross-target checks in CI require Rust targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`; native Windows/macOS CI runs `cargo test --workspace`.
-- **Environment-dependent:** release workflow installs `dioxus-cli` and runs `dx build --release --package clinker-kiln --desktop`, but `cargo metadata` did not find a current `clinker-kiln` workspace package. Verify release workflow state before relying on it.
 
 ## 14. Troubleshooting Common Failures
 

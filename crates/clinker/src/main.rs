@@ -114,7 +114,7 @@ EXAMPLES:
 pub enum ExplainFormat {
     /// Human-readable ASCII text with branch/merge indicators.
     Text,
-    /// Structured JSON for Kiln canvas consumption.
+    /// Structured JSON for tooling consumption.
     Json,
     /// Graphviz DOT for static visualization.
     Dot,

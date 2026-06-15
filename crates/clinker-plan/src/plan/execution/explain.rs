@@ -1595,7 +1595,7 @@ fn dot_escape(s: &str) -> String {
 ///
 /// Includes a `node_properties` map keyed by node *name* (not `NodeIndex`),
 /// ordered by topo position. Keying by name keeps the JSON contract stable
-/// for downstream consumers (Kiln canvas, debugger, third-party tooling)
+/// for downstream consumers (debuggers and third-party tooling)
 /// across recompiles where `NodeIndex` values change.
 impl Serialize for ExecutionPlanDag {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1664,7 +1664,7 @@ struct NodeEntry<'a> {
 /// (`equalities[].left/.right`, `ranges[].left/.op/.right`, residual
 /// flag), per-input role + estimated row count, and the planned-share
 /// memory budget bytes. Round-trips strictly through `serde::Serialize`
-/// (no `Deserialize`) — the JSON channel is consumer-only (Kiln canvas,
+/// (no `Deserialize`) — the JSON channel is consumer-only (debuggers,
 /// third-party tooling).
 ///
 /// Keeping the wrapper out of `ExecutionPlanDag` itself preserves the
@@ -1714,7 +1714,7 @@ impl<'a> ExplainJson<'a> {
 /// spill disk cap, spill compression, cap headroom, and staging plan.
 ///
 /// Every field is structured rather than a stringified blob so downstream
-/// tooling (Kiln canvas, third-party consumers) can read per-stage spill
+/// tooling and third-party consumers can read per-stage spill
 /// estimates and the cap / staging summary without re-parsing prose. The
 /// CLI assembles it from [`ExecutionPlanDag::estimated_spill_json`] and
 /// [`ExecutionPlanDag::spill_compression_json`] (the plan-derivable parts)

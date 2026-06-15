@@ -81,7 +81,7 @@ pub struct BoundBody {
     /// Per-node output row inside this body scope. Keyed by node name.
     /// Consumers that want a public accessor go through
     /// `CompiledPlan::typed_output_row`, which only sees top-level
-    /// names; body-scope rows are Kiln-drill-in state.
+    /// names; body-scope rows are drill-in state.
     pub body_rows: HashMap<String, Row>,
 
     /// Per-body-node original `input:` references in declaration

@@ -78,7 +78,7 @@ Existing direct dependencies are the baseline:
 - Claiming full glob/exclude support.
 - Claiming compiler-grade CXL validation.
 - Copying old `inputs:` / `transformations:` pipeline shapes from tests or stale docs into current user guidance.
-- Copying `clinker-kiln` wording into new docs without marking it stale or asking a maintainer.
+- Copying stale editor-tooling wording into new docs without checking current source.
 - Silently making schema model parsing strict with `deny_unknown_fields`; current structs do not establish that behavior.
 - Adding runtime, network, or benchmark dependencies casually.
 
@@ -108,7 +108,7 @@ Update relevant docs/examples when this crate changes schema file shape, discove
 
 ## Unclear / ask human
 
-Track unresolved questions only in `docs/ai/80_OPEN_QUESTIONS.md`. Relevant entries include the `clinker-schema`/`clinker-plan` boundary, stale `clinker-kiln` wording, and schema validation completeness.
+Track unresolved questions only in `docs/ai/80_OPEN_QUESTIONS.md`. Relevant entries include the `clinker-schema`/`clinker-plan` boundary and schema validation completeness.
 
 ## Evidence
 

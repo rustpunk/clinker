@@ -2,10 +2,6 @@
 
 Purpose: Preserve verified performance assumptions, benchmark entry points, and memory-model notes for future AI agents.
 
-## Status
-
-AI-generated initial draft requiring human review. Verified against current manifests, Rust source, benchmark targets, tests, and comments. This page documents performance-sensitive areas only; it does not recommend optimizations.
-
 Use the labels below carefully:
 
 - **Verified hot path** means code comments, benchmark targets, or executor structure explicitly identify the path as per-record/per-stage/hot.
@@ -187,7 +183,7 @@ Unsafe code found during this inspection:
 
 Do not edit unsafe performance code without reading the local safety comments, size assertions, and relevant benches first.
 
-## Human Review Notes
+## Review Notes
 
 - This page did not run Criterion measurements; it documents available benchmark entry points and source-level performance assumptions.
 - Existing docs under `docs/user` and `docs/engine` contain useful context, but source comments, manifests, benches, and tests were treated as primary evidence.

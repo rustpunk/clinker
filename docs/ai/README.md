@@ -2,14 +2,9 @@
 
 Purpose: Explain how future Codex and Claude agents should use the AI onboarding documentation.
 
-## Status
-
-This is an AI-generated initial draft requiring human review.
-
 ## How Agents Should Use This Folder
 
 - Start with `docs/ai/00_READ_THIS_FIRST.md`.
-- Treat every `docs/ai/*.md` file as a review scaffold until a human marks it as reviewed.
 - Validate claims from the listed source evidence before relying on them.
 - Treat existing `docs/*` files as secondary context only. They may be stale, and any claim from `docs/*` must be validated against code, manifests, tests, examples, or safe local commands before use.
 - Keep AI-facing onboarding updates in `docs/ai/`.
@@ -44,11 +39,7 @@ Validate this page against:
 - `50_TESTING_AND_COMMANDS.md`: canonical command guide.
 - `60_PERFORMANCE_NOTES.md`: hot paths, memory-sensitive code, and benchmark entry points.
 - `70_GLOSSARY.md`: project-specific terms.
-- `80_OPEN_QUESTIONS.md`: unresolved uncertainty for human review.
+- `80_OPEN_QUESTIONS.md`: unresolved uncertainty.
 - `90_CRATE_AGENT_PLAN.md`: crate-level `AGENTS.md` inventory and ownership map.
 - `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow.
 - `AI_CHANGELOG.md`: lightweight AI documentation history and decision notes.
-
-## Human Review Notes
-
-- Confirm whether this README should stay human-review-scaffolded or become the reviewed index for `docs/ai/`.
