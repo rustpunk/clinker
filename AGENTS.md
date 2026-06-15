@@ -90,6 +90,12 @@ Use targeted `cargo test -p <crate>` while iterating. See [docs/ai/50_TESTING_AN
 - Mark stale or contradictory docs; do not silently copy stale claims.
 - For public-facing behavior changes, update examples or explain-code docs when relevant.
 
+## GitHub Issue Workflow
+
+For creating, triaging, splitting, or closing GitHub issues, follow [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md).
+
+Use that workflow only when the task involves GitHub issues, milestones, labels, sub-issues, or autonomous issue closure.
+
 ## Definition Of Done
 
 - Code/docs match the requested scope.

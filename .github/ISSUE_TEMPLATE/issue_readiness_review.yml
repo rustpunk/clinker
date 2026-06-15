@@ -1,0 +1,106 @@
+name: Issue Readiness Review
+description: Triage a vague issue into agent-ready work, split issues, or a blocker
+title: "[Readiness]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when an issue is too vague for direct autonomous implementation.
+
+        The goal is not to force a full rewrite. The agent should inspect the repository, summarize its understanding, propose acceptance criteria, and route the work.
+
+  - type: textarea
+    id: original_issue
+    attributes:
+      label: Original issue or request
+      description: Link the vague issue or paste the rough request.
+      placeholder: |
+        Related issue:
+        Rough request:
+    validations:
+      required: true
+
+  - type: textarea
+    id: my_understanding
+    attributes:
+      label: My understanding
+      description: Agent summary of what the request appears to mean.
+      placeholder: |
+        I understand this as:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: relevant_files
+    attributes:
+      label: Relevant files/components
+      description: Likely files, crates, docs, tests, or examples to inspect.
+      placeholder: |
+        Likely areas:
+        - crates/...
+        - docs/...
+        - examples/...
+    validations:
+      required: false
+
+  - type: textarea
+    id: missing_information
+    attributes:
+      label: Missing information
+      description: List only information that cannot be derived from code, tests, docs, or linked issues.
+      placeholder: |
+        - [ ]
+        - [ ]
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposed_acceptance
+    attributes:
+      label: Proposed acceptance criteria
+      description: Candidate close criteria for an agent-ready implementation issue.
+      placeholder: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_plan
+    attributes:
+      label: Proposed implementation plan
+      description: Concrete implementation or split plan.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: recommended_action
+    attributes:
+      label: Recommended action
+      description: Select the routing action that should happen next.
+      options:
+        - Ready to implement
+        - Needs more repository investigation
+        - Needs bounded agent decision
+        - Needs splitting
+        - Should become a milestone/epic
+        - Blocked by external dependency or credentials
+    validations:
+      required: true
+
+  - type: textarea
+    id: next_action
+    attributes:
+      label: Next action
+      description: State exactly what the agent should do next.
+      placeholder: |
+        Example:
+        I will split this into three agent-ready issues and link them here.
+    validations:
+      required: true
