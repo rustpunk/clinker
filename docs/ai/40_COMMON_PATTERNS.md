@@ -28,7 +28,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `ProgressReporter`, `MemoryConsumer`, `ArbitrationPolicy`,
    `AccumulatorOp`, `SchedulingHint`, `Clock`, `RecordStorage`,
    `FieldResolver`, and `WindowContext`.
-3. Why it seems to exist: traits mark real subsystem boundaries: byte-format
+3. Rationale: traits mark real subsystem boundaries: byte-format
    IO, transport-agnostic source ingestion, memory arbitration, progress
    reporting, expression evaluation, and storage lookup. Many are `Send` or
    `Send + Sync` because executor ownership crosses `std::thread`, Rayon, or
@@ -55,7 +55,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 2. Where it appears: `SchemaBuilder` is defined in `clinker-record` and used
    across format readers, projection, planning, aggregation, combine, benches,
    and executor tests.
-3. Why it seems to exist: schema construction is common and must keep field
+3. Rationale: schema construction is common and must keep field
    metadata aligned with column order while materializing fresh schemas as
    `Arc<Schema>`.
 4. How to copy it correctly: use `SchemaBuilder::new()` or
@@ -79,7 +79,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `EvalErrorKind`, `ConfigError`, `SchemaError`, `ChannelError`,
    `StagingError`, `HashAggError`, `CombineError`, `ArenaError`, and many
    smaller parser/validation errors.
-3. Why it seems to exist: each subsystem owns its diagnostic vocabulary and the
+3. Rationale: each subsystem owns its diagnostic vocabulary and the
    top-level runtime error aggregates failures through variants or `From`
    conversions. Some errors manually implement `Display`/`Error`; `thiserror`
    is used where that is simpler and local.
@@ -107,7 +107,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `PipelineNode`, `NodeHeader`, `MergeHeader`, `CombineHeader`,
    composition raw config, sort specs, schema-source specs, transform inputs,
    aggregate correlation keys, and resources.
-3. Why it seems to exist: user-facing config errors need YAML source spans,
+3. Rationale: user-facing config errors need YAML source spans,
    strict unknown-field rejection, and bounded parser behavior. Manual
    visitors preserve spans and variant-specific `deny_unknown_fields` where a
    `serde_json::Value` intermediate would erase span data.
@@ -136,7 +136,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `NodeId`, `TailVarId`, `DottedPath`, `CxlSource`, `ValidatedPath`,
    `SourceIdentity`, `ConsumerId`, and local wrapper structs like
    `SharedByteCounter`.
-3. Why it seems to exist: wrappers prevent mixing unrelated integers or
+3. Rationale: wrappers prevent mixing unrelated integers or
    strings, encode validation state, preserve origin spans, and provide a
    narrow public API around internal representation.
 4. How to copy it correctly: use a newtype when the type carries a domain
@@ -165,7 +165,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `WindowRuntimeRegistry`, `SourceReaders`, `ScopedVarsRegistry`,
    `BuiltinRegistry`, `DocArenaIndex`, `SourceDb`, `ReopenableSource`,
    `SourceStager`, and staging lock/manifest helpers.
-3. Why it seems to exist: the executor coordinates many shared resources
+3. Rationale: the executor coordinates many shared resources
    without hidden globals: memory accounting, writer ownership, window arena
    lookup, source inputs, scoped variables, builtins, document indexes, loaded
    source text, and stable multi-pass input handles.
@@ -194,7 +194,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 2. Where it appears: `StreamEvent`, `Punctuation`, `PunctuationKind`,
    `StructuralReject`, `EventBatch`, `EventBatcher`, `SourceStream`, and
    executor dispatch arms that preserve or reconcile punctuations.
-3. Why it seems to exist: document-boundary signals must preserve strict order
+3. Rationale: document-boundary signals must preserve strict order
    relative to records. The code explicitly rejects out-of-band signaling for
    these events.
 4. How to copy it correctly: carry new stream-control information as a typed
@@ -218,7 +218,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `Box<dyn FormatReader>`, `SourceInput::Files` / `SourceInput::Records`,
    `SourceReaders`, `ReopenableSource`, `RestRecordSource`, and
    `build_rest_source`.
-3. Why it seems to exist: source ingestion should be transport-agnostic after
+3. Rationale: source ingestion should be transport-agnostic after
    records are yielded. File inputs decode bytes through format readers;
    network sources implement the row-yielding trait directly and still flow
    into the same ingest channel.
@@ -243,7 +243,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 1. Pattern name: Local pattern: typed composition resource declarations.
 2. Where it appears: `ResourceDecl`, `ResourceKind`, `Resource`,
    `resources_schema`, and composition call-site `resources`.
-3. Why it seems to exist: compositions declare resource slots separately from
+3. Rationale: compositions declare resource slots separately from
    config params, while resolved runtime resources carry typed payloads and
    YAML spans for diagnostics. Evidence currently shows only file resources,
    with validation still partly stubbed.
@@ -270,7 +270,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `source_dispatch`, `transform_dispatch`, `aggregate_dispatch`,
    `combine_dispatch`, `route_dispatch`, `merge_dispatch`, `output_dispatch`,
    `reshape_dispatch`, and `cull_dispatch`.
-3. Why it seems to exist: planning builds a typed execution DAG, and runtime
+3. Rationale: planning builds a typed execution DAG, and runtime
    walks it synchronously with node-kind-specific operators. There is no
    evidence of Bevy-style ECS resources/systems/components.
 4. How to copy it correctly: new runtime behavior should normally attach to a
@@ -290,7 +290,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 1. Pattern name: Feature/domain modules with curated crate-root exports.
 2. Where it appears: `clinker-record`, `clinker-format`, `clinker-plan`,
    `clinker-exec`, `cxl`, and smaller crates.
-3. Why it seems to exist: public crates expose core vocabulary at the crate
+3. Rationale: public crates expose core vocabulary at the crate
    root while keeping implementation modules organized by domain or operator.
    The executor uses many `pub(crate)` dispatch modules and only exports the
    public entry points and support types needed by callers.
@@ -316,7 +316,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 2. Where it appears: `bench-alloc`, `bench-xlarge`, `test-utils`, target
    dependencies for Unix/Windows/native signal handling, and platform-specific
    RSS/CPU/IO/filesystem probes.
-3. Why it seems to exist: default runtime builds should not depend on
+3. Rationale: default runtime builds should not depend on
    benchmark instrumentation or test-only surfaces. OS-specific APIs are kept
    behind `cfg` arms with fallback behavior where possible.
 4. How to copy it correctly: keep optional behavior behind explicit features
@@ -344,7 +344,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 2. Where it appears: `serde` derives/attributes, `thiserror::Error`,
    `static_assertions::assert_impl_all!`, `proptest!`, `insta::assert_snapshot!`,
    and Clap derives in CLI crates.
-3. Why it seems to exist: macros reduce boilerplate for serialization, CLI
+3. Rationale: macros reduce boilerplate for serialization, CLI
    parsing, error displays, compile-time trait assertions, snapshots, and
    property tests. There is little evidence of local `macro_rules!` DSLs.
 4. How to copy it correctly: prefer the existing derive/test macros for their
@@ -368,7 +368,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    allocation accounting, process RSS/CPU/IO probes, Windows filesystem probes,
    UTF-8 generation in bench helpers, and test/env-var code required by Rust
    2024.
-3. Why it seems to exist: unsafe is used where Rust cannot express a compact
+3. Rationale: unsafe is used where Rust cannot express a compact
    in-memory representation, global allocator instrumentation, or OS FFI.
 4. How to copy it correctly: keep unsafe in the narrow module that owns the
    invariant. Add a `SAFETY:` comment explaining the contract at every unsafe
@@ -395,7 +395,7 @@ manifests, tests, examples, or safe local commands before being copied here.
    `crates/clinker-exec/tests/fixtures`; snapshots under
    `crates/clinker-exec/tests/snapshots`; `proptest` in CXL and IEJoin tests;
    Criterion benches under crate `benches/`.
-3. Why it seems to exist: narrow unit tests cover local parsing/formatting/data
+3. Rationale: narrow unit tests cover local parsing/formatting/data
    structures; integration tests pin pipeline behavior and public executor
    entry points; snapshots preserve user-visible explain/diagnostic output;
    property tests cover broad algorithm/evaluator invariants.
@@ -424,7 +424,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 2. Where it appears: `examples/pipelines`, `examples/pipelines/data`,
    `examples/pipelines/channels`, `examples/pipelines/compositions`,
    `examples/pipelines/tests/baseline`, and `benches/pipelines`.
-3. Why it seems to exist: examples double as user-facing pipeline material and
+3. Rationale: examples double as user-facing pipeline material and
    integration/benchmark fixtures. Bench configs are grouped by feature area
    rather than by Rust crate.
 4. How to copy it correctly: add runnable pipeline examples under
@@ -450,7 +450,7 @@ project-wide conventions without more support.
 1. Pattern name: Local pattern: `ValidatedPath` proof token.
 2. Where it appears: `clinker-plan::security::ValidatedPath` and
    `SourceDb::load`.
-3. Why it seems to exist: callers that need trusted paths are forced through
+3. Rationale: callers that need trusted paths are forced through
    validation before file loading.
 4. How to copy it correctly: consume `ValidatedPath` by value at APIs that
    require the guarantee. Keep construction private.
@@ -460,7 +460,7 @@ project-wide conventions without more support.
 
 1. Pattern name: Local pattern: `FieldStr` compact string storage.
 2. Where it appears: `clinker-record::field_str`.
-3. Why it seems to exist: `Value::String` is common enough that its memory
+3. Rationale: `Value::String` is common enough that its memory
    width affects spill/RSS accounting.
 4. How to copy it correctly: use `FieldStr` through the public string API; do
    not duplicate its union layout elsewhere.
@@ -473,7 +473,7 @@ project-wide conventions without more support.
 1. Pattern name: Local pattern: `bench-alloc` global allocator accounting.
 2. Where it appears: `clinker-bench-support::alloc` and
    `clinker-exec::executor::stage_metrics`.
-3. Why it seems to exist: benchmarks need scoped allocation deltas without
+3. Rationale: benchmarks need scoped allocation deltas without
    enabling allocation accounting in normal runtime builds.
 4. How to copy it correctly: keep it behind the `bench-alloc` feature and use
    `Region` deltas for benchmark measurements.

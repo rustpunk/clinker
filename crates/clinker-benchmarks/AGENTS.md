@@ -99,7 +99,7 @@ Update relevant docs when benchmark commands, benchmark coverage, report output,
 - `docs/ai/90_CRATE_AGENT_PLAN.md`
 - Relevant YAML under `benches/pipelines/`
 
-## Unclear / ask human
+## Approval Gates
 
 Track unresolved questions only in `docs/ai/80_OPEN_QUESTIONS.md`. Relevant entries include unsupported generated benchmark formats and benchmark report compatibility.
 

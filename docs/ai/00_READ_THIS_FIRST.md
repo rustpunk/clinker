@@ -16,8 +16,8 @@ Use these evidence labels consistently:
   or a local command in this workspace.
 - **Strong inference:** Not directly stated as a rule, but strongly supported
   by current code structure, tests, manifests, and repeated local patterns.
-- **Hypothesis:** Plausible but not yet confirmed. Do not build architecture or
-  user-facing claims on it without more evidence.
+- **Needs grounding:** Plausible but not yet confirmed. Do not build architecture or
+  user-facing claims on it; move it to open questions or validate it against code.
 - **Open question:** Unresolved uncertainty that should be tracked in
   [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md), not guessed around.
 

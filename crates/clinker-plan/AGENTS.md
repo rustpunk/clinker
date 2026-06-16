@@ -72,8 +72,8 @@ type/device detection.
 - Use `ValidatedPath` for trusted paths; do not expose raw path bypasses.
 - `CompileContext::default()` is test convenience. Production callers should pass explicit workspace root / pipeline directory.
 - Retired `cxl_compile` module name and `E100` diagnostic code must stay absent.
-- Hypothesis: schema/CXL binding should remain ahead of DAG execution so runtime code consumes compiled artifacts rather than re-typechecking user programs.
-- Hypothesis: composition bodies should stay isolated from enclosing scope except through declared ports, config, resources, and scoped vars.
+- Schema/CXL binding should remain ahead of DAG execution so runtime code consumes compiled artifacts rather than re-typechecking user programs.
+- Composition bodies should stay isolated from enclosing scope except through declared ports, config, resources, and scoped vars.
 
 ## Common mistakes for AI agents to avoid
 

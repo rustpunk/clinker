@@ -41,7 +41,7 @@ Current normal dependencies are intentionally small:
 
 - `serde-saphyr` for span/error interop.
 - `petgraph` for graph storage and algorithms.
-- `miette` is declared in `Cargo.toml`; Hypothesis: it is retained for diagnostic interoperability even though direct source use in this crate is currently weak.
+- `miette` is declared in `Cargo.toml`; retain or remove it only after checking diagnostic interoperability and recording any unresolved dependency question in `docs/ai/80_OPEN_QUESTIONS.md`.
 
 No internal workspace crate dependencies are currently allowed.
 
@@ -71,7 +71,7 @@ No internal workspace crate dependencies are currently allowed.
 - String-matching DLQ categories instead of using `DlqErrorCategory`.
 - Changing `DlqErrorCategory::as_str` values casually; they appear in DLQ output.
 - Making `FileId` zero-based or using raw integers where `FileId`/`Span` should carry meaning.
-- Assuming synthetic spans can render file/column context without a higher-layer source database.
+- Treating synthetic spans as able to render file/column context without a higher-layer source database.
 
 ## Local commands
 
@@ -90,7 +90,7 @@ planner/executor/channel tests that consume the changed API.
 - `docs/ai/80_OPEN_QUESTIONS.md` for unresolved architecture or dependency questions.
 - User explain docs when diagnostic codes become user-facing.
 
-## Unclear / ask human
+## Approval Gates
 
 - Keep this file short and boundary-focused because this crate is small leaf
   vocabulary.

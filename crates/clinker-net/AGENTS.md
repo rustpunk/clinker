@@ -53,7 +53,7 @@ Current normal dependencies are intentional: `clinker-exec`, `clinker-plan`, `cl
 - HTTP/connect/body failures are hard source errors, not per-row DLQ records.
 - 5xx/transport failures retry only within configured retry limits; 4xx is fatal.
 - Page body reads are capped by `MAX_PAGE_BYTES`.
-- Hypothesis: SQL cursor wording in docs/manifests is roadmap language, not implemented behavior in this crate.
+- SQL cursor wording in docs/manifests is roadmap language, not implemented behavior in this crate; route changes to the central open-question registry before documenting it as current behavior.
 
 ## Common mistakes for AI agents to avoid
 
@@ -64,7 +64,7 @@ Current normal dependencies are intentional: `clinker-exec`, `clinker-plan`, `cl
 - Special-casing REST inside executor operator dispatch.
 - Turning hard HTTP/body errors into per-row DLQ records.
 - Bypassing `CoercingReader` and drifting from file-source row semantics.
-- Assuming local socket tests will pass inside restricted sandboxes.
+- Treating local socket tests as guaranteed to pass inside restricted sandboxes.
 
 ## Local commands
 

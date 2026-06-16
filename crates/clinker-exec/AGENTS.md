@@ -72,7 +72,7 @@ Existing normal dependencies are intentional evidence:
 - Runtime writes fields against schemas already widened/bound by planning.
 - Use `PipelineError::Internal` for violated plan/runtime invariants instead of panics.
 - Snapshot tests, fixture YAML, and proptests are design contracts.
-- Hypothesis: `bench-alloc` is acceptable only while strictly feature-gated and absent from default runtime paths.
+- `bench-alloc` must remain strictly feature-gated and absent from default runtime paths unless the central open-question registry records a different decision.
 
 ## Common mistakes for AI agents to avoid
 

@@ -74,7 +74,7 @@ Existing dev/bench dependencies are also expected: `criterion`,
 - Scoped variable types mirror config-side definitions locally so `cxl` does not depend on `clinker-plan`.
 - Aggregate mode is different from row-transform mode; keep `AggCall`, group-by field, `distinct`, and fan-out restrictions aligned across typecheck and extraction.
 - `ProgramEvaluator` is compile-once and stateful per evaluator instance; distinct state, partition reset, and `max_expansion` live outside immutable compiled programs.
-- Hypothesis: new AST variants should be reviewed across parser, resolver, typechecker, analyzer visitor, aggregate extractor, evaluator, docs, and tests in one change.
+- New AST variants should be reviewed across parser, resolver, typechecker, analyzer visitor, aggregate extractor, evaluator, docs, and tests in one change.
 
 ## Common mistakes for AI agents to avoid
 

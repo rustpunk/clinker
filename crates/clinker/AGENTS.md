@@ -89,7 +89,7 @@ Current dependencies are intentional unless a change is approved: workspace crat
 - Weakening atomic output or DLQ promotion behavior.
 - Moving source staging into lower crates without architectural review.
 - Copying stale "inputs/outputs/transformations" wording from older help/docs without checking current unified `nodes:` config.
-- Assuming every parsed CLI flag is fully wired; verify use in `run` before documenting behavior.
+- Treating every parsed CLI flag as fully wired; verify use in `run` before documenting behavior.
 
 ## Local commands
 

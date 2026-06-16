@@ -70,7 +70,7 @@ Current dev/bench dependencies are expected only for tests and benches:
 - `FieldMetadata` marks engine-stamped columns; default user-field iteration skips stamped columns.
 - Group keys canonicalize default integers/floats together, reject NaN, and treat null as caller-controlled.
 - Accumulator finalize must surface overflow via `AccumulatorError`, not wrapping casts.
-- Hypothesis: crate-local guidance is mostly needed for broad changes to `Value`, `Record`, schema, provenance, document context, storage, accumulator, or counter semantics.
+- Crate-local guidance is most relevant for broad changes to `Value`, `Record`, schema, provenance, document context, storage, accumulator, or counter semantics.
 
 ## Common mistakes for AI agents to avoid
 
@@ -101,7 +101,7 @@ For Rust source changes, also run the relevant workspace gates from the root
 - `docs/user/src/cxl/builtins-map.md` and related `docs/user/src/cxl/*.md` for public value/map behavior changes.
 - Relevant user/engine envelope and document-context docs before copying older examples.
 
-## Unclear / ask human
+## Approval Gates
 
 - Keep this file narrowly scoped to record/value/schema risks and avoid
   duplicating the root onboarding docs.
