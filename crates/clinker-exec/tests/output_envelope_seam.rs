@@ -959,3 +959,274 @@ nodes:
     // A: header row "A" then body "1". B: NO header row, just body "2".
     assert_eq!(lines, vec!["A", "1", "2"], "got:\n{out}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #570: plan-time document-cardinality gate (E355) + E347 lineage relaxation
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn single_document_output_from_two_input_merge_is_rejected_e355() {
+    // A >=2-input Merge is a shape-provable multi-document body; a SWIFT output
+    // frames one message, so it is rejected at plan time with a remedy rather
+    // than silently merging the two documents into one envelope.
+    let yaml = r#"
+pipeline:
+  name: e355_merge
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+  - type: merge
+    name: both
+    inputs: [a, b]
+    config:
+      mode: concat
+  - type: output
+    name: out
+    input: both
+    config:
+      name: out
+      type: swift
+      path: out.swift
+"#;
+    let err = expect_validation_error(yaml);
+    assert!(err.contains("E355"), "expected E355, got: {err}");
+    assert!(
+        err.contains("out") && err.contains("envelope"),
+        "message should name the output and the envelope remedy: {err}"
+    );
+}
+
+#[test]
+fn single_document_output_from_explicit_paths_list_is_rejected_e355() {
+    // An explicit `paths:` list of >= 2 files is shape-provably multi-document.
+    let yaml = r#"
+pipeline:
+  name: e355_paths
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      paths: [a.csv, b.csv]
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: x12
+      path: out.x12
+"#;
+    let err = expect_validation_error(yaml);
+    assert!(err.contains("E355"), "expected E355, got: {err}");
+}
+
+#[test]
+fn multi_document_output_from_two_input_merge_is_allowed() {
+    // A JSON output frames a valid document sequence, so a multi-document body
+    // is fine — the gate only applies to single-document formats.
+    let yaml = r#"
+pipeline:
+  name: e355_json_ok
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+  - type: merge
+    name: both
+    inputs: [a, b]
+    config:
+      mode: concat
+  - type: output
+    name: out
+    input: both
+    config:
+      name: out
+      type: json
+      path: out.json
+"#;
+    parse_config(yaml).expect("multi-document JSON output accepts a multi-document body");
+}
+
+#[test]
+fn single_document_output_through_envelope_concat_is_allowed() {
+    // An `envelope` node with `strategy: concat` consolidates the multi-document
+    // body into one document, satisfying the single-document SWIFT output.
+    let yaml = r#"
+pipeline:
+  name: e355_concat_ok
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+  - type: merge
+    name: both
+    inputs: [a, b]
+    config:
+      mode: concat
+  - type: envelope
+    name: one_doc
+    body: both
+    config:
+      strategy: concat
+  - type: output
+    name: out
+    input: one_doc
+    config:
+      name: out
+      type: swift
+      path: out.swift
+"#;
+    parse_config(yaml).expect("envelope concat consolidates the body for a single-document output");
+}
+
+#[test]
+fn single_document_output_through_envelope_preserve_is_rejected_e355() {
+    // `strategy: preserve` keeps per-document grains — it does NOT consolidate —
+    // so the multi-document body still reaches the single-document output.
+    let yaml = r#"
+pipeline:
+  name: e355_preserve
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: int }
+  - type: merge
+    name: both
+    inputs: [a, b]
+    config:
+      mode: concat
+  - type: envelope
+    name: passthrough
+    body: both
+    config:
+      strategy: preserve
+  - type: output
+    name: out
+    input: passthrough
+    config:
+      name: out
+      type: swift
+      path: out.swift
+"#;
+    let err = expect_validation_error(yaml);
+    assert!(
+        err.contains("E355"),
+        "preserve does not consolidate; expected E355, got: {err}"
+    );
+}
+
+#[test]
+fn combine_then_envelope_concat_allows_reconstruct_envelope_e347_relaxed() {
+    // The E347 lineage ban is relaxed: re-enveloping downstream of a Combine is
+    // legal THROUGH an Envelope node that consolidates the merged stream. Same
+    // shape as `reconstruct_envelope_downstream_of_combine_is_rejected_e347`
+    // (which has no Envelope node) — inserting the Envelope node clears E347.
+    let yaml = r#"
+pipeline:
+  name: e347_relaxed
+nodes:
+  - type: source
+    name: left
+    config:
+      name: left
+      type: json
+      glob: ./left/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: right
+    config:
+      name: right
+      type: json
+      glob: ./right/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: combine
+    name: joined
+    input:
+      a: left
+      b: right
+    config:
+      where: "a.id == b.id"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit id = a.id
+  - type: envelope
+    name: framed
+    body: joined
+    config:
+      strategy: concat
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: json
+      path: out.json
+      reconstruct_envelope: true
+"#;
+    parse_config(yaml)
+        .expect("an envelope node between the Combine and the Output relaxes the E347 ban");
+}

@@ -2399,6 +2399,12 @@ fn generic_output_envelope(
 struct OutputLineage {
     feeding_sources: std::collections::BTreeSet<String>,
     lineage_stripper: Option<String>,
+    /// Whether the body feeding this Output can statically carry >= 2 document
+    /// grains with no consolidating node on the path — the signal the E355
+    /// cardinality gate keys off. MULTI is the conservative default: a false
+    /// MULTI is a fixable compile error, a false SINGLE would let a
+    /// multi-document body silently merge into one single-document envelope.
+    body_cardinality: Cardinality,
 }
 
 /// Walk upstream from `output_name` over the config node graph, collecting the
@@ -2446,10 +2452,155 @@ fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLin
             }
         }
     }
+    // Document cardinality is a separate, path-sensitive fold (a consolidating
+    // node collapses only its own upstream subtree), so compute it with a fresh
+    // recursion over the same node map rather than contorting the flat walk above.
+    let body_cardinality =
+        stream_cardinality(&by_name, output_name, &mut std::collections::HashSet::new());
     OutputLineage {
         feeding_sources,
         lineage_stripper,
+        body_cardinality,
     }
+}
+
+/// Whether a node's output stream can statically carry more than one document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cardinality {
+    /// Provably collapses to at most one document grain at this point.
+    Single,
+    /// Can statically carry two or more document grains.
+    Multi,
+}
+
+impl Cardinality {
+    fn join(self, other: Cardinality) -> Cardinality {
+        if self == Cardinality::Multi || other == Cardinality::Multi {
+            Cardinality::Multi
+        } else {
+            Cardinality::Single
+        }
+    }
+}
+
+/// Conservatively decide whether the stream produced by `node_name` can carry
+/// two or more document grains. Consolidating nodes (`Combine` / `Aggregate` /
+/// `Composition`, or an `Envelope` with `strategy: concat`) collapse everything
+/// upstream of them to a single grain; an `Envelope` `preserve` and the
+/// per-record operators pass cardinality through; a `Merge` of >= 2 inputs is
+/// itself a multiplier; a `Source` is MULTI when it discovers multiple files or
+/// its reader yields multiple documents per file. Unknowns bias to MULTI (a
+/// false MULTI is a loud, fixable compile error; a false SINGLE would let silent
+/// document-merging through). Cycle-safe via the shared `visited` set.
+fn stream_cardinality<'a>(
+    by_name: &HashMap<&'a str, &'a PipelineNode>,
+    node_name: &'a str,
+    visited: &mut std::collections::HashSet<&'a str>,
+) -> Cardinality {
+    if !visited.insert(node_name) {
+        // Already folded on another path; the first visit returned its true
+        // value and `join` is monotonic toward MULTI, so re-counting it as
+        // SINGLE here cannot lower an already-MULTI result.
+        return Cardinality::Single;
+    }
+    let Some(node) = by_name.get(node_name) else {
+        return Cardinality::Single;
+    };
+    match node {
+        PipelineNode::Source { config, .. } => source_cardinality(&config.source),
+        // Consolidators: collapse the whole upstream subtree to one document.
+        PipelineNode::Combine { .. }
+        | PipelineNode::Aggregate { .. }
+        | PipelineNode::Composition { .. } => Cardinality::Single,
+        PipelineNode::Envelope { config, .. } => {
+            use crate::config::pipeline_node::EnvelopeStrategy;
+            match config.strategy {
+                EnvelopeStrategy::Concat => Cardinality::Single,
+                // `preserve` keeps per-document grains — pass-through, not a collapser.
+                EnvelopeStrategy::Preserve => join_input_cardinality(by_name, node, visited),
+            }
+        }
+        // A merge of >= 2 document-carrying inputs is itself multi-document:
+        // each predecessor contributes its own grains.
+        PipelineNode::Merge { .. } => {
+            if node.direct_input_names().len() >= 2 {
+                Cardinality::Multi
+            } else {
+                join_input_cardinality(by_name, node, visited)
+            }
+        }
+        // Per-record / pass-through operators: cardinality of their inputs.
+        PipelineNode::Transform { .. }
+        | PipelineNode::Route { .. }
+        | PipelineNode::Cull { .. }
+        | PipelineNode::Reshape { .. }
+        | PipelineNode::Output { .. } => join_input_cardinality(by_name, node, visited),
+    }
+}
+
+fn join_input_cardinality<'a>(
+    by_name: &HashMap<&'a str, &'a PipelineNode>,
+    node: &'a PipelineNode,
+    visited: &mut std::collections::HashSet<&'a str>,
+) -> Cardinality {
+    node.direct_input_names()
+        .into_iter()
+        .map(|up| stream_cardinality(by_name, up, visited))
+        .fold(Cardinality::Single, Cardinality::join)
+}
+
+/// A `Source` is statically MULTI only when its multiplicity is provable from
+/// the pipeline shape alone: an explicit `paths:` list of length >= 2 is
+/// definitely >= 2 documents. A `glob:`/`regex:` may match a single file, and a
+/// structured single file (X12/EDIFACT/HL7/SWIFT) may hold a single
+/// interchange/message — both are content-dependent, not shape-provable, so
+/// they are left to the runtime guard (which rejects precisely when a second
+/// concrete document grain materializes). This keeps single-document
+/// round-trips such as `x12 -> x12` legal at plan time.
+fn source_cardinality(source: &SourceConfig) -> Cardinality {
+    if source.paths.as_ref().is_some_and(|p| p.len() >= 2) {
+        Cardinality::Multi
+    } else {
+        Cardinality::Single
+    }
+}
+
+/// Whether an `Envelope` node sits between `output_name` and the nearest
+/// upstream lineage stripper on some path — i.e. the user has inserted explicit
+/// consolidation downstream of a `Combine` / `Aggregate` / `Composition`. Used
+/// to relax the E347 lineage ban: re-enveloping downstream of a stripper is
+/// legal THROUGH an Envelope node (the E355 cardinality gate then enforces that
+/// the Envelope actually consolidates a multi-document body). The walk stops
+/// descending at a stripper, so an Envelope found above a stripper — which would
+/// not consolidate the stripped stream — does not count.
+fn envelope_consolidates_stripped_lineage(config: &PipelineConfig, output_name: &str) -> bool {
+    let by_name: HashMap<&str, &PipelineNode> = config
+        .nodes
+        .iter()
+        .map(|n| (n.value.name(), &n.value))
+        .collect();
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = vec![output_name];
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let Some(node) = by_name.get(name) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Envelope { .. } => return true,
+            PipelineNode::Combine { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Composition { .. } => continue,
+            _ => {
+                for up in node.direct_input_names() {
+                    stack.push(up);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The synthesized `$doc` vocabulary of a segment/positional format: the
@@ -3800,6 +3951,42 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
+    // [E355] A single-document output format frames ONE top-level envelope for
+    // its entire record stream. If the body feeding it is SHAPE-PROVABLY
+    // multi-document — a >=2-input Merge, or an explicit `paths:` list of >= 2
+    // files — with no consolidating node on the path (a
+    // Combine/Aggregate/Composition, or an Envelope with `strategy: concat`),
+    // every input document's records collapse into that one envelope, silently
+    // merging distinct interchanges/messages. This plan-time gate rejects the
+    // shape-provable case at `compile()` so the failure is a `clinker explain`
+    // diagnostic, not a mid-run abort. Content-dependent multiplicity (a
+    // `glob:`/`regex:` source that may match one file, a structured single file
+    // that may hold one interchange) is left to the runtime guard (#584), which
+    // rejects precisely when a second concrete grain materializes — so a
+    // single-document round-trip like `x12 -> x12` stays legal here.
+    // Multi-document formats (CSV/JSON/XML/fixed-width) frame a valid document
+    // sequence and are unaffected. Independent of `reconstruct_envelope` so it
+    // survives the later removal of that flag.
+    for output in config.output_configs() {
+        if !output.format.is_single_document() {
+            continue;
+        }
+        if trace_output_lineage(config, &output.name).body_cardinality == Cardinality::Multi {
+            return Err(ConfigError::Validation(format!(
+                "[E355] output '{name}': `{format}` output frames a single top-level \
+                 document envelope, but its body can carry more than one document with no \
+                 consolidating node on the path — every input document's records would \
+                 collapse into one envelope, silently merging distinct messages/interchanges. \
+                 Insert an `envelope` node with `strategy: concat` to consolidate the body \
+                 into one document, route each document to its own output via a per-document \
+                 `split:` / `{{source_file}}` path template, or choose a document-sequence \
+                 format (csv / json / xml / fixed_width)",
+                name = output.name,
+                format = output.format.format_name(),
+            )));
+        }
+    }
+
     // Document-level DLQ cannot coexist with per-source-file fan-out output.
     // Under `dlq_granularity: document` the engine buffers each document and
     // decides flush-vs-reject at its boundary, opening ONE writer for the
@@ -3939,16 +4126,25 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             // (`<merged>`) document context, which the envelope arm streams
             // UNFRAMED. For JSON that means body bytes outside any open
             // document object — malformed JSON — and for every format it means
-            // silently dropped framing / a miscounted footer. Reject the
-            // combination at plan time rather than emit broken output.
-            if let Some(stripper) = lineage.lineage_stripper.as_deref() {
+            // silently dropped framing / a miscounted footer. This is legal,
+            // though, when an `Envelope` node sits between the stripper and the
+            // Output: it re-frames the merged stream into a consolidated
+            // document, so the per-document framing has a grain to attach to.
+            // Reject only when no such consolidation is present; the E355
+            // cardinality gate above then enforces that a single-document output
+            // actually gets a consolidating (`concat`) Envelope.
+            if let Some(stripper) = lineage.lineage_stripper.as_deref()
+                && !envelope_consolidates_stripped_lineage(config, out)
+            {
                 return Err(ConfigError::Validation(format!(
                     "[E347] output '{out}': `reconstruct_envelope` cannot be combined with an \
-                     upstream node ('{stripper}') that strips document lineage — a Combine, \
+                     upstream node ('{stripper}') that strips document lineage unless an \
+                     `envelope` node consolidates the merged stream first — a Combine, \
                      Aggregate, or Composition emits records with no originating document, so \
                      the per-document envelope cannot be framed around them (the framing arm \
-                     would stream them unframed, e.g. producing malformed JSON). Remove the \
-                     intervening node from this Output's path, or drop `reconstruct_envelope`"
+                     would stream them unframed, e.g. producing malformed JSON). Insert an \
+                     `envelope` node between '{stripper}' and this output to consolidate the \
+                     merged stream into one document, or drop `reconstruct_envelope`"
                 )));
             }
 
