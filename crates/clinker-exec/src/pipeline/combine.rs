@@ -1714,9 +1714,7 @@ mod tests {
         // dominates and the ratio rises toward 1.25×. That is the
         // intentional time-memory tradeoff of caching build-side key
         // Values to avoid re-extraction on every chain scan (plan
-        // decision; see C.2.1 sub-task in
-        // /home/glitch/.claude/plans/thoroughly-plan-how-to-silly-fairy.md
-        // Section 4).
+        // decision; see the C.2.1 sub-task).
         let cols: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
         let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let schema = test_schema(&col_refs);
