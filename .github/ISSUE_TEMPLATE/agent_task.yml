@@ -165,18 +165,19 @@ body:
     id: dependencies
     attributes:
       label: Dependencies and blockers
-      description: List issues, PRs, decisions, credentials, services, or environments required.
+      description: Use GitHub native blocked by/blocking relationships for issue and PR dependencies. Use this field for external blockers, credentials, services, environments, or fallback context.
       value: |
-        Blocked by:
-        - None / #...
+        Native GitHub relationships:
+        - Add issue/PR prerequisites using "Mark as blocked by" when applicable.
+        - This issue should show no open "blocked by" relationships before it is Agent Ready.
 
-        Unblocks:
-        - None / #...
+        External blockers / fallback notes:
+        - None / ...
 
         Decision/blocker handling:
         - Can the agent decide this within existing architecture rules? Yes / No
         - If no, create/link a decision issue and do not implement speculative behavior.
-        - If `Blocked by` contains an open issue, unmerged PR, unresolved Decision Gate, missing credential, or external condition, this issue is not agent-ready.
+        - If native "blocked by" relationships, an unmerged PR, unresolved Decision Gate, missing credential, or external condition is open, this issue is not agent-ready.
     validations:
       required: false
 
