@@ -59,6 +59,28 @@ impl OutputFormat {
             OutputFormat::Swift(_) => "swift",
         }
     }
+
+    /// Whether this output frames a SINGLE top-level document envelope for the
+    /// entire record stream it receives — EDIFACT (`UNB..UNZ`), X12
+    /// (`ISA..IEA`), HL7 v2 (`FHS..FTS`), SWIFT MT (`{1:}..{5:}`). Feeding such
+    /// a format a body that carries more than one document collapses every
+    /// input document's records into one envelope, silently merging distinct
+    /// messages/interchanges (the E355 plan-time gate and the runtime guard in
+    /// `clinker-exec` both key off this). The generic formats (CSV / JSON /
+    /// XML / fixed-width) emit a valid document sequence and return `false`.
+    ///
+    /// Single source of truth for the single-document format set: the
+    /// `clinker-plan` cardinality gate and the `clinker-exec` runtime guard
+    /// both consult this so the two cannot diverge.
+    pub fn is_single_document(&self) -> bool {
+        matches!(
+            self,
+            OutputFormat::Edifact(_)
+                | OutputFormat::X12(_)
+                | OutputFormat::Hl7(_)
+                | OutputFormat::Swift(_)
+        )
+    }
 }
 
 /// Adjacently tagged format enum for outputs.
@@ -150,4 +172,37 @@ pub enum MergeMode {
     Concat,
     /// Drain predecessors concurrently; first-ready-wins.
     Interleave,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_document_predicate_matches_the_structured_formats() {
+        for f in [
+            OutputFormat::Edifact(None),
+            OutputFormat::X12(None),
+            OutputFormat::Hl7(None),
+            OutputFormat::Swift(None),
+        ] {
+            assert!(
+                f.is_single_document(),
+                "{} frames one envelope and is single-document",
+                f.format_name()
+            );
+        }
+        for f in [
+            OutputFormat::Csv(None),
+            OutputFormat::Json(None),
+            OutputFormat::Xml(None),
+            OutputFormat::FixedWidth(None),
+        ] {
+            assert!(
+                !f.is_single_document(),
+                "{} emits a document sequence, not a single envelope",
+                f.format_name()
+            );
+        }
+    }
 }

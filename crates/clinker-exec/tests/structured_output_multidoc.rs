@@ -145,8 +145,14 @@ fn streaming_structured_output_rejects_multi_document_merge_body() {
         ),
     ]);
 
+    // A >=2-input Merge is a shape-provable multi-document body, so the E355
+    // plan-time cardinality gate (#570) now rejects this at `parse_config`,
+    // ahead of the runtime guard. (The glob/multi-file body in the test above
+    // is content-dependent and still reaches the runtime guard.)
     let err = run_yaml(streaming_merge_yaml(), readers)
-        .expect_err("streaming structured output must reject multi-document body");
-    assert!(err.contains("SWIFT error"), "{err}");
-    assert!(err.contains("multi-document body"), "{err}");
+        .expect_err("merge into a single-document output must be rejected");
+    assert!(
+        err.contains("E355"),
+        "expected the E355 plan-time cardinality gate: {err}"
+    );
 }
