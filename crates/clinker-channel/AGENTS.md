@@ -61,7 +61,7 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-core-types
 - Per-source advisory locks protect copy/publish, readers, cleanup, overwrite, and crash purge.
 - Crash purge must be liveness-aware and grace-gated; do not reap live sibling artifacts.
 - `SourceStager` keeps shared read guards alive until cleanup so staged files cannot vanish before or during reads.
-- Hypothesis: resource overlay fields are parsed but not fully applied by `apply_channel_overlay`; ask before documenting resources as implemented overlay behavior.
+- Resource overlay fields are parsed but not fully applied by `apply_channel_overlay`; ask before documenting resources as implemented overlay behavior.
 
 ## Common mistakes for AI agents to avoid
 
@@ -73,7 +73,7 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-core-types
 - Turning staging into per-run temp-only paths and breaking reuse.
 - Removing the manifest commit-marker discipline.
 - Making cleanup or purge delete files without lock/liveness checks.
-- Assuming staging is a planner concern; policy parsing/validation is in `clinker-plan`, copy mechanics are here, and CLI orchestrates.
+- Treating staging as a planner concern; policy parsing/validation is in `clinker-plan`, copy mechanics are here, and CLI orchestrates.
 
 ## Local commands
 

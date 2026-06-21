@@ -4,7 +4,7 @@ Purpose: Give future AI agents a factual map of the current Cargo workspace, wit
 
 ## Workspace Overview
 
-The root workspace has 13 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-bench-support`, and `clinker-benchmarks` (`Cargo.toml`). `reserve/` is a separate non-member Cargo package named `clinker` with its own `[workspace]` table; it appears to be a crates.io name-reservation placeholder, not runtime code.
+The root workspace has 13 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-bench-support`, and `clinker-benchmarks` (`Cargo.toml`). `reserve/` is a separate non-member Cargo package named `clinker` with its own `[workspace]` table; `reserve/src/lib.rs` identifies it as a crates.io name-reservation placeholder, not runtime code.
 
 No Cargo `examples` targets were found. The repository does contain YAML pipeline examples and fixtures under `examples/pipelines/` plus benchmark pipeline configs under `benches/pipelines/`.
 
@@ -30,14 +30,14 @@ clinker-benchmarks -> clinker-bench-support + clinker-exec + clinker-plan + cxl
 
 Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`.
 
-## Suspected Layering Rules
+## Current Layering Rules Inferred From Source
 
 - `clinker-core-types` appears intended as a leaf crate: its crate docs say it holds spans, diagnostics, graph, and DLQ vocabulary and "deliberately holds no executor, config, or schema types" (`crates/clinker-core-types/src/lib.rs`).
-- `clinker-record` appears to be the shared data model leaf for row values, schemas, storage traits, grouping keys, document context, and accumulators (`crates/clinker-record/src/lib.rs`).
-- `cxl` appears to sit above records but below planning/execution: it parses, resolves, type-checks, plans aggregates, and evaluates expressions against `clinker-record` values (`crates/cxl/src/lib.rs`).
-- `clinker-format` appears to own streaming readers/writers and document/envelope framing. It depends on `cxl`, so it is not a pure serialization leaf (`crates/clinker-format/Cargo.toml`; `crates/clinker-format/src/lib.rs`).
-- `clinker-plan` appears to be compile-time orchestration and DAG construction below the runtime executor; its crate docs explicitly say execution consumes its plan (`crates/clinker-plan/src/lib.rs`).
-- `clinker-exec` appears to be runtime orchestration and operators; binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
+- `clinker-record` is the shared data model leaf for row values, schemas, storage traits, grouping keys, document context, and accumulators (`crates/clinker-record/src/lib.rs`).
+- `cxl` sits above records but below planning/execution: it parses, resolves, type-checks, plans aggregates, and evaluates expressions against `clinker-record` values (`crates/cxl/src/lib.rs`).
+- `clinker-format` owns streaming readers/writers and document/envelope framing. It depends on `cxl`, so it is not a pure serialization leaf (`crates/clinker-format/Cargo.toml`; `crates/clinker-format/src/lib.rs`).
+- `clinker-plan` is compile-time orchestration and DAG construction below the runtime executor; its crate docs explicitly say execution consumes its plan (`crates/clinker-plan/src/lib.rs`).
+- `clinker-exec` is runtime orchestration and operators; binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
 - `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` appear to be edge/application or integration crates around the plan/exec/language core.
 - Benchmark crates appear intended to stay outside the runtime layer. `clinker-benchmarks/src/lib.rs` says it houses a runner needing both `clinker-exec` and `clinker-bench-support` to avoid a circular dependency.
 
@@ -54,7 +54,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-record`
 - Path: `crates/clinker-record`
 - Role: Library crate plus `record_ops` Criterion bench.
-- Purpose: Appears to define Clinker's core in-memory data model: `Value`, `Record`, `Schema`, field strings, coercion, grouping keys, provenance, document context, storage traits, pipeline counters, and aggregate accumulator state.
+- Purpose: Defines Clinker's core in-memory data model: `Value`, `Record`, `Schema`, field strings, coercion, grouping keys, provenance, document context, storage traits, pipeline counters, and aggregate accumulator state.
 - Important public modules: `accumulator`, `coercion`, `counters`, `document_context`, `field_str`, `group_key`, `minimal`, `provenance`, `record`, `record_view`, `resolver`, `schema`, `schema_def`, `storage`, `value`.
 - Internal dependencies: none for normal build; dev-depends on `clinker-bench-support`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `chrono`, `ahash`, `indexmap`, `smol_str`; `postcard` and `criterion` for dev/bench.
@@ -67,7 +67,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-core-types`
 - Path: `crates/clinker-core-types`
 - Role: Library crate.
-- Purpose: Appears to provide leaf vocabulary shared by planning, execution, diagnostics, and channels: source spans, structured diagnostics, name-keyed graph utilities, and DLQ categories/stage helpers.
+- Purpose: Provides leaf vocabulary shared by planning, execution, diagnostics, and channels: source spans, structured diagnostics, name-keyed graph utilities, and DLQ categories/stage helpers.
 - Important public modules: `diagnostic`, `dlq`, `graph`, `span`.
 - Internal dependencies: none.
 - Architecturally important external dependencies: `miette`, `petgraph`, `serde-saphyr`.
@@ -80,7 +80,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `cxl`
 - Path: `crates/cxl`
 - Role: Library crate plus `eval` and `parse` benches.
-- Purpose: Appears to own the CXL expression language pipeline: AST, lexer/parser, module evaluation, name resolution, type checking, static analysis, aggregate extraction, and runtime evaluation.
+- Purpose: Owns the CXL expression language pipeline: AST, lexer/parser, module evaluation, name resolution, type checking, static analysis, aggregate extraction, and runtime evaluation.
 - Important public modules: `analyzer`, `ast`, `builtins`, `eval`, `lexer`, `module_eval`, `parser`, `plan`, `resolve`, `typecheck`.
 - Internal dependencies: `clinker-record`; dev-depends on `clinker-bench-support`.
 - Architecturally important external dependencies: `miette` for diagnostics, `regex`, `indexmap`, `ahash`, `tracing`, `static_assertions`, `serde`, `chrono`; `proptest`, `criterion`, and `tracing-subscriber` for dev/bench.
@@ -93,7 +93,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `cxl-cli`
 - Path: `crates/cxl-cli`
 - Role: Binary crate (`cxl-cli` package target; command name in Clap is `cxl`).
-- Purpose: Appears to be a standalone language tool for checking, evaluating, and formatting CXL files or inline expressions.
+- Purpose: Provides a standalone language tool for checking, evaluating, and formatting CXL files or inline expressions.
 - Important public modules: none; all code is in `src/main.rs`. Main command symbols include `Cli`, `Command`, `cmd_check`, `cmd_eval`, and `cmd_fmt`.
 - Internal dependencies: `cxl`, `clinker-record`.
 - Architecturally important external dependencies: `clap`, `miette`, `serde_json`, `indexmap`, `chrono`.
@@ -106,7 +106,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-format`
 - Path: `crates/clinker-format`
 - Role: Library crate plus integration tests and `io_throughput` bench.
-- Purpose: Appears to own streaming format IO, including CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record support, document indexes, source reopenability, output envelopes, counting writers, BOM handling, and output splitting.
+- Purpose: Owns streaming format IO, including CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record support, document indexes, source reopenability, output envelopes, counting writers, BOM handling, and output splitting.
 - Important public modules: `bom`, `counting`, `csv`, `doc_index`, `edifact`, `envelope`, `envelope_writer`, `error`, `fixed_width`, `hl7`, `json`, `multi_record`, `source`, `splitting`, `swift`, `traits`, `x12`, `xml`. `segment_tokenizer` is crate-private.
 - Internal dependencies: `clinker-record`, `cxl`; dev-depends on `clinker-bench-support`.
 - Architecturally important external dependencies: `csv`, `quick-xml`, `serde`, `serde_json`, `miette`, `tracing`, `indexmap`, `chrono`.
@@ -119,7 +119,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-plan`
 - Path: `crates/clinker-plan`
 - Role: Library crate with in-crate plan/config tests.
-- Purpose: Appears to parse YAML pipeline/composition configuration, resolve schemas and source discovery, validate configs, compile CXL against row types, and produce typed execution DAGs consumed by `clinker-exec`.
+- Purpose: Parses YAML pipeline/composition configuration, resolve schemas and source discovery, validate configs, compile CXL against row types, and produce typed execution DAGs consumed by `clinker-exec`.
 - Important public modules: `config`, `error`, `plan`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes source/output/format/route/aggregate/storage/composition modules; `plan` exposes `compiled`, `execution`, `properties`, `statistics`, `streaming_eligibility`, `deferred_region`, and `envelope_synthesis`.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-record`, `cxl`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `toml`, `indexmap`, `miette`, `petgraph`, `regex`, `tracing`, `walkdir`, `glob`, `blake3`, `postcard`, `lz4_flex`, `tempfile`, platform `nix`/`windows-sys`.
@@ -132,7 +132,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-exec`
 - Path: `crates/clinker-exec`
 - Role: Library crate with the largest integration-test and benchmark surface.
-- Purpose: Appears to execute compiled pipeline DAGs: source ingestion, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, DLQ, metrics, memory arbitration, spill handling, record sources, progress, and runtime modules.
+- Purpose: Executes compiled pipeline DAGs: source ingestion, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, DLQ, metrics, memory arbitration, spill handling, record sources, progress, and runtime modules.
 - Important public modules: `aggregation`, `dlq`, `executor`, `exit_codes`, `log_dispatch`, `log_rules`, `log_template`, `metrics`, `modules`, `output`, `partial`, `pipeline`, `progress`, `projection`, `sketch`, `source`. The `executor` module exposes `PipelineExecutor`, `PipelineRunParams`, `ExecutionReport`, `WriterRegistry`, `RecordSource`, `SourceInput`, and validation types. The `pipeline` module exposes sort, combine, grace hash, IEJoin, memory, spill, streaming merge, and window context helpers.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-plan`, `clinker-record`, `cxl`; optional normal dependency on `clinker-bench-support`; dev-depends on `clinker-bench-support` and `clinker-channel`.
 - Architecturally important external dependencies: `crossbeam-channel`, `rayon`, `arc-swap`, `hashbrown`, `lz4_flex`, `postcard`, `fs4`, `petgraph`, `miette`, `tracing`, `serde-saphyr`, `serde_json`, `csv`, `glob`, `uuid`, `ctrlc` on native targets, `windows-sys` on Windows, `criterion`, `insta`, `proptest`, `serial_test`.
@@ -145,7 +145,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-channel`
 - Path: `crates/clinker-channel`
 - Role: Library crate plus integration tests and `channel_merge` bench.
-- Purpose: Appears to manage channel files for multi-tenant pipeline/composition launches: binding channel targets, validating config override paths, applying overlays, and staging source copies with reuse/crash-safety logic.
+- Purpose: Manages channel files for multi-tenant pipeline/composition launches: binding channel targets, validating config override paths, applying overlays, and staging source copies with reuse/crash-safety logic.
 - Important public modules: `binding`, `error`, `overlay`, `staging_copy`.
 - Internal dependencies: `clinker-core-types`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `serde-saphyr`, `serde`, `serde_json`, `blake3`, `indexmap`, `tracing`, `thiserror`, `walkdir`, `uuid`, `tempfile`, `fs4`, Unix `nix`.
@@ -158,7 +158,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-net`
 - Path: `crates/clinker-net`
 - Role: Library crate plus REST integration tests.
-- Purpose: Appears to provide finite-pull network source readers, currently REST, that adapt paginated network data into executor `RecordSource` inputs.
+- Purpose: Provides finite-pull network source readers, currently REST, that adapt paginated network data into executor `RecordSource` inputs.
 - Important public modules: no public submodules; `rest` is private. Public API is `build_rest_source`.
 - Internal dependencies: `clinker-exec`, `clinker-format`, `clinker-plan`, `clinker-record`; dev-depends on `clinker-bench-support` and `clinker-exec` with `test-utils`.
 - Architecturally important external dependencies: `ureq` with rustls, `serde_json`, `indexmap`, `tracing`.
@@ -171,7 +171,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker`
 - Path: `crates/clinker`
 - Role: Binary crate for the main CLI.
-- Purpose: Appears to be the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, and explains diagnostic codes.
+- Purpose: Provides the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, and explains diagnostic codes.
 - Important public modules: none; all code is in `src/main.rs`. Main symbols include `Cli`, `Commands`, `RunArgs`, `MetricsCommands`, `CollectArgs`, and `ExplainArgs`.
 - Internal dependencies: `clinker-channel`, `clinker-core-types`, `clinker-exec`, `clinker-format`, `clinker-net`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `clap`, `miette`, `tracing`, `tracing-subscriber`, `serde-saphyr`, `serde_json`, `indexmap`, `chrono`, `num_cpus`, `uuid`, `tempfile`.
@@ -184,7 +184,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-schema`
 - Path: `crates/clinker-schema`
 - Role: Library crate.
-- Purpose: Appears to parse `.schema.yaml` files, discover schemas and pipelines in a workspace, build schema indexes, and validate pipeline source/schema references.
+- Purpose: Parses `.schema.yaml` files, discover schemas and pipelines in a workspace, build schema indexes, and validate pipeline source/schema references.
 - Important public modules: `discovery`, `model`, `parse`, `validate`.
 - Internal dependencies: `clinker-plan`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `ahash`; `tempfile` for dev tests.
@@ -197,7 +197,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-bench-support`
 - Path: `crates/clinker-bench-support`
 - Role: Library support crate for tests/benchmarks, plus `bench_alloc` integration test gated by feature usage.
-- Purpose: Appears to provide deterministic test/benchmark data generation, workspace and benchmark pipeline discovery, IO capture helpers, synthetic readers, reusable cached benchmark data, combine data generation, and optional allocation accounting.
+- Purpose: Provides deterministic test/benchmark data generation, workspace and benchmark pipeline discovery, IO capture helpers, synthetic readers, reusable cached benchmark data, combine data generation, and optional allocation accounting.
 - Important public modules: `alloc` behind `bench-alloc`, `cache`, `combine`, `generators`, `io`.
 - Internal dependencies: `clinker-record`.
 - Architecturally important external dependencies: `fastrand`, `blake3`, `glob`, `serde`, `serde_json`, `chrono`; dev `quick-xml`, `tempfile`, `serial_test`.
@@ -210,7 +210,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker-benchmarks`
 - Path: `crates/clinker-benchmarks`
 - Role: Library benchmark harness plus `e2e_matrix` and feature-gated `e2e_xlarge` benches.
-- Purpose: Appears to run end-to-end pipeline benchmarks over YAML benchmark configs, map pipeline input formats to generated data formats, execute pipelines through `clinker-exec`, and report benchmark output including CI JSON.
+- Purpose: Runs end-to-end pipeline benchmarks over YAML benchmark configs, map pipeline input formats to generated data formats, execute pipelines through `clinker-exec`, and report benchmark output including CI JSON.
 - Important public modules: `format_mapping`, `report`, `runner`.
 - Internal dependencies: `clinker-bench-support`, `clinker-exec`, `clinker-plan`, `cxl`.
 - Architecturally important external dependencies: `criterion`, `indexmap`, `serde`, `serde_json`, `chrono`, `tempfile`.
@@ -223,7 +223,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker`
 - Path: `reserve`
 - Role: Separate non-workspace library package.
-- Purpose: Appears to reserve the published crate name while implementation continues in the main workspace.
+- Purpose: Reserves the published crate name while implementation continues in the main workspace.
 - Important public modules: none.
 - Internal dependencies: none.
 - Architecturally important external dependencies: none.

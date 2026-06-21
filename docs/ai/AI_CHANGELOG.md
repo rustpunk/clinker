@@ -58,14 +58,24 @@ What this entry can say factually:
 - Agent-authored PRs are documented as evidence for one Agent Task.
 - Agents must not merge PRs by default; in this public-contribution repository,
   maintainers review and merge unless they explicitly instruct otherwise.
-- Sequence dependencies are tracked with `Blocked by:` / `Unblocks:` issue
-  blocks, project status, and project ordering. Blocked issues are excluded from
-  `Agent Ready`.
+- Sequence dependencies are tracked primarily with native GitHub `blocked by` /
+  `blocking` relationships, plus project status and project ordering. Body
+  blocks/comments are fallback mirrors for external blockers or tool permission
+  gaps. Blocked issues are excluded from `Agent Ready`.
 - GitHub Projects are documented as flow boards only; stale projects should be
   archived or rebuilt, and the active Project should expose focused queue,
   grounding, decision, review, milestone, and decision-register views.
 - Workflow-relevant issues and PRs are expected to be added to the active
   Project and default to `Status = Intake` until routed.
+- Closed issues tied to active umbrellas or dependency chains should remain in
+  the Project as `Status = Done`; only confirmed unrelated closed items should
+  be archived.
+- Rejected, superseded, or intentionally abandoned items that remain useful
+  board context should use `Status = Won't Do`.
+- GitHub Projects saved views are documented as a manual web UI setup step
+  because current `gh project` commands do not manage saved views and the
+  available GraphQL schema exposes Project v2 views for reading, not creating
+  or updating.
 - Implementation agents now have a post-implementation follow-up check to
   compare acceptance criteria against the diff, scan for shortcut/scope-creep
   signatures, and capture deferred findings as comments or follow-up issues.
@@ -140,30 +150,9 @@ changes.
   `RecordSource` inputs. This means network transport is integrated at the
   executor-source boundary, not isolated as a pure low-level IO crate.
 
-## Major Unresolved Questions
+## Open Question Routing
 
-For the full list, see [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md).
-The highest-impact questions from the initial documentation pass are:
-
-- Should `PipelineExecutor::run_plan_with_readers_writers` consume the stored
-  `CompiledPlan` DAG directly, or is re-entering compilation through
-  `CompiledPlan::config()` intentional?
-- Should channel `resources.default` and `resources.fixed` be implemented,
-  rejected, or documented as reserved?
-- Should pipeline-target channel config keys be validated before overlay
-  application?
-- What is the intended long-term boundary between `clinker-schema` and
-  `clinker-plan`?
-- How complete should `clinker-schema` discovery and validation become?
-- Should user-facing docs be updated everywhere to the unified `nodes:` shape
-  and all current node types?
-- Should source-node and transport docs describe file and finite REST as
-  implemented, while treating SQL cursor language as roadmap or unsupported?
-- Is the `clinker-format -> cxl` dependency an intended permanent layering
-  rule?
-- Which public planner and CXL APIs are stable user-facing API versus exposed
-  internal surface?
-
+Current unresolved questions are tracked in `docs/ai/80_OPEN_QUESTIONS.md`. Keep this changelog focused on dated evidence, resolved uncertainty, and factual documentation maintenance history.
 ## Instructions For Future Agents
 
 - Update this file when making architectural changes, changing subsystem

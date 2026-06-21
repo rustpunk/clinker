@@ -50,7 +50,7 @@ Existing normal dependencies are expected:
 
 - Workspace crates: `cxl` and `clinker-record`.
 - CLI/data support: `clap`, `serde_json`, `indexmap`, and `chrono`.
-- `miette` is declared in `Cargo.toml`; Hypothesis: keep it only if CLI diagnostics are intended to move toward richer miette rendering, because current source prints diagnostics manually.
+- `miette` is declared in `Cargo.toml`; keep it only if CLI diagnostics are intended to move toward richer miette rendering, because current source prints diagnostics manually.
 
 ### Forbidden or suspicious dependencies
 
@@ -76,7 +76,7 @@ Existing normal dependencies are expected:
 - Changing documented exit codes without updating user docs.
 - Breaking JSON stdout by mixing notes/errors into stdout.
 - Adding pipeline execution, YAML config parsing, REST/file format handling, or bounded-memory runtime concerns here.
-- Assuming user docs are current without checking source.
+- Treating user docs as current without checking source.
 
 ## Local commands
 
@@ -96,7 +96,7 @@ For language semantics changes, also run the relevant `crates/cxl` checks.
 - `docs/user/src/ops/cli-reference.md` if CLI reference wording changes.
 - `docs/ai/20_CRATE_MAP.md`, `docs/ai/50_TESTING_AND_COMMANDS.md`, `docs/ai/70_GLOSSARY.md`, `docs/ai/80_OPEN_QUESTIONS.md`, and possibly `docs/ai/90_CRATE_AGENT_PLAN.md`.
 
-## Unclear / ask human
+## Approval Gates
 
 - Keep this local guidance focused on CLI behavior. CXL language semantics
   belong primarily in `crates/cxl/AGENTS.md` and the `cxl` crate.

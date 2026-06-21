@@ -13,7 +13,7 @@ Primary evidence used for this pass:
 - Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
 - Tests and CI: `crates/clinker-exec/tests/*`, `crates/clinker-plan/src/plan/tests/*`, `crates/clinker-format/tests/*`, `crates/clinker-net/tests/*`, `crates/clinker-channel/tests/*`, `.github/workflows/ci.yml`.
 
-## What Clinker Appears To Be
+## What Clinker Is
 
 Verified facts:
 
@@ -23,9 +23,9 @@ Verified facts:
 - CXL is the per-record expression language layer. The `cxl` crate exposes parser, resolver, typechecker, analyzer, aggregate extraction, and evaluator modules; plan and exec compile and evaluate CXL-bearing nodes.
 - Clinker is not currently an editor application in this repository. Tooling-facing surfaces appear to be data/API outputs such as `ExplainFormat::Json`, `CompiledPlan::provenance`, `CompiledPlan::typed_output_row`, and `clinker-schema`.
 
-Hypothesis:
+Current description:
 
-- The project is best described as a bounded-memory, single-process DAG executor for finite ETL jobs, with YAML configuration, CXL expression programs, streaming readers/writers, and an explicit plan/runtime boundary. This matches crate docs and runtime contracts, but maintainers should confirm whether "ETL engine" or "batch DAG executor" is the preferred public wording.
+- Clinker is a bounded-memory, single-process DAG executor for finite ETL jobs, with YAML configuration, CXL expression programs, streaming readers/writers, and an explicit plan/runtime boundary. Preferred public wording is tracked in `docs/ai/80_OPEN_QUESTIONS.md`.
 
 ## Major Subsystems
 
@@ -124,9 +124,9 @@ Verified facts:
 - Shutdown uses per-run `ShutdownToken` values backed by `Arc<AtomicBool>`. A process-wide `ctrlc` handler broadcasts to registered live tokens through a `Weak` registry.
 - Memory arbitration is concurrent but centralized. Registered consumers expose usage/pause/spill hooks; operators poll `should_spill` / `should_abort` at chunk boundaries.
 
-Hypothesis:
+Current guidance:
 
-- `tokio` exists in workspace dependencies, but current core pipeline execution should be treated as non-async. Adding async transport or a Tokio-driven executor would be an architectural change, not a local refactor.
+- `tokio` exists in workspace dependencies, but current core pipeline execution is non-async. Adding async transport or a Tokio-driven executor is an architectural change, not a local refactor.
 
 ## Serialization, Configuration, And Resource Loading
 
@@ -208,10 +208,6 @@ These are supported by current code structure or source comments:
 - Benchmark/test support should not leak into default runtime paths.
 - Public behavior changes need matching docs/examples/tests at the boundary they affect.
 
-## Areas Of Uncertainty
+## Open Question Routing
 
-- `clinker-format -> cxl` is a current dependency edge, apparently for CXL-aware envelope/extraction behavior, but `20_CRATE_MAP.md` flags whether this is intended as a permanent layering rule.
-- `clinker-net -> clinker-exec` is current and deliberate for `RecordSource`, but it means network transport is an executor integration crate rather than a low-level IO layer.
-- `PipelineExecutor::run_plan_with_readers_writers` requires `CompiledPlan`, yet the run body currently re-enters compilation through the embedded config. Future changes around plan reuse should inspect this carefully before assuming the stored DAG is the sole runtime input.
-- The repo has `tokio` in workspace dependencies, but core execution is synchronous. It is unclear whether `tokio` is reserved for external/editor tooling or stale dependency surface.
-- `reserve/` appears to be a crates.io name-reservation package, not runtime code, but this is inferred from local files.
+Current unresolved architecture questions are tracked in `docs/ai/80_OPEN_QUESTIONS.md`. In particular, check that registry before changing layering around `clinker-format`, `clinker-net`, plan reuse in `PipelineExecutor`, async/Tokio usage, or the non-workspace `reserve/` package.

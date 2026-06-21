@@ -106,7 +106,7 @@ Update relevant docs/examples when this crate changes schema file shape, discove
 - `docs/engine/src/architecture.md`, after verifying against current source because older engine docs contain stale crate layout.
 - `examples/pipelines/retract-demo/*.schema.yaml`
 
-## Unclear / ask human
+## Approval Gates
 
 Track unresolved questions only in `docs/ai/80_OPEN_QUESTIONS.md`. Relevant entries include the `clinker-schema`/`clinker-plan` boundary and schema validation completeness.
 
