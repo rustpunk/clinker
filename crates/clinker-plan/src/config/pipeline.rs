@@ -3601,10 +3601,11 @@ pub(crate) fn lower_node_to_plan_node(
             // Carry the typed `cxl:` body program on the node, mirroring the
             // Transform arm's `artifacts.typed.get(name)` read into
             // `PlanTransformPayload.typed`. Body and top-level combines both
-            // flow through this arm; the bare-name lookup is collision-exposed
-            // exactly like Transform's (scope-correct keying is a later phase).
-            // `None` is legitimate here — a body-less combine (e.g.
-            // `match: collect`) carries no program.
+            // flow through this arm; the bare-name lookup into the
+            // `artifacts.typed` body-program table is collision-exposed exactly
+            // like the Transform arm's (see OPEN_QUESTIONS on scope-qualified
+            // keying of that table). `None` is legitimate here — a body-less
+            // combine (e.g. `match: collect`) carries no program.
             let typed = artifacts.typed.get(name).cloned();
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),

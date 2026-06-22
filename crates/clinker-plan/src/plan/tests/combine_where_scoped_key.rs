@@ -1,5 +1,5 @@
 //! Scope-qualified keying of the compile-time `combine_where_typed`
-//! side-table (`#621`, P2).
+//! side-table.
 //!
 //! The `where:` predicate program of a Combine lands in the
 //! `CompileArtifacts.combine_where_typed` side-table keyed by
@@ -147,8 +147,8 @@ nodes:
         .copied()
         .expect("composition body assignment for `body`");
 
-    // Both scope-qualified keys resolve — pre-P2 the bare-name key would
-    // have left only one of these populated.
+    // Both scope-qualified keys resolve — with bare-name keying only one of
+    // these would have been populated (last writer wins).
     let top_key = ScopedNodeId {
         scope: NodeScope::TopLevel,
         name: "join_x".to_string(),
@@ -169,9 +169,9 @@ nodes:
 
     // The two programs are distinct — distinct `where:` predicates produce
     // distinct typed `Statement::Filter` bodies. The collision-regression:
-    // pre-P2 one would have overwritten the other, so a single surviving
-    // program would be shared (or one key absent entirely, already caught
-    // by the `expect`s above).
+    // with bare-name keying one would have overwritten the other, so a single
+    // surviving program would be shared (or one key absent entirely, already
+    // caught by the `expect`s above).
     let top_dbg = format!("{:?}", top_where.program.statements);
     let body_dbg = format!("{:?}", body_where.program.statements);
     assert_ne!(
