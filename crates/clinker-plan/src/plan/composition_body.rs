@@ -230,6 +230,13 @@ impl BoundBody {
     /// plus resolved types and `output_row`) so downstream lineage can
     /// trace a body combine's computed columns at the same fidelity as
     /// body `Transform`/`Aggregation` nodes.
+    ///
+    /// Keyed by body-local node name. The snapshot is taken from the
+    /// compile-wide typed-program table that the executor also consults
+    /// for body combines, so the returned program matches what the
+    /// combine executes; a name reused by a `Combine` in a nested
+    /// composition body resolves to whichever was bound last, the same
+    /// flat node-name keying the executor inherits.
     pub fn combine_typed(&self, node_id: &str) -> Option<&cxl::typecheck::TypedProgram> {
         self.body_combine_typed.get(node_id).map(std::sync::Arc::as_ref)
     }
@@ -238,7 +245,8 @@ impl BoundBody {
     /// node, or `None`. Body-scoped analogue of
     /// `CompileArtifacts.combine_where_typed`. Returns the full
     /// `TypedProgram` so the join-key predicate columns are reachable
-    /// with the same fidelity as the body program.
+    /// with the same fidelity as the body program. Keyed and resolved
+    /// like [`BoundBody::combine_typed`].
     pub fn combine_where_typed(&self, node_id: &str) -> Option<&cxl::typecheck::TypedProgram> {
         self.body_combine_where_typed
             .get(node_id)
