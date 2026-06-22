@@ -688,19 +688,14 @@ pub(crate) const SMALL_INPUT_THRESHOLD: u64 = 10_000;
 /// Threaded into [`select_combine_strategies_in_graph`] so the same
 /// work runs uniformly over the top-level
 /// [`crate::plan::execution::ExecutionPlanDag`] and over each
-/// composition body's mini-DAG. Carrying the subsets as a struct
-/// (rather than half a dozen positional arguments) lets the wrapper
+/// composition body's mini-DAG. The per-combine inputs / predicate /
+/// driving are read off each combine node; only the statistics catalog
+/// and the strategy hints stay in this struct, letting the wrapper
 /// `select_combine_strategies_in_bodies` borrow-split
 /// [`crate::plan::bind_schema::CompileArtifacts`] across
-/// `composition_bodies` (mutable) and the four lookup tables
-/// (immutable) without falling back to a clippy allow.
+/// `composition_bodies` (mutable) and those two tables (immutable)
+/// without falling back to a clippy allow.
 pub(crate) struct CombineSelectionTables<'a> {
-    /// Per-combine input qualifier metadata, keyed by combine node name.
-    pub combine_inputs: &'a std::collections::HashMap<String, IndexMap<String, CombineInput>>,
-    /// Per-combine decomposed `where:` predicate, keyed by combine node name.
-    pub combine_predicates: &'a std::collections::HashMap<String, DecomposedPredicate>,
-    /// Per-combine driving qualifier, keyed by combine node name.
-    pub combine_driving: &'a std::collections::HashMap<String, String>,
     /// Statistics catalog. Combine strategy selection reads each input's
     /// row count from here, keyed by the input's upstream node name, in
     /// place of a per-input cardinality field.
@@ -722,9 +717,6 @@ pub fn select_combine_strategies(
     // graph's mutable borrow without aliasing through `plan`.
     let node_properties_snapshot = plan.node_properties.clone();
     let tables = CombineSelectionTables {
-        combine_inputs: &artifacts.combine_inputs,
-        combine_predicates: &artifacts.combine_predicates,
-        combine_driving: &artifacts.combine_driving,
         statistics: &artifacts.statistics,
         combine_strategy_hints: &artifacts.combine_strategy_hints,
     };
@@ -751,23 +743,18 @@ pub fn select_combine_strategies_in_bodies(
     mem_limit_str: Option<&str>,
 ) {
     // Split the artifacts borrow: the bodies map mutates via
-    // `values_mut()`, while the lookup tables (combine_inputs,
-    // combine_predicates, combine_driving, combine_strategy_hints)
-    // remain immutable references for the inner per-graph call.
+    // `values_mut()`, while the strategy-selection lookup tables
+    // (statistics, combine_strategy_hints) remain immutable references for
+    // the inner per-graph call. The per-combine inputs / predicate / driving
+    // are read off each body node instead, so they are not borrowed here.
     let crate::plan::bind_schema::CompileArtifacts {
         composition_bodies,
-        combine_inputs,
-        combine_predicates,
-        combine_driving,
         statistics,
         combine_strategy_hints,
         ..
     } = artifacts;
 
     let tables = CombineSelectionTables {
-        combine_inputs,
-        combine_predicates,
-        combine_driving,
         statistics,
         combine_strategy_hints,
     };
@@ -816,13 +803,19 @@ pub(crate) fn select_combine_strategies_in_graph(
         .collect();
 
     for (idx, name, span) in combine_nodes {
-        let inputs = match tables.combine_inputs.get(&name) {
-            Some(i) => i,
-            None => continue,
-        };
-        let decomposed = match tables.combine_predicates.get(&name) {
-            Some(d) => d,
-            None => continue,
+        // Read the combine's inputs + decomposed predicate off the node
+        // (stamped at lowering / N-ary decomposition), cloning them out so the
+        // borrow is released before this pass mutates the node's strategy
+        // fields below. Both are present together for a successfully bound
+        // combine; a node missing either is skipped exactly as the absent
+        // map entries were.
+        let (inputs, decomposed) = match &graph[idx] {
+            PlanNode::Combine {
+                combine_inputs: Some(i),
+                decomposed_predicate: Some(d),
+                ..
+            } => (i.clone(), d.clone()),
+            _ => continue,
         };
 
         // Pre-classify the predicate shape. Three branches:
@@ -848,9 +841,12 @@ pub(crate) fn select_combine_strategies_in_graph(
             diags.push(combine_w302_small_both(&name, span));
         }
 
-        let driving = match tables.combine_driving.get(&name) {
-            Some(d) => d.clone(),
-            None => continue,
+        let driving = match &graph[idx] {
+            PlanNode::Combine {
+                combine_driving: Some(d),
+                ..
+            } => d.clone(),
+            _ => continue,
         };
 
         // All non-driver input qualifiers, in declaration (IndexMap)
@@ -864,7 +860,7 @@ pub(crate) fn select_combine_strategies_in_graph(
 
         let chosen_strategy: CombineStrategy = if has_equi && has_range {
             CombineStrategy::HashPartitionIEJoin {
-                partition_bits: compute_partition_bits(inputs, tables.statistics),
+                partition_bits: compute_partition_bits(&inputs, tables.statistics),
             }
         } else if !has_equi && has_range {
             // Pure-range predicate. SortMerge is preferred when both
@@ -888,7 +884,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             } else {
                 CombineStrategy::IEJoin
             }
-        } else if grace_hash_should_fire(inputs, tables.statistics, mem_limit_str)
+        } else if grace_hash_should_fire(&inputs, tables.statistics, mem_limit_str)
             || matches!(
                 tables.combine_strategy_hints.get(&name),
                 Some(crate::config::CombineStrategyHint::GraceHash)
@@ -904,7 +900,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             // its `MIN_BITS` floor — the executor still partitions the
             // build correctly, it just splits into fewer buckets.
             CombineStrategy::GraceHash {
-                partition_bits: compute_grace_partition_bits(inputs, tables.statistics),
+                partition_bits: compute_grace_partition_bits(&inputs, tables.statistics),
             }
         } else {
             CombineStrategy::HashBuildProbe
@@ -1725,12 +1721,16 @@ pub(crate) fn decompose_nary_combines(
         .graph
         .node_indices()
         .filter_map(|idx| match &plan.graph[idx] {
-            PlanNode::Combine { name, span, .. } => {
-                let count = artifacts
-                    .combine_inputs
-                    .get(name)
-                    .map(IndexMap::len)
-                    .unwrap_or(0);
+            PlanNode::Combine {
+                name,
+                span,
+                combine_inputs,
+                ..
+            } => {
+                // Input count comes off the node (stamped at lowering) — the
+                // same source the rewrite below reads, so the snapshot and the
+                // decomposition agree without a bare-name map lookup.
+                let count = combine_inputs.as_ref().map(IndexMap::len).unwrap_or(0);
                 if count > 2 {
                     Some((idx, name.clone(), *span))
                 } else {
@@ -1742,9 +1742,16 @@ pub(crate) fn decompose_nary_combines(
         .collect();
 
     for (original_idx, original_name, span) in nary {
-        let inputs = match artifacts.combine_inputs.get(&original_name) {
-            Some(i) => i.clone(),
-            None => continue,
+        // Read the original N-ary combine's runtime state off the node
+        // (stamped at lowering). Each binary step the decomposition produces
+        // carries its own slice on its own node below, so same-named combines
+        // in sibling composition bodies never collide through a shared map.
+        let inputs = match &plan.graph[original_idx] {
+            PlanNode::Combine {
+                combine_inputs: Some(i),
+                ..
+            } => i.clone(),
+            _ => continue,
         };
         if inputs.len() > MAX_COMBINE_INPUTS {
             diags.push(combine_e300_too_many_inputs(
@@ -1754,18 +1761,24 @@ pub(crate) fn decompose_nary_combines(
             ));
             continue;
         }
-        let predicate = match artifacts.combine_predicates.get(&original_name) {
-            Some(p) => p.clone(),
-            None => continue,
+        let predicate = match &plan.graph[original_idx] {
+            PlanNode::Combine {
+                decomposed_predicate: Some(p),
+                ..
+            } => p.clone(),
+            _ => continue,
         };
         if let Err(d) = validate_join_graph_connectivity(&inputs, &predicate, &original_name, span)
         {
             diags.push(*d);
             continue;
         }
-        let driving = match artifacts.combine_driving.get(&original_name) {
-            Some(d) => d.clone(),
-            None => continue,
+        let driving = match &plan.graph[original_idx] {
+            PlanNode::Combine {
+                combine_driving: Some(d),
+                ..
+            } => d.clone(),
+            _ => continue,
         };
 
         // Reconstruct the merged row from the per-input rows. This is
@@ -1970,6 +1983,12 @@ pub(crate) fn decompose_nary_combines(
                         // step. The executor reads `None` and emits the
                         // matched record directly, no body evaluation.
                         typed: None,
+                        // The per-step runtime state (inputs / predicate /
+                        // driving) is stamped onto the node in the loop below,
+                        // once the per-step input maps are materialized.
+                        combine_inputs: None,
+                        decomposed_predicate: None,
+                        combine_driving: None,
                     }),
                 )
             };
@@ -2079,7 +2098,8 @@ pub(crate) fn decompose_nary_combines(
             }
         }
 
-        // Populate CompileArtifacts for each step.
+        // Stamp each step's runtime state onto its own node, and keep the
+        // resolved-column side-table entry the lowering path expects.
         for (i, step) in steps.iter().enumerate() {
             // Per-step inputs map: driver row + build row. The driver
             // entry for step ≥ 1 carries the previous step's
@@ -2122,15 +2142,21 @@ pub(crate) fn decompose_nary_combines(
                 },
             );
 
-            artifacts
-                .combine_inputs
-                .insert(step.name.clone(), step_inputs);
-            artifacts
-                .combine_predicates
-                .insert(step.name.clone(), step.predicate_slice.clone());
-            artifacts
-                .combine_driving
-                .insert(step.name.clone(), step.driving_input.clone());
+            // Stamp the per-step runtime state onto the step's node (created
+            // above; the final step reuses the original combine's index) so
+            // strategy selection and the executor read it by node instance,
+            // not via a bare-name lookup that collides across sibling scopes.
+            if let PlanNode::Combine {
+                combine_inputs: step_node_inputs,
+                decomposed_predicate: step_node_predicate,
+                combine_driving: step_node_driving,
+                ..
+            } = &mut plan.graph[step_indices[i]]
+            {
+                *step_node_inputs = Some(step_inputs);
+                *step_node_predicate = Some(step.predicate_slice.clone());
+                *step_node_driving = Some(step.driving_input.clone());
+            }
             artifacts
                 .combine_resolved_columns
                 .insert(step.name.clone(), Arc::new(step_resolved_maps[i].clone()));
@@ -2433,6 +2459,10 @@ mod tests {
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
+            // Mirror lowering: the strategy pass reads these off the node.
+            combine_inputs: artifacts.combine_inputs.get(combine_name).cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get(combine_name).cloned(),
+            combine_driving: artifacts.combine_driving.get(combine_name).cloned(),
         });
         let plan = ExecutionPlanDag {
             graph,
@@ -2615,6 +2645,9 @@ mod tests {
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
+            combine_inputs: None,
+            decomposed_predicate: None,
+            combine_driving: None,
         };
         assert_eq!(node.name(), "test_combine");
         assert_eq!(node.type_tag(), "combine");
@@ -2754,6 +2787,10 @@ mod tests {
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
+            // Mirror lowering: N-ary decomposition reads these off the node.
+            combine_inputs: artifacts.combine_inputs.get(combine_name).cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get(combine_name).cloned(),
+            combine_driving: artifacts.combine_driving.get(combine_name).cloned(),
         });
 
         let plan = ExecutionPlanDag {
@@ -2869,12 +2906,20 @@ mod tests {
         let mut diags = Vec::new();
         decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
         // Step 0 joined `a` with the smallest connected partner — `d`.
-        // The synthetic step name carries its build qualifier in
-        // `combine_inputs[step.name]`, so we look that up here.
-        let step0 = artifacts
-            .combine_inputs
-            .get("__combine_c_step_0")
-            .expect("step 0 inserted into combine_inputs");
+        // The synthetic step carries its build qualifier in its own node's
+        // `combine_inputs`, so we look that up here.
+        let step0 = plan
+            .graph
+            .node_weights()
+            .find_map(|n| match n {
+                crate::plan::execution::PlanNode::Combine {
+                    name,
+                    combine_inputs: Some(ci),
+                    ..
+                } if name == "__combine_c_step_0" => Some(ci),
+                _ => None,
+            })
+            .expect("step 0 node carries combine_inputs");
         assert!(
             step0.contains_key("d"),
             "greedy ordering picks d (smallest cardinality, connected via a—d shortcut); \

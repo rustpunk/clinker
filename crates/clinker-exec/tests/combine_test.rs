@@ -4634,6 +4634,10 @@ nodes:
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
+            // Strategy selection reads these off the node; mirror lowering.
+            combine_inputs: artifacts.combine_inputs.get("test_combine").cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get("test_combine").cloned(),
+            combine_driving: artifacts.combine_driving.get("test_combine").cloned(),
         });
 
         let mut plan = ExecutionPlanDag::from_parts(

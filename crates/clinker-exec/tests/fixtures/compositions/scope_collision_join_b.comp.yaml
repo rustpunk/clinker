@@ -1,0 +1,36 @@
+# Sibling composition B for the runtime-combine scope-collision test.
+# Its combine is also named `shared_join` but joins on `products.alt_id`
+# instead of `products.product_id`. With a bare-name combine-predicate
+# table, binding this body second overwrote the entry for `shared_join`,
+# so BOTH bodies' combines executed this `alt_id` predicate at runtime.
+# Reading the predicate off each node makes the two scope-correct.
+_compose:
+  name: scope_collision_join_b
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: alt_id, type: string }
+        - { name: name, type: string }
+  outputs:
+    enriched: shared_join
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: shared_join
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.alt_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+      propagate_ck: driver

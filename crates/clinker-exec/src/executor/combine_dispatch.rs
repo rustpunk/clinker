@@ -61,6 +61,13 @@ pub(crate) fn dispatch_combine(
         // with a body has `Some`; body-less steps (`match: collect`,
         // synthetic non-final N-ary steps) have `None`.
         typed: ref body_typed_on_node,
+        // Per-input metadata and the decomposed `where:` predicate, carried
+        // on the node for the same reason as `typed`: a bare-name lookup into
+        // `ctx.artifacts` is last-writer-wins across same-named combines in
+        // sibling composition bodies, so reading them off this node instance
+        // is what makes the runtime join scope-correct.
+        combine_inputs: ref combine_inputs_on_node,
+        decomposed_predicate: ref predicate_on_node,
         ..
     } = *node
     else {
@@ -113,23 +120,20 @@ pub(crate) fn dispatch_combine(
     let combine_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
 
     let combine_inputs =
-        ctx.artifacts
-            .combine_inputs
-            .get(name)
+        combine_inputs_on_node
+            .as_ref()
             .ok_or_else(|| PipelineError::Internal {
                 op: "combine",
                 node: name.clone(),
                 detail: "no combine_inputs entry for combine node".to_string(),
             })?;
-    let decomposed =
-        ctx.artifacts
-            .combine_predicates
-            .get(name)
-            .ok_or_else(|| PipelineError::Internal {
-                op: "combine",
-                node: name.clone(),
-                detail: "no combine_predicates entry for combine node".to_string(),
-            })?;
+    let decomposed = predicate_on_node
+        .as_ref()
+        .ok_or_else(|| PipelineError::Internal {
+            op: "combine",
+            node: name.clone(),
+            detail: "no combine_predicates entry for combine node".to_string(),
+        })?;
 
     // E312 confines the executor to binary combines.
     // An escaped N>2 combine reaches the executor only
