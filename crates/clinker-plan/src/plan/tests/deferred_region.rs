@@ -26,7 +26,7 @@ fn compile_full(yaml: &str) -> CompiledPlan {
     config.compile(&CompileContext::default()).expect("compile")
 }
 
-fn compile_with_dir_full(yaml: &str, workspace_root: &std::path::Path) -> CompiledPlan {
+pub(super) fn compile_with_dir_full(yaml: &str, workspace_root: &std::path::Path) -> CompiledPlan {
     let config: PipelineConfig = parse_config(yaml).expect("parse");
     let ctx = CompileContext::with_pipeline_dir(workspace_root, PathBuf::from("pipelines"));
     config.compile(&ctx).expect("compile")

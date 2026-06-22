@@ -105,6 +105,25 @@ pub struct BoundBody {
     /// pick up the right `emitted_fields` set.
     pub route_bodies: HashMap<String, crate::config::pipeline_node::RouteBody>,
 
+    /// Body-scoped index of the typed `cxl:` body program for each
+    /// body `Combine` node, keyed by body-local node name. `Arc`-shared
+    /// with `CompileArtifacts.typed` (compile-time metadata, not a
+    /// copy); empty for bodies with no `Combine`. Mirrors the
+    /// top-level `CompileArtifacts.typed` so body-`Combine` lineage
+    /// reaches the same fidelity as body `Transform`/`Aggregation`.
+    pub(crate) body_combine_typed: HashMap<String, std::sync::Arc<cxl::typecheck::TypedProgram>>,
+
+    /// Body-scoped index of the typed `where:` predicate program for
+    /// each body `Combine` node, keyed by body-local node name.
+    /// `Arc`-shared with `CompileArtifacts.combine_where_typed`
+    /// (compile-time metadata, not a copy); empty for bodies with no
+    /// `Combine`. Mirrors the top-level
+    /// `CompileArtifacts.combine_where_typed` so a body combine's
+    /// join-key predicate columns are reachable with the same fidelity
+    /// as its body program.
+    pub(crate) body_combine_where_typed:
+        HashMap<String, std::sync::Arc<cxl::typecheck::TypedProgram>>,
+
     /// Output row types at the body's declared output ports, keyed
     /// by port name. These are what the parent scope sees as the
     /// composition node's output row(s).
@@ -192,6 +211,8 @@ impl BoundBody {
             body_rows: HashMap::new(),
             node_input_refs: HashMap::new(),
             route_bodies: HashMap::new(),
+            body_combine_typed: HashMap::new(),
+            body_combine_where_typed: HashMap::new(),
             output_port_rows: IndexMap::new(),
             output_port_to_node_idx: IndexMap::new(),
             input_port_rows: IndexMap::new(),
@@ -201,6 +222,27 @@ impl BoundBody {
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),
         }
+    }
+
+    /// Typed `cxl:` body program for the named body `Combine` node, or
+    /// `None` if the id is absent / not a Combine. Body-scoped analogue
+    /// of `CompileArtifacts.typed`. Returns the full `TypedProgram` (AST
+    /// plus resolved types and `output_row`) so downstream lineage can
+    /// trace a body combine's computed columns at the same fidelity as
+    /// body `Transform`/`Aggregation` nodes.
+    pub fn combine_typed(&self, node_id: &str) -> Option<&cxl::typecheck::TypedProgram> {
+        self.body_combine_typed.get(node_id).map(std::sync::Arc::as_ref)
+    }
+
+    /// Typed `where:` predicate program for the named body `Combine`
+    /// node, or `None`. Body-scoped analogue of
+    /// `CompileArtifacts.combine_where_typed`. Returns the full
+    /// `TypedProgram` so the join-key predicate columns are reachable
+    /// with the same fidelity as the body program.
+    pub fn combine_where_typed(&self, node_id: &str) -> Option<&cxl::typecheck::TypedProgram> {
+        self.body_combine_where_typed
+            .get(node_id)
+            .map(std::sync::Arc::as_ref)
     }
 }
 

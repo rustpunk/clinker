@@ -1,3 +1,4 @@
+mod body_combine_typed;
 mod ck_aligned_partition;
 mod ck_lattice;
 mod cull_validation;

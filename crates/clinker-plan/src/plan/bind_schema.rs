@@ -2450,6 +2450,20 @@ fn bind_composition(
         body_name_to_idx.insert(port_name.clone(), idx);
     }
 
+    // Body-scoped snapshot of the typed body/where programs for each
+    // body `Combine`, captured here from `artifacts.typed` /
+    // `artifacts.combine_where_typed` (which `bind_combine` already
+    // populated, keyed by bare node name). These maps are stable after
+    // bind for body combines — `decompose_nary_combines` runs only on
+    // the top-level DAG and the body strategy pass mutates `graph`, not
+    // the typed maps — so a body-scoped snapshot never goes stale.
+    let mut body_combine_typed: HashMap<String, std::sync::Arc<cxl::typecheck::TypedProgram>> =
+        HashMap::new();
+    let mut body_combine_where_typed: HashMap<
+        String,
+        std::sync::Arc<cxl::typecheck::TypedProgram>,
+    > = HashMap::new();
+
     for spanned in &body_file.nodes {
         let saphyr_line = spanned.referenced.line();
         let body_span = if saphyr_line > 0 {
@@ -2469,6 +2483,18 @@ fn bind_composition(
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
             n, &n_name, body_span, artifacts, &lower_ctx, diags,
         ) {
+            // Capture the typed body/where artifacts for body Combines
+            // before `n_name` is moved into `body_name_to_idx`. Sharing
+            // the `Arc`s (not copying) keeps these at parity with the
+            // top-level `CompileArtifacts.typed`/`combine_where_typed`.
+            if matches!(&plan_node, crate::plan::execution::PlanNode::Combine { .. }) {
+                if let Some(tp) = artifacts.typed.get(&n_name) {
+                    body_combine_typed.insert(n_name.clone(), std::sync::Arc::clone(tp));
+                }
+                if let Some(tp) = artifacts.combine_where_typed.get(&n_name) {
+                    body_combine_where_typed.insert(n_name.clone(), std::sync::Arc::clone(tp));
+                }
+            }
             let idx = body_graph.add_node(plan_node);
             body_name_to_idx.insert(n_name, idx);
         }
@@ -2728,6 +2754,8 @@ fn bind_composition(
     bound_body.body_rows = body_rows;
     bound_body.node_input_refs = node_input_refs;
     bound_body.route_bodies = route_bodies;
+    bound_body.body_combine_typed = body_combine_typed;
+    bound_body.body_combine_where_typed = body_combine_where_typed;
     bound_body.output_port_rows = output_port_rows.clone();
     bound_body.output_port_to_node_idx = output_port_to_node_idx;
     bound_body.input_port_rows = input_port_rows;
