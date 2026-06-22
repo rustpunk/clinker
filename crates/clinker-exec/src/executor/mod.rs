@@ -602,6 +602,27 @@ impl PipelineExecutor {
                             }
                         });
                     }
+                    // A decomposed N-ary combine's `cxl:` body lives only on its
+                    // `PlanNode::Combine.typed` — decomposition does not re-home
+                    // it into `artifacts.typed` — so collect those emits off the
+                    // node too, or a Route downstream of such a combine cannot
+                    // resolve the fields it emits.
+                    for node in validated_plan.dag().graph.node_weights() {
+                        if let clinker_plan::plan::execution::PlanNode::Combine {
+                            typed: Some(typed),
+                            ..
+                        } = node
+                        {
+                            cxl::ast::for_each_field_emit(
+                                &typed.program.statements,
+                                &mut |name, _| {
+                                    if !emitted_fields.iter().any(|s| s == name) {
+                                        emitted_fields.push(name.to_string());
+                                    }
+                                },
+                            );
+                        }
+                    }
                     Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
                 }
                 None => None,

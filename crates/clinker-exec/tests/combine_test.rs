@@ -1109,6 +1109,138 @@ mod tests {
         );
     }
 
+    /// Regression: a route placed directly downstream of an N-ary
+    /// (3+ input) combine must resolve a field that the combine's
+    /// `cxl:` body emits but that exists on none of the inputs.
+    ///
+    /// A 3-input combine is decomposed at plan time into a left-deep
+    /// chain of binary combines. The body program — the one carrying
+    /// the user's `emit combined = a.x + c.z` — is re-homed onto the
+    /// final chain step's `PlanNode::Combine.typed`, and is NOT mirrored
+    /// into `artifacts.typed` under the original combine name. The route
+    /// resolver seeds its known-field set from sources, transforms, and
+    /// the `artifacts.typed` entries; without also walking the combine
+    /// nodes' `typed` programs it never sees `combined`, and executor
+    /// construction fails in `compile_route` with
+    /// `unresolved identifier 'combined'`.
+    ///
+    /// Running the fixture through `run_combine_fixture` builds and runs
+    /// the `PipelineExecutor`, which compiles the route during executor
+    /// construction — so a successful run proves `compile_route`
+    /// resolved the emitted field. The per-branch record split is
+    /// asserted too: rows whose `combined` is positive land on the
+    /// `positive` output, the rest on the `nonpositive` default.
+    #[test]
+    fn test_nary_combine_body_emit_resolves_in_downstream_route() {
+        let yaml = r#"
+pipeline:
+  name: nary_combine_route
+nodes:
+  - type: source
+    name: a_src
+    config:
+      name: a_src
+      type: csv
+      path: a.csv
+      schema:
+        - { name: k, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: b_src
+    config:
+      name: b_src
+      type: csv
+      path: b.csv
+      schema:
+        - { name: k, type: string }
+        - { name: y, type: int }
+  - type: source
+    name: c_src
+    config:
+      name: c_src
+      type: csv
+      path: c.csv
+      schema:
+        - { name: k, type: string }
+        - { name: z, type: int }
+  - type: combine
+    name: fused
+    input:
+      a: a_src
+      b: b_src
+      c: c_src
+    config:
+      where: "a.k == b.k and b.k == c.k"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit k = a.k
+        emit combined = a.x + c.z
+      propagate_ck: driver
+  - type: route
+    name: split
+    input: fused
+    config:
+      mode: exclusive
+      conditions:
+        positive: "combined > 0"
+      default: nonpositive
+  - type: output
+    name: positive_out
+    input: split.positive
+    config:
+      name: positive_out
+      type: csv
+      path: positive.csv
+  - type: output
+    name: nonpositive_out
+    input: split.nonpositive
+    config:
+      name: nonpositive_out
+      type: csv
+      path: nonpositive.csv
+"#;
+        // Row k2 has a.x + c.z == 0 (default branch); k1 and k3 are positive.
+        let a_csv = "k,x\nk1,3\nk2,-5\nk3,10\n";
+        let b_csv = "k,y\nk1,1\nk2,2\nk3,3\n";
+        let c_csv = "k,z\nk1,4\nk2,5\nk3,1\n";
+
+        let result = run_combine_fixture(
+            yaml,
+            &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
+            Some("a_src"),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "executor startup/run must succeed — the route must resolve the \
+                 combine's `combined` emit during compile_route; got: {e}"
+            )
+        });
+
+        // combined values: k1 = 3+4 = 7, k2 = -5+5 = 0, k3 = 10+1 = 11.
+        let positive = canonicalize_csv(
+            result
+                .output("positive_out")
+                .expect("positive_out buffer must be registered"),
+        );
+        let nonpositive = canonicalize_csv(
+            result
+                .output("nonpositive_out")
+                .expect("nonpositive_out buffer must be registered"),
+        );
+
+        assert_eq!(
+            positive,
+            canonicalize_csv("k,combined\nk1,7\nk3,11\n"),
+            "rows with combined > 0 must route to the positive branch; got:\n{positive}"
+        );
+        assert_eq!(
+            nonpositive,
+            canonicalize_csv("k,combined\nk2,0\n"),
+            "the combined == 0 row must fall through to the default branch; got:\n{nonpositive}"
+        );
+    }
+
     /// Pure-range combine compiles successfully under the IEJoin
     /// planner: the `select_combine_strategies` post-pass emits
     /// W305 (advisory: no equality conjuncts) and selects the
