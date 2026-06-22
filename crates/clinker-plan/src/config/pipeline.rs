@@ -777,9 +777,10 @@ impl PipelineConfig {
         let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = entries
             .iter()
             .filter_map(|e| {
+                // `entries` is the top-level analytic node list; analysis is
+                // top-level-only, so resolve each program by its TopLevel key.
                 artifacts
-                    .typed
-                    .get(&e.name)
+                    .typed_get(crate::plan::bind_schema::NodeScope::TopLevel, &e.name)
                     .map(|tp| (e.name.as_str(), tp.as_ref()))
             })
             .collect();
@@ -800,7 +801,13 @@ impl PipelineConfig {
         let doc_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = artifacts
             .typed
             .iter()
-            .map(|(name, tp)| (name.as_str(), tp.as_ref()))
+            // The `typed` table is keyed by `ScopedNodeId`; the downstream
+            // source attribution keys by the bare node name, so project the
+            // scoped key to its `name`. A node named the same in two scopes now
+            // contributes BOTH programs (the scope key no longer overwrites one
+            // with the other), which is strictly more correct for `$doc`
+            // detection.
+            .map(|(scoped, tp)| (scoped.name.as_str(), tp.as_ref()))
             // A Combine's node-keyed `typed` entry holds only its `cxl:`
             // body; its `where:` predicate program lives in a separate
             // side-table, so include those too — a `$doc` access used only
@@ -1186,8 +1193,15 @@ impl PipelineConfig {
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 primary_source: primary_source.as_str(),
             };
-            let plan_node =
-                lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
+            let plan_node = lower_node_to_plan_node(
+                node,
+                &name,
+                crate::plan::bind_schema::NodeScope::TopLevel,
+                span,
+                &artifacts,
+                &lowering_ctx,
+                &mut diags,
+            );
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1483,16 +1497,21 @@ impl PipelineConfig {
                         // E150e — windows over Combine emit columns
                         // cannot reference an array-typed field. The
                         // typed `output_row` lives in `artifacts.typed`
-                        // keyed by the combine's name and carries the
-                        // CXL `Type` per emitted column; a
+                        // keyed by the combine's scope-qualified id and
+                        // carries the CXL `Type` per emitted column; a
                         // `match: collect` body emits `Type::Array` for
                         // every collected build-row column. Window
                         // builtins (sum/avg/min/max/lag/lead/...) do
                         // not handle `Value::Array`, so they would
-                        // silently see Null at runtime.
+                        // silently see Null at runtime. This pass walks
+                        // the top-level analysis report, so the combine
+                        // is resolved by its TopLevel key.
                         if let crate::plan::execution::PlanNode::Combine { .. } = other {
                             let combine_name = other.name();
-                            if let Some(typed) = artifacts.typed.get(combine_name) {
+                            if let Some(typed) = artifacts.typed_get(
+                                crate::plan::bind_schema::NodeScope::TopLevel,
+                                combine_name,
+                            ) {
                                 for f in &report.transforms[i].accessed_fields {
                                     let is_array = typed
                                         .output_row
@@ -3267,6 +3286,7 @@ pub(crate) struct LoweringCtx<'a> {
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
     name: &str,
+    scope: crate::plan::bind_schema::NodeScope,
     span: clinker_core_types::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     ctx: &LoweringCtx<'_>,
@@ -3304,7 +3324,7 @@ pub(crate) fn lower_node_to_plan_node(
     // own `Arc<Schema>` recovers the same metadata here. The reserved
     // `$` prefix guarantees no user-declared column collides.
     let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
-        match artifacts.typed.get(node_name) {
+        match artifacts.typed_get(scope, node_name) {
             Some(tp) => {
                 let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
                 for (qf, _) in tp.output_row.fields() {
@@ -3359,7 +3379,7 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
             // (E108, E200, etc.) on this node — skip lowering.
-            let typed = match artifacts.typed.get(name) {
+            let typed = match artifacts.typed_get(scope, name) {
                 Some(t) => t.clone(),
                 None => return None,
             };
@@ -3501,7 +3521,7 @@ pub(crate) fn lower_node_to_plan_node(
             config: agg_body, ..
         } => {
             // Skip if bind_schema produced no typed program (CXL error).
-            let typed = match artifacts.typed.get(name) {
+            let typed = match artifacts.typed_get(scope, name) {
                 Some(t) => t.clone(),
                 None => return None,
             };
@@ -3599,23 +3619,22 @@ pub(crate) fn lower_node_to_plan_node(
                 .cloned()
                 .unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
             // Carry the typed `cxl:` body program on the node, mirroring the
-            // Transform arm's `artifacts.typed.get(name)` read into
-            // `PlanTransformPayload.typed`. Body and top-level combines both
-            // flow through this arm; the bare-name lookup into the
-            // `artifacts.typed` body-program table is collision-exposed exactly
-            // like the Transform arm's — cross-scope node-name reuse is
-            // last-writer-wins in that bare-keyed table. `None` is legitimate
-            // here — a body-less combine (e.g. `match: collect`) carries no
-            // program.
-            let typed = artifacts.typed.get(name).cloned();
+            // Transform arm's read into `PlanTransformPayload.typed`. Body and
+            // top-level combines both flow through this arm; the `typed` table
+            // is keyed by `ScopedNodeId`, so the read resolves this node
+            // instance's own program even when a top-level and a body combine
+            // share a name. `None` is legitimate here — a body-less combine
+            // (e.g. `match: collect`) carries no program.
+            let typed = artifacts.typed_get(scope, name).cloned();
             // Carry the per-input metadata, decomposed `where:` predicate, and
             // bind-time driving qualifier on the node so combine strategy
             // selection and the executor read them by node instance instead of
             // a bare-name lookup into `CompileArtifacts` (last-writer-wins
             // across same-named combines in sibling composition bodies). Like
-            // `typed` / `resolved_column_map`, the read here is transiently
-            // scope-correct because each body is bound then lowered before the
-            // next body overwrites the shared map entry.
+            // `resolved_column_map`, these maps are still bare-name keyed, so
+            // the read here is transiently scope-correct because each body is
+            // bound then lowered before the next body overwrites the shared map
+            // entry.
             let combine_inputs = artifacts.combine_inputs.get(name).cloned();
             let decomposed_predicate = artifacts.combine_predicates.get(name).cloned();
             let combine_driving = artifacts.combine_driving.get(name).cloned();
@@ -3647,7 +3666,7 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Reshape { config, .. } => {
             // A missing typed entry means bind_schema rejected the node
             // (E200 on a rule predicate / assignment) — skip lowering.
-            artifacts.typed.get(name)?;
+            artifacts.typed_get(scope, name)?;
             Some(crate::plan::execution::PlanNode::Reshape {
                 name: name.to_string(),
                 span,
@@ -3663,7 +3682,7 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Cull { config, .. } => {
             // A missing typed entry means bind_schema rejected the node
             // (E200 on a rule predicate / removed_to) — skip lowering.
-            artifacts.typed.get(name)?;
+            artifacts.typed_get(scope, name)?;
             Some(crate::plan::execution::PlanNode::Cull {
                 name: name.to_string(),
                 span,
@@ -3679,7 +3698,7 @@ pub(crate) fn lower_node_to_plan_node(
         // `resolve_envelope_header_upstreams` post-pass fills it. A missing
         // typed entry means bind_schema could not resolve the body input — skip.
         PipelineNode::Envelope { header, config } => {
-            artifacts.typed.get(name)?;
+            artifacts.typed_get(scope, name)?;
             let header_input = header
                 .header
                 .as_ref()

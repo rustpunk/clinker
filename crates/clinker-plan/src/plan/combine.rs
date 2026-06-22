@@ -2180,9 +2180,13 @@ pub(crate) fn decompose_nary_combines(
         // Drop the original combine's artifacts — its name is gone from
         // the graph (the index now hosts the final step under a
         // synthetic name). The body program already migrated onto the
-        // final step node above, so its flat `typed` entry is dropped
-        // here too rather than re-homed under the synthetic name.
-        artifacts.typed.remove(&original_name);
+        // final step node above, so its `typed` entry is dropped here too
+        // rather than re-homed under the synthetic name. This pass runs
+        // over the top-level DAG, so the `typed` key is TopLevel-scoped.
+        artifacts.typed_remove(
+            crate::plan::bind_schema::NodeScope::TopLevel,
+            &original_name,
+        );
         artifacts.combine_inputs.remove(&original_name);
         artifacts.combine_predicates.remove(&original_name);
         artifacts.combine_driving.remove(&original_name);
