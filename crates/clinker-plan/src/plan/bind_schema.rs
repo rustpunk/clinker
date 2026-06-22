@@ -53,29 +53,51 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 /// so log-grep on either code finds exactly one emission site.
 pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 
+/// Scope a plan node lives in. Top-level pipeline, or a specific composition body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeScope {
+    TopLevel,
+    Body(crate::plan::composition_body::CompositionBodyId),
+}
+
+/// Scope-qualified node identity. Two composition bodies (or top-level + a body)
+/// can hold same-named nodes; this pair disambiguates them where a bare node
+/// name would collide. Mirrors dbt's `<package>.<name>` and Beam's hierarchical
+/// node name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScopedNodeId {
+    pub scope: NodeScope,
+    pub name: String,
+}
+
 /// Compile artifacts produced by `bind_schema` — one entry per node name
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
     pub typed: HashMap<String, Arc<TypedProgram>>,
-    /// Per-Combine `where:` predicate typed programs, keyed by combine
-    /// node name. The node-keyed `typed` map stores only a Combine's
-    /// `cxl:` body; the `where:` predicate is decomposed into
-    /// `combine_predicates` and otherwise discarded as a standalone
+    /// Per-Combine `where:` predicate typed programs, keyed by the
+    /// combine node's [`ScopedNodeId`]. The node-keyed `typed` map stores
+    /// only a Combine's `cxl:` body; the `where:` predicate is decomposed
+    /// into `combine_predicates` and otherwise discarded as a standalone
     /// program. This side-table retains it so a `$doc` access used ONLY
     /// in a predicate (e.g. `l.amount > $doc.Head.cutoff`) is still
-    /// reachable by the compile-time `$doc` path walk.
-    pub combine_where_typed: HashMap<String, Arc<TypedProgram>>,
-    /// Per-Route branch-condition typed programs, keyed by Route node
-    /// name — one program per branch, in declaration order. A Route's
-    /// node-keyed `typed` entry is an empty body (the node carries no
-    /// `cxl:` projection); the branch conditions are otherwise compiled
-    /// straight to runtime evaluators and never land in `typed`. This
-    /// side-table retains them so a `$doc` access used ONLY in a route
-    /// condition (e.g. `amount > $doc.Head.cutoff`) is still reachable by
-    /// the compile-time `$doc` path walk and attributed to the Route's
-    /// source(s).
-    pub route_branch_typed: HashMap<String, Vec<Arc<TypedProgram>>>,
+    /// reachable by the compile-time `$doc` path walk. Compile-time-only:
+    /// the runtime executor never reads it. The scope qualifier keeps a
+    /// combine named the same in two composition scopes from colliding;
+    /// klinx reads the `where` program back by `(scope, name)`.
+    pub combine_where_typed: HashMap<ScopedNodeId, Arc<TypedProgram>>,
+    /// Per-Route branch-condition typed programs, keyed by the Route
+    /// node's [`ScopedNodeId`] — one program per branch, in declaration
+    /// order. A Route's node-keyed `typed` entry is an empty body (the
+    /// node carries no `cxl:` projection); the branch conditions are
+    /// otherwise compiled straight to runtime evaluators and never land
+    /// in `typed`. This side-table retains them so a `$doc` access used
+    /// ONLY in a route condition (e.g. `amount > $doc.Head.cutoff`) is
+    /// still reachable by the compile-time `$doc` path walk and attributed
+    /// to the Route's source(s). Compile-time-only: the runtime executor
+    /// never reads it. The scope qualifier keeps a route named the same in
+    /// two composition scopes from colliding.
+    pub route_branch_typed: HashMap<ScopedNodeId, Vec<Arc<TypedProgram>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -200,6 +222,13 @@ pub(crate) struct BindContext<'a> {
     /// call site. Empty for compositions that don't propagate scoped vars
     ///.
     pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
+    /// Scope the nodes currently being bound live in. `TopLevel` at the
+    /// pipeline root; `bind_composition` saves and restores it around the
+    /// body recursion, setting it to `Body(body_id)` for the duration.
+    /// The scope-keyed compile-time side-tables (`combine_where_typed`,
+    /// `route_branch_typed`) stamp their producer keys from this so a
+    /// node named the same across two scopes does not collide.
+    pub current_scope: NodeScope,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -237,6 +266,7 @@ pub fn bind_schema(
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
         scoped_vars,
+        current_scope: NodeScope::TopLevel,
     };
     bind_schema_inner(
         nodes,
@@ -1944,9 +1974,13 @@ fn bind_schema_inner(
                         })
                         .collect();
                     if !branch_programs.is_empty() {
-                        artifacts
-                            .route_branch_typed
-                            .insert(name.clone(), branch_programs);
+                        artifacts.route_branch_typed.insert(
+                            ScopedNodeId {
+                                scope: bind_ctx.current_scope,
+                                name: name.clone(),
+                            },
+                            branch_programs,
+                        );
                     }
                     schema_by_name.insert(name, cloned);
                 }
@@ -2113,6 +2147,7 @@ fn bind_schema_inner(
                         config,
                         span,
                         scoped_vars: &bind_ctx.scoped_vars,
+                        scope: bind_ctx.current_scope,
                     },
                     diags,
                     artifacts,
@@ -2332,6 +2367,9 @@ fn bind_composition(
 
     bind_ctx.use_path_stack.push(resolved_path.clone());
     bind_ctx.depth += 1;
+    // Bind this body's nodes under its own scope so the scope-keyed
+    // compile-time side-tables disambiguate same-named nodes across bodies.
+    let saved_scope = std::mem::replace(&mut bind_ctx.current_scope, NodeScope::Body(body_id));
 
     // Seed body_schema_by_name with input port rows.
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -2351,6 +2389,7 @@ fn bind_composition(
     // Restore parent state.
     bind_ctx.depth -= 1;
     bind_ctx.use_path_stack.pop();
+    bind_ctx.current_scope = saved_scope;
     bind_ctx.enclosing_scope_names = saved_enclosing;
     bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
@@ -3919,6 +3958,10 @@ struct CombineNodeBinding<'a> {
     config: &'a CombineBody,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+    /// Scope this combine is bound in, copied from `BindContext.current_scope`
+    /// at the call site. Stamps the `combine_where_typed` side-table key so a
+    /// combine named the same in two composition scopes does not collide.
+    scope: NodeScope,
 }
 
 /// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
@@ -3957,6 +4000,7 @@ fn bind_combine(
         config,
         span,
         scoped_vars,
+        scope,
     } = node;
     // E300: combine requires at least 2 inputs.
     if header.input.len() < 2 {
@@ -4055,9 +4099,13 @@ fn bind_combine(
         }
     };
 
-    artifacts
-        .combine_where_typed
-        .insert(name.to_string(), Arc::clone(&typed_where));
+    artifacts.combine_where_typed.insert(
+        ScopedNodeId {
+            scope,
+            name: name.to_string(),
+        },
+        Arc::clone(&typed_where),
+    );
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
     let e304_before = diags.iter().filter(|d| d.code == "E304").count();
