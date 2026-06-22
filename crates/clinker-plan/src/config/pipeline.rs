@@ -2516,8 +2516,16 @@ fn stream_cardinality<'a>(
             use crate::config::pipeline_node::EnvelopeStrategy;
             match config.strategy {
                 EnvelopeStrategy::Concat => Cardinality::Single,
-                // `preserve` keeps per-document grains — pass-through, not a collapser.
-                EnvelopeStrategy::Preserve => join_input_cardinality(by_name, node, visited),
+                // `preserve` keeps per-document grains, so the output document
+                // cardinality follows the BODY only — `direct_input_names`
+                // returns the body first, then the optional header/trailer
+                // framing ports, which carry framing records, not body
+                // documents, and must not inflate the body's cardinality.
+                EnvelopeStrategy::Preserve => node
+                    .direct_input_names()
+                    .first()
+                    .map(|body| stream_cardinality(by_name, body, visited))
+                    .unwrap_or(Cardinality::Single),
             }
         }
         // A merge of >= 2 document-carrying inputs is itself multi-document:
@@ -2565,15 +2573,30 @@ fn source_cardinality(source: &SourceConfig) -> Cardinality {
     }
 }
 
-/// Whether an `Envelope` node sits between `output_name` and the nearest
-/// upstream lineage stripper on some path — i.e. the user has inserted explicit
-/// consolidation downstream of a `Combine` / `Aggregate` / `Composition`. Used
-/// to relax the E347 lineage ban: re-enveloping downstream of a stripper is
-/// legal THROUGH an Envelope node (the E355 cardinality gate then enforces that
-/// the Envelope actually consolidates a multi-document body). The walk stops
-/// descending at a stripper, so an Envelope found above a stripper — which would
-/// not consolidate the stripped stream — does not count.
-fn envelope_consolidates_stripped_lineage(config: &PipelineConfig, output_name: &str) -> bool {
+/// A node that strips document lineage — `Combine` / `Aggregate` / `Composition`
+/// emit records with a synthetic (`<merged>`) document context (see
+/// [`trace_output_lineage`]).
+fn is_lineage_stripper(node: &PipelineNode) -> bool {
+    matches!(
+        node,
+        PipelineNode::Combine { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Composition { .. }
+    )
+}
+
+/// Find a lineage stripper whose synthetic `<merged>` records can reach
+/// `output_name` WITHOUT being re-consolidated by a `concat` `Envelope`, or
+/// `None` if every stripper on the way is shielded. A `concat` Envelope
+/// re-stamps its whole body onto one document grain, so it shields a
+/// `reconstruct_envelope` Output from synthetic grains; a `preserve` Envelope
+/// passes the synthetic grain through unchanged and so does NOT shield. This is
+/// the E347 relaxation predicate: re-enveloping downstream of a stripper is
+/// legal only through a *consolidating* Envelope, and only for the strippers it
+/// actually covers (a `concat` Envelope on a sibling merge branch does not
+/// shield a stripper on another branch).
+fn unconsolidated_stripper(config: &PipelineConfig, output_name: &str) -> Option<String> {
+    use crate::config::pipeline_node::EnvelopeStrategy;
     let by_name: HashMap<&str, &PipelineNode> = config
         .nodes
         .iter()
@@ -2588,19 +2611,21 @@ fn envelope_consolidates_stripped_lineage(config: &PipelineConfig, output_name: 
         let Some(node) = by_name.get(name) else {
             continue;
         };
-        match node {
-            PipelineNode::Envelope { .. } => return true,
-            PipelineNode::Combine { .. }
-            | PipelineNode::Aggregate { .. }
-            | PipelineNode::Composition { .. } => continue,
-            _ => {
-                for up in node.direct_input_names() {
-                    stack.push(up);
-                }
-            }
+        // A `concat` Envelope consolidates everything on its body path into one
+        // grain — stop descending, the strippers above it are shielded.
+        if let PipelineNode::Envelope { config, .. } = node
+            && config.strategy == EnvelopeStrategy::Concat
+        {
+            continue;
+        }
+        if is_lineage_stripper(node) {
+            return Some(name.to_string());
+        }
+        for up in node.direct_input_names() {
+            stack.push(up);
         }
     }
-    false
+    None
 }
 
 /// The synthesized `$doc` vocabulary of a segment/positional format: the
@@ -3971,6 +3996,17 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         if !output.format.is_single_document() {
             continue;
         }
+        // Per-file fan-out (`split:`, or a `{source_file}` / `{source_path}`
+        // path template) routes each document to its own output file, so every
+        // document lands in its own valid single-document envelope rather than
+        // being merged into one — exactly the remedy this gate's message names.
+        let per_file_fanout = output.split.is_some()
+            || crate::config::path_template::PathTemplate::parse(&output.path)
+                .map(|t| t.has_per_record_tokens())
+                .unwrap_or(false);
+        if per_file_fanout {
+            continue;
+        }
         if trace_output_lineage(config, &output.name).body_cardinality == Cardinality::Multi {
             return Err(ConfigError::Validation(format!(
                 "[E355] output '{name}': `{format}` output frames a single top-level \
@@ -4133,18 +4169,19 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             // Reject only when no such consolidation is present; the E355
             // cardinality gate above then enforces that a single-document output
             // actually gets a consolidating (`concat`) Envelope.
-            if let Some(stripper) = lineage.lineage_stripper.as_deref()
-                && !envelope_consolidates_stripped_lineage(config, out)
+            if lineage.lineage_stripper.is_some()
+                && let Some(stripper) = unconsolidated_stripper(config, out)
             {
                 return Err(ConfigError::Validation(format!(
                     "[E347] output '{out}': `reconstruct_envelope` cannot be combined with an \
                      upstream node ('{stripper}') that strips document lineage unless an \
-                     `envelope` node consolidates the merged stream first — a Combine, \
-                     Aggregate, or Composition emits records with no originating document, so \
-                     the per-document envelope cannot be framed around them (the framing arm \
-                     would stream them unframed, e.g. producing malformed JSON). Insert an \
-                     `envelope` node between '{stripper}' and this output to consolidate the \
-                     merged stream into one document, or drop `reconstruct_envelope`"
+                     `envelope` node with `strategy: concat` consolidates the merged stream \
+                     first — a Combine, Aggregate, or Composition emits records with no \
+                     originating document, so the per-document envelope cannot be framed around \
+                     them (the framing arm would stream them unframed, e.g. producing malformed \
+                     JSON). Insert an `envelope` node with `strategy: concat` between '{stripper}' \
+                     and this output to consolidate the merged stream into one document, or drop \
+                     `reconstruct_envelope`"
                 )));
             }
 
