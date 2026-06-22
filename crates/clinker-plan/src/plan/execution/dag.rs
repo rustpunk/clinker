@@ -789,8 +789,6 @@ mod port_tag_guard_tests {
             body_rows: HashMap::new(),
             node_input_refs: HashMap::new(),
             route_bodies: HashMap::new(),
-            body_combine_typed: HashMap::new(),
-            body_combine_where_typed: HashMap::new(),
             output_port_rows: indexmap::IndexMap::new(),
             output_port_to_node_idx: indexmap::IndexMap::new(),
             input_port_rows: indexmap::IndexMap::new(),

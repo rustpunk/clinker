@@ -4501,6 +4501,7 @@ nodes:
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
+            typed: None,
         });
 
         let mut plan = ExecutionPlanDag::from_parts(

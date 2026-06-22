@@ -439,6 +439,12 @@ pub enum PlanNode {
         /// index read instead of a name-keyed hash lookup.
         #[serde(skip)]
         resolved_column_map: ResolvedColumnMap,
+        /// Typed `cxl:` body program the combine emits, carried on the node like
+        /// `PlanTransformPayload.typed`. `None` only in the pre-lowering window;
+        /// populated for every lowered combine. Read off the node by the executor
+        /// and by downstream lineage instead of re-fetching from a name-keyed map.
+        #[serde(skip)]
+        typed: Option<Arc<TypedProgram>>,
     },
 }
 

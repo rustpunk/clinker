@@ -504,23 +504,24 @@ evidence.
   cross-scope uniqueness guarantee, so a node name reused by a `Combine` (or
   other CXL-bearing node) in a nested composition body overwrites the entry for
   the enclosing body. Should these tables be keyed by `(scope, name)` instead?
-- Why it matters: The executor fetches a body combine's typed body program by
-  bare name (`ctx.artifacts.typed.get(name)` in
-  `crates/clinker-exec/src/executor/combine_dispatch.rs`), and the
-  `BoundBody::combine_typed` / `combine_where_typed` lineage accessors snapshot
-  the same table. Both inherit last-writer-wins under a cross-nesting name
-  collision, so a deliberately reused node name could make a body combine
-  execute — and report lineage for — the wrong typed program. The accessors are
-  consistent with what executes today; the open question is whether the flat
-  keying itself should be hardened.
+- Why it matters: The collision lives in the bare-name-keyed
+  `CompileArtifacts` maps that every per-node CXL consumer shares — the
+  compile-time `where`/doc-paths consumers and the lowering populate that pull
+  the combine body program onto `PlanNode::Combine.typed`. A node name reused
+  by a `Combine` (or other CXL-bearing node) in a nested composition body wins
+  last-writer-wins in the flat map, so the program lowered onto the node — and
+  any lineage derived from it — can be the wrong one. The on-node program is
+  scope-correct once it is read off the node, but it is fed from the
+  collision-exposed flat map at lowering. Tracked for the node-artifact rework
+  (scope-correct keying via `(scope, name)`).
 - Files/modules involved:
   `crates/clinker-plan/src/plan/bind_schema.rs` (`CompileArtifacts`,
   `bind_combine`, `bind_composition`),
-  `crates/clinker-plan/src/plan/composition_body.rs`,
+  `crates/clinker-plan/src/config/pipeline.rs` (combine lowering),
   `crates/clinker-exec/src/executor/combine_dispatch.rs`.
 - Suggested way to resolve it: Decide whether cross-scope node-name reuse is
-  supported. If so, key per-node CXL artifacts by scope and update both the
-  executor fetch and the body accessors; add a regression test with a nested
-  composition that reuses a combine name. If not, add a bind-time diagnostic
-  rejecting the collision.
+  supported. If so, key per-node CXL artifacts by scope (`(scope, name)`) at
+  the flat-map source so the program lowered onto each node is unambiguous;
+  add a regression test with a nested composition that reuses a combine name.
+  If not, add a bind-time diagnostic rejecting the collision.
 - Priority: Low

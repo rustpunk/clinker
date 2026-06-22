@@ -1,6 +1,6 @@
-mod body_combine_typed;
 mod ck_aligned_partition;
 mod ck_lattice;
+mod combine_body_typed_on_node;
 mod cull_validation;
 mod dag;
 mod dedup_node_rooted;
