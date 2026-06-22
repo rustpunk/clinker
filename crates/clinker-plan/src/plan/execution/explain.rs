@@ -891,7 +891,7 @@ impl ExecutionPlanDag {
 
         for (group_name, indices) in &combine_groups {
             if indices.len() > 1 {
-                self.render_combine_group(out, group_name, indices, artifacts, planned_share);
+                self.render_combine_group(out, group_name, indices, planned_share);
             } else {
                 self.render_combine_single(out, indices[0], artifacts, planned_share);
             }
@@ -922,13 +922,17 @@ impl ExecutionPlanDag {
             predicate_summary,
             match_mode,
             on_miss,
+            combine_inputs,
+            decomposed_predicate,
             ..
         } = &self.graph[idx]
         else {
             return;
         };
 
-        let inputs_for_node = artifacts.combine_inputs.get(name);
+        // Per-input metadata + decomposed predicate are read off the node
+        // (the runtime source), not the bare-name `CompileArtifacts` maps.
+        let inputs_for_node = combine_inputs.as_ref();
 
         out.push_str(&format!("Combine '{name}':\n"));
         out.push_str(&format!(
@@ -970,7 +974,7 @@ impl ExecutionPlanDag {
                 "no"
             }
         ));
-        if let Some(decomposed) = artifacts.combine_predicates.get(name) {
+        if let Some(decomposed) = decomposed_predicate {
             out.push_str(&decomposed.format_text());
         }
 
@@ -995,7 +999,6 @@ impl ExecutionPlanDag {
         out: &mut String,
         group_name: &str,
         indices: &[NodeIndex],
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
         planned_share: u64,
     ) {
         let nary_inputs = indices.len() + 1;
@@ -1010,6 +1013,7 @@ impl ExecutionPlanDag {
                 driving_input,
                 build_inputs,
                 predicate_summary,
+                decomposed_predicate,
                 ..
             } = &self.graph[idx]
             else {
@@ -1036,11 +1040,11 @@ impl ExecutionPlanDag {
                 step_name,
             ));
 
-            // Per-step predicate detail under the step line. The
-            // detail is indented one more level than a singleton
-            // block because each step is already nested under the
+            // Per-step predicate detail under the step line, read off the
+            // step node. The detail is indented one more level than a
+            // singleton block because each step is already nested under the
             // group header.
-            if let Some(decomposed) = artifacts.combine_predicates.get(step_name) {
+            if let Some(decomposed) = decomposed_predicate {
                 let detail = decomposed.format_text();
                 for line in detail.lines() {
                     out.push_str("  ");
@@ -1991,23 +1995,25 @@ impl<'a> Serialize for CombineNodeEntry<'a> {
             ),
         );
 
-        // Combine-specific extras. Pull from the variant fields plus
-        // the artifacts side-table.
+        // Combine-specific extras. The per-input metadata and decomposed
+        // predicate come off the node (the runtime source); the statistics
+        // catalog stays in artifacts.
         if let PlanNode::Combine {
-            name,
             strategy,
             driving_input,
             build_inputs,
+            combine_inputs,
+            decomposed_predicate,
             ..
         } = self.node
         {
             // Rich predicate detail.
-            let predicate_value = build_predicate_json(self.artifacts.combine_predicates.get(name));
+            let predicate_value = build_predicate_json(decomposed_predicate.as_ref());
             obj.insert("predicate".to_string(), predicate_value);
 
             // Per-input role + estimated rows.
             let inputs_value = build_inputs_json(
-                self.artifacts.combine_inputs.get(name),
+                combine_inputs.as_ref(),
                 &self.artifacts.statistics,
                 driving_input,
                 build_inputs,
@@ -2194,6 +2200,9 @@ mod spill_projection_tests {
             output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
+            combine_inputs: None,
+            decomposed_predicate: None,
+            combine_driving: None,
         }
     }
 

@@ -3608,6 +3608,17 @@ pub(crate) fn lower_node_to_plan_node(
             // here — a body-less combine (e.g. `match: collect`) carries no
             // program.
             let typed = artifacts.typed.get(name).cloned();
+            // Carry the per-input metadata, decomposed `where:` predicate, and
+            // bind-time driving qualifier on the node so combine strategy
+            // selection and the executor read them by node instance instead of
+            // a bare-name lookup into `CompileArtifacts` (last-writer-wins
+            // across same-named combines in sibling composition bodies). Like
+            // `typed` / `resolved_column_map`, the read here is transiently
+            // scope-correct because each body is bound then lowered before the
+            // next body overwrites the shared map entry.
+            let combine_inputs = artifacts.combine_inputs.get(name).cloned();
+            let decomposed_predicate = artifacts.combine_predicates.get(name).cloned();
+            let combine_driving = artifacts.combine_driving.get(name).cloned();
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),
                 span,
@@ -3623,6 +3634,9 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(name),
                 resolved_column_map,
                 typed,
+                combine_inputs,
+                decomposed_predicate,
+                combine_driving,
             })
         }
         // Reshape lowers to PlanNode::Reshape carrying the parsed config

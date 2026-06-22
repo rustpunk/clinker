@@ -528,3 +528,131 @@ nodes:
         e303[0].message
     );
 }
+
+/// Run a multi-source pipeline through the executor, wiring one in-memory
+/// writer per declared output, and return each output's CSV text keyed by
+/// output name. Mirrors [`run_pipeline_multi_source`] but captures every
+/// output rather than only the first.
+fn run_pipeline_collect_outputs(yaml: &str, inputs: &[(&str, &str)]) -> HashMap<String, String> {
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let plan = config.compile(&ctx).expect("compile pipeline");
+
+    let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
+    for (name, data) in inputs {
+        readers.insert(
+            (*name).to_string(),
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(data.as_bytes().to_vec())),
+            ),
+        );
+    }
+
+    let mut buffers: HashMap<String, SharedBuffer> = HashMap::new();
+    let mut writers: HashMap<String, Box<dyn Write + Send>> = HashMap::new();
+    for out in config.output_configs() {
+        let buf = SharedBuffer::new();
+        buffers.insert(out.name.clone(), buf.clone());
+        writers.insert(out.name.clone(), Box::new(buf) as Box<dyn Write + Send>);
+    }
+
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .expect("pipeline run");
+
+    buffers
+        .into_iter()
+        .map(|(name, buf)| (name, buf.as_string()))
+        .collect()
+}
+
+#[test]
+fn test_combine_same_name_across_sibling_bodies_executes_each_predicate() {
+    // Two sibling compositions each contain a combine named `shared_join`,
+    // but body A joins on `products.product_id` while body B joins on
+    // `products.alt_id`. These are distinct node instances in distinct body
+    // graphs. With the combine's decomposed predicate stored in a bare-name
+    // side-table, binding body B second overwrote the `shared_join` entry, so
+    // body A's combine executed body B's `alt_id` predicate at runtime and
+    // matched nothing. Carrying the predicate (and inputs / driving) on each
+    // node makes the two scope-correct: A matches on product_id, B does not
+    // match on alt_id.
+    let yaml = r#"
+pipeline:
+  name: combine_scope_collision
+nodes:
+  - type: source
+    name: orders_src
+    config:
+      name: orders_src
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products_src
+    config:
+      name: products_src
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: alt_id, type: string }
+        - { name: name, type: string }
+  - type: composition
+    name: join_a
+    input: orders_src
+    use: ../compositions/scope_collision_join_a.comp.yaml
+    inputs:
+      orders: orders_src
+      products: products_src
+  - type: composition
+    name: join_b
+    input: orders_src
+    use: ../compositions/scope_collision_join_b.comp.yaml
+    inputs:
+      orders: orders_src
+      products: products_src
+  - type: output
+    name: out_a
+    input: join_a
+    config:
+      name: out_a
+      type: csv
+      path: out_a.csv
+      include_unmapped: true
+  - type: output
+    name: out_b
+    input: join_b
+    config:
+      name: out_b
+      type: csv
+      path: out_b.csv
+      include_unmapped: true
+"#;
+    let orders_csv = "order_id,product_id\no1,A\n";
+    let products_csv = "product_id,alt_id,name\nA,Z,Widget\n";
+    let outputs = run_pipeline_collect_outputs(
+        yaml,
+        &[("orders_src", orders_csv), ("products_src", products_csv)],
+    );
+
+    let out_a = outputs.get("out_a").expect("out_a output present");
+    let out_b = outputs.get("out_b").expect("out_b output present");
+
+    // Body A joins on product_id (A == A): the order matches and the
+    // enriched row carries the product name.
+    assert!(
+        out_a.contains("o1") && out_a.contains("Widget"),
+        "body A (join on product_id) must emit the matched order; got out_a:\n{out_a}\nout_b:\n{out_b}"
+    );
+    // Body B joins on alt_id (A == Z): no match, `on_miss: skip` drops the
+    // driver row. A predicate collision on the shared name would have leaked
+    // body B's `alt_id` join into body A, emptying out_a as well.
+    assert!(
+        !out_b.contains("o1"),
+        "body B (join on alt_id) must not match the order; got out_b:\n{out_b}"
+    );
+}

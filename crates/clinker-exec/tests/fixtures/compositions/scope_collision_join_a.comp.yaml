@@ -1,0 +1,36 @@
+# Sibling composition A for the runtime-combine scope-collision test.
+# Its combine is named `shared_join` — the SAME name used by the
+# sibling composition B (scope_collision_join_b) — but joins on
+# `products.product_id`. The two bodies are distinct node instances; the
+# runtime must read each combine's predicate off its own node, not from a
+# shared name-keyed table where the last-bound `shared_join` would win.
+_compose:
+  name: scope_collision_join_a
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: alt_id, type: string }
+        - { name: name, type: string }
+  outputs:
+    enriched: shared_join
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: shared_join
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+      propagate_ck: driver

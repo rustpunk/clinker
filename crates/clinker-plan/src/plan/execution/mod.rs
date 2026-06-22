@@ -31,6 +31,7 @@ pub use streaming_class::{
 
 use std::collections::{BTreeSet, HashMap};
 
+use indexmap::IndexMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::Serialize;
 
@@ -448,6 +449,31 @@ pub enum PlanNode {
         /// optional, not `unwrap` it.
         #[serde(skip)]
         typed: Option<Arc<TypedProgram>>,
+        /// Per-input qualifier metadata in declaration order. Carried on the
+        /// node so combine strategy selection and the executor resolve a
+        /// combine's inputs by node instance rather than a bare-name lookup
+        /// into `CompileArtifacts.combine_inputs`, which is last-writer-wins
+        /// across same-named combines in sibling composition bodies. Stamped
+        /// at lowering, and per-step by N-ary decomposition. `None` for a
+        /// combine that failed binding.
+        #[serde(skip)]
+        combine_inputs: Option<IndexMap<String, crate::plan::combine::CombineInput>>,
+        /// Decomposed `where:` predicate (equalities / ranges / residual) the
+        /// strategy pass and the executor consume. The on-node companion of
+        /// the shape-only `predicate_summary`, carried for the same
+        /// node-instance scope-correctness reason as `combine_inputs`. `None`
+        /// for a combine that failed binding (then `predicate_summary` is
+        /// zero-valued).
+        #[serde(skip)]
+        decomposed_predicate: Option<crate::plan::combine::DecomposedPredicate>,
+        /// Driving (probe-side) input qualifier chosen at bind time by
+        /// `select_driving_input`. The strategy post-pass reads it off the
+        /// node to stamp the runtime `driving_input` / `build_inputs`. Distinct
+        /// from `driving_input`, which stays empty until that pass runs. `None`
+        /// when driver selection failed (E306) — the post-pass then skips the
+        /// combine, exactly as an absent `combine_driving` map entry did.
+        #[serde(skip)]
+        combine_driving: Option<String>,
     },
 }
 
