@@ -2193,6 +2193,7 @@ mod spill_projection_tests {
             decomposed_from: None,
             output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
+            typed: None,
         }
     }
 

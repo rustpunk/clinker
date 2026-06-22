@@ -15,6 +15,7 @@ pub mod statistics;
 pub mod streaming_eligibility;
 pub mod types;
 
+pub use bind_schema::{NodeScope, ScopedNodeId};
 pub use compiled::{ChannelIdentity, CompiledPlan};
 pub use composition_body::{BoundBody, CompositionBodyId};
 pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};

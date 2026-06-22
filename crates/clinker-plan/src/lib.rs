@@ -23,7 +23,8 @@ pub use config::{
 };
 pub use error::PipelineError;
 pub use plan::{
-    BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
+    BoundBody, ColumnLookup, CompositionBodyId, NodeScope, QualifiedField, Row, RowTail,
+    ScopedNodeId, TailVarId,
 };
 pub use runtime_error::{BudgetCategory, SpillError};
 

@@ -55,6 +55,12 @@ pub(crate) fn dispatch_combine(
         ref on_miss,
         ref resolved_column_map,
         ref propagate_ck,
+        // Typed `cxl:` body program carried on the node (like
+        // `PlanTransformPayload.typed`). Read here instead of re-fetching
+        // from the name-keyed `ctx.artifacts.typed` map. A lowered combine
+        // with a body has `Some`; body-less steps (`match: collect`,
+        // synthetic non-final N-ary steps) have `None`.
+        typed: ref body_typed_on_node,
         ..
     } = *node
     else {
@@ -436,7 +442,7 @@ pub(crate) fn dispatch_combine(
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
                     name: name.clone(),
                 });
-            let body_typed = ctx.artifacts.typed.get(name);
+            let body_typed = body_typed_on_node.as_ref();
             let combine_output_schema_arc = combine_output_schema.clone();
             let iejoin_ctx = ctx.merged_eval_ctx();
             // CPU-bound IEJoin kernel — partition + range-walk +
@@ -544,7 +550,7 @@ pub(crate) fn dispatch_combine(
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
                     name: name.clone(),
                 });
-            let body_typed = ctx.artifacts.typed.get(name);
+            let body_typed = body_typed_on_node.as_ref();
             let combine_output_schema_arc = combine_output_schema.clone();
             // Resolve the spill compression mode against the combine's output
             // schema width and the run's batch size, so the grace-hash
@@ -677,7 +683,7 @@ pub(crate) fn dispatch_combine(
                 stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
                     name: name.clone(),
                 });
-            let body_typed = ctx.artifacts.typed.get(name);
+            let body_typed = body_typed_on_node.as_ref();
             let combine_output_schema_arc = combine_output_schema.clone();
             // Resolve the spill compression mode against the combine's output
             // schema width and the run's batch size, so Phase A spill runs
@@ -829,8 +835,9 @@ pub(crate) fn dispatch_combine(
 
     // Body typed program (only used when the body is not empty —
     // `match: collect` and body-less synthetic N-ary steps leave it
-    // `None`). Shared with the streaming-probe thread via the kernel.
-    let body_program = ctx.artifacts.typed.get(name).cloned();
+    // `None`). Read off the node; shared with the streaming-probe thread
+    // via the kernel.
+    let body_program = body_typed_on_node.clone();
 
     // The probe matching kernel — owns the materialized hash table and
     // every per-combine artifact the probe reads, and holds no

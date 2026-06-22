@@ -804,25 +804,35 @@ impl PipelineConfig {
             // A Combine's node-keyed `typed` entry holds only its `cxl:`
             // body; its `where:` predicate program lives in a separate
             // side-table, so include those too — a `$doc` access used only
-            // in a predicate would otherwise be dropped.
+            // in a predicate would otherwise be dropped. The side-table is
+            // keyed by `ScopedNodeId`; the downstream source attribution
+            // keys by the bare node name, so project the scoped key to its
+            // `name`. A combine named the same in two scopes now contributes
+            // BOTH predicate programs (the scope key no longer overwrites
+            // one with the other), which is strictly more correct for `$doc`
+            // detection.
             .chain(
                 artifacts
                     .combine_where_typed
                     .iter()
-                    .map(|(name, tp)| (name.as_str(), tp.as_ref())),
+                    .map(|(scoped, tp)| (scoped.name.as_str(), tp.as_ref())),
             )
             // A Route's node-keyed `typed` entry is an empty body; its
             // branch-condition programs live in a separate side-table, one
             // per branch. Include each, keyed by the Route node name so the
             // per-node source attribution stamps the path onto the Route's
             // source(s) — a `$doc` access used only in a route condition
-            // would otherwise be dropped.
+            // would otherwise be dropped. As with the combine side-table,
+            // project the `ScopedNodeId` to its bare `name` for the
+            // attribution key.
             .chain(
                 artifacts
                     .route_branch_typed
                     .iter()
-                    .flat_map(|(name, programs)| {
-                        programs.iter().map(move |tp| (name.as_str(), tp.as_ref()))
+                    .flat_map(|(scoped, programs)| {
+                        programs
+                            .iter()
+                            .map(move |tp| (scoped.name.as_str(), tp.as_ref()))
                     }),
             )
             .collect();
@@ -3588,6 +3598,16 @@ pub(crate) fn lower_node_to_plan_node(
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
+            // Carry the typed `cxl:` body program on the node, mirroring the
+            // Transform arm's `artifacts.typed.get(name)` read into
+            // `PlanTransformPayload.typed`. Body and top-level combines both
+            // flow through this arm; the bare-name lookup into the
+            // `artifacts.typed` body-program table is collision-exposed exactly
+            // like the Transform arm's — cross-scope node-name reuse is
+            // last-writer-wins in that bare-keyed table. `None` is legitimate
+            // here — a body-less combine (e.g. `match: collect`) carries no
+            // program.
+            let typed = artifacts.typed.get(name).cloned();
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),
                 span,
@@ -3602,6 +3622,7 @@ pub(crate) fn lower_node_to_plan_node(
                 decomposed_from: None,
                 output_schema: schema_from_bound(name),
                 resolved_column_map,
+                typed,
             })
         }
         // Reshape lowers to PlanNode::Reshape carrying the parsed config

@@ -1809,19 +1809,18 @@ pub(crate) fn decompose_nary_combines(
             on_miss: original_on_miss,
             output_schema: original_output_schema,
             propagate_ck: original_propagate_ck,
+            typed: mut original_body_typed,
             ..
         } = plan.graph[original_idx].clone()
         else {
             continue;
         };
 
-        // Migrate the original combine's body typed program (if any)
-        // and resolved column map from the original-name slot to the
-        // final step's name. The body's `QualifiedFieldRef`s reference
-        // original qualifiers (`orders`, `products`, …); the final
-        // step's resolved column map is rebuilt below to map those
-        // through the chain.
-        let original_body_typed = artifacts.typed.remove(&original_name);
+        // The original combine's body typed program (if any) was stamped
+        // onto its node at lowering; it migrates to the final step node
+        // below. The body's `QualifiedFieldRef`s reference original
+        // qualifiers (`orders`, `products`, …); the final step's resolved
+        // column map is rebuilt below to map those through the chain.
         // Drop the original combine's resolved column map — we rebuild
         // per-step maps below, and the final step's map differs from
         // the original because chain qualifiers route through Probe at
@@ -1966,6 +1965,11 @@ pub(crate) fn decompose_nary_combines(
                         decomposed_from: Some(original_name.clone()),
                         output_schema: Arc::clone(&step_output_schema),
                         resolved_column_map: Arc::clone(&step_resolved_map),
+                        // Non-final chain steps are body-less `match: All`
+                        // joins; the body program lives only on the final
+                        // step. The executor reads `None` and emits the
+                        // matched record directly, no body evaluation.
+                        typed: None,
                     }),
                 )
             };
@@ -1986,6 +1990,7 @@ pub(crate) fn decompose_nary_combines(
                     decomposed_from,
                     output_schema: os,
                     resolved_column_map,
+                    typed,
                     ..
                 } = &mut plan.graph[original_idx]
                 {
@@ -2004,6 +2009,12 @@ pub(crate) fn decompose_nary_combines(
                     *decomposed_from = Some(original_name.clone());
                     *os = output_schema;
                     *resolved_column_map = Arc::clone(&step_resolved_map);
+                    // The final step inherits the original combine's body
+                    // typed program (read off the original node above); the
+                    // body's QualifiedFieldRefs against the original
+                    // qualifiers route through the final step's resolved
+                    // column map at runtime.
+                    *typed = original_body_typed.take();
                 }
             }
             step_indices.push(idx);
@@ -2140,20 +2151,12 @@ pub(crate) fn decompose_nary_combines(
             }
         }
 
-        // The final step inherits the original combine's body typed
-        // program (if any). The body's QualifiedFieldRefs against the
-        // original qualifiers route through the final step's resolved
-        // column map at runtime — chain-buried qualifiers map to
-        // (Probe, encoded_idx); the newly joined qualifier maps to
-        // (Build, native_idx).
-        if let Some(body) = original_body_typed {
-            let final_step_name = &steps[last_step_idx].name;
-            artifacts.typed.insert(final_step_name.clone(), body);
-        }
-
         // Drop the original combine's artifacts — its name is gone from
         // the graph (the index now hosts the final step under a
-        // synthetic name).
+        // synthetic name). The body program already migrated onto the
+        // final step node above, so its flat `typed` entry is dropped
+        // here too rather than re-homed under the synthetic name.
+        artifacts.typed.remove(&original_name);
         artifacts.combine_inputs.remove(&original_name);
         artifacts.combine_predicates.remove(&original_name);
         artifacts.combine_driving.remove(&original_name);
@@ -2429,6 +2432,7 @@ mod tests {
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
+            typed: None,
         });
         let plan = ExecutionPlanDag {
             graph,
@@ -2610,6 +2614,7 @@ mod tests {
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
+            typed: None,
         };
         assert_eq!(node.name(), "test_combine");
         assert_eq!(node.type_tag(), "combine");
@@ -2748,6 +2753,7 @@ mod tests {
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
+            typed: None,
         });
 
         let plan = ExecutionPlanDag {
