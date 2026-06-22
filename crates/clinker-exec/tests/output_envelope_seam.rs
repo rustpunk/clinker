@@ -1230,3 +1230,180 @@ nodes:
     parse_config(yaml)
         .expect("an envelope node between the Combine and the Output relaxes the E347 ban");
 }
+
+#[test]
+fn reconstruct_envelope_downstream_of_combine_through_preserve_envelope_is_rejected_e347() {
+    // A `preserve` Envelope does NOT consolidate — it passes the Combine's
+    // synthetic `<merged>` grain through unchanged — so the reconstruct arm
+    // would still stream those records unframed. The relaxation must NOT fire
+    // for a preserve envelope; E347 still applies.
+    let yaml = r#"
+pipeline:
+  name: e347_preserve
+nodes:
+  - type: source
+    name: left
+    config:
+      name: left
+      type: json
+      glob: ./left/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: right
+    config:
+      name: right
+      type: json
+      glob: ./right/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: combine
+    name: joined
+    input:
+      a: left
+      b: right
+    config:
+      where: "a.id == b.id"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit id = a.id
+  - type: envelope
+    name: framed
+    body: joined
+    config:
+      strategy: preserve
+  - type: output
+    name: out
+    input: framed
+    config:
+      name: out
+      type: json
+      path: out.json
+      reconstruct_envelope: true
+"#;
+    let err = expect_validation_error(yaml);
+    assert!(
+        err.contains("E347"),
+        "preserve does not consolidate; expected E347, got: {err}"
+    );
+    assert!(
+        err.contains("joined"),
+        "message should name the lineage stripper: {err}"
+    );
+}
+
+#[test]
+fn reconstruct_envelope_with_concat_envelope_on_sibling_branch_is_rejected_e347() {
+    // A `concat` Envelope only consolidates ITS body branch. A stripper on a
+    // sibling merge branch is still unconsolidated, so its `<merged>` records
+    // reach the reconstruct-envelope Output unframed — E347 must still fire.
+    let yaml = r#"
+pipeline:
+  name: e347_sibling
+nodes:
+  - type: source
+    name: left
+    config:
+      name: left
+      type: json
+      glob: ./left/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: right
+    config:
+      name: right
+      type: json
+      glob: ./right/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: other
+    config:
+      name: other
+      type: json
+      glob: ./other/*.json
+      options:
+        record_path: records
+      schema:
+        - { name: id, type: int }
+  - type: combine
+    name: joined
+    input:
+      a: left
+      b: right
+    config:
+      where: "a.id == b.id"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit id = a.id
+  - type: envelope
+    name: framed
+    body: other
+    config:
+      strategy: concat
+  - type: merge
+    name: both
+    inputs: [joined, framed]
+    config:
+      mode: concat
+  - type: output
+    name: out
+    input: both
+    config:
+      name: out
+      type: json
+      path: out.json
+      reconstruct_envelope: true
+"#;
+    let err = expect_validation_error(yaml);
+    assert!(
+        err.contains("E347"),
+        "a sibling-branch concat envelope must not shield the Combine branch; expected E347, got: {err}"
+    );
+    assert!(
+        err.contains("joined"),
+        "message should name the unconsolidated stripper: {err}"
+    );
+}
+
+#[test]
+fn single_document_output_with_per_source_file_fanout_is_allowed() {
+    // Per-file fan-out (`{source_file}` path template) routes each document to
+    // its own output file, so each lands in its own valid single-document
+    // envelope — E355 must not reject it.
+    let yaml = r#"
+pipeline:
+  name: e355_fanout_ok
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      paths: [a.csv, b.csv]
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: x12
+      path: "out_{source_file}.x12"
+"#;
+    parse_config(yaml)
+        .expect("per-file fan-out gives each document its own single-document envelope");
+}

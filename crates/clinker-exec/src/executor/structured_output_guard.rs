@@ -44,7 +44,7 @@ impl StructuredOutputFormat {
 
 pub(crate) fn structured_output_format(format: &OutputFormat) -> Option<StructuredOutputFormat> {
     // Gate on the shared single-document predicate so this runtime allow-list
-    // and the plan-time E355 cardinality gate cannot drift apart (LD-011): the
+    // and the plan-time E355 cardinality gate cannot drift apart; the
     // discriminant map below just names which structured envelope to report.
     if !format.is_single_document() {
         return None;
