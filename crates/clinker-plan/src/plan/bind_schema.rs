@@ -2349,6 +2349,9 @@ fn bind_composition(
     // declaration with the same type, the body's registry includes it.
     // Mismatches (parent missing the var, or type doesn't match) emit
     // E174.
+    // Bind this body's nodes under its own scope so the scope-keyed
+    // compile-time side-tables disambiguate same-named nodes across bodies.
+    let saved_scope = std::mem::replace(&mut bind_ctx.current_scope, NodeScope::Body(body_id));
     let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
     bind_ctx.scoped_vars = build_body_scoped_vars(
         &signature.scoped_vars_schema,
@@ -2367,9 +2370,6 @@ fn bind_composition(
 
     bind_ctx.use_path_stack.push(resolved_path.clone());
     bind_ctx.depth += 1;
-    // Bind this body's nodes under its own scope so the scope-keyed
-    // compile-time side-tables disambiguate same-named nodes across bodies.
-    let saved_scope = std::mem::replace(&mut bind_ctx.current_scope, NodeScope::Body(body_id));
 
     // Seed body_schema_by_name with input port rows.
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();

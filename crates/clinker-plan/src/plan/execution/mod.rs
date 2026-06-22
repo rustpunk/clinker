@@ -440,9 +440,12 @@ pub enum PlanNode {
         #[serde(skip)]
         resolved_column_map: ResolvedColumnMap,
         /// Typed `cxl:` body program the combine emits, carried on the node like
-        /// `PlanTransformPayload.typed`. `None` only in the pre-lowering window;
-        /// populated for every lowered combine. Read off the node by the executor
-        /// and by downstream lineage instead of re-fetching from a name-keyed map.
+        /// `PlanTransformPayload.typed`. Read off the node by the executor and by
+        /// downstream lineage instead of re-fetching from a name-keyed map.
+        /// `None` is a legitimate lowered state — a body-less combine (e.g.
+        /// `match: collect`) and the synthetic non-final steps of a decomposed
+        /// N-ary combine carry no `cxl:` program — so consumers must treat it as
+        /// optional, not `unwrap` it.
         #[serde(skip)]
         typed: Option<Arc<TypedProgram>>,
     },
