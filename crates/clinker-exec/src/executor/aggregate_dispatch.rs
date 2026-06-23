@@ -181,7 +181,7 @@ pub(crate) fn dispatch_aggregation(
         // behind an Arc, so a per-window evaluator clone is cheap). The
         // strict path below never reaches here, so the spill schema is built
         // only on this windowed branch — never built-then-dropped.
-        let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
+        let transform_idx = ctx.transform_idx(name.as_str());
         let spill_schema = aggregate_spill_schema(compiled);
         let mem_limit = parse_memory_limit(ctx.config);
         let win_ctx = WindowedAggContext {
@@ -225,7 +225,7 @@ pub(crate) fn dispatch_aggregation(
         // Build the single retained-stream artifacts here, on the branch
         // that consumes them — the strict path below re-derives its own per
         // document, so nothing is built-then-dropped on the dominant arm.
-        let transform_idx = ctx.transform_by_name.get(name.as_str()).copied();
+        let transform_idx = ctx.transform_idx(name.as_str());
         let evaluator = match transform_idx {
             Some(idx) => ProgramEvaluator::with_max_expansion(
                 Arc::clone(&ctx.compiled_transforms[idx].typed),
@@ -562,15 +562,13 @@ impl DocAggregatorFactory {
         compiled: &Arc<cxl::plan::CompiledAggregate>,
         output_schema: &Arc<Schema>,
     ) -> Result<Self, PipelineError> {
-        let transform_idx = ctx
-            .transform_by_name
-            .get(node_name)
-            .copied()
-            .ok_or_else(|| PipelineError::Internal {
-                op: "aggregation",
-                node: node_name.to_string(),
-                detail: "no compiled transform found for aggregate node".to_string(),
-            })?;
+        let transform_idx =
+            ctx.transform_idx(node_name)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "aggregation",
+                    node: node_name.to_string(),
+                    detail: "no compiled transform found for aggregate node".to_string(),
+                })?;
         let compiled_transform = &ctx.compiled_transforms[transform_idx];
         // The compression mode resolves against the output-schema width and
         // batch size so a spilled table's on-disk format matches what

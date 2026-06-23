@@ -84,9 +84,10 @@ pub(crate) fn dispatch_transform(
         }
     };
 
-    // Find the CompiledTransform for this node
-    let transform_idx = match ctx.transform_by_name.get(name.as_str()) {
-        Some(&idx) => idx,
+    // Find the CompiledTransform for this node, scoped to the body (or top
+    // level) currently executing.
+    let transform_idx = match ctx.transform_idx(name.as_str()) {
+        Some(idx) => idx,
         None => {
             // No transform found — pass through
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;

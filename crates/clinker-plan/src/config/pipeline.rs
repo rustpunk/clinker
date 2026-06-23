@@ -798,48 +798,39 @@ impl PipelineConfig {
         // conditions are typed into separate side-tables and chained in
         // below. Missing any of them would drop a referenced path from the
         // declared set.
-        let doc_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = artifacts
+        // Attribute `$doc` paths by each program's scope-qualified
+        // `ScopedNodeId`, not its bare name, so a node named the same at top
+        // level and inside a composition body keeps its own `$doc` paths
+        // attributed to its own scope's source(s). The key is borrowed from
+        // the artifact tables (all three are `ScopedNodeId`-keyed), so no
+        // allocation; `&ScopedNodeId` is `Ord + Clone` as the collector needs.
+        let doc_refs: Vec<(
+            &crate::plan::bind_schema::ScopedNodeId,
+            &cxl::typecheck::pass::TypedProgram,
+        )> = artifacts
             .typed
             .iter()
-            // The `typed` table is keyed by `ScopedNodeId`; the downstream
-            // source attribution keys by the bare node name, so project the
-            // scoped key to its `name`. A node named the same in two scopes now
-            // contributes BOTH programs (the scope key no longer overwrites one
-            // with the other), which is strictly more correct for `$doc`
-            // detection.
-            .map(|(scoped, tp)| (scoped.name.as_str(), tp.as_ref()))
-            // A Combine's node-keyed `typed` entry holds only its `cxl:`
-            // body; its `where:` predicate program lives in a separate
-            // side-table, so include those too — a `$doc` access used only
-            // in a predicate would otherwise be dropped. The side-table is
-            // keyed by `ScopedNodeId`; the downstream source attribution
-            // keys by the bare node name, so project the scoped key to its
-            // `name`. A combine named the same in two scopes now contributes
-            // BOTH predicate programs (the scope key no longer overwrites
-            // one with the other), which is strictly more correct for `$doc`
-            // detection.
+            .map(|(scoped, tp)| (scoped, tp.as_ref()))
+            // A Combine's node-keyed `typed` entry holds only its `cxl:` body;
+            // its `where:` predicate program lives in a separate side-table, so
+            // include those too — a `$doc` access used only in a predicate
+            // would otherwise be dropped.
             .chain(
                 artifacts
                     .combine_where_typed
                     .iter()
-                    .map(|(scoped, tp)| (scoped.name.as_str(), tp.as_ref())),
+                    .map(|(scoped, tp)| (scoped, tp.as_ref())),
             )
             // A Route's node-keyed `typed` entry is an empty body; its
-            // branch-condition programs live in a separate side-table, one
-            // per branch. Include each, keyed by the Route node name so the
-            // per-node source attribution stamps the path onto the Route's
-            // source(s) — a `$doc` access used only in a route condition
-            // would otherwise be dropped. As with the combine side-table,
-            // project the `ScopedNodeId` to its bare `name` for the
-            // attribution key.
+            // branch-condition programs live in a separate side-table, one per
+            // branch. Include each so a `$doc` access used only in a route
+            // condition is still reachable.
             .chain(
                 artifacts
                     .route_branch_typed
                     .iter()
                     .flat_map(|(scoped, programs)| {
-                        programs
-                            .iter()
-                            .map(move |tp| (scoped.name.as_str(), tp.as_ref()))
+                        programs.iter().map(move |tp| (scoped, tp.as_ref()))
                     }),
             )
             .collect();
@@ -858,8 +849,10 @@ impl PipelineConfig {
             })
             .collect();
         if !doc_path_set.unresolvable.is_empty() {
-            for (node_name, d) in &doc_path_set.unresolvable {
-                let primary = match doc_node_line.get(node_name.as_str()) {
+            for (scoped, d) in &doc_path_set.unresolvable {
+                // doc_node_line is top-level-only; a body node falls back to
+                // SYNTHETIC, so look it up by the scoped key's bare name.
+                let primary = match doc_node_line.get(scoped.name.as_str()) {
                     Some(&line) => Span::line_only(line),
                     None => Span::SYNTHETIC,
                 };
@@ -886,8 +879,8 @@ impl PipelineConfig {
         let mut doc_paths_by_source: HashMap<String, std::collections::BTreeSet<_>> =
             HashMap::new();
         for (doc_path, nodes) in &doc_path_set.by_node {
-            for node_name in nodes {
-                let Some(sources) = node_sources.get(node_name) else {
+            for scoped in nodes {
+                let Some(sources) = node_sources.get(*scoped) else {
                     continue;
                 };
                 for source in sources {
@@ -945,7 +938,10 @@ impl PipelineConfig {
             if sections.is_empty() {
                 continue;
             }
-            let Some(feeding) = node_sources.get(&output.name) else {
+            let Some(feeding) = node_sources.get(&crate::plan::bind_schema::ScopedNodeId {
+                scope: crate::plan::bind_schema::NodeScope::TopLevel,
+                name: output.name.clone(),
+            }) else {
                 continue;
             };
             for source_name in feeding {
@@ -1041,15 +1037,15 @@ impl PipelineConfig {
             }
         }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
-            for node_name in ref_nodes {
-                let Some(sources) = node_sources.get(node_name) else {
+            for scoped in ref_nodes {
+                let Some(sources) = node_sources.get(*scoped) else {
                     continue;
                 };
                 for source_name in sources {
                     let Some(source) = source_by_name.get(source_name.as_str()) else {
                         continue;
                     };
-                    let primary = match doc_node_line.get(node_name.as_str()) {
+                    let primary = match doc_node_line.get(scoped.name.as_str()) {
                         Some(&line) => Span::line_only(line),
                         None => Span::SYNTHETIC,
                     };
@@ -3144,25 +3140,42 @@ fn rest_doc_access_diagnostic(
 fn build_node_source_sets(
     nodes: &[Spanned<PipelineNode>],
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
-) -> HashMap<String, std::collections::BTreeSet<String>> {
+) -> HashMap<crate::plan::bind_schema::ScopedNodeId, std::collections::BTreeSet<String>> {
+    use crate::plan::bind_schema::{NodeScope, ScopedNodeId};
     use crate::plan::composition_body::CompositionBodyId;
 
-    let mut node_sources: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut node_sources: HashMap<ScopedNodeId, std::collections::BTreeSet<String>> =
+        HashMap::new();
+
+    // Key for a top-level node. The main loop walks only `self.nodes`
+    // (top-level) and the cross-node lookups resolve top-level upstreams, so
+    // every key built here is TopLevel; body nodes are keyed `Body(id)` by
+    // `attribute_body`.
+    fn top_key(name: &str) -> ScopedNodeId {
+        ScopedNodeId {
+            scope: NodeScope::TopLevel,
+            name: name.to_string(),
+        }
+    }
 
     // Attribute every node in a composition body (recursively through
-    // nested bodies) to the call-site's source set.
+    // nested bodies) to the call-site's source set, keyed by the body's
+    // scope so a body node named the same as a top-level node stays distinct.
     fn attribute_body(
         body_id: CompositionBodyId,
         call_site_sources: &std::collections::BTreeSet<String>,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
-        node_sources: &mut HashMap<String, std::collections::BTreeSet<String>>,
+        node_sources: &mut HashMap<ScopedNodeId, std::collections::BTreeSet<String>>,
     ) {
         let Some(body) = artifacts.body_of(body_id) else {
             return;
         };
         for body_node_name in body.name_to_idx.keys() {
             node_sources
-                .entry(body_node_name.clone())
+                .entry(ScopedNodeId {
+                    scope: NodeScope::Body(body_id),
+                    name: body_node_name.clone(),
+                })
                 .or_default()
                 .extend(call_site_sources.iter().cloned());
         }
@@ -3181,14 +3194,14 @@ fn build_node_source_sets(
             .map(|ci| ci.upstream_name.as_ref().to_string())
     };
 
-    // Union of the source sets feeding the named producers, resolved
-    // against the sets recorded for already-walked nodes.
+    // Union of the source sets feeding the named (top-level) producers,
+    // resolved against the sets recorded for already-walked nodes.
     let union_of = |producers: &[&str],
-                    sources: &HashMap<String, std::collections::BTreeSet<String>>|
+                    sources: &HashMap<ScopedNodeId, std::collections::BTreeSet<String>>|
      -> std::collections::BTreeSet<String> {
         producers
             .iter()
-            .filter_map(|inp| sources.get(*inp))
+            .filter_map(|inp| sources.get(&top_key(inp)))
             .flat_map(|s| s.iter().cloned())
             .collect()
     };
@@ -3201,7 +3214,7 @@ fn build_node_source_sets(
     // a body `$doc` access, can resolve against any bound port's source.
     let composition_call_site_sources =
         |inputs: &IndexMap<String, String>,
-         sources: &HashMap<String, std::collections::BTreeSet<String>>|
+         sources: &HashMap<ScopedNodeId, std::collections::BTreeSet<String>>|
          -> std::collections::BTreeSet<String> {
             let producers: Vec<&str> = inputs
                 .values()
@@ -3220,7 +3233,7 @@ fn build_node_source_sets(
             // when the planner could not pick a driver (the combine is then
             // omitted from the DAG, so the set is unused either way).
             PipelineNode::Combine { .. } => combine_driver_upstream(&name)
-                .and_then(|driver| node_sources.get(&driver).cloned())
+                .and_then(|driver| node_sources.get(&top_key(&driver)).cloned())
                 .unwrap_or_else(|| union_of(&spanned.value.direct_input_names(), &node_sources)),
             // A composition forwards the union of EVERY bound input port's
             // source set, not just its primary port — a downstream node
@@ -3246,7 +3259,7 @@ fn build_node_source_sets(
             attribute_body(body_id, &sources, artifacts, &mut node_sources);
         }
 
-        node_sources.insert(name, sources);
+        node_sources.insert(top_key(&name), sources);
     }
 
     node_sources

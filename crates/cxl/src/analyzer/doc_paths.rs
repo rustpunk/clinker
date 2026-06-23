@@ -73,22 +73,26 @@ pub struct DocPath {
 /// path. Stamping every source with the pipeline-wide union would tell a
 /// multi-source run to extract envelope sections a given source's own
 /// document never declares.
-#[derive(Debug, Clone, Default)]
-pub struct DocPathSet {
-    /// Each statically-resolved path mapped to the set of node names whose
+/// `K` is the node-identity key the caller attributes paths by — a bare
+/// `&str`/`String` when scope cannot collide (e.g. reshape rule labels), or
+/// a scope-qualified identity (the planner's `ScopedNodeId`) when a node
+/// named the same in two scopes must stay distinct.
+#[derive(Debug, Clone)]
+pub struct DocPathSet<K> {
+    /// Each statically-resolved path mapped to the set of node keys whose
     /// program references it. The outer `BTreeMap` keys (paths) and inner
-    /// `BTreeSet` values (node names) are both ordered, so iteration is
+    /// `BTreeSet` values (node keys) are both ordered, so iteration is
     /// deterministic independent of program walk order.
-    pub by_node: BTreeMap<DocPath, BTreeSet<String>>,
-    /// One entry per `$doc` access whose index is not a literal. The
-    /// `String` is the name of the program's node so the caller can anchor
-    /// a plan-level diagnostic at that node; the [`TypeDiagnostic`] carries
-    /// the precise offending-index span and help.
-    pub unresolvable: Vec<(String, TypeDiagnostic)>,
+    pub by_node: BTreeMap<DocPath, BTreeSet<K>>,
+    /// One entry per `$doc` access whose index is not a literal. The `K` is
+    /// the program's node key so the caller can anchor a plan-level
+    /// diagnostic at that node; the [`TypeDiagnostic`] carries the precise
+    /// offending-index span and help.
+    pub unresolvable: Vec<(K, TypeDiagnostic)>,
 }
 
 #[cfg(test)]
-impl DocPathSet {
+impl<K> DocPathSet<K> {
     /// The deduplicated, sorted set of every resolved path across all
     /// nodes, discarding per-node attribution — a test convenience for
     /// asserting against the flat path list. Production callers consume
@@ -107,10 +111,14 @@ impl DocPathSet {
 /// multiple nodes is attributed to each of them, so the planner can union
 /// the source sets of every referencing node when stamping a source.
 /// Unresolvable-index diagnostics are accumulated in walk order.
-pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
-    let mut collector = DocPathCollector::default();
-    for (name, typed) in programs {
-        collector.node_name = name;
+pub fn collect_doc_paths<K: Ord + Clone>(programs: &[(K, &TypedProgram)]) -> DocPathSet<K> {
+    let mut collector: DocPathCollector<'_, K> = DocPathCollector {
+        node_key: None,
+        by_node: BTreeMap::new(),
+        unresolvable: Vec::new(),
+    };
+    for (key, typed) in programs {
+        collector.node_key = Some(key);
         for stmt in &typed.program.statements {
             collector.visit_statement(stmt);
         }
@@ -132,27 +140,32 @@ pub fn collect_doc_paths(programs: &[(&str, &TypedProgram)]) -> DocPathSet {
 /// not root at a `$doc` access, falls through to the default descent, so a
 /// `$doc` access nested in any control-flow branch or index expression is
 /// still collected.
-#[derive(Default)]
-struct DocPathCollector<'a> {
-    /// Name of the program currently being walked, so each collected path
-    /// — and each unresolvable-index diagnostic — is attributed to its
-    /// node.
-    node_name: &'a str,
-    by_node: BTreeMap<DocPath, BTreeSet<String>>,
-    unresolvable: Vec<(String, TypeDiagnostic)>,
+struct DocPathCollector<'a, K> {
+    /// Key of the program currently being walked, so each collected path —
+    /// and each unresolvable-index diagnostic — is attributed to its node.
+    /// `Some` for the duration of every program walk; never read while
+    /// `None`.
+    node_key: Option<&'a K>,
+    by_node: BTreeMap<DocPath, BTreeSet<K>>,
+    unresolvable: Vec<(K, TypeDiagnostic)>,
 }
 
-impl DocPathCollector<'_> {
+impl<K: Ord + Clone> DocPathCollector<'_, K> {
+    /// The key of the program currently being walked.
+    fn key(&self) -> K {
+        self.node_key
+            .expect("node_key is set before every program walk")
+            .clone()
+    }
+
     /// Record a resolved path against the node currently being walked.
     fn record(&mut self, path: DocPath) {
-        self.by_node
-            .entry(path)
-            .or_default()
-            .insert(self.node_name.to_string());
+        let key = self.key();
+        self.by_node.entry(path).or_default().insert(key);
     }
 }
 
-impl Visitor for DocPathCollector<'_> {
+impl<K: Ord + Clone> Visitor for DocPathCollector<'_, K> {
     fn visit_expr(&mut self, expr: &Expr) {
         // An IndexAccess whose receiver chain bottoms out at a DocAccess is
         // a `$doc` path with trailing indices — classify it as a unit
@@ -164,7 +177,10 @@ impl Visitor for DocPathCollector<'_> {
         {
             match classified {
                 Ok(path) => self.record(path),
-                Err(diag) => self.unresolvable.push((self.node_name.to_string(), diag)),
+                Err(diag) => {
+                    let key = self.key();
+                    self.unresolvable.push((key, diag));
+                }
             }
             return;
         }
@@ -310,13 +326,13 @@ mod tests {
         type_check(resolved, &schema).unwrap()
     }
 
-    fn collect(source: &str) -> DocPathSet {
+    fn collect(source: &str) -> DocPathSet<String> {
         let typed = compile(source);
-        collect_doc_paths(&[("t", &typed)])
+        collect_doc_paths(&[("t".to_string(), &typed)])
     }
 
     /// Sorted node names a path was attributed to.
-    fn attributed_to(set: &DocPathSet, p: &DocPath) -> Vec<String> {
+    fn attributed_to(set: &DocPathSet<String>, p: &DocPath) -> Vec<String> {
         set.by_node
             .get(p)
             .map(|nodes| nodes.iter().cloned().collect())
@@ -516,7 +532,7 @@ mod tests {
         // pipeline-wide union.
         let a = compile("emit x = $doc.Head.batch_id");
         let b = compile("emit y = $doc.Foot.record_count");
-        let set = collect_doc_paths(&[("node_a", &a), ("node_b", &b)]);
+        let set = collect_doc_paths(&[("node_a".to_string(), &a), ("node_b".to_string(), &b)]);
 
         let head = path("Head", "batch_id", vec![]);
         let foot = path("Foot", "record_count", vec![]);
@@ -531,7 +547,7 @@ mod tests {
         // planner unions their source sets when stamping.
         let a = compile("emit x = $doc.Head.batch_id");
         let b = compile("emit y = $doc.Head.batch_id + 1");
-        let set = collect_doc_paths(&[("node_a", &a), ("node_b", &b)]);
+        let set = collect_doc_paths(&[("node_a".to_string(), &a), ("node_b".to_string(), &b)]);
 
         let head = path("Head", "batch_id", vec![]);
         assert_eq!(set.all_paths(), vec![head.clone()]);

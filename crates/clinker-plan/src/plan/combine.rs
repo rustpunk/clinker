@@ -9,8 +9,8 @@
 //! The late-populated compile artifacts that these types describe do NOT
 //! live inline on `PlanNode::Combine`. Instead, they live in
 //! `CompileArtifacts` side-tables:
-//!   - `CompileArtifacts.typed["{name}"]`     — typed cxl-body program
-//!     (same key convention as Transform)
+//!   - `CompileArtifacts.typed` (keyed by the combine's `ScopedNodeId`)
+//!     — typed cxl-body program (same key convention as Transform)
 //!   - `CompileArtifacts.combine_predicates`  — `DecomposedPredicate`
 //!     (the residual re-typechecked program lives inside this, not in
 //!     `typed` — the where-clause TypedProgram is a local intermediate

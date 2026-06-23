@@ -4,8 +4,8 @@
 //! source's schema from its author-declared `schema:` block, typechecks
 //! every Transform/Aggregate/Route body against the upstream Row, and
 //! propagates the output Row downstream. Result: a `CompileArtifacts`
-//! map keyed by node name holding one `Arc<TypedProgram>` per CXL-bearing
-//! node.
+//! map keyed by each node's `ScopedNodeId` holding one `Arc<TypedProgram>`
+//! per CXL-bearing node.
 //!
 //! For `PipelineNode::Composition` nodes, `bind_composition` recursively
 //! binds the composition body at the call-site boundary using
@@ -54,7 +54,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 
 /// Scope a plan node lives in. Top-level pipeline, or a specific composition body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeScope {
     TopLevel,
     Body(crate::plan::composition_body::CompositionBodyId),
@@ -64,7 +64,7 @@ pub enum NodeScope {
 /// can hold same-named nodes; this pair disambiguates them where a bare node
 /// name would collide. Mirrors dbt's `<package>.<name>` and Beam's hierarchical
 /// node name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopedNodeId {
     pub scope: NodeScope,
     pub name: String,
@@ -1484,9 +1484,12 @@ fn bind_reshape(
     // spilled (i.e. on the memory budget). Rather than silently differ, fail
     // loud here until envelope context survives the spill round-trip.
     if ok {
-        let programs: Vec<(&str, &TypedProgram)> = typed_fragments
+        // Reshape rule fragments carry no scope ambiguity (they are
+        // labels within one node's rule set), so attribute by the bare
+        // label `String`.
+        let programs: Vec<(String, &TypedProgram)> = typed_fragments
             .iter()
-            .map(|(label, typed)| (label.as_str(), typed))
+            .map(|(label, typed)| (label.clone(), typed))
             .collect();
         let doc_paths = cxl::analyzer::doc_paths::collect_doc_paths(&programs);
         // Any `$doc` reference disqualifies the rule — both statically-resolved

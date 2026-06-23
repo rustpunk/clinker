@@ -162,6 +162,11 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
 #[derive(Debug)]
 pub struct CompiledTransform {
     pub(crate) name: String,
+    /// Scope the node lives in. Two composition bodies (or a top-level node
+    /// and a body) can hold same-named transforms with different programs;
+    /// the runtime dispatch table keys on `(scope, name)` so each resolves
+    /// its own program instead of collapsing to one bare-name entry.
+    pub(crate) scope: clinker_plan::plan::bind_schema::NodeScope,
     pub(crate) typed: Arc<TypedProgram>,
     pub(crate) max_expansion: u64,
 }

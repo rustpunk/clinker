@@ -459,7 +459,8 @@ use clinker_record::Schema;
 ///   mini-DAG without duplicating arm logic.
 /// * `output_configs` / `primary_output` — output sinks and the
 ///   declaration-order primary used as the fallback projection target.
-/// * `transform_by_name` — name → index into `compiled_transforms`.
+/// * `transform_by_name` — (scope → name) → index into
+///   `compiled_transforms`; resolve via [`ExecutorContext::transform_idx`].
 /// * `compiled_transforms` — precompiled CXL programs for Transform and
 ///   Aggregation arms.
 /// * `stable` / `source_batch_arc` / `strategy` — pipeline-stable scalars
@@ -492,7 +493,8 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
     pub(crate) compiled_transforms: &'a [CompiledTransform],
-    pub(crate) transform_by_name: HashMap<&'a str, usize>,
+    pub(crate) transform_by_name:
+        HashMap<clinker_plan::plan::bind_schema::NodeScope, HashMap<&'a str, usize>>,
     pub(crate) stable: &'a StableEvalContext,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
@@ -1020,6 +1022,32 @@ pub(crate) struct RetainedAggregatorState {
 }
 
 impl<'a> ExecutorContext<'a> {
+    /// The scope the dispatcher is currently executing in: the innermost
+    /// composition body on `window_runtime.active_stack`, or `TopLevel` when
+    /// the stack is empty (the top-level DAG walk).
+    pub(crate) fn current_node_scope(&self) -> clinker_plan::plan::bind_schema::NodeScope {
+        use clinker_plan::plan::bind_schema::NodeScope;
+        self.window_runtime
+            .active_stack
+            .last()
+            .copied()
+            .map(NodeScope::Body)
+            .unwrap_or(NodeScope::TopLevel)
+    }
+
+    /// Resolve a node's `CompiledTransform` index by its scope-qualified
+    /// identity — the current execution scope plus the bare node name — so a
+    /// body transform named the same as a top-level (or sibling-body)
+    /// transform selects its own program instead of a colliding bare-name
+    /// entry. `None` when no compiled program is registered for that node
+    /// (e.g. a top-level aggregate, which carries its logic on the node).
+    pub(crate) fn transform_idx(&self, name: &str) -> Option<usize> {
+        self.transform_by_name
+            .get(&self.current_node_scope())?
+            .get(name)
+            .copied()
+    }
+
     /// Poll the run's shutdown flag at an operator chunk boundary. When
     /// the token has tripped (SIGINT/SIGTERM, or a programmatic
     /// request), record the interruption and return
@@ -2351,7 +2379,7 @@ pub(crate) fn transform_fused_consume(
         }
     };
 
-    let transform_idx_opt = ctx.transform_by_name.get(name).copied();
+    let transform_idx_opt = ctx.transform_idx(name);
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
         .cloned();

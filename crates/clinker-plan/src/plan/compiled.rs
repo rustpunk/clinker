@@ -61,10 +61,11 @@ impl CompiledPlan {
         &self.config
     }
 
-    /// Compile-time CXL typecheck artifacts — one entry per
-    /// CXL-bearing node (Transform/Aggregate/Route) keyed by node name.
-    /// The runtime executor reads this map directly to pull each
-    /// transform's `Arc<TypedProgram>` instead of re-typechecking.
+    /// Compile-time CXL typecheck artifacts — one entry per CXL-bearing
+    /// node keyed by its `ScopedNodeId` (so a top-level node and a
+    /// composition-body node sharing a name stay distinct). The runtime
+    /// executor reads this map to pull each node's `Arc<TypedProgram>`
+    /// instead of re-typechecking.
     pub fn artifacts(&self) -> &CompileArtifacts {
         &self.artifacts
     }
