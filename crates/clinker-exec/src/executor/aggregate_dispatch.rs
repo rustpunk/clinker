@@ -63,6 +63,8 @@ pub(crate) fn dispatch_aggregation(
     let PlanNode::Aggregation {
         ref name,
         ref compiled,
+        ref typed,
+        has_distinct,
         strategy: agg_strategy,
         ref output_schema,
         ref config,
@@ -132,6 +134,8 @@ pub(crate) fn dispatch_aggregation(
             node_idx,
             producer_idx,
             name,
+            typed,
+            has_distinct,
             agg_strategy,
             compiled,
             output_schema,
@@ -177,11 +181,10 @@ pub(crate) fn dispatch_aggregation(
     let out_rows: Vec<AggSortRow> = if is_time_windowed {
         // Time-windowed path: per-(window) AggregateStream instances
         // dispatched in `run_time_windowed_aggregate`, each building its own
-        // evaluator from `transform_idx` (the heavy `TypedProgram` lives
-        // behind an Arc, so a per-window evaluator clone is cheap). The
+        // evaluator from the node's typed program (the heavy `TypedProgram`
+        // lives behind an Arc, so a per-window evaluator clone is cheap). The
         // strict path below never reaches here, so the spill schema is built
         // only on this windowed branch — never built-then-dropped.
-        let transform_idx = ctx.transform_idx(name.as_str());
         let spill_schema = aggregate_spill_schema(compiled);
         let mem_limit = parse_memory_limit(ctx.config);
         let win_ctx = WindowedAggContext {
@@ -191,7 +194,8 @@ pub(crate) fn dispatch_aggregation(
             output_schema: Arc::clone(output_schema),
             spill_schema,
             mem_limit,
-            transform_idx,
+            typed: Arc::clone(typed),
+            has_distinct,
         };
         run_time_windowed_aggregate(
             ctx,
@@ -225,21 +229,11 @@ pub(crate) fn dispatch_aggregation(
         // Build the single retained-stream artifacts here, on the branch
         // that consumes them — the strict path below re-derives its own per
         // document, so nothing is built-then-dropped on the dominant arm.
-        let transform_idx = ctx.transform_idx(name.as_str());
-        let evaluator = match transform_idx {
-            Some(idx) => ProgramEvaluator::with_max_expansion(
-                Arc::clone(&ctx.compiled_transforms[idx].typed),
-                ctx.compiled_transforms[idx].has_distinct(),
-                ctx.compiled_transforms[idx].max_expansion,
-            ),
-            None => {
-                return Err(PipelineError::Internal {
-                    op: "aggregation",
-                    node: name.clone(),
-                    detail: "no compiled transform found for aggregate node".to_string(),
-                });
-            }
-        };
+        let evaluator = ProgramEvaluator::with_max_expansion(
+            Arc::clone(typed),
+            has_distinct,
+            cxl::eval::DEFAULT_MAX_EXPANSION,
+        );
         let spill_schema = aggregate_spill_schema(compiled);
         let mem_limit = parse_memory_limit(ctx.config);
         // Resolve the spill compression mode against this aggregate's
@@ -379,8 +373,15 @@ pub(crate) fn dispatch_aggregation(
         // Builds nothing in the prelude: each document's table derives its
         // own evaluator + spill schema through the `ctx`-free factory, so a
         // strict run allocates no throwaway evaluator or spill schema here.
-        let factory =
-            DocAggregatorFactory::from_ctx(ctx, name, agg_strategy, compiled, output_schema)?;
+        let factory = DocAggregatorFactory::from_ctx(
+            ctx,
+            name,
+            typed,
+            has_distinct,
+            agg_strategy,
+            compiled,
+            output_schema,
+        )?;
         run_strict_aggregate_per_document(ctx, factory, name, output_schema, &input, &input_puncts)?
     };
 
@@ -549,27 +550,18 @@ impl DocAggregatorFactory {
     /// Snapshot the build inputs out of `ctx` for an aggregate node.
     /// Resolves the spill schema, memory limit, and spill-compression mode
     /// from `ctx` itself — the same derivations the single-stream paths run
-    /// inline — so the caller passes only the node identity.
-    ///
-    /// Returns an error when no compiled transform backs the node — the
-    /// same hard-abort `PipelineError::Internal` the single-stream paths
-    /// raise, surfaced here once at construction so [`Self::make`] only
-    /// fails on the never-taken `for_node` arm.
+    /// inline. The typed `aggregate:` program and its distinct-ness are read
+    /// off the `PlanNode::Aggregation` by the caller and passed in here; an
+    /// aggregate's fan-out ceiling is always [`cxl::eval::DEFAULT_MAX_EXPANSION`].
     fn from_ctx(
         ctx: &ExecutorContext<'_>,
         node_name: &str,
+        typed: &Arc<cxl::typecheck::TypedProgram>,
+        has_distinct: bool,
         strategy: AggregateStrategy,
         compiled: &Arc<cxl::plan::CompiledAggregate>,
         output_schema: &Arc<Schema>,
     ) -> Result<Self, PipelineError> {
-        let transform_idx =
-            ctx.transform_idx(node_name)
-                .ok_or_else(|| PipelineError::Internal {
-                    op: "aggregation",
-                    node: node_name.to_string(),
-                    detail: "no compiled transform found for aggregate node".to_string(),
-                })?;
-        let compiled_transform = &ctx.compiled_transforms[transform_idx];
         // The compression mode resolves against the output-schema width and
         // batch size so a spilled table's on-disk format matches what
         // `--explain` reports.
@@ -580,9 +572,9 @@ impl DocAggregatorFactory {
         Ok(Self {
             strategy,
             compiled: Arc::clone(compiled),
-            typed: Arc::clone(&compiled_transform.typed),
-            has_distinct: compiled_transform.has_distinct(),
-            max_expansion: compiled_transform.max_expansion,
+            typed: Arc::clone(typed),
+            has_distinct,
+            max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
             output_schema: Arc::clone(output_schema),
             spill_schema,
             mem_limit: parse_memory_limit(ctx.config),
@@ -1114,6 +1106,8 @@ fn run_streaming_aggregate_ingest(
     node_idx: NodeIndex,
     producer_idx: NodeIndex,
     name: &str,
+    typed: &Arc<cxl::typecheck::TypedProgram>,
+    has_distinct: bool,
     agg_strategy: AggregateStrategy,
     compiled: &Arc<cxl::plan::CompiledAggregate>,
     output_schema: &Arc<Schema>,
@@ -1134,7 +1128,15 @@ fn run_streaming_aggregate_ingest(
     // `sum_consumer_usage` while live, and is unregistered when that
     // document flushes (on its `DocumentClose`, or at disconnect for the
     // document left open).
-    let factory = DocAggregatorFactory::from_ctx(ctx, name, agg_strategy, compiled, output_schema)?;
+    let factory = DocAggregatorFactory::from_ctx(
+        ctx,
+        name,
+        typed,
+        has_distinct,
+        agg_strategy,
+        compiled,
+        output_schema,
+    )?;
 
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
@@ -1400,7 +1402,11 @@ struct WindowedAggContext<'a> {
     output_schema: Arc<Schema>,
     spill_schema: Arc<Schema>,
     mem_limit: usize,
-    transform_idx: Option<usize>,
+    /// Typed `aggregate:` program read off the `PlanNode::Aggregation`. Each
+    /// per-window stream clones a fresh `ProgramEvaluator` from this Arc.
+    typed: Arc<cxl::typecheck::TypedProgram>,
+    /// Distinct-ness of `typed`, computed once at lowering.
+    has_distinct: bool,
 }
 
 impl WindowedAggContext<'_> {
@@ -1423,21 +1429,11 @@ impl WindowedAggContext<'_> {
         ),
         PipelineError,
     > {
-        let evaluator = match self.transform_idx {
-            Some(idx) => ProgramEvaluator::with_max_expansion(
-                Arc::clone(&ctx.compiled_transforms[idx].typed),
-                ctx.compiled_transforms[idx].has_distinct(),
-                ctx.compiled_transforms[idx].max_expansion,
-            ),
-            None => {
-                return Err(PipelineError::Internal {
-                    op: "time-windowed-aggregation",
-                    node: self.name.to_string(),
-                    detail: "no compiled transform found for time-windowed aggregate node"
-                        .to_string(),
-                });
-            }
-        };
+        let evaluator = ProgramEvaluator::with_max_expansion(
+            Arc::clone(&self.typed),
+            self.has_distinct,
+            cxl::eval::DEFAULT_MAX_EXPANSION,
+        );
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
             crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),

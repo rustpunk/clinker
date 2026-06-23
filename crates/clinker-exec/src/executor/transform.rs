@@ -1,5 +1,5 @@
-//! Executor-internal transform spec + compiled transform, and the
-//! per-record transform evaluation helpers the dispatch arms drive.
+//! Executor-internal transform spec and the per-record transform
+//! evaluation helpers the dispatch arms drive.
 
 use std::sync::Arc;
 
@@ -10,9 +10,7 @@ use crate::pipeline::index::{GroupByKey, value_to_group_key};
 use crate::pipeline::window_context::PartitionWindowContext;
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::plan::execution::ExecutionPlanDag;
-use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
-use cxl::typecheck::TypedProgram;
 
 use super::{NullStorage, record_with_emitted_fields};
 
@@ -156,29 +154,6 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
         }
     }
     out
-}
-
-/// Compiled transform: CXL source compiled once, evaluated per record.
-#[derive(Debug)]
-pub struct CompiledTransform {
-    pub(crate) name: String,
-    /// Scope the node lives in. Two composition bodies (or a top-level node
-    /// and a body) can hold same-named transforms with different programs;
-    /// the runtime dispatch table keys on `(scope, name)` so each resolves
-    /// its own program instead of collapsing to one bare-name entry.
-    pub(crate) scope: clinker_plan::plan::bind_schema::NodeScope,
-    pub(crate) typed: Arc<TypedProgram>,
-    pub(crate) max_expansion: u64,
-}
-
-impl CompiledTransform {
-    pub(crate) fn has_distinct(&self) -> bool {
-        self.typed
-            .program
-            .statements
-            .iter()
-            .any(|s| matches!(s, Statement::Distinct { .. }))
-    }
 }
 
 /// Single emitted (or skipped) output of a per-record transform
