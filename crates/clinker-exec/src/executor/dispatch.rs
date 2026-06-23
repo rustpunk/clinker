@@ -2349,8 +2349,10 @@ pub(crate) fn transform_fused_consume(
     // carries no program); the fused loop forwards records unevaluated.
     let transform_payload = match &current_dag.graph[node_idx] {
         PlanNode::Transform {
-            resolved: Some(p), ..
-        } => Some((Arc::clone(&p.typed), p.max_expansion)),
+            resolved: Some(p),
+            has_distinct,
+            ..
+        } => Some((Arc::clone(&p.typed), p.max_expansion, *has_distinct)),
         _ => None,
     };
     let expected_input = current_dag.graph[node_idx]
@@ -2388,12 +2390,7 @@ pub(crate) fn transform_fused_consume(
     });
 
     let mut evaluator_opt: Option<ProgramEvaluator> =
-        transform_payload.map(|(typed, max_expansion)| {
-            let has_distinct = typed
-                .program
-                .statements
-                .iter()
-                .any(|s| matches!(s, cxl::ast::Statement::Distinct { .. }));
+        transform_payload.map(|(typed, max_expansion, has_distinct)| {
             ProgramEvaluator::with_max_expansion(typed, has_distinct, max_expansion)
         });
 

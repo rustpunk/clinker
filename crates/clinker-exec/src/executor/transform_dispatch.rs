@@ -41,6 +41,7 @@ pub(crate) fn dispatch_transform(
         ref name,
         window_index,
         ref resolved,
+        has_distinct,
         ..
     } = *node
     else {
@@ -108,14 +109,10 @@ pub(crate) fn dispatch_transform(
 
     // The compiled program is the per-record evaluator for the transform
     // hot loop: it lowers each statement to a closure once and skips the
-    // per-record AST re-match a recursive tree-walk would pay. `distinct`
-    // detection scans the node's typed program for a `distinct` statement.
-    let has_distinct = payload
-        .typed
-        .program
-        .statements
-        .iter()
-        .any(|s| matches!(s, cxl::ast::Statement::Distinct { .. }));
+    // per-record AST re-match a recursive tree-walk would pay. `has_distinct`
+    // is read off the node — computed once at lowering, the single source of
+    // truth `compute_node_properties` also reads — mirroring the aggregate
+    // dispatch path rather than re-scanning the program per dispatch.
     let mut evaluator = ProgramEvaluator::with_max_expansion(
         Arc::clone(&payload.typed),
         has_distinct,
