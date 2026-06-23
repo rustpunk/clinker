@@ -185,8 +185,10 @@ mod tests {
         expected_fields: &[&str],
     ) {
         let row = artifacts
-            .typed
-            .get(node_name)
+            .typed_get(
+                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                node_name,
+            )
             .map(|tp| &tp.output_row)
             .unwrap_or_else(|| panic!("no bound output row for node {node_name:?}"));
         let actual: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
@@ -494,7 +496,10 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         assert!(
-            !artifacts.typed.contains_key("bad_collect"),
+            !artifacts.typed_contains(
+                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                "bad_collect"
+            ),
             "no output row published when E311 fires"
         );
     }
@@ -575,8 +580,10 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         let row = artifacts
-            .typed
-            .get("collected")
+            .typed_get(
+                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                "collected",
+            )
             .map(|tp| &tp.output_row)
             .expect("collected publishes a bound output row");
 
@@ -787,8 +794,10 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         let row = artifacts
-            .typed
-            .get("enriched")
+            .typed_get(
+                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                "enriched",
+            )
             .map(|tp| &tp.output_row)
             .expect("enriched publishes a bound output row");
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
@@ -829,7 +838,10 @@ mod tests {
             ],
         );
         assert!(
-            artifacts.typed.contains_key("enriched"),
+            artifacts.typed_contains(
+                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                "enriched"
+            ),
             "artifacts.typed['enriched'] must be populated with body TypedProgram"
         );
     }

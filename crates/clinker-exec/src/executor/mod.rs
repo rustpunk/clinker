@@ -490,10 +490,14 @@ impl PipelineExecutor {
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
+                // `resolved_transforms` are top-level transforms; resolve each
+                // by its TopLevel key in the scope-qualified `typed` table.
                 let typed = validated_plan
                     .artifacts()
-                    .typed
-                    .get(&t.name)
+                    .typed_get(
+                        clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                        &t.name,
+                    )
                     .cloned()
                     .ok_or_else(|| PipelineError::Compilation {
                         transform_name: t.name.clone(),
@@ -504,6 +508,7 @@ impl PipelineExecutor {
                     })?;
                 Ok::<CompiledTransform, PipelineError>(CompiledTransform {
                     name: t.name.clone(),
+                    scope: clinker_plan::plan::bind_schema::NodeScope::TopLevel,
                     typed,
                     max_expansion: t.max_expansion,
                 })
@@ -511,15 +516,13 @@ impl PipelineExecutor {
             .collect::<Result<_, _>>()?;
 
         // Extend with body transforms. Composition bodies' Transform
-        // / Aggregate nodes have their typed programs sitting in
-        // `artifacts.typed` under the body's node name. The body
-        // dispatcher arm looks up `transform_by_name` in the same
-        // table the top-level walker uses, so every executable body
-        // node has to be present here too. Skip names already
-        // present so the top-level entry wins on collision.
-        let mut existing_names: std::collections::HashSet<String> =
-            compiled_transforms.iter().map(|c| c.name.clone()).collect();
-        for body in validated_plan.artifacts().composition_bodies.values() {
+        // / Aggregate nodes have their typed programs in `artifacts.typed`
+        // under their own `Body` scope. The body dispatcher looks them up in
+        // the same runtime table the top-level walker uses; that table is
+        // keyed by `(scope, name)`, so two bodies (or a body and the top
+        // level) with same-named nodes each keep their own program — no
+        // bare-name collapse.
+        for (body_id, body) in validated_plan.artifacts().composition_bodies.iter() {
             for idx in body.graph.node_indices() {
                 let body_node = &body.graph[idx];
                 let n = body_node.name();
@@ -527,15 +530,16 @@ impl PipelineExecutor {
                     body_node,
                     clinker_plan::plan::execution::PlanNode::Transform { .. }
                         | clinker_plan::plan::execution::PlanNode::Aggregation { .. }
-                ) && !existing_names.contains(n)
-                    && let Some(typed) = validated_plan.artifacts().typed.get(n)
-                {
+                ) && let Some(typed) = validated_plan.artifacts().typed_get(
+                    clinker_plan::plan::bind_schema::NodeScope::Body(*body_id),
+                    n,
+                ) {
                     compiled_transforms.push(CompiledTransform {
                         name: n.to_string(),
+                        scope: clinker_plan::plan::bind_schema::NodeScope::Body(*body_id),
                         typed: typed.clone(),
                         max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
                     });
-                    existing_names.insert(n.to_string());
                 }
             }
         }
@@ -559,7 +563,11 @@ impl PipelineExecutor {
                     // multi-source pipelines.
                     let mut emitted_fields: Vec<String> = Vec::new();
                     for src_cfg in &source_configs {
-                        if let Some(typed) = validated_plan.artifacts().typed.get(&src_cfg.name) {
+                        // Sources are top-level nodes; resolve by TopLevel key.
+                        if let Some(typed) = validated_plan.artifacts().typed_get(
+                            clinker_plan::plan::bind_schema::NodeScope::TopLevel,
+                            &src_cfg.name,
+                        ) {
                             for (qf, _) in typed.output_row.fields() {
                                 let s = qf.name.to_string();
                                 if s.starts_with('$') {
@@ -583,17 +591,19 @@ impl PipelineExecutor {
                     }
                     // Combine nodes also emit fields via their `cxl:` body;
                     // those typed programs live in `artifacts.typed` keyed
-                    // by combine node name (not in `compiled_transforms`,
-                    // which is transform-only). A route downstream of a
-                    // combine sees the combine's emits, so every emit in
-                    // every typed program that's NOT a transform must be
-                    // surfaced to the route resolver.
+                    // by the combine's scope-qualified id (not in
+                    // `compiled_transforms`, which is transform-only). A route
+                    // downstream of a combine sees the combine's emits, so
+                    // every emit in every typed program that's NOT a transform
+                    // must be surfaced to the route resolver. The table is now
+                    // `ScopedNodeId`-keyed; the transform-name filter and emit
+                    // collection both operate on the bare `name`.
                     let transform_names: std::collections::HashSet<&str> = compiled_transforms
                         .iter()
                         .map(|ct| ct.name.as_str())
                         .collect();
-                    for (node_name, typed) in &validated_plan.artifacts().typed {
-                        if transform_names.contains(node_name.as_str()) {
+                    for (scoped, typed) in &validated_plan.artifacts().typed {
+                        if transform_names.contains(scoped.name.as_str()) {
                             continue;
                         }
                         cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
@@ -637,7 +647,7 @@ impl PipelineExecutor {
         // Routes carry their own conditions.
         let mut compiled_routes_by_name: std::collections::HashMap<String, CompiledRoute> =
             std::collections::HashMap::new();
-        for body in validated_plan.artifacts().composition_bodies.values() {
+        for (body_id, body) in validated_plan.artifacts().composition_bodies.iter() {
             for (route_name, route_body) in &body.route_bodies {
                 // Build the body Route's RouteConfig from its parsed
                 // RouteBody. The condition resolver needs the field
@@ -671,8 +681,12 @@ impl PipelineExecutor {
                         }
                     }
                 }
-                for (n, typed) in &validated_plan.artifacts().typed {
-                    if !body.name_to_idx.contains_key(n.as_str()) {
+                // Only this body's own nodes contribute emits. The `typed`
+                // table is `ScopedNodeId`-keyed, so filter by this body's
+                // scope — a top-level node sharing a name with a body node
+                // stays out of this body's route field set.
+                for (scoped, typed) in &validated_plan.artifacts().typed {
+                    if scoped.scope != clinker_plan::plan::bind_schema::NodeScope::Body(*body_id) {
                         continue;
                     }
                     cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
@@ -1158,14 +1172,22 @@ impl PipelineExecutor {
 
         let strategy = config.error_handling.strategy;
 
-        // Name → index map for looking up `CompiledTransform` by node
-        // name. Borrowed by the dispatcher's Transform / Aggregation
-        // arms.
-        let transform_by_name: HashMap<&str, usize> = transforms
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.name.as_str(), i))
-            .collect();
+        // (scope → name → index) map for looking up `CompiledTransform` by
+        // a node's scope-qualified identity. Keyed by `NodeScope` first so a
+        // body transform named the same as a top-level (or sibling-body)
+        // transform resolves its own program; the dispatcher reads the
+        // current scope off `window_runtime.active_stack`. Borrowed by the
+        // dispatcher's Transform / Aggregation arms.
+        let mut transform_by_name: HashMap<
+            clinker_plan::plan::bind_schema::NodeScope,
+            HashMap<&str, usize>,
+        > = HashMap::new();
+        for (i, t) in transforms.iter().enumerate() {
+            transform_by_name
+                .entry(t.scope)
+                .or_default()
+                .insert(t.name.as_str(), i);
+        }
 
         // Correlation grouping context. `Some(...)` iff at least one
         // source declares a `correlation_key:`; the planner's

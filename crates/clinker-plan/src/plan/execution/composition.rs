@@ -141,10 +141,12 @@ pub(crate) fn resolve_composition_body_windows(
             // `$window.sum(amount)` adds `amount`, and `emit x = y` adds
             // `y`. The analyzer is the same one consumed at top-level
             // lowering (`config/mod.rs`); body Transforms register their
-            // typed programs in `artifacts.typed` keyed by the body
-            // node's name, so the analyzer call here mirrors the
-            // top-level shape exactly.
-            if let Some(typed) = artifacts.typed.get(*transform_name) {
+            // typed programs in `artifacts.typed` under their own `Body`
+            // scope, so resolve by `(Body(body_id), name)` here.
+            if let Some(typed) = artifacts.typed_get(
+                crate::plan::bind_schema::NodeScope::Body(body_id),
+                transform_name,
+            ) {
                 let analysis = cxl::analyzer::analyze_transform(transform_name, typed);
                 for f in &analysis.accessed_fields {
                     arena_fields.insert(f.clone());

@@ -4,8 +4,8 @@
 //! source's schema from its author-declared `schema:` block, typechecks
 //! every Transform/Aggregate/Route body against the upstream Row, and
 //! propagates the output Row downstream. Result: a `CompileArtifacts`
-//! map keyed by node name holding one `Arc<TypedProgram>` per CXL-bearing
-//! node.
+//! map keyed by each node's `ScopedNodeId` holding one `Arc<TypedProgram>`
+//! per CXL-bearing node.
 //!
 //! For `PipelineNode::Composition` nodes, `bind_composition` recursively
 //! binds the composition body at the call-site boundary using
@@ -54,7 +54,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 
 /// Scope a plan node lives in. Top-level pipeline, or a specific composition body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeScope {
     TopLevel,
     Body(crate::plan::composition_body::CompositionBodyId),
@@ -64,17 +64,26 @@ pub enum NodeScope {
 /// can hold same-named nodes; this pair disambiguates them where a bare node
 /// name would collide. Mirrors dbt's `<package>.<name>` and Beam's hierarchical
 /// node name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopedNodeId {
     pub scope: NodeScope,
     pub name: String,
 }
 
-/// Compile artifacts produced by `bind_schema` — one entry per node name
+/// Compile artifacts produced by `bind_schema` — one entry per node
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
-    pub typed: HashMap<String, Arc<TypedProgram>>,
+    /// Per-node typed CXL program (transform/aggregate/combine-body plus
+    /// the synthetic pass-through programs for Source/Merge/Output/etc.),
+    /// keyed by the node's [`ScopedNodeId`]. The scope qualifier keeps a
+    /// node named the same in two composition scopes — or a top-level node
+    /// sharing a name with a composition-body node — from colliding in this
+    /// shared table; before scope-keying the last writer silently won.
+    /// Acts as the bind → lowering handoff (lowering reads each node's
+    /// program off the scope-correct key to stamp the node) and as the
+    /// compile-time `$doc` path-walk source.
+    pub typed: HashMap<ScopedNodeId, Arc<TypedProgram>>,
     /// Per-Combine `where:` predicate typed programs, keyed by the
     /// combine node's [`ScopedNodeId`]. The node-keyed `typed` map stores
     /// only a Combine's `cxl:` body; the `where:` predicate is decomposed
@@ -169,6 +178,47 @@ pub struct CompileArtifacts {
 }
 
 impl CompileArtifacts {
+    /// Look up a node's typed CXL program by its scope-qualified identity.
+    /// The lookup allocates the key's `String`; the table is per-node and
+    /// only read at compile time and executor startup, so this is not hot.
+    pub fn typed_get(&self, scope: NodeScope, name: &str) -> Option<&Arc<TypedProgram>> {
+        self.typed.get(&ScopedNodeId {
+            scope,
+            name: name.to_string(),
+        })
+    }
+
+    /// Whether a typed program is recorded for `(scope, name)`.
+    pub fn typed_contains(&self, scope: NodeScope, name: &str) -> bool {
+        self.typed_get(scope, name).is_some()
+    }
+
+    /// Record a node's typed CXL program under its scope-qualified identity.
+    pub fn typed_insert(
+        &mut self,
+        scope: NodeScope,
+        name: impl Into<String>,
+        prog: Arc<TypedProgram>,
+    ) {
+        self.typed.insert(
+            ScopedNodeId {
+                scope,
+                name: name.into(),
+            },
+            prog,
+        );
+    }
+
+    /// Drop a node's typed CXL program by its scope-qualified identity.
+    /// Used by N-ary combine decomposition when the original combine's
+    /// name leaves the graph.
+    pub fn typed_remove(&mut self, scope: NodeScope, name: &str) -> Option<Arc<TypedProgram>> {
+        self.typed.remove(&ScopedNodeId {
+            scope,
+            name: name.to_string(),
+        })
+    }
+
     /// Allocate a fresh, unique `CompositionBodyId`.
     pub fn fresh_body_id(&mut self) -> CompositionBodyId {
         let id = CompositionBodyId(self.next_body_id);
@@ -368,7 +418,7 @@ fn validate_init_phase_isolation(
 
     for (reader_name, read_span, typed_keys) in readers {
         for typed_key in &typed_keys {
-            let Some(typed) = artifacts.typed.get(typed_key) else {
+            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, typed_key) else {
                 continue;
             };
             let mut reads: Vec<(VarScope, String)> = Vec::new();
@@ -481,12 +531,14 @@ fn validate_post_merge_source_reads(
             continue;
         };
         let mut typed_keys: Vec<String> = Vec::new();
-        if spanned.value.reads_scope_vars_in_cxl() && artifacts.typed.contains_key(&reader_name) {
+        if spanned.value.reads_scope_vars_in_cxl()
+            && artifacts.typed_contains(NodeScope::TopLevel, &reader_name)
+        {
             typed_keys.push(reader_name.clone());
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
-            let Some(typed) = artifacts.typed.get(&key) else {
+            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, &key) else {
                 continue;
             };
             let mut reads: Vec<(crate::config::VarScope, String)> = Vec::new();
@@ -603,12 +655,14 @@ fn validate_read_after_write(
     for spanned in nodes {
         let reader_name = spanned.value.name().to_string();
         let mut typed_keys: Vec<String> = Vec::new();
-        if spanned.value.reads_scope_vars_in_cxl() && artifacts.typed.contains_key(&reader_name) {
+        if spanned.value.reads_scope_vars_in_cxl()
+            && artifacts.typed_contains(NodeScope::TopLevel, &reader_name)
+        {
             typed_keys.push(reader_name.clone());
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
-            let Some(typed) = artifacts.typed.get(&key) else {
+            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, &key) else {
                 continue;
             };
             let mut reads: Vec<(VarScope, String)> = Vec::new();
@@ -1207,6 +1261,10 @@ struct ReshapeNodeBinding<'a> {
     upstream: &'a Row,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+    /// Scope this reshape is bound in, copied from `BindContext.current_scope`
+    /// at the call site. Stamps the `typed` table key so a reshape named the
+    /// same in two composition scopes does not collide.
+    scope: NodeScope,
 }
 
 /// Bind a `PipelineNode::Reshape`: validate `partition_by` against the
@@ -1236,6 +1294,7 @@ fn bind_reshape(
         upstream,
         span,
         scoped_vars,
+        scope,
     } = node;
     let mut ok = true;
 
@@ -1425,9 +1484,12 @@ fn bind_reshape(
     // spilled (i.e. on the memory budget). Rather than silently differ, fail
     // loud here until envelope context survives the spill round-trip.
     if ok {
-        let programs: Vec<(&str, &TypedProgram)> = typed_fragments
+        // Reshape rule fragments carry no scope ambiguity (they are
+        // labels within one node's rule set), so attribute by the bare
+        // label `String`.
+        let programs: Vec<(String, &TypedProgram)> = typed_fragments
             .iter()
-            .map(|(label, typed)| (label.as_str(), typed))
+            .map(|(label, typed)| (label.clone(), typed))
             .collect();
         let doc_paths = cxl::analyzer::doc_paths::collect_doc_paths(&programs);
         // Any `$doc` reference disqualifies the rule — both statically-resolved
@@ -1489,9 +1551,11 @@ fn bind_reshape(
     );
     let out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
     schema_by_name.insert(name.to_string(), out.clone());
-    artifacts
-        .typed
-        .insert(name.to_string(), Arc::new(synthetic_typed_program(out)));
+    artifacts.typed_insert(
+        scope,
+        name.to_string(),
+        Arc::new(synthetic_typed_program(out)),
+    );
 }
 
 /// Borrowed inputs for binding one `PipelineNode::Cull`.
@@ -1505,6 +1569,10 @@ struct CullNodeBinding<'a> {
     upstream: &'a Row,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+    /// Scope this cull is bound in, copied from `BindContext.current_scope`
+    /// at the call site. Stamps the `typed` table key so a cull named the
+    /// same in two composition scopes does not collide.
+    scope: NodeScope,
 }
 
 /// Bind a `PipelineNode::Cull`: validate `partition_by` / `order_by`
@@ -1535,6 +1603,7 @@ fn bind_cull(
         upstream,
         span,
         scoped_vars,
+        scope,
     } = node;
     let mut ok = true;
 
@@ -1656,9 +1725,11 @@ fn bind_cull(
     // identical schema on the main and `removed_to` ports.
     let out = upstream.clone();
     schema_by_name.insert(name.to_string(), out.clone());
-    artifacts
-        .typed
-        .insert(name.to_string(), Arc::new(synthetic_typed_program(out)));
+    artifacts.typed_insert(
+        scope,
+        name.to_string(),
+        Arc::new(synthetic_typed_program(out)),
+    );
 }
 
 // ─── Internal recursive bind_schema ─────────────────────────────────
@@ -1802,9 +1873,11 @@ fn bind_schema_inner(
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
                 schema_by_name.insert(name.clone(), row.clone());
-                artifacts
-                    .typed
-                    .insert(name, Arc::new(synthetic_typed_program(row)));
+                artifacts.typed_insert(
+                    bind_ctx.current_scope,
+                    name,
+                    Arc::new(synthetic_typed_program(row)),
+                );
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
@@ -1838,7 +1911,7 @@ fn bind_schema_inner(
                         let out = propagate_row(&upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
-                        artifacts.typed.insert(name, Arc::new(typed));
+                        artifacts.typed_insert(bind_ctx.current_scope, name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
@@ -1928,7 +2001,7 @@ fn bind_schema_inner(
                         let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
-                        artifacts.typed.insert(name, Arc::new(typed));
+                        artifacts.typed_insert(bind_ctx.current_scope, name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
@@ -1945,7 +2018,11 @@ fn bind_schema_inner(
                         &bind_ctx.scoped_vars,
                     ) {
                         empty.output_row = cloned.clone();
-                        artifacts.typed.insert(name.clone(), Arc::new(empty));
+                        artifacts.typed_insert(
+                            bind_ctx.current_scope,
+                            name.clone(),
+                            Arc::new(empty),
+                        );
                     }
                     // Type-check each branch condition into its own program
                     // so the compile-time `$doc` walk can reach an envelope
@@ -2047,18 +2124,22 @@ fn bind_schema_inner(
                 {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
-                    artifacts
-                        .typed
-                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                    artifacts.typed_insert(
+                        bind_ctx.current_scope,
+                        name,
+                        Arc::new(synthetic_typed_program(row)),
+                    );
                 }
             }
             PipelineNode::Output { header, .. } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
-                    artifacts
-                        .typed
-                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                    artifacts.typed_insert(
+                        bind_ctx.current_scope,
+                        name,
+                        Arc::new(synthetic_typed_program(row)),
+                    );
                 }
             }
             PipelineNode::Reshape { header, config } => {
@@ -2071,6 +2152,7 @@ fn bind_schema_inner(
                             upstream: &upstream,
                             span,
                             scoped_vars: &bind_ctx.scoped_vars,
+                            scope: bind_ctx.current_scope,
                         },
                         diags,
                         artifacts,
@@ -2088,6 +2170,7 @@ fn bind_schema_inner(
                             upstream: &upstream,
                             span,
                             scoped_vars: &bind_ctx.scoped_vars,
+                            scope: bind_ctx.current_scope,
                         },
                         diags,
                         artifacts,
@@ -2126,9 +2209,11 @@ fn bind_schema_inner(
                             .envelope_synthesis
                             .insert(name.clone(), Arc::new(synthesis));
                     }
-                    artifacts
-                        .typed
-                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                    artifacts.typed_insert(
+                        bind_ctx.current_scope,
+                        name,
+                        Arc::new(synthetic_typed_program(row)),
+                    );
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
@@ -2506,7 +2591,13 @@ fn bind_composition(
         // the strict default; `apply_retraction_flags` rewrites it.
         let lower_ctx = crate::config::LoweringCtx::default();
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
-            n, &n_name, body_span, artifacts, &lower_ctx, diags,
+            n,
+            &n_name,
+            NodeScope::Body(body_id),
+            body_span,
+            artifacts,
+            &lower_ctx,
+            diags,
         ) {
             let idx = body_graph.add_node(plan_node);
             body_name_to_idx.insert(n_name, idx);
@@ -4269,7 +4360,8 @@ fn bind_combine(
         }
         let output_row = Row::closed(output_decl, cxl_span);
         schema_by_name.insert(name.to_string(), output_row.clone());
-        artifacts.typed.insert(
+        artifacts.typed_insert(
+            scope,
             name.to_string(),
             Arc::new(synthetic_typed_program(output_row)),
         );
@@ -4366,9 +4458,7 @@ fn bind_combine(
         .combine_resolved_columns
         .insert(name.to_string(), Arc::new(resolved_map));
 
-    artifacts
-        .typed
-        .insert(name.to_string(), Arc::new(body_typed));
+    artifacts.typed_insert(scope, name.to_string(), Arc::new(body_typed));
 }
 
 /// Walk every `Expr::QualifiedFieldRef { parts: [qualifier, name] }` in

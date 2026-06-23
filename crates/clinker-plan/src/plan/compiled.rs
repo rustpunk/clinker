@@ -61,10 +61,11 @@ impl CompiledPlan {
         &self.config
     }
 
-    /// Compile-time CXL typecheck artifacts — one entry per
-    /// CXL-bearing node (Transform/Aggregate/Route) keyed by node name.
-    /// The runtime executor reads this map directly to pull each
-    /// transform's `Arc<TypedProgram>` instead of re-typechecking.
+    /// Compile-time CXL typecheck artifacts — one entry per CXL-bearing
+    /// node keyed by its `ScopedNodeId` (so a top-level node and a
+    /// composition-body node sharing a name stay distinct). The runtime
+    /// executor reads this map to pull each node's `Arc<TypedProgram>`
+    /// instead of re-typechecking.
     pub fn artifacts(&self) -> &CompileArtifacts {
         &self.artifacts
     }
@@ -77,12 +78,16 @@ impl CompiledPlan {
         self.artifacts.body_of(id)
     }
 
-    /// Look up the bound output row type for a node by name.
+    /// Look up the bound output row type for a top-level node by name.
     ///
     /// Returns `None` for nodes that didn't participate in `bind_schema`
-    /// (e.g. compositions whose binding failed).
+    /// (e.g. compositions whose binding failed). Only top-level nodes are
+    /// visible here; composition-body programs live under their `Body`
+    /// scope in the `typed` table and are reached via [`Self::body_of`].
     pub fn typed_output_row(&self, name: &str) -> Option<&Row> {
-        self.artifacts.typed.get(name).map(|tp| &tp.output_row)
+        self.artifacts
+            .typed_get(crate::plan::bind_schema::NodeScope::TopLevel, name)
+            .map(|tp| &tp.output_row)
     }
 
     /// Side-table of provenance-tracked config values for composition nodes.

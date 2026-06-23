@@ -13,4 +13,5 @@ mod explain_polish;
 mod plan_time_window_root;
 mod reshape_validation;
 mod route_ports;
+mod typed_scoped_key;
 mod watermark_validation;
