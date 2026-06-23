@@ -313,10 +313,9 @@ pub enum PlanNode {
         /// the node is not lowered).
         #[serde(skip)]
         typed: Arc<TypedProgram>,
-        /// `true` iff the typed program contains a `distinct` statement —
-        /// the same scan `CompiledTransform::has_distinct` performed.
-        /// Threaded into the per-group `ProgramEvaluator`. Computed at
-        /// lowering from `typed`.
+        /// `true` iff the typed program contains a `distinct` statement.
+        /// Threaded into the per-group `ProgramEvaluator` so the executor
+        /// reads it off the node. Computed at lowering from `typed`.
         #[serde(skip)]
         has_distinct: bool,
         strategy: AggregateStrategy,

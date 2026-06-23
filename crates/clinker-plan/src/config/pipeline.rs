@@ -3593,8 +3593,8 @@ pub(crate) fn lower_node_to_plan_node(
             let output_schema = schema_from_bound(name);
             // Carry the typed program and its distinct-ness on the node so the
             // executor builds its per-group evaluator off the node instead of a
-            // scope-keyed startup table; `has_distinct` is the same scan
-            // `CompiledTransform::has_distinct` performed.
+            // scope-keyed startup table; `has_distinct` records whether the
+            // typed program contains a `distinct` statement.
             let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Aggregation {
                 name: name.to_string(),
