@@ -440,9 +440,7 @@ pub(crate) fn push_write_error(
 
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{
-    CompiledRoute, CompiledTransform, DlqEntry, evaluate_single_transform, stage_metrics,
-};
+use crate::executor::{CompiledRoute, DlqEntry, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
 use clinker_plan::plan::bind_schema::CompileArtifacts;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -459,10 +457,6 @@ use clinker_record::Schema;
 ///   mini-DAG without duplicating arm logic.
 /// * `output_configs` / `primary_output` — output sinks and the
 ///   declaration-order primary used as the fallback projection target.
-/// * `transform_by_name` — (scope → name) → index into
-///   `compiled_transforms`; resolve via [`ExecutorContext::transform_idx`].
-/// * `compiled_transforms` — precompiled CXL programs for Transform and
-///   Aggregation arms.
 /// * `stable` / `source_batch_arc` / `strategy` — pipeline-stable scalars
 ///   reused at every per-record dispatch site.
 ///
@@ -492,9 +486,6 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) artifacts: &'a CompileArtifacts,
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
-    pub(crate) compiled_transforms: &'a [CompiledTransform],
-    pub(crate) transform_by_name:
-        HashMap<clinker_plan::plan::bind_schema::NodeScope, HashMap<&'a str, usize>>,
     pub(crate) stable: &'a StableEvalContext,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
@@ -1022,32 +1013,6 @@ pub(crate) struct RetainedAggregatorState {
 }
 
 impl<'a> ExecutorContext<'a> {
-    /// The scope the dispatcher is currently executing in: the innermost
-    /// composition body on `window_runtime.active_stack`, or `TopLevel` when
-    /// the stack is empty (the top-level DAG walk).
-    pub(crate) fn current_node_scope(&self) -> clinker_plan::plan::bind_schema::NodeScope {
-        use clinker_plan::plan::bind_schema::NodeScope;
-        self.window_runtime
-            .active_stack
-            .last()
-            .copied()
-            .map(NodeScope::Body)
-            .unwrap_or(NodeScope::TopLevel)
-    }
-
-    /// Resolve a node's `CompiledTransform` index by its scope-qualified
-    /// identity — the current execution scope plus the bare node name — so a
-    /// body transform named the same as a top-level (or sibling-body)
-    /// transform selects its own program instead of a colliding bare-name
-    /// entry. `None` when no compiled program is registered for that node
-    /// (e.g. a top-level aggregate, which carries its logic on the node).
-    pub(crate) fn transform_idx(&self, name: &str) -> Option<usize> {
-        self.transform_by_name
-            .get(&self.current_node_scope())?
-            .get(name)
-            .copied()
-    }
-
     /// Poll the run's shutdown flag at an operator chunk boundary. When
     /// the token has tripped (SIGINT/SIGTERM, or a programmatic
     /// request), record the interruption and return
@@ -2379,7 +2344,17 @@ pub(crate) fn transform_fused_consume(
         }
     };
 
-    let transform_idx_opt = ctx.transform_idx(name);
+    // The typed program + fan-out ceiling come off the `PlanNode::Transform`
+    // payload. `None` is the defensive pass-through (a node that did not lower
+    // carries no program); the fused loop forwards records unevaluated.
+    let transform_payload = match &current_dag.graph[node_idx] {
+        PlanNode::Transform {
+            resolved: Some(p),
+            has_distinct,
+            ..
+        } => Some((Arc::clone(&p.typed), p.max_expansion, *has_distinct)),
+        _ => None,
+    };
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
         .cloned();
@@ -2414,13 +2389,10 @@ pub(crate) fn transform_fused_consume(
         ctx.streaming_charge_handle(node_idx, name, spill_allowed)
     });
 
-    let mut evaluator_opt: Option<ProgramEvaluator> = transform_idx_opt.map(|idx| {
-        ProgramEvaluator::with_max_expansion(
-            Arc::clone(&ctx.compiled_transforms[idx].typed),
-            ctx.compiled_transforms[idx].has_distinct(),
-            ctx.compiled_transforms[idx].max_expansion,
-        )
-    });
+    let mut evaluator_opt: Option<ProgramEvaluator> =
+        transform_payload.map(|(typed, max_expansion, has_distinct)| {
+            ProgramEvaluator::with_max_expansion(typed, has_distinct, max_expansion)
+        });
 
     let rx = ctx
         .source_records
@@ -2627,8 +2599,7 @@ pub(crate) fn transform_fused_consume(
                 }
             } else {
                 // Transform has no compiled CXL — passthrough behavior
-                // mirrors the buffered arm's `transform_by_name.get` miss
-                // at the top of the existing path.
+                // mirrors the buffered arm's absent-payload pass-through.
                 let advance_source = source_name_arc_of(&rec);
                 event_batcher.push_record(rec, rn)?;
                 advance_cursor(ctx, &advance_source, rn);

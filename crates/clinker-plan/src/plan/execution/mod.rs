@@ -304,6 +304,20 @@ pub enum PlanNode {
         config: AggregateConfig,
         #[serde(skip)]
         compiled: Arc<CompiledAggregate>,
+        /// Typechecked CXL `aggregate:` program the executor evaluates per
+        /// group. Carried on the node — mirroring `PlanTransformPayload.typed`
+        /// — so the runtime builds its `ProgramEvaluator` off the node it is
+        /// dispatching instead of from a scope-keyed startup table. Populated
+        /// at lowering from `artifacts.typed_get(scope, name)`; never `None`
+        /// (a CXL typecheck failure surfaces as a compile-time diagnostic and
+        /// the node is not lowered).
+        #[serde(skip)]
+        typed: Arc<TypedProgram>,
+        /// `true` iff the typed program contains a `distinct` statement.
+        /// Threaded into the per-group `ProgramEvaluator` so the executor
+        /// reads it off the node. Computed at lowering from `typed`.
+        #[serde(skip)]
+        has_distinct: bool,
         strategy: AggregateStrategy,
         #[serde(skip)]
         output_schema: Arc<Schema>,
@@ -515,6 +529,11 @@ pub struct PlanTransformPayload {
     /// `phase: init` runs the transform (and its transitive ancestors)
     /// to completion before any runtime-phase node sees a record.
     pub phase: crate::config::pipeline_node::Phase,
+    /// `emit each` per-record fan-out ceiling, carried on the node so the
+    /// executor reads it off the `PlanNode::Transform` it is dispatching
+    /// rather than from a startup-built side table. Populated at lowering
+    /// from the authored `TransformBody::max_expansion`.
+    pub max_expansion: u64,
 }
 
 /// Fully-resolved Output payload.

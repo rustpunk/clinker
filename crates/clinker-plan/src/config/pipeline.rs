@@ -3462,6 +3462,7 @@ pub(crate) fn lower_node_to_plan_node(
                     typed,
                     declares: config.declares.clone(),
                     phase: config.phase,
+                    max_expansion: config.max_expansion,
                 })),
                 parallelism_class,
                 tier: 0,
@@ -3590,11 +3591,18 @@ pub(crate) fn lower_node_to_plan_node(
             // `finalize_group_inner` had no slot to populate from the
             // group key.
             let output_schema = schema_from_bound(name);
+            // Carry the typed program and its distinct-ness on the node so the
+            // executor builds its per-group evaluator off the node instead of a
+            // scope-keyed startup table; `has_distinct` records whether the
+            // typed program contains a `distinct` statement.
+            let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Aggregation {
                 name: name.to_string(),
                 span,
                 config: agg_cfg,
                 compiled: Arc::new(compiled_agg),
+                typed,
+                has_distinct,
                 strategy: AggregateStrategy::Hash,
                 output_schema,
                 fallback_reason: None,
