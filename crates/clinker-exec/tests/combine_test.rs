@@ -1376,7 +1376,7 @@ nodes:
     }
 
     /// Compile a fixture and return the full `CompiledPlan` so tests can
-    /// reach `.dag()`, `.config()`, and `.artifacts()` without re-running
+    /// reach `.dag()`, `.config()`, and `.statistics()` without re-running
     /// the lowering pipeline. Mirrors `compile_plan`'s scratch-path opt-in.
     fn compile_full_plan(config: &PipelineConfig) -> clinker_plan::plan::CompiledPlan {
         let ctx = clinker_plan::config::CompileContext {
@@ -1402,7 +1402,7 @@ nodes:
 
         let text = plan
             .dag()
-            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+            .explain_text_with_statistics(plan.config(), plan.statistics());
 
         assert!(
             text.contains("Combine 'bracketed':"),
@@ -1447,7 +1447,7 @@ nodes:
 
         let text = plan
             .dag()
-            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+            .explain_text_with_statistics(plan.config(), plan.statistics());
 
         assert!(
             text.contains("Combine 'fully_enriched' (3 inputs, binary decomposition):"),
@@ -1483,7 +1483,7 @@ nodes:
         let config = parse_fixture(&yaml);
         let plan = compile_full_plan(&config);
 
-        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.statistics());
         let json: serde_json::Value =
             serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
 
@@ -1576,46 +1576,34 @@ nodes:
         }
     }
 
-    /// Gate: a combine whose `combine_predicates` entry is missing (no
-    /// decomposed predicate stored — the kind of state a compile-time
-    /// E303 leaves the artifacts side-table in) must not panic during
-    /// explain rendering. Mirrors the existing `display_name()` defensive
-    /// rendering at execution.rs that falls back to `<unselected>` for an
-    /// empty driving input. We construct this state by compiling a
-    /// successful plan and then mutating the artifacts to drop the
-    /// predicate entry — closer to the real failure mode (artifacts
-    /// state inconsistent with PlanNode) than fabricating a synthetic
-    /// PlanNode from scratch.
+    /// Gate: the combine block's header and `Predicate: equalities=...`
+    /// count summary render off the node, not from a compile-time
+    /// side-table. Explain reads `predicate_summary` / `decomposed_predicate`
+    /// off the `PlanNode`; the statistics catalog only backs the row
+    /// estimates. So the header + summary render without panicking
+    /// regardless of predicate-detail availability.
     #[test]
-    fn test_explain_combine_with_e3xx_error() {
-        use std::collections::HashMap;
-
+    fn test_explain_combine_block_renders_off_node() {
         let yaml = load_fixture("two_input_equi.yaml");
         let config = parse_fixture(&yaml);
         let plan = compile_full_plan(&config);
 
-        // Build a CompileArtifacts mirror with an empty
-        // combine_predicates table. The rest of the side-tables stay
-        // intact (combine_inputs etc.) because the explain block falls
-        // back to summary-only when predicate detail is unavailable —
-        // it doesn't crash through downstream lookups.
-        let original = plan.artifacts();
-        let mut censored = original.clone();
-        censored.combine_predicates = HashMap::new();
-
+        // The combine block's header and `Predicate: equalities=...` count
+        // summary render off the node (`predicate_summary` /
+        // `decomposed_predicate` on `PlanNode::Combine`); the statistics
+        // catalog only backs the row estimates. No compile-time predicate
+        // side-table is consulted, so the block renders straight from the
+        // lowered plan.
         let text = plan
             .dag()
-            .explain_text_with_artifacts(plan.config(), &censored);
-        // The block still renders — header + summary line — without
-        // panic. The detail bucket headers (Equalities:/Ranges:/
-        // Residual:) are absent because the predicate is unreachable.
+            .explain_text_with_statistics(plan.config(), plan.statistics());
         assert!(
             text.contains("Combine 'enriched':"),
-            "explain must still render the block header on missing predicate; got:\n{text}",
+            "explain must render the combine block header; got:\n{text}",
         );
         assert!(
             text.contains("Predicate: equalities="),
-            "explain must still render the count summary on missing predicate; got:\n{text}",
+            "explain must render the count summary line; got:\n{text}",
         );
     }
 
@@ -1667,7 +1655,7 @@ nodes:
 
         let text = plan
             .dag()
-            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+            .explain_text_with_statistics(plan.config(), plan.statistics());
         assert!(
             text.contains("(8 inputs, binary decomposition):"),
             "8-input combine must label the group header with `(8 inputs, binary decomposition):`; got:\n{text}",
@@ -1697,13 +1685,13 @@ nodes:
 
         let text = plan
             .dag()
-            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+            .explain_text_with_statistics(plan.config(), plan.statistics());
         assert!(
             text.contains("Match: collect"),
             "match: collect must surface in the text explain block; got:\n{text}",
         );
 
-        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let view = clinker_plan::plan::execution::ExplainJson::new(plan.dag(), plan.statistics());
         let json: serde_json::Value =
             serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
         let nodes = json["nodes"]

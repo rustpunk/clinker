@@ -2214,7 +2214,7 @@ impl PipelineConfig {
             }
         }
 
-        let plan = CompiledPlan::new(dag, runtime_config, artifacts);
+        let plan = CompiledPlan::from_compile(dag, runtime_config, artifacts);
         Ok((plan, diags))
     }
 }

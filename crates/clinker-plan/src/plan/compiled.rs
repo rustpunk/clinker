@@ -3,14 +3,34 @@
 //! `CompiledPlan` is the typed-handle output of the
 //! [`crate::config::PipelineConfig::compile`] lowering path. It wraps
 //! a validated `PipelineConfig`, its lowered DAG, and the
-//! compile-time CXL typecheck artifacts produced by
-//! [`crate::plan::bind_schema::bind_schema`].
-
-use cxl::typecheck::Row;
+//! runtime-retained slice of the compile artifacts: the bound
+//! composition bodies, the statistics catalog, and the provenance
+//! side-table. The transient compile scratch (per-node typed CXL
+//! programs, combine metadata, the `PlanNodeId` mint counters) lives on
+//! [`CompileArtifacts`] only during compilation and is dropped when the
+//! plan is built — it never enters `CompiledPlan`. Tests that need to
+//! inspect that scratch call [`crate::plan::bind_schema::bind_schema`]
+//! directly (the same entry point `compile` consumes) and read the
+//! returned [`CompileArtifacts`]; post-lowering state (deferred regions,
+//! body assignments) is reachable off the slim plan via [`Self::dag`] and
+//! [`Self::body_of`].
+//!
+//! ## Deriving a node's scoped lineage (klinx export)
+//!
+//! `PlanNodeId` is the sole internal identity; it carries no scope. A
+//! human-readable scoped path (`Outer/Inner/name`) is *derived*, never
+//! keyed: a top-level node lives in [`Self::dag`]; a composition-body
+//! node lives in the graph of the [`BoundBody`] whose
+//! `CompositionBodyId` indexes [`Self::composition_bodies`]. Walk those
+//! graphs to find the node carrying a given `PlanNodeId`, read its
+//! `name`, and prefix the scope's body name(s). No materialized
+//! `PlanNodeId → (scope, name)` map exists because the only consumer is
+//! the out-of-tree klinx exporter; an in-tree map would be unused.
 
 use super::bind_schema::CompileArtifacts;
-use super::composition_body::{BoundBody, CompositionBodyId};
+use super::composition_body::{BoundBody, CompositionBodies, CompositionBodyId};
 use super::execution::ExecutionPlanDag;
+use super::statistics::StatisticsCatalog;
 use crate::config::PipelineConfig;
 use crate::config::composition::ProvenanceDb;
 
@@ -29,7 +49,15 @@ pub struct ChannelIdentity {
 pub struct CompiledPlan {
     dag: ExecutionPlanDag,
     config: PipelineConfig,
-    artifacts: CompileArtifacts,
+    /// Bound composition bodies the executor re-enters at runtime. The
+    /// top-level pipeline is NOT here — it lives on `dag` directly.
+    composition_bodies: CompositionBodies,
+    /// Planner-wide column-statistics catalog, seeded into the runtime
+    /// accumulator and consulted by `--explain` row estimates.
+    statistics: StatisticsCatalog,
+    /// Provenance-tracked config values, queried by the `--field`
+    /// provenance path and mutated by channel overlay application.
+    provenance: ProvenanceDb,
     channel_identity: Option<ChannelIdentity>,
     /// BLAKE3 of the post-env-var-interpolated source YAML, copied
     /// from `PipelineConfig.source_hash` at compile time. Zero array
@@ -38,16 +66,28 @@ pub struct CompiledPlan {
 }
 
 impl CompiledPlan {
-    pub(crate) fn new(
+    /// Build a slim plan from a finished compile, moving the
+    /// runtime-retained fields out of `artifacts` and dropping the
+    /// transient compile scratch. Called once, at the tail of
+    /// [`crate::config::PipelineConfig::compile_with_diagnostics`].
+    pub(crate) fn from_compile(
         dag: ExecutionPlanDag,
         config: PipelineConfig,
         artifacts: CompileArtifacts,
     ) -> Self {
         let pipeline_hash = config.source_hash;
+        let CompileArtifacts {
+            composition_bodies,
+            statistics,
+            provenance,
+            ..
+        } = artifacts;
         Self {
             dag,
             config,
-            artifacts,
+            composition_bodies,
+            statistics,
+            provenance,
             channel_identity: None,
             pipeline_hash,
         }
@@ -61,13 +101,18 @@ impl CompiledPlan {
         &self.config
     }
 
-    /// Compile-time CXL typecheck artifacts — one entry per CXL-bearing
-    /// node keyed by its `PlanNodeId` (so a top-level node and a
-    /// composition-body node sharing a name get distinct ids and stay
-    /// distinct). The runtime executor reads this map to pull each node's
-    /// `Arc<TypedProgram>` instead of re-typechecking.
-    pub fn artifacts(&self) -> &CompileArtifacts {
-        &self.artifacts
+    /// Bound composition bodies the executor re-enters. The executor
+    /// reads this to step into each `PipelineNode::Composition`'s
+    /// mini-DAG; tooling walks it for body drill-in.
+    pub fn composition_bodies(&self) -> &CompositionBodies {
+        &self.composition_bodies
+    }
+
+    /// Planner-wide column-statistics catalog. Cloned into the runtime
+    /// accumulator at executor entry and read by `--explain` row
+    /// estimates.
+    pub fn statistics(&self) -> &StatisticsCatalog {
+        &self.statistics
     }
 
     /// Look up a composition body by its ID.
@@ -75,35 +120,21 @@ impl CompiledPlan {
     /// Returns the `BoundBody` containing the composition's expanded nodes,
     /// bound schemas, and port rows. Used by tooling for drill-in rendering.
     pub fn body_of(&self, id: CompositionBodyId) -> Option<&BoundBody> {
-        self.artifacts.body_of(id)
-    }
-
-    /// Look up the bound output row type for a top-level node by name.
-    ///
-    /// Returns `None` for nodes that didn't participate in `bind_schema`
-    /// (e.g. compositions whose binding failed). Only top-level nodes are
-    /// visible here; composition-body programs are keyed by their own
-    /// `PlanNodeId` in the `typed` table and are reached via
-    /// [`Self::body_of`]. Resolves the name to its top-level `PlanNodeId`
-    /// through the declaration-order id vector (top-level names are
-    /// unique).
-    pub fn typed_output_row(&self, name: &str) -> Option<&Row> {
-        let id = self.artifacts.top_level_id(&self.config.nodes, name)?;
-        self.artifacts.typed_get(id).map(|tp| &tp.output_row)
+        self.composition_bodies.get(&id)
     }
 
     /// Side-table of provenance-tracked config values for composition nodes.
     /// Populated during `bind_schema`; consumed by tooling inspectors and
     /// channel overlay.
     pub fn provenance(&self) -> &ProvenanceDb {
-        &self.artifacts.provenance
+        &self.provenance
     }
 
     /// Mutable access to the provenance side-table for channel overlay
     /// application. The overlay applies `ChannelDefault`/`ChannelFixed`
     /// layers to existing `ResolvedValue` entries.
     pub fn provenance_mut(&mut self) -> &mut ProvenanceDb {
-        &mut self.artifacts.provenance
+        &mut self.provenance
     }
 
     /// The channel identity stamped by [`apply_channel_overlay`], if any.

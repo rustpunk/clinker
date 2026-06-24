@@ -156,7 +156,6 @@ pub(crate) fn orchestrate(
     // contract be exercised with a synthetic small cap; production
     // callers always see the structural value.
     let body_node_count: usize = ctx
-        .artifacts
         .composition_bodies
         .values()
         .map(|b| b.graph.node_count())
@@ -371,9 +370,9 @@ fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag
         else {
             return false;
         };
-        ctx.artifacts.body_of(*body).is_some_and(|b| {
+        ctx.composition_bodies.get(body).is_some_and(|b| {
             clinker_plan::plan::composition_body::body_or_descendants_have_deferred_region(
-                ctx.artifacts,
+                ctx.composition_bodies,
                 b,
             )
         })

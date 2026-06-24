@@ -96,7 +96,7 @@ pub(crate) fn detect_retract_scope(
             _ => None,
         })
         .collect();
-    for body in ctx.artifacts.composition_bodies.values() {
+    for body in ctx.composition_bodies.values() {
         for idx in body.graph.node_indices() {
             if let PlanNode::Aggregation { name, .. } = &body.graph[idx] {
                 aggregate_idx_by_name.entry(name.clone()).or_insert(idx);

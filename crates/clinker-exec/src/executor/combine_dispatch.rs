@@ -56,14 +56,15 @@ pub(crate) fn dispatch_combine(
         ref resolved_column_map,
         ref propagate_ck,
         // Typed `cxl:` body program carried on the node (like
-        // `PlanTransformPayload.typed`). Read here instead of re-fetching
-        // from the name-keyed `ctx.artifacts.typed` map. A lowered combine
-        // with a body has `Some`; body-less steps (`match: collect`,
-        // synthetic non-final N-ary steps) have `None`.
+        // `PlanTransformPayload.typed`). The runtime context carries no
+        // typed-program table, so the program is read off this node
+        // instance. A lowered combine with a body has `Some`; body-less
+        // steps (`match: collect`, synthetic non-final N-ary steps) have
+        // `None`.
         typed: ref body_typed_on_node,
         // Per-input metadata and the decomposed `where:` predicate, carried
-        // on the node for the same reason as `typed`: a bare-name lookup into
-        // `ctx.artifacts` is last-writer-wins across same-named combines in
+        // on the node for the same reason as `typed`: a single name-keyed
+        // side-table would be last-writer-wins across same-named combines in
         // sibling composition bodies, so reading them off this node instance
         // is what makes the runtime join scope-correct.
         combine_inputs: ref combine_inputs_on_node,

@@ -112,8 +112,7 @@ nodes:
 
     // The body's BoundBody must carry a single IndexSpec rooted at
     // the body's Aggregate node.
-    let artifacts = plan.artifacts();
-    let bodies: Vec<_> = artifacts.composition_bodies.values().collect();
+    let bodies: Vec<_> = plan.composition_bodies().values().collect();
     assert_eq!(bodies.len(), 1, "exactly one composition body");
     let body = bodies[0];
     assert_eq!(
@@ -183,8 +182,7 @@ nodes:
         .find(|i| dag.graph[*i].name() == "src")
         .expect("parent DAG carries src");
 
-    let artifacts = plan.artifacts();
-    let bodies: Vec<_> = artifacts.composition_bodies.values().collect();
+    let bodies: Vec<_> = plan.composition_bodies().values().collect();
     assert_eq!(bodies.len(), 1, "one body");
     let body = bodies[0];
     assert_eq!(body.body_indices_to_build.len(), 1, "one body IndexSpec");

@@ -376,16 +376,35 @@ nodes:
     include_unmapped: true
 "#;
     let config = parse_config(yaml).expect("parse pipeline yaml");
-    let plan = PipelineConfig::compile(&config, &CompileContext::default())
-        .expect("same-policy merge must compile cleanly");
-    let row = plan
-        .typed_output_row("merged")
+    // The merge node's cxl output Row comes off `bind_schema` artifacts (the
+    // `pub` compile-scratch entry point); the lowered `PlanNode::Merge.
+    // output_schema` assertion below reads the slim plan's DAG. This fixture
+    // is composition-free, so the symbol table is empty.
+    let ctx = CompileContext::default();
+    let symbol_table = indexmap::IndexMap::new();
+    let mut diags = Vec::new();
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
+        &config.nodes,
+        &mut diags,
+        &ctx,
+        &symbol_table,
+        std::path::Path::new(""),
+        Default::default(),
+    );
+    let merged_id = artifacts
+        .top_level_id(&config.nodes, "merged")
+        .expect("merged node id");
+    let row = artifacts
+        .typed_get(merged_id)
+        .map(|tp| &tp.output_row)
         .expect("merge must publish a bound output row");
     assert!(
         row.has_field("$widened"),
         "merge's typed output row must carry the `$widened` sidecar inherited from \
          its (same-policy) inputs"
     );
+    let plan =
+        PipelineConfig::compile(&config, &ctx).expect("same-policy merge must compile cleanly");
     let merge_node = plan
         .dag()
         .graph

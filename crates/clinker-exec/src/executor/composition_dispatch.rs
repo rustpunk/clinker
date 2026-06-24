@@ -60,8 +60,8 @@ pub(crate) fn dispatch_composition(
     // graph directly and `collect_port_records` walks live
     // edges, so the body's lookup is deferred to
     // `execute_composition_body`.
-    ctx.artifacts
-        .body_of(body)
+    ctx.composition_bodies
+        .get(&body)
         .ok_or_else(|| PipelineError::compose_body_missing(name.clone()))?;
 
     // Schema-check parent records before stepping into the
@@ -253,10 +253,10 @@ fn execute_composition_body(
 
     // Resolve body and pre-compute everything that needs the
     // bound_body borrow before the swap so the body_dag clone is
-    // independent of the artifacts borrow.
+    // independent of the composition_bodies borrow.
     let bound_body = ctx
-        .artifacts
-        .body_of(body_id)
+        .composition_bodies
+        .get(&body_id)
         .ok_or_else(|| PipelineError::compose_body_missing(composition_name.to_string()))?;
 
     let body_dag = clinker_plan::plan::execution::ExecutionPlanDag::from_body(bound_body);

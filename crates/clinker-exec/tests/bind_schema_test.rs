@@ -27,6 +27,57 @@ fn compile_yaml(yaml: &str) -> clinker_plan::plan::CompiledPlan {
         .expect("fixture must compile")
 }
 
+/// Bind a FLAT (composition-free) fixture directly through the `pub`
+/// [`bind_schema`] entry point — the same compile-scratch source production
+/// `compile_with_diagnostics` consumes — returning the populated
+/// [`CompileArtifacts`] (`typed`, `top_level_node_ids`, …) alongside the
+/// parsed [`PipelineConfig`]. These fixtures declare no compositions, so the
+/// symbol table is empty and the pipeline dir is the empty path.
+fn bind_yaml(
+    yaml: &str,
+) -> (
+    clinker_plan::plan::bind_schema::CompileArtifacts,
+    PipelineConfig,
+) {
+    let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture must parse");
+    // Guard the empty-symbol-table assumption: a composition node would bind
+    // against a missing signature and silently produce wrong rows. Fail loudly
+    // so a future composition fixture is routed through a scan-based bind path
+    // instead of mis-binding here.
+    assert!(
+        !config.nodes.iter().any(|n| matches!(
+            n.value,
+            clinker_plan::config::pipeline_node::PipelineNode::Composition { .. }
+        )),
+        "bind_yaml is for composition-free fixtures only; this fixture declares a composition",
+    );
+    let ctx = CompileContext::default();
+    let symbol_table = indexmap::IndexMap::new();
+    let mut diags = Vec::new();
+    let artifacts = clinker_plan::plan::bind_schema::bind_schema(
+        &config.nodes,
+        &mut diags,
+        &ctx,
+        &symbol_table,
+        std::path::Path::new(""),
+        Default::default(),
+    );
+    (artifacts, config)
+}
+
+/// Resolve a top-level node's bound output [`Row`] off the compile
+/// artifacts. Replaces the former `CompiledPlan::typed_output_row`:
+/// resolve the node's id by name, then read its typed program's
+/// `output_row` from the `typed` side-table.
+fn typed_output_row<'a>(
+    config: &PipelineConfig,
+    artifacts: &'a clinker_plan::plan::bind_schema::CompileArtifacts,
+    name: &str,
+) -> Option<&'a cxl::typecheck::Row> {
+    let id = artifacts.top_level_id(&config.nodes, name)?;
+    artifacts.typed_get(id).map(|tp| &tp.output_row)
+}
+
 /// Gate test: a pipeline with a source declaring `schema: [{name: a, type: string}]`
 /// produces `typed_output_row("source1") == Row::closed({a: String})`.
 #[test]
@@ -52,10 +103,9 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let plan = compile_yaml(yaml);
-    let row = plan
-        .typed_output_row("source1")
-        .expect("source1 must have a bound row");
+    let (artifacts, config) = bind_yaml(yaml);
+    let row =
+        typed_output_row(&config, &artifacts, "source1").expect("source1 must have a bound row");
     // Schema includes the user-declared `a` + `b`, the `$widened`
     // engine-stamped sidecar (auto_widen is the default `OnUnmapped`
     // policy), and the `$source.file` / `$source.name` /
@@ -114,10 +164,8 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let plan = compile_yaml(yaml);
-    let row = plan
-        .typed_output_row("tx")
-        .expect("transform must have a bound row");
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "tx").expect("transform must have a bound row");
     assert!(row.has_field("x"), "upstream column 'x' must propagate");
     assert!(row.has_field("y"), "emitted column 'y' must appear");
 }
@@ -151,21 +199,21 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let plan = compile_yaml(yaml);
+    let (artifacts, config) = bind_yaml(yaml);
     assert!(
-        plan.typed_output_row("s1").is_some(),
+        typed_output_row(&config, &artifacts, "s1").is_some(),
         "source must have bound row"
     );
     assert!(
-        plan.typed_output_row("t1").is_some(),
+        typed_output_row(&config, &artifacts, "t1").is_some(),
         "transform must have bound row"
     );
     assert!(
-        plan.typed_output_row("o1").is_some(),
+        typed_output_row(&config, &artifacts, "o1").is_some(),
         "output must have bound row"
     );
     assert!(
-        plan.typed_output_row("nonexistent").is_none(),
+        typed_output_row(&config, &artifacts, "nonexistent").is_none(),
         "nonexistent node must return None"
     );
 }
@@ -294,7 +342,10 @@ nodes:
       type: csv
       path: out.csv
 "#;
+    // The lowered Source `output_schema` comes off the slim plan's DAG; the
+    // `typed_output_row` cxl-Row check below reads `bind_schema` artifacts.
     let plan = compile_yaml(yaml);
+    let (artifacts, config) = bind_yaml(yaml);
     let schema = source_output_schema(&plan, "src");
 
     // User-declared columns stay at their declared positions, then
@@ -328,7 +379,7 @@ nodes:
 
     // The same widening lands on the typecheck Row produced by
     // `bind_schema` — confirms the source goes through `columns_from_decl`.
-    let row = plan.typed_output_row("src").expect("bound row");
+    let row = typed_output_row(&config, &artifacts, "src").expect("bound row");
     assert!(row.has_field("$ck.employee_id"));
 }
 
@@ -421,8 +472,12 @@ nodes:
       type: csv
       path: out.csv
 "#;
+    // `typed_output_row` reads the cxl Row off `bind_schema` artifacts; the
+    // lowered `PlanNode::Transform.output_schema` assertion below reads the
+    // slim plan's DAG. Both surfaces are checked independently.
     let plan = compile_yaml(yaml);
-    let row = plan.typed_output_row("tx").expect("tx row");
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "tx").expect("tx row");
     assert!(
         row.has_field("$ck.id"),
         "transform downstream of widened source must inherit shadow column"
@@ -549,10 +604,13 @@ nodes:
       type: csv
       path: out.csv
 "#;
+    // `typed_output_row` reads the cxl Row off `bind_schema` artifacts; the
+    // lowered `PlanNode::Aggregation.output_schema` assertion below reads the
+    // slim plan's DAG. Both surfaces are checked independently.
     let plan = compile_yaml(yaml);
-    let agg_row = plan
-        .typed_output_row("agg")
-        .expect("aggregate must have a bound row");
+    let (artifacts, config) = bind_yaml(yaml);
+    let agg_row =
+        typed_output_row(&config, &artifacts, "agg").expect("aggregate must have a bound row");
     assert!(
         agg_row.has_field("$widened"),
         "aggregate's bound row must include `$widened` when the upstream source's auto_widen \
@@ -685,23 +743,19 @@ nodes:
     assert!(parent_schema.contains("$ck.id"));
 
     // Body port-synthetic Source ("data" port): walks the composition
-    // body's mini-DAG and finds a PlanNode::Source named after the
-    // port. Its output_schema must mirror the parent's widening.
-    // `composition_body_assignments` keys by the call-site node's id;
-    // resolve `passthrough`'s id off the declaration-order id vector.
-    let passthrough_id = plan
-        .config()
-        .nodes
-        .iter()
-        .zip(plan.artifacts().top_level_node_ids.iter())
-        .find_map(|(spanned, id)| (spanned.value.name() == "passthrough").then_some(*id))
-        .expect("top-level `passthrough` id");
+    // body's mini-DAG and finds a PlanNode::Source named after the port.
+    // Its output_schema must mirror the parent's widening. The body id is
+    // stamped on the `passthrough` Composition node in the slim plan's
+    // lowered DAG — resolve it there.
     let body_id = plan
-        .artifacts()
-        .composition_body_assignments
-        .get(&passthrough_id)
-        .copied()
-        .expect("composition body assigned");
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|n| match n {
+            PlanNode::Composition { name, body, .. } if name == "passthrough" => Some(*body),
+            _ => None,
+        })
+        .expect("top-level `passthrough` composition must carry a body id");
     let body = plan.body_of(body_id).expect("body present");
     let port_node = body
         .graph

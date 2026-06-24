@@ -11,7 +11,7 @@
 use crate::plan::execution::PlanNode;
 use petgraph::graph::DiGraph;
 
-use super::deferred_region::compile_with_dir_full;
+use super::deferred_region::{body_id_for, compile_with_dir_full};
 
 /// Read the typed `cxl:` body program off the named `PlanNode::Combine`
 /// in `graph`, panicking if the node is absent, is not a Combine, or
@@ -174,20 +174,9 @@ nodes:
     );
 
     // 2. BODY combine: program is reachable off the node in the
-    //    composition body's `graph`, with the same fidelity.
-    let artifacts = compiled.artifacts();
-    let body_comp_id = compiled
-        .config()
-        .nodes
-        .iter()
-        .zip(artifacts.top_level_node_ids.iter())
-        .find_map(|(spanned, id)| (spanned.value.name() == "body").then_some(*id))
-        .expect("top-level `body` composition id");
-    let body_id = artifacts
-        .composition_body_assignments
-        .get(&body_comp_id)
-        .copied()
-        .expect("composition body assignment for `body`");
+    //    composition body's `graph`, with the same fidelity. Resolve the
+    //    body id off the slim plan's stamped Composition node.
+    let body_id = body_id_for(&compiled, "body");
     let bound = compiled.body_of(body_id).expect("bound body");
     let body = combine_body_typed(&bound.graph, "body_combine");
     assert!(

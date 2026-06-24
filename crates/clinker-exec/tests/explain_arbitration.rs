@@ -41,7 +41,7 @@ fn render_explain_with_artifacts_anchored(yaml: &str, anchor: &Path) -> String {
     let ctx = CompileContext::with_pipeline_dir(anchor, "");
     let plan = config.compile(&ctx).expect("compile");
     plan.dag()
-        .explain_text_with_artifacts(&config, plan.artifacts())
+        .explain_text_with_statistics(&config, plan.statistics())
 }
 
 /// Write `contents` to `<dir>/<name>` and assert its on-disk length so a
@@ -446,12 +446,13 @@ fn explain_renders_exec_sketches_in_statistics_block() {
     let ctx = CompileContext::with_pipeline_dir(tmp.path(), "");
     let plan = config.compile(&ctx).expect("compile");
 
-    // Clone the artifacts and fold in the build-side sketches the grace-hash
-    // join records at completion, keyed under the build upstream node.
-    let mut artifacts = plan.artifacts().clone();
+    // Clone the statistics catalog and fold in the build-side sketches the
+    // grace-hash join records at completion, keyed under the build upstream
+    // node.
+    let mut statistics = plan.statistics().clone();
     let key = StatKey::new("products", "product_id");
-    artifacts.statistics.record_distinct(key.clone(), 58);
-    artifacts.statistics.record_heavy_hitters(
+    statistics.record_distinct(key.clone(), 58);
+    statistics.record_heavy_hitters(
         key.clone(),
         vec![
             (Value::from("p0"), 12),
@@ -459,7 +460,7 @@ fn explain_renders_exec_sketches_in_statistics_block() {
             (Value::from("p2"), 4),
         ],
     );
-    artifacts.statistics.record_bloom(
+    statistics.record_bloom(
         key,
         BloomSummary {
             bit_count: 560,
@@ -468,7 +469,9 @@ fn explain_renders_exec_sketches_in_statistics_block() {
         },
     );
 
-    let text = plan.dag().explain_text_with_artifacts(&config, &artifacts);
+    let text = plan
+        .dag()
+        .explain_text_with_statistics(&config, &statistics);
 
     assert!(
         text.contains("58 distinct [exec sketch]"),

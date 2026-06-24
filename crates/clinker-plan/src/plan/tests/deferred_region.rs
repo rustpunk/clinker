@@ -15,6 +15,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::config::{CompileContext, PipelineConfig, parse_config};
 use crate::plan::CompiledPlan;
+use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::execution::ExecutionPlanDag;
 
 fn compile(yaml: &str) -> ExecutionPlanDag {
@@ -30,6 +31,35 @@ pub(super) fn compile_with_dir_full(yaml: &str, workspace_root: &std::path::Path
     let config: PipelineConfig = parse_config(yaml).expect("parse");
     let ctx = CompileContext::with_pipeline_dir(workspace_root, PathBuf::from("pipelines"));
     config.compile(&ctx).expect("compile")
+}
+
+/// Bind a composition fixture directly through [`bind_schema`], returning
+/// the full [`CompileArtifacts`] (compile-scratch: `typed`,
+/// `combine_where_typed`, `composition_body_assignments`,
+/// `top_level_node_ids`, plus the bound `composition_bodies`) alongside the
+/// parsed [`PipelineConfig`]. `bind_schema` is `pub` and consumed by
+/// production `compile_with_diagnostics`, so the compile-scratch is reached
+/// through a non-test API. Deferred regions are NOT computed here (those run
+/// later, in `compile`); tests needing post-lowering regions use
+/// [`compile_with_dir_full`] + the slim plan.
+pub(super) fn bind_schema_with_dir(
+    yaml: &str,
+    workspace_root: &std::path::Path,
+) -> (CompileArtifacts, PipelineConfig) {
+    let config: PipelineConfig = parse_config(yaml).expect("parse");
+    let ctx = CompileContext::with_pipeline_dir(workspace_root, PathBuf::from("pipelines"));
+    let symbol_table = crate::config::composition::scan_workspace_signatures(ctx.workspace_root())
+        .expect("composition corpus must scan");
+    let mut diags = Vec::new();
+    let artifacts = crate::plan::bind_schema::bind_schema(
+        &config.nodes,
+        &mut diags,
+        &ctx,
+        &symbol_table,
+        &ctx.pipeline_dir,
+        Default::default(),
+    );
+    (artifacts, config)
 }
 
 fn node_idx_for(plan: &ExecutionPlanDag, node_name: &str) -> NodeIndex {
@@ -49,30 +79,48 @@ fn body_node_idx_for(
         .unwrap_or_else(|| panic!("body node {node_name:?} not found"))
 }
 
-/// Resolve a top-level composition call-site node's [`PlanNodeId`] by name,
-/// the way the production lowering does: from the declaration-order id
-/// vector (top-level names are unique). `composition_body_assignments` keys
-/// by this id, so reads must resolve it rather than indexing by name.
-fn top_level_id_for(compiled: &CompiledPlan, node_name: &str) -> crate::plan::PlanNodeId {
-    let artifacts = compiled.artifacts();
-    compiled
-        .config()
-        .nodes
-        .iter()
-        .zip(artifacts.top_level_node_ids.iter())
-        .find_map(|(spanned, id)| (spanned.value.name() == node_name).then_some(*id))
-        .unwrap_or_else(|| panic!("top-level composition node {node_name:?} not found"))
+/// Resolve a top-level composition's [`CompositionBodyId`] off the slim
+/// plan: find the `PlanNode::Composition` by name in the parent DAG and
+/// read the `body` id stamped on it post-lowering. This replaces the old
+/// `artifacts.composition_body_assignments` lookup — the body id now lives
+/// on the node itself.
+pub(super) fn body_id_for(
+    compiled: &CompiledPlan,
+    comp_name: &str,
+) -> crate::plan::CompositionBodyId {
+    let dag = compiled.dag();
+    dag.graph
+        .node_indices()
+        .find_map(|i| match &dag.graph[i] {
+            crate::plan::execution::PlanNode::Composition { name, body, .. }
+                if name == comp_name =>
+            {
+                Some(*body)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("top-level composition node {comp_name:?} not found"))
 }
 
-/// Resolve a body-internal composition call-site node's [`PlanNodeId`] by
-/// name from its parent body's mini-DAG. Body nodes carry their own stable
-/// id, which keys `composition_body_assignments` for nested compositions.
-fn body_composition_id_for(
+/// Resolve a nested composition's [`CompositionBodyId`] off its enclosing
+/// body's mini-DAG: find the `PlanNode::Composition` by name in `body.graph`
+/// and read the `body` id stamped on it. The body-graph analogue of
+/// [`body_id_for`].
+fn nested_body_id_for(
     body: &crate::plan::composition_body::BoundBody,
-    node_name: &str,
-) -> crate::plan::PlanNodeId {
-    let idx = body_node_idx_for(body, node_name);
-    body.graph[idx].id()
+    comp_name: &str,
+) -> crate::plan::CompositionBodyId {
+    body.graph
+        .node_indices()
+        .find_map(|i| match &body.graph[i] {
+            crate::plan::execution::PlanNode::Composition { name, body, .. }
+                if name == comp_name =>
+            {
+                Some(*body)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("nested composition node {comp_name:?} not found in body"))
 }
 
 /// Test 1: Simple region — Source(CK=order_id) → Aggregate(group_by=dept,
@@ -558,15 +606,10 @@ nodes:
     let out_idx = node_idx_for(plan, "out");
 
     // Body-local regions: look up the bound body via the composition's
-    // name → body-id assignment, then assert the body-internal
-    // Aggregate is the producer, the body's Transform is a member, and
-    // both NodeIndex slots are keyed for O(1) dispatcher lookup.
-    let artifacts = compiled.artifacts();
-    let body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "body"))
-        .copied()
-        .expect("composition 'body' must be assigned a CompositionBodyId");
+    // name → body-id stamped on the slim plan's node, then assert the
+    // body-internal Aggregate is the producer, the body's Transform is a
+    // member, and both NodeIndex slots are keyed for O(1) dispatcher lookup.
+    let body_id = body_id_for(&compiled, "body");
     let bound = compiled
         .body_of(body_id)
         .expect("body_id must resolve to a BoundBody");
@@ -722,15 +765,10 @@ nodes:
 
     // Body-local: the inner body owns the relaxed Aggregate; the outer
     // body owns no relaxed Aggregate of its own and thus has no body-
-    // local region keyed on its mini-DAG. Walk the assignments to
-    // locate both bodies and verify the load-bearing one carries the
-    // expected producer.
-    let artifacts = compiled.artifacts();
-    let outer_body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "outer"))
-        .copied()
-        .expect("outer composition assignment");
+    // local region keyed on its mini-DAG. Resolve both bodies off the
+    // slim plan and verify the load-bearing one carries the expected
+    // producer.
+    let outer_body_id = body_id_for(&compiled, "outer");
     let outer_body = compiled
         .body_of(outer_body_id)
         .expect("outer BoundBody resolves");
@@ -739,14 +777,10 @@ nodes:
         "outer body has no relaxed Aggregate of its own; its body-local map stays empty",
     );
 
-    // Inner body assignment lives under the body-internal Composition
-    // node `inner_call` inside `outer_wrap.comp.yaml` — resolve its id off
-    // the outer body's mini-DAG.
-    let inner_body_id = artifacts
-        .composition_body_assignments
-        .get(&body_composition_id_for(outer_body, "inner_call"))
-        .copied()
-        .expect("inner_call composition assignment");
+    // Inner body id lives on the body-internal Composition node
+    // `inner_call` inside `outer_wrap.comp.yaml` — resolve it off the
+    // outer body's mini-DAG.
+    let inner_body_id = nested_body_id_for(outer_body, "inner_call");
     let inner_body = compiled
         .body_of(inner_body_id)
         .expect("inner BoundBody resolves");
@@ -1066,14 +1100,9 @@ nodes:
     );
 
     // Outer body: continuation for the inner Composition with the
-    // outer body's own Transform downstream. Resolve the outer body
-    // and the inner Composition's body-local NodeIndex.
-    let artifacts = compiled.artifacts();
-    let outer_body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "outer"))
-        .copied()
-        .expect("outer composition assignment");
+    // outer body's own Transform downstream. Resolve the outer body off
+    // the slim plan, then the inner Composition's body-local NodeIndex.
+    let outer_body_id = body_id_for(&compiled, "outer");
     let outer_body = compiled
         .body_of(outer_body_id)
         .expect("outer BoundBody resolves");
@@ -1274,12 +1303,7 @@ nodes:
       include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
-    let artifacts = compiled.artifacts();
-    let body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "body"))
-        .copied()
-        .expect("composition 'body' must be assigned a CompositionBodyId");
+    let body_id = body_id_for(&compiled, "body");
     let bound = compiled
         .body_of(body_id)
         .expect("body_id must resolve to a BoundBody");
@@ -1390,12 +1414,7 @@ nodes:
       include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
-    let artifacts = compiled.artifacts();
-    let body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "body"))
-        .copied()
-        .expect("composition 'body' must be assigned a CompositionBodyId");
+    let body_id = body_id_for(&compiled, "body");
     let bound = compiled
         .body_of(body_id)
         .expect("body_id must resolve to a BoundBody");
@@ -1534,23 +1553,15 @@ nodes:
       include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
-    let artifacts = compiled.artifacts();
 
     // `inner_call` is body-internal to the top-level `outer` composition;
-    // resolve outer's body first, then key by inner_call's body-local id.
-    let outer_body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "outer"))
-        .copied()
-        .expect("outer composition must be assigned a CompositionBodyId");
+    // resolve outer's body off the slim plan, then key by inner_call's
+    // body-local id stamped on the outer body's node.
+    let outer_body_id = body_id_for(&compiled, "outer");
     let outer_body = compiled
         .body_of(outer_body_id)
         .expect("outer body resolves");
-    let inner_body_id = artifacts
-        .composition_body_assignments
-        .get(&body_composition_id_for(outer_body, "inner_call"))
-        .copied()
-        .expect("inner_call composition must be assigned a CompositionBodyId");
+    let inner_body_id = nested_body_id_for(outer_body, "inner_call");
     let inner_body = compiled
         .body_of(inner_body_id)
         .expect("inner body resolves");
@@ -1690,22 +1701,24 @@ nodes:
       path: out_b.csv
       include_unmapped: true
 "#;
+    // The slim plan supplies the post-compile parent continuations and the
+    // real parent graph; `bind_schema` supplies a `CompileArtifacts` for the
+    // `continuation_support` signature. The walk's members here are plain
+    // Transforms (`parent_a`/`parent_b`), never Compositions, so the walker
+    // never dereferences a body id through `artifacts.body_of` — the two id
+    // spaces are never crossed.
     let compiled = compile_with_dir_full(yaml, workspace.path());
+    let (artifacts, _config) = bind_schema_with_dir(yaml, workspace.path());
     let plan = compiled.dag();
-    let artifacts = compiled.artifacts();
 
     let body_a_idx = node_idx_for(plan, "body_a");
     let body_b_idx = node_idx_for(plan, "body_b");
 
     // The two call sites today bind to distinct body IDs (1:1
-    // allocator); pick `body_a`'s id as the canonical body and
-    // forge a second call site pointing at the same id but
-    // referencing `body_b`'s `composition_idx` and continuation.
-    let canonical_body_id: CompositionBodyId = artifacts
-        .composition_body_assignments
-        .get(&plan.graph[body_a_idx].id())
-        .copied()
-        .expect("body_a must be assigned");
+    // allocator); pick `body_a`'s id (stamped on the slim plan's node) as
+    // the canonical body and forge a second call site pointing at the same
+    // id but referencing `body_b`'s `composition_idx` and continuation.
+    let canonical_body_id: CompositionBodyId = body_id_for(&compiled, "body_a");
 
     // Pull the existing per-call-site continuation members from the
     // real plan-time analysis path: each Composition's
@@ -1766,7 +1779,7 @@ nodes:
         "out",
         &analysis,
         &plan.graph,
-        artifacts,
+        &artifacts,
         &mut memo,
         &mut active,
     );
@@ -1809,7 +1822,7 @@ nodes:
         "out",
         &single_analysis,
         &plan.graph,
-        artifacts,
+        &artifacts,
         &mut memo2,
         &mut active2,
     );
@@ -1907,12 +1920,7 @@ nodes:
       include_unmapped: true
 "#;
     let compiled = compile_with_dir_full(yaml, workspace.path());
-    let artifacts = compiled.artifacts();
-    let body_id = artifacts
-        .composition_body_assignments
-        .get(&top_level_id_for(&compiled, "body"))
-        .copied()
-        .expect("composition 'body' must be assigned a CompositionBodyId");
+    let body_id = body_id_for(&compiled, "body");
     let bound = compiled
         .body_of(body_id)
         .expect("body_id must resolve to a BoundBody");

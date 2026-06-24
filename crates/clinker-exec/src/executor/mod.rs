@@ -173,9 +173,12 @@ struct DagExecInputs<'a> {
     source_configs: &'a [clinker_plan::config::SourceConfig],
     /// Topologically-sorted execution DAG walked by the dispatcher.
     plan: &'a ExecutionPlanDag,
-    /// Compile artifacts (bound schemas, composition bodies) consulted
-    /// by the dispatcher while walking the plan.
-    artifacts: &'a clinker_plan::plan::bind_schema::CompileArtifacts,
+    /// Bound composition bodies the dispatcher re-enters while walking
+    /// the plan — the runtime-retained slice of the compile artifacts.
+    composition_bodies: &'a clinker_plan::plan::composition_body::CompositionBodies,
+    /// Planner column-statistics catalog, seeded into the runtime
+    /// accumulator at context construction.
+    statistics: &'a clinker_plan::plan::statistics::StatisticsCatalog,
     /// Per-run parameters: execution / batch ids, channel variable
     /// overrides, shutdown token.
     params: &'a PipelineRunParams,
@@ -544,7 +547,7 @@ impl PipelineExecutor {
         // Routes carry their own conditions.
         let mut compiled_routes_by_name: std::collections::HashMap<String, CompiledRoute> =
             std::collections::HashMap::new();
-        for (_body_id, body) in validated_plan.artifacts().composition_bodies.iter() {
+        for (_body_id, body) in validated_plan.composition_bodies().iter() {
             for (route_name, route_body) in &body.route_bodies {
                 // Build the body Route's RouteConfig from its parsed
                 // RouteBody. The condition resolver needs the field
@@ -807,7 +810,8 @@ impl PipelineExecutor {
                 config,
                 source_configs: &source_configs,
                 plan,
-                artifacts: validated_plan.artifacts(),
+                composition_bodies: validated_plan.composition_bodies(),
+                statistics: validated_plan.statistics(),
                 params,
             },
             DagExecResources {
@@ -994,7 +998,8 @@ impl PipelineExecutor {
             config,
             source_configs,
             plan,
-            artifacts,
+            composition_bodies,
+            statistics,
             params,
         } = inputs;
         let DagExecResources {
@@ -1298,7 +1303,7 @@ impl PipelineExecutor {
 
         let mut ctx = dispatch::ExecutorContext {
             config,
-            artifacts,
+            composition_bodies,
             output_configs: &output_configs,
             primary_output: &output_configs[0],
             stable: &stable,
@@ -1369,7 +1374,7 @@ impl PipelineExecutor {
             // Plane A row counts so a downstream node reading it sees the
             // metadata-derived estimates until an operator finalize
             // supersedes one with an exec-measured figure.
-            runtime_statistics: Arc::new(std::sync::Mutex::new(artifacts.statistics.clone())),
+            runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
 
         // Resolve dispatch order through the memory arbitrator rather
