@@ -82,14 +82,15 @@ pub struct CompileArtifacts {
     /// Per-Route branch-condition typed programs, keyed by the Route
     /// node's [`PlanNodeId`] — one program per branch, in declaration
     /// order. A Route's node-keyed `typed` entry is an empty body (the
-    /// node carries no `cxl:` projection); the branch conditions are
-    /// otherwise compiled straight to runtime evaluators and never land
-    /// in `typed`. This side-table retains them so a `$doc` access used
-    /// ONLY in a route condition (e.g. `amount > $doc.Head.cutoff`) is
-    /// still reachable by the compile-time `$doc` path walk and attributed
-    /// to the Route's source(s). Compile-time-only: the runtime executor
-    /// never reads it. The per-node id keeps a route named the same in
-    /// two composition scopes from colliding.
+    /// node carries no `cxl:` projection); the branch conditions live
+    /// here instead. This is the bind→lowering handoff: lowering stamps
+    /// these onto `PlanNode::Route.branch_programs`, and the runtime
+    /// builds its branch evaluators off that on-node copy — it never
+    /// reads this side-table. The table also keeps a `$doc` access used
+    /// ONLY in a route condition (e.g. `amount > $doc.Head.cutoff`)
+    /// reachable by the compile-time `$doc` path walk and attributed to
+    /// the Route's source(s). Compile-time-only. The per-node id keeps a
+    /// route named the same in two composition scopes from colliding.
     pub route_branch_typed: HashMap<PlanNodeId, Vec<Arc<TypedProgram>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
@@ -1745,8 +1746,8 @@ fn bind_cull(
     // as `count(*) > 100` or `sum(if status == 'error' then 1 else 0) > 0` is
     // well-formed. The predicate is wrapped in a single `emit` so it
     // typechecks through the same aggregate-mode path the Aggregate node uses;
-    // the bound result is discarded here (the executor recompiles per node at
-    // dispatch time, the Route condition-compile seam).
+    // the bound result is discarded here (the executor recompiles this node's
+    // predicate against the live input schema at dispatch time).
     let agg_mode = AggregateMode::GroupBy {
         group_by_fields: config.partition_by.iter().cloned().collect(),
     };
@@ -2095,33 +2096,44 @@ fn bind_schema_inner(
                         empty.output_row = cloned.clone();
                         artifacts.typed_insert(node_id, Arc::new(empty));
                     }
-                    // Type-check each branch condition into its own program
-                    // so the compile-time `$doc` walk can reach an envelope
-                    // path referenced ONLY in a route predicate. The
-                    // condition is a boolean expression; wrapping it in
-                    // `filter` mirrors how the runtime compiles it, giving a
-                    // `Statement::Filter` whose predicate the `$doc` walk
-                    // descends. A condition that fails to type-check is not
-                    // diagnosed here — that surfaces through the existing
-                    // route-compilation path — so only well-typed branches
-                    // contribute paths.
-                    let branch_programs: Vec<Arc<TypedProgram>> = config
-                        .conditions
-                        .values()
-                        .filter_map(|cond| {
-                            typecheck_cxl(
-                                &name,
-                                &format!("filter {}", cond.source),
-                                &cloned,
-                                AggregateMode::Row,
-                                span,
-                                &bind_ctx.scoped_vars,
-                            )
-                            .ok()
-                            .map(Arc::new)
-                        })
-                        .collect();
-                    if !branch_programs.is_empty() {
+                    // Type-check each branch condition into its own program,
+                    // in `conditions` declaration order. Each program is carried
+                    // onto `PlanNode::Route.branch_programs` at lowering so route
+                    // dispatch evaluates it off the node, and it also feeds the
+                    // compile-time `$doc` walk (which reaches an envelope path
+                    // referenced ONLY in a route predicate). The condition is a
+                    // boolean expression; wrapping it in `filter` mirrors how the
+                    // runtime evaluates it, giving a `Statement::Filter` whose
+                    // predicate the `$doc` walk descends. A branch that fails to
+                    // type-check is a hard compile error here — the executor does
+                    // not re-compile route conditions at startup, so this is the
+                    // sole place they are diagnosed — and on any failure the node
+                    // is left without an entry so it is not lowered. A clean
+                    // bind therefore records a full-length vec aligned 1:1 with
+                    // `branches`.
+                    let mut branch_programs: Vec<Arc<TypedProgram>> =
+                        Vec::with_capacity(config.conditions.len());
+                    for (branch_name, cond) in &config.conditions {
+                        // Qualify the diagnostic node name with the branch so a
+                        // type error in a multi-branch route points at the
+                        // offending branch, not just the route node.
+                        match typecheck_cxl(
+                            &format!("{name} (branch {branch_name})"),
+                            &format!("filter {}", cond.source),
+                            &cloned,
+                            AggregateMode::Row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                        ) {
+                            Ok(typed) => branch_programs.push(Arc::new(typed)),
+                            Err(d) => diags.push(d),
+                        }
+                    }
+                    // Record the programs only when every branch typechecked: a
+                    // short vec would not align 1:1 with `branches` at lowering.
+                    // A failed branch has already pushed its diagnostic, which
+                    // aborts the compile before lowering runs.
+                    if branch_programs.len() == config.conditions.len() {
                         artifacts
                             .route_branch_typed
                             .insert(node_id, branch_programs);
@@ -2881,12 +2893,10 @@ fn bind_composition(
         }
     }
 
-    // Populate `node_input_refs` and `route_bodies` from the body
-    // file so the body executor can resolve `<route>.<branch>`
-    // references and compile per-route conditions without having to
-    // re-parse the .comp.yaml at runtime.
+    // Populate `node_input_refs` from the body file so the body executor
+    // can resolve `<route>.<branch>` references without re-parsing the
+    // .comp.yaml at runtime.
     let mut node_input_refs: HashMap<String, Vec<String>> = HashMap::new();
-    let mut route_bodies: HashMap<String, crate::config::pipeline_node::RouteBody> = HashMap::new();
     for spanned in &body_file.nodes {
         let n = &spanned.value;
         let n_name = n.name().to_string();
@@ -2937,11 +2947,7 @@ fn bind_composition(
                 })
                 .collect(),
         };
-        node_input_refs.insert(n_name.clone(), inputs);
-
-        if let PipelineNode::Route { config, .. } = n {
-            route_bodies.insert(n_name, config.clone());
-        }
+        node_input_refs.insert(n_name, inputs);
     }
 
     // Capture analytic-window configs from body Transform nodes so
@@ -2973,7 +2979,6 @@ fn bind_composition(
     bound_body.port_name_to_node_idx = port_name_to_node_idx;
     bound_body.body_rows = body_rows;
     bound_body.node_input_refs = node_input_refs;
-    bound_body.route_bodies = route_bodies;
     bound_body.output_port_rows = output_port_rows.clone();
     bound_body.output_port_to_node_idx = output_port_to_node_idx;
     bound_body.input_port_rows = input_port_rows;

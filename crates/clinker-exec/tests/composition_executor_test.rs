@@ -242,6 +242,121 @@ nodes:
 }
 
 #[test]
+fn test_same_named_route_top_level_and_body_resolve_independently() {
+    // A top-level route `gate` (threshold tier > 100) and a route ALSO named
+    // `gate` inside a composition body (threshold tier > 10) are distinct node
+    // instances in distinct graphs and must each evaluate their own conditions.
+    // Each Route node carries its own typed branch programs, so a shared node
+    // name across scopes cannot cross-wire conditions: tier=50 is `cold` for the
+    // top-level route (> 100 is false) but `hot` for the body route (> 10 is
+    // true). Cross-wiring would route tier=50 to the top-level `hot` branch,
+    // emptying `top_cold`.
+    let yaml = r#"
+pipeline:
+  name: route_scope_collision
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: tier, type: int }
+  - type: route
+    name: gate
+    input: src
+    config:
+      conditions:
+        hot: "tier > 100"
+      default: cold
+  - type: transform
+    name: top_hot
+    input: gate.hot
+    config:
+      cxl: |
+        emit id = id
+        emit tier = tier
+        emit via = "top_hot"
+  - type: transform
+    name: top_cold
+    input: gate.cold
+    config:
+      cxl: |
+        emit id = id
+        emit tier = tier
+        emit via = "top_cold"
+  - type: merge
+    name: top_merged
+    inputs: [top_hot, top_cold]
+  - type: output
+    name: top_out
+    input: top_merged
+    config:
+      name: top_out
+      type: csv
+      path: top.csv
+      include_unmapped: true
+  - type: composition
+    name: comp
+    input: src
+    use: ../compositions/route_scope_body.comp.yaml
+    inputs:
+      inp: src
+  - type: output
+    name: comp_out
+    input: comp
+    config:
+      name: comp_out
+      type: csv
+      path: comp.csv
+      include_unmapped: true
+"#;
+    let csv_input = "id,tier\nr1,50\n";
+
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let plan = config.compile(&ctx).expect("compile pipeline");
+
+    let primary = config.source_configs().next().unwrap().name.clone();
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        primary,
+        clinker_exec::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
+    )]);
+
+    let bufs: HashMap<String, SharedBuffer> = config
+        .output_configs()
+        .map(|o| (o.name.clone(), SharedBuffer::new()))
+        .collect();
+    let writers: HashMap<String, Box<dyn Write + Send>> = bufs
+        .iter()
+        .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
+        .collect();
+
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+        .expect("pipeline run");
+
+    let top_out = bufs.get("top_out").expect("top_out present").as_string();
+    let comp_out = bufs.get("comp_out").expect("comp_out present").as_string();
+
+    assert!(
+        top_out.contains("top_cold") && !top_out.contains("top_hot"),
+        "top-level route (threshold 100) must route tier=50 to its own `cold` \
+         branch; got top_out:\n{top_out}\ncomp_out:\n{comp_out}"
+    );
+    assert!(
+        comp_out.contains("body_hot") && !comp_out.contains("body_cold"),
+        "body route (threshold 10) must route tier=50 to its own `hot` branch; \
+         got comp_out:\n{comp_out}\ntop_out:\n{top_out}"
+    );
+}
+
+#[test]
 fn test_composition_body_error_context() {
     // A body transform that fires a runtime CXL error must surface
     // wrapped with the composition's name so users can locate the

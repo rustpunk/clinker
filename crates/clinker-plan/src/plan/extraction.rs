@@ -454,6 +454,7 @@ mod tests {
             mode: RouteMode::Exclusive,
             branches: vec![],
             default: String::new(),
+            branch_programs: vec![],
         }
     }
 

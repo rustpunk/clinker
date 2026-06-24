@@ -2,8 +2,8 @@
 //!
 //! Drive the multi-writer registry, per-output channels, and DLQ
 //! stage/route extensions end-to-end through the public executor entry
-//! point. The route-evaluation white-box tests (compile + evaluate a
-//! route through the crate-private `compile_route` / `CompiledRoute`
+//! point. The route-evaluation white-box tests (build + evaluate a route
+//! through the crate-private `CompiledRoute::from_node` / `CompiledRoute`
 //! seam) stay inline in `executor/tests/multi_output.rs`.
 
 mod common;

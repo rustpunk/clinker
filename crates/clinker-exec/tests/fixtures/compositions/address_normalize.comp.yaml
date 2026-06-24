@@ -30,6 +30,6 @@ nodes:
     input: clean_whitespace
     config:
       conditions:
-        valid: "not is_empty(zip)"
-        invalid: "is_empty(zip)"
+        valid: "not zip.is_empty()"
+        invalid: "zip.is_empty()"
       default: invalid

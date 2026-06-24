@@ -3514,14 +3514,35 @@ pub(crate) fn lower_node_to_plan_node(
                 fan_out_per_source_file: false,
             })),
         }),
-        PipelineNode::Route { config, .. } => Some(PlanNode::Route {
-            name: name.to_string(),
-            id,
-            span,
-            mode: config.mode,
-            branches: config.conditions.keys().cloned().collect(),
-            default: config.default.clone(),
-        }),
+        PipelineNode::Route { config, .. } => {
+            // One typed program per branch, in `conditions` declaration order —
+            // the same order `branches` is collected in below — so route
+            // dispatch pairs each program with its branch name positionally.
+            let branch_programs = artifacts
+                .route_branch_typed
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            // A Route lowers only when binding produced one program per branch.
+            // A missing or short entry means bind_schema skipped the node
+            // (upstream unresolved) or rejected a branch condition — a
+            // diagnostic was pushed either way — so the node must not lower into
+            // a runtime that would trip `CompiledRoute::from_node`'s 1:1
+            // invariant. Mirrors the `typed_get(id)? => None` guard the other
+            // operator arms use for a node bind_schema rejected.
+            if branch_programs.len() != config.conditions.len() {
+                return None;
+            }
+            Some(PlanNode::Route {
+                name: name.to_string(),
+                id,
+                span,
+                mode: config.mode,
+                branches: config.conditions.keys().cloned().collect(),
+                default: config.default.clone(),
+                branch_programs,
+            })
+        }
         PipelineNode::Merge { .. } => Some(PlanNode::Merge {
             name: name.to_string(),
             id,
@@ -3715,8 +3736,8 @@ pub(crate) fn lower_node_to_plan_node(
         // Reshape lowers to PlanNode::Reshape carrying the parsed config
         // and the audit-widened output schema. The executor compiles each
         // rule's `when` / `set` / `overrides` CXL against the live input
-        // schema at dispatch time (the Route condition-compile seam), so no
-        // per-rule typed program is threaded through CompileArtifacts.
+        // schema at dispatch time, so no per-rule typed program is threaded
+        // through CompileArtifacts.
         PipelineNode::Reshape { config, .. } => {
             // A missing typed entry means bind_schema rejected the node
             // (E200 on a rule predicate / assignment) — skip lowering.

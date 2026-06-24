@@ -1139,17 +1139,16 @@ mod tests {
     /// A 3-input combine is decomposed at plan time into a left-deep
     /// chain of binary combines. The body program — the one carrying
     /// the user's `emit combined = a.x + c.z` — is re-homed onto the
-    /// final chain step's `PlanNode::Combine.typed`, and is NOT mirrored
-    /// into `artifacts.typed` under the original combine name. The route
-    /// resolver seeds its known-field set from sources, transforms, and
-    /// the `artifacts.typed` entries; without also walking the combine
-    /// nodes' `typed` programs it never sees `combined`, and executor
-    /// construction fails in `compile_route` with
-    /// `unresolved identifier 'combined'`.
+    /// final chain step's `PlanNode::Combine.typed`, and the combine's
+    /// bound output row (which includes `combined`) is published into the
+    /// schema table the binder type-checks downstream nodes against. The
+    /// route's branch condition `combined > 0` is type-checked at bind time
+    /// against that upstream schema, so `combined` resolves; were the
+    /// combine's emitted field absent from the route's upstream schema,
+    /// binding the route would fail with `unresolved identifier 'combined'`.
     ///
-    /// Running the fixture through `run_combine_fixture` builds and runs
-    /// the `PipelineExecutor`, which compiles the route during executor
-    /// construction — so a successful run proves `compile_route`
+    /// Running the fixture through `run_combine_fixture` compiles and runs
+    /// the pipeline end to end — so a successful run proves the route
     /// resolved the emitted field. The per-branch record split is
     /// asserted too: rows whose `combined` is positive land on the
     /// `positive` output, the rest on the `nonpositive` default.
@@ -1235,8 +1234,8 @@ nodes:
         )
         .unwrap_or_else(|e| {
             panic!(
-                "executor startup/run must succeed — the route must resolve the \
-                 combine's `combined` emit during compile_route; got: {e}"
+                "compile/run must succeed — the route must resolve the combine's \
+                 `combined` emit when its branch condition is bound; got: {e}"
             )
         });
 

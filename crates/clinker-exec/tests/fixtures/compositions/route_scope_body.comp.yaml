@@ -1,0 +1,45 @@
+# Body containing a route named `gate` — deliberately the SAME node name as a
+# top-level route in the calling pipeline, but with a different threshold
+# (tier > 10 here vs tier > 100 at the top level). Used to confirm each Route
+# node resolves its own on-node branch programs: the old by-name route table
+# keyed compiled routes on the node name, which collided the two `gate`
+# instances. The route tags each branch via a `via` column and merges so the
+# body emits one stream the caller can inspect.
+_compose:
+  name: route_scope_body
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: tier, type: int }
+  outputs:
+    out: merged
+  config_schema: {}
+
+nodes:
+  - type: route
+    name: gate
+    input: inp
+    config:
+      conditions:
+        hot: "tier > 10"
+      default: cold
+  - type: transform
+    name: body_hot
+    input: gate.hot
+    config:
+      cxl: |
+        emit id = id
+        emit tier = tier
+        emit via = "body_hot"
+  - type: transform
+    name: body_cold
+    input: gate.cold
+    config:
+      cxl: |
+        emit id = id
+        emit tier = tier
+        emit via = "body_cold"
+  - type: merge
+    name: merged
+    inputs: [body_hot, body_cold]
